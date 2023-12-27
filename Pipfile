@@ -7,6 +7,7 @@ name = "pypi"
 flask = "*"
 playwright = "*"
 pytest = "*"
+jinja2 = "*"
 
 [dev-packages]
 
