@@ -10,6 +10,7 @@ from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app)  # Enable trust proxy
+app.static_folder = "static"
 
 # Environment variables
 FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET")
@@ -21,10 +22,12 @@ base_dir = "dist"
 static_files = {"assets": "max-age=31104000000", ".well-known": None}  # ~1 year
 
 # Middleware setup
-app.wsgi_app = DispatcherMiddleware(
-    app.wsgi_app,
-    {"/static": app.send_static_file},  # Correctly reference the static file handler
-)  # Allow for multiple WSGI apps and mount static files
+# app.wsgi_app = DispatcherMiddleware(
+#     app.wsgi_app,
+#     {"/static": app.send_static_file
+#      },  # Correctly reference the static file handler
+# )  # Allow for multiple WSGI apps and mount static files
+
 
 # Middleware functions
 @app.before_request
