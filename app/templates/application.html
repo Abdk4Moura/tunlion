@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>ShareDrop</title>
+</head>
+
+<body>
+    <header class="l-header">
+        <nav class="navbar">
+            <h1 class="logo">
+                <span class="logo-title">ShareDrop</span>
+                <span class="logo-subtitle">P2P file transfer</span>
+            </h1>
+
+            <ul class="nav">
+                <li>
+                    <a href="{{ url_for('create_room') }}" class="icon-create-room"
+                        title="Create a room. You'll leave the room you're currently in.">+</a>
+                </li>
+                <li>
+                    <a href="{{ url_for('about_app') }}" class="icon-help" title="About">?</a>
+                </li>
+            </ul>
+        </nav>
+    </header>
+
+    {% block content %}{% endblock %}
+
+    {% block modal %}{% endblock %}
+
+    <footer class="l-footer">
+        <p class="about">{{ about_you }}</p>
+
+    </footer>
+    <!-- Global scripts -->
+    <script>
+        // File-Input component
+        const fileInput = document.getElementById('file-input');
+
+        fileInput.addEventListener('click', (event) => {
+            event.stopPropagation();
+        });
+
+        function handleFileChange() {
+            const files = fileInput.files;
+            // Perform actions with the selected files, e.g., send to Flask route
+            // using AJAX or form submission
+
+            // Reset the file input safely:
+            fileInput.value = null;
+        }
+
+        function reset() {
+            fileInput.value = null;
+        }
+
+    </script>
+</body>
+
+</html>
