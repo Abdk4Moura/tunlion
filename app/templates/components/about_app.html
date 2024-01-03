@@ -1,0 +1,6 @@
+<div id="app">
+    <button @click="openModal">Open Modal</button>
+    <modal v-if="isModalOpen" @close="closeModal">
+        <p>This is a Vue.js modal.</p>
+    </modal>
+</div>
