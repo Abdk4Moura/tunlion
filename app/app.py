@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 
 import os
-from flask import Flask, send_file
+from flask import (
+    Flask,
+    request,
+    session,
+    send_file,
+    render_template,
+    send_from_directory,
+)
+import jinja2
 
 # from raven import Client  # For Sentry integration
-from flask import Flask, render_template, request, session
 from flask_socketio import SocketIO, emit, join_room
 import platform
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "wubba lubba dub dub"
-
 socketio = SocketIO(app)
+
+app.static_folder = "assets"
 
 users_in_room = {}
 rooms_sid = {}
 names_sid = {}
+
+# Flask Routes and Middlewares
 
 # Error handling middleware
 @app.errorhandler(500)
@@ -24,12 +33,16 @@ def handle_500(error):
     return "Internal Server Error", 500
 
 
+# @app.route("/static/<path:path>")
+# def serve_static(path):
+#     return send_from_directory("assets", path)
+
+
 # Routing and other application logic
 @app.route("/")
 def index():
-    base_dir = ""
-    root = os.path.join(os.path.dirname(__file__), base_dir)
-    return send_file(os.path.join(root, "index.html"))
+    context = {}
+    return render_template("index.html", **context)
 
 
 @app.route("/join", methods=["GET"])
@@ -50,6 +63,14 @@ def join():
         mute_audio=session[room_id]["mute_audio"],
         mute_video=session[room_id]["mute_video"],
     )
+
+
+@app.route("/rooms/<room_id>")  # URL parameter using angle brackets
+def room(room_id):
+    return f"You are in room {room_id}"
+
+
+# SocketIO setup
 
 
 @socketio.on("connect")

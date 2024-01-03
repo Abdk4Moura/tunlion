@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import asyncio
+from typing import Optional
 
 
 @dataclass
 class Peer:
     uuid: str
     label: str
-    avatar_url: str = None
-    public_ip: str = None
+    avatar_url: Optional[str] = None
+    public_ip: Optional[str] = None
 
     peer_state: dict = field(
         default_factory={"id": None, "connection": None, "state": "disconnected"}

@@ -8,14 +8,14 @@ app = Flask(__name__)
 #  app.config.from_object("config.DevelopmentConfig")  # Load from a config file
 
 # Define routes
-@app.route("/")
-def index():
-    return "Welcome to the ShareDrop app!"
+# @app.route("/")
+# def index():
+#     return "Welcome to the ShareDrop app!"
 
 
-@app.route("/rooms/<room_id>")  # URL parameter using angle brackets
-def room(room_id):
-    return f"You are in room {room_id}"
+# @app.route("/rooms/<room_id>")  # URL parameter using angle brackets
+# def room(room_id):
+#     return f"You are in room {room_id}"
 
 
 if __name__ == "__main__":

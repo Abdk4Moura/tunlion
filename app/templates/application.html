@@ -3,6 +3,7 @@
 
 <head>
     <title>ShareDrop</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles/sharedrop.css') }}" type="text/css" />
 </head>
 
 <body>
@@ -15,11 +16,12 @@
 
             <ul class="nav">
                 <li>
-                    <a href="{{ url_for('create_room') }}" class="icon-create-room"
+                    <a href="{{ url_for('room', room_id=11) }}" class="icon-create-room"
                         title="Create a room. You'll leave the room you're currently in.">+</a>
                 </li>
                 <li>
-                    <a href="{{ url_for('about_app') }}" class="icon-help" title="About">?</a>
+                    <a href="{{ url_for('index') }}" class="icon-help" title="About">?</a>
+                    <!-- url_for('about_us') but 'index' at least for now -->
                 </li>
             </ul>
         </nav>
@@ -30,11 +32,35 @@
     {% block modal %}{% endblock %}
 
     <footer class="l-footer">
-        <p class="about">{{ about_you }}</p>
-
+        <modal v-if="isModalOpen" @close="closeModal">
+            <p class="about">{% include "components/about-you" }</p>
+        </modal>
     </footer>
     <!-- Global scripts -->
+
+    <!-- Vue Components -->
+    <script src="{{ url_for(" js/modal.js") }}"></script>
+    <!-- End Vue Components -->
+
+    <!-- Custom scripts -->
     <script>
+        //  Modal: click outside the modal
+        // Make it such that the modal closes when outside is clicked
+        // (but not when the modal itself is clicked)
+        //
+        // This is a bit tricky because we need to check if the click
+        // was on the modal or not. We can do this by checking if the
+        // click target is a child of the modal. If it is, then we
+        // don't close the modal.
+        const modal = document.getElementById('modal');
+        const modalContent = document.getElementById('modal-content');
+        document.addEventListener('click', (event) => {
+            if (event.target === modal || modal.contains(event.target)) {
+            } else {
+                // close the modal
+                .classList.remove('is-visible');
+            }
+        });
         // File-Input component
         const fileInput = document.getElementById('file-input');
 
@@ -56,6 +82,7 @@
         }
 
     </script>
+    <!-- End custom scripts -->
 </body>
 
 </html>

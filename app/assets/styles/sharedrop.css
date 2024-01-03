@@ -201,11 +201,9 @@ select {
 
 @font-face {
   font-family: "Glyphicons Filetypes";
-  src: url(/assets/fonts/glyphicons/glyphicons-filetypes-regular.woff)
-      format("woff"),
-    url(/assets/fonts/glyphicons/glyphicons-filetypes-regular.ttf)
-      format("truetype"),
-    url(/assets/fonts/glyphicons/glyphicons-filetypes-regular.svg#glyphicons_filetypesregular)
+  src: url(fonts/glyphicons/glyphicons-filetypes-regular.woff) format("woff"),
+    url(fonts/glyphicons/glyphicons-filetypes-regular.ttf) format("truetype"),
+    url(fonts/glyphicons/glyphicons-filetypes-regular.svg#glyphicons_filetypesregular)
       format("svg");
 }
 
@@ -800,7 +798,7 @@ select {
 .preloader {
   width: 324px;
   height: 56px;
-  background: url(../assets/images/sharedrop.svg) center no-repeat;
+  background: url(../images/sharedrop.svg) center no-repeat;
   background-size: 324px 56px;
   transition: opacity 0.2s;
 }
@@ -942,7 +940,7 @@ select {
 .modal-body .logo {
   height: 38px;
   margin-bottom: 20px;
-  background: url(../assets/images/sharedrop.svg) left no-repeat;
+  background: url(../images/sharedrop.svg) left no-repeat;
 }
 
 .modal-body .logo span {
@@ -1296,7 +1294,7 @@ select {
   height: 38px;
   width: 162px;
   margin: 15px 0 0 15px;
-  background: url(../assets/images/sharedrop.svg) left top no-repeat;
+  background: url(../images/sharedrop.svg) left top no-repeat;
 }
 
 .l-header .navbar .logo .logo-title {
@@ -1438,7 +1436,7 @@ select {
 .l-footer .github {
   width: 20px;
   height: 20px;
-  background: url(../assets/images/github.svg) center no-repeat;
+  background: url(../images/github.svg) center no-repeat;
 }
 
 .l-footer .twitter {
