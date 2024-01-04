@@ -4,13 +4,13 @@
 <main class="l-content">
     <div class="user others">
         {% for peer in peers %}
-        {% include 'components/peer-widget.html' with peer=peer, webrtc=webrtc %}
+        {% include 'components/peer-widget.html' %}
         {% endfor %}
     </div>
 
     {% if current_user %}
     <div class="user you">
-        {% include 'components/user-widget.html' user=current_user %}
+        {% include 'components/user-widget.html' %}
     </div>
     {% endif %}
 
