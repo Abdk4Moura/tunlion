@@ -1,25 +1,16 @@
-Vue.component('modal', {
-  template: `
-    <div class="modal">
-      <div class="modal-content">
-        <span class="close" @click="closeModal">&times;</span>
-        <slot></slot>
-      </div>
-    </div>
-  `
+const openModalButton = document.getElementById('openModalBtn')
+const modal = document.querySelector('div.modal-overlay')
+openModalButton.addEventListener('click', function () {
+  documnet.getElementById('')
 });
 
-new Vue({
-  el: '#app',
-  data: {
-    isModalOpen: false
-  },
-  methods: {
-    openModal() {
-      this.isModalOpen = true;
-    },
-    closeModal() {
-      this.isModalOpen = false;
-    }
+const closeButton = document.querySelector('div.modal > div.modal-content > .close')
+closeButton.addEventListener('click', function () {
+  document.getElementById('myModal').style.display = 'none';
+});
+
+window.addEventListener('click', function (event) {
+  if (event.target == document.getElementById('myModal')) {
+    document.getElementById('myModal').style.display = 'none';
   }
 });
