@@ -4,13 +4,15 @@
 <head>
     <title>ShareDrop</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles/sharedrop.css') }}" type="text/css" />
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script> -->
     <!-- Vue Components -->
     <script type="module" src="{{ url_for('static', filename='js/modal.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/preloader.js') }}"></script>
     <!-- End Vue Components -->
 </head>
 
 <body>
+    <div class="preloader"><span>Loading...</span></div>
     <header class="l-header">
         <nav class="navbar">
             <h1 class="logo">
@@ -36,22 +38,14 @@
     {% block modal %}{% endblock %}
 
     <!-- contains vue component: `modal` -->
-    {% include "components/about-you.html" %}
+    {% set modal_id = 'about_app' %}
+    {% include "components/about_app.html" %}
     </footer>
     <!-- Global scripts -->
 
 
     <!-- Custom scripts -->
     <script>
-// const modal = document.getElementById('modal');
-// const modalContent = document.getElementById('modal-content');
-// document.addEventListener('click', (event) => {
-//     if (event.target === modal || modal.contains(event.target)) {
-//     } else {
-//         // close the modal
-//         modal.classList.remove('is-visible');
-//     }
-// });
 // // File-Input component
 // const fileInput = document.getElementById('file-input');
 //
