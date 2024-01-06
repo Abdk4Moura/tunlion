@@ -6,7 +6,6 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles/sharedrop.css') }}" type="text/css" />
     <!-- <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script> -->
     <!-- Vue Components -->
-    <script type="module" src="{{ url_for('static', filename='js/modal.js') }}"></script>
     <script type="module" src="{{ url_for('static', filename='js/preloader.js') }}"></script>
     <!-- End Vue Components -->
 </head>
@@ -26,8 +25,7 @@
                         title="Create a room. You'll leave the room you're currently in.">+</a>
                 </li>
                 <li>
-                    <a href="{{ url_for('index') }}" class="icon-help" title="About">?</a>
-                    <!-- url_for('about_us') but 'index' at least for now -->
+                    <a href="javascript:void(0)" class="icon-help" title="About">?</a>
                 </li>
             </ul>
         </nav>
@@ -44,6 +42,7 @@
     <!-- Global scripts -->
 
 
+    <script type="module" src="{{ url_for('static', filename='js/modal.js') }}"></script>
     <!-- Custom scripts -->
     <script>
 // // File-Input component
