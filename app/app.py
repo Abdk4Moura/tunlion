@@ -7,7 +7,7 @@ from flask import (
     session,
     send_file,
     render_template,
-    send_from_directory,
+    # send_from_directory,
 )
 import jinja2
 
@@ -23,6 +23,7 @@ app.static_folder = "assets"
 users_in_room = {}
 rooms_sid = {}
 names_sid = {}
+print(app)
 
 # Flask Routes and Middlewares
 
