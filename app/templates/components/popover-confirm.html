@@ -1,15 +1,14 @@
 {% macro popover_confirm(filename, cancelButtonLabel, confirmButtonLabel, onConfirm, onCancel) %}
-<div class="popover">
-    <div class="popover-body">
-        <div class="popover-icon">
-            <i class="{{ icon_class(filename) }}"></i>
-        </div>
-    </div>
-    <div class="popover-buttons">
-        <button type="button" onclick="{{ onCancel }}">{{ cancelButtonLabel }}</button>
-        <button type="button" onclick="{{ onConfirm }}">{{ confirmButtonLabel }}</button>
-    </div>
-</div>
+<script>
+    let _t = definePopover({
+        content: "confirm-file-transfer",
+        confirmButtonLabel: {{ confirmButtonLabel }},
+    cancelButtonLabel: { { cancelButtonLabel } },
+    onConfirm: { { onConfirm } },
+    onCancel: { { onCancel } },
+    filename: { { filename } }
+     })
+</script>
 {% endmacro %}
 
 {{ popover_confirm(data.filename, data.cancelButtonLabel, data.confirmButtonLabel, 'handleConfirm()', 'handleCancel()')

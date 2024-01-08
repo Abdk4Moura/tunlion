@@ -26,7 +26,16 @@ const peerState = {
   isSendingFile: false,
   isIdle: true,
   isPreparingFileTransfer: false,
+  generalPeerState
 }
+
+const generalPeerState = {
+  transfer: {
+    receivingProgress: 0,
+    sendingProgress: 0,
+  },
+}
+
 
 // first manually define an element called peerWidget
 function peerWidget(userId) {
@@ -79,7 +88,7 @@ socket.on('new-peer', (userId) => {
 })
 
 // generic popover definition
-function definePopover({ content, onConfirm, onCancel, confirmButtonLabel, cancelButtonLabel, filename, confirmButtonAction }) {
+function definePopover({ content, onConfirm, onCancel, confirmButtonLabel, cancelButtonLabel, filename }, mountPoint) {
   const popover = document.createElement('div')
   popover.classList.add('popover')
   popover.innerHTML = `
@@ -131,6 +140,8 @@ function definePopover({ content, onConfirm, onCancel, confirmButtonLabel, cance
   const cancelButton = popover.querySelector('button.cancel')
   confirmButton.addEventListener('click', onConfirm)
   cancelButton.addEventListener('click', onCancel)
+
+  mountElement(popover, mountPoint)
 
   // when the user clicks outside the popover, remove it
   document.addEventListener('click', (event) => {
