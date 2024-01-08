@@ -1,3 +1,37 @@
+// StateNotifier class
+// Usage: let stateNotifier = new StateNotifier({ hasSelectedFile: false, hasReceivedFileInfo: false });
+class StateNotifier {
+  constructor(initialState) {
+    this.state = initialState;
+    this.listeners = [];
+  }
+
+  getState() {
+    return this.state;
+  }
+
+  setState(newState) {
+    this.state = { ...this.state, ...newState };
+    this.notifyListeners();
+  }
+
+  addListener(listener) {
+    this.listeners.push(listener);
+  }
+
+  removeListener(listener) {
+    this.listeners = this.listeners.filter((l) => l !== listener);
+  }
+
+  notifyListeners() {
+    this.listeners.forEach((listener) => {
+      if (typeof listener === 'function') {
+        listener();
+      }
+    });
+  }
+}
+
 class GenericElement {
   constructor({ mountPoint, mountOptions, initProps, templateFunction }) {
     const { replaceElemInMountPoint } = mountOptions;
@@ -6,18 +40,21 @@ class GenericElement {
     if (!replaceElemInMountPoint) {
       mainElem = mountPoint;
     } else {
-      mainElem = document.createElement('div').append;
+      mainElem = document.createElement('div');
       mountPoint.parentNode.replaceChild(mainElem, mountPoint);
     }
+    this._replaceElemInMountPoint = true;
     const childrenSlot = mainElem.querySelector('div.genericElemSlot')
     this.childrenSlot = childrenSlot;
 
-    this.mountPoint = mainElem;
+    this.actualMointPoint = mainElem;
     this._state = initProps.stateProps;
-    this.attrs = initProps.props;
+    this.props = initProps.props;
     this.templateFunction = templateFunction;
 
-    this.render();
+
+    beforeMount();
+    update();
   }
 
   appendChild(child) {
@@ -27,6 +64,9 @@ class GenericElement {
     this.childrenSlot.appendChild(child);
   }
 
+  // docstring
+  // children: array of elements
+  //
   appendChildren(children) {
     if (isSingletonElement) {
       throw new Error('Cannot append child to singleton element');
@@ -85,8 +125,9 @@ class GenericElement {
 
     // Check if any state property has changed
     if (!areStatesEqual(prevState, state)) {
-      render();
+      update();
     }
+    return state
   }
 
   areStatesEqual(state1, state2) {
@@ -99,10 +140,53 @@ class GenericElement {
     return true;
   }
 
-  render() {
-    const templateResult = this.templateFunction({ ...this.state, ...this.attrs });
-    this.mountPoint.innerHTML = templateResult;
+  update() {
+    render();
+    this.componentDidRender();
   }
+
+  render() {
+    const templateResult = this.templateFunction({ ...this.state, ...this.props });
+    mount(templateResult)
+  }
+
+  unMount() {
+    componentWillUnMount()
+    // TODO: provide a way to unmount the element
+    // without setting the innerHTML to ''
+    this.actualMointPoint.innerHTML = '';
+  }
+
+  mount(templateResult) {
+    this.actualMointPoint.innerHTML = templateResult;
+    this.componentDidMount()
+  }
+
+  componentWillUnMount() {
+    // Purpose of the componentWillUnmount() Method
+    // Removing event listeners: Detaching event listeners attached to the component
+    // -- or its children to prevent memory leaks or unexpected behavior.
+    // Canceling ongoing tasks: Aborting ongoing network requests, timers, or other
+    // -- asynchronous operations that might continue after the component is gone.
+    // Saving data: Preserving user-generated data or component state to local storage or
+    // -- a server if needed for later retrieval.
+    // Releasing resources: Clearing out data structures or references to prevent memory
+    // -- issues, especially for large or complex components.
+    // Performing final UI updates: Making any last visual changes or animations before the
+    // -- component disappears.
+    // Disconnecting from external resources: Closing connections to WebSockets, open
+    // -- database connections, or other external resources.
+    // Synchronizing data: Ensuring data consistency by updating shared state or notifying
+    // -- other components about the component's removal.
+  }
+
+  componentDidMount() {
+    // Purpose of the componentDidMount() Method
+  }
+
+  componentDidRender() {}
+
+  beforeMount() {}
 }
 
 // Usage remains the same as provided in the previous response
