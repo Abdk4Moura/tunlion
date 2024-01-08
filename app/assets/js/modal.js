@@ -22,8 +22,12 @@ function defineModal(modalOverlay, openTriggerElements, closeTriggerElements) {
     return
   }
   const modal = modalOverlay.querySelector('div.modal-body')
-  const closeModalOverlay = () => modalOverlay.style.display = 'none'
-  const openModalOverlay = () => modalOverlay.style.display = 'block'
+  function closeModalOverlay() {
+    return modalOverlay.style.display = 'none'
+  }
+  function openModalOverlay() {
+    return modalOverlay.style.display = 'block'
+  }
   // open event listeners
   for (const openTriggerElement of openTriggerElements) {
     openTriggerElement.addEventListener('click', function () {
@@ -45,9 +49,10 @@ function defineModal(modalOverlay, openTriggerElements, closeTriggerElements) {
   }
 
   // general close event listener
-  modalOverlay.addEventListener('click', function (event) {
-    if (event.target != modal && !modal.contains(event.target) && event.target != closeButton) {
+  modalOverlay.addEventListener('click', (event) => {
+    if (!modal.contains(event.target) && event.target != closeButton) {
       closeModalOverlay()
+      // this.removeEventListener('click', arguments.callee)
     }
   })
 }

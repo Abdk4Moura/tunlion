@@ -1,0 +1,37 @@
+{% if hasSelectedFile %}
+{{ popover_confirm(
+onConfirm=(action "sendFileTransferInquiry"),
+onCancel=(action "cancelFileTransfer"),
+confirmButtonLabel="Send",
+cancelButtonLabel="Cancel",
+filename=filename
+) }}
+Do you want to send <strong>{{ filename }}</strong> to <strong>{{ label }}</strong>?
+{{ /popover_confirm }}
+{% endif %}
+
+{% if hasReceivedFileInfo %}
+{{ popover_confirm(
+onConfirm=(action "acceptFileTransfer"),
+onCancel=(action "rejectFileTransfer"),
+confirmButtonLabel="Save",
+cancelButtonLabel="Decline",
+filename=filename
+) }}
+<strong>{{ label }}</strong> wants to send you <strong>{{ filename }}</strong>.
+{{ /popover_confirm }}
+{% endif %}
+
+<div class="avatar">
+    {% if isPreparingFileTransfer %}
+    <CircularProgress @value={{ peer.bundlingProgress }} @color="orange" />
+    {% else if peer.transfer %}
+    {% if peer.transfer.receivingProgress %}
+    <CircularProgress @value={{ peer.transfer.receivingProgress }} @color="blue" />
+    {% else if peer.transfer.sendingProgress %}
+    <CircularProgress @value={{ peer.transfer.sendingProgress }} @color="blue" />
+    {% endif %}
+    {% endif %}
+
+    {{ peer_avatar(peer=peer, onFileDrop=(action "uploadFile")) }}
+</div>
