@@ -42,3 +42,38 @@ function defineCircularProgress(options, mountPoint) {
 function mountCircularProgress(element, mountPoint) {
   mountPoint.parentNode.replaceChild(element, mountPoint)
 }
+
+
+// Path: circularProgress.js
+// using GenericElement
+//
+// Usage: new CircularProgress({ mountPoint, mountOptions, initProps })
+class CircularProgress extends GenericElement {
+  templateFunction({ initProps }) {
+    const { state, initProps } = initProps;
+    const { value } = state;
+    const { color } = initProps;
+    const rgb = COLORS[color];
+
+    var style = htmlSafe(`fill: rgba(${rgb}, .5)`);
+    let innerHTML = `
+<svg width="76" height="76" viewport="0 0 76 76" style="${style}">
+    <path class="break" transform="translate(38, 38)" d="${path()}" />
+</svg>
+`
+    return innerHTML
+  }
+}
+
+// Path: app/templates/components/circularProgress.html
+const avatar = document.querySelector(".avatar");
+let a = {
+  mountPoint: avatar,
+  initProps: {
+    stateProps:
+      { value: 0 },
+    props: { color: 'blue' }
+  }
+}
+
+const c1 = new CircularProgress(a);
