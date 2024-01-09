@@ -1,3 +1,40 @@
+// const peerStateNotifier = StateNotifier(peerState);
+// // Path: circularProgress.js
+// // using GenericElement
+// //
+// // Usage: new CircularProgress({ mountPoint, mountOptions, initProps })
+// class CircularProgress extends NotifiedElement {
+//   templateFunction({ initProps }) {
+//     const { initProps } = initProps;
+//     const state = stateNotifier.state;
+//     const { value, color } = state;
+//     const rgb = COLORS[color];
+
+//     var style = htmlSafe(`fill: rgba(${rgb}, .5)`);
+//     let innerHTML = `
+// <svg width="76" height="76" viewport="0 0 76 76" style="${style}">
+//     <path class="break" transform="translate(38, 38)" d="${path()}" />
+// </svg>
+// `
+//     return innerHTML
+//   }
+// }
+
+// // Path: app/templates/components/circularProgress.html
+// const avatar = document.querySelector(".avatar");
+// const state = { value: 0, color: "blue" };
+// let values = {
+//   mountPoint: avatar,
+//   initProps: {
+//     stateProps:
+//       { value: 0, color: "blue" },
+//     props: {}
+//   },
+//   peerStateNotifier
+// }
+
+// const aa = new CircularProgress(values);
+
 const COLORS = {
   blue: '0, 136, 204',
   orange: '197, 197, 51',
@@ -44,36 +81,3 @@ function mountCircularProgress(element, mountPoint) {
 }
 
 
-// Path: circularProgress.js
-// using GenericElement
-//
-// Usage: new CircularProgress({ mountPoint, mountOptions, initProps })
-class CircularProgress extends GenericElement {
-  templateFunction({ initProps }) {
-    const { state, initProps } = initProps;
-    const { value } = state;
-    const { color } = initProps;
-    const rgb = COLORS[color];
-
-    var style = htmlSafe(`fill: rgba(${rgb}, .5)`);
-    let innerHTML = `
-<svg width="76" height="76" viewport="0 0 76 76" style="${style}">
-    <path class="break" transform="translate(38, 38)" d="${path()}" />
-</svg>
-`
-    return innerHTML
-  }
-}
-
-// Path: app/templates/components/circularProgress.html
-const avatar = document.querySelector(".avatar");
-let a = {
-  mountPoint: avatar,
-  initProps: {
-    stateProps:
-      { value: 0 },
-    props: { color: 'blue' }
-  }
-}
-
-const c1 = new CircularProgress(a);
