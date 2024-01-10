@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 
 import os
+from uuid import uuid4
 from flask import (
     Flask,
     request,
     session,
     send_file,
     render_template,
-    # send_from_directory,
 )
 import jinja2
 
+
 # from raven import Client  # For Sentry integration
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import platform
 
 app = Flask(__name__)
@@ -20,10 +21,15 @@ socketio = SocketIO(app)
 
 app.static_folder = "assets"
 
+
 users_in_room = {}
 rooms_sid = {}
 names_sid = {}
-print(app)
+
+
+def generate_unique_room_id():
+    return str(uuid4())
+
 
 # Flask Routes and Middlewares
 
@@ -68,12 +74,16 @@ def join():
 
 @app.route("/rooms/<room_id>")  # URL parameter using angle brackets
 def room(room_id):
-    return f"You are in room {room_id}"
+    context = {room: room_id}
+    if room_id not in rooms_sid:
+        return "Room not found", 404
+
+    return render_template(
+        "index.html",
+    )
 
 
 # SocketIO setup
-
-
 @socketio.on("connect")
 def on_connect():
     sid = request.sid
@@ -83,36 +93,36 @@ def on_connect():
 @socketio.on("join-room")
 def on_join_room(data):
     sid = request.sid
-    room_id = data["room_id"]
-    display_name = session[room_id]["name"]
+    room_id = data.get("room_id") or generate_unique_room_id()
+    display_name = data.get("name")
 
-    # register sid to the room
     join_room(room_id)
     rooms_sid[sid] = room_id
     names_sid[sid] = display_name
 
-    # broadcast to others in the room
-    print("[{}] New member joined: {}<{}>".format(room_id, display_name, sid))
+    print(f"[{room_id}] New member joined: {display_name}<{sid}>")
     emit(
         "user-connect",
         {"sid": sid, "name": display_name},
         broadcast=True,
-        include_self=False,
+        include_self=True,
         room=room_id,
     )
 
-    # add to user list maintained on server
+    handle_user_list(sid, room_id)  # Refactored for clarity
+
+    # Broadcast room creation or joining
+    emit("room-update[create/join]", room_id, room=room_id)
+
+
+def handle_user_list(sid, room_id):
     if room_id not in users_in_room:
         users_in_room[room_id] = [sid]
-        emit("user-list", {"my_id": sid})  # send own id only
+        emit("user-list", {"my_id": sid}, room=room_id)  # Send own ID only
     else:
         usrlist = {u_id: names_sid[u_id] for u_id in users_in_room[room_id]}
-        # send list of existing users to the new member
-        emit("user-list", {"list": usrlist, "my_id": sid})
-        # add new member to user list maintained on server
+        emit("user-list", {"list": usrlist, "my_id": sid}, room=room_id)
         users_in_room[room_id].append(sid)
-
-    print("\nusers: ", users_in_room, "\n")
 
 
 @socketio.on("disconnect")
@@ -140,16 +150,25 @@ def on_disconnect():
     print("\nusers: ", users_in_room, "\n")
 
 
-@socketio.on("data")
-def on_data(data):
-    sender_sid = data["sender_id"]
-    target_sid = data["target_id"]
-    if sender_sid != request.sid:
-        print("[Not supposed to happen!] request.sid and sender_id don't match!!!")
+@socketio.on("ice-candidate")
+def on_data(candidate):
+    room_id = rooms_sid[request.sid]
 
-    if data["type"] != "new-ice-candidate":
-        print("{} message from {} to {}".format(data["type"], sender_sid, target_sid))
-    socketio.emit("data", data, room=target_sid)
+    emit("ice-candidate", candidate, room=room_id, include_self=False)
+
+
+@socketio.on("offer")
+def on_offer(offer):
+    room_id = rooms_sid[request.sid]
+
+    emit("offer", offer, room=room_id, include_self=False)
+
+
+@socketio.on("answer")
+def on_answer(answer):
+    room_id = rooms_sid[request.sid]
+
+    emit("answer", answer, room=room_id, include_self=False)
 
 
 if any(platform.win32_ver()):
