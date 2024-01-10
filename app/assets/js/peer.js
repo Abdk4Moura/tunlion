@@ -1,5 +1,5 @@
 // peer is defined here
-import { Signalling } from './signalling.js';
+import Signalling from './signalling.js';
 
 const configuration = {
   iceServers: [

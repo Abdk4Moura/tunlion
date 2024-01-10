@@ -9,7 +9,6 @@ from flask import (
     send_file,
     render_template,
 )
-import jinja2
 
 
 # from raven import Client  # For Sentry integration
@@ -113,6 +112,28 @@ def on_join_room(data):
 
     # Broadcast room creation or joining
     emit("room-update[create/join]", room_id, room=room_id)
+
+
+@socketio.on("leav-room")
+def on_leave_room(data):
+    sid = request.sid
+    room_id = rooms_sid[sid]
+    display_name = data.get("name")
+
+    leave_room(room_id)
+    rooms_sid[sid].remove(sid)
+    del names_sid[sid]
+
+    print(f"[{room_id}] New member joined: {display_name}<{sid}>")
+    emit(
+        "user-leave-room",
+        {"sid": sid, "name": display_name},
+        broadcast=True,
+        include_self=False,
+        room=room_id,
+    )
+
+    emit("room-update[leave]", room_id, room=room_id)
 
 
 def handle_user_list(sid, room_id):

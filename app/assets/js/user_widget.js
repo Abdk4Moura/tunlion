@@ -1,4 +1,4 @@
-import { Placeholder, Types } from "./genericComponents.js";
+import { NotifiedElement, Placeholder, Types } from "./framework.js";
 
 const userStateNotifier = new StateNotifier(user);
 const userWidget = new NotifiedElement({
@@ -19,4 +19,4 @@ const userWidget = new NotifiedElement({
   }
 });
 
-userWidget.renderComponent();
+userWidget.render();

@@ -35,13 +35,19 @@
 
     {% block modal %}{% endblock %}
 
-    <!-- contains vue component: `modal` -->
     {% set modal_id = 'about_app' %}
     {% include "components/about_app.html" %}
     </footer>
     <!-- Global scripts -->
 
-
+    <script src="https://cdn.socket.io/4.7.3/socket.io.min.js"></script>
+    <script type="module" src="{{ url_for('static', filename='js/framework.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/route.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/signalling.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/peer.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/socket.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/general.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='js/user_widget.js') }}"></script>
     <script type="module" src="{{ url_for('static', filename='js/modal.js') }}"></script>
     <!-- Custom scripts -->
     <!-- End custom scripts -->
