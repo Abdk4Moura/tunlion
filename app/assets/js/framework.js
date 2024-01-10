@@ -1,10 +1,10 @@
-const Types = {
+export const Types = {
   ATTR: 'attr',
   INNER_HTML: 'innerHTML',
   CHILDREN: 'children',
 }
 
-class Placeholder {
+export class Placeholder {
   constructor(type, value) {
     switch (type) {
       case Types.ATTR:
@@ -19,7 +19,7 @@ class Placeholder {
 
 // StateNotifier class
 // Usage: let stateNotifier = new StateNotifier({ hasSelectedFile: false, hasReceivedFileInfo: false });
-class StateNotifier {
+export class StateNotifier {
   // TODO: Use the singleton pattern to ensure that only one instance of the class is created
   // for a specific state
   // #instance = null;
@@ -234,7 +234,7 @@ class _Element {
   beforeMount() {}
 }
 
-class GenericElement extends _Element {
+export class GenericElement extends _Element {
   constructor({ mountPoint, mountOptions, initProps, templateFunction }) {
     super({ mountPoint, mountOptions, initProps, templateFunction });
 
@@ -290,7 +290,7 @@ class GenericElement extends _Element {
   }
 }
 
-class NotifiedElement extends _Element {
+export class NotifiedElement extends _Element {
   constructor({ mountPoint, mountOptions, initProps, templateFunction, stateNotifier }) {
     super({ mountPoint, mountOptions, initProps, templateFunction });
     stateNotifier.addListener(
