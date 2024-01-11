@@ -114,14 +114,15 @@ def on_join_room(data):
     emit("room-update[create/join]", room_id, room=room_id)
 
 
-@socketio.on("leav-room")
+@socketio.on("leave-room")
 def on_leave_room(data):
     sid = request.sid
-    room_id = rooms_sid[sid]
+    room_id = rooms_sid.get(sid)
     display_name = data.get("name")
 
     leave_room(room_id)
-    rooms_sid[sid].remove(sid)
+    if room_id is not None:
+        rooms_sid[sid].remove(sid)
     del names_sid[sid]
 
     print(f"[{room_id}] New member joined: {display_name}<{sid}>")

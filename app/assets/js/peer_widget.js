@@ -1,44 +1,33 @@
 import { NotifiedElement, Placeholder, Types, StateNotifier } from "./framework.js";
 
-function generateUUID() {
-  let dt = new Date().getTime();
-  const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-    const r = (dt + Math.random() * 16) % 16 | 0;
-    dt = Math.floor(dt / 16);
-    const v = c == 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16).toUpperCase();
-  });
-  return uuid;
-}
-
 const user = {
   name: randomName(),
   avatar: `https://avatars.dicebear.com/api/avataaars/${randomName()}.svg`,
-  uuid: generateUUID(),
+  uuid: null,
 }
 
 
 const userStateNotifier = new StateNotifier(user);
 
+const mountPoint = document.querySelector(".avatar")
 const userWidget = new NotifiedElement({
-  // TODO: Provide a way to pass the mount point and options
-  // that is not error prone
-  // mountPoint: document.querySelector("body"),
-  // mountOptions: {
-  //   templateExists: true,
-  // },
+  mountPoint,
+  mountOptions: {
+    templateAlreadyExistent: true,
+    replaceElemInMountPoint: false,
+  },
   stateNotifier: userStateNotifier,
-  templateFunction: function (_) {
+  templateFunction: (_) => {
     const user = this.stateNotifier.state
     return {
-      root: "main.l-content div.user.you",
-      '.avatar img': new Placeholder(Types.ATTR,
+      // 'root': 'div.avatar',
+      'img': Placeholder(Types.ATTR,
         {
           src: user.avatar,
           alt: user.name,
           title: `peer id: ${user.uuid}`
         }),
-      '.user-info .user-ip #user-label': user.name,
+      '.user-info .user-label #userlabel': user.name,
     }
   }
 });
