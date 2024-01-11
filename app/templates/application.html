@@ -4,10 +4,7 @@
 <head>
     <title>ShareDrop</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles/sharedrop.css') }}" type="text/css" />
-    <!-- <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script> -->
-    <!-- Vue Components -->
     <script type="module" src="{{ url_for('static', filename='js/preloader.js') }}"></script>
-    <!-- End Vue Components -->
 </head>
 
 <body>
@@ -21,7 +18,7 @@
 
             <ul class="nav">
                 <li>
-                    <a href="{{ url_for('room', room_id=11) }}" class="icon-create-room"
+                    <a href="javascript:void(0)" class="icon-create-room"
                         title="Create a room. You'll leave the room you're currently in.">+</a>
                 </li>
                 <li>

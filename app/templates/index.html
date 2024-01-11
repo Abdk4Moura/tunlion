@@ -2,17 +2,15 @@
 
 {% block content %}
 <main class="l-content">
-    <div class="user others">
-        {% for peer in peers %}
-        {% include 'components/peer-widget.html' %}
-        {% endfor %}
-    </div>
+    <!-- <div class="user others">
+            {% for peer in peers %}
+            {% include 'components/peer-widget.html' %}
+            {% endfor %}
+        </div> -->
 
-    {% if current_user %}
     <div class="user you">
-        {% include 'components/user-widget.html' %}
+        {% include "components/user_widget.html" %}
     </div>
-    {% endif %}
 
     <svg class="circles" viewBox="-0.5 -0.5 1140 700">
         <circle class="circle" cx="570" cy="570" r="30" stroke="rgba(160,160,160, 1)" />

@@ -1,3 +1,7 @@
+// const defaultMountOptions = {
+//   replaceElemP: false,
+// }
+
 export const Types = {
   ATTR: 'attr',
   INNER_HTML: 'innerHTML',
@@ -17,26 +21,30 @@ export class Placeholder {
   }
 }
 
+function assert(condition, message) {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
 // StateNotifier class
 // Usage: let stateNotifier = new StateNotifier({ hasSelectedFile: false, hasReceivedFileInfo: false });
 export class StateNotifier {
-  // TODO: Use the singleton pattern to ensure that only one instance of the class is created
-  // for a specific state
-  // #instance = null;
+  static #instance = null;
 
-  // static getInstance(initialState) {
-  //   if (!StateNotifier.#instance) {
-  //     StateNotifier.#instance = new StateNotifier(initialState);
-  //   }
-  //   return StateNotifier.instance;
-  // }
+  static getInstance(initialState) {
+    if (!StateNotifier.#instance) {
+      StateNotifier.#instance = new StateNotifier(initialState);
+    }
+    return StateNotifier.#instance;
+  }
 
   constructor(initialState) {
     this._state = initialState;
     this.listeners = [];
   }
 
-  get set() {
+  get state() {
     return this._state;
   }
 
@@ -67,59 +75,113 @@ export class StateNotifier {
 
 // _Element is an abstract class with no concept of state
 class _Element {
-  randomId = `elem${Math.random().toString(36).substring(7)}`;
+  setPlaceholderId() { this._placeholderId = `elem${Math.random().toString(36).substring(7)}` };
 
-  constructor({ mountPoint, mountOptions, initProps, templateFunction }) {
-    const { replaceElemInMountPoint, templateAlreadyExistent } = mountOptions;
-
-    let mainElem;
-    if (!templateAlreadyExistent) {
-      if (!replaceElemInMountPoint) {
-        mainElem = mountPoint;
-      } else {
-        mainElem = document.createElement('div');
-        mountPoint.parentNode.replaceChild(mainElem, mountPoint);
-      }
-      this._replaceElemInMountPoint = true;
-    }
-    const childrenSlot = mainElem.querySelector('div.genericElemSlot')
-    this.childrenSlot = childrenSlot;
-    this.templateAlreadyExistent = templateAlreadyExistent;
-
-    this.actualMointPoint = mainElem;
-    this.templateFunction = templateFunction.bind(this);
+  get randomId() {
+    return this._placeholderId
   }
 
+  _placeholderId = null;
+  _hasInitialised = false;
+
+  constructor({ mountPoint, mountOptions, initProps, templateFunction }) {
+    // can also use new.target
+    assert(this.constructor.name !== '_Element', 'Cannot instantiate abstract class')
+    // mountPoint is compulsory when mountOptions is provided
+    if (xor(mountPoint, mountOptions)) {
+      assert(mountPoint, 'mountPoint must be provided when mountOptions is provided')
+    }
+    if (mountOptions) {
+      assert(typeof mountOptions === 'object', 'mountOptions must be an object')
+    }
+
+    switch (new.target) {
+      case GenericElement:
+        assert(initProps, 'initProps must be provided')
+        assert(!!initProps.stateProps, 'initProps must contain stateProps')
+        break;
+    }
+    assert(templateFunction, 'templateFunction must be provided')
+
+    this.mountPoint = null
+    this.childrenSlot = null
+    this.templateExists = !mountPoint
+
+    this.decideMountPointAndChildren({ mountPoint, mountOptions })
+
+    this.templateFunction = templateFunction.bind(this);
+    this._props = initProps;
+  }
+
+  decideMountPointAndChildren({ mountPoint, mountOptions }) {
+    if (mountOptions) {
+      const { replaceElemP } = mountOptions;
+      this.mountPoint = document.createElement('div');
+      if (replaceElemP) {
+        mountPoint.parentElement.replaceChild(this.mountPoint, mountPoint);
+      } else {
+        // add this::mountPoint to the DOM under mountPoint
+        mountPoint.appendChild(this.mountPoint);
+      }
+      this.childrenSlot = document.createElement('div');
+      this.childrenSlot.classList.add('genericElemSlot');
+      this.mountPoint.appendChild(this.childrenSlot);
+    }
+    // if (!mountPoint) {
+    // mountPoint is null is just a reassertion, it was
+    // already stated in the constructor
+    // this.mountPoint will be later set by useSelectorMapping
+    // return;
+    // }
+  }
+
+  // TODO: Implement a pub/sub pattern for state changes
+  willMount() {}
+
   appendChild(child) {
-    if (isSingletonElement) {
+    assert(child instanceof HTMLElement, 'child must be an HTMLElement')
+    if (this.isSingletonElement) {
       throw new Error('Cannot append child to singleton element');
     }
     this.childrenSlot.appendChild(child);
   }
 
   useSelectorMapping(mapping) {
-    for (const selector in Object.keys(mapping)) {
-      const value = mapping[selector];
+    assert(typeof mapping === 'object' || typeof mapping === Map, 'mapping must be an `object` or `Map`')
+    assert(mapping.hasOwnProperty('root'), 'mapping must contain a `root` key')
+    if (!this._hasInitialised) {
+      assert(!this.mountPoint, 'mountPoint cannot be initially defined when template exists')
+    }
 
-      if (value instanceof Placeholder) {
-        switch (value.type) {
+    // now assign mountPoint
+    this.mountPoint = document.querySelector(mapping.root);
+
+    for (const selector of Object.keys(mapping)) {
+      const potentialPlaceholder = mapping[selector];
+      if (selector === 'root') {
+        continue
+      }
+
+      if (potentialPlaceholder instanceof Placeholder) {
+        switch (potentialPlaceholder.type) {
           case Types.ATTR:
-            for (const attr in Object.keys(value)) {
-              this.actualMointPoint.querySelector(selector).setAttribute(attr);
+            for (const attr of Object.keys(potentialPlaceholder.value)) {
+              let value = potentialPlaceholder.value[attr];
+              this.mountPoint.querySelector(selector).setAttribute(attr, value);
             }
             break;
           case Types.INNER_HTML:
-            this.actualMointPoint.querySelector(selector).innerHTML = value;
+            this.mountPoint.querySelector(selector).innerHTML = potentialPlaceholder.value;
             break;
           case Types.CHILDREN:
-            for (const child of value) {
-              this.actualMointPoint.querySelector(selector).appendChild(child);
+            for (const child of potentialPlaceholder.value) {
+              this.mountPoint.querySelector(selector).appendChild(child);
             }
             break;
         }
-      } else {
-        this.actualMointPoint.querySelector(selector).innerHTML = value;
+        continue
       }
+      this.mountPoint.querySelector(selector).innerHTML = potentialPlaceholder;
     }
   }
 
@@ -127,7 +189,7 @@ class _Element {
   // children: array of elements
   //
   appendChildren(children) {
-    if (isSingletonElement) {
+    if (this.isSingletonElement) {
       throw new Error('Cannot append child to singleton element');
     }
     children.forEach((child) => this.childrenSlot.appendChild(child));
@@ -138,7 +200,7 @@ class _Element {
   }
 
   set children(children) {
-    if (isSingletonElement) {
+    if (this.isSingletonElement) {
       throw new Error('Cannot append child to singleton element');
     }
     this.childrenSlot.innerHTML = '';
@@ -154,57 +216,102 @@ class _Element {
   }
 
   update() {
-    // will run only once
-    beforeMount();
-    unMount();
-    renderComponent();
-    componentDidRender();
-
-    // will run every time the state changes
-    this.update = function () {
-      unMount()
-      renderComponent()
-      componentDidRender()
+    if (!this._hasInitialised) {
+      this._updateInitial(); // Function for initial setup
+      this._hasInitialised = true;
+      return
+    } else {
+      this._updateOnStateChange(); // Function for subsequent updates
     }
   }
 
+  _updateInitial() {
+    // Perform initial setup actions here
+    this.willMount();
+    this.renderComponent();
+    this.componentDidRender();
+  }
+
+  _updateOnStateChange() {
+    // Perform actions for state changes here
+    this.unMount();
+    this.renderComponent();
+    this.componentDidRender();
+  }
+
+  // just an alias
   render() {
-    return update()
+    return this.update()
   }
 
   renderComponent() {
     const templateResult = this.templateFunction({ ...this.state, ...this.props });
-    mount(templateResult)
+    this.mount(templateResult)
   }
 
   unMount() {
-    componentWillUnMount()
+    this.componentWillUnMount()
     // TODO: provide a way to unmount the element
     // without setting the innerHTML to ''
-    if (!this.templateAlreadyExistent) {
-      this.actualMointPoint.innerHTML = '';
+    if (!this.templateExists) {
+      this.mountPoint.innerHTML = '';
       return
     }
     // create a new element with the same tag name
     // and replace the old one
-    const newElem = document.createElement(this.actualMointPoint.tagName);
+    const placeholderElement = document.createElement(this.mountPoint.tagName);
     // newElem's id should be some random id which this component knows
     // so that it can be used to replace the element in the DOM
-    newElem.id = this.randomId;
-    newElem.style.display = 'none';
-    this.actualMointPoint.parent.replaceChild(newElem, this.actualMointPoint);
+    this.setPlaceholderId()
+    placeholderElement.id = this.randomId;
+    placeholderElement.style.display = 'none';
+    this.mountPoint.parentElement.replaceChild(placeholderElement, this.mountPoint);
   }
 
   mount(templateResult) {
-    if (!this.templateAlreadyExistent) {
-      this.actualMointPoint.innerHTML = templateResult;
+    if (this.templateExists) {
+      this._mountOnExistingTemplate(templateResult)
     } else {
-      // remount actualMointPoint
-      let newElem = document.getElementById(this.randomId);
-      newElem.parentNode.replaceChild(this.actual, newElem);
-      this.useSelectorMapping(templateResult);
+      this._mountOnNewTemplate(templateResult)
     }
     this.componentDidMount()
+  }
+
+  _mountOnExistingTemplate(templateResult) {
+    if (!this._hasInitialised) {
+      this._mountInitialForExisingTemplate(templateResult)
+      this._hasInitialised = true
+      return
+    }
+    this._mountOnStateChangeForExistingTemplate(templateResult)
+  }
+
+  _mountInitialForExisingTemplate(templateResult) {
+    this.useSelectorMapping(templateResult);
+  }
+
+  _mountOnStateChangeForExistingTemplate(templateResult) {
+    // remount actualMointPoint
+    let placeholderElement = document.getElementById(this.randomId);
+    placeholderElement.parentElement.replaceChild(this.mountPoint, placeholderElement);
+    this.useSelectorMapping(templateResult);
+  }
+
+  _mountOnNewTemplate(templateResult) {
+    if (!this._hasInitialised) {
+      this._mountInitialForNewTemplate(templateResult)
+      this._hasInitialised = true
+      return
+    }
+    this._mountOnStateChangeForNewTemplate(templateResult)
+  }
+
+  _mountInitialForNewTemplate(templateResult) {
+    this.mountPoint.innerHTML = templateResult;
+  }
+
+  _mountOnStateChangeForNewTemplate(templateResult) {
+    this.mountPoint.innerHTML = templateResult;
   }
 
   componentWillUnMount() {
@@ -240,7 +347,6 @@ export class GenericElement extends _Element {
 
     // state and props
     this._state = initProps.stateProps;
-    this.props = initProps.props;
   }
 
   get state() {
@@ -248,7 +354,7 @@ export class GenericElement extends _Element {
   }
 
   set state(newState) {
-    throwIfInvalidState(newState);
+    this.throwIfInvalidState(newState);
     this._state = newState;
   }
 
@@ -267,16 +373,15 @@ export class GenericElement extends _Element {
   }
 
   setState(newState) {
-    const prevState = { ...state };
+    const prevState = { ...this.state };
 
-    throwIfInvalidState(newState);
-    state = { ...state, ...newState };
+    this.throwIfInvalidState(newState);
+    this.state = { ...this.state, ...newState };
 
     // Check if any state property has changed
-    if (!areStatesEqual(prevState, state)) {
-      update();
+    if (!this.areStatesEqual(prevState, this.state)) {
+      this.update();
     }
-    return state
   }
 
   areStatesEqual(state1, state2) {
@@ -292,17 +397,23 @@ export class GenericElement extends _Element {
 
 export class NotifiedElement extends _Element {
   constructor({ mountPoint, mountOptions, initProps, templateFunction, stateNotifier }) {
+    assert(stateNotifier, 'stateNotifier must be provided')
+    assert(stateNotifier instanceof StateNotifier, 'stateNotifier must be an instance of StateNotifier')
+
     super({ mountPoint, mountOptions, initProps, templateFunction });
     stateNotifier.addListener(
       this.update
     );
     this.stateNotifier = stateNotifier;
 
-    beforeMount();
-    update();
+    this.willMount();
+    this.update();
   }
 }
 
+function xor(a, b) {
+  return (a || b) && !(a && b);
+}
 // Usage remains the same as provided in the previous response
 
 // Example: Change state and trigger re-render
