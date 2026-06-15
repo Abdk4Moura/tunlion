@@ -3,9 +3,12 @@
 # change is first-pairing ONLY; the transfer path is untouched), AND a pair of
 # remembered v2 devices reconnect via channel_of/proof_for unchanged.
 set -uo pipefail
-BIN=/root/wt-l1a/cli/target/release/filament
-SERVER=http://127.0.0.1:8093
-T=/root/.claude/jobs/330c2366/tmp/wt-l1a-gates
+# Configurable for any environment (defaults match gate9's local fixture):
+#   BIN     path to the release filament binary
+#   SERVER  signaling backend URL (a LOCAL fixture, never prod)
+BIN=${BIN:-../../target/release/filament}
+SERVER=${SERVER:-http://127.0.0.1:8093}
+T=${T:-/tmp/l1a-gate7}
 rm -rf "$T/g7"; mkdir -p "$T/g7"
 SRC="$T/g7/src.bin"; OUT="$T/g7/out"
 head -c 200000 /dev/urandom > "$SRC"; mkdir -p "$OUT"

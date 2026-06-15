@@ -4,9 +4,12 @@
 # second claim of the same nameplate finds nothing (burned). No silent same-code
 # retry is possible — a failed pairing forces a FRESH code.
 set -uo pipefail
-BIN=/root/wt-l1a/cli/target/release/filament
-SERVER=http://127.0.0.1:8093
-T=/root/.claude/jobs/330c2366/tmp/wt-l1a-gates
+# Configurable for any environment (defaults match gate9's local fixture):
+#   BIN     path to the release filament binary
+#   SERVER  signaling backend URL (a LOCAL fixture, never prod)
+BIN=${BIN:-../../target/release/filament}
+SERVER=${SERVER:-http://127.0.0.1:8093}
+T=${T:-/tmp/l1a-gate3}
 rm -rf "$T/g3"; mkdir -p "$T/g3/cfgA" "$T/g3/cfgB" "$T/g3/cfgC"
 
 # Creator mints a code.
@@ -15,15 +18,18 @@ FILAMENT_CONFIG_DIR=$T/g3/cfgA FILAMENT_PAIR_GRACE_SECS=20 \
 CRE=$!
 CODE=""
 for i in $(seq 1 50); do
-  CODE=$(grep -oE '[A-Z]+-[A-Z]+-[A-Z]+-[0-9]{3,5}' "$T/g3/creator.log" | head -1)
+  # 2-word `adj-animal-NNNN` minted code (e.g. PERKY-TAPIR-6901).
+  CODE=$(grep -oE '[A-Z]+-[A-Z]+-[0-9]{3,5}' "$T/g3/creator.log" | head -1)
   [ -n "$CODE" ] && break; sleep 0.2
 done
 [ -z "$CODE" ] && { echo "GATE3 FAIL: no code minted"; kill $CRE 2>/dev/null; exit 1; }
 NAMEPLATE="${CODE##*-}"
 echo "minted: $CODE  (nameplate $NAMEPLATE)"
 
-# Claimer uses the right NAMEPLATE but WRONG words.
-WRONG="tidy-walrus-violet-$NAMEPLATE"
+# Claimer uses the right NAMEPLATE but WRONG words (a valid 2-word shape that
+# clears the strength floor, so the REFUSAL is the key-confirmation failure and
+# not a too-weak rejection).
+WRONG="tidy-walrus-$NAMEPLATE"
 FILAMENT_CONFIG_DIR=$T/g3/cfgB FILAMENT_PAIR_GRACE_SECS=20 \
   "$BIN" --server "$SERVER" pair "$WRONG" --name y </dev/null >"$T/g3/claimer.log" 2>&1 &
 CLA=$!
@@ -45,7 +51,7 @@ REFUSED=$(grep -ciE 'REFUSED|confirmation failed|tamper|wrong code|disconnected|
 
 # 3) Nameplate is BURNED: a fresh claim of the same nameplate finds nothing.
 FILAMENT_CONFIG_DIR=$T/g3/cfgC \
-  "$BIN" --server "$SERVER" pair "good-otter-ruby-$NAMEPLATE" --name z </dev/null >"$T/g3/reclaim.log" 2>&1 &
+  "$BIN" --server "$SERVER" pair "good-otter-$NAMEPLATE" --name z </dev/null >"$T/g3/reclaim.log" 2>&1 &
 RC=$!
 for i in $(seq 1 20); do kill -0 $RC 2>/dev/null || break; sleep 0.5; done
 wait $RC 2>/dev/null

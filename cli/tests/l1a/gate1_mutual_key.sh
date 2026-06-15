@@ -3,9 +3,12 @@
 # code derive the SAME pinned secret over the real wire (8093). Key confirmation
 # passes; both write byte-identical devices.json secrets.
 set -uo pipefail
-BIN=/root/wt-l1a/cli/target/release/filament
-SERVER=http://127.0.0.1:8093
-T=/root/.claude/jobs/330c2366/tmp/wt-l1a-gates
+# Configurable for any environment (defaults match gate9's local fixture):
+#   BIN     path to the release filament binary
+#   SERVER  signaling backend URL (a LOCAL fixture, never prod)
+BIN=${BIN:-../../target/release/filament}
+SERVER=${SERVER:-http://127.0.0.1:8093}
+T=${T:-/tmp/l1a-gate1}
 CFG_A=$T/g1-cfgA; CFG_B=$T/g1-cfgB
 rm -rf "$CFG_A" "$CFG_B"; mkdir -p "$CFG_A" "$CFG_B"
 
@@ -14,10 +17,11 @@ FILAMENT_CONFIG_DIR=$CFG_A FILAMENT_PAIR_GRACE_SECS=30 \
   "$BIN" --server "$SERVER" pair --name bee </dev/null >"$T/g1-creator.log" 2>&1 &
 CRE=$!
 
-# Wait for the creator to print the full code (UPPERCASE on its own indented line).
+# Wait for the creator to print the full code (UPPERCASE on its own indented
+# line). Minting is now 2-word `adj-animal-NNNN` (e.g. PERKY-TAPIR-6901).
 CODE=""
 for i in $(seq 1 50); do
-  CODE=$(grep -oE '[A-Z]+-[A-Z]+-[A-Z]+-[0-9]{3,5}' "$T/g1-creator.log" | head -1)
+  CODE=$(grep -oE '[A-Z]+-[A-Z]+-[0-9]{3,5}' "$T/g1-creator.log" | head -1)
   [ -n "$CODE" ] && break
   sleep 0.2
 done
