@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="/xterm.css" />
+  <style>
+    html, body { margin: 0; height: 100%; background: #0a0a0a; }
+    #host { position: absolute; inset: 8px; }
+    .xterm-viewport { touch-action: pan-y; }
+  </style>
+</head>
+<body>
+  <div id="host"></div>
+  <script src="/xterm.js"></script>
+  <script src="/addon-fit.js"></script>
+  <script>
+    // Mirror the EXACT Terminal options from WebTerminal.jsx (the ones that matter
+    // for capability detection / rendering): allowProposedApi, convertEol off, the
+    // scrollback, etc. We do not need the theme to be identical for behavior.
+    const q = new URLSearchParams(location.search)
+    const colorterm = q.get('colorterm') === '1'
+    const cmd = q.get('cmd') || 'opencode'
+
+    const term = new Terminal({
+      fontFamily: 'monospace', fontSize: 13.5, lineHeight: 1.3, letterSpacing: 0.2,
+      cursorBlink: true, cursorStyle: 'bar', cursorWidth: 2, scrollback: 5000,
+      allowProposedApi: true,
+      convertEol: false, altClickMovesCursor: false,
+    })
+    const fit = new FitAddon.FitAddon()
+    term.loadAddon(fit)
+    term.open(document.getElementById('host'))
+    window.__term = term
+    // Capture what xterm.js sends back (its replies to opencode's queries) so the
+    // harness/Playwright can read the exact response bytes.
+    window.__sent = []
+    fit.fit()
+
+    const cols = term.cols || 120, rows = term.rows || 40
+    const ws = new WebSocket(`ws://${location.host}/?cols=${cols}&rows=${rows}&cmd=${encodeURIComponent(cmd)}&colorterm=${colorterm ? 1 : 0}`)
+    ws.binaryType = 'arraybuffer'
+    window.__exit = undefined
+    window.__bytesIn = 0
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        try { const o = JSON.parse(ev.data); if ('__exit' in o) { window.__exit = o.__exit } } catch (e) {}
+        return
+      }
+      const u8 = new Uint8Array(ev.data)
+      window.__bytesIn += u8.length
+      term.write(u8)
+    }
+    ws.onopen = () => {
+      // input path: forward EVERYTHING xterm emits (this is exactly what the real
+      // app forwards via sendPtyInput, including CPR/DA replies via onData).
+      term.onData((d) => {
+        window.__sent.push(d)
+        ws.send(new TextEncoder().encode(d))
+      })
+      // Also forward responses xterm produces via the binary onBinary path (some
+      // replies, e.g. DA, can come through onBinary). The real bridge forwards
+      // onData; we add onBinary to be faithful to "all xterm output to PTY".
+      if (term.onBinary) term.onBinary((d) => {
+        window.__sent.push('[bin]' + d)
+        const bytes = new Uint8Array(d.length)
+        for (let i = 0; i < d.length; i++) bytes[i] = d.charCodeAt(i) & 0xff
+        ws.send(bytes)
+      })
+      term.onResize(({ cols, rows }) => ws.send(JSON.stringify({ resize: true, cols, rows })))
+      // fit-then-resize once more after open, like onPtyReady does.
+      setTimeout(() => { fit.fit(); ws.send(JSON.stringify({ resize: true, cols: term.cols, rows: term.rows })) }, 200)
+    }
+
+    // expose buffer state for assertions
+    window.__state = () => {
+      const b = term.buffer && term.buffer.active
+      return {
+        cols: term.cols, rows: term.rows,
+        type: b && b.type, baseY: b && b.baseY, length: b && b.length,
+        cursorX: b && b.cursorX, cursorY: b && b.cursorY,
+        bytesIn: window.__bytesIn, exit: window.__exit,
+        sent: window.__sent.slice(),
+      }
+    }
+    // dump the visible viewport as text (to see if a UI painted)
+    window.__viewport = () => {
+      const b = term.buffer.active
+      const lines = []
+      for (let i = 0; i < term.rows; i++) {
+        const ln = b.getLine(b.viewportY + i)
+        lines.push(ln ? ln.translateToString(true) : '')
+      }
+      return lines.join('\n')
+    }
+  </script>
+</body>
+</html>
