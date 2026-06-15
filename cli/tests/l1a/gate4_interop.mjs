@@ -9,8 +9,13 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
-const PAKE_DIR = '/root/wt-l1a/frontend/src/pake'
-const NATIVE = '/root/wt-l1a/pake/target/release/native_side'
+// Resolve relative to this script so the gate runs in any checkout:
+//   cli/tests/l1a -> cli/tests -> cli -> <repo root>
+// Override PAKE_DIR / NATIVE for a non-standard layout.
+const here = dirname(fileURLToPath(import.meta.url))
+const ROOT = join(here, '..', '..', '..')
+const PAKE_DIR = process.env.PAKE_DIR || join(ROOT, 'frontend', 'src', 'pake')
+const NATIVE = process.env.NATIVE || join(ROOT, 'pake', 'target', 'release', 'native_side')
 
 // Load the committed wasm-bindgen module (the artifact the browser ships).
 const mod = await import(join(PAKE_DIR, 'filament_pake.js'))
