@@ -13,13 +13,37 @@
 // "not now" — the pair-keep-ack{ok:false} must make THAT sender discard its
 // half (gates.sh asserts its log and the device store).
 //
-// Usage: node known-device.js <app-url> <word-code> <decline-word-code>
+// Usage: node known-device.js <app-url> <code> <decline-code-or-@logfile>
+//
+// L1-a: a `send --word` now mints its OWN numeric nameplate, so the browser must
+// claim the FULL minted `word-word-NNNN` code (not the spoken phrase). <code> is
+// that minted phase-1 code. The phase-3 decline sender is started AFTER this
+// harness launches, so its code is not known up front: pass `@<logfile>` and we
+// poll that sender's log for the minted code right before phase 3.
 const { chromium } = require('playwright');
+const fs = require('node:fs');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function resolveDeclineCode(arg) {
+  if (!arg) return undefined;
+  if (!arg.startsWith('@')) return arg; // a literal code
+  const logPath = arg.slice(1);
+  // Poll the decline sender's log for its minted `word-word-NNNN` code.
+  for (let i = 0; i < 100; i++) {
+    try {
+      const txt = fs.readFileSync(logPath, 'utf8');
+      const m = txt.match(/[a-z]+-[a-z]+-[0-9]{3,5}/i);
+      if (m) return m[0];
+    } catch { /* not created yet */ }
+    await sleep(300);
+  }
+  throw new Error('decline sender never minted a code');
+}
 
 (async () => {
   const url = process.argv[2] || 'http://127.0.0.1:8077/';
   const code = process.argv[3];
-  const declineCode = process.argv[4];
+  const declineArg = process.argv[4];
   const browser = await chromium.launch({ headless: true });
   const page = await (await browser.newContext()).newPage();
   page.on('pageerror', (e) => console.log('[page-error]', String(e).slice(0, 200)));
@@ -65,8 +89,9 @@ const { chromium } = require('playwright');
   console.log('[pw] PHASE2 COMPLETE (channel rendezvous, no code)');
 
   // ---- phase 3: decline a remember offer; the sender must discard ---------
-  if (declineCode) {
-    await new Promise((r) => setTimeout(r, 6000)) // let gates.sh start the sender
+  if (declineArg) {
+    await sleep(6000) // let gates.sh start the decline sender (it mints its code)
+    const declineCode = await resolveDeclineCode(declineArg)
     // phase 1's claim left us in the 'Paired privately' bar, which hides the
     // code buttons — return to the auto room first.
     await page.getByText('← back to nearby', { exact: true }).first().click();

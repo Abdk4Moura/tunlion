@@ -40,6 +40,21 @@ say()  { printf '\n\033[1m== gate %s ==\033[0m\n' "$*"; }
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED_GATES="$FAILED_GATES $1"; }
 hashof() { sha256sum "$1" | cut -d' ' -f1; }
+# L1-a: a `send --word <phrase>` now mints its OWN numeric nameplate (the phrase
+# is only the SPAKE2 password), so the receiver must claim the FULL minted code,
+# not the spoken phrase. CODE_WORD is a valid 2-word phrase (clears the >=2-word
+# strength floor). wait_code <send.log> [phrase] echoes the minted `phrase-NNNN`
+# code once the sender prints it (the same shape gate9 greps).
+CODE_WORD="gigantic-element"
+wait_code() {
+  local log="$1" word="${2:-$CODE_WORD}" code="" i
+  for i in $(seq 1 60); do
+    code=$(grep -oiE "$word-[0-9]{3,5}" "$log" | head -1)
+    [ -n "$code" ] && { echo "$code"; return 0; }
+    sleep 0.3
+  done
+  return 1
+}
 pids=()
 cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null; done; [ -n "${OWN_BACKEND:-}" ] && kill "$OWN_BACKEND" 2>/dev/null; }
 trap cleanup EXIT
@@ -97,10 +112,11 @@ fi
 
 # ---------------------------------------------------------------- gate 1 ----
 say "1: one-time code transfer + code burn"
-W="g1-$$-$RANDOM"; D="$WORK/g1"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$W" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
-if timeout 90 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
+D="$WORK/g1"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g1-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g1-send.log") || { bad "code transfer (no code minted)"; tail -n 3 "$WORK/g1-send.log"; }
+if [ -n "${W:-}" ] && timeout 90 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ]; then
   ok "code transfer, hashes match, clean exits"
 else bad "code transfer"; tail -n 3 "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
@@ -118,9 +134,10 @@ fi
 
 # ---------------------------------------------------------------- gate 2 ----
 say "2: chaos — receiver killed mid-transfer, replacement resumes (C4/C6/C7)"
-W="g2-$$-$RANDOM"; D="$WORK/g2"; mkdir -p "$D"
-"$BIN" send "$BIG" --word "$W" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
+D="$WORK/g2"; mkdir -p "$D"
+"$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g2-send.log") || { bad "kill-resume (no code minted)"; tail -n 3 "$WORK/g2-send.log"; }
 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
@@ -131,7 +148,11 @@ done
 kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
 echo "(killed receiver at $(stat -c %s "$D/big.bin.part" 2>/dev/null || echo '?') bytes)"
 sleep 2
-timeout 180 "$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
+# The "resuming at" line is a DEBUG (resilience-internal) message, so the
+# replacement receiver runs with -v to surface it for the assertion below. The
+# resume itself is verbosity-independent (the sender re-offers from the saved
+# offset); -v only makes the proof visible.
+timeout 180 "$BIN" -v recv -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
 RC2=$?
 wait $SP; RCS=$?
 if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
@@ -141,12 +162,14 @@ else bad "kill-resume"; tail -n 4 "$WORK/g2-send.log" "$WORK/g2-recv2.log"; fi
 
 # ---------------------------------------------------------------- gate 3 ----
 say "3: corruption guard — same name+size, different content restarts (C7)"
-W="g3-$$-$RANDOM"; D="$WORK/g3"; mkdir -p "$D"
+D="$WORK/g3"; mkdir -p "$D"
 head -c $((2 * 1024 * 1024)) /dev/zero > "$D/small.bin.part"
 printf '{"size":%s,"head":"00deadbeef"}' "$(stat -c %s "$SMALL")" > "$D/small.bin.part.meta"
-"$BIN" send "$SMALL" --word "$W" --server "$SERVER" >"$WORK/g3-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
-if timeout 90 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g3-recv.log" 2>&1 \
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g3-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g3-send.log") || { bad "corruption guard (no code minted)"; tail -n 3 "$WORK/g3-send.log"; }
+# "different content" is a DEBUG (resilience-internal) line, so -v surfaces it.
+if [ -n "${W:-}" ] && timeout 90 "$BIN" -v recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g3-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ] \
    && grep -q "different content" "$WORK/g3-recv.log"; then
   ok "head mismatch detected, restarted from 0, hash matches"
@@ -307,9 +330,10 @@ if [ $WITH_RELAY -eq 1 ]; then
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
   BK=$!; pids+=($BK); sleep 4
-  W="g10-$$-$RANDOM"; D="$WORK/g10"; mkdir -p "$D"
-  "$BIN" send "$SMALL" --word "$W" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
-  SP=$!; pids+=($SP); sleep 3
+  D="$WORK/g10"; mkdir -p "$D"
+  "$BIN" send "$SMALL" --word "$CODE_WORD" --relay --server http://127.0.0.1:8078 >"$WORK/g10-send.log" 2>&1 &
+  SP=$!; pids+=($SP)
+  W=$(wait_code "$WORK/g10-send.log") || { bad "relay (no code minted)"; tail -n 3 "$WORK/g10-send.log"; }
   G10=0
   timeout 120 "$BIN" recv "$W" -y --relay --dir "$D" --server http://127.0.0.1:8078 >"$WORK/g10-recv.log" 2>&1 || G10=1
   wait $SP || G10=1
@@ -325,14 +349,16 @@ fi
 
 # --------------------------------------------------------------- gate 11 ----
 say "11: same-uid rejoin supersede (C6) — frozen receiver replaced by same device"
-W="g11-$$-$RANDOM"; D="$WORK/g11"; mkdir -p "$D"
+D="$WORK/g11"; mkdir -p "$D"
 # #28: the same-uid supersede now only fires for an IDLE link — an actively
 # flowing one is preserved (a live signaling reconnect must not tear down a
 # transfer). A frozen receiver goes idle, so it still supersedes; we pin the
 # idle threshold low and sleep past it after the freeze to keep that
 # deterministic regardless of how fast the replacement joins.
-FILAMENT_ADOPT_ACTIVE_MS=500 "$BIN" send "$BIG" --word "$W" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
+# -v on the sender: "superseding old link" is a DEBUG (resilience-internal) line.
+FILAMENT_ADOPT_ACTIVE_MS=500 "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g11-send.log") || { bad "uid supersede (no code minted)"; tail -n 3 "$WORK/g11-send.log"; }
 FILAMENT_UID="samedevice$$" "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
@@ -345,7 +371,8 @@ done
 # peer-left path.
 kill -STOP $R1 2>/dev/null
 sleep 3   # > FILAMENT_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
-FILAMENT_UID="samedevice$$" timeout 180 "$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
+# -v on the replacement: "resuming at" is a DEBUG (resilience-internal) line.
+FILAMENT_UID="samedevice$$" timeout 180 "$BIN" -v recv -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
 # bounded wait: a hung sender must fail the gate, not the whole suite
 RCS=99
@@ -367,9 +394,11 @@ else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; 
 # reach the sender, gate 11 would fail first — keeping this 'no supersede'
 # assertion honest. Default idle threshold (3s) >> a healthy inter-frame gap.
 say "11b: active same-uid link survives a live reconnect (#28)"
-W2="g11b-$$-$RANDOM"; D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
-"$BIN" send "$BIG" --word "$W2" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
+D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
+# -v on the sender: "keeping active link" is a DEBUG (resilience-internal) line.
+"$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W2=$(wait_code "$WORK/g11b-send.log") || { bad "flow-preserve (no code minted)"; tail -n 3 "$WORK/g11b-send.log"; }
 FILAMENT_UID="livedev$$" "$BIN" recv "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
 for _ in $(seq 1 60); do
@@ -408,7 +437,7 @@ else bad "flow-preserve (#28)"; tail -n 4 "$WORK/g11b-send.log" "$WORK/g11b-recv
 # silently stops deferring is caught, not papered over. Pin the idle threshold
 # default (3s) >> a healthy inter-frame gap so the live channel reads flowing.
 say "11c: active link survives a peer-left on a still-flowing channel (#28 trigger)"
-WC="g11c-$$-$RANDOM"; DC="$WORK/g11c"; mkdir -p "$DC"
+DC="$WORK/g11c"; mkdir -p "$DC"
 INJC=$((8 * 1024 * 1024))
 # Default idle threshold (3s) >> a healthy inter-frame gap, so the live channel
 # reads flowing when the synthetic peer-left lands and the defer engages. (Don't
@@ -418,10 +447,12 @@ INJC=$((8 * 1024 * 1024))
 # mid-transfer at the 3s default anyway: the channel stays busy throughout.)
 # A) baseline: defer disabled — the injected peer-left drops the live link and
 #    the transfer cannot complete on it.
-WCA="g11ca-$$-$RANDOM"; DCA="$WORK/g11ca"; mkdir -p "$DCA"
+DCA="$WORK/g11ca"; mkdir -p "$DCA"
+# -v on the sender: "injecting synthetic peer-left" / "deferring drop" are DEBUG.
 FILAMENT_TEST_INJECT_PEER_LEFT=$INJC FILAMENT_TEST_NO_DEFER=1 \
-  "$BIN" send "$BIG" --word "$WCA" --server "$SERVER" >"$WORK/g11ca-send.log" 2>&1 &
-SPA=$!; pids+=($SPA); sleep 3
+  "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11ca-send.log" 2>&1 &
+SPA=$!; pids+=($SPA)
+WCA=$(wait_code "$WORK/g11ca-send.log") || { bad "deferred-drop (no code minted)"; tail -n 3 "$WORK/g11ca-send.log"; }
 timeout 90 "$BIN" recv "$WCA" -y --dir "$DCA" --server "$SERVER" >"$WORK/g11ca-recv.log" 2>&1
 RCA=$?
 RCSA=99; for _ in $(seq 1 60); do kill -0 $SPA 2>/dev/null || { wait $SPA; RCSA=$?; break; }; sleep 1; done
@@ -431,8 +462,9 @@ base_ok=0; { [ $RCA -ne 0 ] || [ $RCSA -ne 0 ] || [ "$HCA" != "$H_BIG" ]; } \
   && grep -q "injecting synthetic peer-left" "$WORK/g11ca-send.log" && base_ok=1
 # B) fix: defer active — the link is kept, transfer completes on it, no supersede.
 FILAMENT_TEST_INJECT_PEER_LEFT=$INJC \
-  "$BIN" send "$BIG" --word "$WC" --server "$SERVER" >"$WORK/g11c-send.log" 2>&1 &
-SPB=$!; pids+=($SPB); sleep 3
+  "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11c-send.log" 2>&1 &
+SPB=$!; pids+=($SPB)
+WC=$(wait_code "$WORK/g11c-send.log") || { bad "deferred-drop (no code minted)"; tail -n 3 "$WORK/g11c-send.log"; }
 timeout 120 "$BIN" recv "$WC" -y --dir "$DC" --server "$SERVER" >"$WORK/g11c-recv.log" 2>&1
 RCB=$?
 RCSB=99; for _ in $(seq 1 150); do kill -0 $SPB 2>/dev/null || { wait $SPB; RCSB=$?; break; }; sleep 1; done
@@ -464,9 +496,9 @@ fi
 # --------------------------------------------------------------- gate 14 ----
 say "14: daemon — pair, introduce-grade trust, room-less up receives (C19/C20/C12)"
 DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
-W="g14-$$-$RANDOM"
-FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$W" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
+FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g14-s1.log") || { bad "daemon (no code minted)"; tail -n 3 "$WORK/g14-s1.log"; }
 FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
 wait $SP
 FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
@@ -482,9 +514,10 @@ else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
 
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"
-W="g15-$$-$RANDOM"; D="$WORK/g15"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$W" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
+D="$WORK/g15"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g15-send.log") || { bad "stepped-away wait (no code minted)"; tail -n 3 "$WORK/g15-send.log"; }
 T0=$(date +%s)
 # no -y and no tty -> the offer is declined -> sender exits -> peer-left with
 # nothing received; the OLD behavior bailed instantly, C21 holds the line.
@@ -501,14 +534,16 @@ else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
 say "16: known-device rendezvous + remember consent (C12/C20/C27 web)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
   G16=0
-  W16="g16-$$-$RANDOM"
-  W16B="g16b-$$-$RANDOM"
   C16="$WORK/g16cfg"; mkdir -p "$C16"
-  # phase 1 sender: mints the word code, offers a pair-keep secret (the
-  # browser must NOT store it until the human clicks 'remember' — C27)
-  FILAMENT_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$W16" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
-  S16=$!; pids+=($S16); sleep 3
-  ( cd "$HERE" && node known-device.js "$SERVER" "$W16" "$W16B" >"$WORK/g16-pw.log" 2>&1 ) &
+  # phase 1 sender: mints the code (a valid 2-word phrase + machine nameplate),
+  # offers a pair-keep secret (the browser must NOT store it until the human
+  # clicks 'remember', C27). The browser must claim the FULL minted code.
+  FILAMENT_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$CODE_WORD" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
+  S16=$!; pids+=($S16)
+  W16=$(wait_code "$WORK/g16-s1.log") || { bad "known-device (no code minted)"; tail -n 3 "$WORK/g16-s1.log"; }
+  # phase 3's decline sender is started later (below); the harness polls its log
+  # for the minted code via the `@<logfile>` form once it reaches phase 3.
+  ( cd "$HERE" && node known-device.js "$SERVER" "$W16" "@$WORK/g16-s3.log" >"$WORK/g16-pw.log" 2>&1 ) &
   PW16=$!; pids+=($PW16)
   wait $S16 || G16=1   # phase 1 transfer done; browser must now hold the secret
   # phase 2: fresh session, ISOLATED room, no code — only the secret-derived
@@ -516,7 +551,7 @@ if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then
   FILAMENT_CONFIG_DIR="$C16" timeout 120 "$BIN" send "$SMALL" --to pwdev --room "g16iso$$" --server "$SERVER" >"$WORK/g16-s2.log" 2>&1 || G16=1
   # phase 3 (C27 decline): a new sender offers; the browser clicks 'not now';
   # the ack must make this sender DISCARD its stored half.
-  FILAMENT_CONFIG_DIR="$C16" timeout 60 "$BIN" send "$SMALL" --word "$W16B" --remember declinedev --server "$SERVER" >"$WORK/g16-s3.log" 2>&1 &
+  FILAMENT_CONFIG_DIR="$C16" timeout 60 "$BIN" send "$SMALL" --word "$CODE_WORD" --remember declinedev --server "$SERVER" >"$WORK/g16-s3.log" 2>&1 &
   S16B=$!; pids+=($S16B)
   wait $PW16 || G16=1
   kill $S16B 2>/dev/null; wait $S16B 2>/dev/null
@@ -535,7 +570,7 @@ say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
 FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
 P17=$!; pids+=($P17); sleep 4
-C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
+C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
 FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" pair "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
@@ -554,7 +589,7 @@ say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 DC="$WORK/g17c"; mkdir -p "$DC/a" "$DC/b"
 FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" pair --name gone --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
 CR=$!; pids+=($CR); sleep 4
-CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
+CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
 FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
   timeout 90 "$BIN" pair "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
@@ -575,15 +610,29 @@ say "18: recv quiet-exit when peer-left never arrives (G-k)"
 # peer-left events at exactly the delivery boundary. (A SIGSTOP'd sender can't
 # do it: engine.io's ping timeout reaps the frozen client in ~30 s and the
 # legit peer-left wins the race against link teardown — measured.)
-W="g18-$$-$RANDOM"; D="$WORK/g18"; mkdir -p "$D"
-"$BIN" send "$SMALL" --word "$W" --server "$SERVER" >"$WORK/g18-send.log" 2>&1 &
-SP=$!; pids+=($SP); sleep 3
+D="$WORK/g18"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g18-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g18-send.log") || { bad "quiet-exit (G-k) (no code minted)"; tail -n 3 "$WORK/g18-send.log"; }
+# The test precondition is "the file arrived AND the sender is GONE, but the
+# peer-left notification was LOST". So SIGKILL the sender the instant IT reports
+# the delivery+ack (its own log, the earliest reliable "done" signal), so the
+# receiver's post-delivery reconnect deterministically finds no live peer and the
+# dropped peer-left forces the quiet-exit. Without this, under suite load the
+# receiver reconnects to the still-lingering sender (a healthy link, which
+# correctly BLOCKS quiet-exit), so the gate hung to the 120s timeout: a
+# test-fidelity gap, not a product bug (the transfer always completed + verified).
+( for _ in $(seq 1 600); do
+    grep -q "delivered + verified\|^done\.\|delivered" "$WORK/g18-send.log" 2>/dev/null \
+      && { kill -9 $SP 2>/dev/null; break; }
+    sleep 0.1
+  done ) &
 T0=$(date +%s)
 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=3 \
   timeout 120 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g18-recv.log" 2>&1
 RC=$?
 T1=$(date +%s)
-kill $SP 2>/dev/null; wait $SP 2>/dev/null
+kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
 if [ $RC -eq 0 ] \
    && grep -q "peer-left never arrived" "$WORK/g18-recv.log" \
    && grep -F "done (1 file" "$WORK/g18-recv.log" >/dev/null \
@@ -617,33 +666,35 @@ fi
 # a MID-transfer link (by_sid non-empty) is never dropped — gate 2 (kill-resume)
 # and gate 11c (deferred-drop) reconnect paths are untouched (unit-tested too).
 say "18b: recv exits on post-completion link churn — Mode B (RC=124 flake, #28)"
-W="g18b-$$-$RANDOM"; H_DIR="$WORK/g18b"; mkdir -p "$H_DIR"
+H_DIR="$WORK/g18b"; mkdir -p "$H_DIR"
 # A) baseline: Mode-B drop disabled → the post-completion flap hangs to timeout.
+# -v on the receivers: the flap line ("connection stuck while connecting,
+# retrying") and "nothing left to fetch" are DEBUG (resilience-internal) lines.
 DA="$H_DIR/a"; mkdir -p "$DA"
-WA="g18ba-$$-$RANDOM"
-"$BIN" send "$SMALL" --word "$WA" --server "$SERVER" >"$WORK/g18ba-send.log" 2>&1 &
-SPA=$!; pids+=($SPA); sleep 3
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g18ba-send.log" 2>&1 &
+SPA=$!; pids+=($SPA)
+WA=$(wait_code "$WORK/g18ba-send.log") || { bad "gate-18b Mode B (no code minted)"; tail -n 3 "$WORK/g18ba-send.log"; }
 ( sleep 6; kill -9 $SPA 2>/dev/null ) &   # sender departs after delivering the file
 FILAMENT_TEST_DISABLE_MODEB_DROP=1 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 \
   FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" recv "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
+  timeout 30 "$BIN" -v recv "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
 RCA=$?
 kill -9 $SPA 2>/dev/null; wait $SPA 2>/dev/null
 # Baseline MUST hang (RC=124) yet still have the bytes on disk (it's the EXIT
 # that's broken, not the transfer) and show the flap, never a clean drop.
 base_ok=0
 { [ $RCA -eq 124 ] && [ "$(hashof "$DA/small.bin" 2>/dev/null)" = "$H_SMALL" ] \
-  && grep -q "stuck while connecting — retrying" "$WORK/g18ba-recv.log" \
+  && grep -q "stuck while connecting" "$WORK/g18ba-recv.log" \
   && ! grep -q "nothing left to fetch" "$WORK/g18ba-recv.log"; } && base_ok=1
 # B) fix: Mode-B drop on → on_stuck drops the dead link, quiet-exit fires fast.
 DB="$H_DIR/b"; mkdir -p "$DB"
-WB="g18bb-$$-$RANDOM"
-"$BIN" send "$SMALL" --word "$WB" --server "$SERVER" >"$WORK/g18bb-send.log" 2>&1 &
-SPB=$!; pids+=($SPB); sleep 3
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g18bb-send.log" 2>&1 &
+SPB=$!; pids+=($SPB)
+WB=$(wait_code "$WORK/g18bb-send.log") || { bad "gate-18b Mode B (no code minted)"; tail -n 3 "$WORK/g18bb-send.log"; }
 T0=$(date +%s)
 ( sleep 6; kill -9 $SPB 2>/dev/null ) &
 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
-  timeout 30 "$BIN" recv "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
+  timeout 30 "$BIN" -v recv "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
 RCB=$?
 T1=$(date +%s)
 kill -9 $SPB 2>/dev/null; wait $SPB 2>/dev/null
@@ -669,7 +720,7 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
 FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
 P19=$!; pids+=($P19); sleep 4
-C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
+C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
 FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" pair "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
