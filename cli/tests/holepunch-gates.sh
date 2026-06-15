@@ -144,14 +144,22 @@ pair_devices() {
   local cfgA="$WORK/cfgA" cfgB="$WORK/cfgB"
   rm -rf "$cfgA" "$cfgB"; mkdir -p "$cfgA" "$cfgB"
   local pf="$WORK/pairsmall.bin"; head -c 4096 /dev/urandom >"$pf"
-  local W="hp-pair-$RANDOM"
+  # Valid 2-word phrase (the SPAKE2 password); the numeric nameplate is ALWAYS
+  # machine-minted, so the receiver must claim the FULL minted code grepped from
+  # the sender's log. A single token (old `hp-pair-$RANDOM`) is now refused by
+  # the >=2-word strength floor.
+  local WORD="gigantic-element"
   nse "${LAB_PREFIX}-cliA" env FILAMENT_CONFIG_DIR="$cfgA" \
-      "$BIN" send "$pf" --word "$W" --remember boxB --server "$server" \
+      "$BIN" send "$pf" --word "$WORD" --remember boxB --server "$server" \
       >"$WORK/pair-send.log" 2>&1 &
   local sp=$!
-  sleep 3
+  local CODE=""
+  for _ in $(seq 1 40); do
+    CODE=$(grep -oiE "$WORD-[0-9]{3,5}" "$WORK/pair-send.log" | head -1)
+    [ -n "$CODE" ] && break; sleep 0.3
+  done
   nse "${LAB_PREFIX}-cliB" env FILAMENT_CONFIG_DIR="$cfgB" \
-      timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$WORK/pairout" --server "$server" \
+      timeout 60 "$BIN" recv "$CODE" -y --remember boxA --dir "$WORK/pairout" --server "$server" \
       >"$WORK/pair-recv.log" 2>&1 || true
   kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
   PAIR_CFGA="$cfgA"; PAIR_CFGB="$cfgB"
