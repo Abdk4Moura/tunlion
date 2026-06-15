@@ -111,6 +111,15 @@ mod test_hooks {
     pub fn drop_peer_left() -> bool {
         std::env::var("FILAMENT_TEST_DROP_PEER_LEFT").is_ok()
     }
+    /// P4 silent-data-loss gate: the receiver finalizes the file INTACT but
+    /// suppresses the outbound `delivery-ack`, faithfully simulating an ack that
+    /// never reaches the sender on an otherwise-healthy link (the black-hole-on-
+    /// the-ack case). The sender must then re-probe and end UNCONFIRMED, never a
+    /// false "delivered + verified". Distinct from corrupt-recv (which drives the
+    /// re-request loop): here the bytes are whole, only the ack is withheld.
+    pub fn suppress_delivery_ack() -> bool {
+        std::env::var("FILAMENT_TEST_SUPPRESS_ACK").is_ok()
+    }
 
     /// truncation/ack gate corruption injector. `FILAMENT_TEST_CORRUPT_RECV=<id>`
     /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
@@ -148,6 +157,7 @@ mod test_hooks {
     #[inline] pub fn churn_after_complete() -> bool { false }
     #[inline] pub fn drop_file_end() -> bool { false }
     #[inline] pub fn drop_peer_left() -> bool { false }
+    #[inline] pub fn suppress_delivery_ack() -> bool { false }
     #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
 }
 
@@ -233,6 +243,39 @@ const MAX_VERIFY_FAILS: u32 = 3;
 ///   keeps a by_sid entry, which must keep the link reconnecting, gate 2/11c).
 fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> bool {
     completed > 0 && !keep_open && by_sid_empty
+}
+
+/// P4 (silent-data-loss fix): what a SEND should do when its delivery-ack window
+/// elapses with NO whole-file-verified `delivery-ack`. A send is "delivered +
+/// verified" ONLY on a genuine `delivery-ack`, so this NEVER returns `Complete`:
+/// the bytes draining out of the send buffer proves nothing (a path that
+/// black-holes without ICE/QUIC noticing drains while NOTHING arrives, no ack
+/// comes, and the old fallback then falsely reported "done"). Pure, so the
+/// completion decision is unit-testable without a live peer.
+///
+/// - `link_alive`: a live transport is still attached (mirrors "channel open").
+///   When false the link is gone, nothing can prompt or carry a re-ack.
+/// - `reprobed`: we have already re-sent `file-end` once this window.
+///
+/// Returns:
+/// - `Reprobe`: link looks alive and we have not re-probed, the ack may be lost,
+///   re-send `file-end` once to prompt it and extend the window.
+/// - `FailUnconfirmed`: end honestly (nonzero, partial kept resumable), never a
+///   false "delivered + verified". Reached when the link is gone, or after a
+///   re-probe still drew no ack.
+#[derive(Debug, PartialEq, Eq)]
+enum AckFallback {
+    Reprobe,
+    FailUnconfirmed,
+}
+fn decide_ack_fallback(link_alive: bool, reprobed: bool) -> AckFallback {
+    if !link_alive {
+        return AckFallback::FailUnconfirmed;
+    }
+    if !reprobed {
+        return AckFallback::Reprobe;
+    }
+    AckFallback::FailUnconfirmed
 }
 
 /// Bug 5: after repeated stuck-while-connecting on establishment, the user has
@@ -4162,13 +4205,14 @@ struct Outgoing {
     temp: bool,          // delete after sending (tar spools, stdin spools)
     accepted_once: bool, // re-offers carry resume:true after first accept
     /// P4: the bytes left this side (stream finished / file-end sent). NOT the
-    /// same as `done` anymore: a transfer is `sent` once but is only `done` after
-    /// the receiver's whole-file-verified `delivery-ack` lands (or the bounded
-    /// fallback fires for a peer too old to ack).
+    /// same as `done`: a transfer is `sent` once but is only `done` after the
+    /// receiver's whole-file-verified `delivery-ack` lands (the no-ack window
+    /// NEVER sets `done`, it re-probes then fails the send, silent-data-loss fix).
     sent: bool,
     /// P4: the receiver returned a verified `delivery-ack` for this id. This is
-    /// the deterministic "it landed intact" signal, `send` completes only when
-    /// every transfer is acked (or the bounded no-ack fallback declared it done).
+    /// the deterministic "it landed intact" signal, the ONLY thing that completes
+    /// a send. (Exception: an un-hashable file with no `full` digest has nothing
+    /// to verify-and-ack, so it is `done` on send, the legacy size-only path.)
     acked: bool,
     done: bool,
 }
@@ -4396,20 +4440,28 @@ async fn send_cmd(
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
-    // P4 (delivery-ack BOUNDED FALLBACK): when every transfer's bytes have been
-    // `sent` but the whole-file `delivery-ack` hasn't landed, we wait, but only
-    // up to this bound, then declare done anyway so an OLD receiver (one that
-    // verifies-on-size but never learned to send the ack) can never make `send`
-    // hang forever. The link's data path drained (`drain_finish`) before we even
-    // start waiting, so the bytes are on the wire; this only bounds the
-    // KNOW-it-landed confirmation, never the delivery itself. Overridable via
-    // FILAMENT_ACK_TIMEOUT (seconds; 0 disables the wait = legacy fire-and-forget).
+    // P4 (delivery-ack window): when every transfer's bytes have been `sent` but
+    // the whole-file `delivery-ack` hasn't landed, we wait up to this bound for
+    // the ack. CRITICAL (silent-data-loss fix): elapsing this window does NOT mean
+    // "declare done". The bytes draining out of the send buffer proves nothing, a
+    // path that black-holes without QUIC noticing drains while NOTHING arrives and
+    // no ack comes. So on no-ack we re-probe once (re-send file-end to prompt a
+    // possibly-lost ack), and if the ack still never lands we FAIL the send
+    // (nonzero, partial kept resumable), never a false "delivered + verified".
+    // Overridable via FILAMENT_ACK_TIMEOUT (seconds). The never-hangs property
+    // holds: we reach a terminal state in bounded time, just an honest one.
     let ack_wait = std::env::var("FILAMENT_ACK_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(15));
+    // After the first window with no ack we re-send file-end and wait this much
+    // longer for a (possibly lost) ack before giving up. Short: the ack is a tiny
+    // control message, on a healthy link it returns within a round-trip.
+    let ack_reprobe = Duration::from_secs(5);
     let mut sent_all_at: Option<Instant> = None;
+    let mut ack_reprobed = false; // re-sent file-end once for the no-ack window?
+    let mut reprobed_at: Option<Instant> = None;
 
     loop {
         // Bug 6: no data channel has come up within the establishment window,
@@ -5073,46 +5125,96 @@ async fn send_cmd(
             }
             _ => {}
         }
-        // P4: every transfer's BYTES have left this side (`sent`), but a transfer
-        // is only truly `done` once the receiver returns a whole-file-verified
-        // `delivery-ack`. Drain the wire first (so the bytes are actually on it,
-        // not parked in a send buffer), then WAIT, bounded by `ack_wait`, for
-        // the ack. A modern receiver acks within a round-trip of finishing its
-        // verify; an OLD receiver (verifies-on-size, never learned the ack) never
-        // sends one, so after the bound we declare it done anyway rather than hang
-        // (graceful backward-compat). The wait is on the KNOW-it-landed signal,
-        // never on delivery, the drain already put the bytes on the wire.
+        // P4 (silent-data-loss fix): every transfer's BYTES have left this side
+        // (`sent`), but a transfer is only truly `done` once the receiver returns a
+        // whole-file-verified `delivery-ack`. Drain the wire first, then WAIT for
+        // the ack, bounded by `ack_wait`. If the window elapses with no ack we do
+        // NOT declare success (the old bug): we decide via decide_ack_fallback,
+        // re-probe ONCE (re-send file-end to prompt a possibly-lost ack), and if
+        // the ack still never lands we FAIL the send below (nonzero, partial kept
+        // resumable). Only the real `delivery-ack` handler may set `o.done`.
         {
-            let mut out = outgoing.lock().await;
-            let all_sent = !out.is_empty() && out.iter().all(|o| o.sent);
-            let all_acked = !out.is_empty() && out.iter().all(|o| o.done);
-            if all_sent && !all_acked {
-                if sent_all_at.is_none() {
-                    sent_all_at = Some(Instant::now());
-                    // Flush (NOT drain_finish) on first reaching the all-sent point:
-                    // push the wire so the receiver can finish + verify + ack. We do
-                    // NOT call drain_finish here because on direct-QUIC that ends the
-                    // send half (`finish()`), which would block a corrupt-case
-                    // RE-FETCH that needs to stream more bytes. The final exit block
-                    // does the authoritative drain_finish once the ack lands (no more
-                    // re-fetch possible by then). On a DataChannel both are just
-                    // flush(); on QUIC this keeps the stream open for a resume.
-                    if let Some(t) = conn.transport() {
-                        let _ = t.flush().await;
+            let all_sent;
+            let all_acked;
+            let mut do_flush = false;
+            let mut do_reprobe = false;
+            let mut give_up = false;
+            {
+                let out = outgoing.lock().await;
+                all_sent = !out.is_empty() && out.iter().all(|o| o.sent);
+                all_acked = !out.is_empty() && out.iter().all(|o| o.done);
+                if all_sent && !all_acked {
+                    if sent_all_at.is_none() {
+                        sent_all_at = Some(Instant::now());
+                        do_flush = true;
+                    }
+                    let window_elapsed = sent_all_at.map(|t| t.elapsed() >= ack_wait).unwrap_or(false);
+                    let reprobe_elapsed = reprobed_at.map(|t| t.elapsed() >= ack_reprobe).unwrap_or(false);
+                    // Only act once a window has elapsed: the first ack_wait, or
+                    // (after a re-probe) the shorter ack_reprobe window.
+                    if (!ack_reprobed && window_elapsed) || (ack_reprobed && reprobe_elapsed) {
+                        // A live transport attached is the "link alive" signal
+                        // (mirrors the browser's data-channel-open check). A
+                        // black-hole that QUIC hasn't noticed still reports a
+                        // transport, so the re-probe path is what catches it.
+                        let link_alive = conn.transport().is_some();
+                        match decide_ack_fallback(link_alive, ack_reprobed) {
+                            AckFallback::Reprobe => do_reprobe = true,
+                            AckFallback::FailUnconfirmed => give_up = true,
+                        }
                     }
                 }
-                // Bounded fallback: ack never came (old/ack-less peer), accept on
-                // size, note it honestly, stop waiting. ack_wait==0 disables the
-                // wait entirely (explicit legacy fire-and-forget).
-                if sent_all_at.map(|t| t.elapsed() >= ack_wait).unwrap_or(false) {
-                    for o in out.iter_mut().filter(|o| !o.done) {
-                        ui::say(&ui::paint(ui::Tone::Warn, &format!(
-                            "  {}: no delivery-ack within {}s, peer may be too old to confirm; accepting on size (bytes were delivered + drained)",
-                            o.name, ack_wait.as_secs()
-                        )));
-                        o.done = true;
-                    }
+            }
+            if do_flush {
+                // Flush (NOT drain_finish) on first reaching the all-sent point:
+                // push the wire so the receiver can finish + verify + ack. We do
+                // NOT call drain_finish here because on direct-QUIC that ends the
+                // send half (`finish()`), which would block a corrupt-case
+                // RE-FETCH that needs to stream more bytes. The final exit block
+                // does the authoritative drain_finish once the ack lands (no more
+                // re-fetch possible by then). On a DataChannel both are just
+                // flush(); on QUIC this keeps the stream open for a resume.
+                if let Some(t) = conn.transport() {
+                    let _ = t.flush().await;
                 }
+            }
+            if do_reprobe {
+                // The ack may have been lost on a still-alive link. Re-send file-end
+                // for every unacked transfer to prompt the receiver to re-ack, then
+                // wait one more (shorter) window. Never completes anything.
+                ack_reprobed = true;
+                reprobed_at = Some(Instant::now());
+                let pending: Vec<(String, u32, String)> = {
+                    let out = outgoing.lock().await;
+                    out.iter().filter(|o| !o.done).map(|o| (o.id.clone(), o.sid, o.name.clone())).collect()
+                };
+                if let Some(t) = conn.transport() {
+                    for (id, sid, name) in &pending {
+                        ui::debug(&format!("  {name}: no delivery-ack yet, re-probing (re-sending file-end)"));
+                        let _ = t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await;
+                    }
+                    let _ = t.flush().await;
+                }
+            }
+            if give_up {
+                // No delivery-ack after the window + re-probe (or the link is gone).
+                // Do NOT claim success: the receiver may have gotten nothing. Fail
+                // honestly. The on-disk source is untouched and the outgoing entry
+                // is preserved for resume; a fresh `send`/reconnect re-offers it.
+                let names: Vec<String> = {
+                    let out = outgoing.lock().await;
+                    out.iter().filter(|o| !o.done).map(|o| o.name.clone()).collect()
+                };
+                for name in &names {
+                    ui::critical(&ui::paint(ui::Tone::Warn, &format!(
+                        "  {name}: delivery not confirmed (no whole-file delivery-ack), the receiver may have gotten nothing; NOT marking complete"
+                    )));
+                }
+                let _ = sio.disconnect().await;
+                bail!(
+                    "delivery not confirmed: {} file(s) sent but never delivery-acked by the receiver (treating as unconfirmed, not delivered)",
+                    names.len().max(1)
+                );
             }
         }
         // Exit when every transfer reached a terminal state (`done` = acked, or the
@@ -6989,7 +7091,14 @@ async fn recv_cmd(
                                     let nm = inc.name.clone();
                                     if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
                                         completed += 1;
-                                        if let Some(t) = conn.transport_of(&pid) {
+                                        // P4 silent-data-loss gate: optionally WITHHOLD the
+                                        // ack (file is intact on disk) to simulate an ack
+                                        // lost on a healthy link, the sender must then end
+                                        // UNCONFIRMED, never a false success. No-op on
+                                        // default/release builds (hook compiled out).
+                                        if test_hooks::suppress_delivery_ack() {
+                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
+                                        } else if let Some(t) = conn.transport_of(&pid) {
                                             let _ = t.send_control(&json!({
                                                 "type": "delivery-ack", "id": id, "sid": sid, "v": 1,
                                             })).await;
@@ -7804,6 +7913,24 @@ mod tests {
         assert!(!recv_transfer_done(5, true, true));
         // nothing completed yet (still connecting / first stream) -> reconnect.
         assert!(!recv_transfer_done(0, false, true));
+    }
+
+    #[test]
+    fn ack_fallback_never_completes_silently() {
+        // P4 silent-data-loss fix: the no-ack window must NEVER claim success. A
+        // send is delivered+verified ONLY on a real delivery-ack, so this decision
+        // function only ever Reprobes or FailsUnconfirmed, never "complete".
+        // Link gone (the black-hole-then-drop case): fail honestly, no point
+        // re-probing into a dead link.
+        assert_eq!(decide_ack_fallback(false, false), AckFallback::FailUnconfirmed);
+        assert_eq!(decide_ack_fallback(false, true), AckFallback::FailUnconfirmed);
+        // Link alive, first window: the ack may be lost, re-probe once.
+        assert_eq!(decide_ack_fallback(true, false), AckFallback::Reprobe);
+        // Link alive but already re-probed and STILL no ack: do not declare
+        // success, fail as unconfirmed (resumable). This is the exact case the
+        // old code falsely completed (drained buffer, healthy-looking link, but
+        // nothing arrived and no ack came).
+        assert_eq!(decide_ack_fallback(true, true), AckFallback::FailUnconfirmed);
     }
 
     #[test]
