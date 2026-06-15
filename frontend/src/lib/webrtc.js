@@ -33,9 +33,46 @@ const CTRL = {
 // P4: bound the whole-file re-fetch so a genuinely-corrupt payload fails CLEANLY
 // instead of looping forever; the partial is kept, the transfer stays resumable.
 const MAX_VERIFY_FAILS = 2
-// P4: if a CLI peer is too old to send a delivery-ack, accept on size+drain after
-// this window so a send never hangs against an ack-less receiver (interop).
+// P4: the window we wait for a genuine delivery-ack after CTRL.END + drain. If it
+// elapses with no ack we do NOT complete (silent data-loss bug): we re-probe once
+// (re-send END to prompt a lost ack) and, failing that, end honestly as
+// unconfirmed/failed (resumable). See decideAckFallback + the _ackTimers logic.
 const ACK_FALLBACK_MS = 30000
+// P4: after the first window with no ack, re-send CTRL.END once and wait this much
+// longer for a (possibly lost) ack before giving up. Short: the ack is a tiny
+// control message, if the link is healthy it returns fast.
+const ACK_REPROBE_MS = 5000
+
+// P4 (silent-data-loss fix): decide what a send should do when the ack window
+// elapses with NO delivery-ack. A send is "complete" (delivered + verified) ONLY
+// on a genuine CTRL.DELIVERY_ACK, so this function NEVER returns 'complete'. Pure
+// (no side effects) so it can be unit-tested directly.
+//
+//   channelOpen     data channel readyState === 'open'
+//   connected       pc.connectionState === 'connected'
+//   peerHasAcked    this peer has delivery-acked before (this link or a past one)
+//                   -> the ack is mandatory for it, a weak completion is wrong
+//   offeredDigest   we shipped a whole-file digest in the OFFER (so a modern
+//                   receiver is expected to ack)
+//   reprobed        we have already re-sent END once this window
+//
+// Returns one of:
+//   { action: 'reprobe' }  re-send END once and extend the window (ack may be lost)
+//   { action: 'fail', resumable }  end honestly, never claim success
+export function decideAckFallback({ channelOpen, connected, peerHasAcked, offeredDigest, reprobed }) {
+  const healthy = !!channelOpen && !!connected
+  // Link looks dead: nothing arrived and we cannot prompt a re-ack. End honestly.
+  if (!healthy) return { action: 'fail', resumable: true }
+  // Link looks alive and we have not yet re-probed: the ack may simply have been
+  // lost. Re-send END once to prompt the receiver to re-ack, extend the window.
+  if (!reprobed) return { action: 'reprobe' }
+  // Re-probed, still no ack. We must not claim success: a peer that ever acked, or
+  // one we offered a digest to, is EXPECTED to ack, treat the silence as a failure
+  // (resumable). With the modern fleet every receiver acks, so this is the norm.
+  void peerHasAcked
+  void offeredDigest
+  return { action: 'fail', resumable: true }
+}
 
 // P4 test shims, INERT unless a `?test=` query flag (persisted to localStorage)
 // is set, so they ship in the bundle with zero effect on real users. They exist
@@ -1043,7 +1080,11 @@ export class PeerLink {
           clearTimeout(this._ackTimers.get(msg.id))
           this._ackTimers.delete(msg.id)
         }
-        if (t.status === 'complete') break // already accepted (e.g. via fallback)
+        if (t.status === 'complete') break // already accepted via a prior ack
+        // This peer DOES delivery-ack. Remember it (this link + persisted per
+        // peerUid) so a future ack-window NEVER falls back to a weak completion:
+        // for an ack-capable peer the ack is mandatory.
+        this._markPeerAcks()
         this._outgoingFiles.delete(msg.id)
         this.stores.outgoing.delete(msg.id)
         this._update(t, { status: 'complete', progress: 1 })
@@ -1151,9 +1192,11 @@ export class PeerLink {
       // The offer ships once the hashes resolve: head (C7 resume) AND the
       // whole-file digest (P4 integrity). Order across concurrent offers
       // doesn't matter, ids are independent.
-      Promise.all([headHash(file), fullHash(file)]).then(([head, full]) =>
+      Promise.all([headHash(file), fullHash(file)]).then(([head, full]) => {
+        const cur = this._outgoingFiles.get(id)
+        if (cur) cur.offeredDigest = !!full // P4: a digest means a modern receiver acks
         this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}), ...(full ? { full } : {}) })
-      )
+      })
       ids.push(id)
     }
     return ids
@@ -1171,9 +1214,11 @@ export class PeerLink {
     })
     t._sid = sid
     this.onTransfer(t)
-    Promise.all([headHash(entry.file), fullHash(entry.file)]).then(([head, full]) =>
+    Promise.all([headHash(entry.file), fullHash(entry.file)]).then(([head, full]) => {
+      const cur = this._outgoingFiles.get(id)
+      if (cur) cur.offeredDigest = !!full // P4: a digest means a modern receiver acks
       this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, ...(head ? { head } : {}), ...(full ? { full } : {}) })
-    )
+    })
   }
 
   // Receiver accepts an offered incoming transfer (fresh, from byte 0).
@@ -1257,22 +1302,67 @@ export class PeerLink {
       await new Promise((res) => setTimeout(res, 50))
     }
     if (this._closed) return
-    // P4: do NOT declare complete here anymore. A send is "done" only when the
-    // receiver delivery-acks the whole-file sha256 (see CTRL.DELIVERY_ACK).
-    // Bounded fallback for interop with a peer too old to ack (or one that
-    // offered no digest): after the buffer drains, accept on size+drain in
-    // ACK_FALLBACK_MS if no ack arrives, preserves the never-hangs property.
+    // P4 (silent-data-loss fix): a send is "done" ONLY on a genuine delivery-ack
+    // (CTRL.DELIVERY_ACK). The bytes "draining" out of the SCTP buffer proves
+    // nothing: a path that black-holes without ICE noticing drains the buffer
+    // while NOTHING arrives. So the no-ack window NEVER completes. After it
+    // elapses we re-probe once (re-send END to prompt a possibly-lost ack), and
+    // if still unacked we end HONESTLY (failed, resumable) rather than claiming a
+    // false success. The never-hangs property is preserved: we always reach a
+    // terminal state in bounded time, just an honest one.
+    this._armAckFallback(id, sid, false)
+  }
+
+  // P4: arm (or re-arm, after a re-probe) the no-ack window for an outgoing send.
+  // `reprobed` is true on the second arming (after we re-sent END once).
+  _armAckFallback(id, sid, reprobed) {
     this._ackTimers ||= new Map()
     if (this._ackTimers.has(id)) clearTimeout(this._ackTimers.get(id))
+    const wait = reprobed ? ACK_REPROBE_MS : ACK_FALLBACK_MS
     this._ackTimers.set(id, setTimeout(() => {
       this._ackTimers.delete(id)
       const cur = this.transfers.get(id)
-      if (!cur || cur.status === 'complete') return
-      rlog.debug('no delivery-ack, accepting on drain', id)
+      if (!cur || cur.status === 'complete') return // the real ack landed meanwhile
+      const entry = this._outgoingFiles.get(id)
+      const decision = decideAckFallback({
+        channelOpen: this.channel?.readyState === 'open',
+        connected: this.pc?.connectionState === 'connected',
+        peerHasAcked: this._peerAcks(),
+        offeredDigest: !!entry?.offeredDigest,
+        reprobed,
+      })
+      if (decision.action === 'reprobe') {
+        // The ack may have been lost on a still-healthy link. Re-send END once to
+        // prompt the receiver to re-ack, then wait one more (shorter) window.
+        rlog.debug('no delivery-ack yet, re-probing (re-sending END)', id)
+        this._control({ type: CTRL.END, id, sid })
+        this._armAckFallback(id, sid, true)
+        return
+      }
+      // No ack after the re-probe (or the link is unhealthy). Do NOT complete.
+      // Keep the file in the outgoing store so it can resume, and end honestly.
+      rlog.warn('no delivery-ack: send NOT confirmed, ending as unconfirmed (resumable)', id)
+      const resumable = decision.resumable && this.stores.outgoing.has(id)
       this._outgoingFiles.delete(id)
-      this.stores.outgoing.delete(id)
-      this._update(cur, { status: 'complete', progress: 1 })
-    }, ACK_FALLBACK_MS))
+      this._update(cur, { status: resumable ? 'paused' : 'failed', reason: 'delivery not confirmed' })
+    }, wait))
+  }
+
+  // P4: persist + cache "this peer delivery-acks" so a known-ack peer never gets a
+  // weak completion, the ack is mandatory for it. Keyed by peerUid (stable across
+  // links); falls back to a per-instance flag when there's no uid.
+  _markPeerAcks() {
+    this._peerAckedThisLink = true
+    try {
+      if (this.peerUid) localStorage.setItem('filamentPeerAcks:' + this.peerUid, '1')
+    } catch {}
+  }
+  _peerAcks() {
+    if (this._peerAckedThisLink) return true
+    try {
+      if (this.peerUid) return localStorage.getItem('filamentPeerAcks:' + this.peerUid) === '1'
+    } catch {}
+    return false
   }
 
   // ------------------------------------------------------------------ helpers
