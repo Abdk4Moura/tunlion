@@ -15,9 +15,19 @@ import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { PredictiveEcho } from '../lib/predict.js'
+import { log } from '../lib/log.js'
 import '@xterm/xterm/css/xterm.css'
 
 const enc = new TextEncoder()
+
+// Run a render-helper / per-write callback so NOTHING it throws can escape into
+// xterm's internal write loop (a throw in a term.write completion callback jams
+// xterm's write queue and freezes the terminal while the link/PTY stay alive,
+// the confirmed root cause of the freeze bug). A helper error is swallowed here
+// (logged at debug), never propagated. `tag` is just for the log line.
+function guarded(tag, fn) {
+  try { fn() } catch (e) { try { log.debug('webterm: render helper threw (' + tag + ')', e && (e.message || e)) } catch (_) {} }
+}
 
 // label -> exact bytes sent to the PTY (xterm/ANSI). From the research doc.
 const KEYS = {
@@ -81,6 +91,17 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   // predict a char AND let the composition commit insert it (double insert).
   const predictRef = useRef(null)
   const composingRef = useRef(false)
+  // --- render watchdog (self-heal a wedge without reload) -------------------
+  // The freeze symptom is: PTY bytes keep arriving but xterm stops painting (a
+  // thrown write-completion callback jammed the write queue, or the renderer
+  // paused). We track WHEN bytes last arrived (bytesAt / byteCount) and the last
+  // time the rendered buffer actually ADVANCED (renderAt, sampled from a parse
+  // tick AND from the buffer's own length/cursor so we are not fooled by a
+  // handler that itself stopped firing). If bytes arrived recently but the
+  // render has not advanced for the stall window, we auto-run redrawRecover.
+  // Only fires when bytes-arrived-but-render-stuck, so a legitimately idle
+  // terminal (no bytes) never triggers it (no false positives).
+  const wd = useRef({ bytesAt: 0, byteCount: 0, renderAt: 0, lastByteCount: 0, lastSig: '', recoverAt: 0 })
   // --- custom scrollbar (the reliable mobile scroll, issue #5) -------------
   // A plain DOM track+thumb pinned to the right edge. Unlike the swipe handler
   // (which never fired reliably on real iPad/Android), a dragged DOM element
@@ -157,7 +178,13 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   // viewport shows `rows` of them starting at viewportY. The thumb height is the
   // visible fraction (rows / total) and its top is viewportY / total. Hidden
   // when everything fits (baseY === 0) or a TUI owns the alternate screen.
+  // Dev-only fault injection (preview harness): set window.__webtermThrowSyncBar
+  // to make the NEXT syncBar() throw once, to prove the guarded callbacks swallow
+  // it and the terminal keeps rendering (no wedge). Inert in the real app: the
+  // ref is only ever set by the preview hook below.
+  const throwSyncBarRef = useRef(false)
   const syncBar = useCallback(() => {
+    if (throwSyncBarRef.current) { throwSyncBarRef.current = false; throw new Error('injected syncBar fault (dev)') }
     const term = termRef.current
     const b = term && term.buffer && term.buffer.active
     if (!term || !b) { setBar((p) => (p.visible ? { ...p, visible: false } : p)); return }
@@ -273,8 +300,8 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
           if (nb) term.scrollToLine(Math.max(0, nb.baseY - fromTail))
         }
       } catch (e) {}
-      setAtBottom(computeAtBottom())
-      syncBar()
+      guarded('safeFit.atBottom', () => setAtBottom(computeAtBottom()))
+      guarded('safeFit.syncBar', () => syncBar())
     })
   }, [computeAtBottom, syncBar])
 
@@ -444,8 +471,21 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       // truth), then resync the predictor's view of the buffer (e.g. a flip into a
       // TUI's alternate screen drops prediction).
       l.onPtyData = (u8) => {
+        // Watchdog signal: PTY bytes have arrived (timestamp + running byte
+        // count). The watchdog compares this against whether the rendered buffer
+        // actually advanced, to self-heal a wedged screen without a reload.
+        try { wd.current.bytesAt = Date.now(); wd.current.byteCount += (u8 && u8.length) || 0 } catch (e) {}
+        // predict.onServerData is itself fail-safe (wrapped in predict.js); the
+        // extra guard here is belt-and-suspenders so the write still happens.
         try { predict.onServerData(u8) } catch (e) {}
-        term.write(u8, () => { try { predict.syncBuffer() } catch (e) {}; syncBar() })
+        // The write-COMPLETION callback runs inside xterm's write loop: if it
+        // throws, it jams the write queue and freezes rendering. Every bit of
+        // work in here is therefore guarded so nothing can escape (the bug was
+        // an UNGUARDED syncBar() here). predict.syncBuffer is also fail-safe.
+        term.write(u8, () => {
+          guarded('onPtyData.predict.syncBuffer', () => predict.syncBuffer())
+          guarded('onPtyData.syncBar', () => syncBar())
+        })
       }
       l.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
       l.onPtyReady = () => {
@@ -489,25 +529,35 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     // predicting it would be wrong. We also never predict mid-IME-composition;
     // the resolved text is predicted on compositionend instead. write() targets
     // linkRef.current, so this sub stays correct across reconnects.
+    // onData is user input (not inside xterm's write loop), but still fully
+    // guarded so a predict/write throw can never wedge typing. predict.onUserKey
+    // is itself fail-safe; this is belt-and-suspenders and protects write().
     const dataSub = term.onData((d) => {
       if (!ctrl.current && !alt.current) {
-        try { predict.onUserKey(d, composingRef.current) } catch (e) {}
+        guarded('onData.predict', () => predict.onUserKey(d, composingRef.current))
       }
-      write(applyMods(d))
+      guarded('onData.write', () => write(applyMods(d)))
     })
     // Resize -> PTY: route through linkRef.current so a reconnect keeps SIGWINCH
-    // flowing to the new link without rebuilding this subscription.
-    const sizeSub = term.onResize(({ cols, rows }) => { const l = linkRef.current; if (l) l.resizePty(cols, rows) })
+    // flowing to the new link without rebuilding this subscription. Guarded: a
+    // resize handler runs on xterm's path and must never throw back into it.
+    const sizeSub = term.onResize(({ cols, rows }) => {
+      guarded('onResize.pty', () => { const l = linkRef.current; if (l) l.resizePty(cols, rows) })
+    })
     // Track scroll position so the scroll-to-bottom affordance shows only when
     // the reader has scrolled up off the live tail. Fires on wheel, touch swipe,
-    // and programmatic scrolls alike.
-    const scrollSub = term.onScroll(() => { setAtBottom(computeAtBottom()); syncBar() })
+    // and programmatic scrolls alike. Guarded so a thrown helper cannot wedge.
+    const scrollSub = term.onScroll(() => {
+      guarded('onScroll', () => { setAtBottom(computeAtBottom()); syncBar() })
+    })
     // Keep the thumb in sync as output arrives and as the alt screen toggles.
     // onWriteParsed fires after each parsed chunk (covers TUI enter/exit and the
-    // alternate-screen flip); onLineFeed covers plain line growth.
-    const writeSub = term.onWriteParsed(() => syncBar())
-    const lineSub = term.onLineFeed(() => syncBar())
-    const resizeBarSub = term.onResize(() => syncBar())
+    // alternate-screen flip), INSIDE xterm's write loop, so guarding it is
+    // essential; onLineFeed covers plain line growth. The watchdog also samples
+    // a render tick here so it can tell the buffer actually advanced.
+    const writeSub = term.onWriteParsed(() => guarded('onWriteParsed', () => { wd.current.renderAt = Date.now(); syncBar() }))
+    const lineSub = term.onLineFeed(() => guarded('onLineFeed', () => { wd.current.renderAt = Date.now(); syncBar() }))
+    const resizeBarSub = term.onResize(() => guarded('onResize.bar', () => syncBar()))
 
     // --- touch scrolling (issue #5) -----------------------------------------
     // On mobile a one-finger swipe over the terminal must scroll the SCROLLBACK,
@@ -616,8 +666,66 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     try {
       if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('preview')) {
         window.__webtermRecover = redrawRecover
+        // Fault-injection hooks for the harness to prove the guards work:
+        //  __webtermThrowSyncBar(): next syncBar() throws once (must be swallowed).
+        //  __webtermWatchdog: live watchdog state (so a "stuck" state can be faked
+        //  by freezing the render signature while bumping byteCount).
+        window.__webtermThrowSyncBar = () => { throwSyncBarRef.current = true }
+        window.__webtermWatchdog = wd.current
       }
     } catch (e) {}
+  }, [redrawRecover])
+
+  // Render watchdog: a cheap 1s poll that self-heals a wedged screen with no
+  // reload. A render "signature" captures whether the terminal actually advanced
+  // (buffer length + cursor); if it is unchanged WHILE new PTY bytes have arrived
+  // since the last advance, the screen is stuck (bytes in, nothing painted), so
+  // we run the existing redrawRecover() once. Guards against false positives:
+  //   - only acts when byteCount grew since we last saw the render advance, so an
+  //     idle terminal (no incoming bytes) is never touched;
+  //   - requires the stall to persist (bytes arrived >= STALL_MS ago and render
+  //     still has not moved), so a single slow frame does not trip it;
+  //   - rate-limited (one recover per RECOVER_COOLDOWN) so it cannot thrash.
+  useEffect(() => {
+    const STALL_MS = 3500   // bytes arrived but render frozen this long => wedged
+    const COOLDOWN = 8000   // do not re-recover more often than this
+    const tick = () => {
+      const term = termRef.current
+      const s = wd.current
+      if (!term) return
+      // Current render signature: total buffer length + cursor position. Any real
+      // paint advances at least one of these; reading it is cheap.
+      let sig = ''
+      try {
+        const b = term.buffer && term.buffer.active
+        if (b) sig = b.length + ':' + b.baseY + ':' + b.cursorY + ':' + b.cursorX
+      } catch (e) { return }
+      const now = Date.now()
+      // If the signature changed, the terminal advanced: record it and clear the
+      // "bytes since last advance" baseline (we are caught up to the render).
+      if (sig !== s.lastSig) {
+        s.lastSig = sig
+        s.renderAt = now
+        s.lastByteCount = s.byteCount
+        return
+      }
+      // Signature unchanged. Only a wedge if NEW bytes arrived since the last
+      // advance AND those bytes are old enough to have rendered by now.
+      const bytesSinceAdvance = s.byteCount - s.lastByteCount
+      const bytesAreStale = s.bytesAt && (now - s.bytesAt) >= STALL_MS
+      const renderStale = s.renderAt && (now - s.renderAt) >= STALL_MS
+      if (bytesSinceAdvance > 0 && bytesAreStale && renderStale) {
+        if (now - s.recoverAt < COOLDOWN) return
+        s.recoverAt = now
+        // Reset the baseline so a successful recover does not immediately re-trip.
+        s.lastByteCount = s.byteCount
+        s.renderAt = now
+        try { log.warn('webterm: render wedge detected, auto-recovering', { bytesSinceAdvance }) } catch (e) {}
+        guarded('watchdog.redrawRecover', () => redrawRecover())
+      }
+    }
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
   }, [redrawRecover])
 
   // live theme
