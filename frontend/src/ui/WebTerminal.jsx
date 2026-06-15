@@ -58,6 +58,13 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const hostRef = useRef(null)
   const termRef = useRef(null)
   const fitRef = useRef(null)
+  // The CURRENT link, always live. The terminal is created ONCE (mount-once
+  // effect) and never recreated on a reconnect; its persistent handlers
+  // (onData, IME commit, the redraw recovery) read linkRef.current so they
+  // always reach the freshest PeerLink instead of a stale closure over the
+  // link that was current when the terminal was built. The link-binding
+  // effect keeps this in sync.
+  const linkRef = useRef(link)
   const ctrl = useRef(false) // 'armed' modifiers, read inside onData
   const alt = useRef(false)
   const [ctrlOn, setCtrlOn] = useState(false) // mirror for the UI
@@ -94,7 +101,10 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   }, [])
   useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
 
-  const write = useCallback((s) => link && link.sendPtyInput(enc.encode(s)), [link])
+  // Always send to the CURRENT link (linkRef), never a captured one, so a
+  // reconnect (new link, same terminal) keeps input flowing without rebuilding
+  // any of the persistent handlers that call write.
+  const write = useCallback((s) => { const l = linkRef.current; return l && l.sendPtyInput(enc.encode(s)) }, [])
 
   // apply sticky Ctrl/Alt to a single typed char, then disarm (unless locked)
   const applyMods = useCallback((data) => {
@@ -268,11 +278,43 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     })
   }, [computeAtBottom, syncBar])
 
-  // mount xterm + open the pty. Re-runs when `link` changes (a reconnect hands
-  // us a fresh PeerLink); the SAME session id makes that a reattach, not a new
-  // shell.
+  // Bind a link's PTY callbacks to the EXISTING terminal and (re)open/reattach
+  // the PTY with our stable session id. Stored in a ref so BOTH the link-binding
+  // effect and the no-reload redraw recovery can call the exact same logic. It
+  // reads termRef/predictRef/linkRef (all live), never closes over a stale link,
+  // and returns a cleanup that only UNBINDS handlers (never disposes the
+  // terminal, never closePty), so a link swap leaves the remote PTY running.
+  const bindLinkRef = useRef(() => () => {})
+  // The active unbind for the current link binding. The link-binding effect and
+  // the redraw recovery both go through rebindLink() so there is ever only ONE
+  // live binding (and one reattach poll): rebinding always unbinds first.
+  const unbindRef = useRef(null)
+  const rebindLink = useCallback(() => {
+    try { if (unbindRef.current) unbindRef.current() } catch (e) {}
+    unbindRef.current = bindLinkRef.current()
+  }, [])
+  // No-reload recovery: if the screen ever gets stuck (a paused DOM renderer
+  // after a flaky reconnect / a hidden then re-shown host), this re-fits, forces
+  // a FULL repaint of every row, rebinds the current link's PTY callbacks, and
+  // re-opens/reattaches the PTY with our stable session id. Safe to call anytime
+  // (no link / no terminal yet => no-ops), and it never tears down the terminal,
+  // so scrollback survives. Wired to a button near the scroll-to-bottom control.
+  const redrawRecover = useCallback(() => {
+    const term = termRef.current
+    safeFit()
+    if (term) { try { term.refresh(0, Math.max(0, (term.rows || 1) - 1)) } catch (e) {} }
+    // Rebind + reattach the CURRENT link (rebindLink unbinds the old binding
+    // first, so there is no duplicate handler or leaked poll).
+    if (linkRef.current) { try { rebindLink() } catch (e) {} }
+    if (term) { try { term.focus() } catch (e) {} }
+    haptic()
+  }, [safeFit, rebindLink])
+
+  // mount xterm ONCE. This is the ONLY place the Terminal is created/opened and
+  // (on final unmount) disposed. It is decoupled from `link`: a reconnect swaps
+  // the link via the link-binding effect below and REBINDS callbacks to this same
+  // terminal, so the screen never gets torn down and rebuilt (the freeze bug).
   useEffect(() => {
-    if (!link) return
     const term = new Terminal({
       fontFamily: font, fontSize: isTouch ? 13 : 13.5, lineHeight: 1.3, letterSpacing: 0.2,
       cursorBlink: true, cursorStyle: 'bar', cursorWidth: 2, scrollback: 5000,
@@ -386,39 +428,76 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       }
     }
 
-    // bridge: PTY -> xterm. Raw bytes, written through unmodified so alternate
-    // screen / cursor-addressing escapes reach the parser intact (issue #1).
-    // Server bytes are authoritative. Let the predictor reconcile its pending
-    // predictions against them FIRST (confirm matches / erase divergences), then
-    // write the real bytes (which overwrite any confirmed styled cells with the
-    // truth), then resync the predictor's view of the buffer (e.g. a flip into a
-    // TUI's alternate screen drops prediction).
-    link.onPtyData = (u8) => {
-      try { predict.onServerData(u8) } catch (e) {}
-      term.write(u8, () => { try { predict.syncBuffer() } catch (e) {}; syncBar() })
+    // The per-link binding (PTY callbacks + reattach) lives in bindLinkRef so the
+    // link-binding effect and the redraw recovery share ONE implementation. It is
+    // defined here, in the mount-once effect, so it closes over the persistent
+    // `term`/`predict`/`fit` (which never change) and reads `linkRef.current` for
+    // the link (which does). Returns an unbind cleanup.
+    bindLinkRef.current = () => {
+      const l = linkRef.current
+      if (!l) return () => {}
+      // bridge: PTY -> xterm. Raw bytes, written through unmodified so alternate
+      // screen / cursor-addressing escapes reach the parser intact (issue #1).
+      // Server bytes are authoritative. Let the predictor reconcile its pending
+      // predictions against them FIRST (confirm matches / erase divergences), then
+      // write the real bytes (which overwrite any confirmed styled cells with the
+      // truth), then resync the predictor's view of the buffer (e.g. a flip into a
+      // TUI's alternate screen drops prediction).
+      l.onPtyData = (u8) => {
+        try { predict.onServerData(u8) } catch (e) {}
+        term.write(u8, () => { try { predict.syncBuffer() } catch (e) {}; syncBar() })
+      }
+      l.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
+      l.onPtyReady = () => {
+        setStatus('ready')
+        // The PTY is live (fresh or reattached): make sure its window size matches
+        // what we actually render, then nudge a SIGWINCH so a TUI redraws to fit.
+        safeFit()
+        const t = termRef.current
+        const cur = linkRef.current
+        if (t && cur) cur.resizePty(t.cols || 80, t.rows || 24)
+      }
+      // open (or reattach to) the shell once the channel is up, carrying our
+      // stable session id so the CLI can rebind a surviving PTY (issue #4). On a
+      // link swap the SAME session id makes this a reattach, not a fresh shell, so
+      // the still-running remote PTY replays into this SAME terminal.
+      const begin = () => {
+        if (l.channel && l.channel.readyState === 'open') {
+          const cols = term.cols || 80
+          const rows = term.rows || 24
+          l.openPty(cols, rows, sessionIdRef.current)
+          setStatus('connecting')
+          return true
+        }
+        return false
+      }
+      let poll = null
+      if (!begin()) poll = setInterval(() => { if (begin()) clearInterval(poll) }, 200)
+      // Cleanup: ONLY unbind this link's handlers (no-op them) and stop the poll.
+      // Never dispose the terminal and never closePty: a link swap must leave the
+      // remote PTY running so the next link reattaches to it.
+      return () => {
+        if (poll) clearInterval(poll)
+        l.onPtyData = () => {}; l.onPtyClose = () => {}; l.onPtyReady = () => {}
+      }
     }
-    link.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
-    link.onPtyReady = () => {
-      setStatus('ready')
-      // The PTY is live (fresh or reattached): make sure its window size matches
-      // what we actually render, then nudge a SIGWINCH so a TUI redraws to fit.
-      safeFit()
-      const t = termRef.current
-      if (t) link.resizePty(t.cols || 80, t.rows || 24)
-    }
+
     // bridge: xterm -> PTY (with sticky modifiers). Prediction is attempted on
     // the RAW key first (cosmetic only; the real key is always sent), but only
     // when no sticky modifier is armed: Ctrl/Alt turn a printable into a control
     // sequence (applyMods), which the server will not echo as that char, so
     // predicting it would be wrong. We also never predict mid-IME-composition;
-    // the resolved text is predicted on compositionend instead.
+    // the resolved text is predicted on compositionend instead. write() targets
+    // linkRef.current, so this sub stays correct across reconnects.
     const dataSub = term.onData((d) => {
       if (!ctrl.current && !alt.current) {
         try { predict.onUserKey(d, composingRef.current) } catch (e) {}
       }
       write(applyMods(d))
     })
-    const sizeSub = term.onResize(({ cols, rows }) => link.resizePty(cols, rows))
+    // Resize -> PTY: route through linkRef.current so a reconnect keeps SIGWINCH
+    // flowing to the new link without rebuilding this subscription.
+    const sizeSub = term.onResize(({ cols, rows }) => { const l = linkRef.current; if (l) l.resizePty(cols, rows) })
     // Track scroll position so the scroll-to-bottom affordance shows only when
     // the reader has scrolled up off the live tail. Fires on wheel, touch swipe,
     // and programmatic scrolls alike.
@@ -486,27 +565,16 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     host.addEventListener('touchend', onTouchEnd, { passive: true })
     host.addEventListener('touchcancel', onTouchEnd, { passive: true })
 
-    // open (or reattach to) the shell once the channel is up, carrying our
-    // stable session id so the CLI can rebind a surviving PTY (issue #4).
-    const begin = () => {
-      if (link.channel && link.channel.readyState === 'open') {
-        const cols = term.cols || 80
-        const rows = term.rows || 24
-        link.openPty(cols, rows, sessionIdRef.current)
-        setStatus('connecting')
-        return true
-      }
-      return false
-    }
-    let poll = null
-    if (!begin()) poll = setInterval(() => { if (begin()) clearInterval(poll) }, 200)
-
     const ro = new ResizeObserver(() => safeFit())
     ro.observe(hostRef.current)
     term.focus()
 
+    // Final-unmount cleanup ONLY. This effect has deps [] so it runs exactly
+    // once on mount and its cleanup runs exactly once on unmount: the ONLY place
+    // the terminal/predictor/terminal-level subs are disposed. A reconnect does
+    // NOT come through here (it is the [link] effect), so the terminal survives a
+    // link swap, preserving scrollback and never blanking the screen.
     return () => {
-      if (poll) clearInterval(poll)
       if (fitRaf.current) { cancelAnimationFrame(fitRaf.current); fitRaf.current = 0 }
       dataSub.dispose(); sizeSub.dispose(); scrollSub.dispose(); ro.disconnect()
       try { writeSub.dispose(); lineSub.dispose(); resizeBarSub.dispose() } catch (e) {}
@@ -514,40 +582,61 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       host.removeEventListener('touchmove', onTouchMove)
       host.removeEventListener('touchend', onTouchEnd)
       host.removeEventListener('touchcancel', onTouchEnd)
-      // Detach our handlers from THIS link but do NOT closePty here on a link
-      // swap: the unmount-vs-reconnect distinction is that a true unmount runs
-      // the close button (closeSession), which detaches the session. A bare
-      // link swap should leave the remote PTY running. We still send a detach
-      // (closePty) only when the whole component unmounts; React runs this
-      // cleanup on both, so we rely on the CLI keeping the PTY alive on a
-      // channel drop and only treat an explicit `l2-close` as a teardown.
-      link.onPtyData = () => {}; link.onPtyClose = () => {}; link.onPtyReady = () => {}
       try { predict.dispose() } catch (e) {}
       predictRef.current = null
       term.dispose()
+      termRef.current = null; fitRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [link])
+  }, [])
+
+  // Link-binding effect: when `link` changes (a reconnect hands us a fresh
+  // PeerLink), point linkRef at it and REBIND its PTY callbacks to the EXISTING
+  // terminal, then re-open/reattach the PTY with the stable session id. Cleanup
+  // only unbinds the old link's handlers (set to no-ops) and stops its poll; it
+  // does NOT dispose or recreate the terminal and does NOT closePty, so the
+  // remote PTY keeps running across the swap.
+  useEffect(() => {
+    linkRef.current = link
+    if (!link) return
+    rebindLink()
+    return () => { try { if (unbindRef.current) unbindRef.current() } catch (e) {}; unbindRef.current = null }
+  }, [link, rebindLink])
 
   // Explicit teardown: closing the session (the ✕) must end the remote PTY.
-  // Kept separate from the link-swap cleanup above so a reconnect never kills it.
+  // Kept separate from the link-swap unbind above so a reconnect never kills it.
   const endSession = useCallback(() => {
-    try { link && link.closePty() } catch (e) {}
+    try { const l = linkRef.current; l && l.closePty() } catch (e) {}
     onClose && onClose()
-  }, [link, onClose])
+  }, [onClose])
+
+  // Dev-only: expose the no-reload recovery to the ?preview= harness so Playwright
+  // can trigger it without a synthetic tap. Inert in the real app (no query).
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('preview')) {
+        window.__webtermRecover = redrawRecover
+      }
+    } catch (e) {}
+  }, [redrawRecover])
 
   // live theme
   useEffect(() => { if (termRef.current) termRef.current.options.theme = xtermTheme(T, accent) }, [T, accent])
 
   // Sessions dock: when this instance is un-hidden (reopened from the background)
-  // its host had display:none, so xterm couldn't measure: refit + refocus now
-  // that it's visible again. The terminal was NEVER unmounted, so scrollback and
-  // the live PTY are intact. requestAnimationFrame waits for the layout to apply.
+  // its host had display:none, so xterm couldn't measure: refit + force a full
+  // repaint + refocus now that it's visible again. A renderer that paused while
+  // the host was hidden / zero-size (mobile keyboard, backgrounded session) needs
+  // the explicit term.refresh to resume painting, otherwise the first frame back
+  // can stay blank. The terminal was NEVER unmounted, so scrollback and the live
+  // PTY are intact. requestAnimationFrame waits for the layout to apply.
   useEffect(() => {
     if (hidden) return
     const raf = requestAnimationFrame(() => {
       safeFit()
-      try { termRef.current && termRef.current.focus() } catch (e) {}
+      const term = termRef.current
+      if (term) { try { term.refresh(0, Math.max(0, (term.rows || 1) - 1)) } catch (e) {} }
+      try { term && term.focus() } catch (e) {}
     })
     return () => cancelAnimationFrame(raf)
   }, [hidden, safeFit])
@@ -670,6 +759,9 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     // Scrollback page controls (scroll the xterm buffer, NOT PgUp/PgDn to the
     // PTY): a touch-friendly way to move through history a page at a time.
     { l: 'ScrollUp', g: '⇞', fn: () => scrollPage(-1) }, { l: 'ScrollDn', g: '⇟', fn: () => scrollPage(1) },
+    // No-reload recovery: repaint + reattach if the screen ever freezes after a
+    // flaky reconnect, so the user never has to reload the page.
+    { l: 'Redraw', g: '⟳', fn: redrawRecover },
     { l: 'Copy', g: 'copy', fn: copySelection }, { l: 'Paste', g: 'paste', fn: pasteClipboard },
   ]
 
