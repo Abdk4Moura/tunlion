@@ -36,6 +36,8 @@
 // to exactly what the server sent. We never layer authoritative bytes on top of
 // stale styled cells, and we never double-apply an erase.
 
+import { log } from './log.js'
+
 // SGR styling for a predicted (not-yet-confirmed) cell: dim + underline. Reset
 // after the run so nothing leaks into authoritative output we write.
 const PREDICT_ON = '\x1b[2m\x1b[4m'
@@ -260,7 +262,12 @@ export class PredictiveEcho {
   // unconfirmed past timeoutMs (a lost keystroke must not leave a ghost).
   _arm() {
     if (this._timer) return
-    this._timer = setInterval(() => this._sweep(), Math.max(100, Math.floor(this.timeoutMs / 4)))
+    // The sweep runs on a timer (not through the public fail-safe wrapper), so it
+    // is guarded here: a throw must disable prediction, never bubble out of the
+    // interval callback uncaught.
+    this._timer = setInterval(() => {
+      try { this._sweep() } catch (err) { try { this._failsafeOff(err) } catch (e) {} }
+    }, Math.max(100, Math.floor(this.timeoutMs / 4)))
   }
   _disarmIfEmpty() {
     if (!this.anchor && this._timer) { clearInterval(this._timer); this._timer = 0 }
@@ -293,6 +300,52 @@ export class PredictiveEcho {
     if (this._timer) { clearInterval(this._timer); this._timer = 0 }
     this.anchor = null; this.text = ''
     this.probe = []
+  }
+
+  // Permanently disable prediction for the rest of the session: clear any
+  // outstanding overlay (best-effort), drop the model, force confidence OFF, and
+  // become a pure pass-through. Called by the fail-safe wrapper when any internal
+  // method throws, so one bad prediction can never freeze or garble the terminal.
+  // Idempotent and itself guarded: a failure here must not propagate either.
+  _failsafeOff(err) {
+    try { if (this._timer) { clearInterval(this._timer); this._timer = 0 } } catch (e) {}
+    // Best-effort erase of any styled cells we left behind.
+    try {
+      if (this.anchor && this.term && this.term.buffer && this.term.buffer.active) {
+        const b = this.term.buffer.active
+        const vrow = this.anchor.y - b.baseY
+        if (vrow >= 0 && vrow < this.term.rows) {
+          this.term.write(`\x1b[${vrow + 1};${this.anchor.x + 1}H\x1b[0m\x1b[K`)
+        }
+      }
+    } catch (e) {}
+    this.anchor = null; this.text = ''
+    this.probe = []
+    this.confidence = OFF
+    this.enabled = false // pure pass-through from now on
+    this._dead = true
+    try { log.warn('predict disabled (failsafe)', err && (err.message || err)) } catch (e) {}
+  }
+}
+
+// Wrap PredictiveEcho's public methods so ANY internal exception disables
+// prediction for the session (pass-through) instead of throwing into xterm's
+// hot render path or corrupting the screen. onServerData MUST still return the
+// authoritative bytes unchanged even on failure: the caller writes them.
+const _GUARDED = ['onUserKey', 'onUserText', 'onServerData', 'syncBuffer', 'clear', 'dispose']
+for (const name of _GUARDED) {
+  const orig = PredictiveEcho.prototype[name]
+  PredictiveEcho.prototype[name] = function (...args) {
+    if (this._dead) {
+      // Already failed-safe: do nothing except honor onServerData's contract.
+      return name === 'onServerData' ? (args.length ? args[0] : undefined) : undefined
+    }
+    try {
+      return orig.apply(this, args)
+    } catch (err) {
+      try { this._failsafeOff(err) } catch (e) {}
+      return name === 'onServerData' ? (args.length ? args[0] : undefined) : undefined
+    }
   }
 }
 
