@@ -762,6 +762,57 @@ function SessionsStrip({ sessions, activeId, onSwitch, onClose, narrow, T, accen
   )
 }
 
+// Track the VISUAL viewport (the actually-visible region), not the layout
+// viewport. On mobile the layout viewport (window.innerHeight) is taller than
+// what is on screen whenever the URL bar is showing or the soft keyboard is up,
+// so a position:fixed; inset:0 box (which sizes to the LAYOUT viewport) hangs
+// below the fold and the browser lets you PAN the whole fixed surface to reach
+// it: the "scroll like an image" symptom. Pinning the terminal overlay to these
+// numbers makes it exactly fill what is visible, so nothing pans. width/height
+// are the visible size; left/top are visualViewport.offsetLeft/Top so the box
+// follows the visible region (e.g. when a pinch leaves the page mid-zoom).
+function useVisualViewport() {
+  const read = () => {
+    const vv = (typeof window !== 'undefined') && window.visualViewport
+    if (vv) return { width: vv.width, height: vv.height, left: vv.offsetLeft, top: vv.offsetTop }
+    if (typeof window !== 'undefined') return { width: window.innerWidth, height: window.innerHeight, left: 0, top: 0 }
+    return { width: 0, height: 0, left: 0, top: 0 }
+  }
+  const [vp, setVp] = useState(read)
+  useEffect(() => {
+    const vv = window.visualViewport
+    const onChange = () => setVp(read())
+    if (vv) {
+      vv.addEventListener('resize', onChange)
+      vv.addEventListener('scroll', onChange)
+    }
+    window.addEventListener('resize', onChange)
+    onChange()
+    return () => {
+      if (vv) { vv.removeEventListener('resize', onChange); vv.removeEventListener('scroll', onChange) }
+      window.removeEventListener('resize', onChange)
+    }
+  }, [])
+  return vp
+}
+
+// Scope pinch-zoom suppression to the shell-terminal view ONLY. When a terminal
+// session is on screen we swap the viewport meta to disallow user scaling, so a
+// pinch can no longer turn the terminal into a zoomable/pannable image (the core
+// "scroll like an image" symptom on real phones). On close we RESTORE the
+// original meta, so accessibility zoom on the marketing/content pages is never
+// broken. No-ops where there is no meta tag.
+function useLockZoomWhile(active) {
+  useEffect(() => {
+    if (!active) return
+    const meta = document.querySelector('meta[name=viewport]')
+    if (!meta) return
+    const prev = meta.getAttribute('content')
+    meta.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover')
+    return () => { if (prev != null) meta.setAttribute('content', prev) }
+  }, [active])
+}
+
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
@@ -810,6 +861,10 @@ export default function Filament(props) {
     setActiveSessionId((cur) => (cur === id ? null : cur))
   }, [])
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null
+  // Pin the terminal overlay to the visual viewport and suppress pinch-zoom only
+  // while a session is actually on screen (mobile "scroll like an image" fix).
+  const vp = useVisualViewport()
+  useLockZoomWhile(!!activeSession)
   // model H: the per-device actions sheet. { peer, rect }: rect anchors the
   // desktop popover near the invoking tile (null = a sensible default position).
   const [sheet, setSheet] = useState(null)
@@ -963,8 +1018,18 @@ export default function Filament(props) {
   // (pointerEvents:none) but the sessions stay mounted underneath.
   const terminalOverlay = sessions.length
     ? createPortal(
-        <div style={{
-          position: 'fixed', inset: 0, zIndex: 4000, background: T.bg,
+        <div data-testid="terminal-overlay" style={{
+          // Pinned to the VISUAL viewport (not inset:0, which is the LAYOUT
+          // viewport): left/top track the visible region's offset and width/
+          // height are exactly the visible size, so on mobile the box never
+          // extends below the fold (no pannable surface) and follows the screen
+          // when the URL bar / soft keyboard changes the visible height.
+          // overflow:hidden so no descendant can introduce a pannable overflow,
+          // and touchAction:none + overscrollBehavior:none so a touch that is not
+          // consumed by the terminal cannot pan or bounce this overlay either.
+          position: 'fixed', zIndex: 4000, background: T.bg,
+          left: vp.left, top: vp.top, width: vp.width, height: vp.height,
+          overflow: 'hidden', touchAction: 'none', overscrollBehavior: 'none',
           display: activeSession ? 'block' : 'none',
         }}>
           {sessions.map((s) => {
@@ -987,6 +1052,7 @@ export default function Filament(props) {
                 {link
                   ? <WebTerminal link={link} peerName={peer.name} route={peer.route}
                       T={T} accent={accent} font={font} instanceId={s.id} hidden={!visible}
+                      viewportPinned
                       onBackground={backgroundSession} onClose={() => closeSession(s.id)} />
                   : (
                     <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: T.dim, fontFamily: font }}>

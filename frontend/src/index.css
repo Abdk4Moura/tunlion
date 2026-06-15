@@ -2,7 +2,14 @@
    The UI itself is inline-styled in ui/Filament.jsx; this file only carries the
    page reset, the keyframes the component references, and scrollbars. */
 
-html, body { margin: 0; height: 100%; background: #0A0B0C; overflow: hidden; }
+/* App shell: lock the page so a touch never pans or rubber-bands the document.
+   overscroll-behavior:none kills the bounce/pull-to-refresh that, on mobile,
+   reads as "panning an oversized image". height:100% + overflow:hidden keep the
+   document exactly one viewport tall; the terminal overlay then sizes itself to
+   the VISUAL viewport in JS (see Filament.jsx) so nothing taller than what is
+   actually visible can be panned into view. This is the app shell, not the
+   marketing/content pages, so locking page scroll here does not affect reading. */
+html, body { margin: 0; height: 100%; background: #0A0B0C; overflow: hidden; overscroll-behavior: none; }
 * { box-sizing: border-box; }
 #root { position: fixed; inset: 0; }
 
