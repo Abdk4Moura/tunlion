@@ -64,7 +64,13 @@ function makeSessionId(instanceId) {
   return 'pty-' + base
 }
 
-export default function WebTerminal({ link, peerName, route, T, accent, font, onClose, onBackground, hidden, instanceId }) {
+// viewportPinned: the host (the terminal overlay in Filament.jsx, and the
+// preview wrapper) already sizes itself to the VISUAL viewport, so the visible
+// box already excludes the soft keyboard. In that case we must NOT also lift the
+// accessory bar by kbInset (that would double-count the keyboard, leaving a gap
+// and shrinking the terminal). We still listen to visualViewport so a keyboard
+// open/close triggers a refit, we just keep the bar margin at 0.
+export default function WebTerminal({ link, peerName, route, T, accent, font, onClose, onBackground, hidden, instanceId, viewportPinned }) {
   const hostRef = useRef(null)
   const termRef = useRef(null)
   const fitRef = useRef(null)
@@ -756,13 +762,17 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     const vv = window.visualViewport
     if (!vv) return
     const onVV = () => {
-      const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+      // When the host is pinned to the visual viewport the visible box already
+      // excludes the keyboard, so the bar needs no extra lift (kbInset stays 0).
+      // Otherwise (e.g. a host pinned to the layout viewport) lift it ourselves.
+      const inset = viewportPinned ? 0 : Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       setKbInset(inset)
       safeFit()
     }
+    onVV()
     vv.addEventListener('resize', onVV); vv.addEventListener('scroll', onVV)
     return () => { vv.removeEventListener('resize', onVV); vv.removeEventListener('scroll', onVV) }
-  }, [safeFit])
+  }, [safeFit, viewportPinned])
 
   // --- copy / paste (issue #3) --------------------------------------------
   // Desktop: select-to-copy (auto-copies the current selection) + Ctrl/Cmd+V
