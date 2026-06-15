@@ -2,7 +2,7 @@
 // tiny in-browser shell (echo + a few commands), so the terminal UI, the mobile
 // accessory key bar, sticky modifiers, and keyboard handling can be felt and
 // verified live without a paired device. ?preview=webterm.
-import React, { useMemo, useState } from 'react'
+import React, { useState } from 'react'
 import WebTerminal from './WebTerminal.jsx'
 
 const T_DARK = {
@@ -116,8 +116,20 @@ function makeMockLink() {
 }
 
 export default function WebTermPreview() {
-  const link = useMemo(makeMockLink, [])
+  // A swappable link: the "Swap link" button (and the window.__webtermSwapLink
+  // dev hook) replaces the mock PeerLink with a BRAND NEW one, exactly like a
+  // reconnect handing WebTerminal a fresh link. This drives the link-binding
+  // effect WITHOUT recreating the terminal, so the render-freeze fix can be
+  // exercised in the harness: the SAME xterm instance must keep painting, with
+  // scrollback preserved, and input must reach the new link. Inert in the real
+  // app (this whole preview is gated behind ?preview=webterm).
+  const [link, setLink] = useState(makeMockLink)
   const [closed, setClosed] = useState(false)
+  const swapLink = React.useCallback(() => { setLink(makeMockLink()) }, [])
+  React.useEffect(() => {
+    try { window.__webtermSwapLink = swapLink } catch (e) {}
+    return () => { try { delete window.__webtermSwapLink } catch (e) {} }
+  }, [swapLink])
   const T = T_DARK
   const accent = '#7CF6C8'
   const font = "'JetBrains Mono',ui-monospace,monospace"
@@ -125,6 +137,12 @@ export default function WebTermPreview() {
   return (
     <div style={{ position: 'fixed', inset: 0, background: T.bg }}>
       <WebTerminal link={link} peerName="mock-device" route="direct" T={T} accent={accent} font={font} onClose={() => setClosed(true)} />
+      {/* Harness-only: simulate a reconnect (fresh link, same terminal). */}
+      <button data-testid="harness-swap-link" onClick={swapLink} style={{
+        position: 'fixed', top: 8, right: 12, zIndex: 50, fontFamily: font, fontSize: 11,
+        padding: '5px 9px', cursor: 'pointer', color: T.sub, background: T.panel2,
+        border: `1px solid ${T.line}`, borderRadius: 6,
+      }}>swap link</button>
     </div>
   )
 }
