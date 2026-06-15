@@ -2,8 +2,32 @@
 // tiny in-browser shell (echo + a few commands), so the terminal UI, the mobile
 // accessory key bar, sticky modifiers, and keyboard handling can be felt and
 // verified live without a paired device. ?preview=webterm.
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import WebTerminal from './WebTerminal.jsx'
+
+// Mirror the real app's visual-viewport tracking (Filament.jsx) so the preview
+// wrapper sizes itself to what is actually visible, matching production.
+function useVisualViewport() {
+  const read = () => {
+    const vv = (typeof window !== 'undefined') && window.visualViewport
+    if (vv) return { width: vv.width, height: vv.height, left: vv.offsetLeft, top: vv.offsetTop }
+    if (typeof window !== 'undefined') return { width: window.innerWidth, height: window.innerHeight, left: 0, top: 0 }
+    return { width: 0, height: 0, left: 0, top: 0 }
+  }
+  const [vp, setVp] = useState(read)
+  useEffect(() => {
+    const vv = window.visualViewport
+    const onChange = () => setVp(read())
+    if (vv) { vv.addEventListener('resize', onChange); vv.addEventListener('scroll', onChange) }
+    window.addEventListener('resize', onChange)
+    onChange()
+    return () => {
+      if (vv) { vv.removeEventListener('resize', onChange); vv.removeEventListener('scroll', onChange) }
+      window.removeEventListener('resize', onChange)
+    }
+  }, [])
+  return vp
+}
 
 const T_DARK = {
   mode: 'dark', bg: '#0A0B0C', panel: '#0F1113', panel2: '#0C0E10',
@@ -130,13 +154,20 @@ export default function WebTermPreview() {
     try { window.__webtermSwapLink = swapLink } catch (e) {}
     return () => { try { delete window.__webtermSwapLink } catch (e) {} }
   }, [swapLink])
+  const vp = useVisualViewport()
   const T = T_DARK
   const accent = '#7CF6C8'
   const font = "'JetBrains Mono',ui-monospace,monospace"
   if (closed) return <div style={{ position: 'fixed', inset: 0, background: T.bg, color: T.dim, display: 'grid', placeItems: 'center', fontFamily: font }}>closed, reload to reopen</div>
   return (
-    <div style={{ position: 'fixed', inset: 0, background: T.bg }}>
-      <WebTerminal link={link} peerName="mock-device" route="direct" T={T} accent={accent} font={font} onClose={() => setClosed(true)} />
+    // Pin the harness wrapper to the VISUAL viewport, exactly like the real app's
+    // terminal overlay (Filament.jsx), so the mobile-fit behavior under test here
+    // matches production rather than the layout-viewport fixed:inset:0 box.
+    <div data-testid="terminal-overlay" style={{
+      position: 'fixed', left: vp.left, top: vp.top, width: vp.width, height: vp.height,
+      overflow: 'hidden', touchAction: 'none', overscrollBehavior: 'none', background: T.bg,
+    }}>
+      <WebTerminal link={link} peerName="mock-device" route="direct" T={T} accent={accent} font={font} viewportPinned onClose={() => setClosed(true)} />
       {/* Harness-only: simulate a reconnect (fresh link, same terminal). */}
       <button data-testid="harness-swap-link" onClick={swapLink} style={{
         position: 'fixed', top: 8, right: 12, zIndex: 50, fontFamily: font, fontSize: 11,
