@@ -17,8 +17,20 @@ backend), independent of the main `gates.sh` suite (which pins 8077).
     FIL_CLAIM_LIMIT=1000000 python app.py & )
 ```
 
-The scripts assume the venv path used during development; adjust `BIN`/`PY`/
-paths at the top of each script for your environment.
+Every script is parameterized by env with sane defaults (resolved relative to
+the script), so no edit is needed for a fresh checkout:
+
+```sh
+# defaults: BIN=../../target/release/filament, SERVER=http://127.0.0.1:8093
+BIN=path/to/filament SERVER=http://127.0.0.1:8093 bash gate1_mutual_key.sh
+# gate6 also takes PY (the backend venv python) and BACKEND_DIR
+PY=/path/to/venv/bin/python bash gate6_downgrade.sh
+# the mjs gates resolve frontend/pake artifacts relative to the repo root
+node gate4_interop.mjs        # override with PAKE_DIR / NATIVE if needed
+```
+
+Codes are the current 2-word `adj-animal-NNNN` shape (a `send --word` mints its
+OWN numeric nameplate, so a claimer uses the FULL minted code, not the phrase).
 
 ## The seven gates
 

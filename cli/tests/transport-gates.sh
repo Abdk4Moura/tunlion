@@ -22,8 +22,8 @@ CLI_DIR="$(dirname "$HERE")"
 BIN="$CLI_DIR/target/release/filament"
 PORT="${FILAMENT_TEST_PORT:-8098}"          # 8098 ONLY (task constraint)
 SERVER="http://127.0.0.1:$PORT"
-WORK="$(mktemp -d /root/.claude/jobs/330c2366/tmp/wt-transport-gates.XXXXXX)"
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+WORK="$(mktemp -d /tmp/wt-transport-gates.XXXXXX)"
+PYV="${FILAMENT_TEST_VENV:-python3}"
 
 PASS=0; FAIL=0; FAILED=""
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
@@ -60,10 +60,19 @@ BIG="$WORK/big.bin";     head -c 5000000 /dev/urandom >"$BIG";  H_BIG=$(hashof "
 # for the known-device direct path. WebRTC (flag OFF) for the pairing itself.
 DA="$WORK/devA"; DB="$WORK/devB"; DDROP="$WORK/drop"; mkdir -p "$DA" "$DB" "$DDROP"
 pair() {
-  local W="pair-$$-$RANDOM"
-  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$W" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
-  local SP=$!; sleep 3
-  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
+  # The sender chooses a valid 2-word phrase (the SPAKE2 password); the numeric
+  # nameplate is ALWAYS machine-minted, so the receiver must claim the FULL
+  # minted code (grepped from the sender's log), not the spoken word. A single
+  # token like the old `pair-$$-$RANDOM` is now refused by the >=2-word floor.
+  local WORD="gigantic-element"
+  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$WORD" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
+  local SP=$!
+  local CODE=""
+  for _ in $(seq 1 40); do
+    CODE=$(grep -oiE "$WORD-[0-9]{3,5}" "$WORK/pair-a.log" | head -1)
+    [ -n "$CODE" ] && break; sleep 0.3
+  done
+  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$CODE" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
   wait $SP 2>/dev/null
 }
 say "setup: pairing A<->B (--remember over a code)"
@@ -78,10 +87,13 @@ fi
 # ===========================================================================
 say "GATE 1: direct-connect (FILAMENT_DIRECT=1) — route: direct-quic + byte-exact"
 DG="$WORK/g1drop"; mkdir -p "$DG"
-FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 timeout 60 "$BIN" up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
+# -v on both ends: the "DIRECT-CONNECT ok (route: ...)" marker is a DEBUG
+# (direct-connect diagnostic) line; the user-facing route label is "route:" on
+# its own. The transfer itself is verbosity-independent.
+FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 timeout 60 "$BIN" -v up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G1=0
-FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 timeout 60 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
+FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 timeout 60 "$BIN" -v send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT="$DG/big.bin"
 if [ $G1 -eq 0 ] \
