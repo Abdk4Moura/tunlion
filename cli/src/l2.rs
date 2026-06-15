@@ -484,6 +484,11 @@ pub async fn spawn_pty_session(
         cmd.arg(a);
     }
     cmd.env("TERM", "xterm-256color");
+    // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
+    // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
+    // truecolor fine, so set this to get full-color output (verified: opencode
+    // emits 38;2;R;G;B with this set, 38;5;N without).
+    cmd.env("COLORTERM", "truecolor");
     if let Ok(home) = std::env::var("HOME") {
         cmd.cwd(home);
     }
