@@ -394,9 +394,21 @@ session/codeentry/ui/sshkeys).
     `cargo build --release` clean; **netns lab** `two-nodes --link filament`:
     baseline 0% → fault stall 100% (link up) → fault clear → recovered 0%/1.3ms.
     No regression in the end-to-end stall→recover behavior.
-  - Next Phase 3 slices: the `protocol` module (file-transfer state machine out of
-    send_cmd/recv_cmd + verify/finalize) and more of `resilience` (upgrade probe,
-    C4 grace, splitting the `Conn` god-struct).
+- **2026-06-16 — `cli/src/protocol.rs`: the file-transfer decisions (mirror of
+  transfer.js).**
+  - Moved the pure file-transfer decisions out of main.rs into a `protocol`
+    module: `recv_transfer_done` (the gate-2/11c "may we drop a dead link?" fence)
+    and `decide_ack_fallback` + the `AckFallback` enum (the P4 no-ack window:
+    Reprobe / FailUnconfirmed, never a false complete). Their unit tests moved with
+    them; the send/recv loops call `protocol::…`.
+  - Verified: `cargo test --release` 71/71 (the 3 protocol tests now run in
+    `protocol::tests`); `cargo build --release` clean; LIVE browser↔CLI 2/2 — gate
+    5 exercises `decide_ack_fallback` (CLI sender), gate 6 `recv_transfer_done`
+    (CLI receiver). Pure move, no behavior change.
+  - Next Phase 3 slices (larger): pull the file-transfer STATE MACHINE out of
+    send_cmd (1027 lines) / recv_cmd (2111 lines) into protocol.rs, more of
+    resilience (upgrade probe, C4 grace), and splitting the `Conn` god-struct so
+    signaling/protocol/resilience state aren't one bag.
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
