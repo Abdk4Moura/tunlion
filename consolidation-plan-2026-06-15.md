@@ -301,6 +301,24 @@ characterization test and the existing gates, smallest verifiable slice first.
     peer-acks memory). The no-ack FAIL path is pinned by decideAckFallback's unit
     tests + the Rust `ack_fallback_never_completes_silently` test.
 
+- **2026-06-16 (cont.) — `UpgradeProber` (timer-owning, P5).**
+  - Moved the whole relay→direct prober (the `_upgradeTimer` chain: arm/disarm/
+    schedule/probe/verify-before-commit/commit/backoff + the `_upgradeVerify`
+    latch + cadence state) out of PeerLink into
+    `net/resilience/upgradeProber.js`. PeerLink arms/disarms from `_detectRoute`
+    (`this._upgrade.arm()/disarm()`), on `_failActive`/`close`, and keeps the
+    frozen public `probeUpgradeNow()` delegating to `this._upgrade.probeNow()`.
+    The pure decisions stay in upgrade.js. Faithful relocation.
+  - Verified: vite build clean; all unit suites (incl. upgrade.js's 15 cases) +
+    gate8 PASS; LIVE happy-path browser↔CLI 2/2. Live relay→direct still not
+    reproducible here (no TURN/relay), so unit tests remain the floor for the
+    prober's own logic.
+
+  → All four resilience controllers are now timer-owning objects: StallController
+    (cross-machine verified), AckFallbackController, UpgradeProber. PTY liveness
+    still ticks inline via PeerLink's shared interval (its detector+ladder are
+    already pure in liveness.js); a LivenessController is the last optional move.
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
