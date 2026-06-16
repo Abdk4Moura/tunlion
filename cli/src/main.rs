@@ -6458,10 +6458,14 @@ async fn recv_cmd(
                             tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
                         }
                         l2::OpenVerdict::Deny { sid, err } => {
-                            // Log refused dials (threat model: port-scan / SSRF
-                            // visibility). The gate observes this line.
-                            // DEBUG, l2 diagnostic (port-scan / SSRF visibility).
-                            ui::debug(&format!("l2: refused stream {sid:#x}: {err}"));
+                            // Log refused dials at INFO (visible by default,
+                            // suppressed under -q) — a refused SSRF/port-scan or
+                            // untrusted/over-cap open is a security event the
+                            // operator should see, mirroring the
+                            // shell-bootstrap-deny path (`ui::say`). Normal
+                            // initiators always dial 127.0.0.1, so this is silent
+                            // in normal operation and only fires on an anomaly.
+                            ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
                             let _ = t
                                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
                                 .await;
