@@ -47,6 +47,37 @@ pub fn decide_ack_fallback(link_alive: bool, reprobed: bool) -> AckFallback {
     AckFallback::FailUnconfirmed
 }
 
+/// P4 (GAP-5): outcome of the RECEIVER's whole-file integrity check at file-end.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyResult {
+    /// Received bytes hash to the sender's offered digest — accept + ack.
+    Match,
+    /// Hash didn't match. `restart_from_zero` distinguishes the two cases: a SHORT
+    /// file (received < size) is merely TRUNCATED — resume the tail; a FULL-SIZE
+    /// file with the wrong hash has a CORRUPT BODY (the partial is poisoned) — so
+    /// re-fetch from 0.
+    Mismatch { restart_from_zero: bool },
+}
+
+/// The pure whole-file verify DECISION (digest present). Mirrors the JS
+/// `decideAfterVerify` (net/protocol/transfer.js). `verify_incoming` does the I/O
+/// (flush + sha256) and calls this; a truncated file is classified WITHOUT hashing
+/// (pass `hash_matches: None`).
+///   received      bytes on disk so far
+///   size          the offered file size
+///   hash_matches  Some(true/false) once hashed; None when skipped (truncated)
+pub fn decide_verify(received: u64, size: u64, hash_matches: Option<bool>) -> VerifyResult {
+    if received < size {
+        // Truncated — can't possibly match yet; resume the tail.
+        return VerifyResult::Mismatch { restart_from_zero: false };
+    }
+    match hash_matches {
+        Some(true) => VerifyResult::Match,
+        // Full size but wrong/uncomputable hash → corrupt body, re-fetch whole.
+        _ => VerifyResult::Mismatch { restart_from_zero: true },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +115,25 @@ mod tests {
         // Link alive but already re-probed and STILL no ack: fail as unconfirmed
         // (resumable) — the exact case the old code falsely completed.
         assert_eq!(decide_ack_fallback(true, true), AckFallback::FailUnconfirmed);
+    }
+
+    #[test]
+    fn verify_match_only_on_full_size_correct_hash() {
+        assert_eq!(decide_verify(100, 100, Some(true)), VerifyResult::Match);
+    }
+
+    #[test]
+    fn verify_truncated_resumes_tail() {
+        // Short file → truncated, resume from the current offset (no re-hash).
+        assert_eq!(decide_verify(60, 100, None), VerifyResult::Mismatch { restart_from_zero: false });
+        // Even if a stale hash were passed, a short file is always truncated.
+        assert_eq!(decide_verify(60, 100, Some(false)), VerifyResult::Mismatch { restart_from_zero: false });
+    }
+
+    #[test]
+    fn verify_full_size_wrong_hash_is_corrupt_restart() {
+        assert_eq!(decide_verify(100, 100, Some(false)), VerifyResult::Mismatch { restart_from_zero: true });
+        // Unhashable (None) at full size is treated as corrupt too (can't accept).
+        assert_eq!(decide_verify(100, 100, None), VerifyResult::Mismatch { restart_from_zero: true });
     }
 }
