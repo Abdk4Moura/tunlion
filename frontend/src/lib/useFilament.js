@@ -19,6 +19,8 @@ import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 // APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '../net/app/recovery.js'
+// APPLICATION/state-reducer — pure peer/transfer list transforms (Phase 2).
+import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../net/app/state.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the pairing
 // wordlists, imported from words.js (ADJ/ANIMAL) so there is a single source
@@ -112,7 +114,7 @@ export function useFilament() {
 
   // ---- snapshot helpers (keep React state in sync with the live PeerLinks) --
   const addPeer = useCallback((p) => {
-    setPeers((prev) => (prev.some((x) => x.id === p.id) ? prev : [...prev, p]))
+    setPeers((prev) => addPeerToList(prev, p))
   }, [])
 
   // Update an EXISTING peer only, never re-adds (#3). A late callback from a
@@ -131,17 +133,11 @@ export function useFilament() {
       // proposition itself stays in the UI (route badge / amber relay chip).
       log.debug('route', id.slice(-6), patch.route)
     }
-    setPeers((prev) => {
-      const i = prev.findIndex((x) => x.id === id)
-      if (i === -1) return prev
-      const next = [...prev]
-      next[i] = { ...next[i], ...patch }
-      return next
-    })
+    setPeers((prev) => patchPeerInList(prev, id, patch))
   }, [])
 
   const removePeer = useCallback((id) => {
-    setPeers((prev) => prev.filter((p) => p.id !== id))
+    setPeers((prev) => removePeerFromList(prev, id))
   }, [])
 
   const upsertTransfer = useCallback((t) => {
@@ -154,13 +150,7 @@ export function useFilament() {
       else log.trace('transfer', t.id, t.status)
     }
     if (t.status) transferStatusRef.current.set(t.id, t.status)
-    setTransfers((prev) => {
-      const i = prev.findIndex((x) => x.id === t.id)
-      if (i === -1) return [t, ...prev]
-      const next = [...prev]
-      next[i] = { ...next[i], ...t }
-      return next
-    })
+    setTransfers((prev) => upsertTransferInList(prev, t))
   }, [])
 
   // ---- known devices (C12/C20 browser half) ---------------------------------
