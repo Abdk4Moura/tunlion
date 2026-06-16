@@ -189,9 +189,26 @@ characterization test and the existing gates, smallest verifiable slice first.
     (`cli/tests/live-wire-check.sh`) — gate 6 exercises the send builders, gate 5
     the receive verify/ack decisions, over real WebRTC framing.
 
+- **2026-06-16 (cont.) — Phase 1 resilience layer opened: `net/resilience/stall.js`.**
+  - First RESILIENCE seam. Extracted the stall-correction LADDER SHAPE
+    (`STALL_LADDER` + `nextStallRung`: none→a→b→c→fail) out of `_correctStall`'s
+    nested ifs — a 1:1, logic-preserving control-flow refactor. The rung
+    MECHANICS (ping+restartIce / re-offer+resume / onStall / failActive) and ALL
+    timers + episode state stay in PeerLink (resilience owns the clock).
+  - Verified: `stall.test.mjs` (new) PASS; vite build clean; wire/transfer/gate8
+    PASS; LIVE browser↔CLI 2/2 (happy path intact). No behavior change (rung
+    firing is byte-identical), so no lab run needed for THIS slice.
+  - DEFERRED (needs the freeze-shim browser gate / netns lab, per §6): the stall
+    DETECTION reducer (`_checkStall`'s idle/away/progress/accumulate/grace→correct
+    — safety-critical, gates against hangs/silent-loss) and the timer-owning
+    StallController. Those move real fault-handling behavior and must be verified
+    under injected stall before promoting.
+
 ### Next slices (Phase 1 continued)
-1. ~~`protocol/transfer.js`~~ — DONE (see above).
-2. `resilience/{stall,upgrade,liveness,ackfallback}.js` — controllers over a
-   Transport handle; pull the timers/ladders out of PeerLink. `decideAckFallback`
-   is already extracted (in transfer.js) as the pure seam for `ackfallback.js`.
+1. ~~`protocol/transfer.js`~~ — DONE.
+2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
+   the freeze-shim browser gate / netns lab: stall detection reducer +
+   StallController (timers/state); `upgrade.js` (relay→direct prober);
+   `liveness.js` (`_checkPtyLiveness`/`_correctPtyDead`); `ackfallback.js` (the
+   no-ack timer — `decideAckFallback` is already the pure seam in transfer.js).
 3. Slim `PeerLink` to a thin orchestrator. Then Phase 2 (useFilament), Phase 3 (Rust).

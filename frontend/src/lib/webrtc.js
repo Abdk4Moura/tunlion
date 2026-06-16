@@ -43,6 +43,9 @@ import {
   sendsToResume,
 } from '../net/protocol/transfer.js'
 export { decideAckFallback }
+// RESILIENCE layer: the stall-correction ladder SHAPE (which rung to run next).
+// PeerLink owns the timers + episode state and runs each rung's mechanics.
+import { nextStallRung } from '../net/resilience/stall.js'
 
 const rlog = log.scope('rtc')
 
@@ -1494,9 +1497,11 @@ export class PeerLink {
   // _failActive (transfers become paused/resumable, NEVER silently dead).
   _correctStall() {
     const now = Date.now()
-    const rung = this._stallEpisode?.rung
+    // The ladder SHAPE lives in resilience/stall.js; this returns the rung to
+    // run NOW from the in-flight episode (none → 'a' → 'b' → 'c' → 'fail').
+    const step = nextStallRung(this._stallEpisode?.rung)
     // RUNG (a): liveness probe + in-place ICE repair.
-    if (!rung) {
+    if (step === 'a') {
       try {
         // A control send over the reliable channel: success ⇒ the transport
         // itself is up (data path dark, link alive). A throw ⇒ truly dead. Let
@@ -1524,7 +1529,7 @@ export class PeerLink {
     }
     // RUNG (b): still stalled after rung (a)'s grace, re-issue every unfinished
     // transfer so the data path re-flows from the partial.
-    if (rung === 'a') {
+    if (step === 'b') {
       let nudged = 0
       for (const t of this.transfers.values()) {
         if (t.status !== 'transferring') continue
@@ -1548,7 +1553,7 @@ export class PeerLink {
     }
     // RUNG (c): still stalled, escalate to the hook (P1 implements the
     // relay-preferred rebuild). The callback may be a no-op for now.
-    if (rung === 'b') {
+    if (step === 'c') {
       rlog.info('stall correction (rung c), escalating to onStall', this.id.slice(-6))
       linkdiag.record('action', { what: 'onStall', reason: 'stall-rung-c', route: this.route || null }, this._diagMeta())
       try {
