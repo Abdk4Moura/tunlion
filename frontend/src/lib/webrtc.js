@@ -12,23 +12,47 @@
 //   failed       -> connection/transfer error
 import { log } from './log.js'
 import * as linkdiag from './linkdiag.js'
+// PROTOCOL codec layer: message-type registry + binary framing + control codec.
+// Extracted from this file so the wire format is one pure, node-testable module
+// (net/protocol/wire.js) that stays byte-identical to the CLI (CONTRACT.md).
+// CTRL is the message registry (re-exported as MSG; it additionally carries the
+// caps/pty-*/l2-close strings that some inline literals below still use).
+import {
+  MSG as CTRL,
+  frame as wireFrame,
+  parseFrame as wireParseFrame,
+  isCloseFrame,
+  highHalfSid,
+  encodeControl,
+  decodeControl,
+} from '../net/protocol/wire.js'
+// PROTOCOL transfer layer: the file-offer/accept/end/delivery-ack ceremony's
+// message vocabulary + pure decisions, extracted from this file. PeerLink keeps
+// the state/IO/timers and delegates the protocol decisions here (CONTRACT.md
+// frozen). decideAckFallback now lives there too; re-exported below to keep the
+// frozen export surface of this module.
+import {
+  offerMsg,
+  acceptMsg,
+  declineMsg,
+  endMsg,
+  deliveryAckMsg,
+  decideOnOffer,
+  decideAfterVerify,
+  decideAckFallback,
+  sendsToResume,
+} from '../net/protocol/transfer.js'
+export { decideAckFallback }
+// RESILIENCE layer: the timer-owning idle-shell (PTY) liveness controller.
+import { LivenessController } from '../net/resilience/livenessController.js'
+// RESILIENCE layer: the timer-owning in-flight stall controller (state + ladder).
+import { StallController } from '../net/resilience/stallController.js'
+// RESILIENCE layer: the timer-owning delivery-ack fallback (no-ack window + peer-acks memory).
+import { AckFallbackController } from '../net/resilience/ackFallback.js'
+// RESILIENCE layer: the timer-owning relay→direct upgrade prober.
+import { UpgradeProber } from '../net/resilience/upgradeProber.js'
 
 const rlog = log.scope('rtc')
-
-const CTRL = {
-  OFFER: 'file-offer',
-  ACCEPT: 'file-accept',
-  DECLINE: 'file-decline',
-  END: 'file-end',
-  BRB: 'brb', // C21: "I'm stepping away (file picker / tab hidden), hold the line"
-  BACK: 'back',
-  PAIR_KEEP: 'pair-keep', // C12: here's a secret, remember me as a known device
-  PAIR_KEEP_ACK: 'pair-keep-ack', // C27: the human's answer, sender keeps only confirmed secrets
-  PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
-  PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict, a rejected prover stops claiming acquaintance
-  STATE: 'state', // C30 ph3: periodic link truth {transfers, trusted, away}, divergence repair
-  DELIVERY_ACK: 'delivery-ack', // P4: receiver verified the WHOLE file (sha256 matched), sender marks done only on this
-}
 
 // P4: bound the whole-file re-fetch so a genuinely-corrupt payload fails CLEANLY
 // instead of looping forever; the partial is kept, the transfer stays resumable.
@@ -43,36 +67,6 @@ const ACK_FALLBACK_MS = 30000
 // control message, if the link is healthy it returns fast.
 const ACK_REPROBE_MS = 5000
 
-// P4 (silent-data-loss fix): decide what a send should do when the ack window
-// elapses with NO delivery-ack. A send is "complete" (delivered + verified) ONLY
-// on a genuine CTRL.DELIVERY_ACK, so this function NEVER returns 'complete'. Pure
-// (no side effects) so it can be unit-tested directly.
-//
-//   channelOpen     data channel readyState === 'open'
-//   connected       pc.connectionState === 'connected'
-//   peerHasAcked    this peer has delivery-acked before (this link or a past one)
-//                   -> the ack is mandatory for it, a weak completion is wrong
-//   offeredDigest   we shipped a whole-file digest in the OFFER (so a modern
-//                   receiver is expected to ack)
-//   reprobed        we have already re-sent END once this window
-//
-// Returns one of:
-//   { action: 'reprobe' }  re-send END once and extend the window (ack may be lost)
-//   { action: 'fail', resumable }  end honestly, never claim success
-export function decideAckFallback({ channelOpen, connected, peerHasAcked, offeredDigest, reprobed }) {
-  const healthy = !!channelOpen && !!connected
-  // Link looks dead: nothing arrived and we cannot prompt a re-ack. End honestly.
-  if (!healthy) return { action: 'fail', resumable: true }
-  // Link looks alive and we have not yet re-probed: the ack may simply have been
-  // lost. Re-send END once to prompt the receiver to re-ack, extend the window.
-  if (!reprobed) return { action: 'reprobe' }
-  // Re-probed, still no ack. We must not claim success: a peer that ever acked, or
-  // one we offered a digest to, is EXPECTED to ack, treat the silence as a failure
-  // (resumable). With the modern fleet every receiver acks, so this is the norm.
-  void peerHasAcked
-  void offeredDigest
-  return { action: 'fail', resumable: true }
-}
 
 // P4 test shims, INERT unless a `?test=` query flag (persisted to localStorage)
 // is set, so they ship in the bundle with zero effect on real users. They exist
@@ -392,30 +386,32 @@ export class PeerLink {
     // against the last tick's snapshot to tell "data wedged, link alive" (→ the
     // correction ladder) from a slow-but-moving link (→ no action).
     this._bytesMoved = 0
-    this._lastMovedSnapshot = 0
-    this._lastBuffered = 0
-    this._stallIdleMs = 0 // accumulated no-progress time across ticks
-    this._stallEpisode = null // {rung, at} latch: prevents re-entering a rung mid-convergence (mirrors Rust repair_in_flight)
+    // RESILIENCE: the in-flight stall watchdog state + ladder live in a
+    // controller (idle clock, episode latch, moved/buffered snapshots). PeerLink
+    // keeps the 2s interval below (it also ticks PTY liveness) and delegates.
+    this._stall = new StallController(this, { stallMs: STALL_MS, tickMs: STALL_TICK_MS })
     this._stallTimer = null // the watchdog interval (armed on channel open)
+    // RESILIENCE: the P4 delivery-ack fallback (per-transfer no-ack windows +
+    // the "this peer acks" memory).
+    this._ack = new AckFallbackController(this, { fallbackMs: ACK_FALLBACK_MS, reprobeMs: ACK_REPROBE_MS })
 
-    // M1 (mobile): idle-interactive-link liveness. `_ptyLiveSignal` is the last
-    // ICE-consent liveness value we read from getStats (responsesReceived, or a
-    // packet/byte fallback); `_ptyDeadMs` accumulates the no-advance time. A dead
-    // idle shell trips once `_ptyDeadMs >= PTY_LIVENESS_WINDOW_MS`. `_ptyEpisode`
-    // latches an open recovery so we don't re-fire every tick mid-convergence.
-    this._ptyLiveSignal = null
-    this._ptyDeadMs = 0
-    this._ptyEpisode = null
-    this._testPtyFrozen = false // M1 test seam: set true by sendPtyInput under ?test=freezepty
+    // M1 (mobile): idle-interactive-link liveness lives in a timer-owning
+    // controller (consent read + dead clock + recovery ladder). PeerLink ticks it
+    // from the shared 2s interval below and resets it on channel-open / teardown.
+    this._liveness = new LivenessController(this, {
+      windowMs: PTY_LIVENESS_WINDOW_MS,
+      tickMs: STALL_TICK_MS,
+      freezePtyTest: TEST.freezePty,
+    })
 
-    // P5 (GAP-6): the relay→direct upgrade prober. Armed when the route becomes
-    // 'relayed', disarmed when it's 'direct'/'local'. `_upgradeTimer` is the
-    // backoff timer; `_upgradeDelay` is the current (doubling) cadence;
-    // `_upgradeVerify` is the in-progress verify latch {since, bytesAt}.
-    this._upgradeTimer = null
-    this._upgradeDelay = UPGRADE_FIRST_MS
-    this._upgradeVerify = null
-    this._upgrading = false // re-entrancy guard while a probe/verify is mid-flight
+    // P5 (GAP-6): the relay→direct upgrade prober (timer-owning controller).
+    // Armed when the route becomes 'relayed' (_detectRoute), disarmed on
+    // direct/local / close. Owns its backoff timer, cadence, and verify latch.
+    this._upgrade = new UpgradeProber(this, {
+      firstMs: UPGRADE_FIRST_MS,
+      steadyMs: UPGRADE_STEADY_MS,
+      verifyMs: UPGRADE_VERIFY_MS,
+    })
 
     // P1 (GAP-4): when this link is rebuilt relay-preferred after a chronically
     // stalled direct/STUN path, force EVERY ICE candidate through the TURN relay
@@ -635,169 +631,18 @@ export class PeerLink {
     // moment we're on a direct/local path (nothing to upgrade away from). This
     // runs on the initial connect detection AND every prober re-poll, so a route
     // that drops back to relay re-arms automatically.
-    if (route === 'relayed') this._armUpgradeProber()
-    else this._disarmUpgradeProber()
+    if (route === 'relayed') this._upgrade.arm()
+    else this._upgrade.disarm()
     return route
   }
 
   // ---------------------------------------------------- P5 relay→direct upgrade
-  // Begin probing for a direct path while serving on relay. Idempotent. The
-  // schedule is: first probe at UPGRADE_FIRST_MS (eager, the cause is often a
-  // transient hiccup), then each failed probe doubles toward UPGRADE_STEADY_MS.
-  _armUpgradeProber() {
-    if (this._closed || this._upgradeTimer) return
-    rlog.debug('upgrade prober armed (on relay, probing for a direct path)', this.id.slice(-6))
-    this._upgradeDelay = UPGRADE_FIRST_MS
-    this._scheduleUpgradeProbe(this._upgradeDelay)
-  }
-
-  _disarmUpgradeProber() {
-    if (this._upgradeTimer) {
-      clearTimeout(this._upgradeTimer)
-      this._upgradeTimer = null
-    }
-    this._upgradeVerify = null
-    this._upgrading = false
-    this._upgradeDelay = UPGRADE_FIRST_MS
-  }
-
-  _scheduleUpgradeProbe(delay) {
-    if (this._closed) return
-    clearTimeout(this._upgradeTimer)
-    this._upgradeTimer = setTimeout(() => this._upgradeProbe(), delay)
-  }
-
-  // Re-probe NOW: collapse the backoff so the next probe fires immediately. The
-  // hook calls this from its visibility/online effect on a network change, the
-  // browser analog of the Rust client's iface-change re-probe trigger.
+  // The prober (timer + backoff cadence + verify-before-commit) lives in
+  // resilience/UpgradeProber; PeerLink arms/disarms it from _detectRoute and on
+  // close. Re-probe NOW on a network change — the hook's public entrypoint
+  // (frozen surface), delegated to the controller.
   probeUpgradeNow() {
-    if (this._closed || this.route !== 'relayed') return
-    this._upgradeDelay = UPGRADE_FIRST_MS // a fresh path may exist, reset the cadence
-    if (this._upgrading) return // a probe is already in flight; let it run
-    rlog.debug('upgrade re-probe now (network change)', this.id.slice(-6))
-    this._scheduleUpgradeProbe(0)
-  }
-
-  // One upgrade attempt: restartIce() on the live PC (the data channel survives,
-  // so this is non-disruptive), let ICE re-nominate, then re-detect the route. A
-  // non-relay re-detection enters the verify-before-commit window; anything else
-  // backs off and re-schedules.
-  async _upgradeProbe() {
-    this._upgradeTimer = null
-    if (this._closed || this.route !== 'relayed') return this._disarmUpgradeProber()
-    // Kill-switch (browser analog of FILAMENT_UPGRADE_PROBE=0): the user opted out
-    // of the prober entirely. Leave the link on relay; never re-schedule.
-    try {
-      if (localStorage.getItem('filamentUpgradeProbe') === '0') {
-        rlog.debug('upgrade prober disabled (filamentUpgradeProbe=0), staying on relay', this.id.slice(-6))
-        return
-      }
-    } catch {}
-    // Shared-ICE-restart guard: the P0 stall ladder also drives restartIce. They
-    // must never both fire at once (glare / churn). If a stall episode is open or
-    // we're not cleanly connected, skip this probe and back off.
-    if (this.pc.connectionState !== 'connected' || this._stallEpisode) {
-      rlog.debug('upgrade probe skipped (not connected or stall episode open)', this.id.slice(-6))
-      return this._backoffUpgrade()
-    }
-    // Only the IMPOLITE side drives restartIce (consistent with C4 + the P0
-    // ladder rung a), restarting from both sides glares.
-    this._upgrading = true
-    if (!this.polite) {
-      try {
-        rlog.debug('upgrade probe: restartIce to find a direct path', this.id.slice(-6))
-        linkdiag.record('action', { what: 'restartIce', reason: 'p5-upgrade-probe' }, this._diagMeta())
-        this.pc.restartIce()
-      } catch {}
-    } else {
-      rlog.debug('upgrade probe: re-detecting route (polite: no restartIce)', this.id.slice(-6))
-    }
-    // Give ICE a moment to re-nominate, then MEASURE (not commit) the route. We
-    // deliberately use _measureRoute, not _detectRoute: a relay→direct flip must
-    // pass verify-before-commit first, so we must NOT fire onRoute / clear the
-    // amber UI here. Only _commitUpgrade does that, after the path holds.
-    await new Promise((r) => setTimeout(r, 1200))
-    this._upgrading = false
-    if (this._closed || this.route !== 'relayed') return
-    const route = await this._measureRoute()
-    if (this._closed || this.route !== 'relayed') return
-    // A non-relay measurement enters the verify window; anything else backs off.
-    if (route && route !== 'relayed') {
-      this._beginUpgradeVerify(route)
-    } else {
-      this._upgradeVerify = null
-      this._backoffUpgrade()
-    }
-  }
-
-  // Verify-before-commit (mirrors Rust judge_upgrade_standby): a direct path that
-  // wins re-nomination must keep moving data for UPGRADE_VERIFY_MS before we cut
-  // over. Reuses the P0 _bytesMoved counter as the "data path holds" signal. We
-  // sample on a short heartbeat; if the route reverts to relay OR bytes stop
-  // before the window closes, DISCARD and back off, no flap.
-  _beginUpgradeVerify(route) {
-    rlog.debug('direct path detected, verifying it holds before committing', this.id.slice(-6))
-    const start = Date.now()
-    const verify = { route, bytesAt: this._bytesMoved, lastBytes: this._bytesMoved, lastSeen: start }
-    this._upgradeVerify = verify
-    const VERIFY_TICK = 500
-    // During the verify window we want some traffic to move so a flaky path
-    // reveals itself. _checkStall already nudges real transfers; if the link is
-    // otherwise idle we can't distinguish hold-vs-flaky, so an idle link that
-    // simply READS non-relay across the whole window is accepted (a connected
-    // direct candidate-pair is itself evidence; the no-flap risk is only when a
-    // transfer is in flight, and then _bytesMoved advances).
-    const tick = async () => {
-      if (this._closed || this._upgradeVerify !== verify) return
-      if (this.route !== 'relayed') return // someone else committed; stop
-      const re = await this._measureRoute() // MEASURE only, commit happens below
-      if (this._closed || this._upgradeVerify !== verify) return
-      const hasInflight = [...this.transfers.values()].some(
-        (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
-      )
-      const moved = this._bytesMoved !== verify.lastBytes
-      if (moved) {
-        verify.lastBytes = this._bytesMoved
-        verify.lastSeen = Date.now()
-      }
-      // REGRESSED: route fell back to relay, OR a transfer is in flight yet bytes
-      // have stalled past a tick-of-grace → discard, stay on relay, back off.
-      const idleTooLong = hasInflight && Date.now() - verify.lastSeen >= UPGRADE_VERIFY_MS
-      if ((re && re === 'relayed') || idleTooLong) {
-        rlog.debug('direct path connected but did not hold, staying on relay (no flap)', this.id.slice(-6))
-        this._upgradeVerify = null
-        this._backoffUpgrade()
-        return
-      }
-      // HELD long enough → commit.
-      if (Date.now() - start >= UPGRADE_VERIFY_MS) {
-        this._commitUpgrade(verify.route)
-        return
-      }
-      this._upgradeTimer = setTimeout(tick, VERIFY_TICK)
-    }
-    this._upgradeTimer = setTimeout(tick, VERIFY_TICK)
-  }
-
-  // Commit the upgrade: the direct path held. Set the route, fire onRoute (which
-  // AUTO-CLEARS the amber RELAY UI, no new UI needed), log the one value-prop
-  // line, and disarm the prober (we're a destination now, not a way-station).
-  _commitUpgrade(route) {
-    if (this._closed) return
-    linkdiag.record('action', { what: 'upgrade-commit', route, from: this.route || null }, this._diagMeta())
-    this.route = route
-    this.onRoute(route)
-    rlog.info('upgraded to direct, relay released', this.id.slice(-6), route)
-    this._disarmUpgradeProber()
-  }
-
-  // A probe (or a failed verify) didn't yield a held direct path: double the
-  // cadence toward the steady cap and re-schedule, so a peer that will never get
-  // direct isn't hammered.
-  _backoffUpgrade() {
-    this._upgrading = false
-    this._upgradeDelay = Math.min(this._upgradeDelay * 2, UPGRADE_STEADY_MS)
-    if (this.route === 'relayed' && !this._closed) this._scheduleUpgradeProbe(this._upgradeDelay)
+    this._upgrade.probeNow()
   }
 
   // ------------------------------------------------------------- data channel
@@ -819,18 +664,12 @@ export class PeerLink {
       // and from C4's _dcTimer (which only arms on 'disconnected'): during a
       // black-hole the pc stays 'connected' and the channel 'open', so only this
       // detector runs. Reset the baseline so the first tick starts clean.
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = this.channel?.bufferedAmount || 0
-      this._stallIdleMs = 0
-      this._stallEpisode = null
-      // M1: reset the idle-interactive liveness baseline too (it shares this tick).
-      this._ptyLiveSignal = null
-      this._ptyDeadMs = 0
-      this._ptyEpisode = null
+      this._stall.reset()
+      this._liveness.reset() // M1: shares this tick; reset its baseline too
       clearInterval(this._stallTimer)
       this._stallTimer = setInterval(() => {
-        this._checkStall()
-        this._checkPtyLiveness() // M1: idle-shell black-hole detector
+        this._stall.tick()
+        this._liveness.tick() // M1: idle-shell black-hole detector
       }, STALL_TICK_MS)
     }
     channel.onmessage = (e) => this._onMessage(e.data)
@@ -844,21 +683,20 @@ export class PeerLink {
   }
 
   _onMessage(data) {
-    if (typeof data === 'string') return this._onControl(JSON.parse(data))
-    // Binary chunk: first 4 bytes are the stream id, the rest is payload (#4).
-    if (data.byteLength < 4) return
-    const sid = new DataView(data).getUint32(0)
+    if (typeof data === 'string') return this._onControl(decodeControl(data))
+    // Binary frame: [4-byte sid][payload]; parseFrame returns null for a runt.
+    const f = wireParseFrame(data)
+    if (!f) return
+    const { sid, payload } = f
     // web-shell: PTY bytes for the open terminal stream (empty frame = closed).
     if (sid === this._ptySid) {
-      const payload = data.slice(4)
-      if (payload.byteLength === 0) { linkdiag.record('pty', { what: 'remote-close', session: this._ptySession }, this._diagMeta()); this.onPtyClose(); this._ptySid = null }
-      else this.onPtyData(new Uint8Array(payload))
+      if (isCloseFrame(payload)) { linkdiag.record('pty', { what: 'remote-close', session: this._ptySession }, this._diagMeta()); this.onPtyClose(); this._ptySid = null }
+      else this.onPtyData(payload)
       return
     }
     const id = this._incomingBySid.get(sid)
     const entry = id && this.stores.partials.get(id)
     if (!entry) return
-    const payload = data.slice(4)
     entry.buffers.push(payload)
     entry.received += payload.byteLength
     this._bytesMoved += payload.byteLength // P0: inbound file bytes = data path alive (PTY excluded, handled above)
@@ -913,7 +751,7 @@ export class PeerLink {
   // NEW per-link sid (the old link is gone), but the `session` is what binds the
   // two opens to the same remote PTY.
   openPty(cols, rows, session) {
-    this._ptySid = (0x80000000 | (this._nextSid++)) >>> 0
+    this._ptySid = highHalfSid(this._nextSid++)
     this._ptySession = session || null
     // PTY session event: an open is a fresh-or-reattach request carrying the
     // stable session id (the persistence path); the ack ('pty-attach') tells us
@@ -926,18 +764,15 @@ export class PeerLink {
     if (this._ptySid == null || this.channel?.readyState !== 'open') return
     // M1 test seam (?test=freezepty): once a PTY is open, black-hole the
     // interactive data path while leaving the channel 'open' and the pc
-    // 'connected', a faithful idle-shell NAT rebind. Marking `_testPtyFrozen`
-    // makes _checkPtyLiveness ignore real ICE-consent progress (the test peer is
-    // a local CLI whose path is genuinely alive), so the M1 detector fires as it
-    // would against a truly dead remote path. Inert in production.
+    // 'connected', a faithful idle-shell NAT rebind. Marking the liveness
+    // controller frozen makes it ignore real ICE-consent progress (the test peer
+    // is a local CLI whose path is genuinely alive), so the M1 detector fires as
+    // it would against a truly dead remote path. Inert in production.
     if (TEST.freezePty) {
-      this._testPtyFrozen = true
+      this._liveness.markFrozenForTest()
       return // drop input on the floor; nothing reaches the wire
     }
-    const framed = new Uint8Array(4 + u8.byteLength)
-    new DataView(framed.buffer).setUint32(0, this._ptySid)
-    framed.set(u8, 4)
-    this.channel.send(framed)
+    this.channel.send(wireFrame(this._ptySid, u8))
   }
   resizePty(cols, rows) {
     if (this._ptySid != null) this._control({ type: 'pty-resize', sid: this._ptySid, cols, rows })
@@ -1000,13 +835,13 @@ export class PeerLink {
         // dropped mid-receive), accept automatically from where we left off,
         // the user already said yes once.
         const partial = msg.resume && this.stores.partials.get(msg.id)
-        if (partial) {
+        if (decideOnOffer({ resume: msg.resume, hasPartial: !!partial }).action === 'auto-accept') {
           // P4: a re-offer may carry the digest the first offer did (or update
           // it); keep the partial verifiable across a resume.
           if (msg.full) partial.full = msg.full
           this._incomingBySid.set(msg.sid, msg.id)
           this._update(t, { status: 'transferring', progress: t.size ? partial.received / t.size : 0 })
-          this._control({ type: CTRL.ACCEPT, id: msg.id, offset: partial.received })
+          this._control(acceptMsg(msg.id, partial.received))
         } else {
           this.onTransfer(t)
         }
@@ -1049,16 +884,12 @@ export class PeerLink {
         break
       case CTRL.STATE: {
         // (the first switch's default already cleared any away-mark, a
-        // state ping is proof of life.) Corrections:
-        const tr = msg.transfers || {}
-        for (const [id, bytes] of Object.entries(tr)) {
-          const t = this.transfers.get(id)
-          // I believe this send is COMPLETE; the peer holds fewer bytes,
-          // the tail/END was lost. Re-offer with resume.
-          if (t && t.direction === 'send' && t.status === 'complete' && bytes < t.size) {
-            this.onPeerStateDiverged('transfer')
-            this.resumeSend(id)
-          }
+        // state ping is proof of life.) Corrections: a send I believe is
+        // COMPLETE that the peer holds short means the tail/END was lost —
+        // re-offer with resume (decision in protocol/transfer.js).
+        for (const id of sendsToResume(msg.transfers, this.transfers)) {
+          this.onPeerStateDiverged('transfer')
+          this.resumeSend(id)
         }
         // They say they don't recognize us; the hook may hold a secret for
         // them, let it re-prove. Report ONCE per link: the re-prove is
@@ -1076,15 +907,12 @@ export class PeerLink {
         // an outgoing send truly done (vs the old fire-and-forget on file-end).
         const t = this.transfers.get(msg.id)
         if (!t || t.direction !== 'send') break
-        if (this._ackTimers?.has(msg.id)) {
-          clearTimeout(this._ackTimers.get(msg.id))
-          this._ackTimers.delete(msg.id)
-        }
+        this._ack.onAck(msg.id) // genuine ack → cancel the no-ack window
         if (t.status === 'complete') break // already accepted via a prior ack
         // This peer DOES delivery-ack. Remember it (this link + persisted per
         // peerUid) so a future ack-window NEVER falls back to a weak completion:
         // for an ack-capable peer the ack is mandatory.
-        this._markPeerAcks()
+        this._ack.markPeerAcks()
         this._outgoingFiles.delete(msg.id)
         this.stores.outgoing.delete(msg.id)
         this._update(t, { status: 'complete', progress: 1 })
@@ -1132,22 +960,32 @@ export class PeerLink {
       finalize(blob)
       return
     }
-    if (got === entry.full) {
+    // Post-hash protocol decision (net/protocol/transfer.js). On a match
+    // verifyFails resets; a mismatch increments it BEFORE the decision so the
+    // give-up bound is checked against this attempt.
+    if (got === entry.full) entry.verifyFails = 0
+    else entry.verifyFails = (entry.verifyFails || 0) + 1
+    const decision = decideAfterVerify({
+      hashMatches: got === entry.full,
+      received: entry.received,
+      size: entry.size,
+      verifyFails: entry.verifyFails,
+      maxFails: MAX_VERIFY_FAILS,
+    })
+    if (decision.action === 'finalize-ack') {
       // INTACT: finalize, then tell the sender it landed whole (delivery-ack).
-      entry.verifyFails = 0
       finalize(blob)
       rlog.info('whole-file sha256 matched, finalizing + acking', id)
-      this._control({ type: CTRL.DELIVERY_ACK, id, sid, v: 1 })
+      this._control(deliveryAckMsg(id, sid))
       return
     }
-    // MISMATCH: do NOT finalize. Keep the partial, bound the re-request.
-    entry.verifyFails = (entry.verifyFails || 0) + 1
+    // MISMATCH: do NOT finalize. Keep the partial.
     const truncated = entry.received < (entry.size || 0)
     rlog.debug(
       `whole-file checksum FAILED (${truncated ? 'truncated ' + entry.received + '/' + entry.size : 'corrupt'}), attempt ${entry.verifyFails}`,
       id,
     )
-    if (entry.verifyFails > MAX_VERIFY_FAILS) {
+    if (decision.action === 'fail') {
       // Give up CLEANLY: keep the partial on the store (resumable), mark paused,
       // do not finalize, do not ack. No silent bad file, no hang.
       rlog.warn(`whole-file checksum still wrong after ${MAX_VERIFY_FAILS} re-fetches, refusing corrupt file (partial kept)`, id)
@@ -1156,18 +994,17 @@ export class PeerLink {
       return
     }
     // Re-request: truncated -> resume from current offset; corrupt (full size,
-    // wrong hash) -> the buffers are poisoned, restart from 0.
-    let offset = entry.received
-    if (!truncated) {
+    // wrong hash, poisoned buffers) -> reset and restart from 0.
+    if (decision.reset) {
       entry.buffers = []
       entry.received = 0
-      offset = 0
     }
+    const offset = decision.offset
     // Keep the stream routable so resumed chunks land in the same partial, and
     // ask the sender to (re)stream from offset.
     this._incomingBySid.set(sid, id)
     this._update(t, { status: 'transferring', progress: entry.size ? offset / entry.size : 0 })
-    this._control({ type: CTRL.ACCEPT, id, offset })
+    this._control(acceptMsg(id, offset))
   }
 
   // ------------------------------------------------------------- send / accept
@@ -1195,7 +1032,7 @@ export class PeerLink {
       Promise.all([headHash(file), fullHash(file)]).then(([head, full]) => {
         const cur = this._outgoingFiles.get(id)
         if (cur) cur.offeredDigest = !!full // P4: a digest means a modern receiver acks
-        this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}), ...(full ? { full } : {}) })
+        this._control(offerMsg({ id, sid, name: file.name, size: file.size, mime: file.type, head, full }))
       })
       ids.push(id)
     }
@@ -1217,7 +1054,7 @@ export class PeerLink {
     Promise.all([headHash(entry.file), fullHash(entry.file)]).then(([head, full]) => {
       const cur = this._outgoingFiles.get(id)
       if (cur) cur.offeredDigest = !!full // P4: a digest means a modern receiver acks
-      this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, ...(head ? { head } : {}), ...(full ? { full } : {}) })
+      this._control(offerMsg({ id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, head, full }))
     })
   }
 
@@ -1228,7 +1065,7 @@ export class PeerLink {
     this.stores.partials.set(id, { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name, full: t._full || null })
     this._incomingBySid.set(t._sid, id)
     this._update(t, { status: 'transferring' })
-    this._control({ type: CTRL.ACCEPT, id, offset: 0 })
+    this._control(acceptMsg(id, 0))
   }
 
   declineTransfer(id) {
@@ -1236,7 +1073,7 @@ export class PeerLink {
     if (!t || t.direction !== 'receive') return
     this.stores.partials.delete(id)
     this._update(t, { status: 'declined' })
-    this._control({ type: CTRL.DECLINE, id })
+    this._control(declineMsg(id))
   }
 
   async _streamFile(id, startOffset = 0) {
@@ -1255,10 +1092,8 @@ export class PeerLink {
         await new Promise((res) => this._drainWaiters.push(res))
         if (this._closed || this.channel?.readyState !== 'open') return
       }
-      // Frame: [uint32 sid][payload]
-      const framed = new Uint8Array(4 + buf.byteLength)
-      new DataView(framed.buffer).setUint32(0, sid)
-      framed.set(new Uint8Array(buf), 4)
+      // Frame: [uint32 sid][payload] (net/protocol/wire.js)
+      const framed = wireFrame(sid, new Uint8Array(buf))
       // P0 test shim (?test=freeze): after FREEZE_AFTER_BYTES on THIS transfer,
       // make the data-path send a no-op ONCE (one-shot per transfer) while the
       // channel stays open, a faithful NAT-rebind black-hole. The control path
@@ -1294,7 +1129,7 @@ export class PeerLink {
       this._bytesMoved += buf.byteLength // P0: outbound file bytes handed to SCTP = progress
       this._update(t, { progress: Math.min(offset / file.size, 1) })
     }
-    this._control({ type: CTRL.END, id, sid })
+    this._control(endMsg(id, sid))
     // Don't declare 'complete' while bytes still sit in the SCTP buffer: the
     // user reads 'complete' as permission to close the tab, and closing then
     // truncates the receiver's tail (caught by CLI gate 6, ledger F5).
@@ -1310,65 +1145,18 @@ export class PeerLink {
     // if still unacked we end HONESTLY (failed, resumable) rather than claiming a
     // false success. The never-hangs property is preserved: we always reach a
     // terminal state in bounded time, just an honest one.
-    this._armAckFallback(id, sid, false)
+    this._ack.arm(id, sid, false)
   }
 
-  // P4: arm (or re-arm, after a re-probe) the no-ack window for an outgoing send.
-  // `reprobed` is true on the second arming (after we re-sent END once).
-  _armAckFallback(id, sid, reprobed) {
-    this._ackTimers ||= new Map()
-    if (this._ackTimers.has(id)) clearTimeout(this._ackTimers.get(id))
-    const wait = reprobed ? ACK_REPROBE_MS : ACK_FALLBACK_MS
-    this._ackTimers.set(id, setTimeout(() => {
-      this._ackTimers.delete(id)
-      const cur = this.transfers.get(id)
-      if (!cur || cur.status === 'complete') return // the real ack landed meanwhile
-      const entry = this._outgoingFiles.get(id)
-      const decision = decideAckFallback({
-        channelOpen: this.channel?.readyState === 'open',
-        connected: this.pc?.connectionState === 'connected',
-        peerHasAcked: this._peerAcks(),
-        offeredDigest: !!entry?.offeredDigest,
-        reprobed,
-      })
-      if (decision.action === 'reprobe') {
-        // The ack may have been lost on a still-healthy link. Re-send END once to
-        // prompt the receiver to re-ack, then wait one more (shorter) window.
-        rlog.debug('no delivery-ack yet, re-probing (re-sending END)', id)
-        this._control({ type: CTRL.END, id, sid })
-        this._armAckFallback(id, sid, true)
-        return
-      }
-      // No ack after the re-probe (or the link is unhealthy). Do NOT complete.
-      // Keep the file in the outgoing store so it can resume, and end honestly.
-      rlog.warn('no delivery-ack: send NOT confirmed, ending as unconfirmed (resumable)', id)
-      const resumable = decision.resumable && this.stores.outgoing.has(id)
-      this._outgoingFiles.delete(id)
-      this._update(cur, { status: resumable ? 'paused' : 'failed', reason: 'delivery not confirmed' })
-    }, wait))
-  }
-
-  // P4: persist + cache "this peer delivery-acks" so a known-ack peer never gets a
-  // weak completion, the ack is mandatory for it. Keyed by peerUid (stable across
-  // links); falls back to a per-instance flag when there's no uid.
-  _markPeerAcks() {
-    this._peerAckedThisLink = true
-    try {
-      if (this.peerUid) localStorage.setItem('filamentPeerAcks:' + this.peerUid, '1')
-    } catch {}
-  }
-  _peerAcks() {
-    if (this._peerAckedThisLink) return true
-    try {
-      if (this.peerUid) return localStorage.getItem('filamentPeerAcks:' + this.peerUid) === '1'
-    } catch {}
-    return false
-  }
+  // P4: the no-ack window (arm/re-probe/fail) + the "peer acks" memory live in
+  // resilience/AckFallbackController; PeerLink arms it after END+drain (above),
+  // cancels it on a genuine delivery-ack (this._ack.onAck), and clears it on
+  // teardown (this._ack.clear).
 
   // ------------------------------------------------------------------ helpers
   _control(obj) {
     try {
-      this.channel?.send(JSON.stringify(obj))
+      this.channel?.send(encodeControl(obj))
     } catch {}
   }
   _track(t) {
@@ -1392,14 +1180,11 @@ export class PeerLink {
     // clean (close() also clears it; this covers a mid-life link drop).
     clearInterval(this._stallTimer)
     this._stallTimer = null
-    this._stallEpisode = null
-    this._stallIdleMs = 0
+    this._stall.clearState()
     // M1: the idle-interactive liveness watchdog rode the same timer; clear its
-    // latch too so a rebuilt link starts judging liveness fresh.
-    this._ptyEpisode = null
-    this._ptyDeadMs = 0
-    this._ptyLiveSignal = null
-    this._disarmUpgradeProber() // P5: the upgrade prober dies with the link's transfers
+    // latches too so a rebuilt link starts judging liveness fresh.
+    this._liveness.reset()
+    this._upgrade.disarm() // P5: the upgrade prober dies with the link's transfers
     for (const t of this.transfers.values()) {
       if (t.status !== 'transferring' && t.status !== 'offered') continue
       const resumable =
@@ -1411,10 +1196,7 @@ export class PeerLink {
     this._outgoingFiles.clear() // per-link send state; the Files survive in stores
     // P4: drop pending ack-fallback timers, the send is no longer 'complete' on
     // this link (it becomes 'paused' above and re-offers on the next link).
-    if (this._ackTimers) {
-      for (const tm of this._ackTimers.values()) clearTimeout(tm)
-      this._ackTimers.clear()
-    }
+    this._ack.clear()
     const waiters = this._drainWaiters
     this._drainWaiters = []
     waiters.forEach((r) => r()) // unblock parked sender loops so they exit
@@ -1435,296 +1217,25 @@ export class PeerLink {
   }
 
   // -------------------------------------------------------------- P0 stall (GAP-1)
-  // Application-layer "no bytes moved in N seconds while the channel is OPEN"
-  // detector. Mirrors the Rust client's idle_ms() watchdog: the threshold is on
-  // TIME SINCE THE LAST BYTE, never throughput, so a slow-but-moving link never
-  // trips. Runs every STALL_TICK_MS from channel.onopen; disarmed in close() /
-  // _failActive(). Composition is deliberate (none double-fires):
-  //   - establishment _watchdog: disjoint (it only runs pre-'connected'; this
-  //     requires the channel 'open');
-  //   - C4 _dcTimer: only arms on 'disconnected'. During a black-hole the state
-  //     stays 'connected', so only this runs; rung (a)'s connectionState guard
-  //     prevents colliding restartIce calls if a real 'disconnected' happens.
-  _checkStall() {
-    // A genuine drop is C4's job, this detector is for an OPEN-but-dark channel.
-    if (this._closed || this.channel?.readyState !== 'open') return
-    // An idle link must never trip: nothing with bytes STILL TO MOVE -> reset the
-    // baseline. A transfer at progress 1 has handed every byte off and is in its
-    // legitimate no-wire-bytes tail (SCTP drain + whole-file verify + delivery-ack,
-    // P4), counting it would false-trip on a clean transfer, so we require
-    // progress < 1 (an outstanding byte) to treat the link as stall-eligible.
-    const transferring = [...this.transfers.values()].some(
-      (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
-    )
-    if (!transferring) {
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = this.channel.bufferedAmount
-      this._stallIdleMs = 0
-      this._stallEpisode = null
-      return
-    }
-    // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
-    // gets its window, don't trip while they're legitimately away.
-    if ((this._awayUntil || 0) > Date.now()) {
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = this.channel.bufferedAmount
-      this._stallIdleMs = 0
-      return
-    }
-    // PROGRESS check. Either application-level bytes advanced, OR the SCTP send
-    // buffer drained (bytes left for the wire), the latter prevents a false
-    // positive on a slow-but-moving link whose chunks sit briefly buffered.
-    const buffered = this.channel.bufferedAmount
-    if (this._bytesMoved !== this._lastMovedSnapshot || buffered < this._lastBuffered) {
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = buffered
-      this._stallIdleMs = 0
-      // A moved byte clears any open episode (the link recovered), mirrors the
-      // Rust note_progress(): a future stall may climb the ladder fresh.
-      if (this._stallEpisode) {
-        rlog.info('stall corrected, bytes moving again', this.id.slice(-6), 'rung', this._stallEpisode.rung)
-        this._stallEpisode = null
-      }
-      return
-    }
-    // No progress this tick, accumulate idle time.
-    this._lastBuffered = buffered
-    this._stallIdleMs += STALL_TICK_MS
-    if (this._stallIdleMs < STALL_MS) return
-    // The _stallEpisode latch gates re-entry: while a rung is mid-convergence
-    // (we gave it ~one STALL_MS grace) we wait rather than re-firing the ladder.
-    const now = Date.now()
-    if (this._stallEpisode && now - this._stallEpisode.at < STALL_MS) return
-    rlog.debug('stall detected', this.id.slice(-6), 'idleMs', this._stallIdleMs)
-    this._correctStall()
-  }
-
-  // Least-disruptive-first correction ladder (mirrors Rust correct_stall):
-  //   (a) liveness ping + (impolite, connected) restartIce, cheapest in-place;
-  //   (b) re-offer/resume unfinished transfers (receiver auto-resumes; the
-  //       receiver instead re-acks at its current offset to nudge the sender);
-  //   (c) escalate to onStall (P1: relay-preferred rebuild), callback may be a
-  //       no-op for now.
-  // Bounded at MAX_STALL_ATTEMPTS; on exhaustion -> onStatus('failed') +
-  // _failActive (transfers become paused/resumable, NEVER silently dead).
-  _correctStall() {
-    const now = Date.now()
-    const rung = this._stallEpisode?.rung
-    // RUNG (a): liveness probe + in-place ICE repair.
-    if (!rung) {
-      try {
-        // A control send over the reliable channel: success ⇒ the transport
-        // itself is up (data path dark, link alive). A throw ⇒ truly dead. Let
-        // C4 / _failActive own it.
-        this.channel.send(JSON.stringify({ type: 'ping', v: 1, reason: 'stall-probe' }))
-      } catch {
-        rlog.debug('stall: control send threw: link is dead, deferring to C4', this.id.slice(-6))
-        return
-      }
-      // Only nudge ICE while CONNECTED and from the IMPOLITE side: C4 owns the
-      // ICE-restart while 'disconnected', and restarting from both sides at once
-      // glares. The guard also stops a double-fire if a real 'disconnected' lands
-      // mid-stall (C4 then takes over).
-      if (this.pc.connectionState === 'connected' && !this.polite) {
-        try {
-          linkdiag.record('action', { what: 'restartIce', reason: 'stall-rung-a' }, this._diagMeta())
-          this.pc.restartIce()
-          rlog.info('stall corrected attempt (rung a), liveness ping + restartIce', this.id.slice(-6))
-        } catch {}
-      } else {
-        rlog.info('stall corrected attempt (rung a), liveness ping (no ICE restart: polite/not-connected)', this.id.slice(-6))
-      }
-      this._stallEpisode = { rung: 'a', at: now }
-      return
-    }
-    // RUNG (b): still stalled after rung (a)'s grace, re-issue every unfinished
-    // transfer so the data path re-flows from the partial.
-    if (rung === 'a') {
-      let nudged = 0
-      for (const t of this.transfers.values()) {
-        if (t.status !== 'transferring') continue
-        if (t.direction === 'send') {
-          // Re-offer with resume:true; the receiver auto-resumes from its partial.
-          // Clear the per-link send state so resumeSend re-arms a fresh stream.
-          this._outgoingFiles.delete(t.id)
-          this.resumeSend(t.id)
-          nudged++
-        } else if (t.direction === 'receive') {
-          // Receiver side: re-send a resume accept at the current offset to nudge
-          // the sender to (re)stream from where we are, never restart from 0.
-          const partial = this.stores.partials.get(t.id)
-          this._control({ type: CTRL.ACCEPT, id: t.id, offset: partial ? partial.received : 0 })
-          nudged++
-        }
-      }
-      rlog.info('stall correction (rung b), re-offered/resumed unfinished transfers', this.id.slice(-6), 'count', nudged)
-      this._stallEpisode = { rung: 'b', at: now }
-      return
-    }
-    // RUNG (c): still stalled, escalate to the hook (P1 implements the
-    // relay-preferred rebuild). The callback may be a no-op for now.
-    if (rung === 'b') {
-      rlog.info('stall correction (rung c), escalating to onStall', this.id.slice(-6))
-      linkdiag.record('action', { what: 'onStall', reason: 'stall-rung-c', route: this.route || null }, this._diagMeta())
-      try {
-        this.onStall?.({ reason: 'persistent', route: this.route })
-      } catch (err) {
-        rlog.warn('onStall hook threw', this.id.slice(-6), err)
-      }
-      this._stallEpisode = { rung: 'c', at: now }
-      return
-    }
-    // EXHAUSTED (rungs a→c spent, MAX_STALL_ATTEMPTS): no rung recovered. Fail
-    // CLEAN, transfers become paused/resumable via _failActive, never silently
-    // dead; the partials are preserved for the next link.
-    rlog.warn('stall correction exhausted, failing clean (partials preserved)', this.id.slice(-6))
-    this.onStatus('failed')
-    this._failActive()
-  }
+  // The in-flight stall watchdog (state + detection + correction ladder) now
+  // lives in resilience/StallController; PeerLink ticks it from the channel-open
+  // interval (this._stall.tick(), alongside _checkPtyLiveness below) and resets
+  // it on open (this._stall.reset()) / teardown (this._stall.clearState()).
 
   // -------------------------------------------------- M1 idle-interactive liveness
-  // Read an ICE-CONSENT liveness value off the selected candidate pair. This
-  // counter advances ONLY while the remote answers the browser's STUN consent
-  // checks (~every 5s on a connected pair), so it keeps climbing on a healthy idle
-  // link (no false positive on an idle terminal) and freezes the instant the path
-  // is black-holed. Preference order: responsesReceived (the consent signal) >
-  // lastPacketReceivedTimestamp > bytesReceived (any inbound life). Returns a
-  // number that strictly increases while alive, or null when no pair / unsupported.
-  async _readConsentLiveness() {
-    if (this._closed) return null
-    try {
-      const stats = await this.pc.getStats()
-      let transportSelectedId = null
-      stats.forEach((r) => {
-        if (r.type === 'transport' && r.selectedCandidatePairId) transportSelectedId = r.selectedCandidatePairId
-      })
-      let pair = null
-      stats.forEach((r) => {
-        if (r.type !== 'candidate-pair') return
-        if (r.id === transportSelectedId || (!transportSelectedId && r.state === 'succeeded' && (r.nominated || r.selected)))
-          pair = r
-      })
-      if (!pair) return null
-      if (typeof pair.responsesReceived === 'number') return pair.responsesReceived
-      if (typeof pair.lastPacketReceivedTimestamp === 'number') return pair.lastPacketReceivedTimestamp
-      if (typeof pair.bytesReceived === 'number') return pair.bytesReceived
-      return null
-    } catch {
-      return null // getStats unsupported
-    }
-  }
-
-  // M1: detect a silently-dead INTERACTIVE link fast (the core mobile bug). Runs
-  // on the same 2s tick as _checkStall but is INDEPENDENT of any file transfer.
-  // Only active for a shell link (_ptySid != null) over an open+connected channel
-  // when NO file transfer is in flight (a transfer hands liveness to _checkStall,
-  // which owns the file-data ladder). If the consent-liveness signal has not
-  // advanced for PTY_LIVENESS_WINDOW_MS, the path is dead though the channel still
-  // claims open, trigger recovery via the SAME ladder P0 uses (no new ladder).
-  async _checkPtyLiveness() {
-    if (this._closed || this.channel?.readyState !== 'open') return
-    if (this._ptySid == null) { this._ptyLiveSignal = null; this._ptyDeadMs = 0; return }
-    if (this.pc.connectionState !== 'connected') { this._ptyDeadMs = 0; return }
-    // A file transfer in flight is _checkStall's job (it watches file bytes + the
-    // SCTP buffer). Don't double-detect, defer to it while a transfer moves.
-    const transferring = [...this.transfers.values()].some(
-      (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
-    )
-    if (transferring) { this._ptyDeadMs = 0; return }
-    // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
-    // is legitimately quiet, don't trip while they're away.
-    if ((this._awayUntil || 0) > Date.now()) { this._ptyDeadMs = 0; return }
-
-    const signal = await this._readConsentLiveness()
-    if (this._closed) return
-    // M1 test seam (?test=freezepty): the local CLI peer's path is genuinely
-    // alive, so consent KEEPS advancing even though we froze the app data path.
-    // Force the "no progress" branch so the detector fires as it would against a
-    // truly dead remote path. Inert in production (_testPtyFrozen stays false).
-    const frozenForTest = TEST.freezePty && this._testPtyFrozen
-    if (signal == null && !frozenForTest) { this._ptyDeadMs = 0; return } // can't read: don't guess
-
-    const advanced = !frozenForTest && this._ptyLiveSignal != null && signal > this._ptyLiveSignal
-    if (this._ptyLiveSignal == null && !frozenForTest) {
-      // First reading: seed the baseline, give it a tick before judging.
-      this._ptyLiveSignal = signal
-      this._ptyDeadMs = 0
-      return
-    }
-    if (advanced) {
-      this._ptyLiveSignal = signal
-      this._ptyDeadMs = 0
-      if (this._ptyEpisode) {
-        rlog.info('idle shell link recovered, consent advancing again', this.id.slice(-6))
-        this._ptyEpisode = null
-      }
-      return
-    }
-    // No advance this tick: accumulate dead time.
-    if (!frozenForTest) this._ptyLiveSignal = signal
-    this._ptyDeadMs += STALL_TICK_MS
-    if (this._ptyDeadMs < PTY_LIVENESS_WINDOW_MS) return
-    // Latch so we don't re-fire every tick while a correction converges.
-    const now = Date.now()
-    if (this._ptyEpisode && now - this._ptyEpisode.at < PTY_LIVENESS_WINDOW_MS) return
-    rlog.debug('idle shell link appears dead (consent not advancing)', this.id.slice(-6), 'deadMs', this._ptyDeadMs)
-    linkdiag.record('m1-dead', { deadMs: this._ptyDeadMs, route: this.route || null }, this._diagMeta())
-    this._correctPtyDead()
-  }
-
-  // M1 + M6: recover a dead idle interactive link. Reuse the EXISTING correction
-  // ladder rather than inventing a new one. Rung 1: impolite-only restartIce (the
-  // cheapest in-place repair, identical to _correctStall rung a, the data channel
-  // survives an ICE restart). Rung 2+: escalate straight to onStall (the P1 relay-
-  // preferred rebuild). M6: because this is a shell link (_ptySid != null), skip
-  // the slower middle rungs, an interactive link should reach the relay fast, so
-  // one in-place ICE try then relay. File transfers are untouched (they go through
-  // _correctStall's full 3-rung ladder, gated above on `transferring`).
-  _correctPtyDead() {
-    const now = Date.now()
-    const stage = this._ptyEpisode?.stage
-    if (!stage) {
-      // Rung 1: in-place ICE repair (impolite + connected only, mirrors rung a).
-      if (this.pc.connectionState === 'connected' && !this.polite) {
-        try {
-          linkdiag.record('action', { what: 'restartIce', reason: 'm1-shell-rung-1' }, this._diagMeta())
-          this.pc.restartIce()
-          rlog.info('idle shell dead (rung 1): restartIce', this.id.slice(-6))
-        } catch {}
-      } else {
-        rlog.info('idle shell dead (rung 1): no restartIce (polite/not-connected), waiting one window', this.id.slice(-6))
-      }
-      this._ptyEpisode = { stage: 'ice', at: now }
-      return
-    }
-    // M6: still dead after the in-place ICE try, escalate FAST to the relay
-    // rebuild (skip the file-transfer ladder's intermediate rungs). The hook's
-    // onStall does the bounded relay-preferred rebuild; the PTY reattaches on the
-    // new link via the stable sessionId, so the terminal recovers on the relay.
-    if (stage === 'ice') {
-      rlog.info('idle shell still dead (rung 2): escalating to relay rebuild (onStall)', this.id.slice(-6))
-      linkdiag.record('action', { what: 'onStall', reason: 'm1-shell-rung-2', route: this.route || null }, this._diagMeta())
-      try {
-        this.onStall?.({ reason: 'persistent', route: this.route })
-      } catch (err) {
-        rlog.warn('onStall hook threw', this.id.slice(-6), err)
-      }
-      this._ptyEpisode = { stage: 'relay', at: now }
-      return
-    }
-    // Exhausted: the relay rebuild was requested and we're still here (the hook
-    // bounds relay escalation to at-most-once). Let the connection-state machine /
-    // M2 short shell grace carry it to a clean 'failed', the terminal reattaches
-    // on the next link. Re-latch so we keep deferring rather than thrashing.
-    this._ptyEpisode = { stage: 'relay', at: now }
-  }
+  // The idle-shell consent-liveness detector + its short recovery ladder live in
+  // resilience/LivenessController (consent read via getStats, dead clock,
+  // ice→relay ladder). PeerLink ticks it from the channel-open interval
+  // (this._liveness.tick(), alongside this._stall.tick()), resets it on open /
+  // teardown (this._liveness.reset()), and flags the ?test=freezepty seam via
+  // this._liveness.markFrozenForTest() from sendPtyInput.
 
   close() {
     linkdiag.record('action', { what: 'close', route: this.route || null }, this._diagMeta())
     this._diag?.stop() // P5/diag: stop the getStats poll
     clearInterval(this._stateTimer)
     clearInterval(this._stallTimer) // P0: disarm the in-flight stall watchdog
-    this._disarmUpgradeProber() // P5: disarm the relay→direct upgrade prober
+    this._upgrade.disarm() // P5: disarm the relay→direct upgrade prober
     if (this._closed) return
     this._closed = true
     clearTimeout(this._dcTimer)
