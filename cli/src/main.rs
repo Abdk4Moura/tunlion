@@ -21,6 +21,7 @@ mod holepunch;
 mod l2;
 mod net;
 mod pake_ceremony;
+mod protocol;
 mod resilience;
 mod session;
 mod sshkeys;
@@ -238,46 +239,9 @@ const MAX_VERIFY_FAILS: u32 = 3;
 /// WebRTC peer. The recv loop computes `conn.recv_done` from exactly this each
 /// tick; `on_stuck` then reads the flag.
 ///
-/// - `completed`: files fully placed on disk so far.
-/// - `keep_open`: the receiver was asked to stay resident (gate 13).
-/// - `by_sid_empty`: NO stream is in flight (an in-progress reconnect/resume
-///   keeps a by_sid entry, which must keep the link reconnecting, gate 2/11c).
-fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> bool {
-    completed > 0 && !keep_open && by_sid_empty
-}
-
-/// P4 (silent-data-loss fix): what a SEND should do when its delivery-ack window
-/// elapses with NO whole-file-verified `delivery-ack`. A send is "delivered +
-/// verified" ONLY on a genuine `delivery-ack`, so this NEVER returns `Complete`:
-/// the bytes draining out of the send buffer proves nothing (a path that
-/// black-holes without ICE/QUIC noticing drains while NOTHING arrives, no ack
-/// comes, and the old fallback then falsely reported "done"). Pure, so the
-/// completion decision is unit-testable without a live peer.
-///
-/// - `link_alive`: a live transport is still attached (mirrors "channel open").
-///   When false the link is gone, nothing can prompt or carry a re-ack.
-/// - `reprobed`: we have already re-sent `file-end` once this window.
-///
-/// Returns:
-/// - `Reprobe`: link looks alive and we have not re-probed, the ack may be lost,
-///   re-send `file-end` once to prompt it and extend the window.
-/// - `FailUnconfirmed`: end honestly (nonzero, partial kept resumable), never a
-///   false "delivered + verified". Reached when the link is gone, or after a
-///   re-probe still drew no ack.
-#[derive(Debug, PartialEq, Eq)]
-enum AckFallback {
-    Reprobe,
-    FailUnconfirmed,
-}
-fn decide_ack_fallback(link_alive: bool, reprobed: bool) -> AckFallback {
-    if !link_alive {
-        return AckFallback::FailUnconfirmed;
-    }
-    if !reprobed {
-        return AckFallback::Reprobe;
-    }
-    AckFallback::FailUnconfirmed
-}
+/// The pure file-transfer decisions `recv_transfer_done` and `decide_ack_fallback`
+/// (+ the `AckFallback` enum) now live in `protocol.rs` (the Rust mirror of the JS
+/// net/protocol layer); the send/recv loops call `protocol::…`.
 
 /// Bug 5: after repeated stuck-while-connecting on establishment, the user has
 /// no clue WHY. The dominant single-host cause is a browser publishing mDNS
@@ -5157,9 +5121,9 @@ async fn send_cmd(
                         // black-hole that QUIC hasn't noticed still reports a
                         // transport, so the re-probe path is what catches it.
                         let link_alive = conn.transport().is_some();
-                        match decide_ack_fallback(link_alive, ack_reprobed) {
-                            AckFallback::Reprobe => do_reprobe = true,
-                            AckFallback::FailUnconfirmed => give_up = true,
+                        match protocol::decide_ack_fallback(link_alive, ack_reprobed) {
+                            protocol::AckFallback::Reprobe => do_reprobe = true,
+                            protocol::AckFallback::FailUnconfirmed => give_up = true,
                         }
                     }
                 }
@@ -5933,7 +5897,7 @@ async fn recv_cmd(
         // here, where `completed`/`by_sid` were just settled, makes the gate-2/
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
-        conn.recv_done = recv_transfer_done(completed, keep_open, by_sid.is_empty());
+        conn.recv_done = protocol::recv_transfer_done(completed, keep_open, by_sid.is_empty());
         if completed > 0 || !by_sid.is_empty() {
             ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
         }
@@ -7893,48 +7857,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recv_done_drops_only_when_complete() {
-        // Gate-18 Mode B: the drop-instead-of-reconnect decision must hold
-        // ONLY when the transfer is complete and idle. This is the exact fence
-        // that protects gate 2 (kill-resume) and gate 11c (deferred-drop): a
-        // mid-transfer link (by_sid non-empty) must always reconnect.
-        // complete + idle + not keep_open -> drop the dead link, let quiet-exit
-        assert!(recv_transfer_done(1, false, true));
-        assert!(recv_transfer_done(3, false, true));
-    }
-
-    #[test]
-    fn recv_done_false_mid_transfer_protects_resume() {
-        // by_sid NON-empty == a stream in flight (an in-progress reconnect or
-        // resume). Must NOT drop, gate 2 / gate 11c reconnect paths depend on
-        // this returning false so on_stuck re-establishes.
-        assert!(!recv_transfer_done(0, false, false)); // nothing done, mid-stream
-        assert!(!recv_transfer_done(1, false, false)); // file done but another in flight
-        // keep_open (gate 13): a resident receiver never self-drops its links.
-        assert!(!recv_transfer_done(1, true, true));
-        assert!(!recv_transfer_done(5, true, true));
-        // nothing completed yet (still connecting / first stream) -> reconnect.
-        assert!(!recv_transfer_done(0, false, true));
-    }
-
-    #[test]
-    fn ack_fallback_never_completes_silently() {
-        // P4 silent-data-loss fix: the no-ack window must NEVER claim success. A
-        // send is delivered+verified ONLY on a real delivery-ack, so this decision
-        // function only ever Reprobes or FailsUnconfirmed, never "complete".
-        // Link gone (the black-hole-then-drop case): fail honestly, no point
-        // re-probing into a dead link.
-        assert_eq!(decide_ack_fallback(false, false), AckFallback::FailUnconfirmed);
-        assert_eq!(decide_ack_fallback(false, true), AckFallback::FailUnconfirmed);
-        // Link alive, first window: the ack may be lost, re-probe once.
-        assert_eq!(decide_ack_fallback(true, false), AckFallback::Reprobe);
-        // Link alive but already re-probed and STILL no ack: do not declare
-        // success, fail as unconfirmed (resumable). This is the exact case the
-        // old code falsely completed (drained buffer, healthy-looking link, but
-        // nothing arrived and no ack came).
-        assert_eq!(decide_ack_fallback(true, true), AckFallback::FailUnconfirmed);
-    }
 
     #[test]
     fn filename_sanitization() {
