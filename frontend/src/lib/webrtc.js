@@ -43,16 +43,14 @@ import {
   sendsToResume,
 } from '../net/protocol/transfer.js'
 export { decideAckFallback }
-// RESILIENCE layer: the stall DETECTOR (pure reducer) + the correction-ladder
-// SHAPE (which rung to run next). PeerLink owns the timer + counters/episode
-// state and runs each rung's mechanics.
-import { nextStallRung, stallTick } from '../net/resilience/stall.js'
 // RESILIENCE layer: the relay→direct upgrade prober's timer-free POLICY
 // (probe-result classification, verify-before-commit tick, backoff cadence).
 import { decideProbeResult, decideUpgradeVerifyTick, nextUpgradeDelay } from '../net/resilience/upgrade.js'
 // RESILIENCE layer: the idle-shell (PTY) consent-liveness detector + its short
 // recovery ladder. PeerLink owns the timer, the consent read, and the counters.
 import { ptyLivenessTick, nextPtyStage } from '../net/resilience/liveness.js'
+// RESILIENCE layer: the timer-owning in-flight stall controller (state + ladder).
+import { StallController } from '../net/resilience/stallController.js'
 
 const rlog = log.scope('rtc')
 
@@ -388,10 +386,10 @@ export class PeerLink {
     // against the last tick's snapshot to tell "data wedged, link alive" (→ the
     // correction ladder) from a slow-but-moving link (→ no action).
     this._bytesMoved = 0
-    this._lastMovedSnapshot = 0
-    this._lastBuffered = 0
-    this._stallIdleMs = 0 // accumulated no-progress time across ticks
-    this._stallEpisode = null // {rung, at} latch: prevents re-entering a rung mid-convergence (mirrors Rust repair_in_flight)
+    // RESILIENCE: the in-flight stall watchdog state + ladder live in a
+    // controller (idle clock, episode latch, moved/buffered snapshots). PeerLink
+    // keeps the 2s interval below (it also ticks PTY liveness) and delegates.
+    this._stall = new StallController(this, { stallMs: STALL_MS, tickMs: STALL_TICK_MS })
     this._stallTimer = null // the watchdog interval (armed on channel open)
 
     // M1 (mobile): idle-interactive-link liveness. `_ptyLiveSignal` is the last
@@ -692,7 +690,7 @@ export class PeerLink {
     // Shared-ICE-restart guard: the P0 stall ladder also drives restartIce. They
     // must never both fire at once (glare / churn). If a stall episode is open or
     // we're not cleanly connected, skip this probe and back off.
-    if (this.pc.connectionState !== 'connected' || this._stallEpisode) {
+    if (this.pc.connectionState !== 'connected' || this._stall.episode) {
       rlog.debug('upgrade probe skipped (not connected or stall episode open)', this.id.slice(-6))
       return this._backoffUpgrade()
     }
@@ -822,17 +820,14 @@ export class PeerLink {
       // and from C4's _dcTimer (which only arms on 'disconnected'): during a
       // black-hole the pc stays 'connected' and the channel 'open', so only this
       // detector runs. Reset the baseline so the first tick starts clean.
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = this.channel?.bufferedAmount || 0
-      this._stallIdleMs = 0
-      this._stallEpisode = null
+      this._stall.reset()
       // M1: reset the idle-interactive liveness baseline too (it shares this tick).
       this._ptyLiveSignal = null
       this._ptyDeadMs = 0
       this._ptyEpisode = null
       clearInterval(this._stallTimer)
       this._stallTimer = setInterval(() => {
-        this._checkStall()
+        this._stall.tick()
         this._checkPtyLiveness() // M1: idle-shell black-hole detector
       }, STALL_TICK_MS)
     }
@@ -1394,8 +1389,7 @@ export class PeerLink {
     // clean (close() also clears it; this covers a mid-life link drop).
     clearInterval(this._stallTimer)
     this._stallTimer = null
-    this._stallEpisode = null
-    this._stallIdleMs = 0
+    this._stall.clearState()
     // M1: the idle-interactive liveness watchdog rode the same timer; clear its
     // latch too so a rebuilt link starts judging liveness fresh.
     this._ptyEpisode = null
@@ -1437,143 +1431,10 @@ export class PeerLink {
   }
 
   // -------------------------------------------------------------- P0 stall (GAP-1)
-  // Application-layer "no bytes moved in N seconds while the channel is OPEN"
-  // detector. Mirrors the Rust client's idle_ms() watchdog: the threshold is on
-  // TIME SINCE THE LAST BYTE, never throughput, so a slow-but-moving link never
-  // trips. Runs every STALL_TICK_MS from channel.onopen; disarmed in close() /
-  // _failActive(). Composition is deliberate (none double-fires):
-  //   - establishment _watchdog: disjoint (it only runs pre-'connected'; this
-  //     requires the channel 'open');
-  //   - C4 _dcTimer: only arms on 'disconnected'. During a black-hole the state
-  //     stays 'connected', so only this runs; rung (a)'s connectionState guard
-  //     prevents colliding restartIce calls if a real 'disconnected' happens.
-  _checkStall() {
-    // A genuine drop is C4's job, this detector is for an OPEN-but-dark channel.
-    if (this._closed || this.channel?.readyState !== 'open') return
-    // An idle link must never trip: nothing with bytes STILL TO MOVE is stall-
-    // eligible. A transfer at progress 1 has handed every byte off and is in its
-    // legitimate no-wire-bytes tail (SCTP drain + whole-file verify + delivery-ack,
-    // P4); counting it would false-trip on a clean transfer, so we require
-    // progress < 1 (an outstanding byte).
-    const transferring = [...this.transfers.values()].some(
-      (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
-    )
-    // The detection DECISION lives in resilience/stall.js (a pure reducer); this
-    // method owns the timer + counters and runs the ladder on its verdict.
-    const r = stallTick(
-      {
-        idleMs: this._stallIdleMs,
-        episode: this._stallEpisode,
-        lastMoved: this._lastMovedSnapshot,
-        lastBuffered: this._lastBuffered,
-      },
-      {
-        transferring,
-        awayActive: (this._awayUntil || 0) > Date.now(),
-        bytesMoved: this._bytesMoved,
-        buffered: this.channel.bufferedAmount,
-        stallMs: STALL_MS,
-        tickMs: STALL_TICK_MS,
-        now: Date.now(),
-      },
-    )
-    this._stallIdleMs = r.state.idleMs
-    this._stallEpisode = r.state.episode
-    this._lastMovedSnapshot = r.state.lastMoved
-    this._lastBuffered = r.state.lastBuffered
-    // A moved byte clears any open episode (mirrors the Rust note_progress()): a
-    // future stall climbs the ladder fresh.
-    if (r.recovered) rlog.info('stall corrected, bytes moving again', this.id.slice(-6), 'rung', r.recovered)
-    if (r.action === 'correct') {
-      rlog.debug('stall detected', this.id.slice(-6), 'idleMs', this._stallIdleMs)
-      this._correctStall()
-    }
-  }
-
-  // Least-disruptive-first correction ladder (mirrors Rust correct_stall):
-  //   (a) liveness ping + (impolite, connected) restartIce, cheapest in-place;
-  //   (b) re-offer/resume unfinished transfers (receiver auto-resumes; the
-  //       receiver instead re-acks at its current offset to nudge the sender);
-  //   (c) escalate to onStall (P1: relay-preferred rebuild), callback may be a
-  //       no-op for now.
-  // Bounded at MAX_STALL_ATTEMPTS; on exhaustion -> onStatus('failed') +
-  // _failActive (transfers become paused/resumable, NEVER silently dead).
-  _correctStall() {
-    const now = Date.now()
-    // The ladder SHAPE lives in resilience/stall.js; this returns the rung to
-    // run NOW from the in-flight episode (none → 'a' → 'b' → 'c' → 'fail').
-    const step = nextStallRung(this._stallEpisode?.rung)
-    // RUNG (a): liveness probe + in-place ICE repair.
-    if (step === 'a') {
-      try {
-        // A control send over the reliable channel: success ⇒ the transport
-        // itself is up (data path dark, link alive). A throw ⇒ truly dead. Let
-        // C4 / _failActive own it.
-        this.channel.send(JSON.stringify({ type: 'ping', v: 1, reason: 'stall-probe' }))
-      } catch {
-        rlog.debug('stall: control send threw: link is dead, deferring to C4', this.id.slice(-6))
-        return
-      }
-      // Only nudge ICE while CONNECTED and from the IMPOLITE side: C4 owns the
-      // ICE-restart while 'disconnected', and restarting from both sides at once
-      // glares. The guard also stops a double-fire if a real 'disconnected' lands
-      // mid-stall (C4 then takes over).
-      if (this.pc.connectionState === 'connected' && !this.polite) {
-        try {
-          linkdiag.record('action', { what: 'restartIce', reason: 'stall-rung-a' }, this._diagMeta())
-          this.pc.restartIce()
-          rlog.info('stall corrected attempt (rung a), liveness ping + restartIce', this.id.slice(-6))
-        } catch {}
-      } else {
-        rlog.info('stall corrected attempt (rung a), liveness ping (no ICE restart: polite/not-connected)', this.id.slice(-6))
-      }
-      this._stallEpisode = { rung: 'a', at: now }
-      return
-    }
-    // RUNG (b): still stalled after rung (a)'s grace, re-issue every unfinished
-    // transfer so the data path re-flows from the partial.
-    if (step === 'b') {
-      let nudged = 0
-      for (const t of this.transfers.values()) {
-        if (t.status !== 'transferring') continue
-        if (t.direction === 'send') {
-          // Re-offer with resume:true; the receiver auto-resumes from its partial.
-          // Clear the per-link send state so resumeSend re-arms a fresh stream.
-          this._outgoingFiles.delete(t.id)
-          this.resumeSend(t.id)
-          nudged++
-        } else if (t.direction === 'receive') {
-          // Receiver side: re-send a resume accept at the current offset to nudge
-          // the sender to (re)stream from where we are, never restart from 0.
-          const partial = this.stores.partials.get(t.id)
-          this._control(acceptMsg(t.id, partial ? partial.received : 0))
-          nudged++
-        }
-      }
-      rlog.info('stall correction (rung b), re-offered/resumed unfinished transfers', this.id.slice(-6), 'count', nudged)
-      this._stallEpisode = { rung: 'b', at: now }
-      return
-    }
-    // RUNG (c): still stalled, escalate to the hook (P1 implements the
-    // relay-preferred rebuild). The callback may be a no-op for now.
-    if (step === 'c') {
-      rlog.info('stall correction (rung c), escalating to onStall', this.id.slice(-6))
-      linkdiag.record('action', { what: 'onStall', reason: 'stall-rung-c', route: this.route || null }, this._diagMeta())
-      try {
-        this.onStall?.({ reason: 'persistent', route: this.route })
-      } catch (err) {
-        rlog.warn('onStall hook threw', this.id.slice(-6), err)
-      }
-      this._stallEpisode = { rung: 'c', at: now }
-      return
-    }
-    // EXHAUSTED (rungs a→c spent, MAX_STALL_ATTEMPTS): no rung recovered. Fail
-    // CLEAN, transfers become paused/resumable via _failActive, never silently
-    // dead; the partials are preserved for the next link.
-    rlog.warn('stall correction exhausted, failing clean (partials preserved)', this.id.slice(-6))
-    this.onStatus('failed')
-    this._failActive()
-  }
+  // The in-flight stall watchdog (state + detection + correction ladder) now
+  // lives in resilience/StallController; PeerLink ticks it from the channel-open
+  // interval (this._stall.tick(), alongside _checkPtyLiveness below) and resets
+  // it on open (this._stall.reset()) / teardown (this._stall.clearState()).
 
   // -------------------------------------------------- M1 idle-interactive liveness
   // Read an ICE-CONSENT liveness value off the selected candidate pair. This

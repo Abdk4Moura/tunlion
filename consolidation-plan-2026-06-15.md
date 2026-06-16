@@ -262,6 +262,21 @@ characterization test and the existing gates, smallest verifiable slice first.
     `decideAckFallback` already lives in protocol/transfer.js; only the
     `_armAckFallback` timer remains in PeerLink).
 
+- **2026-06-16 (cont.) — first TIMER-OWNING controller: `StallController`.**
+  - Moved the in-flight stall watchdog's mutable state (idle clock, episode
+    latch, moved/buffered snapshots) AND the correction-ladder mechanics out of
+    PeerLink into `net/resilience/stallController.js`. PeerLink keeps the single
+    2s interval (it also ticks PTY liveness) and delegates: `this._stall.tick()`,
+    `reset()` on channel-open, `clearState()` on teardown. The upgrade prober's
+    glare-check now reads `this._stall.episode`. `_checkStall`/`_correctStall`
+    deleted from PeerLink. Faithful relocation (pure decisions unchanged in
+    stall.js).
+  - Verified: vite build clean; stall/upgrade/liveness/wire/transfer/gate8 PASS;
+    **browser `?test=freeze` console (2/2 clean runs)** showed the controller
+    firing the ladder identically — stall detected at idleMs 6000 → rung a
+    (ping-only when polite, ping+restartIce when impolite) → re-detect at 14000 →
+    rung b (re-offered/resumed count 1). Cross-machine pop-os check next.
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
