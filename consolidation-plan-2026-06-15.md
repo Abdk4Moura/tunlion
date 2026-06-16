@@ -169,9 +169,29 @@ characterization test and the existing gates, smallest verifiable slice first.
     the explicitly-parked web-shell) would only re-test these same proven
     functions, so it was judged disproportionate — coverage is complete.
 
+- **2026-06-16 (cont.) — Phase 1 slice: `net/protocol/transfer.js` extracted.**
+  - The file-offer/accept/end/delivery-ack ceremony's MESSAGE VOCABULARY +
+    PURE DECISIONS pulled out of `_streamFile`/`_finishReceive`/`_onControl`:
+    `offerMsg`/`acceptMsg`/`declineMsg`/`endMsg`/`deliveryAckMsg` (exact frozen
+    shapes, key order preserved), `decideOnOffer` (resume auto-accept vs
+    surface), `decideAfterVerify` (the whole-file match→ack / mismatch→
+    rerequest(truncated|corrupt) / over-bound→fail tree), `decideAckFallback`
+    (MOVED here from webrtc.js; re-exported to keep the frozen surface), and
+    `sendsToResume` (CTRL.STATE reconciliation). Pure: NO timers, NO state, NO
+    transport, NO browser API — the un-mangling rule holds (the no-ack TIMER
+    `_armAckFallback` stays in PeerLink, slated for resilience/ackfallback.js).
+  - PeerLink delegates at every call site; the mutable stores, Blob assembly +
+    sha256, channel sends, and timers stay put (orchestration). webrtc.js still
+    re-exports `decideAckFallback`; `useFilament`/`WebTerminal` surfaces unchanged.
+  - Verified: `transfer.test.mjs` (new characterization test, pins builders incl.
+    key order + every decision) PASS; `vite build` clean; `wire.test.mjs` PASS;
+    `gate8` byte-identity PASS; LIVE browser↔CLI both directions 2/2 byte-exact
+    (`cli/tests/live-wire-check.sh`) — gate 6 exercises the send builders, gate 5
+    the receive verify/ack decisions, over real WebRTC framing.
+
 ### Next slices (Phase 1 continued)
-1. `protocol/transfer.js` — file-offer/accept/end/delivery-ack state machine out
-   of `_onControl`/`_streamFile`/`_finishReceive` (the worst tangles).
+1. ~~`protocol/transfer.js`~~ — DONE (see above).
 2. `resilience/{stall,upgrade,liveness,ackfallback}.js` — controllers over a
-   Transport handle; pull the timers/ladders out of PeerLink.
+   Transport handle; pull the timers/ladders out of PeerLink. `decideAckFallback`
+   is already extracted (in transfer.js) as the pure seam for `ackfallback.js`.
 3. Slim `PeerLink` to a thin orchestrator. Then Phase 2 (useFilament), Phase 3 (Rust).

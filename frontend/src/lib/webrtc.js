@@ -26,6 +26,23 @@ import {
   encodeControl,
   decodeControl,
 } from '../net/protocol/wire.js'
+// PROTOCOL transfer layer: the file-offer/accept/end/delivery-ack ceremony's
+// message vocabulary + pure decisions, extracted from this file. PeerLink keeps
+// the state/IO/timers and delegates the protocol decisions here (CONTRACT.md
+// frozen). decideAckFallback now lives there too; re-exported below to keep the
+// frozen export surface of this module.
+import {
+  offerMsg,
+  acceptMsg,
+  declineMsg,
+  endMsg,
+  deliveryAckMsg,
+  decideOnOffer,
+  decideAfterVerify,
+  decideAckFallback,
+  sendsToResume,
+} from '../net/protocol/transfer.js'
+export { decideAckFallback }
 
 const rlog = log.scope('rtc')
 
@@ -42,36 +59,6 @@ const ACK_FALLBACK_MS = 30000
 // control message, if the link is healthy it returns fast.
 const ACK_REPROBE_MS = 5000
 
-// P4 (silent-data-loss fix): decide what a send should do when the ack window
-// elapses with NO delivery-ack. A send is "complete" (delivered + verified) ONLY
-// on a genuine CTRL.DELIVERY_ACK, so this function NEVER returns 'complete'. Pure
-// (no side effects) so it can be unit-tested directly.
-//
-//   channelOpen     data channel readyState === 'open'
-//   connected       pc.connectionState === 'connected'
-//   peerHasAcked    this peer has delivery-acked before (this link or a past one)
-//                   -> the ack is mandatory for it, a weak completion is wrong
-//   offeredDigest   we shipped a whole-file digest in the OFFER (so a modern
-//                   receiver is expected to ack)
-//   reprobed        we have already re-sent END once this window
-//
-// Returns one of:
-//   { action: 'reprobe' }  re-send END once and extend the window (ack may be lost)
-//   { action: 'fail', resumable }  end honestly, never claim success
-export function decideAckFallback({ channelOpen, connected, peerHasAcked, offeredDigest, reprobed }) {
-  const healthy = !!channelOpen && !!connected
-  // Link looks dead: nothing arrived and we cannot prompt a re-ack. End honestly.
-  if (!healthy) return { action: 'fail', resumable: true }
-  // Link looks alive and we have not yet re-probed: the ack may simply have been
-  // lost. Re-send END once to prompt the receiver to re-ack, extend the window.
-  if (!reprobed) return { action: 'reprobe' }
-  // Re-probed, still no ack. We must not claim success: a peer that ever acked, or
-  // one we offered a digest to, is EXPECTED to ack, treat the silence as a failure
-  // (resumable). With the modern fleet every receiver acks, so this is the norm.
-  void peerHasAcked
-  void offeredDigest
-  return { action: 'fail', resumable: true }
-}
 
 // P4 test shims, INERT unless a `?test=` query flag (persisted to localStorage)
 // is set, so they ship in the bundle with zero effect on real users. They exist
@@ -995,13 +982,13 @@ export class PeerLink {
         // dropped mid-receive), accept automatically from where we left off,
         // the user already said yes once.
         const partial = msg.resume && this.stores.partials.get(msg.id)
-        if (partial) {
+        if (decideOnOffer({ resume: msg.resume, hasPartial: !!partial }).action === 'auto-accept') {
           // P4: a re-offer may carry the digest the first offer did (or update
           // it); keep the partial verifiable across a resume.
           if (msg.full) partial.full = msg.full
           this._incomingBySid.set(msg.sid, msg.id)
           this._update(t, { status: 'transferring', progress: t.size ? partial.received / t.size : 0 })
-          this._control({ type: CTRL.ACCEPT, id: msg.id, offset: partial.received })
+          this._control(acceptMsg(msg.id, partial.received))
         } else {
           this.onTransfer(t)
         }
@@ -1044,16 +1031,12 @@ export class PeerLink {
         break
       case CTRL.STATE: {
         // (the first switch's default already cleared any away-mark, a
-        // state ping is proof of life.) Corrections:
-        const tr = msg.transfers || {}
-        for (const [id, bytes] of Object.entries(tr)) {
-          const t = this.transfers.get(id)
-          // I believe this send is COMPLETE; the peer holds fewer bytes,
-          // the tail/END was lost. Re-offer with resume.
-          if (t && t.direction === 'send' && t.status === 'complete' && bytes < t.size) {
-            this.onPeerStateDiverged('transfer')
-            this.resumeSend(id)
-          }
+        // state ping is proof of life.) Corrections: a send I believe is
+        // COMPLETE that the peer holds short means the tail/END was lost —
+        // re-offer with resume (decision in protocol/transfer.js).
+        for (const id of sendsToResume(msg.transfers, this.transfers)) {
+          this.onPeerStateDiverged('transfer')
+          this.resumeSend(id)
         }
         // They say they don't recognize us; the hook may hold a secret for
         // them, let it re-prove. Report ONCE per link: the re-prove is
@@ -1127,22 +1110,32 @@ export class PeerLink {
       finalize(blob)
       return
     }
-    if (got === entry.full) {
+    // Post-hash protocol decision (net/protocol/transfer.js). On a match
+    // verifyFails resets; a mismatch increments it BEFORE the decision so the
+    // give-up bound is checked against this attempt.
+    if (got === entry.full) entry.verifyFails = 0
+    else entry.verifyFails = (entry.verifyFails || 0) + 1
+    const decision = decideAfterVerify({
+      hashMatches: got === entry.full,
+      received: entry.received,
+      size: entry.size,
+      verifyFails: entry.verifyFails,
+      maxFails: MAX_VERIFY_FAILS,
+    })
+    if (decision.action === 'finalize-ack') {
       // INTACT: finalize, then tell the sender it landed whole (delivery-ack).
-      entry.verifyFails = 0
       finalize(blob)
       rlog.info('whole-file sha256 matched, finalizing + acking', id)
-      this._control({ type: CTRL.DELIVERY_ACK, id, sid, v: 1 })
+      this._control(deliveryAckMsg(id, sid))
       return
     }
-    // MISMATCH: do NOT finalize. Keep the partial, bound the re-request.
-    entry.verifyFails = (entry.verifyFails || 0) + 1
+    // MISMATCH: do NOT finalize. Keep the partial.
     const truncated = entry.received < (entry.size || 0)
     rlog.debug(
       `whole-file checksum FAILED (${truncated ? 'truncated ' + entry.received + '/' + entry.size : 'corrupt'}), attempt ${entry.verifyFails}`,
       id,
     )
-    if (entry.verifyFails > MAX_VERIFY_FAILS) {
+    if (decision.action === 'fail') {
       // Give up CLEANLY: keep the partial on the store (resumable), mark paused,
       // do not finalize, do not ack. No silent bad file, no hang.
       rlog.warn(`whole-file checksum still wrong after ${MAX_VERIFY_FAILS} re-fetches, refusing corrupt file (partial kept)`, id)
@@ -1151,18 +1144,17 @@ export class PeerLink {
       return
     }
     // Re-request: truncated -> resume from current offset; corrupt (full size,
-    // wrong hash) -> the buffers are poisoned, restart from 0.
-    let offset = entry.received
-    if (!truncated) {
+    // wrong hash, poisoned buffers) -> reset and restart from 0.
+    if (decision.reset) {
       entry.buffers = []
       entry.received = 0
-      offset = 0
     }
+    const offset = decision.offset
     // Keep the stream routable so resumed chunks land in the same partial, and
     // ask the sender to (re)stream from offset.
     this._incomingBySid.set(sid, id)
     this._update(t, { status: 'transferring', progress: entry.size ? offset / entry.size : 0 })
-    this._control({ type: CTRL.ACCEPT, id, offset })
+    this._control(acceptMsg(id, offset))
   }
 
   // ------------------------------------------------------------- send / accept
@@ -1190,7 +1182,7 @@ export class PeerLink {
       Promise.all([headHash(file), fullHash(file)]).then(([head, full]) => {
         const cur = this._outgoingFiles.get(id)
         if (cur) cur.offeredDigest = !!full // P4: a digest means a modern receiver acks
-        this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}), ...(full ? { full } : {}) })
+        this._control(offerMsg({ id, sid, name: file.name, size: file.size, mime: file.type, head, full }))
       })
       ids.push(id)
     }
@@ -1212,7 +1204,7 @@ export class PeerLink {
     Promise.all([headHash(entry.file), fullHash(entry.file)]).then(([head, full]) => {
       const cur = this._outgoingFiles.get(id)
       if (cur) cur.offeredDigest = !!full // P4: a digest means a modern receiver acks
-      this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, ...(head ? { head } : {}), ...(full ? { full } : {}) })
+      this._control(offerMsg({ id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, head, full }))
     })
   }
 
@@ -1223,7 +1215,7 @@ export class PeerLink {
     this.stores.partials.set(id, { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name, full: t._full || null })
     this._incomingBySid.set(t._sid, id)
     this._update(t, { status: 'transferring' })
-    this._control({ type: CTRL.ACCEPT, id, offset: 0 })
+    this._control(acceptMsg(id, 0))
   }
 
   declineTransfer(id) {
@@ -1231,7 +1223,7 @@ export class PeerLink {
     if (!t || t.direction !== 'receive') return
     this.stores.partials.delete(id)
     this._update(t, { status: 'declined' })
-    this._control({ type: CTRL.DECLINE, id })
+    this._control(declineMsg(id))
   }
 
   async _streamFile(id, startOffset = 0) {
@@ -1287,7 +1279,7 @@ export class PeerLink {
       this._bytesMoved += buf.byteLength // P0: outbound file bytes handed to SCTP = progress
       this._update(t, { progress: Math.min(offset / file.size, 1) })
     }
-    this._control({ type: CTRL.END, id, sid })
+    this._control(endMsg(id, sid))
     // Don't declare 'complete' while bytes still sit in the SCTP buffer: the
     // user reads 'complete' as permission to close the tab, and closing then
     // truncates the receiver's tail (caught by CLI gate 6, ledger F5).
@@ -1328,7 +1320,7 @@ export class PeerLink {
         // The ack may have been lost on a still-healthy link. Re-send END once to
         // prompt the receiver to re-ack, then wait one more (shorter) window.
         rlog.debug('no delivery-ack yet, re-probing (re-sending END)', id)
-        this._control({ type: CTRL.END, id, sid })
+        this._control(endMsg(id, sid))
         this._armAckFallback(id, sid, true)
         return
       }
@@ -1546,7 +1538,7 @@ export class PeerLink {
           // Receiver side: re-send a resume accept at the current offset to nudge
           // the sender to (re)stream from where we are, never restart from 0.
           const partial = this.stores.partials.get(t.id)
-          this._control({ type: CTRL.ACCEPT, id: t.id, offset: partial ? partial.received : 0 })
+          this._control(acceptMsg(t.id, partial ? partial.received : 0))
           nudged++
         }
       }
