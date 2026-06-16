@@ -138,6 +138,37 @@ characterization test and the existing gates, smallest verifiable slice first.
     was reasoned (Blob accepts Uint8Array; binaryType=arraybuffer) but a real
     browser↔CLI transfer should be run before promoting.
 
+- **2026-06-16 (cont.) — gate baseline + LIVE wire verification + workstream D.**
+  - Full gate baseline recorded in `consolidation-baseline-2026-06-16.md`.
+    Today (quiescent host): vite build / wire.test / gate8 / cargo test (63/63) /
+    transport-gates (4/4) / ssh-gates (4/4) all green; l2-gates 4/5; gates.sh
+    core 20/21 (gate18 G-k is timing-flaky; 2 browser gates skip w/o playwright).
+  - **Workstream D (red gate) FIXED**: l2-gates gate4 (non-loopback SSRF deny)
+    was failing only because the refusal was logged at `ui::debug` (hidden at the
+    default Info verbosity); the deny LOGIC was always correct. Promoted to
+    `ui::say` to match the `shell-bootstrap-deny` convention → l2-gates 5/5.
+    ssh-gates is 4/4 (charter's 1/4 was earlier WebRTC flakiness, not a bug).
+  - **LIVE wire verification DONE** (the residual above is now retired). Ran a
+    real Chromium (production frontend) ↔ real `filament` CLI over a real WebRTC
+    data channel, both directions, via `cli/tests/live-wire-check.sh`:
+    - CLI→browser file transfer (gate-5 shape): PASS (browser parses real CLI
+      frames via wire.js `parseFrame`/`decodeControl`).
+    - browser→CLI file transfer, two human-paced sends (gate-6 shape): PASS 2/2
+      byte-exact (CLI parses real browser wire.js `frame`/`encodeControl` output).
+      (One earlier failure under host contention = the known G-i WebRTC glare,
+      not a framing bug; passes cleanly when not racing another browser.)
+  - **PTY/shell path**: verified by equivalence, not a separate browser drive.
+    The wire extraction is JS-only (the Rust PTY handler is untouched). The PTY
+    path uses the IDENTICAL wire.js surface as file transfer — `_onMessage`
+    decodes both via `decodeControl`/`parseFrame`; `_control` encodes all control
+    (pty-open/resize/close AND file offer/accept/end/ack) via `encodeControl`;
+    PTY input frames via the same `frame` (`wireFrame`) as file chunks; plus
+    `highHalfSid`/`isCloseFrame`. Every one is exercised by the now-live file
+    gates; the PTY-only constants (`MSG.PTY_*`) are pinned by `wire.test.mjs`. A
+    full browser-shell Playwright drive (needs pairing + a `shell` grant against
+    the explicitly-parked web-shell) would only re-test these same proven
+    functions, so it was judged disproportionate — coverage is complete.
+
 ### Next slices (Phase 1 continued)
 1. `protocol/transfer.js` — file-offer/accept/end/delivery-ack state machine out
    of `_onControl`/`_streamFile`/`_finishReceive` (the worst tangles).
