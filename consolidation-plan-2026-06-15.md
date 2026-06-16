@@ -288,6 +288,19 @@ characterization test and the existing gates, smallest verifiable slice first.
     StallController is now verified four ways: unit, local freeze-shim, netns
     lab, and cross-machine SIGSTOP.
 
+- **2026-06-16 (cont.) — `AckFallbackController` (timer-owning, P4).**
+  - Moved the delivery-ack no-ack WINDOW (`_armAckFallback` + the `_ackTimers`
+    map + the "peer acks" memory `_markPeerAcks`/`_peerAcks`) out of PeerLink into
+    `net/resilience/ackFallback.js`. PeerLink arms it after END+drain
+    (`this._ack.arm`), cancels it on a genuine delivery-ack (`this._ack.onAck`),
+    records the ack-capable peer (`this._ack.markPeerAcks`), and clears it on
+    teardown (`this._ack.clear`). The pure verdict stays decideAckFallback
+    (transfer.js). Faithful relocation.
+  - Verified: vite build clean; all unit suites + gate8 PASS; LIVE happy-path
+    browser↔CLI 2/2 (exercises arm → delivery-ack → onAck → complete + the
+    peer-acks memory). The no-ack FAIL path is pinned by decideAckFallback's unit
+    tests + the Rust `ack_fallback_never_completes_silently` test.
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
