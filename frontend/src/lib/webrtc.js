@@ -12,23 +12,22 @@
 //   failed       -> connection/transfer error
 import { log } from './log.js'
 import * as linkdiag from './linkdiag.js'
+// PROTOCOL codec layer: message-type registry + binary framing + control codec.
+// Extracted from this file so the wire format is one pure, node-testable module
+// (net/protocol/wire.js) that stays byte-identical to the CLI (CONTRACT.md).
+// CTRL is the message registry (re-exported as MSG; it additionally carries the
+// caps/pty-*/l2-close strings that some inline literals below still use).
+import {
+  MSG as CTRL,
+  frame as wireFrame,
+  parseFrame as wireParseFrame,
+  isCloseFrame,
+  highHalfSid,
+  encodeControl,
+  decodeControl,
+} from '../net/protocol/wire.js'
 
 const rlog = log.scope('rtc')
-
-const CTRL = {
-  OFFER: 'file-offer',
-  ACCEPT: 'file-accept',
-  DECLINE: 'file-decline',
-  END: 'file-end',
-  BRB: 'brb', // C21: "I'm stepping away (file picker / tab hidden), hold the line"
-  BACK: 'back',
-  PAIR_KEEP: 'pair-keep', // C12: here's a secret, remember me as a known device
-  PAIR_KEEP_ACK: 'pair-keep-ack', // C27: the human's answer, sender keeps only confirmed secrets
-  PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
-  PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict, a rejected prover stops claiming acquaintance
-  STATE: 'state', // C30 ph3: periodic link truth {transfers, trusted, away}, divergence repair
-  DELIVERY_ACK: 'delivery-ack', // P4: receiver verified the WHOLE file (sha256 matched), sender marks done only on this
-}
 
 // P4: bound the whole-file re-fetch so a genuinely-corrupt payload fails CLEANLY
 // instead of looping forever; the partial is kept, the transfer stays resumable.
@@ -844,21 +843,20 @@ export class PeerLink {
   }
 
   _onMessage(data) {
-    if (typeof data === 'string') return this._onControl(JSON.parse(data))
-    // Binary chunk: first 4 bytes are the stream id, the rest is payload (#4).
-    if (data.byteLength < 4) return
-    const sid = new DataView(data).getUint32(0)
+    if (typeof data === 'string') return this._onControl(decodeControl(data))
+    // Binary frame: [4-byte sid][payload]; parseFrame returns null for a runt.
+    const f = wireParseFrame(data)
+    if (!f) return
+    const { sid, payload } = f
     // web-shell: PTY bytes for the open terminal stream (empty frame = closed).
     if (sid === this._ptySid) {
-      const payload = data.slice(4)
-      if (payload.byteLength === 0) { linkdiag.record('pty', { what: 'remote-close', session: this._ptySession }, this._diagMeta()); this.onPtyClose(); this._ptySid = null }
-      else this.onPtyData(new Uint8Array(payload))
+      if (isCloseFrame(payload)) { linkdiag.record('pty', { what: 'remote-close', session: this._ptySession }, this._diagMeta()); this.onPtyClose(); this._ptySid = null }
+      else this.onPtyData(payload)
       return
     }
     const id = this._incomingBySid.get(sid)
     const entry = id && this.stores.partials.get(id)
     if (!entry) return
-    const payload = data.slice(4)
     entry.buffers.push(payload)
     entry.received += payload.byteLength
     this._bytesMoved += payload.byteLength // P0: inbound file bytes = data path alive (PTY excluded, handled above)
@@ -913,7 +911,7 @@ export class PeerLink {
   // NEW per-link sid (the old link is gone), but the `session` is what binds the
   // two opens to the same remote PTY.
   openPty(cols, rows, session) {
-    this._ptySid = (0x80000000 | (this._nextSid++)) >>> 0
+    this._ptySid = highHalfSid(this._nextSid++)
     this._ptySession = session || null
     // PTY session event: an open is a fresh-or-reattach request carrying the
     // stable session id (the persistence path); the ack ('pty-attach') tells us
@@ -934,10 +932,7 @@ export class PeerLink {
       this._testPtyFrozen = true
       return // drop input on the floor; nothing reaches the wire
     }
-    const framed = new Uint8Array(4 + u8.byteLength)
-    new DataView(framed.buffer).setUint32(0, this._ptySid)
-    framed.set(u8, 4)
-    this.channel.send(framed)
+    this.channel.send(wireFrame(this._ptySid, u8))
   }
   resizePty(cols, rows) {
     if (this._ptySid != null) this._control({ type: 'pty-resize', sid: this._ptySid, cols, rows })
@@ -1255,10 +1250,8 @@ export class PeerLink {
         await new Promise((res) => this._drainWaiters.push(res))
         if (this._closed || this.channel?.readyState !== 'open') return
       }
-      // Frame: [uint32 sid][payload]
-      const framed = new Uint8Array(4 + buf.byteLength)
-      new DataView(framed.buffer).setUint32(0, sid)
-      framed.set(new Uint8Array(buf), 4)
+      // Frame: [uint32 sid][payload] (net/protocol/wire.js)
+      const framed = wireFrame(sid, new Uint8Array(buf))
       // P0 test shim (?test=freeze): after FREEZE_AFTER_BYTES on THIS transfer,
       // make the data-path send a no-op ONCE (one-shot per transfer) while the
       // channel stays open, a faithful NAT-rebind black-hole. The control path
@@ -1368,7 +1361,7 @@ export class PeerLink {
   // ------------------------------------------------------------------ helpers
   _control(obj) {
     try {
-      this.channel?.send(JSON.stringify(obj))
+      this.channel?.send(encodeControl(obj))
     } catch {}
   }
   _track(t) {

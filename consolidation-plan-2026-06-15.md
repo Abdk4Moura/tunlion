@@ -1,0 +1,146 @@
+# Filament consolidation — layered decomposition plan (2026-06-15)
+
+Goal: stop the "mangled" growth. Make the **filament protocol** and the
+**resilience protocol** separate, named layers with one-way dependencies, so each
+has one reason to change (SRP) and can be tested in isolation. `CONTRACT.md` stays
+the cross-implementation wire spec; this doc is the *code-structure* spec that
+mirrors it.
+
+## Where the mess actually is (from a full concern-map pass)
+
+The rot is concentrated in **three god-files**, not spread everywhere:
+
+| File | LOC | Problem |
+|------|-----|---------|
+| `frontend/src/lib/webrtc.js` | 1741 | `PeerLink` mixes transport (WebRTC), protocol (framing/ceremonies), resilience (stall ladder, upgrade prober, watchdog, ack-fallback), and app (file streaming, PTY) in one class. |
+| `frontend/src/lib/useFilament.js` | 1305 | One React hook mixes signaling, protocol orchestration, resilience recovery, and UI state. `makeLink()` (299–514) and the bootstrap effect (587–746) touch all four. |
+| `cli/src/main.rs` | 8020 | God-file. `send_cmd` (1027 lines) and `recv_cmd` (2111 lines) are event loops that interleave PAKE + file protocol + chunk + ack + stall ladder. `Conn` struct mixes signaling/protocol/resilience state. |
+
+**Already clean — keep as-is** (these are the model for the rest):
+- Frontend: `pairing.js` (PAKE, pure state machine), `devices.js` (known-device store), `signaling.js` (relay glue), `session.js` (C30 convergence), `linkdiag.js` (diagnostics).
+- CLI: `l2.rs`, `direct.rs`, `holepunch.rs`, `pake_ceremony.rs`, `session.rs`, `codeentry.rs`, `ui.rs`, `sshkeys.rs`.
+
+## The division — five layers, one-way dependencies
+
+Both the JS networking layer and the Rust CLI get the SAME shape. A layer may only
+depend on layers **below** it. The wire contract (`CONTRACT.md`) is the seam
+between the two implementations.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 5. APPLICATION   file transfer UX · PTY/shell · L2 TUN · device list
+│                  (JS: useFilament public API — FROZEN; web-shell)
+│                  (Rust: send_cmd/recv_cmd as THIN drivers)
+├─────────────────────────────────────────────────────────────┤
+│ 4. ORCHESTRATION wires the 3 below per peer; connection state machine;
+│                  signaling event handling; roster/presence
+│                  (JS: slim PeerLink + signaling dispatcher)
+│                  (Rust: Conn, split into signaling/roster vs. the rest)
+├──────────────────────────────┬──────────────────────────────┤
+│ 3. RESILIENCE                │ 2. PROTOCOL  (the filament protocol)
+│   keep the link alive &      │   the wire contract: message types,
+│   data delivered:            │   framing ([sid][payload]), encode/decode,
+│   · stall detect + ladder    │   ceremonies:
+│   · relay↔direct upgrade     │   · PAKE pairing / pair-keep / pair-proof
+│   · idle/PTY liveness        │   · file-offer/accept/end/delivery-ack
+│   · ack-fallback / replay    │   · pty-open/resize/close, l2-*, state ping
+│   · reconnect budgets,       │   pure-ish: bytes⇄typed events; NO timers,
+│     warm-standby, recovery   │   NO retries, NO reconnect
+├──────────────────────────────┴──────────────────────────────┤
+│ 1. TRANSPORT     the physical link ONLY. open/close, send(bytes),
+│                  onBytes, onState, getStats/route. Knows nothing about
+│                  message meaning or retries.
+│                  (JS: RTCPeerConnection + data channel)
+│                  (Rust: net.rs Transport trait + direct.rs/holepunch.rs)
+└─────────────────────────────────────────────────────────────┘
+```
+
+### The SOLID discipline that makes it hold
+- **SRP** — Protocol changes when the wire format changes; Resilience changes when
+  the network-survival strategy changes. Today a single edit to `_streamFile` or
+  `recv_cmd` risks both. After: separate files, separate reasons.
+- **Dependency Inversion** — Resilience and Protocol depend on a **Transport
+  interface**, not on concrete WebRTC/QUIC. This is what lets the `lab` (netns)
+  drive resilience without real WebRTC, and lets Protocol be unit-tested with no
+  network. The interface is the boundary; the concrete transport plugs in.
+- **Protocol is timer-free and retry-free.** Every retry/timeout/reconnect lives in
+  Resilience. That single rule is the un-mangling: if it has a `setTimeout` or a
+  retry counter, it is Resilience, not Protocol.
+
+## Seams that MUST NOT change (this keeps the refactor safe)
+1. **The wire protocol** (`CONTRACT.md`) — byte-compatible across JS↔Rust, has
+   gates/test-vectors (e.g. `proof_matches_browser`, gate 16). Frozen.
+2. **`useFilament()` return shape** (`CONTRACT.md` UI contract) — the UI seam. Frozen.
+3. **`PeerLink` public methods/callbacks** used by useFilament + WebTerminal
+   (`sendFiles`, `openPty`, `onPtyData`, …). Kept or shimmed.
+
+→ This is a **structural** refactor behind stable seams: behavior identical,
+structure clean. That's what makes it verifiable (existing gates + the lab + the
+web-shell harness all still pass) and reversible per-step.
+
+## Sequencing — incremental, each step independently verifiable
+
+**Phase 0 — name the seams (cheap, no behavior change).** Add the `Transport`,
+`Protocol`, and `Resilience` interfaces as code + this doc. De-risks everything.
+
+**Phase 1 — frontend `webrtc.js` split** (highest value, most verifiable — the lab
+and web-shell harness exist):
+- 1a. Extract **PROTOCOL**: `protocol/messages.js` (CTRL constants + framing +
+  encode/decode), `protocol/transfer.js` (file-offer/accept/end/ack state machine).
+  PeerLink delegates. (Targets the `_streamFile`/`_finishReceive`/`_onControl`
+  tangles.)
+- 1b. Extract **RESILIENCE**: `resilience/stall.js`, `resilience/upgrade.js`,
+  `resilience/liveness.js`, `resilience/ackfallback.js` — controllers that take a
+  Transport handle + progress signals. PeerLink delegates.
+- 1c. PeerLink becomes a thin orchestrator (Transport + Protocol + Resilience +
+  state). Verify against gates + lab.
+
+**Phase 2 — frontend `useFilament.js` split** into signaling-dispatcher /
+protocol-orchestrator / resilience-manager / state-reducer. Public API frozen.
+
+**Phase 3 — CLI `main.rs` mirror** (biggest, riskiest, done last, behind the
+gates): extract a `protocol` module (file-transfer state machine out of
+send_cmd/recv_cmd) and a `resilience` module (ladder/upgrade/recovery out of Conn).
+Keep the already-clean modules.
+
+Each phase is shippable on its own and gated. Phases 1–2 don't touch Rust; Phase 3
+doesn't touch the frontend.
+
+## Other areas worth the same treatment (lower priority)
+- **Frontend UI** (`Filament.jsx` and friends): theme/density/state vs. screens —
+  separate presentation from the `useFilament` data it renders. Already partly OK.
+- **Backend** (`signaling.py`, 654): the relay vs. the room/lease/known-channel
+  bookkeeping could split, but it's small and stable — last.
+
+## Decision (made 2026-06-16)
+Full sweep including the Rust god-file; cleaner-slate interfaces. Hard constraint:
+the **wire protocol stays byte-compatible** (cross-impl, gate-tested) even as
+internal interfaces are redesigned. Verification net is thin (frontend had ZERO
+unit tests; CLI gates partially red), so each step is landed behind a
+characterization test and the existing gates, smallest verifiable slice first.
+
+## Progress log
+- **2026-06-16 — Phase 0 done; Phase 1 started.**
+  - Verification convention chosen: plain-Node ESM characterization tests (like
+    `cli/tests/l1a/gate8`), no new deps. Baseline `gate8` byte-identity = PASS.
+  - `frontend/src/net/contracts.js` — the Transport / ProtocolCodec /
+    ResilienceController interfaces (the cleaner-slate boundary).
+  - `frontend/src/net/protocol/wire.js` — first extracted PROTOCOL module: the
+    message-type registry (`MSG`), binary framing (`frame`/`parseFrame`/
+    `isCloseFrame`/`highHalfSid`), and control codec (`encode/decodeControl`).
+    Pulled out of `webrtc.js` (was inline at the old CTRL block + `_onMessage` +
+    `sendPtyInput` + `openPty` + `_streamFile` + `_control`).
+  - `webrtc.js` rewired to delegate to wire.js. Verified: `vite build` clean,
+    `wire.test.mjs` PASS, `gate8` still PASS.
+  - Residual not yet verified live: the PTY framing path and file-transfer
+    receive assembly are exercised only by the heavier browser gates (need a
+    running app + CLI + network), not by the web-shell mock harness. Equivalence
+    was reasoned (Blob accepts Uint8Array; binaryType=arraybuffer) but a real
+    browser↔CLI transfer should be run before promoting.
+
+### Next slices (Phase 1 continued)
+1. `protocol/transfer.js` — file-offer/accept/end/delivery-ack state machine out
+   of `_onControl`/`_streamFile`/`_finishReceive` (the worst tangles).
+2. `resilience/{stall,upgrade,liveness,ackfallback}.js` — controllers over a
+   Transport handle; pull the timers/ladders out of PeerLink.
+3. Slim `PeerLink` to a thin orchestrator. Then Phase 2 (useFilament), Phase 3 (Rust).
