@@ -314,10 +314,26 @@ characterization test and the existing gates, smallest verifiable slice first.
     reproducible here (no TURN/relay), so unit tests remain the floor for the
     prober's own logic.
 
-  → All four resilience controllers are now timer-owning objects: StallController
-    (cross-machine verified), AckFallbackController, UpgradeProber. PTY liveness
-    still ticks inline via PeerLink's shared interval (its detector+ladder are
-    already pure in liveness.js); a LivenessController is the last optional move.
+- **2026-06-16 (cont.) — `LivenessController` (timer-owning, M1) — set complete.**
+  - Moved the idle-shell consent-liveness detector (`_checkPtyLiveness` + the
+    `getStats` read `_readConsentLiveness` + the counters + the `?test=freezepty`
+    seam) and its short ladder (`_correctPtyDead`) out of PeerLink into
+    `net/resilience/livenessController.js`. PeerLink's shared 2s interval now
+    ticks `this._stall.tick()` + `this._liveness.tick()`; reset on open / teardown
+    via `this._liveness.reset()`; the freeze seam set via
+    `this._liveness.markFrozenForTest()` from `sendPtyInput`. Pure decisions stay
+    in liveness.js. `_checkPtyLiveness`/`_correctPtyDead`/`_readConsentLiveness`
+    deleted from PeerLink.
+  - Verified: vite build clean; all unit suites + gate8 PASS; LIVE happy-path 2/2.
+
+  → **TIMER-OWNING CONTROLLER EXTRACTION COMPLETE.** PeerLink no longer holds any
+    resilience counters/episodes/per-concern timers; all four live in controller
+    objects — `StallController` (cross-machine verified), `LivenessController`,
+    `UpgradeProber`, `AckFallbackController`. PeerLink keeps only the shared 2s
+    tick source (drives stall+liveness), the establishment watchdog, C4's
+    disconnect timer, and the C30 state-ping interval (connection-state, not
+    resilience). Remaining consolidation: slim PeerLink further if desired, then
+    Phase 2 (useFilament.js) and Phase 3 (Rust main.rs).
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
