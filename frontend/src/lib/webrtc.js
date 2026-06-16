@@ -47,6 +47,9 @@ export { decideAckFallback }
 // SHAPE (which rung to run next). PeerLink owns the timer + counters/episode
 // state and runs each rung's mechanics.
 import { nextStallRung, stallTick } from '../net/resilience/stall.js'
+// RESILIENCE layer: the relay→direct upgrade prober's timer-free POLICY
+// (probe-result classification, verify-before-commit tick, backoff cadence).
+import { decideProbeResult, decideUpgradeVerifyTick, nextUpgradeDelay } from '../net/resilience/upgrade.js'
 
 const rlog = log.scope('rtc')
 
@@ -711,8 +714,9 @@ export class PeerLink {
     if (this._closed || this.route !== 'relayed') return
     const route = await this._measureRoute()
     if (this._closed || this.route !== 'relayed') return
-    // A non-relay measurement enters the verify window; anything else backs off.
-    if (route && route !== 'relayed') {
+    // A non-relay measurement enters the verify window; anything else backs off
+    // (decision in resilience/upgrade.js).
+    if (decideProbeResult(route).action === 'verify') {
       this._beginUpgradeVerify(route)
     } else {
       this._upgradeVerify = null
@@ -750,17 +754,23 @@ export class PeerLink {
         verify.lastBytes = this._bytesMoved
         verify.lastSeen = Date.now()
       }
-      // REGRESSED: route fell back to relay, OR a transfer is in flight yet bytes
-      // have stalled past a tick-of-grace → discard, stay on relay, back off.
-      const idleTooLong = hasInflight && Date.now() - verify.lastSeen >= UPGRADE_VERIFY_MS
-      if ((re && re === 'relayed') || idleTooLong) {
+      // The verify-window verdict (commit / discard / wait) lives in
+      // resilience/upgrade.js; this method owns the timer + lastSeen bookkeeping.
+      const decision = decideUpgradeVerifyTick({
+        measuredRoute: re,
+        hasInflight,
+        idleMs: Date.now() - verify.lastSeen,
+        elapsedMs: Date.now() - start,
+        verifyMs: UPGRADE_VERIFY_MS,
+      })
+      if (decision.action === 'discard') {
+        // Reverted to relay, or an inflight transfer stalled → stay on relay (no flap).
         rlog.debug('direct path connected but did not hold, staying on relay (no flap)', this.id.slice(-6))
         this._upgradeVerify = null
         this._backoffUpgrade()
         return
       }
-      // HELD long enough → commit.
-      if (Date.now() - start >= UPGRADE_VERIFY_MS) {
+      if (decision.action === 'commit') {
         this._commitUpgrade(verify.route)
         return
       }
@@ -786,7 +796,7 @@ export class PeerLink {
   // direct isn't hammered.
   _backoffUpgrade() {
     this._upgrading = false
-    this._upgradeDelay = Math.min(this._upgradeDelay * 2, UPGRADE_STEADY_MS)
+    this._upgradeDelay = nextUpgradeDelay(this._upgradeDelay, UPGRADE_STEADY_MS)
     if (this.route === 'relayed' && !this._closed) this._scheduleUpgradeProbe(this._upgradeDelay)
   }
 
