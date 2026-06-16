@@ -372,6 +372,32 @@ real browser; the return shape must stay identical).
     and the protocol-orchestrator (its crypto is already in devices.js/pairing.js;
     what's left in the hook is mostly React wiring of those).
 
+## Phase 3 — Rust main.rs split (started 2026-06-16)
+Mirror the JS protocol/resilience split into `cli/src/main.rs` (8024 lines). Same
+discipline: extract the pure POLICY into modules with `#[cfg(test)]` unit tests,
+leave the stateful event loops (`send_cmd`/`recv_cmd`/`Conn`) delegating. The
+netns lab is the PRIMARY end-to-end verification here (CLI↔CLI under injected
+fault). Preserve the already-clean modules (l2/direct/holepunch/pake_ceremony/
+session/codeentry/ui/sshkeys).
+
+- **2026-06-16 — `cli/src/resilience.rs`: the stall-ladder decision (mirror of
+  resilience/stall.js).**
+  - Extracted `Conn::correct_stall`'s nested-branch ladder into a pure
+    `decide_stall_action(attempt, max_repairs, warm_eligible, relay_forbidden,
+    already_relayed) -> StallAction` (WarmCutover / Resume / Repair /
+    RelayEscalate / ExhaustedRelayForbidden / ExhaustedAlreadyRelay).
+    `correct_stall` keeps the warm-cutover guard, the state mutation, and each
+    rung's side effect (escalate_to_relay / repair_link_in_place / ui lines) and
+    matches on the action. 1:1 faithful.
+  - Verified: `cargo test --release` 71/71 (8 new resilience::tests pinning every
+    branch incl. the relay-forbidden-priority + warm-only-on-attempt-0 edges);
+    `cargo build --release` clean; **netns lab** `two-nodes --link filament`:
+    baseline 0% → fault stall 100% (link up) → fault clear → recovered 0%/1.3ms.
+    No regression in the end-to-end stall→recover behavior.
+  - Next Phase 3 slices: the `protocol` module (file-transfer state machine out of
+    send_cmd/recv_cmd + verify/finalize) and more of `resilience` (upgrade probe,
+    C4 grace, splitting the `Conn` god-struct).
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind

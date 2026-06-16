@@ -21,6 +21,7 @@ mod holepunch;
 mod l2;
 mod net;
 mod pake_ceremony;
+mod resilience;
 mod session;
 mod sshkeys;
 mod ui;
@@ -3081,42 +3082,42 @@ impl Conn {
             && !relay_forbidden()
             && !self.relay_only
             && !self.warm_cutover.contains(pid);
-        if attempt == 0 && warm_eligible {
-            // DEBUG, resilience internal (warm cutover). Visible at -v / the gates
-            // run with FILAMENT_LOG=debug.
-            ui::debug(&ui::paint(
-                ui::Tone::Warn,
-                "  transfer stalled, cutting over to the warm relay standby (instant failover)",
-            ));
-            self.warm_cutover.insert(pid.to_string());
-            // Latch the episode as relaying so detect_stall waits for the fresh
-            // relay path to move a byte (clearing the whole episode) instead of
-            // re-firing the ladder while the cutover converges (P1's convergence
-            // signal, reused).
-            if let Some(st) = self.stall_repairs.get_mut(pid) {
-                st.relayed = true;
+        // The ladder DECISION (which rung) is pure and lives in resilience.rs; this
+        // method owns the state mutation + the rung's side effect.
+        match resilience::decide_stall_action(
+            attempt,
+            STALL_MAX_REPAIRS,
+            warm_eligible,
+            relay_forbidden(),
+            self.relay_only,
+        ) {
+            resilience::StallAction::WarmCutover => {
+                // P3 (GAP-3) WARM-REDUNDANCY instant failover (rung b): cut straight
+                // to the pre-designated warm relay standby instead of grinding the
+                // slow direct-repair rungs (intolerable for an interactive session).
+                // DEBUG, resilience internal; visible at -v / FILAMENT_LOG=debug.
+                ui::debug(&ui::paint(
+                    ui::Tone::Warn,
+                    "  transfer stalled, cutting over to the warm relay standby (instant failover)",
+                ));
+                self.warm_cutover.insert(pid.to_string());
+                // Latch the episode as relaying so detect_stall waits for the fresh
+                // relay path to move a byte (clearing the episode) instead of
+                // re-firing the ladder while the cutover converges.
+                if let Some(st) = self.stall_repairs.get_mut(pid) {
+                    st.relayed = true;
+                }
+                self.escalate_to_relay(pid).await;
+                Rung::Relayed
             }
-            self.escalate_to_relay(pid).await;
-            return Rung::Relayed;
-        }
-
-        if attempt == 0 {
-            // Rung (a): cheapest, re-issue on the same transport. The caller
-            // owns `outgoing`, so it does the actual re-offer; we just classify.
-            // (Reached when warm redundancy is OFF, the one-shot `send` default,
-            // or relay is forbidden / already in use; the P0/P1 ladder is correct
-            // and bounded there.)
-            // DEBUG, resilience internal (rung (a) resume on the same link).
-            ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled, resuming on the same link"));
-            return Rung::Resume;
-        }
-        if attempt >= STALL_MAX_REPAIRS {
-            // Rungs (a)+(c) spent, the direct/in-place-repair ladder is exhausted.
-            // P1 (GAP-4): this is the rung-(d) seam. Either auto-escalate to the
-            // TURN relay (the never-flaky promise) or, if the user forbade relay
-            // / we're already on relay, FAIL CLEANLY with a kept partial.
-            let already_relayed = self.relay_only;
-            if relay_forbidden() {
+            resilience::StallAction::Resume => {
+                // Rung (a): cheapest, re-issue on the same transport. The caller
+                // owns `outgoing` and does the actual re-offer; we just classify.
+                // DEBUG, resilience internal (rung (a) resume on the same link).
+                ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled, resuming on the same link"));
+                Rung::Resume
+            }
+            resilience::StallAction::ExhaustedRelayForbidden => {
                 // The hard direct-only promise: never silently fall to a relay.
                 // CRITICAL, a clean fatal path-decision the user must see (-q too).
                 ui::critical(&ui::paint(
@@ -3125,46 +3126,44 @@ impl Conn {
                     partial kept on disk. Re-run to resume, or drop --no-relay to \
                      allow relay fallback.",
                 ));
-                return Rung::Exhausted;
+                Rung::Exhausted
             }
-            if already_relayed {
-                // We already re-established over relay and it ALSO stalled, there
-                // is no harder rung. Stop honestly with the partial preserved
-                // (this is the genuine out-of-scope case: no path exists).
+            resilience::StallAction::ExhaustedAlreadyRelay => {
+                // We already re-established over relay and it ALSO stalled: no harder
+                // rung. Stop honestly with the partial preserved.
                 // CRITICAL, a terminal honesty line the user must see (-q too).
                 ui::critical(&ui::paint(
                     ui::Tone::Warn,
                     "  transfer still stalled on the relay route, partial kept on disk. \
                      Re-run to resume.",
                 ));
-                return Rung::Exhausted;
+                Rung::Exhausted
             }
-            // Rung (d): re-establish this transfer over the TURN relay, preserving
-            // the on-disk partial (C7 resume). Bounded: one escalation per episode.
-            // CRITICAL, P1's value-prop: the never-flaky promise kicking in. The
-            // user must see the path change to relay even under -q.
-            ui::critical(&ui::paint(
-                ui::Tone::Warn,
-                "  direct paths exhausted, falling back to the TURN relay",
-            ));
-            // Latch the episode as "relaying": the fresh relay link establishes
-            // with no transport yet, so this stops detect_stall from re-firing the
-            // ladder (into a premature Exhausted) until the relay path moves a byte
-            // (which clears the whole episode via note_progress).
-            if let Some(st) = self.stall_repairs.get_mut(pid) {
-                st.relayed = true;
+            resilience::StallAction::RelayEscalate => {
+                // Rung (d): re-establish over the TURN relay, preserving the on-disk
+                // partial (C7 resume). Bounded: one escalation per episode.
+                // CRITICAL, P1's value-prop: the never-flaky promise kicking in.
+                ui::critical(&ui::paint(
+                    ui::Tone::Warn,
+                    "  direct paths exhausted, falling back to the TURN relay",
+                ));
+                if let Some(st) = self.stall_repairs.get_mut(pid) {
+                    st.relayed = true;
+                }
+                self.escalate_to_relay(pid).await;
+                Rung::Relayed
             }
-            self.escalate_to_relay(pid).await;
-            return Rung::Relayed;
+            resilience::StallAction::Repair => {
+                // Rung (c): repair the transport IN PLACE under the live session.
+                // DEBUG, resilience internal (in-place repair).
+                ui::debug(&ui::paint(
+                    ui::Tone::Warn,
+                    &format!("  transfer stalled, repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
+                ));
+                self.repair_link_in_place(pid).await;
+                Rung::Repaired
+            }
         }
-        // Rung (c): repair the transport IN PLACE under the live session.
-        // DEBUG, resilience internal (in-place repair).
-        ui::debug(&ui::paint(
-            ui::Tone::Warn,
-            &format!("  transfer stalled, repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
-        ));
-        self.repair_link_in_place(pid).await;
-        Rung::Repaired
     }
 
     /// Rung (c): rebuild a path under the LIVE session, preserving the on-disk
