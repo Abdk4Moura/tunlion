@@ -7049,7 +7049,7 @@ async fn recv_cmd(
                         if inc.full.is_some() {
                             let verdict = verify_incoming(&mut inc).await;
                             match verdict {
-                                VerifyResult::Match => {
+                                protocol::VerifyResult::Match => {
                                     // INTACT, finalize, then tell the sender it
                                     // landed whole (the deterministic delivery-ack).
                                     verify_fails.remove(&id);
@@ -7073,7 +7073,7 @@ async fn recv_cmd(
                                         }
                                     }
                                 }
-                                VerifyResult::Mismatch { restart_from_zero } => {
+                                protocol::VerifyResult::Mismatch { restart_from_zero } => {
                                     // TRUNCATED or CORRUPT, do NOT accept. Bound the
                                     // re-request so a genuinely-unrecoverable payload
                                     // fails clearly instead of looping forever.
@@ -7389,17 +7389,6 @@ async fn recv_cmd(
     }
 }
 
-/// P4 (GAP-5): outcome of the whole-file integrity check on completion.
-enum VerifyResult {
-    /// Received bytes hash to the sender's offered digest, accept + ack.
-    Match,
-    /// Hash didn't match. `restart_from_zero` distinguishes the two cases:
-    /// a SHORT file (received < size) is merely TRUNCATED, resume the tail;
-    /// a FULL-SIZE file with the wrong hash has a CORRUPT BODY, the partial is
-    /// poisoned, so re-fetch from 0.
-    Mismatch { restart_from_zero: bool },
-}
-
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
 /// compare against the digest the sender offered (`inc.full`, guaranteed Some by
 /// the caller). Flushes first so every buffered byte is on disk. This is the
@@ -7411,8 +7400,8 @@ enum VerifyResult {
 /// hash is computed, deterministically inducing the corrupt-receive case so the
 /// gate can prove reject + recover. `FILAMENT_TEST_CORRUPT_ONCE=1` makes it fire
 /// exactly once (the re-fetch then succeeds), proving auto-recovery.
-async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
-    let want = match &inc.full { Some(w) => w.clone(), None => return VerifyResult::Match };
+async fn verify_incoming(inc: &mut IncomingFile) -> protocol::VerifyResult {
+    let want = match &inc.full { Some(w) => w.clone(), None => return protocol::VerifyResult::Match };
     let _ = inc.file.flush().await;
 
     // Test-only corruption injection (deterministic; gate proof). Compiled out
@@ -7439,17 +7428,14 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
         let _ = &target;
     }
 
-    // A short file can't possibly match, it's truncated; resume the tail.
+    // A short file can't possibly match, it's truncated; classify without hashing.
     if inc.received < inc.size {
-        return VerifyResult::Mismatch { restart_from_zero: false };
+        return protocol::decide_verify(inc.received, inc.size, None);
     }
     let path = inc.part_path.clone();
     let got = tokio::task::spawn_blocking(move || full_hash(&path)).await.ok().flatten();
-    match got {
-        Some(g) if g == want => VerifyResult::Match,
-        // Full size but wrong hash → corrupt body, re-fetch whole.
-        _ => VerifyResult::Mismatch { restart_from_zero: true },
-    }
+    // The decision (match / truncated / corrupt-restart) is pure (protocol.rs).
+    protocol::decide_verify(inc.received, inc.size, Some(got.as_deref() == Some(want.as_str())))
 }
 
 /// Finalize a fully-received incoming file: flush, rename `.part` → final,

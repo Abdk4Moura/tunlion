@@ -405,10 +405,23 @@ session/codeentry/ui/sshkeys).
     `protocol::tests`); `cargo build --release` clean; LIVE browser↔CLI 2/2 — gate
     5 exercises `decide_ack_fallback` (CLI sender), gate 6 `recv_transfer_done`
     (CLI receiver). Pure move, no behavior change.
-  - Next Phase 3 slices (larger): pull the file-transfer STATE MACHINE out of
-    send_cmd (1027 lines) / recv_cmd (2111 lines) into protocol.rs, more of
-    resilience (upgrade probe, C4 grace), and splitting the `Conn` god-struct so
-    signaling/protocol/resilience state aren't one bag.
+- **2026-06-16 — `protocol.rs`: the receiver verify DECISION (mirror of
+  decideAfterVerify).**
+  - Extracted the whole-file verify decision out of `verify_incoming` into a pure
+    `decide_verify(received, size, hash_matches: Option<bool>) -> VerifyResult`
+    (Match / Mismatch{restart_from_zero}); moved the `VerifyResult` enum to
+    protocol.rs. `verify_incoming` keeps the I/O (flush, sha256, the test-corrupt
+    hook) and the no-digest early return, and calls `decide_verify` for the
+    classification (truncated → resume tail; full-size wrong/uncomputable hash →
+    corrupt restart; match → accept). The file-end handler matches on
+    `protocol::VerifyResult`.
+  - Verified: `cargo test --release` 74/74 (3 new verify tests pinning the
+    truncated/corrupt/match cases); build clean; LIVE browser↔CLI 2/2 — gate 6
+    drives the real CLI receive→verify→delivery-ack path ("verified … acked").
+  - Next Phase 3 slices (larger): the control-message builders (offer/accept/
+    end/decline/delivery-ack — currently inline `json!` at ~8 sites), then the
+    rest of the send_cmd/recv_cmd loop scaffolding, more resilience (upgrade
+    probe, C4 grace), and splitting the `Conn` god-struct.
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
