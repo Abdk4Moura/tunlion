@@ -335,6 +335,29 @@ characterization test and the existing gates, smallest verifiable slice first.
     resilience). Remaining consolidation: slim PeerLink further if desired, then
     Phase 2 (useFilament.js) and Phase 3 (Rust main.rs).
 
+## Phase 2 — useFilament.js split (started 2026-06-16)
+The hook is a god-file mixing signaling, protocol orchestration, resilience
+recovery, and UI state, behind a FROZEN return shape (CONTRACT.md UI contract).
+Same discipline as Phase 1: extract the pure POLICY into node-testable modules
+under `net/app/`, leave the React glue (state/refs/effects) in the hook delegating.
+Verification: vite build + LIVE browser↔CLI (the hook is only exercisable in a
+real browser; the return shape must stay identical).
+
+- **2026-06-16 — resilience-MANAGER pure core: `net/app/recovery.js`.**
+  - Extracted the recovery DECISIONS from `makeLink`/the network-recovery effect:
+    `decideStallEscalation` (onStall: ignore / leave-to-p0 / already-spent /
+    escalate-relay — bounded at-most-once relay), `decideStuckRecovery` (onStuck:
+    retry up to maxRetries → second-wind → fail), `shouldRebuildLink` (rebuild
+    failed/closed/disconnected links on a network change). The hook keeps the
+    effects (makeLink, link.close, setTimeout, setState) and delegates.
+  - Verified: `recovery.test.mjs` (new, 18 cases) PASS; vite build clean; all
+    unit suites + gate8 PASS; LIVE browser↔CLI 2/2 (hook behavior + return shape
+    intact).
+  - Remaining Phase 2 concerns (React-glue heavy, build+live verified): the
+    state-reducer (addPeer/updatePeer/upsertTransfer snapshot logic), the
+    signaling-dispatcher (socket events → typed intents), the protocol-
+    orchestrator (device matching / proofs / PAKE binding).
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind

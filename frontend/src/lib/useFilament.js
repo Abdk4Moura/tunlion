@@ -17,6 +17,8 @@ import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
+// APPLICATION/resilience-manager — pure recovery decisions (Phase 2).
+import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink } from '../net/app/recovery.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the pairing
 // wordlists, imported from words.js (ADJ/ANIMAL) so there is a single source
@@ -457,19 +459,20 @@ export function useFilament() {
         // itself stalls falls through to P0's terminal _failActive, never an
         // infinite relay-rebuild loop.
         onStall: ({ reason }) => {
-          if (reason !== 'persistent') return
-          if (relayOnly) {
-            // We're already on the relay and it stalled too, don't re-escalate.
-            // Let P0's terminal _failActive own it (partials preserved).
+          // Decision in net/app/recovery.js; the hook owns the relay-rebuild effect.
+          const d = decideStallEscalation({ reason, relayOnly, relayedCount: relayedRef.current.get(id) || 0 })
+          if (d.action === 'leave-to-p0') {
+            // We're already on the relay and it stalled too; let P0's terminal
+            // _failActive own it (partials preserved).
             log.debug('rtc: relay link still stalled, leaving terminal failure to P0', id.slice(-6))
             return
           }
-          const r = relayedRef.current.get(id) || 0
-          if (r >= 1) {
+          if (d.action === 'already-spent') {
             log.debug('rtc: persistent stall but relay-preferred already spent, not re-escalating', id.slice(-6))
             return
           }
-          relayedRef.current.set(id, r + 1)
+          if (d.action !== 'escalate-relay') return // 'ignore' (non-persistent)
+          relayedRef.current.set(id, (relayedRef.current.get(id) || 0) + 1)
           log.info('rtc: persistent stall, rebuilding relay-preferred (auto-relay fallback)', id.slice(-6))
           linksRef.current.delete(id)
           link.close()
@@ -480,25 +483,31 @@ export function useFilament() {
           link.close()
           const n = (attemptsRef.current.get(id) || 0) + 1
           attemptsRef.current.set(id, n)
-          if (n <= 2) {
+          // Decision in net/app/recovery.js; the hook owns the rebuild + timer.
+          const d = decideStuckRecovery({
+            attempts: n,
+            visible: document.visibilityState === 'visible',
+            secondWindUsed: !!attemptsRef.current.get(id + ':sw'),
+          })
+          if (d.action === 'retry') {
             makeLinkRef.current?.({ id, name, uid })
-          } else {
-            updatePeer(id, { status: 'failed' })
-            // #13 second wind (measured: refocus-time revival ran while the
-            // links still read healthy; they decayed to failed seconds later
-            // with nothing left to catch them). If we're VISIBLE when a peer
-            // finally fails, grant ONE delayed fresh start, covers the
-            // "both tabs finally awake but budgets exhausted" rendezvous.
-            if (document.visibilityState === 'visible' && !attemptsRef.current.get(id + ':sw')) {
-              attemptsRef.current.set(id + ':sw', 1)
-              tel('second-wind', { peer: id.slice(-6) })
-              setTimeout(() => {
-                attemptsRef.current.delete(id)
-                if (!linksRef.current.has(id) && document.visibilityState === 'visible') {
-                  makeLinkRef.current?.({ id, name, uid })
-                }
-              }, 2500)
-            }
+            return
+          }
+          updatePeer(id, { status: 'failed' })
+          // #13 second wind (measured: refocus-time revival ran while the links
+          // still read healthy; they decayed to failed seconds later with nothing
+          // left to catch them). If we're VISIBLE when a peer finally fails, grant
+          // ONE delayed fresh start — the "both tabs finally awake but budgets
+          // exhausted" rendezvous.
+          if (d.action === 'second-wind') {
+            attemptsRef.current.set(id + ':sw', 1)
+            tel('second-wind', { peer: id.slice(-6) })
+            setTimeout(() => {
+              attemptsRef.current.delete(id)
+              if (!linksRef.current.has(id) && document.visibilityState === 'visible') {
+                makeLinkRef.current?.({ id, name, uid })
+              }
+            }, 2500)
           }
         },
       })
@@ -1155,7 +1164,7 @@ export function useFilament() {
       attemptsRef.current.clear()
       for (const [id, link] of [...linksRef.current.entries()]) {
         const st = link.pc?.connectionState
-        if (st === 'failed' || st === 'closed' || st === 'disconnected') {
+        if (shouldRebuildLink(st)) {
           tel('refocus-revive', { peer: id.slice(-6), was: st })
           const { name, peerUid } = { name: link.name, peerUid: link.peerUid }
           link.close()
