@@ -50,6 +50,9 @@ import { nextStallRung, stallTick } from '../net/resilience/stall.js'
 // RESILIENCE layer: the relay→direct upgrade prober's timer-free POLICY
 // (probe-result classification, verify-before-commit tick, backoff cadence).
 import { decideProbeResult, decideUpgradeVerifyTick, nextUpgradeDelay } from '../net/resilience/upgrade.js'
+// RESILIENCE layer: the idle-shell (PTY) consent-liveness detector + its short
+// recovery ladder. PeerLink owns the timer, the consent read, and the counters.
+import { ptyLivenessTick, nextPtyStage } from '../net/resilience/liveness.js'
 
 const rlog = log.scope('rtc')
 
@@ -1634,32 +1637,22 @@ export class PeerLink {
     const frozenForTest = TEST.freezePty && this._testPtyFrozen
     if (signal == null && !frozenForTest) { this._ptyDeadMs = 0; return } // can't read: don't guess
 
-    const advanced = !frozenForTest && this._ptyLiveSignal != null && signal > this._ptyLiveSignal
-    if (this._ptyLiveSignal == null && !frozenForTest) {
-      // First reading: seed the baseline, give it a tick before judging.
-      this._ptyLiveSignal = signal
-      this._ptyDeadMs = 0
-      return
+    // The seed/advance/accumulate-dead/correct verdict lives in
+    // resilience/liveness.js (a pure reducer, mirrors stallTick); this method
+    // owns the timer, the consent read, and the counters.
+    const r = ptyLivenessTick(
+      { liveSignal: this._ptyLiveSignal, deadMs: this._ptyDeadMs, episode: this._ptyEpisode },
+      { signal, frozenForTest, windowMs: PTY_LIVENESS_WINDOW_MS, tickMs: STALL_TICK_MS, now: Date.now() },
+    )
+    this._ptyLiveSignal = r.state.liveSignal
+    this._ptyDeadMs = r.state.deadMs
+    this._ptyEpisode = r.state.episode
+    if (r.recovered) rlog.info('idle shell link recovered, consent advancing again', this.id.slice(-6))
+    if (r.action === 'correct') {
+      rlog.debug('idle shell link appears dead (consent not advancing)', this.id.slice(-6), 'deadMs', this._ptyDeadMs)
+      linkdiag.record('m1-dead', { deadMs: this._ptyDeadMs, route: this.route || null }, this._diagMeta())
+      this._correctPtyDead()
     }
-    if (advanced) {
-      this._ptyLiveSignal = signal
-      this._ptyDeadMs = 0
-      if (this._ptyEpisode) {
-        rlog.info('idle shell link recovered, consent advancing again', this.id.slice(-6))
-        this._ptyEpisode = null
-      }
-      return
-    }
-    // No advance this tick: accumulate dead time.
-    if (!frozenForTest) this._ptyLiveSignal = signal
-    this._ptyDeadMs += STALL_TICK_MS
-    if (this._ptyDeadMs < PTY_LIVENESS_WINDOW_MS) return
-    // Latch so we don't re-fire every tick while a correction converges.
-    const now = Date.now()
-    if (this._ptyEpisode && now - this._ptyEpisode.at < PTY_LIVENESS_WINDOW_MS) return
-    rlog.debug('idle shell link appears dead (consent not advancing)', this.id.slice(-6), 'deadMs', this._ptyDeadMs)
-    linkdiag.record('m1-dead', { deadMs: this._ptyDeadMs, route: this.route || null }, this._diagMeta())
-    this._correctPtyDead()
   }
 
   // M1 + M6: recover a dead idle interactive link. Reuse the EXISTING correction
@@ -1672,8 +1665,10 @@ export class PeerLink {
   // _correctStall's full 3-rung ladder, gated above on `transferring`).
   _correctPtyDead() {
     const now = Date.now()
-    const stage = this._ptyEpisode?.stage
-    if (!stage) {
+    // The stage to run NOW (ice → relay → exhausted) comes from
+    // resilience/liveness.js; this method runs each stage's mechanics.
+    const stage = nextPtyStage(this._ptyEpisode?.stage)
+    if (stage === 'ice') {
       // Rung 1: in-place ICE repair (impolite + connected only, mirrors rung a).
       if (this.pc.connectionState === 'connected' && !this.polite) {
         try {
@@ -1691,7 +1686,7 @@ export class PeerLink {
     // rebuild (skip the file-transfer ladder's intermediate rungs). The hook's
     // onStall does the bounded relay-preferred rebuild; the PTY reattaches on the
     // new link via the stable sessionId, so the terminal recovers on the relay.
-    if (stage === 'ice') {
+    if (stage === 'relay') {
       rlog.info('idle shell still dead (rung 2): escalating to relay rebuild (onStall)', this.id.slice(-6))
       linkdiag.record('action', { what: 'onStall', reason: 'm1-shell-rung-2', route: this.route || null }, this._diagMeta())
       try {

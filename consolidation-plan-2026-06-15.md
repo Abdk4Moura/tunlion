@@ -242,6 +242,26 @@ characterization test and the existing gates, smallest verifiable slice first.
     neither the netns lab nor a single-host browser can exercise it live — unit
     tests are the floor. A true live check needs a two-machine / NAT'd-relay rig.
 
+- **2026-06-16 (cont.) — `net/resilience/liveness.js` (idle-shell M1 detector + ladder).**
+  - Extracted the consent-liveness detector from `_checkPtyLiveness` as a pure
+    reducer `ptyLivenessTick(state, obs)` (seed / advance / accumulate-dead /
+    correct, incl. the `?test=freezepty` frozen-seam handling), and the short
+    shell recovery ladder from `_correctPtyDead` as `nextPtyStage` (ice → relay →
+    exhausted). PeerLink keeps the timer (shares `_checkStall`'s tick), the
+    `getStats` consent read, and the counters.
+  - Verified: `liveness.test.mjs` (new, 15 cases incl. the frozen-seam) PASS;
+    vite build clean; stall/upgrade/wire/transfer/gate8 regression PASS; LIVE
+    happy-path browser↔CLI 2/2.
+  - **Verification caveat:** the live idle-shell-death path needs `?test=freezepty`
+    over a GRANTED browser PTY (trusted device + `shell` cap) — the heavier PTY
+    harness — so unit tests are the floor for this slice.
+
+  → Resilience POLICY is now fully extracted (stall detect+ladder, upgrade,
+    liveness — all pure + tested). Remaining: move the TIMERS/counters into
+    controller objects (StallController etc.), and `ackfallback` (its decision
+    `decideAckFallback` already lives in protocol/transfer.js; only the
+    `_armAckFallback` timer remains in PeerLink).
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
