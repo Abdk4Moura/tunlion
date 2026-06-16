@@ -448,6 +448,23 @@ session/codeentry/ui/sshkeys).
     chunk pump, the by_sid receive assembly), more resilience (upgrade probe / C4
     grace mechanics), and further Conn grouping (signaling vs protocol state).
 
+## Post-merge follow-ups (branch: refactor/conn-split-cont, 2026-06-16)
+PR #3 (the 20-commit consolidation) is merged to main. Continuing the Conn split.
+
+- **2026-06-16: `Conn` split continued, `RejoinState` extracted.**
+  - Grouped the peer-absence / rejoin-grace orchestration fields (waiting_rejoin,
+    rejoin_window, away) out of Conn into a named RejoinState, accessed via
+    self.rejoin.X (18 access sites; both constructors updated). deferred_left is a
+    separate concern (#28 deferred drop) and was left in Conn for now. Pure
+    structural grouping, no behavior change.
+  - Verified: cargo test --release 76/76; build clean; live browser to CLI 2/2
+    (one glare-flake retry, then green).
+  - Conn is now down to ~17 fields with two named sub-structs (ResilienceState,
+    RejoinState). Remaining bag: signaling/transport (sio, tx, server, my_uid,
+    my_id), the link/roster registry, and direct_pending. The signaling group is
+    the highest-churn (accessed at far more sites) so it is the next deliberate
+    step, not a quick one.
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
