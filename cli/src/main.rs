@@ -21,6 +21,8 @@ mod holepunch;
 mod l2;
 mod net;
 mod pake_ceremony;
+mod protocol;
+mod resilience;
 mod session;
 mod sshkeys;
 mod ui;
@@ -237,46 +239,9 @@ const MAX_VERIFY_FAILS: u32 = 3;
 /// WebRTC peer. The recv loop computes `conn.recv_done` from exactly this each
 /// tick; `on_stuck` then reads the flag.
 ///
-/// - `completed`: files fully placed on disk so far.
-/// - `keep_open`: the receiver was asked to stay resident (gate 13).
-/// - `by_sid_empty`: NO stream is in flight (an in-progress reconnect/resume
-///   keeps a by_sid entry, which must keep the link reconnecting, gate 2/11c).
-fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> bool {
-    completed > 0 && !keep_open && by_sid_empty
-}
-
-/// P4 (silent-data-loss fix): what a SEND should do when its delivery-ack window
-/// elapses with NO whole-file-verified `delivery-ack`. A send is "delivered +
-/// verified" ONLY on a genuine `delivery-ack`, so this NEVER returns `Complete`:
-/// the bytes draining out of the send buffer proves nothing (a path that
-/// black-holes without ICE/QUIC noticing drains while NOTHING arrives, no ack
-/// comes, and the old fallback then falsely reported "done"). Pure, so the
-/// completion decision is unit-testable without a live peer.
-///
-/// - `link_alive`: a live transport is still attached (mirrors "channel open").
-///   When false the link is gone, nothing can prompt or carry a re-ack.
-/// - `reprobed`: we have already re-sent `file-end` once this window.
-///
-/// Returns:
-/// - `Reprobe`: link looks alive and we have not re-probed, the ack may be lost,
-///   re-send `file-end` once to prompt it and extend the window.
-/// - `FailUnconfirmed`: end honestly (nonzero, partial kept resumable), never a
-///   false "delivered + verified". Reached when the link is gone, or after a
-///   re-probe still drew no ack.
-#[derive(Debug, PartialEq, Eq)]
-enum AckFallback {
-    Reprobe,
-    FailUnconfirmed,
-}
-fn decide_ack_fallback(link_alive: bool, reprobed: bool) -> AckFallback {
-    if !link_alive {
-        return AckFallback::FailUnconfirmed;
-    }
-    if !reprobed {
-        return AckFallback::Reprobe;
-    }
-    AckFallback::FailUnconfirmed
-}
+/// The pure file-transfer decisions `recv_transfer_done` and `decide_ack_fallback`
+/// (+ the `AckFallback` enum) now live in `protocol.rs` (the Rust mirror of the JS
+/// net/protocol layer); the send/recv loops call `protocol::…`.
 
 /// Bug 5: after repeated stuck-while-connecting on establishment, the user has
 /// no clue WHY. The dominant single-host cause is a browser publishing mDNS
@@ -1345,15 +1310,14 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         deferred_left: HashMap::new(),
         recv_done: false,
     direct_pending: HashMap::new(),
-    stall_repairs: HashMap::new(),
-    relay_committed: std::collections::HashSet::new(),
-    // P3 (GAP-3): warm redundancy is selective, OFF for one-shot / non-session
-    // flows; the long-lived `up` acceptor turns it ON below. The override knob
-    // (`FILAMENT_WARM_STANDBY`) can force it either way.
-    warm_standby: net::warm_standby_override().unwrap_or(false),
-    warm_cutover: std::collections::HashSet::new(),
-    upgrade_probe: HashMap::new(),
-    iface_snapshot: Vec::new(),
+    resil: ResilienceState {
+        stall_repairs: HashMap::new(),
+        relay_committed: std::collections::HashSet::new(),
+        warm_standby: net::warm_standby_override().unwrap_or(false),
+        warm_cutover: std::collections::HashSet::new(),
+        upgrade_probe: HashMap::new(),
+        iface_snapshot: Vec::new(),
+    },
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1988,6 +1952,59 @@ fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
 /// target; RECV accepts from any link, gated per-link by consent/trust.
 const MAX_LINKS: usize = 16;
 
+/// RESILIENCE state, split out of the `Conn` god-struct so the stall/relay/
+/// warm-standby/upgrade-probe bookkeeping is one named bag, not mixed in with
+/// signaling + protocol state. The pure decisions live in `resilience.rs`.
+#[derive(Default)]
+struct ResilienceState {
+    /// P0 (GAP-1): per-peer stall-repair bookkeeping for the bytes-moved
+    /// watchdog. Tracks how many correction-ladder repairs we've already run for
+    /// the current stall episode (bounded by MAX_ATTEMPTS) and whether a repair
+    /// is in flight, so a single stall can't re-fire the ladder every tick while
+    /// a repair is converging. Reset once the link starts flowing again.
+    stall_repairs: HashMap<String, StallState>,
+    /// P1 (GAP-4): peers this session has COMMITTED to the relay route after the
+    /// direct ladder exhausted (rung d). Once a pid is in here, we stop dialing /
+    /// answering direct-QUIC for it (the direct path is what just failed and would
+    /// only re-freeze, racing the relay link); all (re)establishment for it goes
+    /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
+    /// Link), so a re-establish never bounces back to the known-bad direct path.
+    relay_committed: std::collections::HashSet<String>,
+    /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
+    /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
+    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel),
+    /// the sessions §2.4 says a mid-session drop is intolerable for. When set,
+    /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
+    /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
+    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, so the
+    /// failover is near-instant rather than a perceptible gap. FALSE for one-shot
+    /// file `send` (the 90% case): the on-disk partial + C7 resume make the cold
+    /// repair ladder correct and bounded, and a warm standby isn't worth a second
+    /// socket / NAT mapping / keepalive for a single transfer (the honest cost
+    /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
+    /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
+    warm_standby: bool,
+    /// P3: per-peer warm-standby bookkeeping, peers whose relay standby has
+    /// already been cut over to in the current stall episode, so a flapping relay
+    /// path can't re-fire the instant cutover every tick (it falls through to the
+    /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
+    /// `note_progress` once bytes move again.
+    warm_cutover: std::collections::HashSet<String>,
+    /// P5 (GAP-6): per-peer relay->direct UPGRADE-PROBE bookkeeping. Present only
+    /// for peers currently committed to relay (`relay_committed`) on a session
+    /// where the prober is eligible (warm_standby/daemon, relay permitted). Drives
+    /// the backoff schedule (probe soon, then steady cadence) and the
+    /// verify-before-upgrade window for a connected direct standby. Removed on a
+    /// successful upgrade (cutover) or when the peer leaves.
+    upgrade_probe: HashMap<String, UpgradeProbe>,
+    /// P5: a snapshot of the local interface set (sorted IP strings) at the last
+    /// probe schedule. A change (new/removed interface, wifi<->cellular,
+    /// default-route move surfacing a new local IP) is the "walked home onto wifi"
+    /// signal, we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
+    /// netlink dependency); the portable best-effort trigger the plan asks for.
+    iface_snapshot: Vec<String>,
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -2042,52 +2059,8 @@ struct Conn {
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
     direct_pending: HashMap<String, DirectPending>,
-    /// P0 (GAP-1): per-peer stall-repair bookkeeping for the bytes-moved
-    /// watchdog. Tracks how many correction-ladder repairs we've already run for
-    /// the current stall episode (bounded by MAX_ATTEMPTS) and whether a repair
-    /// is in flight, so a single stall can't re-fire the ladder every tick while
-    /// a repair is converging. Reset once the link starts flowing again.
-    stall_repairs: HashMap<String, StallState>,
-    /// P1 (GAP-4): peers this session has COMMITTED to the relay route after the
-    /// direct ladder exhausted (rung d). Once a pid is in here, we stop dialing /
-    /// answering direct-QUIC for it (the direct path is what just failed and would
-    /// only re-freeze, racing the relay link); all (re)establishment for it goes
-    /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
-    /// Link), so a re-establish never bounces back to the known-bad direct path.
-    relay_committed: std::collections::HashSet<String>,
-    /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
-    /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
-    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel),
-    /// the sessions §2.4 says a mid-session drop is intolerable for. When set,
-    /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
-    /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
-    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, so the
-    /// failover is near-instant rather than a perceptible gap. FALSE for one-shot
-    /// file `send` (the 90% case): the on-disk partial + C7 resume make the cold
-    /// repair ladder correct and bounded, and a warm standby isn't worth a second
-    /// socket / NAT mapping / keepalive for a single transfer (the honest cost
-    /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
-    /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
-    warm_standby: bool,
-    /// P3: per-peer warm-standby bookkeeping, peers whose relay standby has
-    /// already been cut over to in the current stall episode, so a flapping relay
-    /// path can't re-fire the instant cutover every tick (it falls through to the
-    /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
-    /// `note_progress` once bytes move again.
-    warm_cutover: std::collections::HashSet<String>,
-    /// P5 (GAP-6): per-peer relay->direct UPGRADE-PROBE bookkeeping. Present only
-    /// for peers currently committed to relay (`relay_committed`) on a session
-    /// where the prober is eligible (warm_standby/daemon, relay permitted). Drives
-    /// the backoff schedule (probe soon, then steady cadence) and the
-    /// verify-before-upgrade window for a connected direct standby. Removed on a
-    /// successful upgrade (cutover) or when the peer leaves.
-    upgrade_probe: HashMap<String, UpgradeProbe>,
-    /// P5: a snapshot of the local interface set (sorted IP strings) at the last
-    /// probe schedule. A change (new/removed interface, wifi<->cellular,
-    /// default-route move surfacing a new local IP) is the "walked home onto wifi"
-    /// signal, we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
-    /// netlink dependency); the portable best-effort trigger the plan asks for.
-    iface_snapshot: Vec<String>,
+    /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
+    resil: ResilienceState,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -2232,14 +2205,14 @@ impl Conn {
             deferred_left: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
-            stall_repairs: HashMap::new(),
-            relay_committed: std::collections::HashSet::new(),
-            // P3 (GAP-3): warm redundancy is selective; the caller passes the
-            // per-session default and the override knob can still force either way.
-            warm_standby: net::warm_standby_override().unwrap_or(warm_standby_default),
-            warm_cutover: std::collections::HashSet::new(),
-            upgrade_probe: HashMap::new(),
-            iface_snapshot: Vec::new(),
+            resil: ResilienceState {
+                stall_repairs: HashMap::new(),
+                relay_committed: std::collections::HashSet::new(),
+                warm_standby: net::warm_standby_override().unwrap_or(warm_standby_default),
+                warm_cutover: std::collections::HashSet::new(),
+                upgrade_probe: HashMap::new(),
+                iface_snapshot: Vec::new(),
+            },
         }
     }
 
@@ -2427,7 +2400,7 @@ impl Conn {
         // the relay link got "stuck while connecting". A genuinely failed link is
         // removed by the normal drop path (on_pc_state/GraceExpired) FIRST, so when
         // no link is present here we DO proceed to (re)build the relay link.
-        if self.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
+        if self.resil.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
             return Ok(());
         }
         self.drop_link(&peer_id); // re-establish replaces any same-sid link
@@ -2527,7 +2500,7 @@ impl Conn {
         if !direct::direct_enabled() {
             return;
         }
-        if !probe && self.relay_committed.contains(pid) {
+        if !probe && self.resil.relay_committed.contains(pid) {
             // P1: this peer escalated to relay, never re-dial direct (it would
             // only re-freeze and race the relay link). If a link already exists
             // (the relay link that escalate_to_relay built, possibly still
@@ -2736,7 +2709,7 @@ impl Conn {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
         }
-        if !self.relay_committed.contains(pid) || !self.links.contains_key(pid) {
+        if !self.resil.relay_committed.contains(pid) || !self.links.contains_key(pid) {
             return;
         }
         if self.direct_pending.contains_key(pid) {
@@ -2937,7 +2910,7 @@ impl Conn {
     /// idle_ms's baseline) never trips, the threshold is on time-since-last-byte,
     /// never on throughput.
     fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
-        let in_episode = self.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
+        let in_episode = self.resil.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
         // Transport recency is the ground truth for "are bytes moving NOW".
         let idle = self.links.get(pid).and_then(|l| l.transport.as_ref()).map(|t| t.idle_ms());
         let threshold = net::stall_ms();
@@ -2959,7 +2932,7 @@ impl Conn {
                 _ => {
                     // Idle-but-empty / still establishing / flowing, clear stray
                     // bookkeeping and do nothing.
-                    self.stall_repairs.remove(pid);
+                    self.resil.stall_repairs.remove(pid);
                     return None;
                 }
             }
@@ -2987,16 +2960,16 @@ impl Conn {
         if self.direct_pending.contains_key(pid) {
             return true;
         }
-        self.stall_repairs.get(pid).map(|s| s.relayed).unwrap_or(false)
+        self.resil.stall_repairs.get(pid).map(|s| s.relayed).unwrap_or(false)
     }
 
     /// Clear a peer's stall episode, called when bytes are observed moving
     /// again (the link recovered) or nothing is in flight.
     fn note_progress(&mut self, pid: &str) {
-        self.stall_repairs.remove(pid);
+        self.resil.stall_repairs.remove(pid);
         // P3: a fresh byte means the (warm-cut-over) path is healthy again, let a
         // FUTURE episode warm-cut-over once more if it too stalls.
-        self.warm_cutover.remove(pid);
+        self.resil.warm_cutover.remove(pid);
     }
 
     /// P0 liveness cross-check: is the link's CONTROL path still answering? A
@@ -3045,10 +3018,10 @@ impl Conn {
         // which is ONLY ever set on the warm path, so the COLD ladder (P0/P1) is
         // byte-for-byte unchanged and still climbs rung a→c→d normally. Cleared by
         // `note_progress` when the relay path moves a byte.
-        if self.warm_cutover.contains(pid) {
+        if self.resil.warm_cutover.contains(pid) {
             return Rung::Repaired;
         }
-        let st = self.stall_repairs.entry(pid.to_string()).or_default();
+        let st = self.resil.stall_repairs.entry(pid.to_string()).or_default();
         st.pending = true;
         let attempt = st.attempts;
         st.attempts += 1;
@@ -3077,46 +3050,46 @@ impl Conn {
         //   - we cut over at most ONCE per episode (`warm_cutover`), a flapping
         //     relay can't re-fire instant cutover every tick; the second stall on
         //     the relay path falls through to the bounded relay-stalled honesty.
-        let warm_eligible = self.warm_standby
+        let warm_eligible = self.resil.warm_standby
             && !relay_forbidden()
             && !self.relay_only
-            && !self.warm_cutover.contains(pid);
-        if attempt == 0 && warm_eligible {
-            // DEBUG, resilience internal (warm cutover). Visible at -v / the gates
-            // run with FILAMENT_LOG=debug.
-            ui::debug(&ui::paint(
-                ui::Tone::Warn,
-                "  transfer stalled, cutting over to the warm relay standby (instant failover)",
-            ));
-            self.warm_cutover.insert(pid.to_string());
-            // Latch the episode as relaying so detect_stall waits for the fresh
-            // relay path to move a byte (clearing the whole episode) instead of
-            // re-firing the ladder while the cutover converges (P1's convergence
-            // signal, reused).
-            if let Some(st) = self.stall_repairs.get_mut(pid) {
-                st.relayed = true;
+            && !self.resil.warm_cutover.contains(pid);
+        // The ladder DECISION (which rung) is pure and lives in resilience.rs; this
+        // method owns the state mutation + the rung's side effect.
+        match resilience::decide_stall_action(
+            attempt,
+            STALL_MAX_REPAIRS,
+            warm_eligible,
+            relay_forbidden(),
+            self.relay_only,
+        ) {
+            resilience::StallAction::WarmCutover => {
+                // P3 (GAP-3) WARM-REDUNDANCY instant failover (rung b): cut straight
+                // to the pre-designated warm relay standby instead of grinding the
+                // slow direct-repair rungs (intolerable for an interactive session).
+                // DEBUG, resilience internal; visible at -v / FILAMENT_LOG=debug.
+                ui::debug(&ui::paint(
+                    ui::Tone::Warn,
+                    "  transfer stalled, cutting over to the warm relay standby (instant failover)",
+                ));
+                self.resil.warm_cutover.insert(pid.to_string());
+                // Latch the episode as relaying so detect_stall waits for the fresh
+                // relay path to move a byte (clearing the episode) instead of
+                // re-firing the ladder while the cutover converges.
+                if let Some(st) = self.resil.stall_repairs.get_mut(pid) {
+                    st.relayed = true;
+                }
+                self.escalate_to_relay(pid).await;
+                Rung::Relayed
             }
-            self.escalate_to_relay(pid).await;
-            return Rung::Relayed;
-        }
-
-        if attempt == 0 {
-            // Rung (a): cheapest, re-issue on the same transport. The caller
-            // owns `outgoing`, so it does the actual re-offer; we just classify.
-            // (Reached when warm redundancy is OFF, the one-shot `send` default,
-            // or relay is forbidden / already in use; the P0/P1 ladder is correct
-            // and bounded there.)
-            // DEBUG, resilience internal (rung (a) resume on the same link).
-            ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled, resuming on the same link"));
-            return Rung::Resume;
-        }
-        if attempt >= STALL_MAX_REPAIRS {
-            // Rungs (a)+(c) spent, the direct/in-place-repair ladder is exhausted.
-            // P1 (GAP-4): this is the rung-(d) seam. Either auto-escalate to the
-            // TURN relay (the never-flaky promise) or, if the user forbade relay
-            // / we're already on relay, FAIL CLEANLY with a kept partial.
-            let already_relayed = self.relay_only;
-            if relay_forbidden() {
+            resilience::StallAction::Resume => {
+                // Rung (a): cheapest, re-issue on the same transport. The caller
+                // owns `outgoing` and does the actual re-offer; we just classify.
+                // DEBUG, resilience internal (rung (a) resume on the same link).
+                ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled, resuming on the same link"));
+                Rung::Resume
+            }
+            resilience::StallAction::ExhaustedRelayForbidden => {
                 // The hard direct-only promise: never silently fall to a relay.
                 // CRITICAL, a clean fatal path-decision the user must see (-q too).
                 ui::critical(&ui::paint(
@@ -3125,46 +3098,44 @@ impl Conn {
                     partial kept on disk. Re-run to resume, or drop --no-relay to \
                      allow relay fallback.",
                 ));
-                return Rung::Exhausted;
+                Rung::Exhausted
             }
-            if already_relayed {
-                // We already re-established over relay and it ALSO stalled, there
-                // is no harder rung. Stop honestly with the partial preserved
-                // (this is the genuine out-of-scope case: no path exists).
+            resilience::StallAction::ExhaustedAlreadyRelay => {
+                // We already re-established over relay and it ALSO stalled: no harder
+                // rung. Stop honestly with the partial preserved.
                 // CRITICAL, a terminal honesty line the user must see (-q too).
                 ui::critical(&ui::paint(
                     ui::Tone::Warn,
                     "  transfer still stalled on the relay route, partial kept on disk. \
                      Re-run to resume.",
                 ));
-                return Rung::Exhausted;
+                Rung::Exhausted
             }
-            // Rung (d): re-establish this transfer over the TURN relay, preserving
-            // the on-disk partial (C7 resume). Bounded: one escalation per episode.
-            // CRITICAL, P1's value-prop: the never-flaky promise kicking in. The
-            // user must see the path change to relay even under -q.
-            ui::critical(&ui::paint(
-                ui::Tone::Warn,
-                "  direct paths exhausted, falling back to the TURN relay",
-            ));
-            // Latch the episode as "relaying": the fresh relay link establishes
-            // with no transport yet, so this stops detect_stall from re-firing the
-            // ladder (into a premature Exhausted) until the relay path moves a byte
-            // (which clears the whole episode via note_progress).
-            if let Some(st) = self.stall_repairs.get_mut(pid) {
-                st.relayed = true;
+            resilience::StallAction::RelayEscalate => {
+                // Rung (d): re-establish over the TURN relay, preserving the on-disk
+                // partial (C7 resume). Bounded: one escalation per episode.
+                // CRITICAL, P1's value-prop: the never-flaky promise kicking in.
+                ui::critical(&ui::paint(
+                    ui::Tone::Warn,
+                    "  direct paths exhausted, falling back to the TURN relay",
+                ));
+                if let Some(st) = self.resil.stall_repairs.get_mut(pid) {
+                    st.relayed = true;
+                }
+                self.escalate_to_relay(pid).await;
+                Rung::Relayed
             }
-            self.escalate_to_relay(pid).await;
-            return Rung::Relayed;
+            resilience::StallAction::Repair => {
+                // Rung (c): repair the transport IN PLACE under the live session.
+                // DEBUG, resilience internal (in-place repair).
+                ui::debug(&ui::paint(
+                    ui::Tone::Warn,
+                    &format!("  transfer stalled, repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
+                ));
+                self.repair_link_in_place(pid).await;
+                Rung::Repaired
+            }
         }
-        // Rung (c): repair the transport IN PLACE under the live session.
-        // DEBUG, resilience internal (in-place repair).
-        ui::debug(&ui::paint(
-            ui::Tone::Warn,
-            &format!("  transfer stalled, repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
-        ));
-        self.repair_link_in_place(pid).await;
-        Rung::Repaired
     }
 
     /// Rung (c): rebuild a path under the LIVE session, preserving the on-disk
@@ -3230,7 +3201,7 @@ impl Conn {
         // Commit THIS peer to relay: stop dialing/answering direct-QUIC for it, so
         // the known-bad direct path can't keep winning the race and re-freezing
         // while the relay link tries to form (the exact thrash the sim exposed).
-        self.relay_committed.insert(pid.to_string());
+        self.resil.relay_committed.insert(pid.to_string());
         let Some(l) = self.links.get(pid) else { return };
         let info = l.info.clone();
         let known = l.expected_secret.clone();
@@ -3265,7 +3236,7 @@ impl Conn {
         // requires relay to be PERMITTED. The kill switch (`FILAMENT_UPGRADE_PROBE=0`)
         // and `--no-relay` both make this a no-op.
         if self.upgrade_eligible() {
-            self.upgrade_probe
+            self.resil.upgrade_probe
                 .entry(pid.to_string())
                 .or_insert_with(UpgradeProbe::armed);
             ui::say(&ui::paint(
@@ -3281,7 +3252,7 @@ impl Conn {
     /// interactive via `FILAMENT_WARM_STANDBY=1`). Gated off by the kill switch
     /// and by `--no-relay` (which never reaches relay anyway).
     fn upgrade_eligible(&self) -> bool {
-        self.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
+        self.resil.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
     }
 
     /// P5 (GAP-6): a portable network-change-ish event fired (a signaling
@@ -3292,7 +3263,7 @@ impl Conn {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
         }
-        for up in self.upgrade_probe.values_mut() {
+        for up in self.resil.upgrade_probe.values_mut() {
             if up.standby.is_none() {
                 up.next_at = Some(Instant::now());
             }
@@ -3303,7 +3274,7 @@ impl Conn {
     /// the steady cadence (exponential, capped at steady_ms). Also clears any
     /// stale standby/verify state so the next probe starts clean.
     fn mark_probe_failed(&mut self, pid: &str) {
-        let Some(up) = self.upgrade_probe.get_mut(pid) else { return };
+        let Some(up) = self.resil.upgrade_probe.get_mut(pid) else { return };
         up.attempt = up.attempt.saturating_add(1);
         up.standby = None;
         up.verify_started = None;
@@ -3327,7 +3298,7 @@ impl Conn {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
         }
-        if self.upgrade_probe.is_empty() {
+        if self.resil.upgrade_probe.is_empty() {
             return;
         }
         // Network-change trigger: a change to the local interface set is the
@@ -3335,35 +3306,35 @@ impl Conn {
         // platform netlink dependency. On change, reset every armed probe's
         // backoff to fire immediately (catches the wifi/cellular handoff instantly).
         let snap = direct::local_ip_snapshot();
-        if snap != self.iface_snapshot {
-            if !self.iface_snapshot.is_empty() {
+        if snap != self.resil.iface_snapshot {
+            if !self.resil.iface_snapshot.is_empty() {
                 // DEBUG, resilience internal (upgrade-probe trigger).
                 ui::debug(&ui::paint(
                     ui::Tone::Dim,
                     "  network changed, re-probing for a direct path now",
                 ));
-                for up in self.upgrade_probe.values_mut() {
+                for up in self.resil.upgrade_probe.values_mut() {
                     if up.standby.is_none() {
                         up.next_at = Some(Instant::now()); // fire ASAP
                     }
                 }
             }
-            self.iface_snapshot = snap;
+            self.resil.iface_snapshot = snap;
         }
 
         let now = Instant::now();
-        let pids: Vec<String> = self.upgrade_probe.keys().cloned().collect();
+        let pids: Vec<String> = self.resil.upgrade_probe.keys().cloned().collect();
         for pid in pids {
             // A peer that is no longer relay-committed (already upgraded or gone)
             // shouldn't be probed; drop its entry.
-            if !self.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
-                self.upgrade_probe.remove(&pid);
+            if !self.resil.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
+                self.resil.upgrade_probe.remove(&pid);
                 self.direct_pending.remove(&pid);
                 continue;
             }
             // VERIFYING: a standby connected, judge it before scheduling anything.
             let verifying = self
-                .upgrade_probe
+                .resil.upgrade_probe
                 .get(&pid)
                 .map(|u| u.standby.is_some())
                 .unwrap_or(false);
@@ -3377,11 +3348,11 @@ impl Conn {
                 continue;
             }
             // IDLE: schedule / fire the next probe per the backoff.
-            let due = match self.upgrade_probe.get(&pid).and_then(|u| u.next_at) {
+            let due = match self.resil.upgrade_probe.get(&pid).and_then(|u| u.next_at) {
                 None => true,            // armed but unscheduled → schedule first probe
                 Some(at) => now >= at,   // due
             };
-            if let Some(up) = self.upgrade_probe.get_mut(&pid) {
+            if let Some(up) = self.resil.upgrade_probe.get_mut(&pid) {
                 if up.next_at.is_none() {
                     // First scheduling after arming: probe after first_ms.
                     up.next_at = Some(now + Duration::from_millis(net::upgrade_first_ms()));
@@ -3396,7 +3367,7 @@ impl Conn {
             let Some((name, secret)) = known else {
                 // No stored secret to authenticate a direct dial, can't probe;
                 // disarm so we don't spin.
-                self.upgrade_probe.remove(&pid);
+                self.resil.upgrade_probe.remove(&pid);
                 continue;
             };
             // DEBUG, resilience internal (upgrade probe attempt).
@@ -3432,7 +3403,7 @@ impl Conn {
         // pass on a flaky standby (whose control path stays alive), so we MUST probe
         // the data path. The peer drops the unknown-sid chunk harmlessly but stamps
         // its inbound activity, so its side's idle drops too (symmetric verify).
-        let standby = self.upgrade_probe.get(pid).and_then(|u| u.standby.clone());
+        let standby = self.resil.upgrade_probe.get(pid).and_then(|u| u.standby.clone());
         let Some(standby) = standby else { return };
         // BOUND the heartbeat (F8: never block the event loop on something a remote
         // / a wedged path controls). A flaky standby's data path black-holes, the
@@ -3446,7 +3417,7 @@ impl Conn {
             Ok(Ok(()))
         );
         let idle = standby.idle_ms();
-        let Some(up) = self.upgrade_probe.get_mut(pid) else { return };
+        let Some(up) = self.resil.upgrade_probe.get_mut(pid) else { return };
         let started = match up.verify_started {
             Some(t) => t,
             None => {
@@ -3471,7 +3442,7 @@ impl Conn {
         // Sustained: moved data continuously for the whole verify window → upgrade.
         if started.elapsed() >= Duration::from_millis(verify_ms) {
             let t = standby;
-            let route = self.upgrade_probe.get(pid).map(|u| u.standby_route).unwrap_or("direct-quic");
+            let route = self.resil.upgrade_probe.get(pid).map(|u| u.standby_route).unwrap_or("direct-quic");
             self.perform_upgrade(pid, t, route).await;
         }
     }
@@ -3488,9 +3459,9 @@ impl Conn {
         let known = self.links.get(pid).and_then(|l| l.expected_secret.clone());
         // Clear the relay commitment FIRST so the new direct link isn't treated as
         // a known-bad path and so a future stall can escalate cleanly again.
-        self.relay_committed.remove(pid);
+        self.resil.relay_committed.remove(pid);
         self.relay_only = false;
-        self.upgrade_probe.remove(pid);
+        self.resil.upgrade_probe.remove(pid);
         self.direct_pending.remove(pid);
         // Swap the verified direct transport into the link, dropping the relay
         // link/transport (drop_link tears down the WebRTC peer). adopt the new
@@ -3566,7 +3537,7 @@ impl Conn {
         // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
         // out from under the verify (the race already won).
         self.direct_pending.remove(pid);
-        let Some(up) = self.upgrade_probe.get_mut(pid) else {
+        let Some(up) = self.resil.upgrade_probe.get_mut(pid) else {
             // No armed probe, the transport is unowned; dropping it tears it down.
             return;
         };
@@ -4844,19 +4815,10 @@ async fn send_cmd(
                         if o.done {
                             continue;
                         }
-                        let mut offer = json!({
-                            "type": "file-offer", "id": o.id, "sid": o.sid,
-                            "name": o.name, "size": o.size, "mime": "application/octet-stream",
-                        });
-                        if let Some(h) = &o.head {
-                            offer["head"] = json!(h);
-                        }
-                        if let Some(f) = &o.full {
-                            offer["full"] = json!(f);
-                        }
-                        if o.accepted_once {
-                            offer["resume"] = json!(true);
-                        }
+                        let offer = protocol::offer_msg(
+                            &o.id, o.sid, &o.name, o.size,
+                            o.head.as_deref(), o.full.as_deref(), o.accepted_once,
+                        );
                         t.send_control(&offer).await?;
                     }
                 }
@@ -4897,17 +4859,10 @@ async fn send_cmd(
                                     // DEBUG, resilience internal (state-divergence re-offer).
                                     ui::debug(&ui::paint(ui::Tone::Warn, &format!("  state-diverged: {}, peer holds {b}/{}; re-offering", o.name, o.size)));
                                     if let Some(t) = conn.transport_of(&pid) {
-                                        let mut offer = json!({
-                                            "type": "file-offer", "id": o.id, "sid": o.sid,
-                                            "name": o.name, "size": o.size, "mime": "application/octet-stream",
-                                            "resume": true,
-                                        });
-                                        if let Some(h) = &o.head {
-                                            offer["head"] = json!(h);
-                                        }
-                                        if let Some(f) = &o.full {
-                                            offer["full"] = json!(f);
-                                        }
+                                        let offer = protocol::offer_msg(
+                                            &o.id, o.sid, &o.name, o.size,
+                                            o.head.as_deref(), o.full.as_deref(), true,
+                                        );
                                         let _ = t.send_control(&offer).await;
                                     }
                                 }
@@ -5037,17 +4992,10 @@ async fn send_cmd(
                         if let Some(t) = conn.transport_of(&pid) {
                             let out = outgoing.lock().await;
                             for o in out.iter().filter(|o| o.accepted_once && !o.done) {
-                                let mut offer = json!({
-                                    "type": "file-offer", "id": o.id, "sid": o.sid,
-                                    "name": o.name, "size": o.size,
-                                    "mime": "application/octet-stream", "resume": true,
-                                });
-                                if let Some(h) = &o.head {
-                                    offer["head"] = json!(h);
-                                }
-                                if let Some(f) = &o.full {
-                                    offer["full"] = json!(f);
-                                }
+                                let offer = protocol::offer_msg(
+                                    &o.id, o.sid, &o.name, o.size,
+                                    o.head.as_deref(), o.full.as_deref(), true,
+                                );
                                 let _ = t.send_control(&offer).await;
                             }
                         }
@@ -5158,9 +5106,9 @@ async fn send_cmd(
                         // black-hole that QUIC hasn't noticed still reports a
                         // transport, so the re-probe path is what catches it.
                         let link_alive = conn.transport().is_some();
-                        match decide_ack_fallback(link_alive, ack_reprobed) {
-                            AckFallback::Reprobe => do_reprobe = true,
-                            AckFallback::FailUnconfirmed => give_up = true,
+                        match protocol::decide_ack_fallback(link_alive, ack_reprobed) {
+                            protocol::AckFallback::Reprobe => do_reprobe = true,
+                            protocol::AckFallback::FailUnconfirmed => give_up = true,
                         }
                     }
                 }
@@ -5191,7 +5139,7 @@ async fn send_cmd(
                 if let Some(t) = conn.transport() {
                     for (id, sid, name) in &pending {
                         ui::debug(&format!("  {name}: no delivery-ack yet, re-probing (re-sending file-end)"));
-                        let _ = t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await;
+                        let _ = t.send_control(&protocol::end_msg(id, *sid)).await;
                     }
                     let _ = t.flush().await;
                 }
@@ -5292,7 +5240,7 @@ async fn stream_one(
             }
         }
     }
-    t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await?;
+    t.send_control(&protocol::end_msg(&id, sid)).await?;
     t.flush().await?;
     bar.done(sent - offset);
     let mut out = outgoing.lock().await;
@@ -5934,7 +5882,7 @@ async fn recv_cmd(
         // here, where `completed`/`by_sid` were just settled, makes the gate-2/
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
-        conn.recv_done = recv_transfer_done(completed, keep_open, by_sid.is_empty());
+        conn.recv_done = protocol::recv_transfer_done(completed, keep_open, by_sid.is_empty());
         if completed > 0 || !by_sid.is_empty() {
             ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
         }
@@ -6458,10 +6406,14 @@ async fn recv_cmd(
                             tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
                         }
                         l2::OpenVerdict::Deny { sid, err } => {
-                            // Log refused dials (threat model: port-scan / SSRF
-                            // visibility). The gate observes this line.
-                            // DEBUG, l2 diagnostic (port-scan / SSRF visibility).
-                            ui::debug(&format!("l2: refused stream {sid:#x}: {err}"));
+                            // Log refused dials at INFO (visible by default,
+                            // suppressed under -q) — a refused SSRF/port-scan or
+                            // untrusted/over-cap open is a security event the
+                            // operator should see, mirroring the
+                            // shell-bootstrap-deny path (`ui::say`). Normal
+                            // initiators always dial 127.0.0.1, so this is silent
+                            // in normal operation and only fires on an anomaly.
+                            ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
                             let _ = t
                                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
                                 .await;
@@ -6946,7 +6898,7 @@ async fn recv_cmd(
                             "  declined {name} from {sender_name} ({})",
                             if daemon { "unverified peer" } else { "no tty, use -y to auto-accept" }
                         )));
-                        t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
+                        t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
                     }
 
@@ -7023,7 +6975,7 @@ async fn recv_cmd(
                                 full: None,
                                 bar: ui::Progress::new("(stdout)", size),
                             });
-                            t.send_control(&json!({ "type": "file-accept", "id": id, "offset": 0 })).await?;
+                            t.send_control(&protocol::accept_msg(&id, 0)).await?;
                             continue;
                         }
                     }
@@ -7049,7 +7001,7 @@ async fn recv_cmd(
                         full: effective_full,
                         bar,
                     });
-                    t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
+                    t.send_control(&protocol::accept_msg(&id, offset)).await?;
                 }
                 Some("file-end") => {
                     // Test hook (gate 18 standalone repro): drop the file-end
@@ -7082,7 +7034,7 @@ async fn recv_cmd(
                         if inc.full.is_some() {
                             let verdict = verify_incoming(&mut inc).await;
                             match verdict {
-                                VerifyResult::Match => {
+                                protocol::VerifyResult::Match => {
                                     // INTACT, finalize, then tell the sender it
                                     // landed whole (the deterministic delivery-ack).
                                     verify_fails.remove(&id);
@@ -7099,14 +7051,12 @@ async fn recv_cmd(
                                         if test_hooks::suppress_delivery_ack() {
                                             ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
                                         } else if let Some(t) = conn.transport_of(&pid) {
-                                            let _ = t.send_control(&json!({
-                                                "type": "delivery-ack", "id": id, "sid": sid, "v": 1,
-                                            })).await;
+                                            let _ = t.send_control(&protocol::delivery_ack_msg(&id, sid)).await;
                                             ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched), acked", )));
                                         }
                                     }
                                 }
-                                VerifyResult::Mismatch { restart_from_zero } => {
+                                protocol::VerifyResult::Mismatch { restart_from_zero } => {
                                     // TRUNCATED or CORRUPT, do NOT accept. Bound the
                                     // re-request so a genuinely-unrecoverable payload
                                     // fails clearly instead of looping forever.
@@ -7162,9 +7112,7 @@ async fn recv_cmd(
                                     }
                                     by_sid.insert((pid.clone(), sid), inc);
                                     if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = t.send_control(&json!({
-                                            "type": "file-accept", "id": id, "offset": req_offset,
-                                        })).await;
+                                        let _ = t.send_control(&protocol::accept_msg(&id, req_offset)).await;
                                     }
                                 }
                             }
@@ -7219,7 +7167,7 @@ async fn recv_cmd(
                         ui::clear_sticky();
                         ui::say(&ui::paint(ui::Tone::Dim, &format!("  declined {}", qv["name"].as_str().unwrap_or("file"))));
                         if let Some(t) = conn.transport_of(&qpid) {
-                            t.send_control(&json!({ "type": "file-decline", "id": qv["id"] })).await?;
+                            t.send_control(&protocol::decline_msg(qv["id"].as_str().unwrap_or_default())).await?;
                         }
                     }
                     // show the next queued question (or re-show on gibberish)
@@ -7422,17 +7370,6 @@ async fn recv_cmd(
     }
 }
 
-/// P4 (GAP-5): outcome of the whole-file integrity check on completion.
-enum VerifyResult {
-    /// Received bytes hash to the sender's offered digest, accept + ack.
-    Match,
-    /// Hash didn't match. `restart_from_zero` distinguishes the two cases:
-    /// a SHORT file (received < size) is merely TRUNCATED, resume the tail;
-    /// a FULL-SIZE file with the wrong hash has a CORRUPT BODY, the partial is
-    /// poisoned, so re-fetch from 0.
-    Mismatch { restart_from_zero: bool },
-}
-
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
 /// compare against the digest the sender offered (`inc.full`, guaranteed Some by
 /// the caller). Flushes first so every buffered byte is on disk. This is the
@@ -7444,8 +7381,8 @@ enum VerifyResult {
 /// hash is computed, deterministically inducing the corrupt-receive case so the
 /// gate can prove reject + recover. `FILAMENT_TEST_CORRUPT_ONCE=1` makes it fire
 /// exactly once (the re-fetch then succeeds), proving auto-recovery.
-async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
-    let want = match &inc.full { Some(w) => w.clone(), None => return VerifyResult::Match };
+async fn verify_incoming(inc: &mut IncomingFile) -> protocol::VerifyResult {
+    let want = match &inc.full { Some(w) => w.clone(), None => return protocol::VerifyResult::Match };
     let _ = inc.file.flush().await;
 
     // Test-only corruption injection (deterministic; gate proof). Compiled out
@@ -7472,17 +7409,14 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
         let _ = &target;
     }
 
-    // A short file can't possibly match, it's truncated; resume the tail.
+    // A short file can't possibly match, it's truncated; classify without hashing.
     if inc.received < inc.size {
-        return VerifyResult::Mismatch { restart_from_zero: false };
+        return protocol::decide_verify(inc.received, inc.size, None);
     }
     let path = inc.part_path.clone();
     let got = tokio::task::spawn_blocking(move || full_hash(&path)).await.ok().flatten();
-    match got {
-        Some(g) if g == want => VerifyResult::Match,
-        // Full size but wrong hash → corrupt body, re-fetch whole.
-        _ => VerifyResult::Mismatch { restart_from_zero: true },
-    }
+    // The decision (match / truncated / corrupt-restart) is pure (protocol.rs).
+    protocol::decide_verify(inc.received, inc.size, Some(got.as_deref() == Some(want.as_str())))
 }
 
 /// Finalize a fully-received incoming file: flush, rename `.part` → final,
@@ -7890,48 +7824,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recv_done_drops_only_when_complete() {
-        // Gate-18 Mode B: the drop-instead-of-reconnect decision must hold
-        // ONLY when the transfer is complete and idle. This is the exact fence
-        // that protects gate 2 (kill-resume) and gate 11c (deferred-drop): a
-        // mid-transfer link (by_sid non-empty) must always reconnect.
-        // complete + idle + not keep_open -> drop the dead link, let quiet-exit
-        assert!(recv_transfer_done(1, false, true));
-        assert!(recv_transfer_done(3, false, true));
-    }
-
-    #[test]
-    fn recv_done_false_mid_transfer_protects_resume() {
-        // by_sid NON-empty == a stream in flight (an in-progress reconnect or
-        // resume). Must NOT drop, gate 2 / gate 11c reconnect paths depend on
-        // this returning false so on_stuck re-establishes.
-        assert!(!recv_transfer_done(0, false, false)); // nothing done, mid-stream
-        assert!(!recv_transfer_done(1, false, false)); // file done but another in flight
-        // keep_open (gate 13): a resident receiver never self-drops its links.
-        assert!(!recv_transfer_done(1, true, true));
-        assert!(!recv_transfer_done(5, true, true));
-        // nothing completed yet (still connecting / first stream) -> reconnect.
-        assert!(!recv_transfer_done(0, false, true));
-    }
-
-    #[test]
-    fn ack_fallback_never_completes_silently() {
-        // P4 silent-data-loss fix: the no-ack window must NEVER claim success. A
-        // send is delivered+verified ONLY on a real delivery-ack, so this decision
-        // function only ever Reprobes or FailsUnconfirmed, never "complete".
-        // Link gone (the black-hole-then-drop case): fail honestly, no point
-        // re-probing into a dead link.
-        assert_eq!(decide_ack_fallback(false, false), AckFallback::FailUnconfirmed);
-        assert_eq!(decide_ack_fallback(false, true), AckFallback::FailUnconfirmed);
-        // Link alive, first window: the ack may be lost, re-probe once.
-        assert_eq!(decide_ack_fallback(true, false), AckFallback::Reprobe);
-        // Link alive but already re-probed and STILL no ack: do not declare
-        // success, fail as unconfirmed (resumable). This is the exact case the
-        // old code falsely completed (drained buffer, healthy-looking link, but
-        // nothing arrived and no ack came).
-        assert_eq!(decide_ack_fallback(true, true), AckFallback::FailUnconfirmed);
-    }
 
     #[test]
     fn filename_sanitization() {
