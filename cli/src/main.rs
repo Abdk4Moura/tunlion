@@ -1303,9 +1303,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         roster: HashMap::new(),
         active: None,
         next_gen: 0,
-        waiting_rejoin: None,
-        rejoin_window: REJOIN_WINDOW,
-        away: None,
+        rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
@@ -2005,6 +2003,19 @@ struct ResilienceState {
     iface_snapshot: Vec<String>,
 }
 
+/// ORCHESTRATION: peer-absence / rejoin-grace bookkeeping, split out of the Conn
+/// god-struct. Tracks the reconnect window we hold open for a vanished peer and a
+/// peer's declared absence (C21 `brb`).
+struct RejoinState {
+    /// when set, we are holding a reconnect window open for a vanished peer.
+    waiting_rejoin: Option<Instant>,
+    /// How long the current rejoin window runs (set when it opens; depends on
+    /// whether the peer declared `brb`).
+    rejoin_window: Duration,
+    /// (peer sid, until), the peer told us it's stepping away (C21).
+    away: Option<(String, Instant)>,
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -2017,12 +2028,8 @@ struct Conn {
     roster: HashMap<String, Value>, // sid -> {id,name,uid} from welcome/peer-joined
     active: Option<String>,        // the transfer-target sid (send side)
     next_gen: u32,
-    waiting_rejoin: Option<Instant>,
-    /// How long the current rejoin window runs (set when it opens; depends on
-    /// whether the peer declared `brb`).
-    rejoin_window: Duration,
-    /// (peer sid, until), the peer told us it's stepping away (C21).
-    away: Option<(String, Instant)>,
+    /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
+    rejoin: RejoinState,
     chunk_size: usize,
     /// #28 (deferred drop): sids that got a peer-left while their data channel
     /// was still FLOWING. The signaling socket left the room, but the WebRTC
@@ -2198,9 +2205,7 @@ impl Conn {
             roster: HashMap::new(),
             active: None,
             next_gen: 0,
-            waiting_rejoin: None,
-            rejoin_window: REJOIN_WINDOW,
-            away: None,
+            rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
             chunk_size: net::MAX_DC_PAYLOAD,
             deferred_left: HashMap::new(),
             recv_done: false,
@@ -2350,7 +2355,7 @@ impl Conn {
                 }
             }
             self.active = Some(peer_id.clone());
-            self.waiting_rejoin = None;
+            self.rejoin.waiting_rejoin = None;
         }
         Ok(self.is_active(&peer_id))
     }
@@ -3576,7 +3581,7 @@ impl Conn {
             "disconnected" => {
                 let grace = if away {
                     l.presence = Presence::Away;
-                    if let Some((_, until)) = &self.away {
+                    if let Some((_, until)) = &self.rejoin.away {
                         until.duration_since(Instant::now()) + Duration::from_secs(15)
                     } else {
                         Duration::from_secs(6)
@@ -3651,13 +3656,13 @@ impl Conn {
             // promised window (plus slack); an unannounced vanish gets the
             // short default. Their client auto-rejoins; C6 supersede or a
             // fresh adopt completes the recovery.
-            self.rejoin_window = match &self.away {
+            self.rejoin.rejoin_window = match &self.rejoin.away {
                 Some((apid, until)) if *apid == pid && *until > Instant::now() => {
                     until.duration_since(Instant::now()) + Duration::from_secs(15)
                 }
                 _ => rejoin_unwarned(),
             };
-            self.waiting_rejoin = Some(Instant::now());
+            self.rejoin.waiting_rejoin = Some(Instant::now());
         }
         was_active
     }
@@ -3712,8 +3717,8 @@ impl Conn {
 
     /// C21: any traffic from a peer cancels its declared absence.
     fn note_alive(&mut self, pid: &str) {
-        if matches!(&self.away, Some((apid, _)) if apid == pid) {
-            self.away = None;
+        if matches!(&self.rejoin.away, Some((apid, _)) if apid == pid) {
+            self.rejoin.away = None;
         }
     }
 
@@ -3729,7 +3734,7 @@ impl Conn {
     }
 
     fn is_away(&self, pid: &str) -> bool {
-        matches!(&self.away, Some((apid, until)) if apid == pid && *until > Instant::now())
+        matches!(&self.rejoin.away, Some((apid, until)) if apid == pid && *until > Instant::now())
     }
 
     /// C26: one static colored status line showing EVERY peer, the changed
@@ -3823,16 +3828,16 @@ async fn next_ev(
     conn: &Conn,
     suppress_countdown: bool,
 ) -> Result<Option<Ev>> {
-    if let Some(since) = conn.waiting_rejoin {
-        if since.elapsed() > conn.rejoin_window {
+    if let Some(since) = conn.rejoin.waiting_rejoin {
+        if since.elapsed() > conn.rejoin.rejoin_window {
             ui::clear_sticky();
             bail!(
                 "peer did not come back within {}s (partial state kept for resume)",
-                conn.rejoin_window.as_secs()
+                conn.rejoin.rejoin_window.as_secs()
             );
         }
         if !suppress_countdown {
-            let left = conn.rejoin_window.saturating_sub(since.elapsed()).as_secs();
+            let left = conn.rejoin.rejoin_window.saturating_sub(since.elapsed()).as_secs();
             ui::sticky(&ui::paint(
                 ui::Tone::Dim,
                 &format!("  {} holding the line, {left}s for them to come back (Ctrl-C to stop)", ui::spinner_frame()),
@@ -4451,7 +4456,7 @@ async fn send_cmd(
             );
         }
         // The wait-for-peer deadline only applies while we have no peer (F3).
-        let ev = if conn.active.is_none() && conn.waiting_rejoin.is_none() {
+        let ev = if conn.active.is_none() && conn.rejoin.waiting_rejoin.is_none() {
             // C30: read in ≤2s slices, a blocking full-deadline read starves
             // the session tick, so a dropped initial subscribe was never
             // repaired and the wait could NEVER succeed (found by gate L's
@@ -4827,7 +4832,7 @@ async fn send_cmd(
                 _ if !conn.is_active(&pid) => {}
                 Some("brb") => {
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
-                    conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
+                    conn.rejoin.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
                     let n = conn.link_presence(&pid, Presence::Away);
                     ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away, holding the line", &n));
                 }
@@ -5975,7 +5980,7 @@ async fn recv_cmd(
         if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
             && conn.links.is_empty()
         {
-            conn.waiting_rejoin = None;
+            conn.rejoin.waiting_rejoin = None;
             ui::clear_sticky();
             ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
             let _ = sio.disconnect().await;
@@ -6640,7 +6645,7 @@ async fn recv_cmd(
                     // C21: the peer announces a benign absence (mobile file
                     // picker suspends the tab). Hold the line that long.
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
-                    conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
+                    conn.rejoin.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
                     let n = conn.link_presence(&pid, Presence::Away);
                     ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away, choosing a file · holding the line", &n));
                 }
@@ -7338,7 +7343,7 @@ async fn recv_cmd(
                 }
                 let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
                 if conn.on_peer_left(&v) {
-                    let secs = conn.rejoin_window.as_secs();
+                    let secs = conn.rejoin.rejoin_window.as_secs();
                     if !by_sid.is_empty() {
                         // Keep partials writable-but-parked; resume comes via
                         // rejoin (C6) or a later re-offer against the .part.
@@ -7356,7 +7361,7 @@ async fn recv_cmd(
                         let n = gone.unwrap_or_else(|| "sender".into());
                         ui::say(&conn.roster(gid, "●", ui::Tone::Warn, &format!("stepped away, holding the line up to {secs}s (Ctrl-C to stop)"), &n));
                     } else {
-                        conn.waiting_rejoin = None; // open listener: keep going
+                        conn.rejoin.waiting_rejoin = None; // open listener: keep going
                         let gid = v["id"].as_str().unwrap_or_default();
                         match gone {
                             Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, "left, still listening", &n)),
