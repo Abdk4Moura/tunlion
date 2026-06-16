@@ -4807,19 +4807,10 @@ async fn send_cmd(
                         if o.done {
                             continue;
                         }
-                        let mut offer = json!({
-                            "type": "file-offer", "id": o.id, "sid": o.sid,
-                            "name": o.name, "size": o.size, "mime": "application/octet-stream",
-                        });
-                        if let Some(h) = &o.head {
-                            offer["head"] = json!(h);
-                        }
-                        if let Some(f) = &o.full {
-                            offer["full"] = json!(f);
-                        }
-                        if o.accepted_once {
-                            offer["resume"] = json!(true);
-                        }
+                        let offer = protocol::offer_msg(
+                            &o.id, o.sid, &o.name, o.size,
+                            o.head.as_deref(), o.full.as_deref(), o.accepted_once,
+                        );
                         t.send_control(&offer).await?;
                     }
                 }
@@ -4860,17 +4851,10 @@ async fn send_cmd(
                                     // DEBUG, resilience internal (state-divergence re-offer).
                                     ui::debug(&ui::paint(ui::Tone::Warn, &format!("  state-diverged: {}, peer holds {b}/{}; re-offering", o.name, o.size)));
                                     if let Some(t) = conn.transport_of(&pid) {
-                                        let mut offer = json!({
-                                            "type": "file-offer", "id": o.id, "sid": o.sid,
-                                            "name": o.name, "size": o.size, "mime": "application/octet-stream",
-                                            "resume": true,
-                                        });
-                                        if let Some(h) = &o.head {
-                                            offer["head"] = json!(h);
-                                        }
-                                        if let Some(f) = &o.full {
-                                            offer["full"] = json!(f);
-                                        }
+                                        let offer = protocol::offer_msg(
+                                            &o.id, o.sid, &o.name, o.size,
+                                            o.head.as_deref(), o.full.as_deref(), true,
+                                        );
                                         let _ = t.send_control(&offer).await;
                                     }
                                 }
@@ -5000,17 +4984,10 @@ async fn send_cmd(
                         if let Some(t) = conn.transport_of(&pid) {
                             let out = outgoing.lock().await;
                             for o in out.iter().filter(|o| o.accepted_once && !o.done) {
-                                let mut offer = json!({
-                                    "type": "file-offer", "id": o.id, "sid": o.sid,
-                                    "name": o.name, "size": o.size,
-                                    "mime": "application/octet-stream", "resume": true,
-                                });
-                                if let Some(h) = &o.head {
-                                    offer["head"] = json!(h);
-                                }
-                                if let Some(f) = &o.full {
-                                    offer["full"] = json!(f);
-                                }
+                                let offer = protocol::offer_msg(
+                                    &o.id, o.sid, &o.name, o.size,
+                                    o.head.as_deref(), o.full.as_deref(), true,
+                                );
                                 let _ = t.send_control(&offer).await;
                             }
                         }
@@ -5154,7 +5131,7 @@ async fn send_cmd(
                 if let Some(t) = conn.transport() {
                     for (id, sid, name) in &pending {
                         ui::debug(&format!("  {name}: no delivery-ack yet, re-probing (re-sending file-end)"));
-                        let _ = t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await;
+                        let _ = t.send_control(&protocol::end_msg(id, *sid)).await;
                     }
                     let _ = t.flush().await;
                 }
@@ -5255,7 +5232,7 @@ async fn stream_one(
             }
         }
     }
-    t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await?;
+    t.send_control(&protocol::end_msg(&id, sid)).await?;
     t.flush().await?;
     bar.done(sent - offset);
     let mut out = outgoing.lock().await;
@@ -6913,7 +6890,7 @@ async fn recv_cmd(
                             "  declined {name} from {sender_name} ({})",
                             if daemon { "unverified peer" } else { "no tty, use -y to auto-accept" }
                         )));
-                        t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
+                        t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
                     }
 
@@ -6990,7 +6967,7 @@ async fn recv_cmd(
                                 full: None,
                                 bar: ui::Progress::new("(stdout)", size),
                             });
-                            t.send_control(&json!({ "type": "file-accept", "id": id, "offset": 0 })).await?;
+                            t.send_control(&protocol::accept_msg(&id, 0)).await?;
                             continue;
                         }
                     }
@@ -7016,7 +6993,7 @@ async fn recv_cmd(
                         full: effective_full,
                         bar,
                     });
-                    t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
+                    t.send_control(&protocol::accept_msg(&id, offset)).await?;
                 }
                 Some("file-end") => {
                     // Test hook (gate 18 standalone repro): drop the file-end
@@ -7066,9 +7043,7 @@ async fn recv_cmd(
                                         if test_hooks::suppress_delivery_ack() {
                                             ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
                                         } else if let Some(t) = conn.transport_of(&pid) {
-                                            let _ = t.send_control(&json!({
-                                                "type": "delivery-ack", "id": id, "sid": sid, "v": 1,
-                                            })).await;
+                                            let _ = t.send_control(&protocol::delivery_ack_msg(&id, sid)).await;
                                             ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched), acked", )));
                                         }
                                     }
@@ -7129,9 +7104,7 @@ async fn recv_cmd(
                                     }
                                     by_sid.insert((pid.clone(), sid), inc);
                                     if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = t.send_control(&json!({
-                                            "type": "file-accept", "id": id, "offset": req_offset,
-                                        })).await;
+                                        let _ = t.send_control(&protocol::accept_msg(&id, req_offset)).await;
                                     }
                                 }
                             }
@@ -7186,7 +7159,7 @@ async fn recv_cmd(
                         ui::clear_sticky();
                         ui::say(&ui::paint(ui::Tone::Dim, &format!("  declined {}", qv["name"].as_str().unwrap_or("file"))));
                         if let Some(t) = conn.transport_of(&qpid) {
-                            t.send_control(&json!({ "type": "file-decline", "id": qv["id"] })).await?;
+                            t.send_control(&protocol::decline_msg(qv["id"].as_str().unwrap_or_default())).await?;
                         }
                     }
                     // show the next queued question (or re-show on gibberish)

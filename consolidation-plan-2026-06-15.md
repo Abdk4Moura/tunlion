@@ -418,10 +418,26 @@ session/codeentry/ui/sshkeys).
   - Verified: `cargo test --release` 74/74 (3 new verify tests pinning the
     truncated/corrupt/match cases); build clean; LIVE browser↔CLI 2/2 — gate 6
     drives the real CLI receive→verify→delivery-ack path ("verified … acked").
-  - Next Phase 3 slices (larger): the control-message builders (offer/accept/
-    end/decline/delivery-ack — currently inline `json!` at ~8 sites), then the
-    rest of the send_cmd/recv_cmd loop scaffolding, more resilience (upgrade
-    probe, C4 grace), and splitting the `Conn` god-struct.
+- **2026-06-16 — `protocol.rs`: the control-message builders (the wire vocabulary).**
+  - Replaced the inline `json!` control-message literals scattered through
+    send_cmd/recv_cmd (11 sites) with `protocol::{offer_msg, accept_msg,
+    decline_msg, end_msg, delivery_ack_msg}` — one definition per file-transfer
+    message, mirroring frontend/src/net/protocol/transfer.js's builders. Control
+    messages are parsed by key, so order-independent and interop-safe.
+  - Verified: `cargo test --release` 76/76 (2 new builder tests pinning the exact
+    JSON shapes incl. the optional head/full/resume); build clean; LIVE
+    browser↔CLI 2/2 — gates 5+6 exercise EVERY CLI builder being parsed by the
+    real browser, both directions byte-exact (the wire-compatibility proof).
+
+  → Rust **protocol** module now holds the file-transfer decisions
+    (recv_transfer_done / decide_ack_fallback / decide_verify + VerifyResult) AND
+    the full control-message vocabulary. Rust **resilience** module holds the
+    stall-ladder decision. Both mirror their JS counterparts, all unit-tested,
+    lab- + live-verified.
+  - Next (larger, deferred): pull the remaining send_cmd/recv_cmd loop scaffolding
+    (the chunk pump, the by_sid receive assembly) toward the protocol module, more
+    resilience (upgrade probe, C4 grace), and splitting the `Conn` god-struct so
+    signaling/protocol/resilience state aren't one bag.
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
