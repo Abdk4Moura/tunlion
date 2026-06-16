@@ -358,6 +358,20 @@ real browser; the return shape must stay identical).
     signaling-dispatcher (socket events → typed intents), the protocol-
     orchestrator (device matching / proofs / PAKE binding).
 
+- **2026-06-16 — state-REDUCER pure core: `net/app/state.js`.**
+  - Extracted the peer/transfer list transforms behind the snapshot helpers:
+    `addPeerToList` (no dup), `patchPeerInList` (patch-existing-only, never
+    resurrects #3), `removePeerFromList`, `upsertTransferInList` (new prepends,
+    existing merges). Each preserves the same-reference-on-no-change contract
+    React relies on. The hook keeps setPeers/setTransfers + the telemetry/logging
+    + owner/status refs and delegates the list math.
+  - Verified: `state.test.mjs` (new, 10 cases incl. the no-render reference
+    checks) PASS; vite build clean; all suites + gate8 PASS; LIVE browser↔CLI 2/2
+    (the state path is exercised on every peer-status / transfer-progress update).
+  - Remaining Phase 2: the signaling-dispatcher (socket events → typed intents)
+    and the protocol-orchestrator (its crypto is already in devices.js/pairing.js;
+    what's left in the hook is mostly React wiring of those).
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
