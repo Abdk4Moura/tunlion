@@ -228,6 +228,20 @@ characterization test and the existing gates, smallest verifiable slice first.
     setInterval+counters out of PeerLink), `upgrade.js`, `liveness.js`,
     `ackfallback.js`.
 
+- **2026-06-16 (cont.) — `net/resilience/upgrade.js` (relay→direct prober policy).**
+  - Extracted the prober's timer-free POLICY from `_upgradeProbe`/
+    `_beginUpgradeVerify`/`_backoffUpgrade`: `decideProbeResult` (non-relay
+    measurement → verify, else backoff), `decideUpgradeVerifyTick`
+    (commit/discard/wait for the verify-before-commit window), `nextUpgradeDelay`
+    (double-toward-cap backoff). PeerLink keeps the restartIce, the timers, and
+    the verify-window bookkeeping (lastBytes/lastSeen).
+  - Verified: `upgrade.test.mjs` (new, 15 cases) PASS; vite build clean;
+    stall/wire/transfer/gate8 regression PASS; LIVE happy-path browser↔CLI 2/2.
+  - **Verification caveat:** the relay→direct scenario is NOT reproducible on a
+    single host (links are always `local`; the prober only runs on `relayed`), so
+    neither the netns lab nor a single-host browser can exercise it live — unit
+    tests are the floor. A true live check needs a two-machine / NAT'd-relay rig.
+
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
 2. `resilience/*` — IN PROGRESS. Done: `stall.js` ladder shape. Next, each behind
