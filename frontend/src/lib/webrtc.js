@@ -43,9 +43,6 @@ import {
   sendsToResume,
 } from '../net/protocol/transfer.js'
 export { decideAckFallback }
-// RESILIENCE layer: the relay→direct upgrade prober's timer-free POLICY
-// (probe-result classification, verify-before-commit tick, backoff cadence).
-import { decideProbeResult, decideUpgradeVerifyTick, nextUpgradeDelay } from '../net/resilience/upgrade.js'
 // RESILIENCE layer: the idle-shell (PTY) consent-liveness detector + its short
 // recovery ladder. PeerLink owns the timer, the consent read, and the counters.
 import { ptyLivenessTick, nextPtyStage } from '../net/resilience/liveness.js'
@@ -53,6 +50,8 @@ import { ptyLivenessTick, nextPtyStage } from '../net/resilience/liveness.js'
 import { StallController } from '../net/resilience/stallController.js'
 // RESILIENCE layer: the timer-owning delivery-ack fallback (no-ack window + peer-acks memory).
 import { AckFallbackController } from '../net/resilience/ackFallback.js'
+// RESILIENCE layer: the timer-owning relay→direct upgrade prober.
+import { UpgradeProber } from '../net/resilience/upgradeProber.js'
 
 const rlog = log.scope('rtc')
 
@@ -407,14 +406,14 @@ export class PeerLink {
     this._ptyEpisode = null
     this._testPtyFrozen = false // M1 test seam: set true by sendPtyInput under ?test=freezepty
 
-    // P5 (GAP-6): the relay→direct upgrade prober. Armed when the route becomes
-    // 'relayed', disarmed when it's 'direct'/'local'. `_upgradeTimer` is the
-    // backoff timer; `_upgradeDelay` is the current (doubling) cadence;
-    // `_upgradeVerify` is the in-progress verify latch {since, bytesAt}.
-    this._upgradeTimer = null
-    this._upgradeDelay = UPGRADE_FIRST_MS
-    this._upgradeVerify = null
-    this._upgrading = false // re-entrancy guard while a probe/verify is mid-flight
+    // P5 (GAP-6): the relay→direct upgrade prober (timer-owning controller).
+    // Armed when the route becomes 'relayed' (_detectRoute), disarmed on
+    // direct/local / close. Owns its backoff timer, cadence, and verify latch.
+    this._upgrade = new UpgradeProber(this, {
+      firstMs: UPGRADE_FIRST_MS,
+      steadyMs: UPGRADE_STEADY_MS,
+      verifyMs: UPGRADE_VERIFY_MS,
+    })
 
     // P1 (GAP-4): when this link is rebuilt relay-preferred after a chronically
     // stalled direct/STUN path, force EVERY ICE candidate through the TURN relay
@@ -634,176 +633,18 @@ export class PeerLink {
     // moment we're on a direct/local path (nothing to upgrade away from). This
     // runs on the initial connect detection AND every prober re-poll, so a route
     // that drops back to relay re-arms automatically.
-    if (route === 'relayed') this._armUpgradeProber()
-    else this._disarmUpgradeProber()
+    if (route === 'relayed') this._upgrade.arm()
+    else this._upgrade.disarm()
     return route
   }
 
   // ---------------------------------------------------- P5 relay→direct upgrade
-  // Begin probing for a direct path while serving on relay. Idempotent. The
-  // schedule is: first probe at UPGRADE_FIRST_MS (eager, the cause is often a
-  // transient hiccup), then each failed probe doubles toward UPGRADE_STEADY_MS.
-  _armUpgradeProber() {
-    if (this._closed || this._upgradeTimer) return
-    rlog.debug('upgrade prober armed (on relay, probing for a direct path)', this.id.slice(-6))
-    this._upgradeDelay = UPGRADE_FIRST_MS
-    this._scheduleUpgradeProbe(this._upgradeDelay)
-  }
-
-  _disarmUpgradeProber() {
-    if (this._upgradeTimer) {
-      clearTimeout(this._upgradeTimer)
-      this._upgradeTimer = null
-    }
-    this._upgradeVerify = null
-    this._upgrading = false
-    this._upgradeDelay = UPGRADE_FIRST_MS
-  }
-
-  _scheduleUpgradeProbe(delay) {
-    if (this._closed) return
-    clearTimeout(this._upgradeTimer)
-    this._upgradeTimer = setTimeout(() => this._upgradeProbe(), delay)
-  }
-
-  // Re-probe NOW: collapse the backoff so the next probe fires immediately. The
-  // hook calls this from its visibility/online effect on a network change, the
-  // browser analog of the Rust client's iface-change re-probe trigger.
+  // The prober (timer + backoff cadence + verify-before-commit) lives in
+  // resilience/UpgradeProber; PeerLink arms/disarms it from _detectRoute and on
+  // close. Re-probe NOW on a network change — the hook's public entrypoint
+  // (frozen surface), delegated to the controller.
   probeUpgradeNow() {
-    if (this._closed || this.route !== 'relayed') return
-    this._upgradeDelay = UPGRADE_FIRST_MS // a fresh path may exist, reset the cadence
-    if (this._upgrading) return // a probe is already in flight; let it run
-    rlog.debug('upgrade re-probe now (network change)', this.id.slice(-6))
-    this._scheduleUpgradeProbe(0)
-  }
-
-  // One upgrade attempt: restartIce() on the live PC (the data channel survives,
-  // so this is non-disruptive), let ICE re-nominate, then re-detect the route. A
-  // non-relay re-detection enters the verify-before-commit window; anything else
-  // backs off and re-schedules.
-  async _upgradeProbe() {
-    this._upgradeTimer = null
-    if (this._closed || this.route !== 'relayed') return this._disarmUpgradeProber()
-    // Kill-switch (browser analog of FILAMENT_UPGRADE_PROBE=0): the user opted out
-    // of the prober entirely. Leave the link on relay; never re-schedule.
-    try {
-      if (localStorage.getItem('filamentUpgradeProbe') === '0') {
-        rlog.debug('upgrade prober disabled (filamentUpgradeProbe=0), staying on relay', this.id.slice(-6))
-        return
-      }
-    } catch {}
-    // Shared-ICE-restart guard: the P0 stall ladder also drives restartIce. They
-    // must never both fire at once (glare / churn). If a stall episode is open or
-    // we're not cleanly connected, skip this probe and back off.
-    if (this.pc.connectionState !== 'connected' || this._stall.episode) {
-      rlog.debug('upgrade probe skipped (not connected or stall episode open)', this.id.slice(-6))
-      return this._backoffUpgrade()
-    }
-    // Only the IMPOLITE side drives restartIce (consistent with C4 + the P0
-    // ladder rung a), restarting from both sides glares.
-    this._upgrading = true
-    if (!this.polite) {
-      try {
-        rlog.debug('upgrade probe: restartIce to find a direct path', this.id.slice(-6))
-        linkdiag.record('action', { what: 'restartIce', reason: 'p5-upgrade-probe' }, this._diagMeta())
-        this.pc.restartIce()
-      } catch {}
-    } else {
-      rlog.debug('upgrade probe: re-detecting route (polite: no restartIce)', this.id.slice(-6))
-    }
-    // Give ICE a moment to re-nominate, then MEASURE (not commit) the route. We
-    // deliberately use _measureRoute, not _detectRoute: a relay→direct flip must
-    // pass verify-before-commit first, so we must NOT fire onRoute / clear the
-    // amber UI here. Only _commitUpgrade does that, after the path holds.
-    await new Promise((r) => setTimeout(r, 1200))
-    this._upgrading = false
-    if (this._closed || this.route !== 'relayed') return
-    const route = await this._measureRoute()
-    if (this._closed || this.route !== 'relayed') return
-    // A non-relay measurement enters the verify window; anything else backs off
-    // (decision in resilience/upgrade.js).
-    if (decideProbeResult(route).action === 'verify') {
-      this._beginUpgradeVerify(route)
-    } else {
-      this._upgradeVerify = null
-      this._backoffUpgrade()
-    }
-  }
-
-  // Verify-before-commit (mirrors Rust judge_upgrade_standby): a direct path that
-  // wins re-nomination must keep moving data for UPGRADE_VERIFY_MS before we cut
-  // over. Reuses the P0 _bytesMoved counter as the "data path holds" signal. We
-  // sample on a short heartbeat; if the route reverts to relay OR bytes stop
-  // before the window closes, DISCARD and back off, no flap.
-  _beginUpgradeVerify(route) {
-    rlog.debug('direct path detected, verifying it holds before committing', this.id.slice(-6))
-    const start = Date.now()
-    const verify = { route, bytesAt: this._bytesMoved, lastBytes: this._bytesMoved, lastSeen: start }
-    this._upgradeVerify = verify
-    const VERIFY_TICK = 500
-    // During the verify window we want some traffic to move so a flaky path
-    // reveals itself. _checkStall already nudges real transfers; if the link is
-    // otherwise idle we can't distinguish hold-vs-flaky, so an idle link that
-    // simply READS non-relay across the whole window is accepted (a connected
-    // direct candidate-pair is itself evidence; the no-flap risk is only when a
-    // transfer is in flight, and then _bytesMoved advances).
-    const tick = async () => {
-      if (this._closed || this._upgradeVerify !== verify) return
-      if (this.route !== 'relayed') return // someone else committed; stop
-      const re = await this._measureRoute() // MEASURE only, commit happens below
-      if (this._closed || this._upgradeVerify !== verify) return
-      const hasInflight = [...this.transfers.values()].some(
-        (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
-      )
-      const moved = this._bytesMoved !== verify.lastBytes
-      if (moved) {
-        verify.lastBytes = this._bytesMoved
-        verify.lastSeen = Date.now()
-      }
-      // The verify-window verdict (commit / discard / wait) lives in
-      // resilience/upgrade.js; this method owns the timer + lastSeen bookkeeping.
-      const decision = decideUpgradeVerifyTick({
-        measuredRoute: re,
-        hasInflight,
-        idleMs: Date.now() - verify.lastSeen,
-        elapsedMs: Date.now() - start,
-        verifyMs: UPGRADE_VERIFY_MS,
-      })
-      if (decision.action === 'discard') {
-        // Reverted to relay, or an inflight transfer stalled → stay on relay (no flap).
-        rlog.debug('direct path connected but did not hold, staying on relay (no flap)', this.id.slice(-6))
-        this._upgradeVerify = null
-        this._backoffUpgrade()
-        return
-      }
-      if (decision.action === 'commit') {
-        this._commitUpgrade(verify.route)
-        return
-      }
-      this._upgradeTimer = setTimeout(tick, VERIFY_TICK)
-    }
-    this._upgradeTimer = setTimeout(tick, VERIFY_TICK)
-  }
-
-  // Commit the upgrade: the direct path held. Set the route, fire onRoute (which
-  // AUTO-CLEARS the amber RELAY UI, no new UI needed), log the one value-prop
-  // line, and disarm the prober (we're a destination now, not a way-station).
-  _commitUpgrade(route) {
-    if (this._closed) return
-    linkdiag.record('action', { what: 'upgrade-commit', route, from: this.route || null }, this._diagMeta())
-    this.route = route
-    this.onRoute(route)
-    rlog.info('upgraded to direct, relay released', this.id.slice(-6), route)
-    this._disarmUpgradeProber()
-  }
-
-  // A probe (or a failed verify) didn't yield a held direct path: double the
-  // cadence toward the steady cap and re-schedule, so a peer that will never get
-  // direct isn't hammered.
-  _backoffUpgrade() {
-    this._upgrading = false
-    this._upgradeDelay = nextUpgradeDelay(this._upgradeDelay, UPGRADE_STEADY_MS)
-    if (this.route === 'relayed' && !this._closed) this._scheduleUpgradeProbe(this._upgradeDelay)
+    this._upgrade.probeNow()
   }
 
   // ------------------------------------------------------------- data channel
@@ -1350,7 +1191,7 @@ export class PeerLink {
     this._ptyEpisode = null
     this._ptyDeadMs = 0
     this._ptyLiveSignal = null
-    this._disarmUpgradeProber() // P5: the upgrade prober dies with the link's transfers
+    this._upgrade.disarm() // P5: the upgrade prober dies with the link's transfers
     for (const t of this.transfers.values()) {
       if (t.status !== 'transferring' && t.status !== 'offered') continue
       const resumable =
@@ -1522,7 +1363,7 @@ export class PeerLink {
     this._diag?.stop() // P5/diag: stop the getStats poll
     clearInterval(this._stateTimer)
     clearInterval(this._stallTimer) // P0: disarm the in-flight stall watchdog
-    this._disarmUpgradeProber() // P5: disarm the relay→direct upgrade prober
+    this._upgrade.disarm() // P5: disarm the relay→direct upgrade prober
     if (this._closed) return
     this._closed = true
     clearTimeout(this._dcTimer)
