@@ -1,0 +1,97 @@
+# Demo for winget-pkgs PR #384634 (Abdk4Moura.Filament 0.1.0).
+#
+# Reviewer @Trenly observed `filament` failing to launch after `winget install`
+# on a clean Windows machine ("VCRUNTIME140.dll was not found"). This workflow
+# reproduces that on GitHub-hosted Windows and proves the fix is the VC++
+# 2015-2022 Redistributable — i.e. the manifest should declare a dependency on
+# Microsoft.VCRedist.2015+.x64.
+#
+#   job 1 (inspect)   : prove the shipped 0.1.0 binary imports VCRUNTIME140.dll
+#   job 2 (clean-room): on a pristine Windows Server Core container (no VCRedist)
+#                       the binary fails with STATUS_DLL_NOT_FOUND (0xC0000135),
+#                       then runs cleanly once vc_redist.x64.exe is installed.
+
+name: winget-vcredist-demo
+
+on:
+  push:
+    branches: [winget-vcredist-demo]
+  workflow_dispatch:
+
+env:
+  ZIP_URL: https://github.com/Abdk4Moura/filament/releases/download/cli-v0.1.0/filament-x86_64-pc-windows-msvc.zip
+  DLL_NOT_FOUND: "-1073741515" # 0xC0000135 STATUS_DLL_NOT_FOUND
+
+jobs:
+  inspect:
+    name: Prove binary imports VCRUNTIME140.dll
+    runs-on: windows-latest
+    steps:
+      - name: Download & extract the released 0.1.0 zip
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:ZIP_URL -OutFile filament.zip
+          Expand-Archive -Path filament.zip -DestinationPath bin -Force
+          Get-ChildItem bin
+      - name: Set up MSVC dev tools (dumpbin)
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: dumpbin /dependents filament.exe
+        shell: pwsh
+        run: |
+          $out = & dumpbin /dependents bin\filament.exe | Out-String
+          Write-Host $out
+          if ($out -match 'VCRUNTIME140') {
+            Write-Host "::notice::CONFIRMED - filament.exe dynamically imports the VC++ runtime (VCRUNTIME140*.dll)."
+          } else {
+            Write-Host "::error::Did not find VCRUNTIME140 in the import table."
+            exit 1
+          }
+
+  clean-room:
+    name: Reproduce failure & prove VCRedist fixes it
+    runs-on: windows-2022
+    container:
+      image: mcr.microsoft.com/windows/servercore:ltsc2022
+    steps:
+      - name: Download & extract the released 0.1.0 zip
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri $env:ZIP_URL -OutFile filament.zip
+          Expand-Archive -Path filament.zip -DestinationPath bin -Force
+          Get-ChildItem bin
+
+      - name: Run filament.exe on a clean machine (expect it to FAIL)
+        shell: powershell
+        run: |
+          Write-Host "Server Core has no Visual C++ Redistributable installed."
+          & .\bin\filament.exe --version 2>&1 | Write-Host
+          $code = $LASTEXITCODE
+          Write-Host "exit code: $code"
+          if ("$code" -eq $env:DLL_NOT_FOUND) {
+            Write-Host "::notice::REPRODUCED - process aborted with STATUS_DLL_NOT_FOUND (0xC0000135): the missing VCRUNTIME140.dll, exactly what @Trenly saw."
+          } else {
+            Write-Host "::error::Expected $env:DLL_NOT_FOUND (missing-DLL), got $code."
+            exit 1
+          }
+
+      - name: Install Microsoft.VCRedist.2015+.x64
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile vc_redist.x64.exe
+          Write-Host "Installing vc_redist.x64.exe /quiet /norestart ..."
+          $p = Start-Process -FilePath .\vc_redist.x64.exe -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
+
+      - name: Run filament.exe again (expect SUCCESS)
+        shell: powershell
+        run: |
+          & .\bin\filament.exe --version 2>&1 | Write-Host
+          $code = $LASTEXITCODE
+          Write-Host "exit code: $code"
+          if ($code -eq 0) {
+            Write-Host "::notice::FIXED - with the VC++ Redistributable present, filament runs. Declaring Microsoft.VCRedist.2015+.x64 as a winget dependency resolves the install."
+          } else {
+            Write-Host "::error::filament.exe still failed after installing VCRedist (exit $code)."
+            exit 1
+          }
