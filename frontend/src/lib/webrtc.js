@@ -43,9 +43,8 @@ import {
   sendsToResume,
 } from '../net/protocol/transfer.js'
 export { decideAckFallback }
-// RESILIENCE layer: the idle-shell (PTY) consent-liveness detector + its short
-// recovery ladder. PeerLink owns the timer, the consent read, and the counters.
-import { ptyLivenessTick, nextPtyStage } from '../net/resilience/liveness.js'
+// RESILIENCE layer: the timer-owning idle-shell (PTY) liveness controller.
+import { LivenessController } from '../net/resilience/livenessController.js'
 // RESILIENCE layer: the timer-owning in-flight stall controller (state + ladder).
 import { StallController } from '../net/resilience/stallController.js'
 // RESILIENCE layer: the timer-owning delivery-ack fallback (no-ack window + peer-acks memory).
@@ -396,15 +395,14 @@ export class PeerLink {
     // the "this peer acks" memory).
     this._ack = new AckFallbackController(this, { fallbackMs: ACK_FALLBACK_MS, reprobeMs: ACK_REPROBE_MS })
 
-    // M1 (mobile): idle-interactive-link liveness. `_ptyLiveSignal` is the last
-    // ICE-consent liveness value we read from getStats (responsesReceived, or a
-    // packet/byte fallback); `_ptyDeadMs` accumulates the no-advance time. A dead
-    // idle shell trips once `_ptyDeadMs >= PTY_LIVENESS_WINDOW_MS`. `_ptyEpisode`
-    // latches an open recovery so we don't re-fire every tick mid-convergence.
-    this._ptyLiveSignal = null
-    this._ptyDeadMs = 0
-    this._ptyEpisode = null
-    this._testPtyFrozen = false // M1 test seam: set true by sendPtyInput under ?test=freezepty
+    // M1 (mobile): idle-interactive-link liveness lives in a timer-owning
+    // controller (consent read + dead clock + recovery ladder). PeerLink ticks it
+    // from the shared 2s interval below and resets it on channel-open / teardown.
+    this._liveness = new LivenessController(this, {
+      windowMs: PTY_LIVENESS_WINDOW_MS,
+      tickMs: STALL_TICK_MS,
+      freezePtyTest: TEST.freezePty,
+    })
 
     // P5 (GAP-6): the relay→direct upgrade prober (timer-owning controller).
     // Armed when the route becomes 'relayed' (_detectRoute), disarmed on
@@ -667,14 +665,11 @@ export class PeerLink {
       // black-hole the pc stays 'connected' and the channel 'open', so only this
       // detector runs. Reset the baseline so the first tick starts clean.
       this._stall.reset()
-      // M1: reset the idle-interactive liveness baseline too (it shares this tick).
-      this._ptyLiveSignal = null
-      this._ptyDeadMs = 0
-      this._ptyEpisode = null
+      this._liveness.reset() // M1: shares this tick; reset its baseline too
       clearInterval(this._stallTimer)
       this._stallTimer = setInterval(() => {
         this._stall.tick()
-        this._checkPtyLiveness() // M1: idle-shell black-hole detector
+        this._liveness.tick() // M1: idle-shell black-hole detector
       }, STALL_TICK_MS)
     }
     channel.onmessage = (e) => this._onMessage(e.data)
@@ -769,12 +764,12 @@ export class PeerLink {
     if (this._ptySid == null || this.channel?.readyState !== 'open') return
     // M1 test seam (?test=freezepty): once a PTY is open, black-hole the
     // interactive data path while leaving the channel 'open' and the pc
-    // 'connected', a faithful idle-shell NAT rebind. Marking `_testPtyFrozen`
-    // makes _checkPtyLiveness ignore real ICE-consent progress (the test peer is
-    // a local CLI whose path is genuinely alive), so the M1 detector fires as it
-    // would against a truly dead remote path. Inert in production.
+    // 'connected', a faithful idle-shell NAT rebind. Marking the liveness
+    // controller frozen makes it ignore real ICE-consent progress (the test peer
+    // is a local CLI whose path is genuinely alive), so the M1 detector fires as
+    // it would against a truly dead remote path. Inert in production.
     if (TEST.freezePty) {
-      this._testPtyFrozen = true
+      this._liveness.markFrozenForTest()
       return // drop input on the floor; nothing reaches the wire
     }
     this.channel.send(wireFrame(this._ptySid, u8))
@@ -1187,10 +1182,8 @@ export class PeerLink {
     this._stallTimer = null
     this._stall.clearState()
     // M1: the idle-interactive liveness watchdog rode the same timer; clear its
-    // latch too so a rebuilt link starts judging liveness fresh.
-    this._ptyEpisode = null
-    this._ptyDeadMs = 0
-    this._ptyLiveSignal = null
+    // latches too so a rebuilt link starts judging liveness fresh.
+    this._liveness.reset()
     this._upgrade.disarm() // P5: the upgrade prober dies with the link's transfers
     for (const t of this.transfers.values()) {
       if (t.status !== 'transferring' && t.status !== 'offered') continue
@@ -1230,133 +1223,12 @@ export class PeerLink {
   // it on open (this._stall.reset()) / teardown (this._stall.clearState()).
 
   // -------------------------------------------------- M1 idle-interactive liveness
-  // Read an ICE-CONSENT liveness value off the selected candidate pair. This
-  // counter advances ONLY while the remote answers the browser's STUN consent
-  // checks (~every 5s on a connected pair), so it keeps climbing on a healthy idle
-  // link (no false positive on an idle terminal) and freezes the instant the path
-  // is black-holed. Preference order: responsesReceived (the consent signal) >
-  // lastPacketReceivedTimestamp > bytesReceived (any inbound life). Returns a
-  // number that strictly increases while alive, or null when no pair / unsupported.
-  async _readConsentLiveness() {
-    if (this._closed) return null
-    try {
-      const stats = await this.pc.getStats()
-      let transportSelectedId = null
-      stats.forEach((r) => {
-        if (r.type === 'transport' && r.selectedCandidatePairId) transportSelectedId = r.selectedCandidatePairId
-      })
-      let pair = null
-      stats.forEach((r) => {
-        if (r.type !== 'candidate-pair') return
-        if (r.id === transportSelectedId || (!transportSelectedId && r.state === 'succeeded' && (r.nominated || r.selected)))
-          pair = r
-      })
-      if (!pair) return null
-      if (typeof pair.responsesReceived === 'number') return pair.responsesReceived
-      if (typeof pair.lastPacketReceivedTimestamp === 'number') return pair.lastPacketReceivedTimestamp
-      if (typeof pair.bytesReceived === 'number') return pair.bytesReceived
-      return null
-    } catch {
-      return null // getStats unsupported
-    }
-  }
-
-  // M1: detect a silently-dead INTERACTIVE link fast (the core mobile bug). Runs
-  // on the same 2s tick as _checkStall but is INDEPENDENT of any file transfer.
-  // Only active for a shell link (_ptySid != null) over an open+connected channel
-  // when NO file transfer is in flight (a transfer hands liveness to _checkStall,
-  // which owns the file-data ladder). If the consent-liveness signal has not
-  // advanced for PTY_LIVENESS_WINDOW_MS, the path is dead though the channel still
-  // claims open, trigger recovery via the SAME ladder P0 uses (no new ladder).
-  async _checkPtyLiveness() {
-    if (this._closed || this.channel?.readyState !== 'open') return
-    if (this._ptySid == null) { this._ptyLiveSignal = null; this._ptyDeadMs = 0; return }
-    if (this.pc.connectionState !== 'connected') { this._ptyDeadMs = 0; return }
-    // A file transfer in flight is _checkStall's job (it watches file bytes + the
-    // SCTP buffer). Don't double-detect, defer to it while a transfer moves.
-    const transferring = [...this.transfers.values()].some(
-      (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
-    )
-    if (transferring) { this._ptyDeadMs = 0; return }
-    // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
-    // is legitimately quiet, don't trip while they're away.
-    if ((this._awayUntil || 0) > Date.now()) { this._ptyDeadMs = 0; return }
-
-    const signal = await this._readConsentLiveness()
-    if (this._closed) return
-    // M1 test seam (?test=freezepty): the local CLI peer's path is genuinely
-    // alive, so consent KEEPS advancing even though we froze the app data path.
-    // Force the "no progress" branch so the detector fires as it would against a
-    // truly dead remote path. Inert in production (_testPtyFrozen stays false).
-    const frozenForTest = TEST.freezePty && this._testPtyFrozen
-    if (signal == null && !frozenForTest) { this._ptyDeadMs = 0; return } // can't read: don't guess
-
-    // The seed/advance/accumulate-dead/correct verdict lives in
-    // resilience/liveness.js (a pure reducer, mirrors stallTick); this method
-    // owns the timer, the consent read, and the counters.
-    const r = ptyLivenessTick(
-      { liveSignal: this._ptyLiveSignal, deadMs: this._ptyDeadMs, episode: this._ptyEpisode },
-      { signal, frozenForTest, windowMs: PTY_LIVENESS_WINDOW_MS, tickMs: STALL_TICK_MS, now: Date.now() },
-    )
-    this._ptyLiveSignal = r.state.liveSignal
-    this._ptyDeadMs = r.state.deadMs
-    this._ptyEpisode = r.state.episode
-    if (r.recovered) rlog.info('idle shell link recovered, consent advancing again', this.id.slice(-6))
-    if (r.action === 'correct') {
-      rlog.debug('idle shell link appears dead (consent not advancing)', this.id.slice(-6), 'deadMs', this._ptyDeadMs)
-      linkdiag.record('m1-dead', { deadMs: this._ptyDeadMs, route: this.route || null }, this._diagMeta())
-      this._correctPtyDead()
-    }
-  }
-
-  // M1 + M6: recover a dead idle interactive link. Reuse the EXISTING correction
-  // ladder rather than inventing a new one. Rung 1: impolite-only restartIce (the
-  // cheapest in-place repair, identical to _correctStall rung a, the data channel
-  // survives an ICE restart). Rung 2+: escalate straight to onStall (the P1 relay-
-  // preferred rebuild). M6: because this is a shell link (_ptySid != null), skip
-  // the slower middle rungs, an interactive link should reach the relay fast, so
-  // one in-place ICE try then relay. File transfers are untouched (they go through
-  // _correctStall's full 3-rung ladder, gated above on `transferring`).
-  _correctPtyDead() {
-    const now = Date.now()
-    // The stage to run NOW (ice → relay → exhausted) comes from
-    // resilience/liveness.js; this method runs each stage's mechanics.
-    const stage = nextPtyStage(this._ptyEpisode?.stage)
-    if (stage === 'ice') {
-      // Rung 1: in-place ICE repair (impolite + connected only, mirrors rung a).
-      if (this.pc.connectionState === 'connected' && !this.polite) {
-        try {
-          linkdiag.record('action', { what: 'restartIce', reason: 'm1-shell-rung-1' }, this._diagMeta())
-          this.pc.restartIce()
-          rlog.info('idle shell dead (rung 1): restartIce', this.id.slice(-6))
-        } catch {}
-      } else {
-        rlog.info('idle shell dead (rung 1): no restartIce (polite/not-connected), waiting one window', this.id.slice(-6))
-      }
-      this._ptyEpisode = { stage: 'ice', at: now }
-      return
-    }
-    // M6: still dead after the in-place ICE try, escalate FAST to the relay
-    // rebuild (skip the file-transfer ladder's intermediate rungs). The hook's
-    // onStall does the bounded relay-preferred rebuild; the PTY reattaches on the
-    // new link via the stable sessionId, so the terminal recovers on the relay.
-    if (stage === 'relay') {
-      rlog.info('idle shell still dead (rung 2): escalating to relay rebuild (onStall)', this.id.slice(-6))
-      linkdiag.record('action', { what: 'onStall', reason: 'm1-shell-rung-2', route: this.route || null }, this._diagMeta())
-      try {
-        this.onStall?.({ reason: 'persistent', route: this.route })
-      } catch (err) {
-        rlog.warn('onStall hook threw', this.id.slice(-6), err)
-      }
-      this._ptyEpisode = { stage: 'relay', at: now }
-      return
-    }
-    // Exhausted: the relay rebuild was requested and we're still here (the hook
-    // bounds relay escalation to at-most-once). Let the connection-state machine /
-    // M2 short shell grace carry it to a clean 'failed', the terminal reattaches
-    // on the next link. Re-latch so we keep deferring rather than thrashing.
-    this._ptyEpisode = { stage: 'relay', at: now }
-  }
+  // The idle-shell consent-liveness detector + its short recovery ladder live in
+  // resilience/LivenessController (consent read via getStats, dead clock,
+  // ice→relay ladder). PeerLink ticks it from the channel-open interval
+  // (this._liveness.tick(), alongside this._stall.tick()), resets it on open /
+  // teardown (this._liveness.reset()), and flags the ?test=freezepty seam via
+  // this._liveness.markFrozenForTest() from sendPtyInput.
 
   close() {
     linkdiag.record('action', { what: 'close', route: this.route || null }, this._diagMeta())
