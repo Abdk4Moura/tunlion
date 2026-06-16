@@ -4,6 +4,58 @@
 //! `main.rs`) own the I/O and call in here. Mirrors
 //! `frontend/src/net/protocol/transfer.js` (`decideAfterVerify`/`decideAckFallback`).
 
+use serde_json::{json, Value};
+
+// ---- control-message builders (the file-transfer wire vocabulary) -----------
+// The exact JSON control shapes, mirroring frontend/src/net/protocol/transfer.js.
+// Control messages are parsed by key (order-independent), so these stay
+// interop-safe with the JS peer. One definition per message instead of the inline
+// `json!` literals that were scattered through send_cmd/recv_cmd.
+
+/// A file offer. `head` (C7 resume digest) and `full` (P4 whole-file digest) are
+/// included when present; `resume` marks a re-offer after a prior accept.
+pub fn offer_msg(
+    id: &str,
+    sid: u32,
+    name: &str,
+    size: u64,
+    head: Option<&str>,
+    full: Option<&str>,
+    resume: bool,
+) -> Value {
+    let mut o = json!({
+        "type": "file-offer", "id": id, "sid": sid,
+        "name": name, "size": size, "mime": "application/octet-stream",
+    });
+    if let Some(h) = head {
+        o["head"] = json!(h);
+    }
+    if let Some(f) = full {
+        o["full"] = json!(f);
+    }
+    if resume {
+        o["resume"] = json!(true);
+    }
+    o
+}
+
+pub fn accept_msg(id: &str, offset: u64) -> Value {
+    json!({ "type": "file-accept", "id": id, "offset": offset })
+}
+
+pub fn decline_msg(id: &str) -> Value {
+    json!({ "type": "file-decline", "id": id })
+}
+
+pub fn end_msg(id: &str, sid: u32) -> Value {
+    json!({ "type": "file-end", "id": id, "sid": sid })
+}
+
+/// P4: sent ONLY after the whole file verified (sha256 matched).
+pub fn delivery_ack_msg(id: &str, sid: u32) -> Value {
+    json!({ "type": "delivery-ack", "id": id, "sid": sid, "v": 1 })
+}
+
 /// RECEIVER: may we drop a dead link instead of reconnecting? Pulled out so the
 /// gate-2 / gate-11c fence (a mid-transfer link must NEVER be dropped) is
 /// unit-testable without a live WebRTC peer. The recv loop computes
@@ -81,6 +133,29 @@ pub fn decide_verify(received: u64, size: u64, hash_matches: Option<bool>) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_msg_shapes() {
+        // Fresh offer (no digests, no resume).
+        assert_eq!(
+            offer_msg("id1", 7, "a.bin", 100, None, None, false),
+            json!({ "type": "file-offer", "id": "id1", "sid": 7, "name": "a.bin", "size": 100, "mime": "application/octet-stream" })
+        );
+        // With head + full digests and resume.
+        assert_eq!(
+            offer_msg("id1", 7, "a.bin", 100, Some("hh"), Some("ff"), true),
+            json!({ "type": "file-offer", "id": "id1", "sid": 7, "name": "a.bin", "size": 100, "mime": "application/octet-stream", "head": "hh", "full": "ff", "resume": true })
+        );
+    }
+
+    #[test]
+    fn accept_decline_end_ack_shapes() {
+        assert_eq!(accept_msg("id1", 0), json!({ "type": "file-accept", "id": "id1", "offset": 0 }));
+        assert_eq!(accept_msg("id1", 4096), json!({ "type": "file-accept", "id": "id1", "offset": 4096 }));
+        assert_eq!(decline_msg("id1"), json!({ "type": "file-decline", "id": "id1" }));
+        assert_eq!(end_msg("id1", 7), json!({ "type": "file-end", "id": "id1", "sid": 7 }));
+        assert_eq!(delivery_ack_msg("id1", 7), json!({ "type": "delivery-ack", "id": "id1", "sid": 7, "v": 1 }));
+    }
 
     #[test]
     fn recv_done_drops_only_when_complete() {
