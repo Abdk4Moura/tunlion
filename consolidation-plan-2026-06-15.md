@@ -198,11 +198,35 @@ characterization test and the existing gates, smallest verifiable slice first.
   - Verified: `stall.test.mjs` (new) PASS; vite build clean; wire/transfer/gate8
     PASS; LIVE browser↔CLI 2/2 (happy path intact). No behavior change (rung
     firing is byte-identical), so no lab run needed for THIS slice.
-  - DEFERRED (needs the freeze-shim browser gate / netns lab, per §6): the stall
-    DETECTION reducer (`_checkStall`'s idle/away/progress/accumulate/grace→correct
-    — safety-critical, gates against hangs/silent-loss) and the timer-owning
-    StallController. Those move real fault-handling behavior and must be verified
-    under injected stall before promoting.
+
+- **2026-06-16 (cont.) — stall DETECTOR reducer extracted (`stallTick`).**
+  - The safety-critical watchdog decision (`_checkStall`'s idle / away-grace /
+    progress / accumulate / episode-grace → correct) pulled into a PURE REDUCER
+    `stallTick(state, obs) → {state, action, recovered}`. PeerLink keeps the
+    STALL_TICK_MS timer + the mutable counters (idle/episode/lastMoved/
+    lastBuffered) and just applies the returned next-counters and runs the ladder
+    iff `action === 'correct'`. 1:1 extraction; every branch (incl. the
+    idle-clears-episode vs away-keeps-episode distinction and the buffer-drain
+    progress signal) preserved.
+  - **Verified under real fault (per §6):**
+    - `stall.test.mjs` extended — all 8 reducer branches pinned. PASS.
+    - **netns lab**: `two-nodes --link filament`, `fault stall` → 100% loss
+      (link up), `fault clear` → recovered 0% loss/1.6ms. Transport-resilience
+      contract holds.
+    - **browser freeze-shim** (`?test=freeze&log=debug`, console-captured): the
+      detector tripped at exactly `idleMs 6000`, fired rung a (correctly
+      polite-skipping restartIce), re-tripped at `14000` after the episode grace,
+      then climbed to rung b (`re-offered/resumed … count 1`) — the EXACT
+      original log strings, sequence, and thresholds. Proves the reducer is
+      behavior-faithful. (The frozen transfer doesn't reach `complete` on THIS
+      single host because the CLI's repair exhausts direct paths and falls to a
+      dark TURN relay — an environment limit that hits the pre-refactor code
+      identically, not a regression; the CLI fail-clean'd with the partial kept,
+      never silent loss.)
+    - LIVE happy-path browser↔CLI 2/2 (unchanged).
+  - DEFERRED still: the timer-owning StallController (moving the
+    setInterval+counters out of PeerLink), `upgrade.js`, `liveness.js`,
+    `ackfallback.js`.
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.

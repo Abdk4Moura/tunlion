@@ -43,9 +43,10 @@ import {
   sendsToResume,
 } from '../net/protocol/transfer.js'
 export { decideAckFallback }
-// RESILIENCE layer: the stall-correction ladder SHAPE (which rung to run next).
-// PeerLink owns the timers + episode state and runs each rung's mechanics.
-import { nextStallRung } from '../net/resilience/stall.js'
+// RESILIENCE layer: the stall DETECTOR (pure reducer) + the correction-ladder
+// SHAPE (which rung to run next). PeerLink owns the timer + counters/episode
+// state and runs each rung's mechanics.
+import { nextStallRung, stallTick } from '../net/resilience/stall.js'
 
 const rlog = log.scope('rtc')
 
@@ -1436,55 +1437,44 @@ export class PeerLink {
   _checkStall() {
     // A genuine drop is C4's job, this detector is for an OPEN-but-dark channel.
     if (this._closed || this.channel?.readyState !== 'open') return
-    // An idle link must never trip: nothing with bytes STILL TO MOVE -> reset the
-    // baseline. A transfer at progress 1 has handed every byte off and is in its
+    // An idle link must never trip: nothing with bytes STILL TO MOVE is stall-
+    // eligible. A transfer at progress 1 has handed every byte off and is in its
     // legitimate no-wire-bytes tail (SCTP drain + whole-file verify + delivery-ack,
-    // P4), counting it would false-trip on a clean transfer, so we require
-    // progress < 1 (an outstanding byte) to treat the link as stall-eligible.
+    // P4); counting it would false-trip on a clean transfer, so we require
+    // progress < 1 (an outstanding byte).
     const transferring = [...this.transfers.values()].some(
       (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
     )
-    if (!transferring) {
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = this.channel.bufferedAmount
-      this._stallIdleMs = 0
-      this._stallEpisode = null
-      return
+    // The detection DECISION lives in resilience/stall.js (a pure reducer); this
+    // method owns the timer + counters and runs the ladder on its verdict.
+    const r = stallTick(
+      {
+        idleMs: this._stallIdleMs,
+        episode: this._stallEpisode,
+        lastMoved: this._lastMovedSnapshot,
+        lastBuffered: this._lastBuffered,
+      },
+      {
+        transferring,
+        awayActive: (this._awayUntil || 0) > Date.now(),
+        bytesMoved: this._bytesMoved,
+        buffered: this.channel.bufferedAmount,
+        stallMs: STALL_MS,
+        tickMs: STALL_TICK_MS,
+        now: Date.now(),
+      },
+    )
+    this._stallIdleMs = r.state.idleMs
+    this._stallEpisode = r.state.episode
+    this._lastMovedSnapshot = r.state.lastMoved
+    this._lastBuffered = r.state.lastBuffered
+    // A moved byte clears any open episode (mirrors the Rust note_progress()): a
+    // future stall climbs the ladder fresh.
+    if (r.recovered) rlog.info('stall corrected, bytes moving again', this.id.slice(-6), 'rung', r.recovered)
+    if (r.action === 'correct') {
+      rlog.debug('stall detected', this.id.slice(-6), 'idleMs', this._stallIdleMs)
+      this._correctStall()
     }
-    // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
-    // gets its window, don't trip while they're legitimately away.
-    if ((this._awayUntil || 0) > Date.now()) {
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = this.channel.bufferedAmount
-      this._stallIdleMs = 0
-      return
-    }
-    // PROGRESS check. Either application-level bytes advanced, OR the SCTP send
-    // buffer drained (bytes left for the wire), the latter prevents a false
-    // positive on a slow-but-moving link whose chunks sit briefly buffered.
-    const buffered = this.channel.bufferedAmount
-    if (this._bytesMoved !== this._lastMovedSnapshot || buffered < this._lastBuffered) {
-      this._lastMovedSnapshot = this._bytesMoved
-      this._lastBuffered = buffered
-      this._stallIdleMs = 0
-      // A moved byte clears any open episode (the link recovered), mirrors the
-      // Rust note_progress(): a future stall may climb the ladder fresh.
-      if (this._stallEpisode) {
-        rlog.info('stall corrected, bytes moving again', this.id.slice(-6), 'rung', this._stallEpisode.rung)
-        this._stallEpisode = null
-      }
-      return
-    }
-    // No progress this tick, accumulate idle time.
-    this._lastBuffered = buffered
-    this._stallIdleMs += STALL_TICK_MS
-    if (this._stallIdleMs < STALL_MS) return
-    // The _stallEpisode latch gates re-entry: while a rung is mid-convergence
-    // (we gave it ~one STALL_MS grace) we wait rather than re-firing the ladder.
-    const now = Date.now()
-    if (this._stallEpisode && now - this._stallEpisode.at < STALL_MS) return
-    rlog.debug('stall detected', this.id.slice(-6), 'idleMs', this._stallIdleMs)
-    this._correctStall()
   }
 
   // Least-disruptive-first correction ladder (mirrors Rust correct_stall):
