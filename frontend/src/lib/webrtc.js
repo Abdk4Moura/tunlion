@@ -51,6 +51,8 @@ import { decideProbeResult, decideUpgradeVerifyTick, nextUpgradeDelay } from '..
 import { ptyLivenessTick, nextPtyStage } from '../net/resilience/liveness.js'
 // RESILIENCE layer: the timer-owning in-flight stall controller (state + ladder).
 import { StallController } from '../net/resilience/stallController.js'
+// RESILIENCE layer: the timer-owning delivery-ack fallback (no-ack window + peer-acks memory).
+import { AckFallbackController } from '../net/resilience/ackFallback.js'
 
 const rlog = log.scope('rtc')
 
@@ -391,6 +393,9 @@ export class PeerLink {
     // keeps the 2s interval below (it also ticks PTY liveness) and delegates.
     this._stall = new StallController(this, { stallMs: STALL_MS, tickMs: STALL_TICK_MS })
     this._stallTimer = null // the watchdog interval (armed on channel open)
+    // RESILIENCE: the P4 delivery-ack fallback (per-transfer no-ack windows +
+    // the "this peer acks" memory).
+    this._ack = new AckFallbackController(this, { fallbackMs: ACK_FALLBACK_MS, reprobeMs: ACK_REPROBE_MS })
 
     // M1 (mobile): idle-interactive-link liveness. `_ptyLiveSignal` is the last
     // ICE-consent liveness value we read from getStats (responsesReceived, or a
@@ -1066,15 +1071,12 @@ export class PeerLink {
         // an outgoing send truly done (vs the old fire-and-forget on file-end).
         const t = this.transfers.get(msg.id)
         if (!t || t.direction !== 'send') break
-        if (this._ackTimers?.has(msg.id)) {
-          clearTimeout(this._ackTimers.get(msg.id))
-          this._ackTimers.delete(msg.id)
-        }
+        this._ack.onAck(msg.id) // genuine ack → cancel the no-ack window
         if (t.status === 'complete') break // already accepted via a prior ack
         // This peer DOES delivery-ack. Remember it (this link + persisted per
         // peerUid) so a future ack-window NEVER falls back to a weak completion:
         // for an ack-capable peer the ack is mandatory.
-        this._markPeerAcks()
+        this._ack.markPeerAcks()
         this._outgoingFiles.delete(msg.id)
         this.stores.outgoing.delete(msg.id)
         this._update(t, { status: 'complete', progress: 1 })
@@ -1307,60 +1309,13 @@ export class PeerLink {
     // if still unacked we end HONESTLY (failed, resumable) rather than claiming a
     // false success. The never-hangs property is preserved: we always reach a
     // terminal state in bounded time, just an honest one.
-    this._armAckFallback(id, sid, false)
+    this._ack.arm(id, sid, false)
   }
 
-  // P4: arm (or re-arm, after a re-probe) the no-ack window for an outgoing send.
-  // `reprobed` is true on the second arming (after we re-sent END once).
-  _armAckFallback(id, sid, reprobed) {
-    this._ackTimers ||= new Map()
-    if (this._ackTimers.has(id)) clearTimeout(this._ackTimers.get(id))
-    const wait = reprobed ? ACK_REPROBE_MS : ACK_FALLBACK_MS
-    this._ackTimers.set(id, setTimeout(() => {
-      this._ackTimers.delete(id)
-      const cur = this.transfers.get(id)
-      if (!cur || cur.status === 'complete') return // the real ack landed meanwhile
-      const entry = this._outgoingFiles.get(id)
-      const decision = decideAckFallback({
-        channelOpen: this.channel?.readyState === 'open',
-        connected: this.pc?.connectionState === 'connected',
-        peerHasAcked: this._peerAcks(),
-        offeredDigest: !!entry?.offeredDigest,
-        reprobed,
-      })
-      if (decision.action === 'reprobe') {
-        // The ack may have been lost on a still-healthy link. Re-send END once to
-        // prompt the receiver to re-ack, then wait one more (shorter) window.
-        rlog.debug('no delivery-ack yet, re-probing (re-sending END)', id)
-        this._control(endMsg(id, sid))
-        this._armAckFallback(id, sid, true)
-        return
-      }
-      // No ack after the re-probe (or the link is unhealthy). Do NOT complete.
-      // Keep the file in the outgoing store so it can resume, and end honestly.
-      rlog.warn('no delivery-ack: send NOT confirmed, ending as unconfirmed (resumable)', id)
-      const resumable = decision.resumable && this.stores.outgoing.has(id)
-      this._outgoingFiles.delete(id)
-      this._update(cur, { status: resumable ? 'paused' : 'failed', reason: 'delivery not confirmed' })
-    }, wait))
-  }
-
-  // P4: persist + cache "this peer delivery-acks" so a known-ack peer never gets a
-  // weak completion, the ack is mandatory for it. Keyed by peerUid (stable across
-  // links); falls back to a per-instance flag when there's no uid.
-  _markPeerAcks() {
-    this._peerAckedThisLink = true
-    try {
-      if (this.peerUid) localStorage.setItem('filamentPeerAcks:' + this.peerUid, '1')
-    } catch {}
-  }
-  _peerAcks() {
-    if (this._peerAckedThisLink) return true
-    try {
-      if (this.peerUid) return localStorage.getItem('filamentPeerAcks:' + this.peerUid) === '1'
-    } catch {}
-    return false
-  }
+  // P4: the no-ack window (arm/re-probe/fail) + the "peer acks" memory live in
+  // resilience/AckFallbackController; PeerLink arms it after END+drain (above),
+  // cancels it on a genuine delivery-ack (this._ack.onAck), and clears it on
+  // teardown (this._ack.clear).
 
   // ------------------------------------------------------------------ helpers
   _control(obj) {
@@ -1407,10 +1362,7 @@ export class PeerLink {
     this._outgoingFiles.clear() // per-link send state; the Files survive in stores
     // P4: drop pending ack-fallback timers, the send is no longer 'complete' on
     // this link (it becomes 'paused' above and re-offers on the next link).
-    if (this._ackTimers) {
-      for (const tm of this._ackTimers.values()) clearTimeout(tm)
-      this._ackTimers.clear()
-    }
+    this._ack.clear()
     const waiters = this._drainWaiters
     this._drainWaiters = []
     waiters.forEach((r) => r()) // unblock parked sender loops so they exit
