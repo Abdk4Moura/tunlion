@@ -434,10 +434,19 @@ session/codeentry/ui/sshkeys).
     the full control-message vocabulary. Rust **resilience** module holds the
     stall-ladder decision. Both mirror their JS counterparts, all unit-tested,
     lab- + live-verified.
-  - Next (larger, deferred): pull the remaining send_cmd/recv_cmd loop scaffolding
-    (the chunk pump, the by_sid receive assembly) toward the protocol module, more
-    resilience (upgrade probe, C4 grace), and splitting the `Conn` god-struct so
-    signaling/protocol/resilience state aren't one bag.
+- **2026-06-16 — `Conn` god-struct split: `ResilienceState` sub-struct.**
+  - Grouped the six resilience fields (`stall_repairs`, `relay_committed`,
+    `warm_standby`, `warm_cutover`, `upgrade_probe`, `iface_snapshot`) out of the
+    ~30-field `Conn` bag into a named `ResilienceState`, accessed via `self.resil.…`
+    (38 access sites renamed; both constructors — the `up` daemon literal and
+    `for_command` — updated). Conn now carries `resil: ResilienceState`. Pure
+    structural grouping, no behavior change; the stall/relay/upgrade bookkeeping is
+    one cohesive unit instead of mixed into signaling/protocol state.
+  - Verified: `cargo test --release` 76/76; build clean; **netns lab** stall→recover
+    (0% → fault stall 100% → clear → 0%/1.46ms); LIVE browser↔CLI 2/2.
+  - Next (larger, deferred): the remaining send_cmd/recv_cmd loop scaffolding (the
+    chunk pump, the by_sid receive assembly), more resilience (upgrade probe / C4
+    grace mechanics), and further Conn grouping (signaling vs protocol state).
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.

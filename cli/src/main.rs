@@ -1310,15 +1310,14 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         deferred_left: HashMap::new(),
         recv_done: false,
     direct_pending: HashMap::new(),
-    stall_repairs: HashMap::new(),
-    relay_committed: std::collections::HashSet::new(),
-    // P3 (GAP-3): warm redundancy is selective, OFF for one-shot / non-session
-    // flows; the long-lived `up` acceptor turns it ON below. The override knob
-    // (`FILAMENT_WARM_STANDBY`) can force it either way.
-    warm_standby: net::warm_standby_override().unwrap_or(false),
-    warm_cutover: std::collections::HashSet::new(),
-    upgrade_probe: HashMap::new(),
-    iface_snapshot: Vec::new(),
+    resil: ResilienceState {
+        stall_repairs: HashMap::new(),
+        relay_committed: std::collections::HashSet::new(),
+        warm_standby: net::warm_standby_override().unwrap_or(false),
+        warm_cutover: std::collections::HashSet::new(),
+        upgrade_probe: HashMap::new(),
+        iface_snapshot: Vec::new(),
+    },
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1953,6 +1952,59 @@ fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
 /// target; RECV accepts from any link, gated per-link by consent/trust.
 const MAX_LINKS: usize = 16;
 
+/// RESILIENCE state, split out of the `Conn` god-struct so the stall/relay/
+/// warm-standby/upgrade-probe bookkeeping is one named bag, not mixed in with
+/// signaling + protocol state. The pure decisions live in `resilience.rs`.
+#[derive(Default)]
+struct ResilienceState {
+    /// P0 (GAP-1): per-peer stall-repair bookkeeping for the bytes-moved
+    /// watchdog. Tracks how many correction-ladder repairs we've already run for
+    /// the current stall episode (bounded by MAX_ATTEMPTS) and whether a repair
+    /// is in flight, so a single stall can't re-fire the ladder every tick while
+    /// a repair is converging. Reset once the link starts flowing again.
+    stall_repairs: HashMap<String, StallState>,
+    /// P1 (GAP-4): peers this session has COMMITTED to the relay route after the
+    /// direct ladder exhausted (rung d). Once a pid is in here, we stop dialing /
+    /// answering direct-QUIC for it (the direct path is what just failed and would
+    /// only re-freeze, racing the relay link); all (re)establishment for it goes
+    /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
+    /// Link), so a re-establish never bounces back to the known-bad direct path.
+    relay_committed: std::collections::HashSet<String>,
+    /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
+    /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
+    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel),
+    /// the sessions §2.4 says a mid-session drop is intolerable for. When set,
+    /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
+    /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
+    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, so the
+    /// failover is near-instant rather than a perceptible gap. FALSE for one-shot
+    /// file `send` (the 90% case): the on-disk partial + C7 resume make the cold
+    /// repair ladder correct and bounded, and a warm standby isn't worth a second
+    /// socket / NAT mapping / keepalive for a single transfer (the honest cost
+    /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
+    /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
+    warm_standby: bool,
+    /// P3: per-peer warm-standby bookkeeping, peers whose relay standby has
+    /// already been cut over to in the current stall episode, so a flapping relay
+    /// path can't re-fire the instant cutover every tick (it falls through to the
+    /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
+    /// `note_progress` once bytes move again.
+    warm_cutover: std::collections::HashSet<String>,
+    /// P5 (GAP-6): per-peer relay->direct UPGRADE-PROBE bookkeeping. Present only
+    /// for peers currently committed to relay (`relay_committed`) on a session
+    /// where the prober is eligible (warm_standby/daemon, relay permitted). Drives
+    /// the backoff schedule (probe soon, then steady cadence) and the
+    /// verify-before-upgrade window for a connected direct standby. Removed on a
+    /// successful upgrade (cutover) or when the peer leaves.
+    upgrade_probe: HashMap<String, UpgradeProbe>,
+    /// P5: a snapshot of the local interface set (sorted IP strings) at the last
+    /// probe schedule. A change (new/removed interface, wifi<->cellular,
+    /// default-route move surfacing a new local IP) is the "walked home onto wifi"
+    /// signal, we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
+    /// netlink dependency); the portable best-effort trigger the plan asks for.
+    iface_snapshot: Vec<String>,
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -2007,52 +2059,8 @@ struct Conn {
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
     direct_pending: HashMap<String, DirectPending>,
-    /// P0 (GAP-1): per-peer stall-repair bookkeeping for the bytes-moved
-    /// watchdog. Tracks how many correction-ladder repairs we've already run for
-    /// the current stall episode (bounded by MAX_ATTEMPTS) and whether a repair
-    /// is in flight, so a single stall can't re-fire the ladder every tick while
-    /// a repair is converging. Reset once the link starts flowing again.
-    stall_repairs: HashMap<String, StallState>,
-    /// P1 (GAP-4): peers this session has COMMITTED to the relay route after the
-    /// direct ladder exhausted (rung d). Once a pid is in here, we stop dialing /
-    /// answering direct-QUIC for it (the direct path is what just failed and would
-    /// only re-freeze, racing the relay link); all (re)establishment for it goes
-    /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
-    /// Link), so a re-establish never bounces back to the known-bad direct path.
-    relay_committed: std::collections::HashSet<String>,
-    /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
-    /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
-    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel),
-    /// the sessions §2.4 says a mid-session drop is intolerable for. When set,
-    /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
-    /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
-    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, so the
-    /// failover is near-instant rather than a perceptible gap. FALSE for one-shot
-    /// file `send` (the 90% case): the on-disk partial + C7 resume make the cold
-    /// repair ladder correct and bounded, and a warm standby isn't worth a second
-    /// socket / NAT mapping / keepalive for a single transfer (the honest cost
-    /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
-    /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
-    warm_standby: bool,
-    /// P3: per-peer warm-standby bookkeeping, peers whose relay standby has
-    /// already been cut over to in the current stall episode, so a flapping relay
-    /// path can't re-fire the instant cutover every tick (it falls through to the
-    /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
-    /// `note_progress` once bytes move again.
-    warm_cutover: std::collections::HashSet<String>,
-    /// P5 (GAP-6): per-peer relay->direct UPGRADE-PROBE bookkeeping. Present only
-    /// for peers currently committed to relay (`relay_committed`) on a session
-    /// where the prober is eligible (warm_standby/daemon, relay permitted). Drives
-    /// the backoff schedule (probe soon, then steady cadence) and the
-    /// verify-before-upgrade window for a connected direct standby. Removed on a
-    /// successful upgrade (cutover) or when the peer leaves.
-    upgrade_probe: HashMap<String, UpgradeProbe>,
-    /// P5: a snapshot of the local interface set (sorted IP strings) at the last
-    /// probe schedule. A change (new/removed interface, wifi<->cellular,
-    /// default-route move surfacing a new local IP) is the "walked home onto wifi"
-    /// signal, we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
-    /// netlink dependency); the portable best-effort trigger the plan asks for.
-    iface_snapshot: Vec<String>,
+    /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
+    resil: ResilienceState,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -2197,14 +2205,14 @@ impl Conn {
             deferred_left: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
-            stall_repairs: HashMap::new(),
-            relay_committed: std::collections::HashSet::new(),
-            // P3 (GAP-3): warm redundancy is selective; the caller passes the
-            // per-session default and the override knob can still force either way.
-            warm_standby: net::warm_standby_override().unwrap_or(warm_standby_default),
-            warm_cutover: std::collections::HashSet::new(),
-            upgrade_probe: HashMap::new(),
-            iface_snapshot: Vec::new(),
+            resil: ResilienceState {
+                stall_repairs: HashMap::new(),
+                relay_committed: std::collections::HashSet::new(),
+                warm_standby: net::warm_standby_override().unwrap_or(warm_standby_default),
+                warm_cutover: std::collections::HashSet::new(),
+                upgrade_probe: HashMap::new(),
+                iface_snapshot: Vec::new(),
+            },
         }
     }
 
@@ -2392,7 +2400,7 @@ impl Conn {
         // the relay link got "stuck while connecting". A genuinely failed link is
         // removed by the normal drop path (on_pc_state/GraceExpired) FIRST, so when
         // no link is present here we DO proceed to (re)build the relay link.
-        if self.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
+        if self.resil.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
             return Ok(());
         }
         self.drop_link(&peer_id); // re-establish replaces any same-sid link
@@ -2492,7 +2500,7 @@ impl Conn {
         if !direct::direct_enabled() {
             return;
         }
-        if !probe && self.relay_committed.contains(pid) {
+        if !probe && self.resil.relay_committed.contains(pid) {
             // P1: this peer escalated to relay, never re-dial direct (it would
             // only re-freeze and race the relay link). If a link already exists
             // (the relay link that escalate_to_relay built, possibly still
@@ -2701,7 +2709,7 @@ impl Conn {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
         }
-        if !self.relay_committed.contains(pid) || !self.links.contains_key(pid) {
+        if !self.resil.relay_committed.contains(pid) || !self.links.contains_key(pid) {
             return;
         }
         if self.direct_pending.contains_key(pid) {
@@ -2902,7 +2910,7 @@ impl Conn {
     /// idle_ms's baseline) never trips, the threshold is on time-since-last-byte,
     /// never on throughput.
     fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
-        let in_episode = self.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
+        let in_episode = self.resil.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
         // Transport recency is the ground truth for "are bytes moving NOW".
         let idle = self.links.get(pid).and_then(|l| l.transport.as_ref()).map(|t| t.idle_ms());
         let threshold = net::stall_ms();
@@ -2924,7 +2932,7 @@ impl Conn {
                 _ => {
                     // Idle-but-empty / still establishing / flowing, clear stray
                     // bookkeeping and do nothing.
-                    self.stall_repairs.remove(pid);
+                    self.resil.stall_repairs.remove(pid);
                     return None;
                 }
             }
@@ -2952,16 +2960,16 @@ impl Conn {
         if self.direct_pending.contains_key(pid) {
             return true;
         }
-        self.stall_repairs.get(pid).map(|s| s.relayed).unwrap_or(false)
+        self.resil.stall_repairs.get(pid).map(|s| s.relayed).unwrap_or(false)
     }
 
     /// Clear a peer's stall episode, called when bytes are observed moving
     /// again (the link recovered) or nothing is in flight.
     fn note_progress(&mut self, pid: &str) {
-        self.stall_repairs.remove(pid);
+        self.resil.stall_repairs.remove(pid);
         // P3: a fresh byte means the (warm-cut-over) path is healthy again, let a
         // FUTURE episode warm-cut-over once more if it too stalls.
-        self.warm_cutover.remove(pid);
+        self.resil.warm_cutover.remove(pid);
     }
 
     /// P0 liveness cross-check: is the link's CONTROL path still answering? A
@@ -3010,10 +3018,10 @@ impl Conn {
         // which is ONLY ever set on the warm path, so the COLD ladder (P0/P1) is
         // byte-for-byte unchanged and still climbs rung a→c→d normally. Cleared by
         // `note_progress` when the relay path moves a byte.
-        if self.warm_cutover.contains(pid) {
+        if self.resil.warm_cutover.contains(pid) {
             return Rung::Repaired;
         }
-        let st = self.stall_repairs.entry(pid.to_string()).or_default();
+        let st = self.resil.stall_repairs.entry(pid.to_string()).or_default();
         st.pending = true;
         let attempt = st.attempts;
         st.attempts += 1;
@@ -3042,10 +3050,10 @@ impl Conn {
         //   - we cut over at most ONCE per episode (`warm_cutover`), a flapping
         //     relay can't re-fire instant cutover every tick; the second stall on
         //     the relay path falls through to the bounded relay-stalled honesty.
-        let warm_eligible = self.warm_standby
+        let warm_eligible = self.resil.warm_standby
             && !relay_forbidden()
             && !self.relay_only
-            && !self.warm_cutover.contains(pid);
+            && !self.resil.warm_cutover.contains(pid);
         // The ladder DECISION (which rung) is pure and lives in resilience.rs; this
         // method owns the state mutation + the rung's side effect.
         match resilience::decide_stall_action(
@@ -3064,11 +3072,11 @@ impl Conn {
                     ui::Tone::Warn,
                     "  transfer stalled, cutting over to the warm relay standby (instant failover)",
                 ));
-                self.warm_cutover.insert(pid.to_string());
+                self.resil.warm_cutover.insert(pid.to_string());
                 // Latch the episode as relaying so detect_stall waits for the fresh
                 // relay path to move a byte (clearing the episode) instead of
                 // re-firing the ladder while the cutover converges.
-                if let Some(st) = self.stall_repairs.get_mut(pid) {
+                if let Some(st) = self.resil.stall_repairs.get_mut(pid) {
                     st.relayed = true;
                 }
                 self.escalate_to_relay(pid).await;
@@ -3111,7 +3119,7 @@ impl Conn {
                     ui::Tone::Warn,
                     "  direct paths exhausted, falling back to the TURN relay",
                 ));
-                if let Some(st) = self.stall_repairs.get_mut(pid) {
+                if let Some(st) = self.resil.stall_repairs.get_mut(pid) {
                     st.relayed = true;
                 }
                 self.escalate_to_relay(pid).await;
@@ -3193,7 +3201,7 @@ impl Conn {
         // Commit THIS peer to relay: stop dialing/answering direct-QUIC for it, so
         // the known-bad direct path can't keep winning the race and re-freezing
         // while the relay link tries to form (the exact thrash the sim exposed).
-        self.relay_committed.insert(pid.to_string());
+        self.resil.relay_committed.insert(pid.to_string());
         let Some(l) = self.links.get(pid) else { return };
         let info = l.info.clone();
         let known = l.expected_secret.clone();
@@ -3228,7 +3236,7 @@ impl Conn {
         // requires relay to be PERMITTED. The kill switch (`FILAMENT_UPGRADE_PROBE=0`)
         // and `--no-relay` both make this a no-op.
         if self.upgrade_eligible() {
-            self.upgrade_probe
+            self.resil.upgrade_probe
                 .entry(pid.to_string())
                 .or_insert_with(UpgradeProbe::armed);
             ui::say(&ui::paint(
@@ -3244,7 +3252,7 @@ impl Conn {
     /// interactive via `FILAMENT_WARM_STANDBY=1`). Gated off by the kill switch
     /// and by `--no-relay` (which never reaches relay anyway).
     fn upgrade_eligible(&self) -> bool {
-        self.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
+        self.resil.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
     }
 
     /// P5 (GAP-6): a portable network-change-ish event fired (a signaling
@@ -3255,7 +3263,7 @@ impl Conn {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
         }
-        for up in self.upgrade_probe.values_mut() {
+        for up in self.resil.upgrade_probe.values_mut() {
             if up.standby.is_none() {
                 up.next_at = Some(Instant::now());
             }
@@ -3266,7 +3274,7 @@ impl Conn {
     /// the steady cadence (exponential, capped at steady_ms). Also clears any
     /// stale standby/verify state so the next probe starts clean.
     fn mark_probe_failed(&mut self, pid: &str) {
-        let Some(up) = self.upgrade_probe.get_mut(pid) else { return };
+        let Some(up) = self.resil.upgrade_probe.get_mut(pid) else { return };
         up.attempt = up.attempt.saturating_add(1);
         up.standby = None;
         up.verify_started = None;
@@ -3290,7 +3298,7 @@ impl Conn {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
         }
-        if self.upgrade_probe.is_empty() {
+        if self.resil.upgrade_probe.is_empty() {
             return;
         }
         // Network-change trigger: a change to the local interface set is the
@@ -3298,35 +3306,35 @@ impl Conn {
         // platform netlink dependency. On change, reset every armed probe's
         // backoff to fire immediately (catches the wifi/cellular handoff instantly).
         let snap = direct::local_ip_snapshot();
-        if snap != self.iface_snapshot {
-            if !self.iface_snapshot.is_empty() {
+        if snap != self.resil.iface_snapshot {
+            if !self.resil.iface_snapshot.is_empty() {
                 // DEBUG, resilience internal (upgrade-probe trigger).
                 ui::debug(&ui::paint(
                     ui::Tone::Dim,
                     "  network changed, re-probing for a direct path now",
                 ));
-                for up in self.upgrade_probe.values_mut() {
+                for up in self.resil.upgrade_probe.values_mut() {
                     if up.standby.is_none() {
                         up.next_at = Some(Instant::now()); // fire ASAP
                     }
                 }
             }
-            self.iface_snapshot = snap;
+            self.resil.iface_snapshot = snap;
         }
 
         let now = Instant::now();
-        let pids: Vec<String> = self.upgrade_probe.keys().cloned().collect();
+        let pids: Vec<String> = self.resil.upgrade_probe.keys().cloned().collect();
         for pid in pids {
             // A peer that is no longer relay-committed (already upgraded or gone)
             // shouldn't be probed; drop its entry.
-            if !self.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
-                self.upgrade_probe.remove(&pid);
+            if !self.resil.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
+                self.resil.upgrade_probe.remove(&pid);
                 self.direct_pending.remove(&pid);
                 continue;
             }
             // VERIFYING: a standby connected, judge it before scheduling anything.
             let verifying = self
-                .upgrade_probe
+                .resil.upgrade_probe
                 .get(&pid)
                 .map(|u| u.standby.is_some())
                 .unwrap_or(false);
@@ -3340,11 +3348,11 @@ impl Conn {
                 continue;
             }
             // IDLE: schedule / fire the next probe per the backoff.
-            let due = match self.upgrade_probe.get(&pid).and_then(|u| u.next_at) {
+            let due = match self.resil.upgrade_probe.get(&pid).and_then(|u| u.next_at) {
                 None => true,            // armed but unscheduled → schedule first probe
                 Some(at) => now >= at,   // due
             };
-            if let Some(up) = self.upgrade_probe.get_mut(&pid) {
+            if let Some(up) = self.resil.upgrade_probe.get_mut(&pid) {
                 if up.next_at.is_none() {
                     // First scheduling after arming: probe after first_ms.
                     up.next_at = Some(now + Duration::from_millis(net::upgrade_first_ms()));
@@ -3359,7 +3367,7 @@ impl Conn {
             let Some((name, secret)) = known else {
                 // No stored secret to authenticate a direct dial, can't probe;
                 // disarm so we don't spin.
-                self.upgrade_probe.remove(&pid);
+                self.resil.upgrade_probe.remove(&pid);
                 continue;
             };
             // DEBUG, resilience internal (upgrade probe attempt).
@@ -3395,7 +3403,7 @@ impl Conn {
         // pass on a flaky standby (whose control path stays alive), so we MUST probe
         // the data path. The peer drops the unknown-sid chunk harmlessly but stamps
         // its inbound activity, so its side's idle drops too (symmetric verify).
-        let standby = self.upgrade_probe.get(pid).and_then(|u| u.standby.clone());
+        let standby = self.resil.upgrade_probe.get(pid).and_then(|u| u.standby.clone());
         let Some(standby) = standby else { return };
         // BOUND the heartbeat (F8: never block the event loop on something a remote
         // / a wedged path controls). A flaky standby's data path black-holes, the
@@ -3409,7 +3417,7 @@ impl Conn {
             Ok(Ok(()))
         );
         let idle = standby.idle_ms();
-        let Some(up) = self.upgrade_probe.get_mut(pid) else { return };
+        let Some(up) = self.resil.upgrade_probe.get_mut(pid) else { return };
         let started = match up.verify_started {
             Some(t) => t,
             None => {
@@ -3434,7 +3442,7 @@ impl Conn {
         // Sustained: moved data continuously for the whole verify window → upgrade.
         if started.elapsed() >= Duration::from_millis(verify_ms) {
             let t = standby;
-            let route = self.upgrade_probe.get(pid).map(|u| u.standby_route).unwrap_or("direct-quic");
+            let route = self.resil.upgrade_probe.get(pid).map(|u| u.standby_route).unwrap_or("direct-quic");
             self.perform_upgrade(pid, t, route).await;
         }
     }
@@ -3451,9 +3459,9 @@ impl Conn {
         let known = self.links.get(pid).and_then(|l| l.expected_secret.clone());
         // Clear the relay commitment FIRST so the new direct link isn't treated as
         // a known-bad path and so a future stall can escalate cleanly again.
-        self.relay_committed.remove(pid);
+        self.resil.relay_committed.remove(pid);
         self.relay_only = false;
-        self.upgrade_probe.remove(pid);
+        self.resil.upgrade_probe.remove(pid);
         self.direct_pending.remove(pid);
         // Swap the verified direct transport into the link, dropping the relay
         // link/transport (drop_link tears down the WebRTC peer). adopt the new
@@ -3529,7 +3537,7 @@ impl Conn {
         // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
         // out from under the verify (the race already won).
         self.direct_pending.remove(pid);
-        let Some(up) = self.upgrade_probe.get_mut(pid) else {
+        let Some(up) = self.resil.upgrade_probe.get_mut(pid) else {
             // No armed probe, the transport is unowned; dropping it tears it down.
             return;
         };
