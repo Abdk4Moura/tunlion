@@ -59,6 +59,12 @@ jobs:
         run: |
           export FILAMENT_BUILD_SHA="${GITHUB_SHA::7}"
           export FILAMENT_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          # Statically link the MSVC CRT so the Windows binary is self-contained
+          # and doesn't need the VC++ Redistributable (no VCRUNTIME140.dll at
+          # runtime), mirroring the fully-static musl Linux build.
+          if [[ "${{ matrix.target }}" == *windows-msvc* ]]; then
+            export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+          fi
           cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
       - name: Package (unix)
         if: runner.os != 'Windows'
