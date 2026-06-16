@@ -275,7 +275,18 @@ characterization test and the existing gates, smallest verifiable slice first.
     **browser `?test=freeze` console (2/2 clean runs)** showed the controller
     firing the ladder identically — stall detected at idleMs 6000 → rung a
     (ping-only when polite, ping+restartIce when impolite) → re-detect at 14000 →
-    rung b (re-offered/resumed count 1). Cross-machine pop-os check next.
+    rung b (re-offered/resumed count 1).
+  - **CROSS-MACHINE verified (pop-os over Tailscale)** — the real-network check.
+    do-vm browser → pop-os `filament recv`: 1MB and 8MB transfers complete
+    byte-exact (delivery-ack verified, route direct over Tailscale). Then a
+    genuine injected stall: SIGSTOP the pop-os receiver mid-transfer (open-but-
+    dark far end) → the do-vm StallController fired exactly as designed —
+    `stall detected idleMs 6000` → rung a (ping+restartIce, impolite) →
+    `idleMs 12000` → rung b (re-offered/resumed count 1); pop-os logged the
+    mirror inbound-stall repair. It fail-cleaned (partials kept) only because no
+    TURN is configured (relay fallback is dark) — orthogonal to the controller.
+    StallController is now verified four ways: unit, local freeze-shim, netns
+    lab, and cross-machine SIGSTOP.
 
 ### Next slices (Phase 1 continued)
 1. ~~`protocol/transfer.js`~~ — DONE.
