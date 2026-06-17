@@ -471,7 +471,7 @@ pub async fn fetch_auto_room(server: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no room in /api/room response"))
 }
 
-async fn http_get_json(url: &str) -> Result<Value> {
+pub(crate) async fn http_get_json(url: &str) -> Result<Value> {
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
     // 3 quick attempts: establish() refetches config per connection attempt
     // (C5), and one blip of the API mustn't kill a transfer in progress.
