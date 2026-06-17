@@ -5728,9 +5728,10 @@ async fn recv_cmd(
             match &ev {
                 Some(Ev::SignalingDown(_)) => saw_down = true,
                 Some(
-                    Ev::Welcome(_) | Ev::Synced(_) | Ev::PeerJoined(_) | Ev::PeerLeft(_)
-                    | Ev::Signal(_) | Ev::KnownPeer(_) | Ev::KnownPeerLeft(_) | Ev::PairMatched(_)
-                    | Ev::PairOk(_) | Ev::PairCode(_) | Ev::PairUsed(_) | Ev::PairError(_),
+                    Ev::Welcome(_) | Ev::Synced(_) | Ev::SignalingAlive | Ev::PeerJoined(_)
+                    | Ev::PeerLeft(_) | Ev::Signal(_) | Ev::KnownPeer(_) | Ev::KnownPeerLeft(_)
+                    | Ev::PairMatched(_) | Ev::PairOk(_) | Ev::PairCode(_) | Ev::PairUsed(_)
+                    | Ev::PairError(_),
                 ) => {
                     last_signaling = Instant::now();
                     signaling_down_since = None;
@@ -5756,11 +5757,17 @@ async fn recv_cmd(
                     ui::debug(&ui::paint(ui::Tone::Warn, "  signaling link closed, reconnecting"));
                 } else if silent_ms >= silence {
                     if !probed_silence {
-                        // Heartbeat probe: force a sync NOW (bypassing the C30
-                        // cadence). A live socket answers; a dead one won't.
+                        // Heartbeat probe: an ACK'd `sync` round-trip, the only
+                        // liveness signal that works for a room-less idle
+                        // acceptor. `sess.tick()` can't serve here: it returns
+                        // early when there is no room (the `up` case) AND when
+                        // the session is already confirmed-fresh, so on a quiet
+                        // link it emitted nothing and the watchdog falsely
+                        // reconnected every ~30 s, churning presence. The server
+                        // acks `sync` unconditionally; the ack wakes the loop as
+                        // Ev::SignalingAlive, which resets the gap below.
                         probed_silence = true;
-                        sess.touch();
-                        sess.tick(&sio).await;
+                        net::heartbeat(&sio, sess.sync_payload(), tx.clone()).await;
                     } else if silent_ms >= silence.saturating_mul(2) {
                         signaling_down_since = Some(Instant::now());
                         last_reconnect_try = Instant::now() - Duration::from_secs(60);
