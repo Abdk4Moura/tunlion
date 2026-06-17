@@ -874,19 +874,26 @@ async fn bring_up_to_known(
     // parallel race glares, proven, see multicandidate-attempt.patch), a
     // short per-candidate timer, and rotation through everything seen.
     let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
-    // Per-candidate establish budget for the INTERACTIVE L2/ssh path. Tightened
-    // from 7s to 4s so a WEDGED candidate (the "ssh stalls on first try, works
-    // after retries" failure) rotates and re-races fast, our target is Tailscale
-    // ssh's sub-5s connect. 4s is deliberately NOT sub-second: a legitimately
-    // slow-but-real ICE lands around 5s, and rotation here is round-robin (the
-    // same candidate is re-queued and the direct-QUIC race / relay re-dial cover
-    // it), so a slow real path is retried, never abandoned with no fallback.
-    // Overridable via FILAMENT_L2_CANDIDATE_SECS for field tuning.
+    // Per-candidate establish budget for the INTERACTIVE L2/ssh path: how long a
+    // single candidate gets to complete (WebRTC + direct-QUIC race) before it is
+    // declared Stuck and we rotate to the next. This is a TIMEOUT, not the
+    // connect time: a healthy candidate completes in 1.7-3.3s regardless, so a
+    // larger budget never slows a good path, it only stops abandoning a real one
+    // too early.
+    //
+    // It was briefly tightened to 4s chasing Tailscale's sub-5s connect, but 4s
+    // is BELOW the time a legitimately slow-but-real ICE needs (~5s, e.g. a
+    // cross-NAT path that nominates a srflx/relay pair): the budget fired before
+    // the real candidate finished, every rotation got cut at 4s, and the link
+    // never came up ("establishment timed out", reproduced live as a consistent
+    // pop-os -> do-vm failure that 7s/12s established cleanly). Back to 7s, which
+    // clears the real ICE time with margin; field-overridable via
+    // FILAMENT_L2_CANDIDATE_SECS.
     let candidate_secs: u64 = std::env::var("FILAMENT_L2_CANDIDATE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(4);
+        .unwrap_or(7);
     // Item 3: the L2 initiator races a DIRECT-QUIC dial against WebRTC. On
     // KnownPeer we bind a quinn endpoint + advertise our candidates (mirrors
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
