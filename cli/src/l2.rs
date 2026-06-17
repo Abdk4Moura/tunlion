@@ -1164,6 +1164,118 @@ async fn bring_up_to_known(
     Err(anyhow!("signaling ended before a data channel came up"))
 }
 
+// ------------------------------------------------------------- DOCTOR PROBE --
+//
+// `filament doctor <device>` drives this: an "establish then drop" probe that
+// runs the EXACT same bring-up as netcat (`bring_up_to_known` with role
+// "doctor"), opens one L2 stream so the L2Open round trip is exercised, then
+// IMMEDIATELY tears the link down. It never opens a shell or moves payload. The
+// point is to surface WHERE establishment is slow or stalls, using the same
+// `Attempt` instrumentation (phases + budgets) a real connect uses, so the
+// ladder a probe prints matches what a live ssh would have hit.
+
+/// The result of one `establish_probe`: the per-phase ladder (reused verbatim
+/// from the `Attempt`), the total span time, and the terminal verdict.
+pub struct ProbeOutcome {
+    /// Per-phase timings, in completion order (signaling, presence, ...). Each
+    /// carries its over-budget flag, computed by `diag::over_budget`.
+    pub timings: Vec<crate::diag::PhaseTiming>,
+    /// Total establish time, signaling start to link usable.
+    pub total_ms: u64,
+    /// True iff the link came up. On `false`, `failed_phase` says where it died.
+    pub established: bool,
+    /// On failure, the phase the bring-up was IN when it gave up.
+    pub failed_phase: Option<crate::diag::Phase>,
+    /// On failure, the error string.
+    pub error: Option<String>,
+}
+
+/// Establish a link to `peer` exactly as netcat would, then drop it. Returns the
+/// per-phase timings + verdict. Reuses `bring_up_to_known` (role "doctor"), so
+/// the phases/budgets are identical to a real connect, and cleans up BOTH the
+/// link (LinkGuard::close) and the mux (no leaked streams/pumps).
+pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<ProbeOutcome> {
+    // Overall safety bound so a wedged candidate cannot hang the probe forever
+    // (the per-candidate rotation already re-races inside bring_up_to_known; this
+    // is the outer wall). Generous: a slow-but-real ICE lands around 5s and we
+    // want to OBSERVE that, not abort it prematurely. Overridable for the field.
+    let probe_secs: u64 = std::env::var("FILAMENT_DOCTOR_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    let deadline = std::time::Duration::from_secs(probe_secs);
+
+    match tokio::time::timeout(deadline, bring_up_to_known(server, peer, relay, "doctor")).await {
+        Ok(Ok((t, rx, guard, mut diag))) => {
+            // The link is up (Ready recorded). Exercise the L2Open round trip the
+            // same way netcat does: pump inbound events, open one stream (sends
+            // l2-open), record `up`. We do NOT wait on payload; the open is the
+            // last establishment rung we care about.
+            let mux = Mux::new(t);
+            let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
+
+            diag.enter(crate::diag::Phase::L2Open);
+            // rport is irrelevant for the timing: the acceptor dials localhost:0
+            // and refuses, but the l2-open / l2-close round trip is what we time.
+            // Use a benign port and tear the stream down immediately afterwards.
+            let probe_rport: u16 = 9; // discard
+            let (sid, _rx_pipe) = open_stream(&mux, probe_rport).await?;
+            diag.up("tunnel", "datachannel-or-direct");
+
+            // Tear DOWN, no leak: drop the stream, tell the peer, stop the pump,
+            // and close the link (peer + signaling), so the acceptor reaps us.
+            mux.drop_stream(sid).await;
+            let _ = mux
+                .transport()
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            mux.shutdown_all().await;
+            pump.abort();
+            guard.close().await;
+
+            Ok(ProbeOutcome {
+                timings: diag.timings().to_vec(),
+                total_ms: diag.total_ms(),
+                established: true,
+                failed_phase: None,
+                error: None,
+            })
+        }
+        Ok(Err(e)) => {
+            // bring_up_to_known recorded `fail` on its (now-consumed) Attempt and
+            // wrote the partial ladder to the JSONL. Read it back so the verdict
+            // can name where it died, the SAME timings a live connect recorded.
+            let (timings, failed_phase) = match crate::diag::latest_span_ladder() {
+                Some((t, p)) => (t, Some(p)),
+                None => (Vec::new(), None),
+            };
+            Ok(ProbeOutcome {
+                timings,
+                total_ms: 0,
+                established: false,
+                failed_phase,
+                error: Some(e.to_string()),
+            })
+        }
+        Err(_elapsed) => {
+            // The outer wall fired: the bring-up is still running (the Attempt was
+            // never returned). Recover whatever ladder it logged so far.
+            let (timings, failed_phase) = match crate::diag::latest_span_ladder() {
+                Some((t, p)) => (t, Some(p)),
+                None => (Vec::new(), None),
+            };
+            Ok(ProbeOutcome {
+                timings,
+                total_ms: probe_secs * 1000,
+                established: false,
+                failed_phase,
+                error: Some(format!("establishment timed out after {probe_secs}s")),
+            })
+        }
+    }
+}
+
 /// Drive the initiator's inbound event pump: route L2 control/data into the mux
 /// and tear everything down on data-channel death. The initiator never accepts
 /// inbound opens (it allocates ids); an l2-open-ack unparks nothing today (no
