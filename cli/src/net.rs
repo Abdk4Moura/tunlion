@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client, ClientBuilder};
-use rust_socketio::{Event as SioEvent, Payload};
+use rust_socketio::{Event as SioEvent, Payload, TransportType};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -205,6 +205,13 @@ pub enum Ev {
     KnownPeerLeft(Value),
     /// C30: the server's session digest (mirror of the sync ack)
     Synced(Value),
+    /// The silence-watchdog heartbeat's ACK came back: the signaling socket is
+    /// alive even though no application event has flowed. A room-less idle
+    /// acceptor (`up`) gets no `synced` EVENT (the server emits that only for a
+    /// room) and this loop is events-only, so without an ack-driven liveness
+    /// signal the watchdog falsely declared a healthy idle link dead every ~30 s
+    /// and reconnected, churning presence for every known device.
+    SignalingAlive,
     /// (peer sid, ...), every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
@@ -536,7 +543,17 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
     // with the existing machinery rather than racing it. The triggers are the
     // close/error callbacks below (fast path) PLUS the silence watchdog in the
     // acceptor loop (the authoritative path, a hard TCP sever fires no callback).
+    // Connect over a RAW websocket, never long-polling. The default
+    // (TransportType::Any) handshakes on polling and only upgrades "if
+    // possible"; behind Cloudflare the upgrade leg 400s, so it gets STUCK on
+    // long-polling, where consecutive poll requests die and the server's 5 s
+    // engine.io pings never arrive. The client then sees 30 s of silence, the
+    // acceptor watchdog re-dials, and every reconnect re-announces presence to
+    // every known device, a churn storm that prevents any link (ssh included)
+    // from holding. A direct websocket (proven to traverse Cloudflare) carries
+    // the pings reliably and removes the silence/reconnect cycle entirely.
     let sio = ClientBuilder::new(server)
+        .transport_type(TransportType::Websocket)
         .reconnect(false)
         .on(SioEvent::Connect, |_p: Payload, _c: Client| async {}.boxed())
         .on(SioEvent::Close, down("close"))
@@ -567,6 +584,33 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
 /// caller owns the backoff (so it can also keep ticking the rest of the loop).
 pub async fn reconnect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
     connect_signaling(server, tx).await
+}
+
+/// Silence-watchdog heartbeat: an ACK'd `sync` round-trip that proves the
+/// signaling socket is alive WITHOUT depending on application traffic. The
+/// server acks `sync` unconditionally (even a room-less / channel-only `up`,
+/// whose ack is just `{ok:false}`), but it emits the `synced` EVENT only for a
+/// room, and this loop consumes events only. So we listen for the ACK and turn
+/// it into `Ev::SignalingAlive`. A live socket answers within the timeout and
+/// the loop's liveness gap resets; a dead one never fires the callback and the
+/// watchdog escalates to a reconnect. `emit_with_ack` only fails if the socket
+/// is already gone, which the close/error fast-path handles, so errors here are
+/// benign and swallowed.
+pub async fn heartbeat(sio: &Client, payload: Value, tx: mpsc::UnboundedSender<Ev>) {
+    let _ = sio
+        .emit_with_ack(
+            "sync",
+            payload,
+            std::time::Duration::from_secs(5),
+            move |_p: Payload, _c: Client| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Ev::SignalingAlive);
+                }
+                .boxed()
+            },
+        )
+        .await;
 }
 
 // --------------------------------------------------------------------- peer --
