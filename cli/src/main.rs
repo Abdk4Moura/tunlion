@@ -18,6 +18,7 @@
 mod codeentry;
 mod diag;
 mod direct;
+mod doctor;
 mod holepunch;
 mod l2;
 mod net;
@@ -485,6 +486,28 @@ enum Cmd {
         /// Extra args passed through to ssh (user@host, commands, -p, ...)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Diagnose connect health: where SSH/L2 establishment is slow or stalls.
+    ///
+    /// With a device: run an "establish then drop" probe (the same bring-up a
+    /// real connect does, torn down immediately) and print the per-phase ladder
+    /// + a verdict. `--repeat N` / `--watch` run it many times and show a
+    /// distribution (the tool for the intermittent "fails on the first try"
+    /// case). With NO device: an environment preflight (signaling reachability,
+    /// one STUN binding, local interfaces) plus a history digest of past
+    /// connects. `--json` emits machine-readable output for scripting.
+    Doctor {
+        /// Known device (petname) to probe; omit for environment preflight
+        device: Option<String>,
+        /// Repeat the probe until interrupted-ish (a bounded default count)
+        #[arg(long)]
+        watch: bool,
+        /// Run the probe N times and print a distribution summary
+        #[arg(long)]
+        repeat: Option<u32>,
+        /// Machine-readable JSON output (for scripting)
+        #[arg(long)]
+        json: bool,
     },
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
@@ -4014,6 +4037,9 @@ async fn main() -> Result<()> {
         Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, cli.relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay).await,
+        Cmd::Doctor { device, watch, repeat, json } => {
+            doctor::doctor_cmd(&server, device, watch, repeat, json, cli.relay).await
+        }
         Cmd::Grant { device, capability } => {
             device_set_cap(&device, &capability, true)?;
             println!(

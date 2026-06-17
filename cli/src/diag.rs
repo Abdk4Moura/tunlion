@@ -29,7 +29,7 @@ use std::time::Instant;
 
 /// The connect lifecycle, smallest set that makes a stall locatable. Ordered so
 /// `(p as u8)` doubles as a monotonic position for "how far did we get".
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Phase {
     /// socket connect + Ev::Welcome (the signaling socket is live).
     Signaling,
@@ -108,6 +108,29 @@ pub struct Attempt {
     start: Instant,
     phase: Phase,
     phase_at: Instant,
+    /// Per-phase durations recorded as each phase is LEFT (via `enter`/`up`), so
+    /// an in-process reader (the `doctor` probe) can read the same phase ladder
+    /// the JSONL records, WITHOUT re-parsing the file. `doctor` is the consumer;
+    /// the live connect paths simply never read it. Ordered by completion.
+    timings: Vec<PhaseTiming>,
+}
+
+/// One completed phase of a connect span: which phase, how long it took, and
+/// whether it crossed its soft budget. The unit the `doctor` phase ladder is
+/// rendered from (it mirrors the `phase`/`up` JSONL events exactly).
+#[derive(Clone, Copy, Debug)]
+pub struct PhaseTiming {
+    pub phase: Phase,
+    pub dur_ms: u64,
+    pub over_budget: bool,
+}
+
+impl Phase {
+    /// Public, stable label for a phase (the ladder column + the JSONL `phase`
+    /// field share this). Re-exposes the private `name` for `doctor`.
+    pub fn label(self) -> &'static str {
+        self.name()
+    }
 }
 
 impl Attempt {
@@ -123,6 +146,7 @@ impl Attempt {
             start: now,
             phase: Phase::Signaling,
             phase_at: now,
+            timings: Vec::new(),
         };
         a.emit("start", json!({ "phase": a.phase.name() }));
         a
@@ -135,13 +159,15 @@ impl Attempt {
         let now = Instant::now();
         let dur_ms = now.duration_since(self.phase_at).as_millis() as u64;
         let prev = self.phase;
+        let ob = over_budget(prev, dur_ms);
+        self.timings.push(PhaseTiming { phase: prev, dur_ms, over_budget: ob });
         self.emit(
             "phase",
             json!({
                 "phase": next.name(),
                 "prev": prev.name(),
                 "dur_ms": dur_ms,
-                "over_budget": over_budget(prev, dur_ms),
+                "over_budget": ob,
             }),
         );
         self.phase = next;
@@ -152,9 +178,17 @@ impl Attempt {
     /// span time and the route/transport labels (e.g. route "direct"/"relayed",
     /// transport "direct-quic"/"datachannel").
     pub fn up(&mut self, route: &str, transport: &str) {
+        let now = Instant::now();
+        // Record the duration of the phase we are leaving (typically L2Open) so
+        // the ladder has its final rung; Up itself is the steady state, no timing.
+        let dur_ms = now.duration_since(self.phase_at).as_millis() as u64;
+        let prev = self.phase;
+        if prev != Phase::Up {
+            self.timings.push(PhaseTiming { phase: prev, dur_ms, over_budget: over_budget(prev, dur_ms) });
+        }
         let total_ms = self.start.elapsed().as_millis() as u64;
         self.phase = Phase::Up;
-        self.phase_at = Instant::now();
+        self.phase_at = now;
         self.emit(
             "up",
             json!({
@@ -192,6 +226,19 @@ impl Attempt {
                 "elapsed_ms": elapsed_ms,
             }),
         );
+    }
+
+    /// The per-phase ladder recorded so far (one entry per phase LEFT, in order).
+    /// `doctor`'s probe reads this after the bring-up to render the phase ladder
+    /// from the SAME timings/budgets a live connect records.
+    pub fn timings(&self) -> &[PhaseTiming] {
+        &self.timings
+    }
+
+    /// Total elapsed time on this span (start to now). Used as the probe's
+    /// "healthy (total Xs)" figure.
+    pub fn total_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
     }
 
     /// Fan one event out to both sinks. Builds the common envelope once.
@@ -263,6 +310,209 @@ fn beacon(server: &str, body: Value) {
     });
 }
 
+// ---------------------------------------------------------------- history ----
+//
+// `summarize` turns the passive JSONL telemetry into an instant local report:
+// the last N connect spans, their median total time, the phase most often over
+// budget, and the stall rate. This is what `filament doctor` (no device) prints
+// under "history", the trail of what the live daemon's own connects looked like.
+
+/// A digest of the recent connect spans in the local JSONL. All counts are over
+/// the spans considered (`considered`), the most recent `limit` that reached a
+/// terminal `up`/`fail` (a span with only a `start` and no terminal event is an
+/// in-flight or crashed connect and is skipped).
+#[derive(Debug, Default, Clone)]
+pub struct Summary {
+    /// How many terminal spans were folded in (<= the requested limit).
+    pub considered: usize,
+    /// How many of those ended in `up` (success).
+    pub ups: usize,
+    /// How many ended in `fail`.
+    pub fails: usize,
+    /// Median total_ms across the spans that recorded a total (up or fail).
+    pub median_total_ms: Option<u64>,
+    /// The phase seen over budget most often, with that count. `None` when no
+    /// phase was ever over budget across the window.
+    pub worst_phase: Option<(Phase, usize)>,
+    /// How many spans recorded at least one `stall` event.
+    pub spans_with_stall: usize,
+}
+
+/// Parse a phase label back to a `Phase` (the inverse of `Phase::label`). Used by
+/// the history reader to fold JSONL `phase` fields into the worst-phase tally.
+fn phase_from_label(s: &str) -> Option<Phase> {
+    match s {
+        "signaling" => Some(Phase::Signaling),
+        "presence" => Some(Phase::Presence),
+        "establishing" => Some(Phase::Establishing),
+        "ready" => Some(Phase::Ready),
+        "l2open" => Some(Phase::L2Open),
+        "up" => Some(Phase::Up),
+        _ => None,
+    }
+}
+
+/// Read the local diag JSONL and digest the most recent `limit` terminal spans.
+/// Reads from `{FILAMENT_CONFIG_DIR else ~/.config/filament}/diag.jsonl`. A
+/// missing/empty file yields an all-zero `Summary` (a fresh install with no
+/// history, not an error).
+pub fn summarize(limit: usize) -> Summary {
+    let path = diag_path();
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    summarize_lines(&raw, limit)
+}
+
+/// The pure core of `summarize`: digest JSONL `text` (one event per line). Split
+/// out so it is unit-testable without touching the filesystem.
+pub fn summarize_lines(text: &str, limit: usize) -> Summary {
+    // Group events by span id, preserving the order each span first appears so
+    // "most recent" is by appearance in the file (the JSONL is append-ordered).
+    let mut order: Vec<String> = Vec::new();
+    let mut spans: std::collections::HashMap<String, SpanAcc> = std::collections::HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let id = match v["id"].as_str() {
+            Some(i) => i.to_string(),
+            None => continue,
+        };
+        let acc = spans.entry(id.clone()).or_insert_with(|| {
+            order.push(id.clone());
+            SpanAcc::default()
+        });
+        match v["ev"].as_str() {
+            Some("phase") => {
+                if v["over_budget"].as_bool().unwrap_or(false) {
+                    if let Some(p) = v["prev"].as_str().and_then(phase_from_label) {
+                        acc.over_budget_phases.push(p);
+                    }
+                }
+            }
+            Some("stall") => acc.had_stall = true,
+            Some("up") => {
+                acc.terminal = Some(Terminal::Up);
+                acc.total_ms = v["total_ms"].as_u64();
+            }
+            Some("fail") => {
+                acc.terminal = Some(Terminal::Fail);
+                acc.total_ms = v["total_ms"].as_u64();
+            }
+            _ => {}
+        }
+    }
+
+    // Keep only TERMINAL spans (reached up/fail), newest first, capped at `limit`.
+    let mut terminal: Vec<&SpanAcc> = order
+        .iter()
+        .rev()
+        .filter_map(|id| spans.get(id))
+        .filter(|s| s.terminal.is_some())
+        .take(limit)
+        .collect();
+    // `terminal` is newest-first; that ordering is all we need below.
+    let considered = terminal.len();
+    let ups = terminal.iter().filter(|s| matches!(s.terminal, Some(Terminal::Up))).count();
+    let fails = terminal.iter().filter(|s| matches!(s.terminal, Some(Terminal::Fail))).count();
+    let spans_with_stall = terminal.iter().filter(|s| s.had_stall).count();
+
+    let mut totals: Vec<u64> = terminal.iter().filter_map(|s| s.total_ms).collect();
+    totals.sort_unstable();
+    let median_total_ms = median(&totals);
+
+    // Tally which phase was over budget most often across the window.
+    let mut tally: std::collections::HashMap<Phase, usize> = std::collections::HashMap::new();
+    for s in terminal.iter_mut() {
+        for p in &s.over_budget_phases {
+            *tally.entry(*p).or_default() += 1;
+        }
+    }
+    let worst_phase = tally
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(p, c)| (p, c));
+
+    Summary { considered, ups, fails, median_total_ms, worst_phase, spans_with_stall }
+}
+
+/// Read back the MOST RECENT span's phase ladder + last phase from the JSONL.
+/// The `doctor` probe uses this on a FAILED/timed-out establish (where the
+/// `Attempt` was consumed by the erroring `bring_up_to_known`) to recover the
+/// partial ladder it managed to record, so the verdict can name where it died.
+/// Returns `(timings, last_phase)` for the latest span that has any events.
+pub fn latest_span_ladder() -> Option<(Vec<PhaseTiming>, Phase)> {
+    let raw = std::fs::read_to_string(diag_path()).ok()?;
+    latest_span_ladder_lines(&raw)
+}
+
+/// Pure core of `latest_span_ladder` (testable without the filesystem).
+pub fn latest_span_ladder_lines(text: &str) -> Option<(Vec<PhaseTiming>, Phase)> {
+    // Find the id of the LAST span to appear (the most recent connect).
+    let mut last_id: Option<String> = None;
+    for line in text.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+            if let Some(id) = v["id"].as_str() {
+                if last_id.as_deref() != Some(id) {
+                    last_id = Some(id.to_string());
+                }
+            }
+        }
+    }
+    let id = last_id?;
+    // Replay that span's phase events into a ladder + track the deepest phase.
+    let mut timings = Vec::new();
+    let mut last_phase = Phase::Signaling;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if v["id"].as_str() != Some(id.as_str()) {
+            continue;
+        }
+        match v["ev"].as_str() {
+            Some("phase") => {
+                if let Some(prev) = v["prev"].as_str().and_then(phase_from_label) {
+                    let dur_ms = v["dur_ms"].as_u64().unwrap_or(0);
+                    timings.push(PhaseTiming { phase: prev, dur_ms, over_budget: over_budget(prev, dur_ms) });
+                }
+                if let Some(p) = v["phase"].as_str().and_then(phase_from_label) {
+                    last_phase = p;
+                }
+            }
+            Some("fail") => {
+                if let Some(p) = v["last_phase"].as_str().and_then(phase_from_label) {
+                    last_phase = p;
+                }
+            }
+            Some("up") => last_phase = Phase::Up,
+            _ => {}
+        }
+    }
+    Some((timings, last_phase))
+}
+
+/// Median of a SORTED slice. Even-length takes the lower-middle (a stable,
+/// integer-only choice, no averaging that would invent a non-observed value).
+fn median(sorted: &[u64]) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    Some(sorted[(sorted.len() - 1) / 2])
+}
+
+#[derive(Default)]
+struct SpanAcc {
+    terminal: Option<Terminal>,
+    total_ms: Option<u64>,
+    over_budget_phases: Vec<Phase>,
+    had_stall: bool,
+}
+
+enum Terminal {
+    Up,
+    Fail,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +559,104 @@ mod tests {
         // intentionally tighter (it only flags, never aborts), but the establish
         // phase budget must stay in the few-seconds range, not sub-second.
         assert!(budget_ms(Phase::Establishing) >= 2000);
+    }
+
+    fn line(id: &str, ev: &str, extra: &str) -> String {
+        if extra.is_empty() {
+            format!(r#"{{"id":"{id}","ev":"{ev}"}}"#)
+        } else {
+            format!(r#"{{"id":"{id}","ev":"{ev}",{extra}}}"#)
+        }
+    }
+
+    #[test]
+    fn summarize_empty_is_all_zero() {
+        let s = summarize_lines("", 10);
+        assert_eq!(s.considered, 0);
+        assert_eq!(s.ups, 0);
+        assert_eq!(s.fails, 0);
+        assert!(s.median_total_ms.is_none());
+        assert!(s.worst_phase.is_none());
+        assert_eq!(s.spans_with_stall, 0);
+    }
+
+    #[test]
+    fn summarize_counts_ups_fails_and_median() {
+        // Three terminal spans: two up (1000ms, 3000ms), one fail (5000ms).
+        let mut text = String::new();
+        text += &line("a", "start", "");
+        text.push('\n');
+        text += &line("a", "up", r#""total_ms":1000"#);
+        text.push('\n');
+        text += &line("b", "up", r#""total_ms":3000"#);
+        text.push('\n');
+        text += &line("c", "fail", r#""total_ms":5000"#);
+        text.push('\n');
+        let s = summarize_lines(&text, 10);
+        assert_eq!(s.considered, 3);
+        assert_eq!(s.ups, 2);
+        assert_eq!(s.fails, 1);
+        // Sorted totals [1000,3000,5000] -> lower-middle median = 3000.
+        assert_eq!(s.median_total_ms, Some(3000));
+    }
+
+    #[test]
+    fn summarize_skips_in_flight_spans() {
+        // A span with only a `start` (no up/fail) is in-flight, not counted.
+        let text = format!("{}\n", line("x", "start", ""));
+        let s = summarize_lines(&text, 10);
+        assert_eq!(s.considered, 0);
+    }
+
+    #[test]
+    fn summarize_finds_worst_phase_and_stall_rate() {
+        // Two spans over budget on `establishing`, one on `presence`; one stall.
+        let mut text = String::new();
+        // span a: establishing over budget, has a stall, terminal up
+        text += &line("a", "phase", r#""prev":"establishing","over_budget":true"#);
+        text.push('\n');
+        text += &line("a", "stall", r#""phase":"establishing""#);
+        text.push('\n');
+        text += &line("a", "up", r#""total_ms":4000"#);
+        text.push('\n');
+        // span b: establishing over budget, terminal up
+        text += &line("b", "phase", r#""prev":"establishing","over_budget":true"#);
+        text.push('\n');
+        text += &line("b", "up", r#""total_ms":4200"#);
+        text.push('\n');
+        // span c: presence over budget, terminal fail
+        text += &line("c", "phase", r#""prev":"presence","over_budget":true"#);
+        text.push('\n');
+        text += &line("c", "fail", r#""total_ms":9000"#);
+        text.push('\n');
+        let s = summarize_lines(&text, 10);
+        assert_eq!(s.considered, 3);
+        assert_eq!(s.spans_with_stall, 1);
+        let (p, c) = s.worst_phase.expect("a worst phase");
+        assert_eq!(p, Phase::Establishing);
+        assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn summarize_limit_keeps_newest() {
+        // Four terminal spans; limit 2 keeps the LAST two by file order (c,d).
+        let mut text = String::new();
+        for (id, t) in [("a", 100u64), ("b", 200), ("c", 300), ("d", 400)] {
+            text += &line(id, "up", &format!(r#""total_ms":{t}"#));
+            text.push('\n');
+        }
+        let s = summarize_lines(&text, 2);
+        assert_eq!(s.considered, 2);
+        // Newest two totals are [300,400]; lower-middle median = 300.
+        assert_eq!(s.median_total_ms, Some(300));
+    }
+
+    #[test]
+    fn median_handles_odd_even_empty() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[5]), Some(5));
+        assert_eq!(median(&[1, 2, 3]), Some(2));
+        assert_eq!(median(&[1, 2, 3, 4]), Some(2)); // lower-middle
     }
 
     #[test]
