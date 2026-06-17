@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod codeentry;
+mod diag;
 mod direct;
 mod holepunch;
 mod l2;
