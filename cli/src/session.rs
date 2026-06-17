@@ -73,6 +73,21 @@ impl Session {
         }
     }
 
+    /// The full-desire `sync` payload. Shared by the cadence tick AND the
+    /// silence-watchdog heartbeat so the two stay byte-identical. `room` may be
+    /// None for a channel-only acceptor (`up`): the server answers that with an
+    /// `{ok:false}` ack (still proof the socket is alive), it just emits no
+    /// `synced` event.
+    pub fn sync_payload(&self) -> Value {
+        json!({
+            "v": 1,
+            "room": self.room,
+            "name": self.name,
+            "uid": self.uid,
+            "channels": self.channels,
+        })
+    }
+
     /// What we want the server to hold for us, as a comparable string.
     fn desired_digest(&self) -> String {
         let mut chans = self.channels.clone();
@@ -152,14 +167,8 @@ impl Session {
             return;
         }
         self.last_attempt = Some(now);
-        let payload = json!({
-            "v": 1,
-            "room": room,
-            "name": self.name,
-            "uid": self.uid,
-            "channels": self.channels,
-        });
-        self.emit(sio, "sync", payload).await;
+        let _ = room; // room presence is enforced by the early return above
+        self.emit(sio, "sync", self.sync_payload()).await;
     }
 }
 
