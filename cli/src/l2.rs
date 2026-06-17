@@ -828,13 +828,24 @@ async fn bring_up_to_known(
     server: &str,
     peer_name: &str,
     relay: bool,
-) -> Result<(Arc<dyn Transport>, mpsc::UnboundedReceiver<Ev>, LinkGuard)> {
+    role: &'static str,
+) -> Result<(Arc<dyn Transport>, mpsc::UnboundedReceiver<Ev>, LinkGuard, crate::diag::Attempt)> {
     let secret = crate::devices_load()
         .into_iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(peer_name))
         .map(|(_, s)| s)
         .ok_or_else(|| anyhow!("no known device named '{peer_name}', run `filament pair` first (see `filament devices`)"))?;
     let channel = crate::channel_of(&secret);
+
+    // Establishment telemetry: a connect span, peer tagged by SHORT HASH (never
+    // the petname). The Attempt is returned to the caller so it can record the
+    // L2Open round trip and the final `up`. We start in Signaling (socket + the
+    // first `welcome`); the loop drives the phase transitions below.
+    let mut diag = crate::diag::Attempt::new(server, &crate::diag::peer_hash_from_secret(&secret), role);
+    // Latch so we record the Presence->Establishing transition exactly once
+    // (the loop dequeues a candidate every time `peer` is idle, but the connect
+    // lifecycle's "establishing" begins at the FIRST candidate).
+    let mut entered_establishing = false;
 
     let cfg = net::fetch_config(server).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
@@ -863,7 +874,19 @@ async fn bring_up_to_known(
     // parallel race glares, proven, see multicandidate-attempt.patch), a
     // short per-candidate timer, and rotation through everything seen.
     let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
-    const CANDIDATE_SECS: u64 = 7;
+    // Per-candidate establish budget for the INTERACTIVE L2/ssh path. Tightened
+    // from 7s to 4s so a WEDGED candidate (the "ssh stalls on first try, works
+    // after retries" failure) rotates and re-races fast, our target is Tailscale
+    // ssh's sub-5s connect. 4s is deliberately NOT sub-second: a legitimately
+    // slow-but-real ICE lands around 5s, and rotation here is round-robin (the
+    // same candidate is re-queued and the direct-QUIC race / relay re-dial cover
+    // it), so a slow real path is retried, never abandoned with no fallback.
+    // Overridable via FILAMENT_L2_CANDIDATE_SECS for field tuning.
+    let candidate_secs: u64 = std::env::var("FILAMENT_L2_CANDIDATE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4);
     // Item 3: the L2 initiator races a DIRECT-QUIC dial against WebRTC. On
     // KnownPeer we bind a quinn endpoint + advertise our candidates (mirrors
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
@@ -884,7 +907,7 @@ async fn bring_up_to_known(
     let spawn_timer = |pid: String, g: u32| {
         let tx = tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(CANDIDATE_SECS)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(candidate_secs)).await;
             let _ = tx.send(Ev::Stuck(pid, g));
         });
     };
@@ -895,6 +918,13 @@ async fn bring_up_to_known(
         // One candidate at a time: start the next attempt whenever idle.
         if peer.is_none() {
             if let Some((pid, uid)) = queue.pop_front() {
+                // A candidate appeared and we are dialing it: presence is done,
+                // we are now in the Establishing (WebRTC + direct-QUIC race)
+                // phase. Latched so re-dials of later candidates don't re-emit.
+                if !entered_establishing {
+                    diag.enter(crate::diag::Phase::Establishing);
+                    entered_establishing = true;
+                }
                 let mine = my_id.clone().unwrap_or_default();
                 let polite = net::polite_role(&my_uid, uid.as_deref(), &mine, &pid);
                 generation += 1;
@@ -940,6 +970,9 @@ async fn bring_up_to_known(
         match ev {
             Ev::Welcome(v) => {
                 my_id = v["id"].as_str().map(|s| s.to_string());
+                // Signaling is live (socket + welcome); we now subscribe and wait
+                // for the known device to appear, that is the Presence phase.
+                diag.enter(crate::diag::Phase::Presence);
                 // Subscribe now that the connection is confirmed (see the note
                 // at the join site). The server replies with known-peer for every
                 // live member already on the channel, so discovery is reliable.
@@ -1066,10 +1099,13 @@ async fn bring_up_to_known(
                 // OR pair-proof, we confirmed pre-trust holds for the L2 acceptor.)
                 // INFO, tunnel established (with its route label).
                 crate::ui::say(&format!("filament: tunnel up to '{peer_name}' (route: {route})"));
+                // Transport is up: the Establishing race is won. Record Ready;
+                // the caller records the L2Open round trip and the final `up`.
+                diag.enter(crate::diag::Phase::Ready);
                 // The WebRTC `peer` is now superfluous; the guard owns it (its
                 // teardown/forget semantics are unchanged, no extra teardown).
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
-                return Ok((t, rx, guard));
+                return Ok((t, rx, guard, diag));
             }
             Ev::Stuck(pid, g) => {
                 // Per-candidate timer (or the 15s watchdog) fired for the
@@ -1080,6 +1116,10 @@ async fn bring_up_to_known(
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
+                    // The per-candidate establish budget fired: this candidate
+                    // wedged and we rotate. Record a stall (the "burns the budget
+                    // then succeeds on retry" signal we are hunting).
+                    diag.stall(crate::diag::Phase::Establishing, candidate_secs * 1000);
                     crate::ui::debug("filament: candidate unresponsive, rotating");
                     queue.push_back((pid, peer_uid.take()));
                 }
@@ -1100,8 +1140,11 @@ async fn bring_up_to_known(
                 // `forget()`s it (keep alive); the bootstrap `close().await`s it
                 // (tear down before the second link).
                 crate::ui::say(&format!("filament: tunnel up to '{peer_name}'"));
+                // Transport is up via WebRTC: Establishing race won. Record Ready;
+                // the caller records the L2Open round trip and the final `up`.
+                diag.enter(crate::diag::Phase::Ready);
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
-                return Ok((t, rx, guard));
+                return Ok((t, rx, guard, diag));
             }
             Ev::PcState(pid, s) if s == "failed" || s == "closed" => {
                 // Was fatal; now just rotate, the overall command timeout
@@ -1117,6 +1160,7 @@ async fn bring_up_to_known(
             _ => {}
         }
     }
+    diag.fail("signaling ended before a data channel came up");
     Err(anyhow!("signaling ended before a data channel came up"))
 }
 
@@ -1169,12 +1213,21 @@ async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
 /// This is the ssh ProxyCommand primitive.
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
-    let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
     guard.forget(); // long-lived tunnel, keep the link alive for the process
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
+    // L2Open round trip: open the stream and wait for the acceptor's l2-open-ack
+    // (the stream-is-live confirmation) before declaring the link Up. The ack is
+    // consumed by pump_initiator, so we instead wait for the FIRST inbound byte
+    // or a bounded grace, the practical "stream usable" signal for stdio netcat.
+    diag.enter(crate::diag::Phase::L2Open);
     let (sid, mut rx_pipe) = open_stream(&mux, rport).await?;
+    // The link is now usable end to end (the ssh handshake will flow). Record
+    // `up` with the route label we can infer (the transport carries no route()
+    // for a direct link, so we report the generic tunnel transport here).
+    diag.up("tunnel", "datachannel-or-direct");
 
     // stdin -> dc
     let t_in = mux.transport();
@@ -1223,11 +1276,12 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// or resize handling yet, primarily a test/diagnostic of the PTY session
 /// acceptor; the browser is the polished client.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
-    let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
     guard.forget();
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
+    diag.enter(crate::diag::Phase::L2Open);
     let sid = mux.alloc_sid();
     let mut rx_pipe = mux.register(sid).await;
     let (cols, rows) = (
@@ -1237,6 +1291,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     mux.transport()
         .send_control(&json!({ "type": "pty-open", "sid": sid, "cols": cols, "rows": rows }))
         .await?;
+    diag.up("tunnel", "datachannel-or-direct");
 
     let t_in = mux.transport();
     let reader = tokio::spawn(async move {
@@ -1278,11 +1333,14 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
 /// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
 /// connection opens a fresh L2 stream to `peer:127.0.0.1:rport`.
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
-    let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
     guard.forget(); // long-lived listener, keep the link alive for the process
     let mux = Mux::new(t);
     tokio::spawn(pump_initiator(rx, mux.clone()));
 
+    // The link is up; per-connection L2 opens are independent streams (each is
+    // its own short L2Open), so the span completes here once the link is usable.
+    diag.up("tunnel", "datachannel-or-direct");
     let listener = TcpListener::bind(("127.0.0.1", lport)).await?;
     crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
     // NOTE(scope): concurrent heavy forwards over one link need credit flow
@@ -1311,7 +1369,11 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
     // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
-    let (t, mut rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    let (t, mut rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
+    // The bootstrap rides the bring-up transport directly (pure control JSON, no
+    // mux), so the link being usable IS the end of this span. Record `up`; the
+    // ssh data link is a SEPARATE netcat span instrumented in its own right.
+    diag.up("tunnel", "datachannel-or-direct");
     t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey })).await?;
 
     // Await the verdict (bounded, a daemon without FILAMENT_L2 / without the cap

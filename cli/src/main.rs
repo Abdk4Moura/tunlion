@@ -6401,6 +6401,14 @@ async fn recv_cmd(
                 // link (placeholder for L1-a caps); localhost-only is enforced in
                 // accept_control. A non-trusted or non-loopback open is refused.
                 Some("l2-open") | Some("l2-close") if l2_enabled => {
+                    // TODO(diag acceptor): emit a diag::Attempt with role
+                    // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
+                    // because the acceptor has no per-connect span here: this fires
+                    // on an ALREADY-established shared link inside the big up/recv
+                    // loop (the link's bring-up lives in the file-transfer/recv
+                    // machinery upstream), so a clean span would mean threading an
+                    // Attempt through the whole loop. The initiator path (l2.rs) is
+                    // fully instrumented and is the side that exhibits the stall.
                     let Some(t) = conn.transport_of(&pid) else { continue };
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let mux = l2_muxes
