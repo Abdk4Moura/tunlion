@@ -5793,7 +5793,7 @@ async fn recv_cmd(
                         // acks `sync` unconditionally; the ack wakes the loop as
                         // Ev::SignalingAlive, which resets the gap below.
                         probed_silence = true;
-                        net::heartbeat(&sio, sess.sync_payload(), tx.clone()).await;
+                        net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
                     } else if silent_ms >= silence.saturating_mul(2) {
                         signaling_down_since = Some(Instant::now());
                         last_reconnect_try = Instant::now() - Duration::from_secs(60);

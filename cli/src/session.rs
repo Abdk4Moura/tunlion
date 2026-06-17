@@ -88,6 +88,18 @@ impl Session {
         })
     }
 
+    /// A liveness-only `sync` for the silence-watchdog heartbeat. `room` is
+    /// intentionally null so the server takes its no-op early-return path: it
+    /// still ACKs (proving the socket is alive, which is all the watchdog needs)
+    /// but does NOT run channel subscription, so it emits NO `known-peer`. A
+    /// full `sync_payload()` heartbeat would re-`_do_subscribe` every cycle and
+    /// re-emit `known-peer` to every channel peer, a ~15 s presence-churn storm
+    /// ("known device X appeared, connecting" on both ends). Channel/room state
+    /// is owned by the cadence `tick()`, not the heartbeat.
+    pub fn heartbeat_payload(&self) -> Value {
+        json!({ "v": 1, "room": Value::Null, "name": self.name, "uid": self.uid })
+    }
+
     /// What we want the server to hold for us, as a comparable string.
     fn desired_digest(&self) -> String {
         let mut chans = self.channels.clone();
