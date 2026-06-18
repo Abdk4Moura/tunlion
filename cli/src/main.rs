@@ -814,7 +814,39 @@ pub(crate) fn devices_load() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Strip terminal escape sequences and control characters from a device petname
+/// before it is stored. A name typed or pasted in a terminal can capture the
+/// terminal's own device-attributes reply (`ESC[?1;2c…`); that junk then never
+/// matches `--to <name>`, silently breaking targeting (observed live: a `send
+/// --to pixel` whose stored name was `…escapes…pixel` fell back to the local
+/// room and the Pixel never received). Keep only printable, non-control chars.
+fn sanitize_device_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC: drop a CSI escape (`ESC [ … final-letter`) wholesale.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue; // also drops a lone/other ESC
+        }
+        if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
 fn devices_store(name: &str, secret: &str) -> Result<()> {
+    let clean = sanitize_device_name(name);
+    let name = clean.as_str();
     let p = devices_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
@@ -849,6 +881,8 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
 /// working byte-for-byte, no regression.
 fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
+    let clean = sanitize_device_name(name);
+    let name = clean.as_str();
     let p = devices_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
@@ -7671,6 +7705,18 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_device_name_strips_escape_junk() {
+        // The exact corruption observed on the snapshot: a terminal
+        // device-attributes reply captured ahead of the real name.
+        let dirty = "\u{1b}[?1;2c\u{1b}[?1;2c\u{1b}[>0;276;0cpixel";
+        assert_eq!(sanitize_device_name(dirty), "pixel");
+        // Lone control chars dropped; surrounding whitespace trimmed.
+        assert_eq!(sanitize_device_name("  lap\u{7}top \n"), "laptop");
+        // A clean name is unchanged.
+        assert_eq!(sanitize_device_name("agboola@pop-os"), "agboola@pop-os");
+    }
 
     #[test]
     fn capability_deny_by_default() {
