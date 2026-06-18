@@ -1340,6 +1340,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         upgrade_probe: HashMap::new(),
         iface_snapshot: Vec::new(),
     },
+    direct_ok: direct::direct_enabled(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1620,6 +1621,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         relay,        // relay_only
         None,         // to_filter
         false,        // warm_standby default (pair is one-shot)
+        direct::direct_enabled(), // direct_ok: env gate only (no L2 acceptor here)
     );
     {
         let tx = tx.clone();
@@ -2092,6 +2094,17 @@ struct Conn {
     direct_pending: HashMap<String, DirectPending>,
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     resil: ResilienceState,
+    /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
+    /// just `direct::direct_enabled()` (the FILAMENT_DIRECT/FILAMENT_L2 env gate),
+    /// but the L2/ssh ACCEPTOR (`up --shell`) must ALSO take it even when those
+    /// env vars are unset, otherwise it silently drops the initiator's
+    /// `transport-offer` AND builds its own WebRTC peer dialing back, colliding
+    /// with the initiator's offer (GLARE) and stalling at "stuck while connecting".
+    /// Answering the direct dial instead is sequential, authenticated, and rides
+    /// the reachable host candidate (e.g. the Tailscale link), so it neither
+    /// glares nor depends on cross-NAT ICE. `start_direct_inner` gates on this
+    /// instead of the bare env check.
+    direct_ok: bool,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -2216,6 +2229,7 @@ impl Conn {
         relay_only: bool,
         to_filter: Option<String>,
         warm_standby_default: bool,
+        direct_ok: bool,
     ) -> Self {
         Conn {
             server: server.to_string(),
@@ -2242,6 +2256,7 @@ impl Conn {
                 upgrade_probe: HashMap::new(),
                 iface_snapshot: Vec::new(),
             },
+            direct_ok,
         }
     }
 
@@ -2526,7 +2541,12 @@ impl Conn {
     }
 
     async fn start_direct_inner(&mut self, pid: &str, name: &str, secret: &str, probe: bool) {
-        if !direct::direct_enabled() {
+        // Gate on the per-session flag, not the bare env check: the L2/ssh
+        // acceptor (`up --shell`) sets `direct_ok` true even with the env unset,
+        // so it answers the initiator's transport-offer (rung-1 direct-QUIC over
+        // the reachable host candidate) instead of building a colliding WebRTC
+        // peer that glares with the initiator's offer.
+        if !self.direct_ok {
             return;
         }
         if !probe && self.resil.relay_committed.contains(pid) {
@@ -4385,6 +4405,7 @@ async fn send_cmd(
         relay,        // relay_only
         to,           // to_filter
         false,        // warm_standby default (one-shot send)
+        direct::direct_enabled(), // direct_ok: env gate only (file transfer keeps WebRTC default)
     );
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -5504,6 +5525,12 @@ async fn recv_cmd(
         }
     }
 
+    // L2 acceptor posture (computed here so it also gates the direct-QUIC path).
+    // OFF unless FILAMENT_L2=1 (opt-in) OR an active `up --shell` policy turns it
+    // on (you can't ssh in without the acceptor). See its second use below.
+    let l2_enabled = shell_policy.enables_l2()
+        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
+
     let mut conn = Conn::for_command(
         server,
         sio.clone(),
@@ -5515,6 +5542,13 @@ async fn recv_cmd(
         // long-lived / interactive session, so warm redundancy defaults ON for it
         // (a one-shot `recv` keeps daemon=false -> OFF).
         daemon,       // warm_standby default
+        // rung-1 direct-QUIC: take it when the env gate is set OR when this is an
+        // L2/ssh acceptor. The acceptor MUST answer the initiator's
+        // transport-offer (direct-QUIC over the reachable host candidate, e.g.
+        // Tailscale) rather than build a colliding WebRTC peer (glare), the
+        // dominant `filament ssh` "stuck while connecting" failure once presence
+        // discovery is made reliable.
+        direct::direct_enabled() || l2_enabled,
     );
     {
         let tx = tx.clone();
@@ -5605,12 +5639,8 @@ async fn recv_cmd(
     // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
-    // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in) OR an active
-    // `up --shell` policy turns it on (you can't ssh in without the acceptor).
-    // The cap gate (shell-bootstrap) is enforced separately. Keyed by peer sid
-    // so multiple links stay isolated.
-    let l2_enabled = shell_policy.enables_l2()
-        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
+    // l2-open seen on that link. `l2_enabled` is computed once above (it also
+    // gates the direct-QUIC path); reused here for the mux/cap machinery.
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
