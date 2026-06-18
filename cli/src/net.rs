@@ -18,7 +18,10 @@ use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client, ClientBuilder};
 use rust_socketio::{Event as SioEvent, Payload, TransportType};
 use serde_json::{json, Value};
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -414,6 +417,198 @@ impl Transport for DataChannelTransport {
     }
 }
 
+// ----------------------------------------------------------- DNS happy-eyes --
+//
+// Why this exists: on some hosts (notably a multi-homed systemd-resolved box
+// with both a LAN resolver and Tailscale MagicDNS) the FIRST `getaddrinfo` of
+// the signaling host after the resolver state goes cold stalls ~5 s before it
+// answers, even though each upstream server answers in milliseconds when asked
+// directly. Every `filament ssh`/`send`/`recv` is a fresh process, so its DNS
+// cache is cold and that stall lands squarely on the signaling phase (measured
+// 5.6 s vs a ~0.5 s warm connect, blowing the 1.2 s budget).
+//
+// The fix is in-app and helps every user, not just that box: after a connect
+// succeeds we remember the host's resolved IPs in the config dir, and on the
+// next connect we RACE a fresh OS resolution against the cached IPs. A slow
+// resolver can no longer gate the connection, the cached IP wins the race and
+// the connect proceeds in ~0.5 s; the fresh resolution, when it lands, refreshes
+// the cache. TLS SNI / Host stay the original hostname (we only steer which IP
+// the TCP connect targets, via reqwest `resolve_to_addrs`), so certificate
+// validation is unchanged. The cached IP is never trusted blindly: it is only
+// ever an alternate connect target for the same hostname+TLS, and the fresh
+// resolution always runs alongside it.
+
+/// Bounded wait for the fresh OS resolution before the cached IPs are allowed
+/// to win the race outright. Comfortably above a healthy resolver's answer
+/// (single-digit to low-hundreds ms) and well below the ~5 s cold stall, so a
+/// healthy box always uses fresh DNS and only a stalling resolver falls back to
+/// the cache. Overridable via `FILAMENT_DNS_RACE_MS`.
+const DNS_RACE_MS_DEFAULT: u64 = 700;
+
+fn dns_race_ms() -> u64 {
+    std::env::var("FILAMENT_DNS_RACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DNS_RACE_MS_DEFAULT)
+}
+
+/// Hard cap on the fresh OS resolution itself, so our own pre-resolve can never
+/// hang the process even when the cache is empty (first ever connect from a box
+/// with the cold-resolver stall). Above the observed worst case (~7.4 s) with
+/// headroom. Overridable via `FILAMENT_DNS_TIMEOUT_MS`.
+const DNS_TIMEOUT_MS_DEFAULT: u64 = 9_000;
+
+fn dns_timeout_ms() -> u64 {
+    std::env::var("FILAMENT_DNS_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DNS_TIMEOUT_MS_DEFAULT)
+}
+
+fn dns_cache_path() -> PathBuf {
+    let base = if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
+        PathBuf::from(d)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".config/filament")
+    };
+    base.join("signaling-dns.json")
+}
+
+/// Pull `host` and `port` out of an `http(s)://` URL for resolution. Returns the
+/// conventional port for the scheme when none is given. Pure (no I/O) so the
+/// parse is unit-testable.
+pub(crate) fn host_port_from_url(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    // Strip path/query, keep only the authority.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Drop any userinfo.
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "https" | "wss" => 443,
+        "http" | "ws" => 80,
+        _ => return None,
+    };
+    // IPv6 literal: [::1]:443
+    if let Some(hp) = hostport.strip_prefix('[') {
+        let (h, after) = hp.split_once(']')?;
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some((h.to_string(), port));
+    }
+    match hostport.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => {
+            let port = p.parse::<u16>().unwrap_or(default_port);
+            Some((h.to_string(), port))
+        }
+        _ => Some((hostport.to_string(), default_port)),
+    }
+}
+
+/// Parse a persisted DNS-cache document for `host` into usable `SocketAddr`s at
+/// `port`. The document is `{ "<host>": ["ip", ...], ... }`. Pure (no I/O) so
+/// selection is unit-testable; robust to a missing host / malformed entries.
+pub(crate) fn cached_addrs_from_doc(doc: &Value, host: &str, port: u16) -> Vec<SocketAddr> {
+    doc.get(host)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| s.parse::<IpAddr>().ok())
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn read_cached_addrs(host: &str, port: u16) -> Vec<SocketAddr> {
+    let Ok(text) = std::fs::read_to_string(dns_cache_path()) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    cached_addrs_from_doc(&doc, host, port)
+}
+
+/// Persist the freshly-resolved IPs for `host` (best-effort, never fatal). Reads
+/// the existing doc so other hosts' entries survive.
+fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
+    if addrs.is_empty() {
+        return;
+    }
+    let path = dns_cache_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut doc = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    let ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
+    doc[host] = json!(ips);
+    let _ = std::fs::write(&path, doc.to_string());
+}
+
+/// Resolve `host:port` to connect targets, immune to a cold-resolver stall.
+///
+/// Races a fresh OS resolution (capped at `dns_timeout_ms`) against the IPs
+/// cached from a previous successful connect:
+///   - Fresh resolution wins if it answers within `dns_race_ms` (the healthy
+///     case): its result is returned AND written back to the cache.
+///   - Otherwise the cached IPs are returned immediately so a stalling resolver
+///     never gates the connect; the fresh resolution keeps running and updates
+///     the cache when (if) it lands, for next time.
+///   - No cache and a slow resolver: we wait out the fresh resolution (bounded
+///     by `dns_timeout_ms`), the unavoidable first-ever-connect cost.
+///
+/// Returns the IPs to hand to reqwest `resolve_to_addrs`. An empty result means
+/// "resolve normally" (caller omits the override and lets reqwest resolve).
+/// Side effect: a successful fresh lookup also warms the OS resolver cache, so a
+/// socket.io connect that resolves the same host moments later hits warm cache.
+pub(crate) async fn resolve_warm(host: &str, port: u16) -> Vec<SocketAddr> {
+    // Skip the dance for an IP literal: nothing to resolve or cache.
+    if host.parse::<IpAddr>().is_ok() {
+        return Vec::new();
+    }
+    let cached = read_cached_addrs(host, port);
+    let host_owned = format!("{host}:{port}");
+    let host_for_cache = host.to_string();
+    let fresh = tokio::spawn(async move {
+        let lookup = tokio::net::lookup_host(host_owned);
+        match tokio::time::timeout(Duration::from_millis(dns_timeout_ms()), lookup).await {
+            Ok(Ok(it)) => {
+                let addrs: Vec<SocketAddr> = it.collect();
+                if !addrs.is_empty() {
+                    write_cached_addrs(&host_for_cache, &addrs);
+                }
+                addrs
+            }
+            _ => Vec::new(),
+        }
+    });
+
+    if cached.is_empty() {
+        // Nothing to fall back to: take whatever fresh resolution returns
+        // (bounded inside the task by dns_timeout_ms). Empty => caller resolves
+        // normally as a last resort.
+        return fresh.await.unwrap_or_default();
+    }
+
+    // Have a fallback: give fresh DNS a short head start, else use the cache.
+    match tokio::time::timeout(Duration::from_millis(dns_race_ms()), fresh).await {
+        Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+        // Fresh lost the race (still resolving) or failed: use the cache now.
+        // The spawned task keeps running and refreshes the cache when it lands.
+        _ => cached,
+    }
+}
+
 // ------------------------------------------------------------- HTTP config --
 
 #[derive(Clone)]
@@ -475,6 +670,19 @@ pub(crate) async fn http_get_json(url: &str) -> Result<Value> {
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
     // 3 quick attempts: establish() refetches config per connection attempt
     // (C5), and one blip of the API mustn't kill a transfer in progress.
+    //
+    // Happy-eyeballs DNS: resolve the host ourselves (cached IP raced against a
+    // fresh lookup) so a cold-resolver stall can't gate the connect, then steer
+    // reqwest at those IPs with `resolve_to_addrs`. Host/SNI stay the hostname,
+    // so TLS verification is unchanged. Done once, reused across the 3 attempts.
+    let host_port = host_port_from_url(url);
+    let overrides = match &host_port {
+        Some((host, port)) => {
+            let addrs = resolve_warm(host, *port).await;
+            (!addrs.is_empty()).then(|| (host.clone(), addrs))
+        }
+        None => None,
+    };
     let mut last = None;
     for attempt in 0..3 {
         if attempt > 0 {
@@ -482,9 +690,12 @@ pub(crate) async fn http_get_json(url: &str) -> Result<Value> {
         }
         // Explicit timeout: reqwest has none by default, and this is awaited
         // from the event loop, a hung GET must not freeze the process.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build();
+        let mut builder =
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+        if let Some((host, addrs)) = &overrides {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
+        let client = builder.build();
         let Ok(client) = client else { continue };
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json().await {
@@ -501,6 +712,19 @@ pub(crate) async fn http_get_json(url: &str) -> Result<Value> {
 // ---------------------------------------------------------------- signaling --
 
 pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
+    // Warm the OS resolver cache before rust_socketio resolves the host itself.
+    // rust_socketio's builder takes only a URL string (no DNS-override or custom
+    // client hook), so we cannot steer its connect at a cached IP the way the
+    // reqwest path can. What we CAN do is run our bounded happy-eyeballs resolve
+    // first: on success it primes glibc/systemd-resolved so socket.io's own
+    // immediately-following lookup hits warm cache (the common case), and it is
+    // bounded so even a stalling resolver only adds `dns_race_ms`, not the full
+    // ~5 s cold stall. In nearly every connect path `fetch_config` runs first and
+    // has already warmed the cache, this just covers the socket.io-first paths.
+    if let Some((host, port)) = host_port_from_url(server) {
+        let _ = resolve_warm(&host, port).await;
+    }
+
     let fwd = |variant: fn(Value) -> Ev, tx: mpsc::UnboundedSender<Ev>| {
         move |payload: Payload, _c: Client| {
             let tx = tx.clone();
@@ -1212,6 +1436,73 @@ mod tests {
         assert_eq!(out[0]["id"], "sidA");
         assert_eq!(out[1]["id"], "sidB");
         assert_eq!(out[0]["channel"], "ch");
+    }
+
+    #[test]
+    fn host_port_parses_scheme_defaults_and_explicit() {
+        assert_eq!(
+            host_port_from_url("https://api.filament.autumated.com"),
+            Some(("api.filament.autumated.com".to_string(), 443))
+        );
+        assert_eq!(
+            host_port_from_url("http://example.com/api/config?x=1"),
+            Some(("example.com".to_string(), 80))
+        );
+        assert_eq!(
+            host_port_from_url("https://example.com:8443/api/config"),
+            Some(("example.com".to_string(), 8443))
+        );
+        assert_eq!(
+            host_port_from_url("wss://relay.example.com"),
+            Some(("relay.example.com".to_string(), 443))
+        );
+        // userinfo is dropped; path/query ignored.
+        assert_eq!(
+            host_port_from_url("https://user:pass@host.example/path"),
+            Some(("host.example".to_string(), 443))
+        );
+        // IPv6 literal with and without explicit port.
+        assert_eq!(
+            host_port_from_url("https://[2606:4700::1]:443/api"),
+            Some(("2606:4700::1".to_string(), 443))
+        );
+        assert_eq!(
+            host_port_from_url("http://[::1]"),
+            Some(("::1".to_string(), 80))
+        );
+        // Unknown scheme: no default port, decline.
+        assert_eq!(host_port_from_url("ftp://example.com"), None);
+        assert_eq!(host_port_from_url("not a url"), None);
+    }
+
+    #[test]
+    fn cached_addrs_select_host_and_apply_port() {
+        let doc = json!({
+            "api.filament.autumated.com": ["104.21.73.85", "172.67.142.8"],
+            "other.example": ["10.0.0.1"]
+        });
+        let mut got = cached_addrs_from_doc(&doc, "api.filament.autumated.com", 443);
+        got.sort();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"104.21.73.85:443".parse::<SocketAddr>().unwrap()));
+        assert!(got.contains(&"172.67.142.8:443".parse::<SocketAddr>().unwrap()));
+        // Other host, different port applied.
+        let other = cached_addrs_from_doc(&doc, "other.example", 8443);
+        assert_eq!(other, vec!["10.0.0.1:8443".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn cached_addrs_robust_to_missing_or_malformed() {
+        // Host absent.
+        assert!(cached_addrs_from_doc(&json!({}), "nope.example", 443).is_empty());
+        // Entry not an array.
+        assert!(cached_addrs_from_doc(&json!({"h": "oops"}), "h", 443).is_empty());
+        // Array with junk: only valid IPs survive, no panic.
+        let doc = json!({"h": ["not-an-ip", "192.0.2.7", 42, null]});
+        assert_eq!(
+            cached_addrs_from_doc(&doc, "h", 443),
+            vec!["192.0.2.7:443".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[test]
