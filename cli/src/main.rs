@@ -26,6 +26,7 @@ mod pake_ceremony;
 mod protocol;
 mod resilience;
 mod session;
+mod shutdown;
 mod sshkeys;
 mod ui;
 
@@ -103,6 +104,16 @@ mod test_hooks {
     pub fn no_signaling_reconnect() -> bool {
         std::env::var("FILAMENT_TEST_NO_SIGNALING_RECONNECT").is_ok()
     }
+    /// shutdown-hang gate: deterministically reproduce the multi-link shutdown
+    /// hang by WEDGING the event loop forever (simulating a peer transport whose
+    /// inline write never returns). With the wedge active, the graceful
+    /// Ev::Interrupted is never processed; only the signal-owned force-exit
+    /// watchdog can still terminate the process. Proves the A/B: a build whose
+    /// watchdog is defeated hangs to the systemd timeout, the shipped one exits
+    /// within the bounded grace.
+    pub fn wedge_loop_on_shutdown() -> bool {
+        std::env::var("FILAMENT_TEST_WEDGE_LOOP").is_ok()
+    }
     /// warm-standby gate: churn surviving links after completion to force the C4 flap.
     pub fn churn_after_complete() -> bool {
         std::env::var("FILAMENT_TEST_CHURN_AFTER_COMPLETE").is_ok()
@@ -158,6 +169,7 @@ mod test_hooks {
     #[inline] pub fn no_defer() -> bool { false }
     #[inline] pub fn inject_peer_left_at() -> Option<u64> { None }
     #[inline] pub fn no_signaling_reconnect() -> bool { false }
+    #[inline] pub fn wedge_loop_on_shutdown() -> bool { false }
     #[inline] pub fn churn_after_complete() -> bool { false }
     #[inline] pub fn drop_file_end() -> bool { false }
     #[inline] pub fn drop_peer_left() -> bool { false }
@@ -1661,6 +1673,10 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         let tx = tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Bounded force-exit guarantee: the Interrupted bail unwinds and drops
+            // the peers, and a webrtc/quinn drop can itself deadlock. Arm a
+            // watchdog so Ctrl-C always exits promptly regardless.
+            shutdown::arm_force_exit(130, shutdown::grace());
             let _ = tx.send(Ev::Interrupted);
         });
     }
@@ -4477,6 +4493,9 @@ async fn send_cmd(
         let tx = tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Bounded force-exit guarantee (see the acceptor path): Ctrl-C must
+            // exit promptly even if the unwind/peer-drop deadlocks.
+            shutdown::arm_force_exit(130, shutdown::grace());
             let _ = tx.send(Ev::Interrupted);
         });
     }
@@ -5584,10 +5603,19 @@ async fn recv_cmd(
         // discovery is made reliable.
         direct::direct_enabled() || l2_enabled,
     );
+    // SIGINT/SIGTERM: route a graceful Ev::Interrupted through the loop AND arm a
+    // signal-owned force-exit watchdog. The watchdog is the guarantee: if the
+    // event loop is wedged on a stuck peer transport (a WebRTC data-channel write
+    // against a frozen/half-open peer, or a send_frame parked on backpressure that
+    // never drains), the graceful Interrupted is never processed and the daemon
+    // would otherwise ignore the signal until systemd SIGKILLs it ~90s later. The
+    // watchdog force-exits within the bounded grace regardless of loop state; a
+    // dropped link is an ordinary disconnect to the peer's resilience layer.
     {
         let tx = tx.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            shutdown::arm_force_exit(130, shutdown::grace());
             let _ = tx.send(Ev::Interrupted);
         });
     }
@@ -5597,6 +5625,7 @@ async fn recv_cmd(
         tokio::spawn(async move {
             if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 term.recv().await;
+                shutdown::arm_force_exit(130, shutdown::grace());
                 let _ = tx.send(Ev::Interrupted);
             }
         });
@@ -5730,6 +5759,14 @@ async fn recv_cmd(
     let mut probed_silence = false; // fired one forced sync before declaring down
 
     loop {
+        // Shutdown-hang repro hook: once links are live, freeze the event loop
+        // forever, faithfully simulating a peer transport whose inline write
+        // never returns. The graceful Ev::Interrupted can no longer be processed;
+        // only the signal-owned force-exit watchdog can still terminate us. No-op
+        // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
+        if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
+            std::future::pending::<()>().await;
+        }
         let ev = match tokio::time::timeout(
             Duration::from_secs(2),
             next_ev(&mut rx, &conn, !pending.is_empty()),
@@ -5964,14 +6001,22 @@ async fn recv_cmd(
                             transfers.insert(inc.id.clone(), json!(inc.received));
                         }
                     }
-                    let _ = t
-                        .send_control(&json!({
+                    // BOUNDED: this runs inline in the event loop for EVERY link.
+                    // A WebRTC data-channel write against a frozen / half-open peer
+                    // can block (write_data_channel().await never returns), which
+                    // would starve the whole loop, including the signal-driven
+                    // Interrupted handler, the multi-link shutdown hang. The state
+                    // ping is best-effort, so cap it and move on.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        t.send_control(&json!({
                             "type": "state", "v": 1,
                             "transfers": Value::Object(transfers),
                             "trusted": l.trusted,
                             "away": false,
-                        }))
-                        .await;
+                        })),
+                    )
+                    .await;
                 }
             }
         }
@@ -7339,7 +7384,11 @@ async fn recv_cmd(
                 if let Some(g) = &tty_guard {
                     g.restore(); // process::exit skips Drop
                 }
-                let _ = sio.disconnect().await;
+                // Best-effort, BOUNDED: a wedged signaling socket must not turn the
+                // graceful exit into the very hang the watchdog exists to catch.
+                // The signal task already armed a force-exit; cap the disconnect so
+                // we exit cleanly on our own well inside that grace.
+                let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
                 std::process::exit(130);
             }
             // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
