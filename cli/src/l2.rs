@@ -849,19 +849,28 @@ async fn bring_up_to_known(
 
     let cfg = net::fetch_config(server).await?;
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let mut sio = net::connect_signaling(server, tx.clone()).await?;
 
     let my_uid = crate::mk_uid("l2");
     // A solo room keeps strangers out; presence-channel subscription is how we
     // actually find the known device (same as `--to` identity mode).
     let solo = format!("l2-{}", crate::fresh_secret());
-    sio.emit("join", json!({ "room": solo, "uid": my_uid, "name": crate::display_name() }))
-        .await
-        .ok();
+    let join_payload =
+        json!({ "room": solo, "uid": my_uid, "name": crate::display_name() });
+    sio.emit("join", join_payload.clone()).await.ok();
     // NOTE: subscribe is emitted on Ev::Welcome (below), not here, `welcome` is
     // the proof the socket.io connection is fully established, so the subscribe
     // can't be lost in the connect->emit race that intermittently left the client
     // unsubscribed and "waiting for known device" forever (harness finding).
+    //
+    // The `join` ABOVE has the SAME connect->emit race: fired the instant
+    // `connect_signaling` returns, it can land before the socket.io connection is
+    // fully ready and be silently dropped, the server then never runs `_do_join`,
+    // never emits `welcome`, and this loop waits for a Welcome that never comes,
+    // stranding `filament ssh` in "waiting for known device" (~30% of attempts in
+    // the isolated repro). So we RE-EMIT join on the same cadence as the
+    // re-subscribe below until Welcome lands (idempotent: a repeat join to the
+    // same solo room is a no-op server-side once it took).
 
     let mut my_id: Option<String> = None;
     let mut peer: Option<Arc<Peer>> = None;
@@ -921,6 +930,27 @@ async fn bring_up_to_known(
 
     crate::ui::say(&format!("filament: waiting for known device '{peer_name}'..."));
 
+    // Presence re-subscribe cadence: while we have NOT yet discovered a candidate
+    // (empty queue, no live peer), re-emit the ack'd subscribe every ~2s. This
+    // recovers the inverse of the ack-roster race, the acceptor that subscribes
+    // AFTER us, whose single async `known-peer` push to us is lost. The `up`
+    // acceptor gets this self-healing free from its `sync` tick; the one-shot L2
+    // initiator needs it explicitly or a lost push strands it in "presence"
+    // forever. Cheap (one emit) and idempotent, and it STOPS the instant a
+    // candidate is queued/dialing, so a healthy connect never re-subscribes.
+    let mut resubscribe = tokio::time::interval(Duration::from_millis(2000));
+    resubscribe.tick().await; // consume the immediate first tick (we just subscribed on Welcome)
+    // How many re-join ticks we've waited with NO Welcome. rust_socketio's
+    // websocket client occasionally finishes `.connect().await` in a state where
+    // it can SEND but silently never DELIVERS inbound events to our handlers: the
+    // server receives our `join` (and re-emits `welcome` on every retry, verified
+    // in the backend telemetry) but this loop never sees `Ev::Welcome`, so it
+    // hangs in "waiting for known device" no matter how many times we re-join the
+    // SAME dead socket (the residual ~30% rapid-`ssh` failure). Re-emitting can't
+    // fix a socket that won't receive, so after a couple of silent ticks we tear
+    // the socket DOWN and dial a FRESH one (reconnect_signaling) on the same `tx`.
+    let mut welcome_silent_ticks: u32 = 0;
+
     loop {
         // One candidate at a time: start the next attempt whenever idle.
         if peer.is_none() {
@@ -973,19 +1003,49 @@ async fn bring_up_to_known(
                 }
             }
         }
-        let Some(ev) = rx.recv().await else { break };
+        let ev = tokio::select! {
+            ev = rx.recv() => match ev {
+                Some(ev) => ev,
+                None => break,
+            },
+            _ = resubscribe.tick() => {
+                if my_id.is_none() {
+                    // No Welcome yet. Re-emit the `join` once (it may have raced the
+                    // socket-ready and been dropped server-bound); but if the socket
+                    // stays silent across a couple of ticks the socket itself is
+                    // RECEIVE-dead, so dial a fresh one and re-join on it.
+                    welcome_silent_ticks += 1;
+                    if welcome_silent_ticks >= 2 {
+                        welcome_silent_ticks = 0;
+                        if let Ok(fresh) = net::reconnect_signaling(server, tx.clone()).await {
+                            let _ = sio.disconnect().await;
+                            sio = fresh;
+                        }
+                    }
+                    sio.emit("join", join_payload.clone()).await.ok();
+                } else if peer.is_none() && queue.is_empty() {
+                    // Welcome landed but no candidate found yet: re-subscribe so a
+                    // lost `known-peer` push / a late-appearing acceptor is still
+                    // discovered. Stops the instant a candidate is queued/dialing.
+                    net::subscribe_with_ack(&sio, vec![channel.clone()], tx.clone()).await;
+                }
+                continue;
+            }
+        };
         match ev {
             Ev::Welcome(v) => {
                 my_id = v["id"].as_str().map(|s| s.to_string());
                 // Signaling is live (socket + welcome); we now subscribe and wait
                 // for the known device to appear, that is the Presence phase.
                 diag.enter(crate::diag::Phase::Presence);
-                // Subscribe now that the connection is confirmed (see the note
-                // at the join site). The server replies with known-peer for every
-                // live member already on the channel, so discovery is reliable.
-                sio.emit("subscribe", json!({ "channels": [channel.clone()] }))
-                    .await
-                    .ok();
+                // Subscribe now that the connection is confirmed (see the note at
+                // the join site). DETERMINISTIC discovery: emit-with-ack and read
+                // the roster the server returns synchronously, so a known device
+                // already present is found even if its one-shot async `known-peer`
+                // push is lost (the dominant presence stall, see
+                // `net::subscribe_with_ack`). The periodic re-subscribe below
+                // covers the inverse race (the acceptor appearing AFTER us).
+                net::subscribe_with_ack(&sio, vec![channel.clone()], tx.clone()).await;
             }
             Ev::KnownPeer(v) => {
                 if v["channel"].as_str() != Some(channel.as_str()) {

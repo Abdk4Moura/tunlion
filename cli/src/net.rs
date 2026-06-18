@@ -613,6 +613,60 @@ pub async fn heartbeat(sio: &Client, payload: Value, tx: mpsc::UnboundedSender<E
         .await;
 }
 
+/// Subscribe to presence channels and DETERMINISTICALLY discover the members
+/// already present, via the socket.io ACK rather than the async `known-peer`
+/// push.
+///
+/// The server's `on_subscribe` returns `{ok, n, peers:[{id,name,uid,channel}]}`,
+/// the live roster of every device already on the channel (signaling.py
+/// `_do_subscribe`). It ALSO emits a one-shot async `known-peer` per existing
+/// member, but that single push is lossy: if it dies in a half-open socket the
+/// subscriber waits for a peer that, from its view, never appeared, and stalls
+/// in "presence" forever (the dominant `filament ssh` establishment failure,
+/// reproduced as ~40% of pop-os->do-vm attempts). The `up` acceptor never hit
+/// this because its `sync` tick re-subscribes on a cadence AND reconciles the
+/// digest roster; the one-shot L2 initiator (`bring_up_to_known`) did neither.
+///
+/// This mirrors `heartbeat`: emit-with-ack, then turn each ack roster entry into
+/// an `Ev::KnownPeer` so the loop's existing dedup / self-filter / queue logic
+/// handles it on the SAME path as the async push (idempotent, so a roster entry
+/// that also arrives as an async push is harmless). `emit_with_ack` only fails
+/// if the socket is already gone; errors are benign and swallowed (the caller's
+/// re-subscribe cadence retries).
+pub async fn subscribe_with_ack(sio: &Client, channels: Vec<String>, tx: mpsc::UnboundedSender<Ev>) {
+    let _ = sio
+        .emit_with_ack(
+            "subscribe",
+            json!({ "channels": channels }),
+            std::time::Duration::from_secs(5),
+            move |payload: Payload, _c: Client| {
+                let tx = tx.clone();
+                async move {
+                    if let Payload::Text(vals) = payload {
+                        for p in roster_from_ack(&vals) {
+                            let _ = tx.send(Ev::KnownPeer(p));
+                        }
+                    }
+                }
+                .boxed()
+            },
+        )
+        .await;
+}
+
+/// Pull the `peers` roster entries out of a `subscribe` ACK payload. The ack is
+/// `{ok, n, peers:[{id,name,uid,channel}]}`; each roster entry is shaped exactly
+/// like an async `known-peer` push, so the caller can replay them through the
+/// same `Ev::KnownPeer` path. Factored out so the (otherwise socket-bound)
+/// forwarding is unit-testable. Robust to a missing/empty/non-array `peers`.
+fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
+    vals.iter()
+        .filter_map(|v| v["peers"].as_array())
+        .flatten()
+        .cloned()
+        .collect()
+}
+
 // --------------------------------------------------------------------- peer --
 
 /// Mirror of webrtc.js politeRole(): prefer stable uids, fall back to sids.
@@ -1125,4 +1179,50 @@ async fn wire_channel(
             }
         })
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polite_role_prefers_uid_then_sid() {
+        // Distinct uids: lexical comparison of uids decides (mirrors webrtc.js).
+        assert!(polite_role("uid-z", Some("uid-a"), "s1", "s9"));
+        assert!(!polite_role("uid-a", Some("uid-z"), "s9", "s1"));
+        // Same/None uid: fall back to sid comparison.
+        assert!(polite_role("u", None, "s9", "s1"));
+        assert!(!polite_role("u", None, "s1", "s9"));
+        assert!(polite_role("u", Some("u"), "s9", "s1"));
+    }
+
+    #[test]
+    fn roster_from_ack_extracts_present_peers() {
+        // A real subscribe ACK: {ok, n, peers:[...]}. Every roster entry is
+        // shaped like a known-peer push and must be forwarded.
+        let ack = json!({
+            "ok": true, "n": 1,
+            "peers": [
+                {"id": "sidA", "name": "dovm", "uid": "cli-r-1", "channel": "ch"},
+                {"id": "sidB", "name": "dovm2", "uid": "cli-r-2", "channel": "ch"}
+            ]
+        });
+        let out = roster_from_ack(&[ack]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["id"], "sidA");
+        assert_eq!(out[1]["id"], "sidB");
+        assert_eq!(out[0]["channel"], "ch");
+    }
+
+    #[test]
+    fn roster_from_ack_robust_to_empty_or_missing() {
+        // Empty roster (nobody present yet): no entries, no panic.
+        assert!(roster_from_ack(&[json!({"ok": true, "n": 1, "peers": []})]).is_empty());
+        // `peers` absent entirely (error ack / older server): no entries.
+        assert!(roster_from_ack(&[json!({"ok": false, "n": 0})]).is_empty());
+        // `peers` present but not an array: ignored, no panic.
+        assert!(roster_from_ack(&[json!({"peers": "oops"})]).is_empty());
+        // No payload values at all.
+        assert!(roster_from_ack(&[]).is_empty());
+    }
 }
