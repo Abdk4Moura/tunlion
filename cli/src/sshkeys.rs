@@ -260,6 +260,83 @@ pub fn pin_host_keys(dest_token: &str, hostkeys: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ---- shell-bootstrap fast-path cache ---------------------------------------
+// A repeat `filament ssh <dev>` re-ran the full key/host-key/cap bootstrap every
+// time (a second establish before the data link). Once a device has been
+// bootstrapped its host keys are pinned, our key is installed, and the shell cap
+// was granted, so the next ssh can skip straight to the data link. The skip
+// self-heals: if the device since rotated keys or revoked the cap the ssh
+// attempt fails and the caller falls back to a full bootstrap + one retry.
+
+fn bootstrap_cache_path() -> PathBuf {
+    ssh_dir().join("bootstrap-cache.json")
+}
+
+/// How long a recorded bootstrap lets `filament ssh` skip the pre-flight (s).
+const BOOTSTRAP_TTL_SECS: u64 = 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// True if `dest_token` already has a pinned host key in our known_hosts (the
+/// bootstrap already ran for it at least once).
+pub fn host_pinned(dest_token: &str) -> bool {
+    std::fs::read_to_string(known_hosts_path())
+        .map(|s| s.lines().any(|l| l.split_whitespace().next() == Some(dest_token)))
+        .unwrap_or(false)
+}
+
+/// The cached login for `device` if its bootstrap is still fresh, else None
+/// (None = do a full bootstrap). Outer Some = fresh cache hit; the inner Option
+/// is the login account the acceptor last reported (None when it reported none).
+pub fn bootstrap_cache_get(device: &str) -> Option<Option<String>> {
+    let raw = std::fs::read_to_string(bootstrap_cache_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let e = v.get(device)?;
+    let ts = e.get("ts")?.as_u64()?;
+    if now_secs().saturating_sub(ts) > BOOTSTRAP_TTL_SECS {
+        return None;
+    }
+    Some(
+        e.get("user")
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+    )
+}
+
+/// Record a successful bootstrap so the next `filament ssh` to `device` skips it.
+pub fn bootstrap_cache_put(device: &str, user: Option<&str>) {
+    let path = bootstrap_cache_path();
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[device] = serde_json::json!({ "user": user.unwrap_or(""), "ts": now_secs() });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+        chmod(dir, 0o700);
+    }
+    if std::fs::write(&path, v.to_string()).is_ok() {
+        chmod(&path, 0o600);
+    }
+}
+
+/// Drop the cached bootstrap for `device` (forces a full bootstrap next time).
+pub fn bootstrap_cache_clear(device: &str) {
+    let path = bootstrap_cache_path();
+    let Ok(s) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&s) else { return };
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove(device);
+    }
+    let _ = std::fs::write(&path, v.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -928,7 +928,13 @@ async fn bring_up_to_known(
         });
     };
 
-    crate::ui::say(&format!("filament: waiting for known device '{peer_name}'..."));
+    // Distinct wording for the shell-auth pre-flight so the two sequential
+    // bring-ups of `filament ssh` (the bootstrap link, then the netcat data link)
+    // do not read as a flap/retry of one connection.
+    crate::ui::say(&match role {
+        "bootstrap" => format!("filament: authenticating with '{peer_name}'..."),
+        _ => format!("filament: waiting for known device '{peer_name}'..."),
+    });
 
     // Presence re-subscribe cadence: while we have NOT yet discovered a candidate
     // (empty queue, no live peer), re-emit the ack'd subscribe every ~2s. This
@@ -1164,8 +1170,11 @@ async fn bring_up_to_known(
                 // not have, and the acceptor's direct link (`peer: None`) has none
                 // to verify against. (design-l2-direct-ladder.md §NOTE: pre-trust
                 // OR pair-proof, we confirmed pre-trust holds for the L2 acceptor.)
-                // INFO, tunnel established (with its route label).
-                crate::ui::say(&format!("filament: tunnel up to '{peer_name}' (route: {route})"));
+                // INFO, tunnel established (with its route label). Silent for the
+                // bootstrap pre-flight (internal; the data link reports the route).
+                if role != "bootstrap" {
+                    crate::ui::say(&format!("filament: tunnel up to '{peer_name}' (route: {route})"));
+                }
                 // Transport is up: the Establishing race is won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
@@ -1206,7 +1215,9 @@ async fn bring_up_to_known(
                 // Hand sio + peer to the caller via a guard: a long-lived tunnel
                 // `forget()`s it (keep alive); the bootstrap `close().await`s it
                 // (tear down before the second link).
-                crate::ui::say(&format!("filament: tunnel up to '{peer_name}'"));
+                if role != "bootstrap" {
+                    crate::ui::say(&format!("filament: tunnel up to '{peer_name}'"));
+                }
                 // Transport is up via WebRTC: Establishing race won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
                 diag.enter(crate::diag::Phase::Ready);
@@ -1548,7 +1559,7 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
     // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
-    let (t, mut rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
+    let (t, mut rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "bootstrap").await?;
     // The bootstrap rides the bring-up transport directly (pure control JSON, no
     // mux), so the link being usable IS the end of this span. Record `up`; the
     // ssh data link is a SEPARATE netcat span instrumented in its own right.
@@ -1599,6 +1610,71 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
     verdict
 }
 
+/// The login account for the ssh destination: FILAMENT_SSH_USER wins, else the
+/// account the ACCEPTOR installed our key into (from the bootstrap-ack, or the
+/// cache), else local $USER, else root. The acceptor's report is authoritative
+/// over a local $USER guess, which is usually wrong cross-machine (agboola@laptop
+/// vs root@server, the "Permission denied (publickey)" mismatch).
+fn resolve_login(remote_user: Option<String>) -> String {
+    std::env::var("FILAMENT_SSH_USER")
+        .ok()
+        .or(remote_user)
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into())
+}
+
+/// Spawn the real `ssh`, pointed EXCLUSIVELY at filament-managed key material +
+/// known_hosts, with a `filament netcat` ProxyCommand. Returns ssh's exit code
+/// (so a cached fast-path can detect a 255 connect/auth failure and retry after a
+/// fresh bootstrap). The destination is always `<login>@filament-<peer>`.
+fn spawn_ssh(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    host: &str,
+    login: &str,
+    rport: u16,
+    extra: &[String],
+) -> Result<i32> {
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_string_lossy();
+    let mut proxy = format!("{exe} --server {server}");
+    if relay {
+        proxy.push_str(" --relay");
+    }
+    proxy.push_str(&format!(" netcat {peer} {rport}"));
+
+    let key = crate::sshkeys::managed_key_path();
+    let kh = crate::sshkeys::known_hosts_path();
+    let dest_token = format!("{login}@{host}");
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.arg("-o").arg(format!("ProxyCommand={proxy}"))
+        .arg("-o").arg(format!("IdentityFile={}", key.display()))
+        .arg("-o").arg("IdentitiesOnly=yes")
+        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o").arg("StrictHostKeyChecking=accept-new");
+    // Split passthrough args into ssh OPTIONS (leading flags) and the remote
+    // COMMAND (from the first non-flag token on). The destination is ALWAYS our
+    // managed token, inserted BETWEEN options and command, or ssh would mistake
+    // the command (e.g. `hostname`) for the host.
+    let mut split = extra.len();
+    for (i, a) in extra.iter().enumerate() {
+        if !a.starts_with('-') {
+            split = i;
+            break;
+        }
+    }
+    for a in &extra[..split] {
+        cmd.arg(a);
+    }
+    cmd.arg(&dest_token);
+    for a in &extra[split..] {
+        cmd.arg(a);
+    }
+    Ok(cmd.status()?.code().unwrap_or(1))
+}
+
 /// `filament ssh <peer> [args...]`: seamless shell over the trusted channel.
 ///
 /// With zero pre-existing ssh setup: bootstrap our managed key + the peer's host
@@ -1612,66 +1688,51 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     // MUST be keyed on the bare host or it is silently inert.
     let host = format!("filament-{peer}");
 
-    // 1) Bootstrap auth material over the trusted channel (deny-by-default gate).
-    let (hostkeys, remote_user) = shell_bootstrap(server, peer, relay).await?;
-    crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
+    // The ProxyCommand data link talks to peer:22 (or a test port via
+    // FILAMENT_SSH_PORT, mirroring FILAMENT_L2_DIALHOST).
+    let rport: u16 =
+        std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
 
-    // The login account is the one the ACCEPTOR actually installed our key into
-    // (reported in the bootstrap-ack), authoritative over a guess from our local
-    // $USER, which is usually wrong cross-machine (agboola@laptop vs root@server).
-    // A killed earlier session left "agboola@filament-dovm: Permission denied
-    // (publickey)" precisely because of that mismatch. FILAMENT_SSH_USER still
-    // overrides for explicit control (`ssh -l user` via extra args also works).
-    let login = std::env::var("FILAMENT_SSH_USER")
-        .ok()
-        .or(remote_user)
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "root".into());
-    // `<login>@filament-<peer>` keeps the destination stable + recognizable.
-    let dest_token = format!("{login}@{host}");
+    // FAST PATH: a device whose host keys are already pinned AND whose bootstrap
+    // is still fresh has our key installed + the shell cap granted, so skip the
+    // pre-flight bootstrap (a whole extra establish) and go straight to ssh. It
+    // self-heals: a stale skip that fails at the ssh layer (255) falls back to a
+    // full bootstrap + one retry below.
+    let cached = if crate::sshkeys::host_pinned(&host) {
+        crate::sshkeys::bootstrap_cache_get(peer)
+    } else {
+        None
+    };
 
-    // 2) Build the ProxyCommand: a fresh `filament netcat` link to peer:22 (or a
-    // test port via FILAMENT_SSH_PORT, mirroring FILAMENT_L2_DIALHOST).
-    let rport: u16 = std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
-    let exe = std::env::current_exe()?;
-    let exe = exe.to_string_lossy();
-    let mut proxy = format!("{exe} --server {server}");
-    if relay {
-        proxy.push_str(" --relay");
-    }
-    proxy.push_str(&format!(" netcat {peer} {rport}"));
-
-    // 3) ssh pointed ONLY at filament-managed key + known_hosts; no prompts.
-    let key = crate::sshkeys::managed_key_path();
-    let kh = crate::sshkeys::known_hosts_path();
-    let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-o").arg(format!("ProxyCommand={proxy}"))
-        .arg("-o").arg(format!("IdentityFile={}", key.display()))
-        .arg("-o").arg("IdentitiesOnly=yes")
-        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
-        .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new");
-    // Split passthrough args into ssh OPTIONS (leading `-…` flags) and the remote
-    // COMMAND (everything from the first non-flag token on). The destination is
-    // ALWAYS our managed token, in the seamless model `<peer>` IS the host, so
-    // the destination must be inserted BETWEEN the options and the command, or
-    // ssh would mistake the command (e.g. `hostname`) for the host.
-    let mut split = extra.len();
-    for (i, a) in extra.iter().enumerate() {
-        if !a.starts_with('-') {
-            split = i;
-            break;
+    let (login, took_fast_path) = match cached {
+        Some(cached_user) => (resolve_login(cached_user), true),
+        None => {
+            // Full bootstrap over the trusted channel (deny-by-default gate),
+            // pin host keys, and record the cache for next time.
+            let (hostkeys, remote_user) = shell_bootstrap(server, peer, relay).await?;
+            crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
+            crate::sshkeys::bootstrap_cache_put(peer, remote_user.as_deref());
+            (resolve_login(remote_user), false)
         }
+    };
+
+    let code = spawn_ssh(server, peer, relay, &host, &login, rport, extra)?;
+
+    // A cached skip that failed at the ssh layer (connect/auth, exit 255) may mean
+    // the device rotated its key/host-key or revoked the cap. Invalidate, run a
+    // real bootstrap (which surfaces a clear deny if revoked, or re-installs our
+    // key + re-pins host keys), and retry ssh ONCE.
+    if code == 255 && took_fast_path {
+        crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
+        crate::sshkeys::bootstrap_cache_clear(peer);
+        let (hostkeys, remote_user) = shell_bootstrap(server, peer, relay).await?;
+        crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
+        crate::sshkeys::bootstrap_cache_put(peer, remote_user.as_deref());
+        let login = resolve_login(remote_user);
+        let code = spawn_ssh(server, peer, relay, &host, &login, rport, extra)?;
+        std::process::exit(code);
     }
-    for a in &extra[..split] {
-        cmd.arg(a); // leading ssh flags (e.g. -p, -L, -v)
-    }
-    cmd.arg(&dest_token); // the destination is the filament peer
-    for a in &extra[split..] {
-        cmd.arg(a); // remote command + its args
-    }
-    let status = cmd.status()?;
-    std::process::exit(status.code().unwrap_or(1));
+    std::process::exit(code);
 }
 
 #[cfg(test)]
