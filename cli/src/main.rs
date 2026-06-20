@@ -2001,6 +2001,17 @@ struct Link {
     direct_route: &'static str,
 }
 
+impl Link {
+    /// The name to SHOW for this peer. A known device proves into its local
+    /// petname (`verified_name`); show that, so one device reads consistently as
+    /// (e.g.) `dovm` everywhere instead of flipping between the petname and the
+    /// peer's broadcast display name (`name`, e.g. `Abdul's server`). The
+    /// broadcast name is the fallback only for an unverified / unknown peer.
+    fn shown(&self) -> &str {
+        self.verified_name.as_deref().unwrap_or(&self.name)
+    }
+}
+
 /// C26: per-peer presence for the static status roster.
 #[derive(Clone, Copy, PartialEq)]
 enum Presence {
@@ -3842,10 +3853,10 @@ impl Conn {
         for (id, l) in links {
             if id == pid {
                 seen = true;
-                parts.push(peer_entry(&l.name, mark, tone, note));
+                parts.push(peer_entry(l.shown(), mark, tone, note));
             } else {
                 let (m, t, n) = presence_glyph(l.presence);
-                parts.push(peer_entry(&l.name, m, t, n));
+                parts.push(peer_entry(l.shown(), m, t, n));
             }
         }
         if !seen {
@@ -4854,7 +4865,7 @@ async fn send_cmd(
                 established = true;
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(l) = conn.link(&pid) {
-                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
+                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, l.shown())));
                     let is_direct = l.direct;
                     let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
@@ -6435,7 +6446,7 @@ async fn recv_cmd(
                 // actual pty-open is still gated server-side by the cap/policy.
                 let _ = t.send_control(&json!({ "type": "caps", "shell": l2_enabled })).await;
                 if let Some(l) = conn.link_mut(&pid) {
-                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
+                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, l.shown())));
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
                     let is_direct = l.direct;
