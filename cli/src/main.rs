@@ -804,6 +804,27 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 // Trust: an HMAC(secret) proof exchanged after connect, so the server cannot
 // impersonate a known device. Full PAKE remains roadmap (ledger C15).
 
+/// Should THIS acceptor session take the rung-1 direct-QUIC path (answer the
+/// initiator's transport-offer instead of building a colliding WebRTC peer)?
+///
+/// True when the env gate is set (`direct_enabled`), OR this is the L2/ssh
+/// acceptor (`l2_enabled`), OR this is the long-lived `up` daemon (`daemon`).
+///
+/// The daemon case is the anti-glare fix for a PLAIN `filament up` (no `--shell`,
+/// no `FILAMENT_L2`): two such daemons that are known devices to each other each
+/// fire a KnownPeer for the other and each tries to be the WebRTC initiator. The
+/// two offers collide (GLARE); the polite side drops and rebuilds as a responder,
+/// the supersede churn loops ("appeared, connecting" repeatedly, "reconnecting…")
+/// and never settles to one stable link. Answering the direct-QUIC dial instead is
+/// sequential (one `direct_pending` per peer, one race, one link) and authenticated
+/// by the pair-secret MAC, so it neither glares nor depends on cross-NAT ICE.
+///
+/// One-shot `send`/`recv`/`pair` pass `daemon=false` and so keep their WebRTC
+/// default (`direct_enabled()` only): they are deliberately left unchanged.
+fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
+    direct::direct_enabled() || l2_enabled || daemon
+}
+
 fn devices_path() -> PathBuf {
     if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
         return PathBuf::from(d).join("devices.json");
@@ -2157,14 +2178,17 @@ struct Conn {
     resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
     /// just `direct::direct_enabled()` (the FILAMENT_DIRECT/FILAMENT_L2 env gate),
-    /// but the L2/ssh ACCEPTOR (`up --shell`) must ALSO take it even when those
-    /// env vars are unset, otherwise it silently drops the initiator's
-    /// `transport-offer` AND builds its own WebRTC peer dialing back, colliding
-    /// with the initiator's offer (GLARE) and stalling at "stuck while connecting".
-    /// Answering the direct dial instead is sequential, authenticated, and rides
-    /// the reachable host candidate (e.g. the Tailscale link), so it neither
-    /// glares nor depends on cross-NAT ICE. `start_direct_inner` gates on this
-    /// instead of the bare env check.
+    /// but ANY long-lived acceptor must ALSO take it even when those env vars are
+    /// unset: the L2/ssh ACCEPTOR (`up --shell`) AND the plain `up` daemon. An
+    /// acceptor that doesn't silently drops the initiator's `transport-offer` AND
+    /// builds its own WebRTC peer dialing back, colliding with the initiator's
+    /// offer (GLARE), which for `up --shell` stalls at "stuck while connecting" and
+    /// for a plain `up` (two mutually-known daemons) loops the supersede churn and
+    /// never settles to one link. Answering the direct dial instead is sequential,
+    /// authenticated, and rides the reachable host candidate (e.g. the Tailscale
+    /// link), so it neither glares nor depends on cross-NAT ICE. Set via
+    /// `direct_ok_for`; `start_direct_inner` gates on this instead of the bare env
+    /// check. One-shot send/recv/pair keep the bare `direct_enabled()` default.
     direct_ok: bool,
 }
 
@@ -5606,13 +5630,16 @@ async fn recv_cmd(
         // long-lived / interactive session, so warm redundancy defaults ON for it
         // (a one-shot `recv` keeps daemon=false -> OFF).
         daemon,       // warm_standby default
-        // rung-1 direct-QUIC: take it when the env gate is set OR when this is an
-        // L2/ssh acceptor. The acceptor MUST answer the initiator's
-        // transport-offer (direct-QUIC over the reachable host candidate, e.g.
-        // Tailscale) rather than build a colliding WebRTC peer (glare), the
-        // dominant `filament ssh` "stuck while connecting" failure once presence
-        // discovery is made reliable.
-        direct::direct_enabled() || l2_enabled,
+        // rung-1 direct-QUIC: take it when the env gate is set, when this is an
+        // L2/ssh acceptor, OR when this is the long-lived `up` daemon. Any acceptor
+        // MUST answer the initiator's transport-offer (direct-QUIC over the
+        // reachable host candidate, e.g. Tailscale) rather than build a colliding
+        // WebRTC peer (glare). For `up --shell` this kills the `filament ssh`
+        // "stuck while connecting" failure; for a plain `up` it kills the up<->up
+        // glare/supersede churn (two known daemons each racing to be the WebRTC
+        // initiator). See `direct_ok_for`. One-shot send/recv/pair (daemon=false)
+        // are unaffected and keep their WebRTC default.
+        direct_ok_for(daemon, l2_enabled),
     );
     // SIGINT/SIGTERM: route a graceful Ev::Interrupted through the loop AND arm a
     // signal-owned force-exit watchdog. The watchdog is the guarantee: if the
@@ -7835,6 +7862,31 @@ mod tests {
         assert!(o.auto_allows("popos") && o.auto_allows("laptop"));
         assert!(!o.auto_allows("stranger"), "shell-only must not auto-shell unlisted devices");
         assert!(o.enables_l2());
+    }
+
+    #[test]
+    fn direct_ok_for_covers_daemon_and_l2_acceptors() {
+        // Anti-glare gate (`recv_cmd` builds `direct_ok` from this). Clear the env
+        // gates so the daemon/l2 BRANCHES are what we're asserting, not the env.
+        // SAFETY: single-threaded within this test; the asserts that depend on the
+        // env-unset state are the (false,false) and (false,false,daemon=false) ones.
+        unsafe {
+            std::env::remove_var("FILAMENT_DIRECT");
+            std::env::remove_var("FILAMENT_L2");
+        }
+        // A plain `up` daemon (no --shell, no env): MUST take the direct path so it
+        // answers the peer's transport-offer instead of glaring with a WebRTC dial.
+        assert!(direct_ok_for(true, false), "plain `up` daemon must answer direct-QUIC (anti-glare)");
+        // The L2/ssh acceptor (`up --shell`) keeps taking it (the prior fix).
+        assert!(direct_ok_for(true, true));
+        assert!(direct_ok_for(false, true), "L2 acceptor must take direct even when not a daemon");
+        // A one-shot command (daemon=false) with no L2 and no env gate keeps the
+        // WebRTC default: send/recv/pair are deliberately left unchanged.
+        assert!(!direct_ok_for(false, false), "one-shot send/recv/pair keep the WebRTC default");
+        // The env gate still forces it on for any session.
+        unsafe { std::env::set_var("FILAMENT_DIRECT", "1") };
+        assert!(direct_ok_for(false, false), "FILAMENT_DIRECT=1 forces direct for any session");
+        unsafe { std::env::remove_var("FILAMENT_DIRECT") };
     }
 
     #[test]
