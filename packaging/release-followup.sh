@@ -12,6 +12,9 @@ set -euo pipefail
 TAG="${1:?usage: release-followup.sh cli-vX.Y.Z [--pr]}"
 OPEN_PR="${2:-}"
 VERSION="${TAG#cli-v}"
+# Release date for the winget manifest (the validation bot flags it missing
+# otherwise, inconsistent with the published version). Overridable for replays.
+RELEASE_DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%d)}"
 REPO="Abdk4Moura/filament"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/out"
@@ -30,7 +33,7 @@ done
 
 render() { sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA_LINUX@/$SHA_LINUX/g" \
                -e "s/@SHA_MAC_ARM@/$SHA_MAC_ARM/g" -e "s/@SHA_MAC_X64@/$SHA_MAC_X64/g" \
-               -e "s/@SHA_WINDOWS@/$SHA_WINDOWS/g" "$1"; }
+               -e "s/@SHA_WINDOWS@/$SHA_WINDOWS/g" -e "s/@RELEASE_DATE@/$RELEASE_DATE/g" "$1"; }
 
 # ------------------------------------------------------------------ homebrew
 # The tap lives INSIDE this repo (Formula/) — no extra repo needed:
