@@ -1581,17 +1581,24 @@ fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
     )
 }
 
+/// Bidirectionally copy an accepted local TCP connection and a warm-reuse unix
+/// socket (the daemon bridges the unix socket to an L2 stream over its existing
+/// link). One copy per direction; either side's EOF ends the pair.
+async fn bridge_streams(mut tcp: TcpStream, mut unix: tokio::net::UnixStream) -> std::io::Result<()> {
+    tokio::io::copy_bidirectional(&mut tcp, &mut unix).await.map(|_| ())
+}
+
 /// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
 /// connection opens a fresh L2 stream to `peer:127.0.0.1:rport`.
+///
+/// WARM-LINK FAST PATH: when a local daemon already holds a link to `peer`, each
+/// accepted connection rides it (no establishment) via the control socket. If the
+/// daemon can't serve it (no daemon / no warm link / --relay), we fall back to
+/// establishing ONE cold link lazily and multiplexing connections over it, the
+/// original behavior. The warm path also sidesteps the single-link credit caveat:
+/// each connection is an independent stream over the daemon's link.
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
-    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
-    guard.forget(); // long-lived listener, keep the link alive for the process
-    let mux = Mux::new(t);
-    tokio::spawn(pump_initiator(rx, mux.clone()));
-
-    // The link is up; per-connection L2 opens are independent streams (each is
-    // its own short L2Open), so the span completes here once the link is usable.
-    diag.up("tunnel", "datachannel-or-direct");
+    // Bind first so a port conflict fails fast, before any network work.
     let listener = match TcpListener::bind(("127.0.0.1", lport)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -1604,12 +1611,37 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         }
     };
     crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
-    // NOTE(scope): concurrent heavy forwards over one link need credit flow
-    // control (design §4); single active stream is the supported case today.
+    let mut warm = !relay; // try the daemon's warm link until proven unavailable
+    let mut cold: Option<Arc<Mux>> = None; // lazily established fallback link
     loop {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
-        let mux = mux.clone();
+        // Warm path: bridge this connection straight to the daemon's link.
+        if warm {
+            if let Some(usock) = crate::ctl::try_open(peer, rport).await {
+                tokio::spawn(async move {
+                    let _ = bridge_streams(sock, usock).await;
+                });
+                continue;
+            }
+            warm = false; // no daemon / no warm link: settle on the cold path
+            crate::ui::trace("filament: no warm link, establishing for forward");
+        }
+        // Cold path: establish one link on the first connection, reuse it after.
+        let mux = match &cold {
+            Some(m) => m.clone(),
+            None => {
+                let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
+                guard.forget(); // long-lived listener, keep the link alive
+                diag.up("tunnel", "datachannel-or-direct");
+                let m = Mux::new(t);
+                tokio::spawn(pump_initiator(rx, m.clone()));
+                cold = Some(m.clone());
+                m
+            }
+        };
+        // NOTE(scope): concurrent heavy forwards over ONE cold link need credit
+        // flow control (design §4); the warm path avoids this (independent streams).
         let (sid, rx_pipe) = open_stream(&mux, rport).await?;
         tokio::spawn(async move {
             serve_stream(mux, sid, sock, rx_pipe, true).await;
