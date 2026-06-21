@@ -966,6 +966,16 @@ fn any_shell_grant_at(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether to serve an `l2-open` (TCP tunnel / ssh data link) from a peer.
+/// Blanket modes (`--shell` / `--shell-only` / `FILAMENT_L2`) keep their existing
+/// trusted-gated behavior. But when L2 is on ONLY because some device was
+/// `grant`ed shell, the OPENING peer must itself hold that grant: otherwise a
+/// grant for ONE device would let EVERY trusted device open loopback tunnels.
+/// `trusted` is still required upstream; this is the additional per-device gate.
+fn l2_open_allowed(blanket: bool, peer_has_shell: bool) -> bool {
+    blanket || peer_has_shell
+}
+
 /// L1-a (spec §8): read a device's granted capabilities. v1 records (no `caps`)
 #[allow(dead_code)] // enforcement hook (gate 5); exercised by the capability gate
 /// read as `["transfer"]` for backward compatibility; deny-by-default otherwise.
@@ -6715,28 +6725,50 @@ async fn recv_cmd(
                     // fully instrumented and is the side that exhibits the stall.
                     let Some(t) = conn.transport_of(&pid) else { continue };
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    let mux = l2_muxes
-                        .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone()))
-                        .clone();
-                    match mux.accept_control(&v, trusted).await {
-                        l2::OpenVerdict::Accept { sid, host, port, rx } => {
-                            tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
+                    // Per-device authorization for a NEW open (an l2-close just
+                    // tears a stream down, so it is never gated here). In a blanket
+                    // mode any trusted peer may open; in grant-only mode the opening
+                    // peer must hold the shell grant itself.
+                    let authorized = v["type"].as_str() != Some("l2-open") || {
+                        let blanket = shell_policy.enables_l2()
+                            || std::env::var("FILAMENT_L2").map(|x| x == "1").unwrap_or(false);
+                        let peer_has_shell = conn
+                            .link(&pid)
+                            .and_then(|l| l.verified_name.as_deref())
+                            .map(|n| device_allows(n, "shell"))
+                            .unwrap_or(false);
+                        l2_open_allowed(blanket, peer_has_shell)
+                    };
+                    if !authorized {
+                        let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                        ui::say(&format!("l2: refused stream {sid:#x}: device not granted shell"));
+                        let _ = t
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
+                            .await;
+                    } else {
+                        let mux = l2_muxes
+                            .entry(pid.clone())
+                            .or_insert_with(|| l2::Mux::new(t.clone()))
+                            .clone();
+                        match mux.accept_control(&v, trusted).await {
+                            l2::OpenVerdict::Accept { sid, host, port, rx } => {
+                                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
+                            }
+                            l2::OpenVerdict::Deny { sid, err } => {
+                                // Log refused dials at INFO (visible by default,
+                                // suppressed under -q) — a refused SSRF/port-scan or
+                                // untrusted/over-cap open is a security event the
+                                // operator should see, mirroring the
+                                // shell-bootstrap-deny path (`ui::say`). Normal
+                                // initiators always dial 127.0.0.1, so this is silent
+                                // in normal operation and only fires on an anomaly.
+                                ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
+                                let _ = t
+                                    .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
+                                    .await;
+                            }
+                            l2::OpenVerdict::Ignore => {}
                         }
-                        l2::OpenVerdict::Deny { sid, err } => {
-                            // Log refused dials at INFO (visible by default,
-                            // suppressed under -q) — a refused SSRF/port-scan or
-                            // untrusted/over-cap open is a security event the
-                            // operator should see, mirroring the
-                            // shell-bootstrap-deny path (`ui::say`). Normal
-                            // initiators always dial 127.0.0.1, so this is silent
-                            // in normal operation and only fires on an anomaly.
-                            ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
-                            let _ = t
-                                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
-                                .await;
-                        }
-                        l2::OpenVerdict::Ignore => {}
                     }
                     // A PTY stream closing frees its resize channel, handled by
                     // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
@@ -8002,6 +8034,18 @@ mod tests {
         // A missing/garbage file is false, never a panic.
         assert!(!any_shell_grant_at(&dir.join("nope.json")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn l2_open_gate_scopes_grant_mode() {
+        // Blanket mode (--shell / --shell-only / FILAMENT_L2): any trusted peer
+        // may open, regardless of its own per-device grant (unchanged behavior).
+        assert!(l2_open_allowed(true, false));
+        assert!(l2_open_allowed(true, true));
+        // Grant-only mode (L2 on solely because SOME device has a shell grant):
+        // the opening peer must itself hold the grant.
+        assert!(l2_open_allowed(false, true), "granted device may open");
+        assert!(!l2_open_allowed(false, false), "ungranted device denied in grant mode");
     }
 
     #[test]
