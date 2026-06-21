@@ -22,7 +22,7 @@
 // dialing (the SSRF defense). See `Mux::on_open` and main.rs's recv loop.
 
 use crate::net::{self, Ev, Peer, Transport};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -1520,6 +1520,19 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     Ok(())
 }
 
+/// Build the user-facing message for the case where `filament forward` could
+/// not bind its local listener because the requested port is in use. The
+/// tunnel itself is healthy; only the local bind failed. We suggest
+/// lport+1 with a saturating increment so the suggestion is always a valid
+/// u16 (the helper is pure so the unit test below can pin the message shape
+/// without touching the network).
+fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
+    let suggested = lport.saturating_add(1);
+    format!(
+        "filament: local port {lport} is already in use, pick another (e.g. filament forward {suggested} {peer} {rport})"
+    )
+}
+
 /// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
 /// connection opens a fresh L2 stream to `peer:127.0.0.1:rport`.
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
@@ -1531,7 +1544,17 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // The link is up; per-connection L2 opens are independent streams (each is
     // its own short L2Open), so the span completes here once the link is usable.
     diag.up("tunnel", "datachannel-or-direct");
-    let listener = TcpListener::bind(("127.0.0.1", lport)).await?;
+    let listener = match TcpListener::bind(("127.0.0.1", lport)).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            bail!("{}", port_in_use_msg(lport, peer, rport));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "filament: failed to bind 127.0.0.1:{lport} for forward to {peer}:127.0.0.1:{rport}"
+            )));
+        }
+    };
     crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
     // NOTE(scope): concurrent heavy forwards over one link need credit flow
     // control (design §4); single active stream is the supported case today.
@@ -1998,5 +2021,29 @@ mod h1_tests {
         live.end();
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(sessions.get_live("sess-x").await.is_none(), "ended session must leave the store");
+    }
+
+    /// The `port_in_use_msg` helper must surface the conflicting port and a
+    /// `filament forward <lport+1> <peer> <rport>` retry hint, so a user
+    /// staring at a "port in use" error can recover in one copy-paste.
+    #[test]
+    fn port_in_use_msg_names_port_and_suggests_forward() {
+        let msg = port_in_use_msg(8080, "laptop", 22);
+        assert!(msg.contains("8080"), "message must name the conflicting port: {msg}");
+        assert!(msg.contains("filament forward"), "message must suggest a filament forward retry: {msg}");
+        assert!(msg.contains("8081"), "suggested port should be lport+1: {msg}");
+        assert!(msg.contains("laptop"), "message should reference the peer: {msg}");
+        assert!(msg.contains("22"), "message should reference the rport: {msg}");
+    }
+
+    /// The helper's `saturating_add` must not wrap when lport is u16::MAX, so
+    /// the user never sees a suggested port of 0 (which would still be valid
+    /// for binding but is a confusing retry hint).
+    #[test]
+    fn port_in_use_msg_saturates_at_u16_max() {
+        let msg = port_in_use_msg(u16::MAX, "laptop", 22);
+        assert!(msg.contains(&format!("{}", u16::MAX)), "must name the conflicting port: {msg}");
+        // u16::MAX.saturating_add(1) == u16::MAX, NOT 0.
+        assert!(!msg.contains("0 "), "saturating add must not wrap to 0: {msg}");
     }
 }
