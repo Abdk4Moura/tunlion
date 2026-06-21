@@ -29,7 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
@@ -255,10 +255,10 @@ impl Mux {
 /// TODO(credits): single-stream only relies on send_frame's per-link
 /// backpressure. With >1 concurrent heavy stream this needs a per-stream credit
 /// window (design §4) or one slow stream head-of-line-blocks the others.
-async fn socket_to_dc(
+async fn socket_to_dc<R: AsyncRead + Unpin>(
     transport: Arc<dyn Transport>,
     sid: u32,
-    mut rd: tokio::net::tcp::OwnedReadHalf,
+    mut rd: R,
 ) -> Result<()> {
     let cap = transport.max_payload();
     let mut buf = vec![0u8; cap];
@@ -275,9 +275,9 @@ async fn socket_to_dc(
 /// Pump data-channel frames -> local TCP writes. `None` = peer FIN: shutdown the
 /// write half so the local app sees a clean EOF, then end. A dropped pipe
 /// (channel closed without a `None`) = abort: shutdown anyway and end.
-async fn dc_to_socket(
+async fn dc_to_socket<W: AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<PipeItem>,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    mut wr: W,
 ) -> Result<()> {
     while let Some(item) = rx.recv().await {
         match item {
@@ -297,15 +297,17 @@ async fn dc_to_socket(
 /// teardown can wake it, and runs the read pump to completion. On exit, drops
 /// the stream and (optionally) sends a trailing l2-close (FIN or, on read error,
 /// RST with `err`).
-async fn serve_stream(
+async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
     sid: u32,
-    sock: TcpStream,
+    sock: S,
     rx: mpsc::Receiver<PipeItem>,
     send_close: bool,
 ) {
-    let _ = sock.set_nodelay(true);
-    let (rd, wr) = sock.into_split();
+    // Caller sets TCP_NODELAY where applicable (a unix socket has none); split
+    // generically so the same plumbing serves a TcpStream OR a local UnixStream
+    // (the warm-link reuse path bridges a unix socket to an L2 stream).
+    let (rd, wr) = tokio::io::split(sock);
     let writer = tokio::spawn(dc_to_socket(rx, wr));
     let reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
     mux.set_read_pump(sid, reader.abort_handle()).await;
@@ -746,6 +748,7 @@ impl Mux {
     pub async fn dial_and_serve(self: Arc<Self>, sid: u32, host: String, port: u16, rx: mpsc::Receiver<PipeItem>) {
         match TcpStream::connect((host.as_str(), port)).await {
             Ok(sock) => {
+                let _ = sock.set_nodelay(true);
                 // l2-open-ack is mandatory (design §3.4/O2): it tells the
                 // initiator the stream is live. credit-in-ack is the follow-up
                 // (TODO(credits)); 0 here means "no per-stream window yet".
@@ -1387,7 +1390,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
 /// the inbound pipe is wired. Returns the registered receiver. The initiator
 /// registers its OWN pipe up front so a server-speaks-first protocol (ssh
 /// banner) can't lose bytes.
-async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
+pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
     let sid = mux.alloc_sid();
     let rx = mux.register(sid).await;
     // The dial target is ALWAYS 127.0.0.1 in production (localhost-only is the
@@ -1400,9 +1403,54 @@ async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<
     Ok((sid, rx))
 }
 
+/// WARM-LINK REUSE (daemon side): open a NEW L2 stream to `rport` over an
+/// EXISTING peer link (its `mux`) and bridge it to a local `stream` (a unix
+/// socket from a sibling `filament netcat`/`ssh`/`forward` process). This is the
+/// same initiator primitive netcat uses (`open_stream` + `serve_stream`), but the
+/// bytes ride a unix socket instead of stdio, and the underlying QUIC/DC link is
+/// the daemon's already-established one, so signaling + establishment are skipped
+/// entirely. The remote acceptor is UNCHANGED: it serves this `l2-open` exactly
+/// as it serves a cold one.
+pub(crate) async fn serve_local_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mux: Arc<Mux>,
+    rport: u16,
+    stream: S,
+) -> Result<()> {
+    let (sid, rx_pipe) = open_stream(&mux, rport).await?;
+    serve_stream(mux, sid, stream, rx_pipe, true).await;
+    Ok(())
+}
+
+/// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
+/// sock -> stdout. Exit when the remote half closes (sock read EOF), the same
+/// "session over" semantics the cold netcat path has; then abort the stdin pump.
+async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
+    let (mut rd, mut wr) = tokio::io::split(sock);
+    let writer = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut stdin, &mut wr).await; // local EOF
+        let _ = wr.shutdown().await; // half-close so the remote sees our EOF
+    });
+    let mut stdout = tokio::io::stdout();
+    tokio::io::copy(&mut rd, &mut stdout).await?;
+    let _ = stdout.flush().await;
+    writer.abort();
+    Ok(())
+}
+
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
 /// This is the ssh ProxyCommand primitive.
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
+    // WARM-LINK FAST PATH: if a local `up` daemon already holds a link to `peer`,
+    // ride it (no signaling, no establishment, ~1s saved). Skipped under --relay
+    // (the user forced a relay path; a warm link may be direct) and self-heals: any
+    // miss / no daemon / dead stream falls through to a fresh establish below.
+    if !relay {
+        if let Some(sock) = crate::ctl::try_open(peer, rport).await {
+            crate::ui::trace(&format!("filament: reusing warm link to '{peer}' (no establish)"));
+            return pump_stdio_over(sock).await;
+        }
+    }
     let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
     guard.forget(); // long-lived tunnel, keep the link alive for the process
     let mux = Mux::new(t);
@@ -1560,6 +1608,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // control (design §4); single active stream is the supported case today.
     loop {
         let (sock, _) = listener.accept().await?;
+        let _ = sock.set_nodelay(true);
         let mux = mux.clone();
         let (sid, rx_pipe) = open_stream(&mux, rport).await?;
         tokio::spawn(async move {
