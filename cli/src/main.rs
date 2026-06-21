@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod codeentry;
+mod ctl;
 mod diag;
 mod direct;
 mod doctor;
@@ -936,6 +937,33 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// True if ANY known device has been granted the `shell` capability. The daemon
+/// uses this to switch L2/shell ON even for a plain `filament up`: otherwise
+/// `filament grant <dev> shell` writes a grant the running daemon never consults
+/// (l2_enabled was set only by --shell/--shell-only at startup), so the grant
+/// silently did nothing and `filament ssh` timed out. With this, a grant alone is
+/// enough; the per-device cap gate (auto_allows || device_allows) still denies
+/// every non-granted device, so this does NOT broaden access, it only honors the
+/// grants that already exist.
+fn any_shell_grant() -> bool {
+    any_shell_grant_at(&devices_path())
+}
+
+fn any_shell_grant_at(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else { return false };
+    let Ok(arr) = serde_json::from_str::<Value>(&raw) else { return false };
+    arr.as_array()
+        .map(|a| {
+            a.iter().any(|d| {
+                d.get("caps")
+                    .and_then(|c| c.as_array())
+                    .map(|list| list.iter().any(|c| c.as_str() == Some("shell")))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// L1-a (spec §8): read a device's granted capabilities. v1 records (no `caps`)
@@ -3996,6 +4024,49 @@ async fn next_ev(
     }
 }
 
+/// Warm-link reuse: a sibling process asked to reach `req.peer:req.rport`. If we
+/// hold a trusted, live link to that peer, open a NEW L2 stream over it and bridge
+/// the sibling's unix socket to it, skipping the sibling's own establishment. The
+/// remote acceptor serves this `l2-open` exactly as a cold one (and re-verifies
+/// trust). On any miss we `reject`, and the sibling falls back to a fresh dial.
+async fn handle_warm_open(
+    conn: &Conn,
+    l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    req: ctl::Req,
+) {
+    // Resolve the peer NAME (matched case-insensitively on the proven
+    // `verified_name`, the same key the L2 cap gate uses) to a trusted link with a
+    // live transport. Prefer a DIRECT link over a relay one: faster, and it honors
+    // "reuse never traps you on a worse path than a fresh dial would pick".
+    let chosen = conn
+        .links
+        .iter()
+        .filter(|(_, l)| {
+            l.trusted
+                && l.transport.is_some()
+                && l.verified_name
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case(&req.peer))
+                    .unwrap_or(false)
+        })
+        .max_by_key(|(_, l)| l.direct as u8)
+        .map(|(pid, l)| (pid.clone(), l.transport.clone().unwrap()));
+    let Some((pid, t)) = chosen else {
+        req.reject("no warm link to that peer").await;
+        return;
+    };
+    // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to, so
+    // the new stream shares its sid space and `streams` table.
+    let mux = l2_muxes.entry(pid).or_insert_with(|| l2::Mux::new(t)).clone();
+    let rport = req.rport;
+    let sock = req.accept().await;
+    tokio::spawn(async move {
+        if let Err(e) = l2::serve_local_stream(mux, rport, sock).await {
+            ui::trace(&format!("filament: warm stream failed: {e}"));
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // F2: both ring (webrtc) and aws-lc (reqwest) end up in the dep tree;
@@ -5624,8 +5695,14 @@ async fn recv_cmd(
     // L2 acceptor posture (computed here so it also gates the direct-QUIC path).
     // OFF unless FILAMENT_L2=1 (opt-in) OR an active `up --shell` policy turns it
     // on (you can't ssh in without the acceptor). See its second use below.
+    // L2/shell is ON when: an `--shell`/`--shell-only` policy turns it on, the
+    // FILAMENT_L2 opt-in is set, OR any known device has been `grant`ed shell (so
+    // `filament grant <dev> shell` works on a plain `up` without restarting with a
+    // flag, matching what the grant command tells the user). The per-device gate
+    // below still denies every non-granted device, so this never widens access.
     let l2_enabled = shell_policy.enables_l2()
-        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
+        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false)
+        || any_shell_grant();
 
     let mut conn = Conn::for_command(
         server,
@@ -5751,6 +5828,22 @@ async fn recv_cmd(
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
+    // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
+    // socket (a short-lived `recv`/`send` must never bind it and steal the
+    // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
+    // reach a peer we already hold a link to, we open a new L2 stream over that
+    // warm link instead of making the sibling establish a fresh one. `ctl_tx` is
+    // held for the loop's life so the channel stays open (recv pends, never spins)
+    // even when we are not the daemon and `serve` was not spawned.
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
+    if daemon_alive() == Some(std::process::id()) {
+        let ctl_tx = ctl_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ctl::serve(ctl_tx).await {
+                crate::ui::trace(&format!("filament: control socket disabled: {e}"));
+            }
+        });
+    }
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
     // DETACHES (does not kill) the shell; a reconnect with the same session id
@@ -5813,14 +5906,24 @@ async fn recv_cmd(
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
         }
-        let ev = match tokio::time::timeout(
-            Duration::from_secs(2),
-            next_ev(&mut rx, &conn, !pending.is_empty()),
-        )
-        .await
-        {
-            Ok(res) => res?,
-            Err(_) => None, // 2s tick, run the fallback quiet-check below
+        let ev = tokio::select! {
+            biased;
+            // Warm-link reuse request from a sibling process. Handle it inline
+            // (we own `conn`/`l2_muxes` here), then fall through like a tick. For
+            // a non-daemon this branch pends forever (ctl_tx held, serve unspawned).
+            req = ctl_rx.recv() => {
+                if let Some(req) = req {
+                    handle_warm_open(&conn, &mut l2_muxes, req).await;
+                }
+                None
+            }
+            res = tokio::time::timeout(
+                Duration::from_secs(2),
+                next_ev(&mut rx, &conn, !pending.is_empty()),
+            ) => match res {
+                Ok(res) => res?,
+                Err(_) => None, // 2s tick, run the fallback quiet-check below
+            },
         };
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
@@ -6343,8 +6446,21 @@ async fn recv_cmd(
                     continue; // our own sender/daemon shares these channels
                 }
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
-                    ui::say(&format!("known device '{n}' appeared, connecting"));
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    // Only announce a FRESH connect. The server re-pushes the
+                    // known-peer roster on every (re)subscribe and C30 sync tick, so
+                    // a peer we already hold a link to (or are already dialing) would
+                    // otherwise reprint "appeared, connecting" on a loop, reading
+                    // like a flap even though `start_direct` below no-ops for an
+                    // existing link (start_direct_inner early-return). A real
+                    // reconnect removes the link first, so it still announces.
+                    let fresh = !conn.links.contains_key(&pid)
+                        && !conn.direct_pending.contains_key(&pid);
+                    if fresh {
+                        ui::say(&format!("known device '{n}' appeared, connecting"));
+                    } else {
+                        ui::trace(&format!("known device '{n}' re-announced (link already up)"));
+                    }
                     // rung-1: known device = both CLIs; try direct QUIC first.
                     let (n, sec) = (n.clone(), sec.clone());
                     conn.start_direct(&pid, &n, &sec).await;
@@ -7852,6 +7968,39 @@ mod tests {
         assert!(!device_allows_at(&p, "ghost", "remote-exec"));
         assert!(device_allows_at(&p, "ghost", "transfer"), "transfer baseline is universal");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn any_shell_grant_detects_a_shell_cap() {
+        let dir = std::env::temp_dir().join(format!("fil-anyshell-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("devices.json");
+        let sec = "b".repeat(64);
+        // No shell grant anywhere -> false (a plain `up` stays L2-off).
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "xfer",   "secret": sec, "v": 2, "caps": ["transfer"]},
+                {"name": "legacy", "secret": sec}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!any_shell_grant_at(&p), "no shell cap -> L2 stays off");
+        // One device granted shell -> true (the daemon turns L2 on).
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "xfer",  "secret": sec, "v": 2, "caps": ["transfer"]},
+                {"name": "popos", "secret": sec, "v": 2, "caps": ["transfer", "shell"]}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(any_shell_grant_at(&p), "a shell grant enables L2");
+        // A missing/garbage file is false, never a panic.
+        assert!(!any_shell_grant_at(&dir.join("nope.json")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
