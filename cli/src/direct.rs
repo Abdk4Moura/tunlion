@@ -257,10 +257,45 @@ pub fn local_ip_snapshot() -> Vec<String> {
 /// else a one-line `GET /api/whoami` echo of CF-Connecting-IP (the droplet is
 /// behind Cloudflare; the backend reads that header). Best-effort, failure
 /// just means we advertise no public candidate.
+/// Our public IP, learned from `{server}/api/whoami`. This sits on the
+/// CRITICAL PATH of every connect: `gather_candidates` calls it before the
+/// transport-offer can be sent, and the long-lived `up` acceptor pays it on
+/// EVERY incoming connect (the initiator waits on that reply). The public IP is
+/// STABLE for a box, only the ephemeral UDP port rotates per bind, so the IP is
+/// safe to memoize for a short TTL even though the endpoint cache (which keyed on
+/// the rotating port) was not. A cache miss/expiry just refetches; the env
+/// override always wins and never touches the network.
+const PUBIP_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+struct PubIpEntry {
+    server: String,
+    ip: IpAddr,
+    at: std::time::Instant,
+}
+
+static PUBIP_CACHE: std::sync::OnceLock<Mutex<Option<PubIpEntry>>> = std::sync::OnceLock::new();
+
+/// Pure freshness test, split out so the TTL/server-match logic is unit-testable
+/// without a clock or the network. A cached IP is reusable only for the SAME
+/// server and only while younger than the TTL.
+fn pubip_fresh(cached_server: &str, age: std::time::Duration, want_server: &str, ttl: std::time::Duration) -> bool {
+    cached_server == want_server && age < ttl
+}
+
 async fn public_ip(server: &str) -> Option<IpAddr> {
     if let Ok(v) = std::env::var("FILAMENT_PUBLIC_IP") {
         if let Ok(ip) = v.trim().parse::<IpAddr>() {
             return Some(ip);
+        }
+    }
+    let cache = PUBIP_CACHE.get_or_init(|| Mutex::new(None));
+    // Read the cache under a short-held lock (NEVER across the await below).
+    {
+        let guard = cache.lock().await;
+        if let Some(e) = guard.as_ref() {
+            if pubip_fresh(&e.server, e.at.elapsed(), server, PUBIP_TTL) {
+                return Some(e.ip);
+            }
         }
     }
     let url = format!("{server}/api/whoami");
@@ -273,7 +308,20 @@ async fn public_ip(server: &str) -> Option<IpAddr> {
         return None;
     }
     let v: Value = resp.json().await.ok()?;
-    v["ip"].as_str()?.trim().parse::<IpAddr>().ok()
+    let ip = v["ip"].as_str()?.trim().parse::<IpAddr>().ok()?;
+    // Record for the next connect. A concurrent cold fetch may overwrite this
+    // with an identical value, which is harmless (idempotent).
+    let mut guard = cache.lock().await;
+    *guard = Some(PubIpEntry { server: server.to_string(), ip, at: std::time::Instant::now() });
+    Some(ip)
+}
+
+/// Pre-resolve and cache our public IP. The `up` acceptor calls this at startup
+/// so its FIRST incoming connect answers the transport-offer without an inline
+/// `/api/whoami` round trip (subsequent connects already hit the warm cache).
+/// Best-effort: a failure leaves the cache empty and the normal lazy path runs.
+pub async fn warm_public_ip(server: &str) {
+    let _ = public_ip(server).await;
 }
 
 /// Format an addr as a candidate string; v6 gets brackets so `[ip]:port` parses.
@@ -955,6 +1003,22 @@ mod tests {
         assert_ne!(a, c, "different secret -> different key");
         // Not equal to the raw secret bytes (independence sanity).
         assert_ne!(&a[..], b"secret-one\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn pubip_cache_freshness() {
+        use std::time::Duration;
+        let ttl = Duration::from_secs(300);
+        let server = "https://api.filament.autumated.com";
+        // Same server, well within TTL -> reusable.
+        assert!(pubip_fresh(server, Duration::from_secs(10), server, ttl));
+        // Same server, exactly at the boundary -> expired (strict <).
+        assert!(!pubip_fresh(server, ttl, server, ttl));
+        // Same server, past TTL -> expired.
+        assert!(!pubip_fresh(server, Duration::from_secs(600), server, ttl));
+        // Different server, even when fresh -> never reused (avoids serving one
+        // deployment's reflexive IP to another).
+        assert!(!pubip_fresh("https://other.example.com", Duration::from_secs(1), server, ttl));
     }
 
     #[test]

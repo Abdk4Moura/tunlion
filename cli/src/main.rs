@@ -1318,6 +1318,14 @@ async fn up_cmd(
             ui::paint(ui::Tone::Warn, "!"),
         ));
     }
+    // Pre-resolve our public IP off the critical path so the FIRST incoming
+    // connect answers the transport-offer without an inline `/api/whoami` round
+    // trip (the acceptor's gather is what the initiator waits on during
+    // establishing). Best-effort, backgrounded so it never delays daemon start.
+    {
+        let server = server.to_string();
+        tokio::spawn(async move { direct::warm_public_ip(&server).await; });
+    }
     let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
     let _ = std::fs::remove_file(pidfile());
     res
