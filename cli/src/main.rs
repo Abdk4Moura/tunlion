@@ -3151,52 +3151,46 @@ impl Conn {
     /// never on throughput.
     fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
         let in_episode = self.resil.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
-        // Transport recency is the ground truth for "are bytes moving NOW".
+        // The liveness PHASE is the single source of truth (resilience::classify):
+        // it pairs each phase with its own clock, so an ESTABLISHING link (no first
+        // byte yet) is judged by the generous grace and a FLOWING one by the tight
+        // stall threshold. This makes "judge a still-establishing link by the 6 s
+        // flowing threshold" — the high-RTT relay repair loop — unrepresentable.
+        // See docs/transfer-state-machine.md.
         let transport = self.links.get(pid).and_then(|l| l.transport.as_ref());
-        let idle = transport.map(|t| t.idle_ms());
-        // Before the first DATA byte the link is ESTABLISHING (TURN alloc + ICE +
-        // DTLS/SCTP + first chunk), which over a high-RTT relay routinely exceeds
-        // the 6 s flowing-transfer threshold. Charging that one-time setup as a
-        // stall makes the watchdog tear down and rebuild the link, and the rebuild
-        // re-exceeds 6 s -> a repair loop that delivers zero bytes (the very hang
-        // it exists to prevent). Give a generous grace until bytes flow; the tight
-        // stall_ms applies only once the transport has moved its first byte.
-        let threshold = if transport.map(|t| t.has_flowed()).unwrap_or(true) {
-            net::stall_ms()
-        } else {
-            net::establish_grace_ms()
+        let obs = resilience::LiveObs {
+            in_flight,
+            transport_up: transport.is_some(),
+            flowed: transport.map(|t| t.has_flowed()).unwrap_or(false),
+            idle_ms: transport.map(|t| t.idle_ms()).unwrap_or(u64::MAX),
+            grace_ms: net::establish_grace_ms(),
+            stall_ms: net::stall_ms(),
         };
-
-        // FLOWING again: a transport exists and moved a byte within the window.
-        // This is the ONLY thing that clears an open episode, so the brief
-        // windows during a repair (by_sid flushed empty, or the new transport
-        // not yet up) do NOT reset the attempt counter and re-arm rung (a).
-        if matches!(idle, Some(ms) if ms < threshold) {
-            self.note_progress(pid);
-            return None;
-        }
-
-        if !in_episode {
-            // No episode open yet. A stall can only START while a transfer is in
-            // flight on a transport that has gone idle past the threshold.
-            match (in_flight, idle) {
-                (true, Some(ms)) if ms >= threshold => return Some(ms),
-                _ => {
-                    // Idle-but-empty / still establishing / flowing, clear stray
-                    // bookkeeping and do nothing.
-                    self.resil.stall_repairs.remove(pid);
-                    return None;
+        match resilience::classify(&obs) {
+            // Flowing, or still establishing within grace: bytes are (or may yet
+            // be) moving. note_progress clears any open episode, so the brief
+            // windows during a repair (new transport not yet flowing) do NOT reset
+            // the attempt counter and re-arm rung (a).
+            resilience::Liveness::Flowing | resilience::Liveness::Establishing => {
+                self.note_progress(pid);
+                None
+            }
+            // Nothing in flight: drop stray bookkeeping.
+            resilience::Liveness::Idle => {
+                self.resil.stall_repairs.remove(pid);
+                None
+            }
+            // No progress past the phase threshold. Open a new episode, or (if one
+            // is already open) re-fire the ladder UNLESS a repair is converging —
+            // re-emitting every tick would thrash while the replacement transport
+            // is still establishing.
+            resilience::Liveness::Stalled => {
+                if in_episode && self.repair_in_flight(pid) {
+                    None
+                } else {
+                    Some(obs.idle_ms)
                 }
             }
-        }
-
-        // An episode is OPEN and we have NOT yet seen fresh progress. Keep
-        // driving the ladder: if a repair is in flight wait for it to converge
-        // (re-emitting every tick would thrash); otherwise (the prior repair's
-        // new transport itself went idle past the threshold) escalate again.
-        match idle {
-            Some(ms) if ms >= threshold && !self.repair_in_flight(pid) => Some(ms),
-            _ => None,
         }
     }
 
