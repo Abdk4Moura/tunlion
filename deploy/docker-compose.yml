@@ -76,10 +76,14 @@ services:
     network_mode: host
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # TLS cert (Let's Encrypt for turn.filament.autumated.com) for turns: on 443.
+      - ./coturn/cert.pem:/etc/coturn/cert.pem:ro
+      - ./coturn/pkey.pem:/etc/coturn/pkey.pem:ro
     # Secret/realm/IP come from .env so they live in exactly one place.
     # listening-ip pins coturn to the PUBLIC address only (avoids clashing with
-    # tailscale and the docker bridges); an aux-server adds a full :443 listener
-    # (udp+tcp) so TURN passes strict mobile/corporate networks that block 3478.
+    # tailscale and the docker bridges). 443 serves TLS-TURN (turns:, via
+    # tls-listening-port in turnserver.conf) + DTLS on UDP 443 — looks like HTTPS
+    # so it passes strict/throttling mobile networks that RST plain TURN.
     command:
       - -c
       - /etc/coturn/turnserver.conf
@@ -87,6 +91,5 @@ services:
       - --realm=${TURN_REALM}
       - --external-ip=${DROPLET_IP}
       - --listening-ip=${DROPLET_IP}
-      - --aux-server=${DROPLET_IP}:443
     mem_limit: ${COTURN_MEM:-96m}
     cpus: ${COTURN_CPUS:-0.50}
