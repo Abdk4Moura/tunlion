@@ -678,7 +678,11 @@ impl Mux {
     /// Registers the pipe synchronously for an accepted open, then returns the
     /// verdict for the caller to act on (the dial is async and must NOT block the
     /// event loop). Returns `Ignore` for non-l2 control.
-    pub async fn accept_control(&self, v: &Value, trusted: bool) -> OpenVerdict {
+    /// `allow_nonloopback`: the caller (main.rs, where the peer's device name is
+    /// known) decided this specific non-loopback target is permitted by the
+    /// operator's opt-in `l2-allow.json` allowlist. Loopback is always allowed; a
+    /// non-loopback host is refused UNLESS this is set, keeping the SSRF default.
+    pub async fn accept_control(&self, v: &Value, trusted: bool, allow_nonloopback: bool) -> OpenVerdict {
         match v["type"].as_str() {
             Some("l2-open") => {
                 let Some(sid) = v["sid"].as_u64().map(|s| s as u32) else {
@@ -716,10 +720,11 @@ impl Mux {
                 }
                 // ---- SSRF defense: localhost-only by default ----
                 // Stricter than is_private_addr (which ALLOWS LAN/RFC1918): the
-                // dial target must resolve to loopback. Non-loopback is refused
-                // unless a future per-device allowlist opts in (TODO above).
-                if !host_is_loopback(&host) {
-                    return OpenVerdict::Deny { sid, err: "non-loopback denied" };
+                // dial target must resolve to loopback. A non-loopback host is
+                // refused UNLESS the caller's opt-in per-device allowlist
+                // (l2-allow.json) authorized this exact target (`allow_nonloopback`).
+                if !host_is_loopback(&host) && !allow_nonloopback {
+                    return OpenVerdict::Deny { sid, err: "non-loopback denied (not in l2-allow.json)" };
                 }
                 // H-1 (DoS): cap concurrent streams per link. A flaky/hostile
                 // paired device can otherwise flood `l2-open` and exhaust
@@ -1947,7 +1952,7 @@ mod h1_tests {
         // Fill to the cap with accepted opens (they register pipes).
         for i in 0..MAX_STREAMS_PER_LINK as u32 {
             let sid = L2_SID_BASE | (i + 1);
-            match mux.accept_control(&open_msg(sid), true).await {
+            match mux.accept_control(&open_msg(sid), true, false).await {
                 OpenVerdict::Accept { .. } => {}
                 other => panic!("expected Accept under cap, got {:?}", std::mem::discriminant(&other)),
             }
@@ -1955,7 +1960,7 @@ mod h1_tests {
         assert_eq!(mux.live_streams().await, MAX_STREAMS_PER_LINK);
         // One more must be denied with the cap error, leaving the table unchanged.
         let over = L2_SID_BASE | 9999;
-        match mux.accept_control(&open_msg(over), true).await {
+        match mux.accept_control(&open_msg(over), true, false).await {
             OpenVerdict::Deny { sid, err } => {
                 assert_eq!(sid, over);
                 assert_eq!(err, "too many streams");

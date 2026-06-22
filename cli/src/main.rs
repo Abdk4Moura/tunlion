@@ -976,6 +976,51 @@ fn l2_open_allowed(blanket: bool, peer_has_shell: bool) -> bool {
     blanket || peer_has_shell
 }
 
+/// Opt-in non-loopback forward allowlist: `{config_dir}/l2-allow.json`. Absent or
+/// malformed file => no entries => loopback-only (the default SSRF posture). Lets
+/// an operator deliberately turn the daemon into a gateway to SPECIFIC hosts for
+/// SPECIFIC devices, without opening blanket SSRF. Shape:
+///   { "laptop": ["10.0.0.5:5432", "192.168.1.10:*"], "*": ["db.internal:5432"] }
+/// A "*" device key applies to any authorized device; "host:*" allows any port.
+fn l2_allow_path() -> PathBuf {
+    devices_path().with_file_name("l2-allow.json")
+}
+
+fn l2_allow_load() -> Value {
+    std::fs::read_to_string(l2_allow_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// True if `allow` lists `host:port` (or `host:*`) for `device` or for "*". Pure,
+/// so the matching logic is unit-testable without the filesystem. Host match is
+/// case-insensitive; the device key must match the proven `verified_name` exactly
+/// (or be "*").
+fn l2_target_allowed_in(allow: &Value, device: &str, host: &str, port: u16) -> bool {
+    let matches = |list: &Value| -> bool {
+        list.as_array()
+            .map(|a| {
+                a.iter().any(|e| {
+                    let s = e.as_str().unwrap_or("");
+                    match s.rsplit_once(':') {
+                        Some((h, "*")) => h.eq_ignore_ascii_case(host),
+                        Some((h, p)) => {
+                            h.eq_ignore_ascii_case(host) && p.parse::<u16>().ok() == Some(port)
+                        }
+                        None => false,
+                    }
+                })
+            })
+            .unwrap_or(false)
+    };
+    allow.get(device).map(&matches).unwrap_or(false) || allow.get("*").map(&matches).unwrap_or(false)
+}
+
+fn l2_target_allowed(device: &str, host: &str, port: u16) -> bool {
+    l2_target_allowed_in(&l2_allow_load(), device, host, port)
+}
+
 /// L1-a (spec §8): read a device's granted capabilities. v1 records (no `caps`)
 #[allow(dead_code)] // enforcement hook (gate 5); exercised by the capability gate
 /// read as `["transfer"]` for backward compatibility; deny-by-default otherwise.
@@ -4065,7 +4110,11 @@ async fn handle_warm_open(
         .iter()
         .filter(|(_, l)| {
             l.trusted
-                && l.transport.is_some()
+                // Only reuse a link whose transport is actually ALIVE; a zombie
+                // (NAT-dead / departed peer not yet torn down) would otherwise open
+                // a dead stream and the client could not fall back. A miss here
+                // makes the client establish fresh, which is correct.
+                && l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
                 && l.verified_name
                     .as_deref()
                     .map(|n| n.eq_ignore_ascii_case(&req.peer))
@@ -6766,11 +6815,23 @@ async fn recv_cmd(
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
                             .await;
                     } else {
+                        // Opt-in gateway: if the target is non-loopback, allow it
+                        // only when the operator's l2-allow.json lists it for this
+                        // device (or "*"). Loopback ignores this (always allowed).
+                        let allow_nonloopback = {
+                            let host = v["host"].as_str().unwrap_or("127.0.0.1");
+                            let port = v["rport"].as_u64().or_else(|| v["port"].as_u64()).unwrap_or(0) as u16;
+                            let name = conn
+                                .link(&pid)
+                                .and_then(|l| l.verified_name.clone())
+                                .unwrap_or_default();
+                            l2_target_allowed(&name, host, port)
+                        };
                         let mux = l2_muxes
                             .entry(pid.clone())
                             .or_insert_with(|| l2::Mux::new(t.clone()))
                             .clone();
-                        match mux.accept_control(&v, trusted).await {
+                        match mux.accept_control(&v, trusted, allow_nonloopback).await {
                             l2::OpenVerdict::Accept { sid, host, port, rx } => {
                                 tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
                             }
@@ -8066,6 +8127,30 @@ mod tests {
         // the opening peer must itself hold the grant.
         assert!(l2_open_allowed(false, true), "granted device may open");
         assert!(!l2_open_allowed(false, false), "ungranted device denied in grant mode");
+    }
+
+    #[test]
+    fn l2_target_allowlist_matches() {
+        let allow = json!({
+            "laptop": ["10.0.0.5:5432", "192.168.1.10:*"],
+            "*": ["db.internal:5432"]
+        });
+        // Exact host:port for the named device.
+        assert!(l2_target_allowed_in(&allow, "laptop", "10.0.0.5", 5432));
+        // host:* allows any port for that host.
+        assert!(l2_target_allowed_in(&allow, "laptop", "192.168.1.10", 9999));
+        // "*" device entry applies to any device.
+        assert!(l2_target_allowed_in(&allow, "phone", "db.internal", 5432));
+        // Wrong port (no wildcard) is denied.
+        assert!(!l2_target_allowed_in(&allow, "laptop", "10.0.0.5", 22));
+        // Host not listed is denied.
+        assert!(!l2_target_allowed_in(&allow, "laptop", "10.0.0.9", 5432));
+        // A device with no entry (and not matching "*") is denied.
+        assert!(!l2_target_allowed_in(&allow, "phone", "10.0.0.5", 5432));
+        // No allowlist at all (null) denies everything (loopback-only default).
+        assert!(!l2_target_allowed_in(&Value::Null, "laptop", "10.0.0.5", 5432));
+        // Host match is case-insensitive.
+        assert!(l2_target_allowed_in(&allow, "phone", "DB.INTERNAL", 5432));
     }
 
     #[test]
