@@ -320,8 +320,11 @@ fn timing_json(t: &diag::PhaseTiming) -> Value {
 // ===================================================== preflight (no device) ==
 
 async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
-    let sig = check_signaling(server).await;
-    let ice = check_stun(server).await;
+    // #2 (parallelism): the signaling reachability probe and the STUN probe are
+    // independent network round-trips; run them CONCURRENTLY so the preflight's
+    // wall-clock is the slower of the two, not their sum (on a slow link that is
+    // ~2.7s + ~0.9s sequential -> ~2.7s).
+    let (sig, ice) = tokio::join!(check_signaling(server), check_stun(server));
     let ifaces = list_interfaces();
     let history = diag::summarize(HISTORY_LIMIT);
 

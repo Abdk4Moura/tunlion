@@ -97,6 +97,59 @@ pub fn stun_srflx(sock: &UdpSocket, stun_server: SocketAddr) -> Result<SocketAdd
     Err(last_err)
 }
 
+/// #3 (parallelism): STUN happy-eyeballs. Send a Binding-Request to ALL servers
+/// on the SAME socket and take the FIRST valid reply, so one slow/dead STUN
+/// server can't stall candidate gathering. The srflx reflects OUR NAT mapping; on
+/// a cone NAT every server returns the same value (a symmetric NAT already breaks
+/// STUN-based punch regardless, so racing servers never makes it worse). Falls
+/// back to the single-server path for a 1-element list.
+pub fn stun_srflx_any(sock: &UdpSocket, servers: &[SocketAddr]) -> Result<SocketAddr> {
+    match servers {
+        [] => return Err(anyhow!("stun: no servers")),
+        [one] => return stun_srflx(sock, *one),
+        _ => {}
+    }
+    let mut txid = [0u8; 12];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    txid.copy_from_slice(&now.to_be_bytes()[..12]);
+
+    let mut req = Vec::with_capacity(20);
+    req.extend_from_slice(&0x0001u16.to_be_bytes());
+    req.extend_from_slice(&0x0000u16.to_be_bytes());
+    req.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    req.extend_from_slice(&txid);
+
+    let prev_timeout = sock.read_timeout().ok().flatten();
+    sock.set_read_timeout(Some(Duration::from_millis(700)))
+        .context("stun: set read timeout")?;
+
+    let mut last_err = anyhow!("stun: no response");
+    for _ in 0..4 {
+        // Fan out to every server, then take whichever answers first.
+        for s in servers {
+            if let Err(e) = sock.send_to(&req, s) {
+                last_err = anyhow!("stun: send_to {s}: {e}");
+            }
+        }
+        let mut buf = [0u8; 512];
+        match sock.recv_from(&mut buf) {
+            Ok((n, _from)) => {
+                if let Some(addr) = parse_xor_mapped_address(&buf[..n], &txid) {
+                    let _ = sock.set_read_timeout(prev_timeout);
+                    return Ok(addr);
+                }
+                last_err = anyhow!("stun: response had no XOR-MAPPED-ADDRESS");
+            }
+            Err(e) => last_err = anyhow!("stun: recv_from: {e}"),
+        }
+    }
+    let _ = sock.set_read_timeout(prev_timeout);
+    Err(last_err)
+}
+
 /// Parse the XOR-MAPPED-ADDRESS (0x0020) attribute from a STUN response.
 /// Returns the de-XOR'd public address. Tolerates MAPPED-ADDRESS (0x0001) as a
 /// fallback (un-XOR'd) for older servers.
@@ -165,6 +218,30 @@ pub fn stun_server_addr(stun_urls: &[String]) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+/// All resolvable STUN server addresses for happy-eyeballs (`stun_srflx_any`).
+/// `FILAMENT_STUN` override, when set, is authoritative (returns just it); else
+/// every distinct `stun:`/`stuns:` URL from the ICE config that resolves.
+pub fn stun_server_addrs(stun_urls: &[String]) -> Vec<SocketAddr> {
+    if let Ok(v) = std::env::var("FILAMENT_STUN") {
+        if let Some(a) = resolve_host_port(v.trim()) {
+            return vec![a];
+        }
+    }
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for url in stun_urls {
+        let Some(rest) = url.strip_prefix("stun:").or_else(|| url.strip_prefix("stuns:")) else {
+            continue;
+        };
+        let hostport = rest.split('?').next().unwrap_or(rest);
+        if let Some(a) = resolve_host_port(hostport) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
 }
 
 fn resolve_host_port(hostport: &str) -> Option<SocketAddr> {
@@ -324,6 +401,21 @@ mod tests {
         let urls = vec!["stun:198.18.0.1:3478?transport=udp".to_string()];
         let a = stun_server_addr(&urls).unwrap();
         assert_eq!(a.port(), 3478);
+    }
+
+    #[test]
+    fn stun_server_addrs_collects_and_dedups() {
+        // Multiple distinct servers for happy-eyeballs; a duplicate collapses.
+        let urls = vec![
+            "stun:198.18.0.1:3478".to_string(),
+            "stun:198.18.0.2:3478?transport=udp".to_string(),
+            "stun:198.18.0.1:3478".to_string(), // dup of the first
+            "turn:198.18.0.9:3478".to_string(), // not stun: -> ignored
+        ];
+        let addrs = stun_server_addrs(&urls);
+        assert_eq!(addrs.len(), 2, "two distinct stun servers, turn ignored, dup collapsed");
+        assert!(addrs.iter().any(|a| a.to_string() == "198.18.0.1:3478"));
+        assert!(addrs.iter().any(|a| a.to_string() == "198.18.0.2:3478"));
     }
 
     #[test]

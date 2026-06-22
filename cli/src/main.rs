@@ -2754,20 +2754,30 @@ impl Conn {
                 return;
             }
         };
-        let cands = direct::gather_candidates(&self.server, port).await;
-
+        // #1 (parallelism): gather the host/public candidates (incl. the
+        // /api/whoami HTTP) and the rung-2 STUN srflx CONCURRENTLY. Both are
+        // independent network round-trips that must finish before the
+        // transport-offer can go out, and the initiator's "establishing" phase
+        // waits on exactly that offer, so overlapping them shaves a round-trip off
+        // every cold connect. Both borrow &self immutably, so join! is sound.
+        //
         // rung-2 (FILAMENT_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
         // can advertise a server-reflexive candidate. This socket is kept RAW
         // (not handed to quinn), its NAT mapping is the one we'll punch + run
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
-        let (punch_sock, my_srflx) = if holepunch::holepunch_enabled() {
-            match self.gather_srflx().await {
-                Some((sock, srflx)) => (Some(sock), Some(srflx)),
-                None => (None, None),
+        let srflx_fut = async {
+            if holepunch::holepunch_enabled() {
+                self.gather_srflx().await
+            } else {
+                None
             }
-        } else {
-            (None, None)
+        };
+        let (cands, srflx) =
+            tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut);
+        let (punch_sock, my_srflx) = match srflx {
+            Some((sock, srflx)) => (Some(sock), Some(srflx)),
+            None => (None, None),
         };
 
         // transport-offer rides the OPAQUE signaling relay (same channel as ICE
@@ -2848,11 +2858,16 @@ impl Conn {
             .iter()
             .flat_map(|s| s.urls.iter().cloned())
             .collect();
-        let stun_addr = holepunch::stun_server_addr(&stun_urls)?;
+        // #3 (parallelism): race ALL configured STUN servers so a slow/dead one
+        // never stalls gathering (the offer the initiator waits on).
+        let stun_addrs = holepunch::stun_server_addrs(&stun_urls);
+        if stun_addrs.is_empty() {
+            return None;
+        }
         let sock = holepunch::bind_punch_socket().ok()?;
         // STUN is blocking UDP I/O, run it off the reactor.
         tokio::task::spawn_blocking(move || {
-            holepunch::stun_srflx(&sock, stun_addr).map(|srflx| (sock, srflx))
+            holepunch::stun_srflx_any(&sock, &stun_addrs).map(|srflx| (sock, srflx))
         })
         .await
         .ok()?
