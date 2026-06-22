@@ -4034,11 +4034,23 @@ async fn next_ev(
     }
 }
 
+/// Non-unix: warm-link reuse is unavailable (no control socket), so `ctl::Req` is
+/// uninhabited and this is never reached; it exists to keep the loop portable.
+#[cfg(not(unix))]
+async fn handle_warm_open(
+    _conn: &Conn,
+    _l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    req: ctl::Req,
+) {
+    match req {}
+}
+
 /// Warm-link reuse: a sibling process asked to reach `req.peer:req.rport`. If we
 /// hold a trusted, live link to that peer, open a NEW L2 stream over it and bridge
 /// the sibling's unix socket to it, skipping the sibling's own establishment. The
 /// remote acceptor serves this `l2-open` exactly as a cold one (and re-verifies
 /// trust). On any miss we `reject`, and the sibling falls back to a fresh dial.
+#[cfg(unix)]
 async fn handle_warm_open(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
@@ -5846,14 +5858,22 @@ async fn recv_cmd(
     // held for the loop's life so the channel stays open (recv pends, never spins)
     // even when we are not the daemon and `serve` was not spawned.
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
-    if daemon_alive() == Some(std::process::id()) {
-        let ctl_tx = ctl_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ctl::serve(ctl_tx).await {
-                crate::ui::trace(&format!("filament: control socket disabled: {e}"));
-            }
-        });
+    // The control socket is a unix-domain socket, so warm-link reuse is unix-only.
+    #[cfg(unix)]
+    {
+        if daemon_alive() == Some(std::process::id()) {
+            let ctl_tx = ctl_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ctl::serve(ctl_tx).await {
+                    crate::ui::trace(&format!("filament: control socket disabled: {e}"));
+                }
+            });
+        }
     }
+    // Hold `ctl_tx` for the loop's life so `ctl_rx` stays open (recv pends, never
+    // spins) even when `serve` was not spawned (non-unix, or not the daemon).
+    #[cfg(not(unix))]
+    let _ = &ctl_tx;
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
     // DETACHES (does not kill) the shell; a reconnect with the same session id
