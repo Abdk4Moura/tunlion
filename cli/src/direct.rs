@@ -441,6 +441,22 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// rung-2 reuses these QUIC configs verbatim, same ALPN, same accept-any-cert +
 /// keying-material auth, only the underlying socket differs (a punched one).
+/// Keep idle direct-QUIC links alive across NAT UDP-mapping timeouts. Residential
+/// NAT routinely drops an idle UDP mapping in ~30-120s; without a keepalive the
+/// link goes silently dead and FLAPS (re-establishing every ~minute), and a warm
+/// link reused for ssh/forward hits a zombie. A 15s keepalive sits well under
+/// common timeouts; max_idle_timeout (must exceed 2x the keepalive) lets a TRULY
+/// dead peer be detected and the connection closed in ~30s, so teardown and
+/// warm-link liveness checks see it promptly instead of hanging on a zombie.
+fn direct_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+    if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+        tc.max_idle_timeout(Some(idle));
+    }
+    Arc::new(tc)
+}
+
 pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
     let ck = rcgen::generate_simple_self_signed(vec!["filament-direct".to_string()])
         .context("self-signed cert")?;
@@ -457,7 +473,9 @@ pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
 
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("quic server config")?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
+    let mut sc = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+    sc.transport_config(direct_transport_config());
+    Ok(sc)
 }
 
 pub(crate) fn client_config() -> Result<quinn::ClientConfig> {
@@ -471,7 +489,9 @@ pub(crate) fn client_config() -> Result<quinn::ClientConfig> {
 
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .context("quic client config")?;
-    Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+    let mut cc = quinn::ClientConfig::new(Arc::new(qcc));
+    cc.transport_config(direct_transport_config());
+    Ok(cc)
 }
 
 /// Bind a quinn endpoint on an EPHEMERAL UDP port that BOTH accepts and dials
@@ -775,6 +795,15 @@ impl Transport for DirectTransport {
         }
         let _ = &self.conn; // keep the connection alive for the link's lifetime
         now_ms().saturating_sub(self.last_activity.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn is_alive(&self) -> bool {
+        // Our own teardown flag, OR quinn having closed the connection (idle
+        // timeout from the keepalive probe, peer close, transport error). With the
+        // 15s keepalive + 30s idle timeout, a NAT-dead or departed peer flips this
+        // within ~30s, so warm-link reuse skips it and falls back.
+        !self.dead.load(std::sync::atomic::Ordering::Relaxed)
+            && self.conn.close_reason().is_none()
     }
 }
 

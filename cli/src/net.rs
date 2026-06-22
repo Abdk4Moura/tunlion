@@ -305,6 +305,14 @@ pub trait Transport: Send + Sync {
     fn idle_ms(&self) -> u64 {
         u64::MAX
     }
+    /// Best-effort liveness: `false` if the underlying connection is known closed.
+    /// Default `true` (untracked transports are assumed live). Warm-link reuse
+    /// consults this so it never opens a stream over a dead/zombie link (and falls
+    /// back to a fresh establish instead). A direct-QUIC link reports its real
+    /// state; with keepalive a dead peer is detected and this flips within ~30s.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 // The channel is DETACHED (SettingEngine::detach_data_channels): webrtc-rs's
