@@ -3152,8 +3152,20 @@ impl Conn {
     fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
         let in_episode = self.resil.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
         // Transport recency is the ground truth for "are bytes moving NOW".
-        let idle = self.links.get(pid).and_then(|l| l.transport.as_ref()).map(|t| t.idle_ms());
-        let threshold = net::stall_ms();
+        let transport = self.links.get(pid).and_then(|l| l.transport.as_ref());
+        let idle = transport.map(|t| t.idle_ms());
+        // Before the first DATA byte the link is ESTABLISHING (TURN alloc + ICE +
+        // DTLS/SCTP + first chunk), which over a high-RTT relay routinely exceeds
+        // the 6 s flowing-transfer threshold. Charging that one-time setup as a
+        // stall makes the watchdog tear down and rebuild the link, and the rebuild
+        // re-exceeds 6 s -> a repair loop that delivers zero bytes (the very hang
+        // it exists to prevent). Give a generous grace until bytes flow; the tight
+        // stall_ms applies only once the transport has moved its first byte.
+        let threshold = if transport.map(|t| t.has_flowed()).unwrap_or(true) {
+            net::stall_ms()
+        } else {
+            net::establish_grace_ms()
+        };
 
         // FLOWING again: a transport exists and moved a byte within the window.
         // This is the ONLY thing that clears an open episode, so the brief
