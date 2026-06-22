@@ -66,6 +66,16 @@ ASYNC_MODE = os.environ.get("FIL_ASYNC_MODE", "threading")
 # reconnects with a fresh sid, and triggers a stale-answer negotiation glare —
 # the gate-6/12 flake — so the test fixture overrides FIL_PING_TIMEOUT
 # generously to keep a briefly-starved tab connected.
+# engine.io caps how many packets one HTTP long-poll payload may carry
+# (default 16). A high-RTT browser on the polling transport batches its queued
+# signaling messages into a single POST; during a candidate burst (parallel
+# srflx gather + multiple ICE candidates + the offer) that easily exceeds 16,
+# and engine.io rejects the WHOLE payload with "Too many packets in payload" —
+# silently dropping a batch of offers/candidates so establishment stalls or
+# never completes. Raise the cap; signaling payloads are tiny so this is cheap.
+from engineio.payload import Payload as _EioPayload
+_EioPayload.max_decode_packets = int(os.environ.get("FIL_MAX_DECODE_PACKETS", "250"))
+
 socketio = SocketIO(
     app,
     async_mode=ASYNC_MODE,
