@@ -30,3 +30,4 @@ htmlcov
 .idea
 *.log
 tmp/
+deploy/coturn/*.pem
