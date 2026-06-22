@@ -1410,7 +1410,8 @@ pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc
 /// bytes ride a unix socket instead of stdio, and the underlying QUIC/DC link is
 /// the daemon's already-established one, so signaling + establishment are skipped
 /// entirely. The remote acceptor is UNCHANGED: it serves this `l2-open` exactly
-/// as it serves a cold one.
+/// as it serves a cold one. Unix-only (the control socket is a unix-domain socket).
+#[cfg(unix)]
 pub(crate) async fn serve_local_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
     rport: u16,
@@ -1424,6 +1425,7 @@ pub(crate) async fn serve_local_stream<S: AsyncRead + AsyncWrite + Unpin + Send 
 /// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
 /// sock -> stdout. Exit when the remote half closes (sock read EOF), the same
 /// "session over" semantics the cold netcat path has; then abort the stdin pump.
+#[cfg(unix)]
 async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(sock);
     let writer = tokio::spawn(async move {
@@ -1445,6 +1447,8 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     // ride it (no signaling, no establishment, ~1s saved). Skipped under --relay
     // (the user forced a relay path; a warm link may be direct) and self-heals: any
     // miss / no daemon / dead stream falls through to a fresh establish below.
+    // Unix-only: the control socket is a unix-domain socket (no-op elsewhere).
+    #[cfg(unix)]
     if !relay {
         if let Some(sock) = crate::ctl::try_open(peer, rport).await {
             crate::ui::trace(&format!("filament: reusing warm link to '{peer}' (no establish)"));
@@ -1583,7 +1587,8 @@ fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
 
 /// Bidirectionally copy an accepted local TCP connection and a warm-reuse unix
 /// socket (the daemon bridges the unix socket to an L2 stream over its existing
-/// link). One copy per direction; either side's EOF ends the pair.
+/// link). One copy per direction; either side's EOF ends the pair. Unix-only.
+#[cfg(unix)]
 async fn bridge_streams(mut tcp: TcpStream, mut unix: tokio::net::UnixStream) -> std::io::Result<()> {
     tokio::io::copy_bidirectional(&mut tcp, &mut unix).await.map(|_| ())
 }
@@ -1611,12 +1616,15 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         }
     };
     crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
+    // Warm path is unix-only (control socket); elsewhere every connection is cold.
+    #[cfg(unix)]
     let mut warm = !relay; // try the daemon's warm link until proven unavailable
     let mut cold: Option<Arc<Mux>> = None; // lazily established fallback link
     loop {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
         // Warm path: bridge this connection straight to the daemon's link.
+        #[cfg(unix)]
         if warm {
             if let Some(usock) = crate::ctl::try_open(peer, rport).await {
                 tokio::spawn(async move {
