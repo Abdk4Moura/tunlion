@@ -25,6 +25,13 @@ services:
     env_file: .env
     environment:
       FIL_ASYNC_MODE: eventlet
+      # engine.io ping: the 10s/5s app default is too tight for slow/flaky
+      # high-RTT clients (e.g. residential ~2.7s signaling RTT), which get
+      # dropped and reconnect-storm. The liveness lease in signaling.py keeps
+      # ghosts out of rosters, so a longer window is safe. Tests already use
+      # 120/25 for exactly this reason.
+      FIL_PING_TIMEOUT: "60"
+      FIL_PING_INTERVAL: "25"
     expose:
       - "8000" # internal only — cloudflared reaches it as http://api:8000
     depends_on:
