@@ -6978,14 +6978,24 @@ async fn recv_cmd(
                     }
                     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                     let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                    // #4: a stable, browser-chosen session id binds reconnects to
-                    // the same persistent PTY. Absent (older client) -> fall back
-                    // to a per-sid id, which simply never reattaches (old behavior).
-                    let session_id = v["session"]
+                    // #4: a stable, client-chosen session id binds reconnects to
+                    // the same persistent PTY. DEVICE-SCOPED: prefixed with the
+                    // verified device so a client id from device A can never
+                    // address device B's session (no cross-device collision or
+                    // hijack) — the random per-invocation client id then only
+                    // needs to be unique per device. Absent (older client) -> a
+                    // per-sid id that never reattaches (old behavior).
+                    let session_id = match v["session"].as_str().filter(|s| !s.is_empty() && s.len() <= 128) {
+                        Some(s) => format!("{}\u{1}{}", dev.as_deref().unwrap_or(&pid), s),
+                        None => format!("{pid}:{sid:#x}"),
+                    };
+                    // $TERM forwarded by the client (so the remote matches the
+                    // user's actual terminal); validated + capped, sane default.
+                    let term = v["term"]
                         .as_str()
-                        .filter(|s| !s.is_empty() && s.len() <= 128)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("{pid}:{sid:#x}"));
+                        .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
+                        .unwrap_or("xterm-256color")
+                        .to_string();
                     let mux = l2_muxes
                         .entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
@@ -7040,6 +7050,7 @@ async fn recv_cmd(
                         sid,
                         cols,
                         rows,
+                        &term,
                         shell_argv(shell_user.as_deref()),
                         pty_guard,
                     )
