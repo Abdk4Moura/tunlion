@@ -467,6 +467,7 @@ pub async fn spawn_pty_session(
     sid: u32,
     cols: u16,
     rows: u16,
+    term: &str,
     argv: Vec<String>,
     pty_guard: PtyGuard,
 ) -> Option<PtySessionHandle> {
@@ -485,7 +486,7 @@ pub async fn spawn_pty_session(
     for a in &argv[1..] {
         cmd.arg(a);
     }
-    cmd.env("TERM", "xterm-256color");
+    cmd.env("TERM", if term.is_empty() { "xterm-256color" } else { term });
     // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
     // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
     // truecolor fine, so set this to get full-color output (verified: opencode
@@ -1536,17 +1537,29 @@ impl Drop for RawGuard {
     }
 }
 
-/// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
-/// terminal (the CLI sibling of the browser web-shell). When stdio is a real
-/// terminal this is a FULL interactive client: it sends the actual tty size (so
-/// TUIs render correctly, not at a stale 80x24), puts the local terminal in raw
-/// mode (so keystrokes + escape sequences reach the remote app), and forwards
-/// SIGWINCH as `pty-resize` so the remote PTY tracks window resizes. A non-tty
-/// stdio (a pipe, e.g. `echo cmd | filament pty`) keeps the plain cooked bridge
-/// for scripting.
-pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
-    use std::io::IsTerminal;
-    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
+/// Why a single PTY attach ended.
+enum PtyOutcome {
+    /// The remote shell exited (acceptor sent `l2-close` while the link was
+    /// healthy) — we are DONE, do not reconnect.
+    Exited,
+    /// The link died under us (transport not alive) — the remote PTY session may
+    /// still be alive on the acceptor; reconnect and REATTACH the same session.
+    Dropped,
+}
+
+/// One attach to the peer's PTY over a freshly-established link: open/reattach the
+/// `session_id`, bridge stdio, and return why it ended. Raw mode is owned by the
+/// caller (held across reconnects), so this only does size/resize/IO.
+async fn pty_attach_once(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    role: &'static str,
+    session_id: &str,
+    term: &str,
+    interactive: bool,
+) -> Result<PtyOutcome> {
+    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, role).await?;
     guard.forget();
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
@@ -1558,7 +1571,6 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     // Real terminal: query the ACTUAL tty size (crossterm asks the tty via
     // ioctl), NOT the COLUMNS/LINES shell vars which are usually unexported and
     // leave a TUI rendering at a stale size. Fall back to env/defaults for a pipe.
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let (cols, rows) = if interactive {
         crossterm::terminal::size().unwrap_or((80, 24))
     } else {
@@ -1567,17 +1579,18 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
             std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(24u16),
         )
     };
+    // `session` makes reconnects REATTACH the same shell (acceptor keys it per
+    // verified device); a fresh per-invocation id means two `filament pty` runs
+    // never collide. `term` is forwarded so the remote matches THIS terminal.
     mux.transport()
-        .send_control(&json!({ "type": "pty-open", "sid": sid, "cols": cols, "rows": rows }))
+        .send_control(&json!({
+            "type": "pty-open", "sid": sid, "session": session_id,
+            "cols": cols, "rows": rows, "term": term,
+        }))
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
 
-    // Raw mode AFTER the status lines print (so they aren't garbled), restored on
-    // every exit path by the guard's Drop.
-    let _raw = if interactive { Some(RawGuard::enable()?) } else { None };
-
-    // Forward terminal resizes to the remote PTY (the acceptor handles
-    // `pty-resize` -> master.resize). Unix-only; SIGWINCH has no Windows analog.
+    // Forward terminal resizes to the remote PTY (acceptor handles `pty-resize`).
     #[cfg(unix)]
     let winch = if interactive {
         let t_resize = mux.transport();
@@ -1619,25 +1632,104 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
         }
     });
 
+    // Stream remote output to stdout. End when the pipe closes (shell exit OR
+    // link death) — disambiguated by the transport's liveness. A 2s liveness
+    // poll is the backstop for a silent black-hole that never closes the pipe.
     let mut stdout = tokio::io::stdout();
-    while let Some(item) = rx_pipe.recv().await {
-        match item {
-            Some(bytes) => {
-                stdout.write_all(&bytes).await?;
-                stdout.flush().await?;
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    ticker.tick().await; // consume the immediate tick
+    let dropped;
+    loop {
+        tokio::select! {
+            item = rx_pipe.recv() => match item {
+                Some(Some(bytes)) => {
+                    stdout.write_all(&bytes).await?;
+                    stdout.flush().await?;
+                }
+                // Pipe closed: clean exit (l2-close, link still alive) vs drop.
+                _ => { dropped = !mux.transport().is_alive(); break; }
+            },
+            _ = ticker.tick() => {
+                if !mux.transport().is_alive() { dropped = true; break; }
             }
-            None => break,
         }
     }
-    let _ = reader.await;
+
+    reader.abort();
     #[cfg(unix)]
     if let Some(w) = winch {
         w.abort();
     }
     mux.drop_stream(sid).await;
-    let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
+    // Only send our own l2-close on a CLEAN exit. On a drop the link is gone and,
+    // crucially, an l2-close would tell the acceptor to END the session we want
+    // to reattach — so we stay silent and let it buffer for the reattach.
+    if !dropped {
+        let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
+    }
     pump.abort();
-    Ok(())
+    Ok(if dropped { PtyOutcome::Dropped } else { PtyOutcome::Exited })
+}
+
+/// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
+/// terminal (the CLI sibling of the browser web-shell). On a real terminal it is
+/// a FULL interactive client — real tty size, raw mode, SIGWINCH, $TERM — AND
+/// RESUMABLE: a per-invocation random session id lets a dropped link reconnect
+/// and reattach the SAME live shell (mosh/tmux-style, the acceptor replays its
+/// output buffer), so a flaky link (e.g. a Coder workspace reconnecting every
+/// ~90s) no longer loses the session. The session id lives only in THIS process,
+/// so a separate `filament pty` run always gets a fresh shell, never this one.
+/// A non-tty stdio (a pipe) keeps the plain cooked, non-resuming bridge.
+pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    // Random, per-invocation, in-memory only: distinct runs never collide; only
+    // THIS process's reconnects reattach (see the user's "same client" concern).
+    let session_id = crate::fresh_secret();
+    let term = std::env::var("TERM").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "xterm-256color".into());
+
+    // Raw mode for the WHOLE invocation (held across reconnects so a reattach
+    // doesn't flap the terminal), restored on every exit path by Drop.
+    let _raw = if interactive { Some(RawGuard::enable()?) } else { None };
+
+    let mut ever_connected = false;
+    let mut last_up = std::time::Instant::now();
+    let mut backoff = Duration::from_millis(300);
+    let mut role: &'static str = "init";
+    loop {
+        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive).await {
+            Ok(PtyOutcome::Exited) => return Ok(()),
+            Ok(PtyOutcome::Dropped) => {
+                // Non-tty (scripted) sessions don't resume; a drop is the end.
+                if !interactive {
+                    return Ok(());
+                }
+                ever_connected = true;
+                last_up = std::time::Instant::now();
+                backoff = Duration::from_millis(300);
+                role = "reconnect";
+                eprint!("\r\n\x1b[2m[filament: link dropped, reconnecting…]\x1b[0m\r\n");
+                continue;
+            }
+            Err(e) => {
+                // First connect failed (peer offline, no pair, ...): surface it.
+                if !ever_connected {
+                    return Err(e);
+                }
+                // A reconnect attempt failed. Keep trying until the acceptor would
+                // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);
+                // stop a bit under that so we don't reattach into a fresh shell.
+                if last_up.elapsed() > Duration::from_secs(150) {
+                    eprint!("\r\n\x1b[2m[filament: session expired, reconnect window passed]\x1b[0m\r\n");
+                    return Ok(());
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                role = "reconnect";
+                continue;
+            }
+        }
+    }
 }
 
 /// Build the user-facing message for the case where `filament forward` could
@@ -2140,6 +2232,7 @@ mod h1_tests {
             sid_a,
             80,
             24,
+            "xterm-256color",
             vec!["/bin/cat".to_string()],
             guard,
         )
