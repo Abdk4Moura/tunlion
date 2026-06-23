@@ -1550,6 +1550,7 @@ enum PtyOutcome {
 /// One attach to the peer's PTY over a freshly-established link: open/reattach the
 /// `session_id`, bridge stdio, and return why it ended. Raw mode is owned by the
 /// caller (held across reconnects), so this only does size/resize/IO.
+#[allow(clippy::too_many_arguments)]
 async fn pty_attach_once(
     server: &str,
     peer: &str,
@@ -1558,6 +1559,7 @@ async fn pty_attach_once(
     session_id: &str,
     term: &str,
     interactive: bool,
+    raw: &mut Option<RawGuard>,
 ) -> Result<PtyOutcome> {
     let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, role).await?;
     guard.forget();
@@ -1589,6 +1591,15 @@ async fn pty_attach_once(
         }))
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
+
+    // Enable raw mode LAZILY, AFTER the establishment status lines have printed in
+    // cooked mode (so `\n` still does CR+LF and they don't "staircase"). Held in
+    // the caller's scope so it persists across reconnects and is restored on exit.
+    // On a reconnect raw is already on; the acceptor's buffer replay redraws the
+    // screen cleanly anyway.
+    if interactive && raw.is_none() {
+        *raw = Some(RawGuard::enable()?);
+    }
 
     // Forward terminal resizes to the remote PTY (acceptor handles `pty-resize`).
     #[cfg(unix)]
@@ -1688,16 +1699,17 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     let session_id = crate::fresh_secret();
     let term = std::env::var("TERM").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "xterm-256color".into());
 
-    // Raw mode for the WHOLE invocation (held across reconnects so a reattach
-    // doesn't flap the terminal), restored on every exit path by Drop.
-    let _raw = if interactive { Some(RawGuard::enable()?) } else { None };
+    // Raw mode is held for the WHOLE invocation (enabled lazily inside the first
+    // attach, AFTER its status lines, so they don't staircase), persists across
+    // reconnects, and is restored on every exit path by this guard's Drop.
+    let mut raw: Option<RawGuard> = None;
 
     let mut ever_connected = false;
     let mut last_up = std::time::Instant::now();
     let mut backoff = Duration::from_millis(300);
     let mut role: &'static str = "init";
     loop {
-        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive).await {
+        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive, &mut raw).await {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Dropped) => {
                 // Non-tty (scripted) sessions don't resume; a drop is the end.
