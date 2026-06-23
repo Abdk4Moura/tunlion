@@ -2905,9 +2905,12 @@ impl Conn {
             }
         };
         tokio::spawn(async move {
-            // rung-1: direct-dial QUIC over host candidates (UNCHANGED).
+            // rung-1: direct-dial QUIC over host candidates. answerer=true: this
+            // is on_transport_offer (the side whose daemon received the offer), so
+            // it allocates from the high L2 sid half (the connector side uses the
+            // low half) — keeps the two ends' sids disjoint.
             if let Some(t) =
-                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone()).await
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone(), true).await
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
@@ -2926,6 +2929,7 @@ impl Conn {
                         &secret,
                         pid_s.clone(),
                         tx.clone(),
+                        true, // answerer (same on_transport_offer/acceptor side)
                     )
                     .await
                     {

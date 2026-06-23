@@ -325,6 +325,16 @@ pub trait Transport: Send + Sync {
         self.flush().await
     }
     fn max_payload(&self) -> usize;
+    /// Which half of the L2 sid space THIS end allocates from. Both ends of a
+    /// link MUST return opposite values (derived from the deterministic `polite`
+    /// role) so a sid this end allocates can never equal one the peer allocated —
+    /// otherwise, when BOTH ends open L2 streams on one link (e.g. a pty plus a
+    /// warm-reuse forward sharing the up-daemon's link), their sids collide and
+    /// frames cross between unrelated tunnels. Default `false` (the low half);
+    /// real transports return the role-derived bit.
+    fn sid_answerer(&self) -> bool {
+        false
+    }
     /// Milliseconds since this link last moved a byte. `u64::MAX` means "no
     /// activity tracked / idle forever", the safe default, so an untracked
     /// transport never blocks a supersede. Backs the #28 data-flow guard.
@@ -382,6 +392,10 @@ pub struct DataChannelTransport {
     // before-first-byte establishment grace (a link awaiting its first chunk over
     // a high-RTT relay is establishing, not stalled).
     first_data: Arc<std::sync::atomic::AtomicBool>,
+    // The `polite` role for this link (opposite on the two ends). Selects which
+    // half of the L2 sid space this end allocates from, so the two ends never
+    // collide (Transport::sid_answerer).
+    answerer: bool,
 }
 
 impl DataChannelTransport {
@@ -466,6 +480,10 @@ impl Transport for DataChannelTransport {
 
     fn has_flowed(&self) -> bool {
         self.first_data.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn sid_answerer(&self) -> bool {
+        self.answerer
     }
 }
 
@@ -1064,7 +1082,7 @@ impl Peer {
 
         if !polite {
             let dc = pc.create_data_channel("filament", None).await?;
-            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone()).await;
+            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone(), polite).await;
             let offer = pc.create_offer(None).await?;
             pc.set_local_description(offer).await?;
             let ld = pc
@@ -1086,7 +1104,7 @@ impl Peer {
                 let closed = closed.clone();
                 let pid = pid.clone();
                 Box::pin(async move {
-                    wire_channel(pid, dc, tx, closed).await;
+                    wire_channel(pid, dc, tx, closed, polite).await;
                 })
             }));
         }
@@ -1366,6 +1384,7 @@ async fn wire_channel(
     dc: Arc<RTCDataChannel>,
     tx: mpsc::UnboundedSender<Ev>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    polite: bool,
 ) {
     // With detach_data_channels(), on_open still fires but webrtc-rs's
     // managed (65535-byte-buffer) read loop never starts, we detach and run
@@ -1454,7 +1473,7 @@ async fn wire_channel(
 
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 let transport: Arc<dyn Transport> =
-                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity, first_data });
+                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity, first_data, answerer: polite });
                 let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
             }
         })
