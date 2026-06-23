@@ -1518,11 +1518,34 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     Ok(())
 }
 
+/// RAII guard: put the local terminal in raw mode for an interactive PTY and
+/// ALWAYS restore cooked mode on drop (normal exit, error, or `?`). Without raw
+/// mode the local tty line-buffers + echoes and swallows control keys, so a
+/// remote TUI (claude/opencode/vim/htop) can't receive keystrokes or escape
+/// sequences and renders unusable.
+struct RawGuard;
+impl RawGuard {
+    fn enable() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(RawGuard)
+    }
+}
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 /// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
-/// process's stdio (the CLI sibling of the browser terminal). No local raw-mode
-/// or resize handling yet, primarily a test/diagnostic of the PTY session
-/// acceptor; the browser is the polished client.
+/// terminal (the CLI sibling of the browser web-shell). When stdio is a real
+/// terminal this is a FULL interactive client: it sends the actual tty size (so
+/// TUIs render correctly, not at a stale 80x24), puts the local terminal in raw
+/// mode (so keystrokes + escape sequences reach the remote app), and forwards
+/// SIGWINCH as `pty-resize` so the remote PTY tracks window resizes. A non-tty
+/// stdio (a pipe, e.g. `echo cmd | filament pty`) keeps the plain cooked bridge
+/// for scripting.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
+    use std::io::IsTerminal;
     let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
     guard.forget();
     let mux = Mux::new(t);
@@ -1531,14 +1554,50 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     diag.enter(crate::diag::Phase::L2Open);
     let sid = mux.alloc_sid();
     let mut rx_pipe = mux.register(sid).await;
-    let (cols, rows) = (
-        std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80u16),
-        std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(24u16),
-    );
+
+    // Real terminal: query the ACTUAL tty size (crossterm asks the tty via
+    // ioctl), NOT the COLUMNS/LINES shell vars which are usually unexported and
+    // leave a TUI rendering at a stale size. Fall back to env/defaults for a pipe.
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let (cols, rows) = if interactive {
+        crossterm::terminal::size().unwrap_or((80, 24))
+    } else {
+        (
+            std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80u16),
+            std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(24u16),
+        )
+    };
     mux.transport()
         .send_control(&json!({ "type": "pty-open", "sid": sid, "cols": cols, "rows": rows }))
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
+
+    // Raw mode AFTER the status lines print (so they aren't garbled), restored on
+    // every exit path by the guard's Drop.
+    let _raw = if interactive { Some(RawGuard::enable()?) } else { None };
+
+    // Forward terminal resizes to the remote PTY (the acceptor handles
+    // `pty-resize` -> master.resize). Unix-only; SIGWINCH has no Windows analog.
+    #[cfg(unix)]
+    let winch = if interactive {
+        let t_resize = mux.transport();
+        Some(tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while sig.recv().await.is_some() {
+                if let Ok((c, r)) = crossterm::terminal::size() {
+                    let _ = t_resize
+                        .send_control(&json!({ "type": "pty-resize", "sid": sid, "cols": c, "rows": r }))
+                        .await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     let t_in = mux.transport();
     let reader = tokio::spawn(async move {
@@ -1571,6 +1630,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
         }
     }
     let _ = reader.await;
+    #[cfg(unix)]
+    if let Some(w) = winch {
+        w.abort();
+    }
     mux.drop_stream(sid).await;
     let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
     pump.abort();
