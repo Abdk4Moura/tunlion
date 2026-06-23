@@ -575,6 +575,9 @@ pub struct DirectTransport {
     send: Arc<Mutex<SendStream>>,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// The deterministic `polite` role for this link (opposite on the two ends);
+    /// selects this end's L2 sid half so the two ends never collide.
+    answerer: bool,
     /// Running count of file-data bytes this transport has written. Only read by
     /// the data-path-freeze PROOF hook (`freeze_after_bytes`); compiled out
     /// entirely unless `--features test-hooks` is set.
@@ -789,6 +792,10 @@ impl Transport for DirectTransport {
         MAX_DIRECT_PAYLOAD
     }
 
+    fn sid_answerer(&self) -> bool {
+        self.answerer
+    }
+
     fn idle_ms(&self) -> u64 {
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return u64::MAX;
@@ -868,6 +875,7 @@ fn make_transport(
     send: SendStream,
     recv: RecvStream,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    answerer: bool,
 ) -> Arc<dyn Transport> {
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -877,6 +885,7 @@ fn make_transport(
         send: Arc::new(Mutex::new(send)),
         last_activity,
         dead,
+        answerer,
         #[cfg(feature = "test-hooks")]
         sent_data: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "test-hooks")]
@@ -902,8 +911,9 @@ pub async fn race_connect(
     secret: &str,
     peer_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
-    race_connect_labeled(endpoint, peer_cands, secret, peer_id, tx, "direct-quic").await
+    race_connect_labeled(endpoint, peer_cands, secret, peer_id, tx, "direct-quic", answerer).await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -916,6 +926,13 @@ pub async fn race_connect_labeled(
     peer_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
+    // Which L2 sid half THIS end allocates from (Transport::sid_answerer). It is
+    // the application-level role, NOT the QUIC race outcome (simultaneous open can
+    // let both ends win as dialer): the side that ran the command (`bring_up`,
+    // connector) passes false; the side whose daemon received the transport-offer
+    // (`on_transport_offer`, acceptor) passes true. Opposite on the two ends, so
+    // their sids never collide.
+    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
     // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
     // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2, a
@@ -1016,7 +1033,7 @@ pub async fn race_connect_labeled(
             drop(endpoint);
         });
     }
-    Some(make_transport(peer_id, conn, send, recv, tx))
+    Some(make_transport(peer_id, conn, send, recv, tx, answerer))
 }
 
 #[cfg(test)]

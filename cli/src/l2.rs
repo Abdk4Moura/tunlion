@@ -127,7 +127,7 @@ impl Mux {
         Arc::new(Mux {
             transport: t,
             streams: Mutex::new(HashMap::new()),
-            next_sid: AtomicU32::new(L2_SID_BASE),
+            next_sid: AtomicU32::new(0),
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
         })
@@ -138,10 +138,16 @@ impl Mux {
     }
 
     fn alloc_sid(&self) -> u32 {
-        // Wrap inside the high half so a long-lived link never escapes back into
-        // the low (file-transfer) range.
-        let raw = self.next_sid.fetch_add(1, Ordering::Relaxed);
-        raw | L2_SID_BASE
+        // Mask the counter to the low 30 bits so a long-lived link never escapes
+        // into the L2 flag (0x80000000) OR the answerer-role bit (0x40000000).
+        // The role bit keeps the two ends' sid spaces DISJOINT: each end allocates
+        // with its own bit (opposite the peer's, via the deterministic `polite`
+        // role), so a sid this end allocates can never equal one the peer
+        // allocated — preventing cross-tunnel frame collisions when both ends open
+        // L2 streams on one link (pty + warm-reuse forward, etc.).
+        let n = self.next_sid.fetch_add(1, Ordering::Relaxed) & 0x3FFF_FFFF;
+        let role = if self.transport.sid_answerer() { 0x4000_0000 } else { 0 };
+        n | L2_SID_BASE | role
     }
 
     /// Register a stream's inbound pipe and return the receiver the socket-writer
@@ -1126,7 +1132,9 @@ async fn bring_up_to_known(
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
-                                ep, peer_cands, &secret, pid.clone(), tx.clone(), "direct-quic",
+                                // answerer=false: this is bring_up (the connector
+                                // side), so it allocates the low L2 sid half.
+                                ep, peer_cands, &secret, pid.clone(), tx.clone(), "direct-quic", false,
                             )
                             .await
                             {
