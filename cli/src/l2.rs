@@ -359,6 +359,17 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 /// without letting an abandoned-but-not-reaped session hoard memory.
 pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 
+/// Terminal-mode reset emitted to the client right AFTER a reattach replay.
+/// A TUI that gets cut off mid-run (link drop, then the app dies before it can
+/// emit its own disable) leaves the client terminal stuck in mouse-reporting
+/// mode: every trackpad move then spews escape codes onto the shell line, which
+/// also wedges readline so Ctrl-U / Alt-Backspace stop parsing. Clearing the
+/// mouse modes after the replay heals that; a TUI that is STILL alive re-enables
+/// the mouse on its next redraw. Deliberately ONLY mouse modes (X10/normal/
+/// button/any-motion + SGR + urxvt ext), never cursor-key or keypad modes, so a
+/// reattach never disturbs arrow keys.
+pub const PTY_REATTACH_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
+
 /// A detached session (channel dropped, nobody reattached) is reaped after this.
 /// Long enough to ride out a mobile network handoff / tab suspend, short enough
 /// that a closed laptop does not leave a root shell alive for hours.
@@ -601,6 +612,12 @@ pub async fn spawn_pty_session(
                                 ok = false;
                                 break;
                             }
+                        }
+                        // Heal a mouse-reporting mode a cut-off TUI left stuck on
+                        // the client (see PTY_REATTACH_RESET): sent after the
+                        // replay so it is the last word on terminal state.
+                        if ok && transport.send_frame(sid, PTY_REATTACH_RESET).await.is_err() {
+                            ok = false;
                         }
                         if ok {
                             bind = Some(OutBind { transport, sid });
