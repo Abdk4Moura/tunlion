@@ -4104,63 +4104,154 @@ async fn next_ev(
     }
 }
 
-/// Non-unix: warm-link reuse is unavailable (no control socket), so `ctl::Req` is
-/// uninhabited and this is never reached; it exists to keep the loop portable.
+/// Per-peer-link map keyed by warm-pty `session` -> (pid, sid), so a later
+/// `pty-resize` op can relay to the right stream. Shared between the event loop
+/// (lookup) and the spawned bridge tasks (insert/remove). Inert on non-unix.
+type WarmPtys = std::sync::Arc<std::sync::Mutex<HashMap<String, (String, u32)>>>;
+
+/// Dispatch one warm-reuse control request to the right handler. Warm reuse is
+/// unix-only (the control socket is a unix-domain socket); on non-unix `ctl::Req`
+/// is uninhabited so this is never reached — it only keeps the event loop portable.
 #[cfg(not(unix))]
-async fn handle_warm_open(
+async fn handle_warm_req(
     _conn: &Conn,
     _l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    _warm_ptys: &WarmPtys,
     req: ctl::Req,
 ) {
     match req {}
 }
 
-/// Warm-link reuse: a sibling process asked to reach `req.peer:req.rport`. If we
-/// hold a trusted, live link to that peer, open a NEW L2 stream over it and bridge
-/// the sibling's unix socket to it, skipping the sibling's own establishment. The
-/// remote acceptor serves this `l2-open` exactly as a cold one (and re-verifies
-/// trust). On any miss we `reject`, and the sibling falls back to a fresh dial.
 #[cfg(unix)]
-async fn handle_warm_open(
+async fn handle_warm_req(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    warm_ptys: &WarmPtys,
     req: ctl::Req,
 ) {
-    // Resolve the peer NAME (matched case-insensitively on the proven
-    // `verified_name`, the same key the L2 cap gate uses) to a trusted link with a
-    // live transport. Prefer a DIRECT link over a relay one: faster, and it honors
-    // "reuse never traps you on a worse path than a fresh dial would pick".
-    let chosen = conn
-        .links
+    match &req.kind {
+        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, req).await,
+        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, req).await,
+        ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
+    }
+}
+
+#[cfg(unix)]
+
+/// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
+/// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
+/// direct one. The single resolver for every warm-reuse op (open + pty), so the
+/// eligibility rule lives in exactly one place. A miss means the caller falls
+/// back to a fresh establish, which is correct.
+fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transport>)> {
+    conn.links
         .iter()
         .filter(|(_, l)| {
             l.trusted
-                // Only reuse a link whose transport is actually ALIVE; a zombie
-                // (NAT-dead / departed peer not yet torn down) would otherwise open
-                // a dead stream and the client could not fall back. A miss here
-                // makes the client establish fresh, which is correct.
                 && l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
-                && l.verified_name
-                    .as_deref()
-                    .map(|n| n.eq_ignore_ascii_case(&req.peer))
-                    .unwrap_or(false)
+                && l.verified_name.as_deref().map(|n| n.eq_ignore_ascii_case(peer)).unwrap_or(false)
         })
         .max_by_key(|(_, l)| l.direct as u8)
-        .map(|(pid, l)| (pid.clone(), l.transport.clone().unwrap()));
-    let Some((pid, t)) = chosen else {
+        .map(|(pid, l)| (pid.clone(), l.transport.clone().unwrap()))
+}
+
+/// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
+/// is diagnosable (visible at `-v` / FILAMENT_LOG=debug only).
+#[cfg(unix)]
+fn log_warm_miss(conn: &Conn, peer: &str) {
+    for (p, l) in conn.links.iter() {
+        ui::debug(&format!(
+            "warm-miss '{peer}': pid={p} name={:?} verified={:?} trusted={} has_transport={} alive={} direct={}",
+            l.name, l.verified_name, l.trusted,
+            l.transport.is_some(),
+            l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false),
+            l.direct,
+        ));
+    }
+}
+
+/// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
+/// bridge it to the client's unix socket (netcat/ssh/forward fast path).
+#[cfg(unix)]
+async fn handle_warm_open(conn: &Conn, l2_muxes: &mut HashMap<String, Arc<l2::Mux>>, req: ctl::Req) {
+    let ctl::ReqKind::Open { peer, rport } = &req.kind else { return };
+    let (peer, rport) = (peer.clone(), *rport);
+    let Some((pid, t)) = warm_link_for(conn, &peer) else {
+        log_warm_miss(conn, &peer);
         req.reject("no warm link to that peer").await;
         return;
     };
-    // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to, so
-    // the new stream shares its sid space and `streams` table.
+    // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
     let mux = l2_muxes.entry(pid).or_insert_with(|| l2::Mux::new(t)).clone();
-    let rport = req.rport;
     let sock = req.accept().await;
     tokio::spawn(async move {
         if let Err(e) = l2::serve_local_stream(mux, rport, sock).await {
             ui::trace(&format!("filament: warm stream failed: {e}"));
         }
     });
+}
+
+/// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
+/// client's stdio socket (the `filament pty` fast path). Records the session->sid
+/// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
+#[cfg(unix)]
+async fn handle_warm_pty(
+    conn: &Conn,
+    l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    warm_ptys: &WarmPtys,
+    req: ctl::Req,
+) {
+    let ctl::ReqKind::Pty { peer, session, cols, rows, term } = &req.kind else { return };
+    let (peer, session, cols, rows, term) = (peer.clone(), session.clone(), *cols, *rows, term.clone());
+    let Some((pid, t)) = warm_link_for(conn, &peer) else {
+        log_warm_miss(conn, &peer);
+        req.reject("no warm link to that peer").await;
+        return;
+    };
+    let mux = l2_muxes.entry(pid.clone()).or_insert_with(|| l2::Mux::new(t)).clone();
+    let (sid, rx_pipe) = match l2::open_pty_stream(&mux, &session, cols, rows, &term).await {
+        Ok(v) => v,
+        Err(e) => {
+            req.reject(&format!("pty-open failed: {e}")).await;
+            return;
+        }
+    };
+    if let Ok(mut m) = warm_ptys.lock() {
+        m.insert(session.clone(), (pid, sid));
+    }
+    let sock = req.accept().await;
+    let warm_ptys = warm_ptys.clone();
+    tokio::spawn(async move {
+        l2::serve_opened_stream(mux, sid, sock, rx_pipe).await;
+        // Bridge ended (shell exit / client gone / link drop): drop our entry,
+        // but only if it is still ours (a reconnect may have replaced it).
+        if let Ok(mut m) = warm_ptys.lock() {
+            if m.get(&session).map(|(_, s)| *s == sid).unwrap_or(false) {
+                m.remove(&session);
+            }
+        }
+    });
+}
+
+/// Warm-reuse: relay a window-size change to an already-open warm PTY (by session).
+#[cfg(unix)]
+async fn handle_warm_resize(
+    l2_muxes: &HashMap<String, Arc<l2::Mux>>,
+    warm_ptys: &WarmPtys,
+    req: ctl::Req,
+) {
+    let ctl::ReqKind::Resize { session, cols, rows } = &req.kind else { return };
+    let (cols, rows) = (*cols, *rows);
+    let target = warm_ptys.lock().ok().and_then(|m| m.get(session).cloned());
+    if let Some((pid, sid)) = target {
+        if let Some(mux) = l2_muxes.get(&pid) {
+            let _ = mux
+                .transport()
+                .send_control(&json!({ "type": "pty-resize", "sid": sid, "cols": cols, "rows": rows }))
+                .await;
+        }
+    }
+    req.accept().await; // close the client's short connection cleanly
 }
 
 #[tokio::main]
@@ -5924,6 +6015,8 @@ async fn recv_cmd(
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
+    // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
+    let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
     // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
@@ -6017,7 +6110,7 @@ async fn recv_cmd(
             // a non-daemon this branch pends forever (ctl_tx held, serve unspawned).
             req = ctl_rx.recv() => {
                 if let Some(req) = req {
-                    handle_warm_open(&conn, &mut l2_muxes, req).await;
+                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, req).await;
                 }
                 None
             }

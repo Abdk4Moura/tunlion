@@ -1417,6 +1417,41 @@ pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc
     Ok((sid, rx))
 }
 
+/// WARM pty (daemon side): open a PTY on the peer over an EXISTING link's `mux`,
+/// sending `pty-open` (vs `open_stream`'s `l2-open`). Returns the sid + inbound
+/// pipe; the caller bridges with `serve_opened_stream` and relays `pty-resize` by
+/// the sid. `session` keys the peer's persistent PTY so a reconnect reattaches.
+/// The remote acceptor serves this exactly as a cold `pty-open`.
+pub(crate) async fn open_pty_stream(
+    mux: &Arc<Mux>,
+    session: &str,
+    cols: u16,
+    rows: u16,
+    term: &str,
+) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
+    let sid = mux.alloc_sid();
+    let rx = mux.register(sid).await;
+    mux.transport
+        .send_control(&json!({
+            "type": "pty-open", "sid": sid, "session": session, "cols": cols, "rows": rows, "term": term
+        }))
+        .await?;
+    Ok((sid, rx))
+}
+
+/// Bridge an already-opened L2 stream (`sid` + its inbound `rx`) to a local
+/// `stream` (the warm pty client's unix socket), running to completion (stream
+/// EOF or peer FIN). The daemon's warm-pty path uses this after `open_pty_stream`.
+#[cfg(unix)]
+pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mux: Arc<Mux>,
+    sid: u32,
+    stream: S,
+    rx: mpsc::Receiver<PipeItem>,
+) {
+    serve_stream(mux, sid, stream, rx, true).await;
+}
+
 /// WARM-LINK REUSE (daemon side): open a NEW L2 stream to `rport` over an
 /// EXISTING peer link (its `mux`) and bridge it to a local `stream` (a unix
 /// socket from a sibling `filament netcat`/`ssh`/`forward` process). This is the
@@ -1690,6 +1725,47 @@ async fn pty_attach_once(
     Ok(if dropped { PtyOutcome::Dropped } else { PtyOutcome::Exited })
 }
 
+/// Warm fast path for `filament pty`: if the local daemon already holds a link to
+/// `peer`, open the PTY over it (via the control socket) and bridge this process's
+/// stdio to it — raw mode + SIGWINCH forwarded as a `resize` op. Returns
+/// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
+/// warm-link drop -> we exit), or `None` when there is no warm link, so the caller
+/// falls through to the cold resumable path. Unix-only (the control socket is unix).
+#[cfg(unix)]
+async fn try_warm_pty(
+    peer: &str,
+    session: &str,
+    term: &str,
+    raw: &mut Option<RawGuard>,
+) -> Option<Result<()>> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let sock = crate::ctl::try_pty(peer, session, cols, rows, term).await?; // None = no warm link
+    crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for pty (no establish)"));
+    if raw.is_none() {
+        match RawGuard::enable() {
+            Ok(g) => *raw = Some(g),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    // Forward SIGWINCH as a `resize` control op (a fresh short connection each time).
+    let session_owned = session.to_string();
+    let winch = tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig = match signal(SignalKind::window_change()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        while sig.recv().await.is_some() {
+            if let Ok((c, r)) = crossterm::terminal::size() {
+                crate::ctl::try_resize(&session_owned, c, r).await;
+            }
+        }
+    });
+    let r = pump_stdio_over(sock).await;
+    winch.abort();
+    Some(r)
+}
+
 /// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
 /// terminal (the CLI sibling of the browser web-shell). On a real terminal it is
 /// a FULL interactive client — real tty size, raw mode, SIGWINCH, $TERM — AND
@@ -1711,6 +1787,19 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     // attach, AFTER its status lines, so they don't staircase), persists across
     // reconnects, and is restored on every exit path by this guard's Drop.
     let mut raw: Option<RawGuard> = None;
+
+    // WARM FAST PATH: if the local `up` daemon already holds a (verified, direct)
+    // link to `peer`, open the PTY over it — no signaling, no establishment, ~0.2s
+    // instead of seconds. A miss / no daemon / no warm link falls through to the
+    // cold resumable path below. Skipped under --relay (the user forced relay; a
+    // warm link may be direct) and for non-tty stdio (scripted). Resumability
+    // lives on the cold path, where flaky peers (no warm link) need it anyway.
+    #[cfg(unix)]
+    if interactive && !relay {
+        if let Some(r) = try_warm_pty(peer, &session_id, &term, &mut raw).await {
+            return r;
+        }
+    }
 
     let mut ever_connected = false;
     let mut last_up = std::time::Instant::now();
