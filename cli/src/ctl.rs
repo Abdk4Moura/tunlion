@@ -46,7 +46,7 @@ pub fn reuse_disabled() -> bool {
 }
 
 #[cfg(unix)]
-pub use imp::{serve, serve_at, try_open, try_open_at, Req};
+pub use imp::{serve, serve_at, try_open, try_open_at, try_pty, try_resize, Req, ReqKind};
 
 #[cfg(not(unix))]
 pub use stub::Req;
@@ -114,14 +114,58 @@ mod imp {
         }
     }
 
+    /// Try to open a PTY shell on `peer` THROUGH a local daemon's warm link.
+    /// On success returns the socket bridging this process's stdio to the warm
+    /// PTY stream; `None` (no daemon / no warm link) means fall back to a fresh
+    /// establish. `session` keys the peer's persistent PTY for reattach.
+    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str) -> Option<UnixStream> {
+        if reuse_disabled() {
+            return None;
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = read_line(&mut s, 4096).await.ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(s)
+    }
+
+    /// Relay a window-size change to an already-open warm PTY (by `session`),
+    /// over a fresh short control connection. Best-effort and fire-and-forget.
+    pub async fn try_resize(session: &str, cols: u16, rows: u16) {
+        if reuse_disabled() {
+            return;
+        }
+        let Ok(mut s) = UnixStream::connect(control_sock_path()).await else { return };
+        let req = json!({ "op": "resize", "session": session, "cols": cols, "rows": rows });
+        if let Ok(mut line) = serde_json::to_vec(&req) {
+            line.push(b'\n');
+            let _ = s.write_all(&line).await;
+            let _ = s.flush().await;
+        }
+    }
+
     // ----------------------------------------------------------------- daemon -
 
-    /// A parsed open request handed to the daemon's event loop, which owns the
-    /// link table and the per-peer muxes. The loop resolves `peer` to a warm link
-    /// and then `accept()`s (bridging `sock`) or `reject()`s.
+    /// What a warm-reuse client is asking the daemon to do over its warm link.
+    pub enum ReqKind {
+        /// Open one raw L2 stream to `peer`'s localhost:`rport` (netcat/ssh/forward).
+        Open { peer: String, rport: u16 },
+        /// Open a PTY shell on `peer` (the warm pty fast path). `session` keys the
+        /// peer's persistent PTY so a later reconnect reattaches the same shell.
+        Pty { peer: String, session: String, cols: u16, rows: u16, term: String },
+        /// Relay a window-size change to an already-open warm PTY (by `session`).
+        Resize { session: String, cols: u16, rows: u16 },
+    }
+
+    /// A parsed request handed to the daemon's event loop, which owns the link
+    /// table and the per-peer muxes. The loop dispatches on `kind` and then
+    /// `accept()`s (bridging `sock`) or `reject()`s.
     pub struct Req {
-        pub peer: String,
-        pub rport: u16,
+        pub kind: ReqKind,
         pub sock: UnixStream,
     }
 
@@ -179,12 +223,29 @@ mod imp {
                     Ok(v) => v,
                     Err(_) => return,
                 };
-                if v["op"].as_str() != Some("open") {
-                    return;
-                }
-                let Some(peer) = v["peer"].as_str().map(|s| s.to_string()) else { return };
-                let Some(rport) = v["rport"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
-                let _ = tx.send(Req { peer, rport, sock });
+                let kind = match v["op"].as_str() {
+                    Some("open") => {
+                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
+                        let Some(rport) = v["rport"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
+                        ReqKind::Open { peer, rport }
+                    }
+                    Some("pty") => {
+                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
+                        let Some(session) = v["session"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string) else { return };
+                        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                        let term = v["term"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).unwrap_or("xterm-256color").to_string();
+                        ReqKind::Pty { peer, session, cols, rows, term }
+                    }
+                    Some("resize") => {
+                        let Some(session) = v["session"].as_str().map(str::to_string) else { return };
+                        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                        ReqKind::Resize { session, cols, rows }
+                    }
+                    _ => return,
+                };
+                let _ = tx.send(Req { kind, sock });
             });
         }
     }
@@ -211,8 +272,13 @@ mod imp {
             let client = tokio::spawn(async move { try_open_at(&p, "popos", 22).await });
 
             let req = rx.recv().await.expect("request reached the loop");
-            assert_eq!(req.peer, "popos");
-            assert_eq!(req.rport, 22);
+            match &req.kind {
+                ReqKind::Open { peer, rport } => {
+                    assert_eq!(peer, "popos");
+                    assert_eq!(*rport, 22);
+                }
+                _ => panic!("expected an Open request"),
+            }
             let mut daemon_side = req.accept().await;
 
             let mut client_side = client.await.unwrap().expect("client got ok");
