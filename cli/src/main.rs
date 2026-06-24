@@ -6826,6 +6826,33 @@ async fn recv_cmd(
                         ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                 }
+                // Warm-reuse readiness: proactively prove our identity to a KNOWN
+                // peer on a RELAY/WebRTC link (a DIRECT link is born-verified at
+                // adoption, so it skips this). `send_cmd` already does this on its
+                // active transfer link (the ChannelReady proof ~5205); the daemon
+                // must too, otherwise a passively-held link reaches `✓` but neither
+                // end ever sets `verified_name`, so `warm_link_for` rejects it and
+                // the FIRST ssh/pty/netcat to an idle paired peer eats a full cold
+                // establish. Symmetric by construction: both daemons send, both
+                // verify (the `pair-proof` handler below), both can then warm-reuse.
+                // No guard, mirroring send_cmd: re-proving on a reconnect is
+                // harmless and just refreshes trust.
+                let proof_creds = conn.link(&pid).and_then(|l| {
+                    if l.direct {
+                        return None;
+                    }
+                    let (_n, sec) = l.expected_secret.clone()?;
+                    Some((sec, l.uid.clone().unwrap_or_default(), l.peer.clone()))
+                });
+                if let Some((sec, uid, peer)) = proof_creds {
+                    if let Some((my_fp, their_fp)) = match peer {
+                        Some(p) => p.fingerprints().await,
+                        None => None,
+                    } {
+                        let mac = proof_for(&sec, &conn.my_uid, &conn.my_uid, &uid, &my_fp, &their_fp);
+                        let _ = t.send_control(&json!({ "type": "pair-proof", "mac": mac })).await;
+                    }
+                }
                 // L1-a: on the `recv <code>` path, this peer is a CANDIDATE sender.
                 // Mint its own ephemeral ceremony (bounded) and arm its per-peer
                 // budget plus the overall backstop. The progression block (top of
