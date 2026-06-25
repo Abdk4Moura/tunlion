@@ -4140,7 +4140,17 @@ async fn handle_warm_req(
 }
 
 #[cfg(unix)]
+/// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
+/// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
+/// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
+/// link would open a stream into a black hole and hang. So past this idle window
+/// we refuse to warm-reuse a non-direct link and fall back to a fresh establish
+/// (correct, just not free). Direct links are exempt: the 7s keepalive keeps them
+/// genuinely alive across idle gaps, and their `idle_ms()` is unreliable here
+/// anyway (quinn keepalive frames don't stamp last_activity).
+const WARM_RELAY_STALE_MS: u64 = 8_000;
 
+#[cfg(unix)]
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
 /// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
 /// direct one. The single resolver for every warm-reuse op (open + pty), so the
@@ -4151,8 +4161,12 @@ fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transp
         .iter()
         .filter(|(_, l)| {
             l.trusted
-                && l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
                 && l.verified_name.as_deref().map(|n| n.eq_ignore_ascii_case(peer)).unwrap_or(false)
+                && l.transport.as_ref().map(|t| {
+                    // Alive, AND (direct OR a relay link that hasn't been idle long
+                    // enough to be a silently-evicted zombie).
+                    t.is_alive() && (l.direct || t.idle_ms() < WARM_RELAY_STALE_MS)
+                }).unwrap_or(false)
         })
         .max_by_key(|(_, l)| l.direct as u8)
         .map(|(pid, l)| (pid.clone(), l.transport.clone().unwrap()))

@@ -482,6 +482,16 @@ impl Transport for DataChannelTransport {
         self.first_data.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Real liveness for a DataChannel/relay link (the base trait defaults to
+    /// `true`, which let warm-reuse open a stream over a dead relay link and hang).
+    /// The read loop already sets `dead` on EOF/error, so expose it: unlike
+    /// direct-QUIC there is no keepalive here, so this `dead` flag plus the
+    /// idle-staleness gate in `warm_link_for` are what keep warm-reuse off a
+    /// silently-evicted relay path.
+    fn is_alive(&self) -> bool {
+        !self.is_dead()
+    }
+
     fn sid_answerer(&self) -> bool {
         self.answerer
     }
