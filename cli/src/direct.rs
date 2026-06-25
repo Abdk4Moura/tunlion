@@ -442,16 +442,18 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// rung-2 reuses these QUIC configs verbatim, same ALPN, same accept-any-cert +
 /// keying-material auth, only the underlying socket differs (a punched one).
 /// Keep idle direct-QUIC links alive across NAT UDP-mapping timeouts. Residential
-/// NAT routinely drops an idle UDP mapping in ~30-120s; without a keepalive the
-/// link goes silently dead and FLAPS (re-establishing every ~minute), and a warm
-/// link reused for ssh/forward hits a zombie. A 15s keepalive sits well under
-/// common timeouts; max_idle_timeout (must exceed 2x the keepalive) lets a TRULY
-/// dead peer be detected and the connection closed in ~30s, so teardown and
-/// warm-link liveness checks see it promptly instead of hanging on a zombie.
+/// NAT drops an idle UDP mapping in ~30-120s, but CONTAINER/relay paths (e.g. a
+/// Coder workspace behind DERP) evict far faster, observed ~10s: a warm link gone
+/// idle for ten seconds is already dead, yet quinn (and is_alive) only notice it
+/// at max_idle_timeout, so warm-reuse grabs the zombie and the next ssh/pty hangs.
+/// A 7s keepalive sits UNDER that ~10s window, so the mapping is refreshed before
+/// it dies (the link stays genuinely alive across idle gaps); max_idle_timeout
+/// (must exceed 2x the keepalive) then closes a TRULY dead peer in ~21s so
+/// teardown and warm-link liveness checks see it instead of hanging on a zombie.
 fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
-    tc.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
-    if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(7)));
+    if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(21)) {
         tc.max_idle_timeout(Some(idle));
     }
     Arc::new(tc)
