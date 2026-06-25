@@ -273,7 +273,10 @@ fn bootstrap_cache_path() -> PathBuf {
 }
 
 /// How long a recorded bootstrap lets `filament ssh` skip the pre-flight (s).
-const BOOTSTRAP_TTL_SECS: u64 = 3600;
+/// 24h: repeat ssh stays instant across a working day. A stale skip self-heals,
+/// the ssh-layer 255 retry re-runs a fresh bootstrap, and a cache miss now rides
+/// the daemon's warm link anyway, so a longer window costs nothing.
+const BOOTSTRAP_TTL_SECS: u64 = 24 * 3600;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()

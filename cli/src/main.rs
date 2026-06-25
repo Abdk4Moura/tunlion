@@ -4133,6 +4133,9 @@ async fn handle_warm_req(
         ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, req).await,
         ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, req).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
+        // Bootstrap is dispatched before this (it defers its reply), so it never
+        // reaches here; reject defensively so a future caller falls back to cold.
+        ctl::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,
     }
 }
 
@@ -4252,6 +4255,71 @@ async fn handle_warm_resize(
         }
     }
     req.accept().await; // close the client's short connection cleanly
+}
+
+/// Deferred ssh-bootstrap replies, keyed by the peer's link pid. A `Bootstrap`
+/// request can't be answered inline: the daemon sends `shell-bootstrap` over the
+/// warm link and the peer's `shell-bootstrap-ack` arrives LATER via this same
+/// event loop, so blocking here would deadlock. We stash the reply socket (with a
+/// deadline) and complete it from the `shell-bootstrap-ack`/`-deny` control arms,
+/// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
+/// ack is identical, so every waiter gets the same answer).
+#[cfg(unix)]
+type PendingBootstraps =
+    HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
+
+/// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
+/// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
+/// big win for `filament ssh` (pty already rode the warm link; the bootstrap was
+/// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
+/// socket; the ack/deny handler completes it. A miss falls the client back to the
+/// cold `shell_bootstrap`.
+#[cfg(unix)]
+async fn handle_warm_bootstrap(conn: &Conn, pending: &mut PendingBootstraps, req: ctl::Req) {
+    let (peer, pubkey) = match &req.kind {
+        ctl::ReqKind::Bootstrap { peer, pubkey } => (peer.clone(), pubkey.clone()),
+        _ => return,
+    };
+    let Some((pid, t)) = warm_link_for(conn, &peer) else {
+        log_warm_miss(conn, &peer);
+        req.reject("no warm link to that peer").await;
+        return;
+    };
+    if t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey }))
+        .await
+        .is_err()
+    {
+        req.reject("warm link send failed").await;
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    pending.entry(pid).or_default().push((req.sock, deadline));
+}
+
+/// Complete every stashed `Bootstrap` waiter for `pid` with `reply`. Called from
+/// the `shell-bootstrap-ack`/`-deny` arms; a no-op if none are pending (e.g. the
+/// peer re-acked, or the waiter was already reaped).
+#[cfg(unix)]
+async fn complete_warm_bootstrap(pending: &mut PendingBootstraps, pid: &str, reply: &Value) {
+    if let Some(waiters) = pending.remove(pid) {
+        for (mut sock, _) in waiters {
+            ctl::send_reply(&mut sock, reply).await;
+        }
+    }
+}
+
+/// Drop expired bootstrap waiters (peer never answered): closing the socket gives
+/// the client an EOF, which it reads as a miss and falls back to the cold path.
+#[cfg(unix)]
+fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
+    if pending.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    for waiters in pending.values_mut() {
+        waiters.retain(|(_, deadline)| *deadline > now);
+    }
+    pending.retain(|_, waiters| !waiters.is_empty());
 }
 
 #[tokio::main]
@@ -6017,6 +6085,9 @@ async fn recv_cmd(
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
     // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
     let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
+    #[cfg(unix)]
+    let mut pending_bootstrap: PendingBootstraps = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
     // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
@@ -6110,6 +6181,18 @@ async fn recv_cmd(
             // a non-daemon this branch pends forever (ctl_tx held, serve unspawned).
             req = ctl_rx.recv() => {
                 if let Some(req) = req {
+                    // Bootstrap defers its reply (awaits the peer's ack via this
+                    // loop), so it can't go through the inline handle_warm_req; it
+                    // stashes the socket in pending_bootstrap instead.
+                    #[cfg(unix)]
+                    {
+                        if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
+                            handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
+                        } else {
+                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, req).await;
+                        }
+                    }
+                    #[cfg(not(unix))]
                     handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, req).await;
                 }
                 None
@@ -6327,6 +6410,10 @@ async fn recv_cmd(
         }
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // Drop warm-bootstrap waiters whose peer never acked; the client's read
+        // hits EOF and falls back to the cold establish.
+        #[cfg(unix)]
+        reap_warm_bootstraps(&mut pending_bootstrap);
         // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).
         for (pid, info, (n, sec)) in conn.expired_direct() {
             conn.maybe_adopt(&info, true).await?;
@@ -7007,6 +7094,27 @@ async fn recv_cmd(
                 // `transfer`, so pairing for file transfer never yields a shell.
                 // The write happens only here (over the authenticated channel)
                 // into a clearly-marked, removable authorized_keys block.
+                // Warm-bootstrap (INITIATOR side): the peer answered a
+                // `shell-bootstrap` we relayed over its warm link for a `filament
+                // ssh`. Complete the stashed reply socket(s) for this pid; the
+                // client then pins these host keys and skips the cold establish.
+                #[cfg(unix)]
+                Some("shell-bootstrap-ack") => {
+                    let reply = json!({
+                        "ok": true,
+                        "hostkeys": v["hostkeys"].clone(),
+                        "user": v["user"].clone(),
+                    });
+                    complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
+                }
+                #[cfg(unix)]
+                Some("shell-bootstrap-deny") => {
+                    let reply = json!({
+                        "ok": false,
+                        "err": v["reason"].as_str().unwrap_or("shell bootstrap denied"),
+                    });
+                    complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
+                }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
