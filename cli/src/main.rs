@@ -24,6 +24,7 @@ mod holepunch;
 mod l2;
 mod net;
 mod pake_ceremony;
+mod ping;
 mod protocol;
 mod resilience;
 mod session;
@@ -499,6 +500,21 @@ enum Cmd {
         /// Extra args passed through to ssh (user@host, commands, -p, ...)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Ping a known device: show the live route, RTT, and whether `ssh`/`pty`
+    /// will be instant. Like `tailscale ping`, plus what it can't show — warm vs
+    /// cold (is a link already held?) and verified identity (paired + proven).
+    /// A warm direct link reports quinn's RTT and the real remote IP:port; with no
+    /// live link it reports the cold establish cost instead.
+    Ping {
+        /// Known device (petname) to ping
+        peer: String,
+        /// How many pings to send (a warm link is re-sampled each round)
+        #[arg(long, default_value_t = 1)]
+        count: u32,
+        /// Machine-readable JSON output (for scripting)
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose connect health: where SSH/L2 establishment is slow or stalls.
     ///
@@ -4133,10 +4149,45 @@ async fn handle_warm_req(
         ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, req).await,
         ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, req).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
+        ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, req).await,
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.
         ctl::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,
     }
+}
+
+/// Answer a `filament ping`: report the daemon's warm link to `peer` (route,
+/// remote address, RTT, verified name). Synchronous — every fact is local (quinn
+/// already measured the RTT/addr; the route is the link's own label/ICE state), so
+/// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
+/// miss `reject`s so the client falls back to a cold establish-probe.
+#[cfg(unix)]
+async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
+    let ctl::ReqKind::Ping { peer } = &req.kind else { return };
+    let peer = peer.clone();
+    let Some((pid, t)) = warm_link_for(conn, &peer) else {
+        req.reject("no warm link").await;
+        return;
+    };
+    let link = conn.link(&pid);
+    let direct = link.map(|l| l.direct).unwrap_or(false);
+    let route = if direct {
+        link.map(|l| l.direct_route.to_string()).unwrap_or_else(|| "direct".into())
+    } else if let Some(p) = link.and_then(|l| l.peer.clone()) {
+        p.route().await.unwrap_or("relay").to_string()
+    } else {
+        "relay".to_string()
+    };
+    let reply = json!({
+        "ok": true,
+        "warm": true,
+        "direct": direct,
+        "route": route,
+        "remote_addr": t.remote_addr().map(|a| a.to_string()),
+        "rtt_ms": t.rtt_ms(),
+        "verified": link.and_then(|l| l.verified_name.clone()),
+    });
+    req.reply(&reply).await;
 }
 
 #[cfg(unix)]
@@ -4346,7 +4397,7 @@ async fn main() -> Result<()> {
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
-        const CMDS: [&str; 17] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh", "grant", "revoke"];
+        const CMDS: [&str; 18] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh", "ping", "grant", "revoke"];
         if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
             if std::path::Path::new(first).exists() {
                 argv.insert(1, "send".into());
@@ -4490,6 +4541,7 @@ async fn main() -> Result<()> {
         Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, cli.relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay).await,
+        Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, cli.relay).await,
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, cli.relay).await
         }

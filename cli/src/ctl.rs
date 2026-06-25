@@ -47,8 +47,8 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_pty, try_resize, Req,
-    ReqKind,
+    send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping, try_pty,
+    try_resize, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
@@ -178,6 +178,29 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask a local daemon what its warm link to `peer` looks like (for
+    /// `filament ping`): returns the facts JSON (`{"ok":true,"warm":true,"route":…,
+    /// "remote_addr":…,"rtt_ms":…,"direct":…,"verified":…}`) when the daemon holds
+    /// a live link, or `None` (no daemon / no warm link) so the caller falls back
+    /// to a cold establish-probe. Bounded so a wedged daemon can't hang ping.
+    pub async fn try_ping(peer: &str) -> Option<Value> {
+        if reuse_disabled() {
+            return None;
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "ping", "peer": peer });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -195,6 +218,11 @@ mod imp {
         /// peer's ack via the event loop), so the daemon stashes the socket rather
         /// than answering inline.
         Bootstrap { peer: String, pubkey: String },
+        /// Report the daemon's live link to `peer` for `filament ping`: route,
+        /// remote address, RTT, verified name. Answered INLINE (synchronous): all
+        /// the facts are local to the daemon (quinn's RTT/addr, the link table), so
+        /// unlike Bootstrap there is nothing to await from the peer.
+        Ping { peer: String },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -220,6 +248,12 @@ mod imp {
             let _ = self.sock.write_all(line.as_bytes()).await;
             let _ = self.sock.write_all(b"\n").await;
             let _ = self.sock.flush().await;
+        }
+
+        /// Answer a synchronous request (Ping) with one JSON line, then drop the
+        /// socket. For requests that report facts rather than handing off a stream.
+        pub async fn reply(mut self, v: &Value) {
+            send_reply(&mut self.sock, v).await;
         }
     }
 
@@ -293,6 +327,10 @@ mod imp {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
                         let Some(pubkey) = v["pubkey"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096).map(str::to_string) else { return };
                         ReqKind::Bootstrap { peer, pubkey }
+                    }
+                    Some("ping") => {
+                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
+                        ReqKind::Ping { peer }
                     }
                     _ => return,
                 };
