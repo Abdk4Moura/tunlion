@@ -46,7 +46,10 @@ pub fn reuse_disabled() -> bool {
 }
 
 #[cfg(unix)]
-pub use imp::{serve, serve_at, try_open, try_open_at, try_pty, try_resize, Req, ReqKind};
+pub use imp::{
+    send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_pty, try_resize, Req,
+    ReqKind,
+};
 
 #[cfg(not(unix))]
 pub use stub::Req;
@@ -148,6 +151,33 @@ mod imp {
         }
     }
 
+    /// Run the ssh `shell-bootstrap` THROUGH a local daemon's warm link: the
+    /// daemon installs our `pubkey` on `peer` over its existing link (no cold
+    /// establish) and relays the peer's verdict. Returns the ack JSON
+    /// (`{"ok":true,"hostkeys":[...],"user":...}`) on success, or `None` (no
+    /// daemon / no warm link / deny / timeout / protocol error) so the caller
+    /// falls back to the cold `shell_bootstrap`. The reply is deferred on the
+    /// daemon side (it awaits the peer), so we bound our own wait too.
+    pub async fn try_bootstrap(peer: &str, pubkey: &str) -> Option<Value> {
+        if reuse_disabled() {
+            return None;
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "bootstrap", "peer": peer, "pubkey": pubkey });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        // Bound the wait: the daemon relays the peer's ack, which can take a beat,
+        // but a hung/denying peer must not stall ssh. On timeout, fall back to cold.
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -159,6 +189,12 @@ mod imp {
         Pty { peer: String, session: String, cols: u16, rows: u16, term: String },
         /// Relay a window-size change to an already-open warm PTY (by `session`).
         Resize { session: String, cols: u16, rows: u16 },
+        /// Run the ssh `shell-bootstrap` over the daemon's warm link instead of a
+        /// fresh cold establish: install our managed `pubkey` on `peer` and return
+        /// the peer's host keys + login. The reply is deferred (it awaits the
+        /// peer's ack via the event loop), so the daemon stashes the socket rather
+        /// than answering inline.
+        Bootstrap { peer: String, pubkey: String },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -184,6 +220,16 @@ mod imp {
             let _ = self.sock.write_all(line.as_bytes()).await;
             let _ = self.sock.write_all(b"\n").await;
             let _ = self.sock.flush().await;
+        }
+    }
+
+    /// Write one JSON reply line to a DEFERRED-reply socket (a `Bootstrap` request
+    /// whose `sock` the daemon stashed until the peer's ack arrived). Best-effort.
+    pub async fn send_reply(sock: &mut UnixStream, v: &Value) {
+        if let Ok(mut line) = serde_json::to_vec(v) {
+            line.push(b'\n');
+            let _ = sock.write_all(&line).await;
+            let _ = sock.flush().await;
         }
     }
 
@@ -242,6 +288,11 @@ mod imp {
                         let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                         let rows = v["rows"].as_u64().unwrap_or(24) as u16;
                         ReqKind::Resize { session, cols, rows }
+                    }
+                    Some("bootstrap") => {
+                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
+                        let Some(pubkey) = v["pubkey"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096).map(str::to_string) else { return };
+                        ReqKind::Bootstrap { peer, pubkey }
                     }
                     _ => return,
                 };

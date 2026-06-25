@@ -2008,6 +2008,32 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
     verdict
 }
 
+/// Install our managed key on `peer`, WARM-first: ask the local `up` daemon to
+/// run the `shell-bootstrap` over its already-established link (instant, no cold
+/// establish), and fall back to a fresh `shell_bootstrap` on a miss/deny/timeout,
+/// under `--relay`, or off-unix. This is what closes the last gap that left
+/// `filament ssh` slow while `pty` was already warm: the bootstrap was the only
+/// remaining cold establish in the ssh path.
+async fn bootstrap_key(server: &str, peer: &str, relay: bool) -> Result<(Vec<String>, Option<String>)> {
+    #[cfg(unix)]
+    if !relay {
+        let pubkey = crate::sshkeys::ensure_managed_key()?;
+        if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey).await {
+            let hostkeys: Vec<String> = v["hostkeys"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if !hostkeys.is_empty() {
+                crate::ui::trace(&format!(
+                    "filament: reusing warm link to '{peer}' for ssh bootstrap (no establish)"
+                ));
+                return Ok((hostkeys, v["user"].as_str().map(String::from)));
+            }
+        }
+    }
+    shell_bootstrap(server, peer, relay).await
+}
+
 /// The login account for the ssh destination: FILAMENT_SSH_USER wins, else the
 /// account the ACCEPTOR installed our key into (from the bootstrap-ack, or the
 /// cache), else local $USER, else root. The acceptor's report is authoritative
@@ -2105,9 +2131,10 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     let (login, took_fast_path) = match cached {
         Some(cached_user) => (resolve_login(cached_user), true),
         None => {
-            // Full bootstrap over the trusted channel (deny-by-default gate),
-            // pin host keys, and record the cache for next time.
-            let (hostkeys, remote_user) = shell_bootstrap(server, peer, relay).await?;
+            // Bootstrap over the trusted channel (deny-by-default gate), WARM-first
+            // (ride the daemon's link, no cold establish), pin host keys, and
+            // record the cache for next time.
+            let (hostkeys, remote_user) = bootstrap_key(server, peer, relay).await?;
             crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
             crate::sshkeys::bootstrap_cache_put(peer, remote_user.as_deref());
             (resolve_login(remote_user), false)
