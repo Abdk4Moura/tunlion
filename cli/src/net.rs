@@ -349,6 +349,19 @@ pub trait Transport: Send + Sync {
     fn is_alive(&self) -> bool {
         true
     }
+    /// The literal remote socket address the underlying connection is pinned to
+    /// (the `IP:port` `filament ping` shows for a direct link). `None` for a
+    /// transport with no single socket endpoint (a relay/DataChannel link, whose
+    /// path is the ICE-selected candidate pair, not one UDP 5-tuple).
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+    /// Smoothed round-trip time of the underlying connection in ms, when the
+    /// transport measures one. Direct-QUIC reports quinn's estimate (free, no peer
+    /// cooperation); `None` for transports that don't measure RTT themselves.
+    fn rtt_ms(&self) -> Option<u64> {
+        None
+    }
     /// Has this transport ever moved a DATA byte (not just control)? Backs the
     /// before-first-byte establishment grace (`establish_grace_ms`): a link still
     /// awaiting its first chunk is establishing, not stalled. Default `true`
@@ -1482,6 +1495,32 @@ async fn wire_channel(
             }
 
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                // Relay/DataChannel links have NO QUIC keepalive, so an idle one
+                // on a container/DERP path is silently evicted in ~10s, after which
+                // warm-reuse refuses it (the 8s staleness gate) and falls back to a
+                // slow cold establish. Send a tiny keepalive every 7s (under that
+                // window) so the path stays alive AND idle_ms stays low, keeping the
+                // link instantly warm-reusable across idle gaps. The peer ignores an
+                // unknown control type, and receiving it stamps ITS activity too, so
+                // the reverse direction stays warm symmetrically.
+                {
+                    let raw_k = raw.clone();
+                    let dead_k = dead.clone();
+                    let act_k = last_activity.clone();
+                    tokio::spawn(async move {
+                        let frame = Bytes::from(json!({ "type": "ping", "reason": "keepalive" }).to_string());
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+                            if dead_k.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            if raw_k.write_data_channel(&frame, true).await.is_err() {
+                                break;
+                            }
+                            act_k.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+                }
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport { raw, drained, dead, last_activity, first_data, answerer: polite });
                 let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));

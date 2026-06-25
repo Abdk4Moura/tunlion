@@ -1,0 +1,167 @@
+// `filament ping <peer>`: show the live link to a known device — route, RTT, and
+// whether ssh/pty will be instant. Mirrors `tailscale ping` and elevates it with
+// two things Tailscale has no concept of: WARM vs COLD (is a link already held by
+// the local `up` daemon, so ssh/pty is instant?) and VERIFIED identity (paired +
+// proof-verified, not merely reachable). A warm direct link reports quinn's RTT
+// and the real remote IP:port; with no live link it reports the cold establish
+// cost (what ssh/pty would actually pay) instead of a fake latency.
+//
+// Color is restrained: one accent (Brand mint = warm), amber only for the relay
+// caveat, green for a good pong, red for unreachable, dim for metadata.
+
+use crate::ui::{self, Tone};
+use anyhow::Result;
+use serde_json::{json, Value};
+
+pub async fn ping_cmd(server: &str, peer: &str, count: u32, json_out: bool, relay: bool) -> Result<()> {
+    let count = count.max(1);
+
+    // Warm path: ask a local `up` daemon about its held link. Synchronous and
+    // exact (quinn already measured RTT/addr). A miss → None → cold probe below.
+    #[cfg(unix)]
+    let warm = if relay { None } else { crate::ctl::try_ping(peer).await };
+    #[cfg(not(unix))]
+    let warm: Option<Value> = None;
+
+    if json_out {
+        return ping_json(server, peer, relay, warm).await;
+    }
+
+    println!("{} {}", ui::paint(Tone::Dim, "filament ping →"), ui::paint(Tone::Brand, peer));
+
+    match warm {
+        Some(mut v) => {
+            for i in 0..count {
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    // Re-sample so repeated pings show live RTT drift (quinn keeps
+                    // it fresh via the keepalive); keep the prior facts on a miss.
+                    #[cfg(unix)]
+                    if let Some(nv) = crate::ctl::try_ping(peer).await {
+                        v = nv;
+                    }
+                }
+                print_warm_line(&v);
+            }
+            print_warm_verdict(peer, &v);
+        }
+        None => print_cold(server, peer, relay).await,
+    }
+    Ok(())
+}
+
+/// A relay/TURN path (no direct line of sight) — the only case we tint amber.
+fn is_relay(route: &str) -> bool {
+    matches!(route, "relay" | "relayed")
+}
+
+/// Human route label: collapse the relay aliases to one phrase, pass direct
+/// labels through (direct-quic / holepunched / direct / local).
+fn fmt_route(route: &str) -> String {
+    if is_relay(route) {
+        "relay · TURN".to_string()
+    } else {
+        route.to_string()
+    }
+}
+
+fn fmt_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+/// One result line for a held (warm) link. Direct links carry a real RTT + the
+/// remote IP:port (like tailscale); a relay link has no quinn RTT, so it reads
+/// "warm" without a fake number.
+fn print_warm_line(v: &Value) {
+    let route = v["route"].as_str().unwrap_or("?");
+    let rtt = v["rtt_ms"].as_u64();
+    let addr = v["remote_addr"].as_str();
+    let verified = v["verified"].as_str();
+
+    let lead = match rtt {
+        Some(ms) => ui::paint(Tone::Ok, &format!("● pong  {:>4}ms", ms)),
+        None => ui::paint(Tone::Ok, "● warm       "),
+    };
+    let route_tone = if is_relay(route) { Tone::Warn } else { Tone::Dim };
+    let mut line = format!("  {}   {}", lead, ui::paint(route_tone, &fmt_route(route)));
+    if let Some(a) = addr {
+        line.push_str(&format!("  {}", ui::paint(Tone::Dim, a)));
+    }
+    if let Some(name) = verified {
+        line.push_str(&format!("   {}", ui::paint(Tone::Ok, &format!("✓ {name}"))));
+    }
+    line.push_str(&format!("   {}", ui::paint(Tone::Brand, "⚡ warm")));
+    println!("{line}");
+}
+
+fn print_warm_verdict(peer: &str, v: &Value) {
+    let route = v["route"].as_str().unwrap_or("?");
+    if is_relay(route) {
+        println!("  {}", ui::paint(Tone::Warn, "⚠ on relay, no direct path · still end-to-end encrypted"));
+        println!("  {}", ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} will be instant, over the relay")));
+    } else {
+        println!("  {}", ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} will be instant (warm direct link)")));
+    }
+}
+
+/// No live link held locally: measure what a fresh connect would cost (the honest
+/// number — that IS what ssh/pty would pay), via the same establish-then-drop
+/// probe `filament doctor` uses.
+async fn print_cold(server: &str, peer: &str, relay: bool) {
+    match crate::l2::establish_probe(server, peer, relay).await {
+        Ok(o) if o.established => {
+            println!(
+                "  {}   {}",
+                ui::paint(Tone::Warn, "○ cold"),
+                ui::paint(Tone::Dim, &format!("no warm link · would connect in ~{}", fmt_ms(o.total_ms)))
+            );
+            println!(
+                "  {}",
+                ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} would establish a fresh link; run `filament up` to keep it warm"))
+            );
+        }
+        Ok(o) => {
+            let phase = o.failed_phase.map(|p| p.label()).unwrap_or("establishing");
+            println!(
+                "  {}   {}",
+                ui::paint(Tone::Err, "✗ unreachable"),
+                ui::paint(Tone::Dim, &format!("gave up at the {phase} phase (~{})", fmt_ms(o.total_ms)))
+            );
+            println!(
+                "  {}",
+                ui::paint(Tone::Dim, &format!("─ {peer} may be offline, or not running `filament up` / `--shell`"))
+            );
+        }
+        Err(e) => {
+            println!(
+                "  {}   {}",
+                ui::paint(Tone::Err, "✗ unreachable"),
+                ui::paint(Tone::Dim, &e.to_string())
+            );
+        }
+    }
+}
+
+/// Machine-readable output: the warm facts verbatim, or the cold probe result.
+async fn ping_json(server: &str, peer: &str, relay: bool, warm: Option<Value>) -> Result<()> {
+    let out = if let Some(v) = warm {
+        v
+    } else {
+        match crate::l2::establish_probe(server, peer, relay).await {
+            Ok(o) => json!({
+                "ok": true,
+                "warm": false,
+                "established": o.established,
+                "total_ms": o.total_ms,
+                "failed_phase": o.failed_phase.map(|p| p.label()),
+            }),
+            Err(e) => json!({ "ok": false, "warm": false, "error": e.to_string() }),
+        }
+    };
+    println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}

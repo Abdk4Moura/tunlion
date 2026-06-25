@@ -814,6 +814,18 @@ impl Transport for DirectTransport {
         !self.dead.load(std::sync::atomic::Ordering::Relaxed)
             && self.conn.close_reason().is_none()
     }
+
+    fn remote_addr(&self) -> Option<std::net::SocketAddr> {
+        // The actual UDP 5-tuple this direct link is pinned to (post hole-punch
+        // this is the punched peer address, like what `tailscale ping` prints).
+        Some(self.conn.remote_address())
+    }
+
+    fn rtt_ms(&self) -> Option<u64> {
+        // quinn's smoothed RTT estimate, measured continuously from ACKs (kept
+        // fresh by the 7s keepalive) — no peer cooperation or round-trip needed.
+        Some(self.conn.rtt().as_millis() as u64)
+    }
 }
 
 /// Spawn the read loop that demuxes the authenticated stream back into
