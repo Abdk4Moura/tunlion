@@ -4156,6 +4156,22 @@ async fn handle_warm_req(
     }
 }
 
+/// Is something listening on this host's own loopback `port` — i.e. an sshd a
+/// `filament ssh` initiator could actually reach? A fast connect probe: a
+/// successful connect means a listener (we close it at once); refused/timeout
+/// means nothing is there. Reported in the shell-bootstrap ack so the initiator
+/// fails fast with a clear message instead of ssh hanging on a dead port.
+async fn sshd_listening(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
 /// Answer a `filament ping`: report the daemon's warm link to `peer` (route,
 /// remote address, RTT, verified name). Synchronous — every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
@@ -4341,8 +4357,8 @@ type PendingBootstraps =
 /// cold `shell_bootstrap`.
 #[cfg(unix)]
 async fn handle_warm_bootstrap(conn: &Conn, pending: &mut PendingBootstraps, req: ctl::Req) {
-    let (peer, pubkey) = match &req.kind {
-        ctl::ReqKind::Bootstrap { peer, pubkey } => (peer.clone(), pubkey.clone()),
+    let (peer, pubkey, ssh_port) = match &req.kind {
+        ctl::ReqKind::Bootstrap { peer, pubkey, ssh_port } => (peer.clone(), pubkey.clone(), *ssh_port),
         _ => return,
     };
     let Some((pid, t)) = warm_link_for(conn, &peer) else {
@@ -4350,7 +4366,7 @@ async fn handle_warm_bootstrap(conn: &Conn, pending: &mut PendingBootstraps, req
         req.reject("no warm link to that peer").await;
         return;
     };
-    if t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey }))
+    if t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey, "ssh_port": ssh_port }))
         .await
         .is_err()
     {
@@ -7170,6 +7186,7 @@ async fn recv_cmd(
                         "ok": true,
                         "hostkeys": v["hostkeys"].clone(),
                         "user": v["user"].clone(),
+                        "sshd": v["sshd"].clone(),
                     });
                     complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
                 }
@@ -7229,12 +7246,20 @@ async fn recv_cmd(
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
                             let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                            // Tell the initiator whether an sshd is actually
+                            // listening on the port `filament ssh` will dial here,
+                            // so it can fail fast with a clear message instead of
+                            // spawning ssh into a refused/black-holed connection.
+                            let ssh_port = v["ssh_port"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(22);
+                            let sshd = sshd_listening(ssh_port).await;
                             ui::say(&format!("l2: shell granted to '{device}', installed managed key (filament-managed block)"));
                             let _ = t
                                 .send_control(&json!({
                                     "type": "shell-bootstrap-ack",
                                     "hostkeys": hostkeys,
-                                    "user": login
+                                    "user": login,
+                                    "sshd": sshd,
+                                    "ssh_port": ssh_port
                                 }))
                                 .await;
                         }

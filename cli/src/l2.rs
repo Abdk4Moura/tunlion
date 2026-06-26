@@ -1953,7 +1953,18 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
 /// device lacks the `shell` cap) or times out, in which case the caller MUST NOT
 /// fall through to a key-less ssh attempt (that would be a muddy auth failure
 /// instead of a clear "zero shell" denial).
-async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<String>, Option<String>)> {
+/// Result of installing our managed key on a peer (warm or cold path). `sshd` is
+/// the peer's report of whether an sshd is listening on the port `filament ssh`
+/// will dial: `Some(true)` reachable, `Some(false)` nothing there (so ssh would
+/// fail blindly — caller bails with a clear message), `None` when the peer is an
+/// older build that didn't report it (caller proceeds, status unknown).
+struct BootstrapInfo {
+    hostkeys: Vec<String>,
+    user: Option<String>,
+    sshd: Option<bool>,
+}
+
+async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -> Result<BootstrapInfo> {
     // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
@@ -1962,14 +1973,14 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
     // mux), so the link being usable IS the end of this span. Record `up`; the
     // ssh data link is a SEPARATE netcat span instrumented in its own right.
     diag.up("tunnel", "datachannel-or-direct");
-    t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey })).await?;
+    t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey, "ssh_port": ssh_port })).await?;
 
     // Await the verdict (bounded, a daemon without FILAMENT_L2 / without the cap
     // must not hang us forever). Capture it, then ALWAYS tear this link down
     // BEFORE returning, so the ssh data link (netcat ProxyCommand) is the only
     // boxA peer the acceptor sees, no concurrent same-device supersede churn.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    let verdict: Result<(Vec<String>, Option<String>)> = loop {
+    let verdict: Result<BootstrapInfo> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break Err(anyhow!(
@@ -1986,7 +1997,9 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
                     // The acceptor reports the account it installed our key into,
                     // authoritative for the ssh login (see ssh_cmd).
                     let user = v["user"].as_str().map(String::from);
-                    break Ok((hostkeys, user));
+                    // Older acceptors omit `sshd` -> None (unknown, proceed).
+                    let sshd = v["sshd"].as_bool();
+                    break Ok(BootstrapInfo { hostkeys, user, sshd });
                 }
                 Some("shell-bootstrap-deny") => {
                     let why = v["reason"].as_str().unwrap_or("shell capability not granted");
@@ -2014,11 +2027,11 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
 /// under `--relay`, or off-unix. This is what closes the last gap that left
 /// `filament ssh` slow while `pty` was already warm: the bootstrap was the only
 /// remaining cold establish in the ssh path.
-async fn bootstrap_key(server: &str, peer: &str, relay: bool) -> Result<(Vec<String>, Option<String>)> {
+async fn bootstrap_key(server: &str, peer: &str, relay: bool, ssh_port: u16) -> Result<BootstrapInfo> {
     #[cfg(unix)]
     if !relay {
         let pubkey = crate::sshkeys::ensure_managed_key()?;
-        if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey).await {
+        if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey, ssh_port).await {
             let hostkeys: Vec<String> = v["hostkeys"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
@@ -2027,11 +2040,15 @@ async fn bootstrap_key(server: &str, peer: &str, relay: bool) -> Result<(Vec<Str
                 crate::ui::trace(&format!(
                     "filament: reusing warm link to '{peer}' for ssh bootstrap (no establish)"
                 ));
-                return Ok((hostkeys, v["user"].as_str().map(String::from)));
+                return Ok(BootstrapInfo {
+                    hostkeys,
+                    user: v["user"].as_str().map(String::from),
+                    sshd: v["sshd"].as_bool(),
+                });
             }
         }
     }
-    shell_bootstrap(server, peer, relay).await
+    shell_bootstrap(server, peer, relay, ssh_port).await
 }
 
 /// The login account for the ssh destination: FILAMENT_SSH_USER wins, else the
@@ -2134,10 +2151,11 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
             // Bootstrap over the trusted channel (deny-by-default gate), WARM-first
             // (ride the daemon's link, no cold establish), pin host keys, and
             // record the cache for next time.
-            let (hostkeys, remote_user) = bootstrap_key(server, peer, relay).await?;
-            crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
-            crate::sshkeys::bootstrap_cache_put(peer, remote_user.as_deref());
-            (resolve_login(remote_user), false)
+            let info = bootstrap_key(server, peer, relay, rport).await?;
+            bail_if_no_sshd(peer, rport, info.sshd)?;
+            crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
+            crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
+            (resolve_login(info.user), false)
         }
     };
 
@@ -2150,14 +2168,31 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     if code == 255 && took_fast_path {
         crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
         crate::sshkeys::bootstrap_cache_clear(peer);
-        let (hostkeys, remote_user) = shell_bootstrap(server, peer, relay).await?;
-        crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
-        crate::sshkeys::bootstrap_cache_put(peer, remote_user.as_deref());
-        let login = resolve_login(remote_user);
+        let info = shell_bootstrap(server, peer, relay, rport).await?;
+        // A stale fast-path 255 can simply mean the peer's sshd went away; the
+        // re-bootstrap now reports that, so say so plainly instead of looping.
+        bail_if_no_sshd(peer, rport, info.sshd)?;
+        crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
+        crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
+        let login = resolve_login(info.user);
         let code = spawn_ssh(server, peer, relay, &host, &login, rport, extra)?;
         std::process::exit(code);
     }
     std::process::exit(code);
+}
+
+/// Stop before spawning ssh when the peer told us no sshd is listening on the
+/// port we'd dial: ssh would otherwise hang or die with an opaque error. `None`
+/// (older peer, status unknown) and `Some(true)` both proceed.
+fn bail_if_no_sshd(peer: &str, rport: u16, sshd: Option<bool>) -> Result<()> {
+    if sshd == Some(false) {
+        return Err(anyhow!(
+            "'{peer}' is reachable but nothing is listening on port {rport} for ssh. \
+             Start an sshd on '{peer}' (or set FILAMENT_SSH_PORT to its port), or use \
+             `filament pty {peer}` for a shell that needs no sshd."
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
