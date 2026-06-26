@@ -158,12 +158,12 @@ mod imp {
     /// daemon / no warm link / deny / timeout / protocol error) so the caller
     /// falls back to the cold `shell_bootstrap`. The reply is deferred on the
     /// daemon side (it awaits the peer), so we bound our own wait too.
-    pub async fn try_bootstrap(peer: &str, pubkey: &str) -> Option<Value> {
+    pub async fn try_bootstrap(peer: &str, pubkey: &str, ssh_port: u16) -> Option<Value> {
         if reuse_disabled() {
             return None;
         }
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "bootstrap", "peer": peer, "pubkey": pubkey });
+        let req = json!({ "op": "bootstrap", "peer": peer, "pubkey": pubkey, "ssh_port": ssh_port });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -216,8 +216,10 @@ mod imp {
         /// fresh cold establish: install our managed `pubkey` on `peer` and return
         /// the peer's host keys + login. The reply is deferred (it awaits the
         /// peer's ack via the event loop), so the daemon stashes the socket rather
-        /// than answering inline.
-        Bootstrap { peer: String, pubkey: String },
+        /// than answering inline. `ssh_port` is the port `filament ssh` will dial
+        /// on the peer's loopback, so the peer can report whether an sshd is
+        /// actually listening there (else ssh would fail blindly).
+        Bootstrap { peer: String, pubkey: String, ssh_port: u16 },
         /// Report the daemon's live link to `peer` for `filament ping`: route,
         /// remote address, RTT, verified name. Answered INLINE (synchronous): all
         /// the facts are local to the daemon (quinn's RTT/addr, the link table), so
@@ -326,7 +328,8 @@ mod imp {
                     Some("bootstrap") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
                         let Some(pubkey) = v["pubkey"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096).map(str::to_string) else { return };
-                        ReqKind::Bootstrap { peer, pubkey }
+                        let ssh_port = v["ssh_port"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(22);
+                        ReqKind::Bootstrap { peer, pubkey, ssh_port }
                     }
                     Some("ping") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
