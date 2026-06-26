@@ -2152,7 +2152,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
             // (ride the daemon's link, no cold establish), pin host keys, and
             // record the cache for next time.
             let info = bootstrap_key(server, peer, relay, rport).await?;
-            bail_if_no_sshd(peer, rport, info.sshd)?;
+            ensure_sshd(peer, rport, info.sshd).await;
             crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
             crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
             (resolve_login(info.user), false)
@@ -2171,7 +2171,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         let info = shell_bootstrap(server, peer, relay, rport).await?;
         // A stale fast-path 255 can simply mean the peer's sshd went away; the
         // re-bootstrap now reports that, so say so plainly instead of looping.
-        bail_if_no_sshd(peer, rport, info.sshd)?;
+        ensure_sshd(peer, rport, info.sshd).await;
         crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
         crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
         let login = resolve_login(info.user);
@@ -2181,18 +2181,55 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     std::process::exit(code);
 }
 
-/// Stop before spawning ssh when the peer told us no sshd is listening on the
-/// port we'd dial: ssh would otherwise hang or die with an opaque error. `None`
-/// (older peer, status unknown) and `Some(true)` both proceed.
-fn bail_if_no_sshd(peer: &str, rport: u16, sshd: Option<bool>) -> Result<()> {
-    if sshd == Some(false) {
-        return Err(anyhow!(
-            "'{peer}' is reachable but nothing is listening on port {rport} for ssh. \
-             Start an sshd on '{peer}' (or set FILAMENT_SSH_PORT to its port), or use \
-             `filament pty {peer}` for a shell that needs no sshd."
-        ));
+/// Confirm an sshd is reachable on `rport` before spawning ssh, so it fails fast
+/// with a clear message instead of hanging on a refused/black-holed connection.
+/// A beta.20+ peer already `reported` it in the bootstrap ack; for an older peer
+/// (`None`) fall back to a quick client-side probe over the warm link, which works
+/// regardless of the peer's version. Only a DEFINITE "no sshd" stops us; an
+/// inconclusive probe proceeds (never make ssh worse than before).
+async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
+    let sshd = match reported {
+        Some(b) => Some(b),
+        #[cfg(unix)]
+        None => probe_sshd_warm(peer, rport).await,
+        #[cfg(not(unix))]
+        None => None,
+    };
+    if sshd != Some(false) {
+        return;
     }
-    Ok(())
+    crate::ui::problem(
+        &format!("filament ssh: no sshd on '{peer}'"),
+        &format!("'{peer}' is reachable, but nothing is listening on port {rport} for ssh."),
+        &[
+            format!("start an sshd on '{peer}'"),
+            format!("set {} to its port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
+            format!(
+                "use {} for a shell that needs no sshd",
+                crate::ui::paint(crate::ui::Tone::Brand, &format!("filament pty {peer}"))
+            ),
+        ],
+    );
+    std::process::exit(1);
+}
+
+/// Client-side "is there an sshd on `peer:rport`" probe over the daemon's WARM
+/// link only (fast, never a cold establish, so it can't hang). Opens one L2
+/// stream and reads: an immediate EOF means the acceptor's local dial was refused
+/// (no listener); any bytes (the SSH banner) mean a listener is there. No warm
+/// link or no banner in time -> `None` (unknown, caller proceeds). Works against
+/// any peer version, since it relies only on the old l2-open/l2-close path.
+#[cfg(unix)]
+async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut s = crate::ctl::try_open(peer, rport).await?;
+    let mut buf = [0u8; 8];
+    match tokio::time::timeout(std::time::Duration::from_secs(3), s.read(&mut buf)).await {
+        Ok(Ok(0)) => Some(false),  // refused: stream closed before any byte
+        Ok(Ok(_)) => Some(true),   // a listener answered (sshd banner)
+        Ok(Err(_)) => Some(false), // stream error: treat as unreachable
+        Err(_) => None,            // no banner in time: inconclusive, don't block
+    }
 }
 
 #[cfg(test)]
