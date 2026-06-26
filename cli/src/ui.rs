@@ -244,6 +244,26 @@ pub fn critical(line: &str) {
     }
 }
 
+/// A structured, must-see PROBLEM block, for an error the user has to act on.
+/// Instead of one dense sentence, it breaks the message into a red `✗` headline,
+/// an optional one-line explanation, and a list of concrete next steps — far
+/// easier to scan than a wall of prose. Each line rides the CRITICAL channel
+/// (always shown, even under `-q`) and `paint()` (color only on a tty, clean in a
+/// pipe). Steps are pre-formatted by the caller, so a step may embed a command in
+/// the brand accent, e.g. `paint(Tone::Brand, "filament pty box")`.
+pub fn problem(headline: &str, detail: &str, steps: &[String]) {
+    critical(&format!("{} {}", paint(Tone::Err, "✗"), paint(Tone::Bold, headline)));
+    if !detail.is_empty() {
+        critical(&format!("  {detail}"));
+    }
+    if !steps.is_empty() {
+        critical(&format!("  {}", paint(Tone::Dim, "try one of:")));
+        for s in steps {
+            critical(&format!("    {} {s}", paint(Tone::Brand, "•")));
+        }
+    }
+}
+
 /// DEBUG level (`-v`): resilience internals, stall detected, resuming, in-place
 /// repair, signaling reconnecting/reconnected, warm cutover, upgrade-probe
 /// attempts. No-op at the default level.
