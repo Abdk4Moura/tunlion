@@ -826,6 +826,13 @@ impl Transport for DirectTransport {
         // fresh by the 7s keepalive) — no peer cooperation or round-trip needed.
         Some(self.conn.rtt().as_millis() as u64)
     }
+
+    fn local_ip(&self) -> Option<std::net::IpAddr> {
+        // The local address quinn's socket actually sends from for this link.
+        // Maps to the outbound interface (tailscale0 / eth0 / docker0) so ping
+        // can name the path's local end without guessing.
+        self.conn.local_ip()
+    }
 }
 
 /// Spawn the read loop that demuxes the authenticated stream back into

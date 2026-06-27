@@ -25,6 +25,7 @@ mod l2;
 mod net;
 mod pake_ceremony;
 mod ping;
+mod sdnotify;
 mod protocol;
 mod resilience;
 mod session;
@@ -1365,8 +1366,15 @@ async fn up_cmd(
         if let Some(u) = &shell_user {
             up_args.push_str(&format!(" --shell-user {u}"));
         }
+        // Type=notify + WatchdogSec: the daemon sends READY=1 once its event loop
+        // is serving and WATCHDOG=1 each tick. If the loop WEDGES (the failure
+        // that also defeats the in-core signaling reconnect, so the node silently
+        // drops off presence) the pings stop and systemd restarts us within
+        // WatchdogSec instead of needing a manual `down`/`up`. Restart=always so
+        // any exit recovers too. (Requires a binary new enough to emit sd_notify,
+        // which is exactly the one writing this unit, so they ship together.)
         std::fs::write(&unit, format!(
-            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={}{}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={}{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
             exe.display(), up_args
         ))?;
         ui::say(&format!("  {} wrote {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), unit.display()));
@@ -4194,6 +4202,14 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     } else {
         "relay".to_string()
     };
+    // Path detail: name the interface the link's local end sits on, classify the
+    // remote address, and (for webrtc) report the candidate types + whether the
+    // path is relayed. The daemon holds the link AND runs on the same box as the
+    // ping client, so it resolves local-ip -> interface locally; ping.rs just
+    // renders the fields. This is the data that answers "is it the tailnet?"
+    // (e.g. local 100.x on a tailscale0 iface) instead of inferring it.
+    let peer_ref = link.and_then(|l| l.peer.clone());
+    let path = net::describe_path(t.as_ref(), peer_ref.as_deref()).await.to_json();
     let reply = json!({
         "ok": true,
         "warm": true,
@@ -4202,6 +4218,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
         "remote_addr": t.remote_addr().map(|a| a.to_string()),
         "rtt_ms": t.rtt_ms(),
         "verified": link.and_then(|l| l.verified_name.clone()),
+        "path": path,
     });
     req.reply(&reply).await;
 }
@@ -6246,8 +6263,23 @@ async fn recv_cmd(
     let mut reconnect_attempt: u32 = 0;
     let mut last_reconnect_try = Instant::now();
     let mut probed_silence = false; // fired one forced sync before declaring down
+    let mut last_watchdog = Instant::now();
+
+    // systemd Type=notify: announce readiness once the serving loop is about to
+    // run, then ping the watchdog below. No-op when not run under systemd.
+    if daemon {
+        sdnotify::ready();
+        sdnotify::status("up — serving");
+    }
 
     loop {
+        // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
+        // If this loop WEDGES on an await, the pings stop and systemd restarts us
+        // — the backstop for the stall that also freezes the reconnect code.
+        if daemon && last_watchdog.elapsed() >= Duration::from_secs(5) {
+            sdnotify::watchdog();
+            last_watchdog = Instant::now();
+        }
         // Shutdown-hang repro hook: once links are live, freeze the event loop
         // forever, faithfully simulating a peer transport whose inline write
         // never returns. The graceful Ev::Interrupted can no longer be processed;
@@ -6391,8 +6423,11 @@ async fn recv_cmd(
                 if saw_down {
                     signaling_down_since = Some(Instant::now());
                     last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
-                    // DEBUG, resilience internal (signaling reconnect).
-                    ui::debug(&ui::paint(ui::Tone::Warn, "  signaling link closed, reconnecting"));
+                    // Visible (not just debug): a node dropping off signaling was
+                    // previously silent until it bit someone. Surface it + reflect
+                    // it in `systemctl status` so it's diagnosable at a glance.
+                    ui::say(&ui::paint(ui::Tone::Warn, "signaling link closed, reconnecting…"));
+                    sdnotify::status("signaling down — reconnecting");
                 } else if silent_ms >= silence {
                     if !probed_silence {
                         // Heartbeat probe: an ACK'd `sync` round-trip, the only
@@ -6409,8 +6444,10 @@ async fn recv_cmd(
                     } else if silent_ms >= silence.saturating_mul(2) {
                         signaling_down_since = Some(Instant::now());
                         last_reconnect_try = Instant::now() - Duration::from_secs(60);
-                        // DEBUG, resilience internal (signaling reconnect).
-                        ui::debug(&ui::paint(ui::Tone::Warn, &format!("  signaling silent for {silent_ms}ms, reconnecting")));
+                        // Visible: a silent (half-open) signaling link is the exact
+                        // way a node falls off presence without anyone noticing.
+                        ui::say(&ui::paint(ui::Tone::Warn, &format!("signaling silent for {silent_ms}ms, reconnecting…")));
+                        sdnotify::status("signaling silent — reconnecting");
                     }
                 }
             }
@@ -6450,8 +6487,10 @@ async fn recv_cmd(
                             last_signaling = Instant::now();
                             signaling_down_since = None;
                             probed_silence = false;
-                            // DEBUG, resilience internal (signaling reconnected).
-                            ui::debug(&ui::paint(ui::Tone::Ok, "  signaling reconnected, re-announcing presence"));
+                            // Visible: pairs with the "reconnecting…" line so the
+                            // recovery is observable end to end.
+                            ui::say(&ui::paint(ui::Tone::Ok, "signaling reconnected, re-announcing presence"));
+                            sdnotify::status("up — serving");
                         }
                         Err(e) => {
                             // DEBUG, resilience internal (signaling reconnect retry).

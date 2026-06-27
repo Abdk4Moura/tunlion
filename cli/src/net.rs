@@ -362,6 +362,13 @@ pub trait Transport: Send + Sync {
     fn rtt_ms(&self) -> Option<u64> {
         None
     }
+    /// Local IP this transport's socket is bound to (so `filament ping` can name
+    /// the network INTERFACE the path uses — tailscale0 / eth0 / docker0). Direct-
+    /// QUIC reports quinn's local_ip; `None` for transports that don't expose it
+    /// (a relay/DataChannel link's local candidate is read from the ICE pair).
+    fn local_ip(&self) -> Option<std::net::IpAddr> {
+        None
+    }
     /// Has this transport ever moved a DATA byte (not just control)? Backs the
     /// before-first-byte establishment grace (`establish_grace_ms`): a link still
     /// awaiting its first chunk is establishing, not stalled. Default `true`
@@ -1342,6 +1349,130 @@ impl Peer {
         let both_private = is_private_addr(&pair.local.address) && is_private_addr(&pair.remote.address);
         Some(if same_host || both_private { "local" } else { "direct" })
     }
+
+    /// The selected ICE pair's concrete endpoints, for `filament ping`/`doctor`
+    /// to render the exact path (local↔remote address + candidate type + whether
+    /// it's relayed). `route()` answers the policy question ("does it leave the
+    /// network?"); this hands back the raw 5-tuple so the UI can name the
+    /// interface and show the addresses instead of guessing.
+    pub async fn path_detail(&self) -> Option<PathPair> {
+        let pair = self
+            .pc
+            .sctp()
+            .transport()
+            .ice_transport()
+            .get_selected_candidate_pair()
+            .await?;
+        let typ = |t: RTCIceCandidateType| {
+            match t {
+                RTCIceCandidateType::Host => "host",
+                RTCIceCandidateType::Srflx => "srflx",
+                RTCIceCandidateType::Prflx => "prflx",
+                RTCIceCandidateType::Relay => "relay",
+                _ => "?",
+            }
+            .to_string()
+        };
+        Some(PathPair {
+            local_ip: pair.local.address.clone(),
+            local_typ: typ(pair.local.typ),
+            remote_ip: pair.remote.address.clone(),
+            remote_port: pair.remote.port,
+            remote_typ: typ(pair.remote.typ),
+            relayed: pair.local.typ == RTCIceCandidateType::Relay
+                || pair.remote.typ == RTCIceCandidateType::Relay,
+        })
+    }
+}
+
+/// The concrete endpoints of a selected ICE candidate pair, for path display.
+#[derive(Debug, Clone)]
+pub struct PathPair {
+    pub local_ip: String,
+    pub local_typ: String,
+    pub remote_ip: String,
+    pub remote_port: u16,
+    pub remote_typ: String,
+    pub relayed: bool,
+}
+
+/// A rendered description of a link's path, shared by `filament ping` (warm) and
+/// `filament doctor` (probe) so both name the path identically: the local
+/// INTERFACE, the address class, the concrete endpoints, and whether it's
+/// relayed. Fields are `Option` because a relay/webrtc link exposes less than a
+/// direct one.
+#[derive(Debug, Clone, Default)]
+pub struct PathInfo {
+    pub iface: Option<String>,
+    pub vpn: bool,
+    pub class: Option<String>,
+    pub local: Option<String>,
+    pub remote: Option<String>,
+    pub cand: Option<String>,
+    pub relay: bool,
+}
+
+impl PathInfo {
+    pub fn to_json(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        if let Some(i) = &self.iface {
+            m.insert("iface".into(), json!(i));
+            m.insert("vpn".into(), json!(self.vpn));
+        }
+        if let Some(c) = &self.class {
+            m.insert("class".into(), json!(c));
+        }
+        if let Some(l) = &self.local {
+            m.insert("local".into(), json!(l));
+        }
+        if let Some(r) = &self.remote {
+            m.insert("remote".into(), json!(r));
+        }
+        if let Some(c) = &self.cand {
+            m.insert("cand".into(), json!(c));
+        }
+        m.insert("relay".into(), json!(self.relay));
+        Value::Object(m)
+    }
+}
+
+/// Describe a link's path. Transport-FIRST: a direct-QUIC transport knows its
+/// own 5-tuple (`remote_addr`), so that's authoritative even if a stale webrtc
+/// `peer` Arc rode along on the guard; only when the transport has no address (a
+/// relay/DataChannel link) do we read the ICE candidate pair off the peer. The
+/// local interface comes from quinn's `local_ip` when available, else from the
+/// kernel's route to the remote (`source_ip_for`) — so the interface name shows
+/// even for holepunched sockets.
+pub async fn describe_path(t: &dyn Transport, peer: Option<&Peer>) -> PathInfo {
+    let mut info = PathInfo::default();
+    if let Some(ra) = t.remote_addr() {
+        info.remote = Some(ra.to_string());
+        info.class = Some(crate::doctor::ip_class(ra.ip()));
+        if let Some(la) = t.local_ip().or_else(|| source_ip_for(ra)) {
+            info.local = Some(la.to_string());
+            if let Some((n, v)) = crate::doctor::iface_for_ip(la) {
+                info.iface = Some(n);
+                info.vpn = v;
+            }
+        }
+    } else if let Some(p) = peer {
+        if let Some(pp) = p.path_detail().await {
+            info.remote = Some(format!("{}:{}", pp.remote_ip, pp.remote_port));
+            info.local = Some(pp.local_ip.clone());
+            info.cand = Some(format!("{}\u{2194}{}", pp.local_typ, pp.remote_typ));
+            info.relay = pp.relayed;
+            if let Ok(rip) = pp.remote_ip.parse::<std::net::IpAddr>() {
+                info.class = Some(crate::doctor::ip_class(rip));
+            }
+            if let Ok(lip) = pp.local_ip.parse::<std::net::IpAddr>() {
+                if let Some((n, v)) = crate::doctor::iface_for_ip(lip) {
+                    info.iface = Some(n);
+                    info.vpn = v;
+                }
+            }
+        }
+    }
+    info
 }
 
 /// C1: webrtc-rs never writes `a=max-message-size` into its SDP, so browsers
@@ -1380,6 +1511,23 @@ pub fn is_own_addr(addr: &str) -> bool {
         })
         .map(|la| la.ip() == ip)
         .unwrap_or(false)
+}
+
+/// The local source IP the kernel would use to reach `remote`. Same no-packets
+/// UDP-connect trick as `is_own_addr`: after `connect()`, `local_addr()` reports
+/// the source the routing table picked. Lets `filament ping` name the outbound
+/// interface even when quinn's `local_ip()` is `None` (holepunched / specifically
+/// bound sockets don't carry per-packet dst info). `None` only if the bind fails.
+pub fn source_ip_for(remote: std::net::SocketAddr) -> Option<std::net::IpAddr> {
+    let bind = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    std::net::UdpSocket::bind(bind)
+        .and_then(|s| {
+            s.connect(remote)?;
+            s.local_addr()
+        })
+        .ok()
+        .map(|la| la.ip())
+        .filter(|ip| !ip.is_unspecified())
 }
 
 /// RFC1918/4193 + loopback + link-local, "on your network" for the route badge.

@@ -989,6 +989,13 @@ async fn bring_up_to_known(
     // the socket DOWN and dial a FRESH one (reconnect_signaling) on the same `tx`.
     let mut welcome_silent_ticks: u32 = 0;
 
+    // Heartbeat so a slow establish never reads as a silent hang: every 7s while
+    // still connecting, emit elapsed progress (skipped for `doctor`, which renders
+    // its own per-phase ladder). The overall deadline lives at the call site.
+    let connect_started = tokio::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(7));
+    heartbeat.tick().await; // consume the immediate first tick
+
     loop {
         // One candidate at a time: start the next attempt whenever idle.
         if peer.is_none() {
@@ -1046,6 +1053,15 @@ async fn bring_up_to_known(
                 Some(ev) => ev,
                 None => break,
             },
+            _ = heartbeat.tick() => {
+                if role != "doctor" {
+                    crate::ui::say(&format!(
+                        "filament: still reaching '{peer_name}'... ({}s)",
+                        connect_started.elapsed().as_secs()
+                    ));
+                }
+                continue;
+            }
             _ = resubscribe.tick() => {
                 if my_id.is_none() {
                     // No Welcome yet. Re-emit the `join` once (it may have raced the
@@ -1300,6 +1316,10 @@ pub struct ProbeOutcome {
     pub failed_phase: Option<crate::diag::Phase>,
     /// On failure, the error string.
     pub error: Option<String>,
+    /// On success, the path the probe link actually took (interface, address
+    /// class, endpoints) — so `filament doctor` shows the route in the same fine
+    /// detail as `filament ping`. `None` when the link never came up.
+    pub path: Option<crate::net::PathInfo>,
 }
 
 /// Establish a link to `peer` exactly as netcat would, then drop it. Returns the
@@ -1335,6 +1355,12 @@ pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<Pr
             let (sid, _rx_pipe) = open_stream(&mux, probe_rport).await?;
             diag.up("tunnel", "datachannel-or-direct");
 
+            // Capture the path BEFORE teardown: the transport (direct) or the
+            // guard's webrtc peer (relay) still holds the live endpoints here.
+            let path = Some(
+                crate::net::describe_path(mux.transport().as_ref(), guard.peer.as_deref()).await,
+            );
+
             // Tear DOWN, no leak: drop the stream, tell the peer, stop the pump,
             // and close the link (peer + signaling), so the acceptor reaps us.
             mux.drop_stream(sid).await;
@@ -1352,6 +1378,7 @@ pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<Pr
                 established: true,
                 failed_phase: None,
                 error: None,
+                path,
             })
         }
         Ok(Err(e)) => {
@@ -1368,6 +1395,7 @@ pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<Pr
                 established: false,
                 failed_phase,
                 error: Some(e.to_string()),
+                path: None,
             })
         }
         Err(_elapsed) => {
@@ -1383,6 +1411,7 @@ pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<Pr
                 established: false,
                 failed_phase,
                 error: Some(format!("establishment timed out after {probe_secs}s")),
+                path: None,
             })
         }
     }
@@ -1968,7 +1997,35 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
     // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
-    let (t, mut rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "bootstrap").await?;
+    // Bound the connect so an unreachable peer fails with a clear, actionable
+    // message instead of looping forever (the heartbeat inside reports progress
+    // meanwhile). Override with FILAMENT_SSH_CONNECT_SECS.
+    let connect_secs: u64 = std::env::var("FILAMENT_SSH_CONNECT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(45);
+    let (t, mut rx, guard, mut diag) = match tokio::time::timeout(
+        std::time::Duration::from_secs(connect_secs),
+        bring_up_to_known(server, peer, relay, "bootstrap"),
+    )
+    .await
+    {
+        Ok(inner) => inner?,
+        Err(_) => {
+            crate::ui::problem(
+                &format!("filament ssh: can't reach '{peer}'"),
+                &format!(
+                    "couldn't establish a link to '{peer}' in {connect_secs}s — it may be offline or unreachable from here."
+                ),
+                &[
+                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
+                    format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
+                ],
+            );
+            std::process::exit(1);
+        }
+    };
     // The bootstrap rides the bring-up transport directly (pure control JSON, no
     // mux), so the link being usable IS the end of this span. Record `up`; the
     // ssh data link is a SEPARATE netcat span instrumented in its own right.
@@ -2094,7 +2151,12 @@ fn spawn_ssh(
         .arg("-o").arg("IdentitiesOnly=yes")
         .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new");
+        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+        // Bound the ssh-side connect and detect a dead session, so the data link
+        // (the filament netcat ProxyCommand) can't hang ssh indefinitely either.
+        .arg("-o").arg("ConnectTimeout=25")
+        .arg("-o").arg("ServerAliveInterval=15")
+        .arg("-o").arg("ServerAliveCountMax=3");
     // Split passthrough args into ssh OPTIONS (leading flags) and the remote
     // COMMAND (from the first non-flag token on). The destination is ALWAYS our
     // managed token, inserted BETWEEN options and command, or ssh would mistake
