@@ -167,11 +167,52 @@ fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
             }
         }
     }
+    // The path the link actually took: same fine detail as `filament ping` so the
+    // diagnosis names the interface + endpoints, not just the timings.
+    if let Some(p) = &o.path {
+        println!("  {:<13} {:>6}  {}", "path", "", fmt_path(p));
+    }
     println!();
     let v = verdict(o);
     let tone = if v.healthy { Tone::Ok } else { Tone::Err };
     println!("  {} {}", ui::paint(Tone::Bold, "verdict:"), ui::paint(tone, &v.line));
     println!();
+}
+
+/// Render a `PathInfo` to one elegant line: interface · class, the endpoints
+/// (direct shows `→remote`; a webrtc pair shows `local ↔ remote` plus the
+/// candidate types), or the relay caveat. A VPN/tailscale interface is tinted
+/// mint so the tunnel is obvious. Doctor keeps the full class form.
+fn fmt_path(p: &crate::net::PathInfo) -> String {
+    if p.relay {
+        return format!(
+            "{}   {}",
+            ui::paint(Tone::Warn, "relay · TURN"),
+            ui::paint(Tone::Dim, "(encrypted, no direct 5-tuple)")
+        );
+    }
+    let mut s = String::new();
+    if let Some(iface) = &p.iface {
+        let tone = if p.vpn { Tone::Brand } else { Tone::Dim };
+        s.push_str(&ui::paint(tone, iface));
+        if let Some(c) = &p.class {
+            s.push_str(&format!(" {} {}", ui::paint(Tone::Dim, "·"), ui::paint(Tone::Dim, c)));
+        }
+    } else if let Some(c) = &p.class {
+        s.push_str(&ui::paint(Tone::Dim, c));
+    }
+    let addrs = match (&p.local, &p.remote, p.cand.is_some()) {
+        (Some(l), Some(r), true) => format!("{l} \u{2194} {r}"),
+        (_, Some(r), _) => format!("\u{2192}{r}"),
+        _ => String::new(),
+    };
+    if !addrs.is_empty() {
+        s.push_str(&format!("  {}", ui::paint(Tone::Dim, &addrs)));
+    }
+    if let Some(c) = &p.cand {
+        s.push_str(&format!("  {}", ui::paint(Tone::Dim, &format!("({c})"))));
+    }
+    s
 }
 
 /// Render the distribution across N probes: per-phase min/median/max, the stall
@@ -259,6 +300,7 @@ fn single_json(device: &str, o: &crate::l2::ProbeOutcome) -> Value {
         "phases": o.timings.iter().map(timing_json).collect::<Vec<_>>(),
         "failed_phase": o.failed_phase.map(|p| p.label()),
         "error": o.error,
+        "path": o.path.as_ref().map(|p| p.to_json()),
         "verdict": {
             "healthy": v.healthy,
             "culprit": v.culprit.map(|p| p.label()),
@@ -544,6 +586,25 @@ fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
+/// Coarse class for a bare IP. `filament ping`/`doctor` path display reuses the
+/// doctor's taxonomy so "public"/"private (RFC1918)"/"CGNAT (100.64/10)" read
+/// identically everywhere. (Tailscale hands out CGNAT addresses, so a local end
+/// in 100.64/10 on a `tailscale0` interface is the tailnet, stated as data.)
+pub(crate) fn ip_class(ip: std::net::IpAddr) -> String {
+    address_class(&std::net::SocketAddr::new(ip, 0))
+}
+
+/// Map a local IP (the near end of a selected path) to the interface it belongs
+/// to, plus whether that interface is a VPN/tailscale tunnel. `None` when the IP
+/// isn't among local interfaces or `ip` is unavailable — the caller then just
+/// omits the interface name rather than guessing one.
+pub(crate) fn iface_for_ip(ip: std::net::IpAddr) -> Option<(String, bool)> {
+    list_interfaces()
+        .into_iter()
+        .find(|i| i.ip == ip)
+        .map(|i| (i.name, i.vpn))
+}
+
 struct Iface {
     name: String,
     ip: std::net::IpAddr,
@@ -690,6 +751,7 @@ mod tests {
             established: true,
             failed_phase: None,
             error: None,
+            path: None,
         };
         let v = verdict(&o);
         assert!(v.healthy);
@@ -707,6 +769,7 @@ mod tests {
             established: true,
             failed_phase: None,
             error: None,
+            path: None,
         };
         let v = verdict(&o);
         assert!(!v.healthy);
@@ -722,6 +785,7 @@ mod tests {
             established: false,
             failed_phase: Some(Phase::Establishing),
             error: Some("establishment timed out after 30s".into()),
+            path: None,
         };
         let v = verdict(&o);
         assert!(!v.healthy);

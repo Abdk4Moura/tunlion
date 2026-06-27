@@ -65,6 +65,12 @@ fn fmt_route(route: &str) -> String {
     }
 }
 
+/// Compact the doctor's address class for the one-line ping ("private (RFC1918)"
+/// → "private", "CGNAT (100.64/10)" → "CGNAT"). Doctor keeps the full form.
+fn short_class(class: &str) -> &str {
+    class.split(" (").next().unwrap_or(class)
+}
+
 fn fmt_ms(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
@@ -73,24 +79,56 @@ fn fmt_ms(ms: u64) -> String {
     }
 }
 
-/// One result line for a held (warm) link. Direct links carry a real RTT + the
-/// remote IP:port (like tailscale); a relay link has no quinn RTT, so it reads
-/// "warm" without a fake number.
+/// One result line for a held (warm) link. The path is shown in fine detail but
+/// compactly: the local network INTERFACE, the remote-address class, and the
+/// concrete addresses — so you can see exactly which route the link takes (e.g.
+/// `tailscale0 · CGNAT  100.x ↔ 100.y` means the tailnet, stated as data, not
+/// guessed). A relay/TURN path has no line of sight, so it reads "relay · TURN"
+/// with the encrypted caveat instead of addresses; direct links also carry a
+/// real RTT from quinn.
 fn print_warm_line(v: &Value) {
     let route = v["route"].as_str().unwrap_or("?");
     let rtt = v["rtt_ms"].as_u64();
-    let addr = v["remote_addr"].as_str();
     let verified = v["verified"].as_str();
+    let direct = v["direct"].as_bool().unwrap_or(false);
+    let path = &v["path"];
 
     let lead = match rtt {
         Some(ms) => ui::paint(Tone::Ok, &format!("● pong  {:>4}ms", ms)),
         None => ui::paint(Tone::Ok, "● warm       "),
     };
-    let route_tone = if is_relay(route) { Tone::Warn } else { Tone::Dim };
-    let mut line = format!("  {}   {}", lead, ui::paint(route_tone, &fmt_route(route)));
-    if let Some(a) = addr {
-        line.push_str(&format!("  {}", ui::paint(Tone::Dim, a)));
+    let mut line = format!("  {lead}");
+
+    let relayed = is_relay(route) || path["relay"].as_bool().unwrap_or(false);
+    if relayed {
+        line.push_str(&format!("   {}", ui::paint(Tone::Warn, &fmt_route(route))));
+        line.push_str(&format!("  {}", ui::paint(Tone::Dim, "(encrypted, not direct)")));
+    } else {
+        // Interface · class — the heart of "show the path". When the interface
+        // is a VPN/tailscale tunnel, tint it mint so the tunnel is obvious.
+        if let Some(iface) = path["iface"].as_str() {
+            let vpn = path["vpn"].as_bool().unwrap_or(false);
+            let iface_tone = if vpn { Tone::Brand } else { Tone::Dim };
+            line.push_str(&format!("   {}", ui::paint(iface_tone, iface)));
+            if let Some(class) = path["class"].as_str() {
+                line.push_str(&format!(" {} {}", ui::paint(Tone::Dim, "·"), ui::paint(Tone::Dim, short_class(class))));
+            }
+        } else if let Some(class) = path["class"].as_str() {
+            line.push_str(&format!("   {}", ui::paint(Tone::Dim, short_class(class))));
+        }
+        // Addresses: direct-QUIC pins a 5-tuple, so the remote end is the story
+        // (→ remote); a webrtc pair is meaningful on both ends (local ↔ remote).
+        let local = path["local"].as_str();
+        let remote = path["remote"].as_str().or_else(|| v["remote_addr"].as_str());
+        if let Some(r) = remote {
+            let addrs = match local {
+                Some(l) if !direct => format!("{l} \u{2194} {r}"),
+                _ => format!("\u{2192}{r}"),
+            };
+            line.push_str(&format!("  {}", ui::paint(Tone::Dim, &addrs)));
+        }
     }
+
     if let Some(name) = verified {
         line.push_str(&format!("   {}", ui::paint(Tone::Ok, &format!("✓ {name}"))));
     }
