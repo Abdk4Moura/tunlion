@@ -1,0 +1,8 @@
+[Unit]
+Description=Filament signaling health check (one-shot; driven by filament-monitor.timer)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/signaling-monitor.py
+# Alerts go out via Resend; the send-only key is read from ~/secret_keys.
