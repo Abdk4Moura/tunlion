@@ -292,6 +292,11 @@ pub enum Ev {
     /// authoritative trigger and this is purely an accelerant.
     #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
     SignalingDown(String),
+    /// Warm-reuse opened a stream over this held link and it black-holed (no
+    /// response within the verify window) — the link is a zombie (alive at the
+    /// QUIC layer but dead for new streams). The loop drops it so the daemon
+    /// re-forms a healthy one and warm-reuse goes back to instant. Carries the pid.
+    DropLink(String),
     /// Ctrl-C: park state, print the resume hint, leave cleanly.
     Interrupted,
     /// A line typed into a listening recv (claim-a-code convenience).

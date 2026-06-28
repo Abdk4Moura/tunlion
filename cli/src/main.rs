@@ -4141,6 +4141,7 @@ async fn handle_warm_req(
     _conn: &Conn,
     _l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     _warm_ptys: &WarmPtys,
+    _tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
 ) {
     match req {}
@@ -4151,11 +4152,12 @@ async fn handle_warm_req(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
+    tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
 ) {
     match &req.kind {
-        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, req).await,
-        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, req).await,
+        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req).await,
+        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
         ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, req).await,
         // Bootstrap is dispatched before this (it defers its reply), so it never
@@ -4274,7 +4276,12 @@ fn log_warm_miss(conn: &Conn, peer: &str) {
 /// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
 /// bridge it to the client's unix socket (netcat/ssh/forward fast path).
 #[cfg(unix)]
-async fn handle_warm_open(conn: &Conn, l2_muxes: &mut HashMap<String, Arc<l2::Mux>>, req: ctl::Req) {
+async fn handle_warm_open(
+    conn: &Conn,
+    l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    tx: &mpsc::UnboundedSender<Ev>,
+    req: ctl::Req,
+) {
     let ctl::ReqKind::Open { peer, rport } = &req.kind else { return };
     let (peer, rport) = (peer.clone(), *rport);
     let Some((pid, t)) = warm_link_for(conn, &peer) else {
@@ -4283,11 +4290,32 @@ async fn handle_warm_open(conn: &Conn, l2_muxes: &mut HashMap<String, Arc<l2::Mu
         return;
     };
     // Reuse the SAME per-peer mux the event loop routes inbound L2 frames to.
-    let mux = l2_muxes.entry(pid).or_insert_with(|| l2::Mux::new(t)).clone();
-    let sock = req.accept().await;
+    let mux = l2_muxes.entry(pid.clone()).or_insert_with(|| l2::Mux::new(t)).clone();
+    let tx = tx.clone();
+    // SELF-HEALING warm-reuse: VERIFY the held link still delivers BEFORE committing
+    // the client. Open the stream and wait for the first inbound frame (sshd's
+    // banner — the byte we needed anyway, so a healthy link pays ~1 RTT and nothing
+    // extra), then accept. A zombie link (alive at the QUIC layer but black-holing
+    // new streams — the popos hang) yields nothing within the window, so we DROP it
+    // (the loop re-forms a healthy one, keeping warm-reuse fast) and REJECT, which
+    // makes the client's `try_open` return None and fall straight through to a fresh
+    // establish. Verifying before accepting is what makes the fallback INSTANT: an
+    // accepted-then-dead connection would instead stall the client until ITS own
+    // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
+    // never blocks the event loop (F8).
     tokio::spawn(async move {
-        if let Err(e) = l2::serve_local_stream(mux, rport, sock).await {
-            ui::trace(&format!("filament: warm stream failed: {e}"));
+        match l2::open_stream_verified(&mux, rport, l2::warm_verify_window()).await {
+            Ok((sid, first, rx)) => {
+                let sock = req.accept().await;
+                l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+            }
+            Err(e) => {
+                ui::debug(&format!(
+                    "filament: warm link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
+                ));
+                let _ = tx.send(Ev::DropLink(pid));
+                req.reject("warm link unresponsive; establishing fresh").await;
+            }
         }
     });
 }
@@ -4300,6 +4328,7 @@ async fn handle_warm_pty(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
+    tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
 ) {
     let ctl::ReqKind::Pty { peer, session, cols, rows, term } = &req.kind else { return };
@@ -4310,25 +4339,38 @@ async fn handle_warm_pty(
         return;
     };
     let mux = l2_muxes.entry(pid.clone()).or_insert_with(|| l2::Mux::new(t)).clone();
-    let (sid, rx_pipe) = match l2::open_pty_stream(&mux, &session, cols, rows, &term).await {
-        Ok(v) => v,
-        Err(e) => {
-            req.reject(&format!("pty-open failed: {e}")).await;
-            return;
-        }
-    };
-    if let Ok(mut m) = warm_ptys.lock() {
-        m.insert(session.clone(), (pid, sid));
-    }
-    let sock = req.accept().await;
     let warm_ptys = warm_ptys.clone();
+    let tx = tx.clone();
+    let verify = l2::warm_verify_window();
+    // SELF-HEALING warm pty, same shape as handle_warm_open: VERIFY the held link
+    // delivers (the shell prompt / replayed buffer, sent unprompted, is the first
+    // frame) BEFORE recording the session and accepting the terminal. On a zombie
+    // link we DROP it and REJECT, so the client falls straight through to a cold
+    // pty rather than getting a dead terminal. Spawned so the verify wait never
+    // blocks the event loop (F8).
     tokio::spawn(async move {
-        l2::serve_opened_stream(mux, sid, sock, rx_pipe).await;
-        // Bridge ended (shell exit / client gone / link drop): drop our entry,
-        // but only if it is still ours (a reconnect may have replaced it).
-        if let Ok(mut m) = warm_ptys.lock() {
-            if m.get(&session).map(|(_, s)| *s == sid).unwrap_or(false) {
-                m.remove(&session);
+        match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, verify).await {
+            Ok((sid, first, rx_pipe)) => {
+                if let Ok(mut m) = warm_ptys.lock() {
+                    m.insert(session.clone(), (pid, sid));
+                }
+                let sock = req.accept().await;
+                l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                // Bridge ended (shell exit / client gone / link drop): drop our
+                // entry, but only if it is still ours (a reconnect may have
+                // replaced it).
+                if let Ok(mut m) = warm_ptys.lock() {
+                    if m.get(&session).map(|(_, s)| *s == sid).unwrap_or(false) {
+                        m.remove(&session);
+                    }
+                }
+            }
+            Err(e) => {
+                ui::debug(&format!(
+                    "filament: warm pty link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
+                ));
+                let _ = tx.send(Ev::DropLink(pid));
+                req.reject("warm link unresponsive; establishing fresh").await;
             }
         }
     });
@@ -6303,11 +6345,11 @@ async fn recv_cmd(
                         if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
                         } else {
-                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, req).await;
+                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                         }
                     }
                     #[cfg(not(unix))]
-                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, req).await;
+                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                 }
                 None
             }
@@ -6750,6 +6792,18 @@ async fn recv_cmd(
         }
 
         match ev {
+            // A warm-reuse open found this held link black-holing new streams
+            // (zombie: alive at QUIC, dead for data). Drop it so the proactive
+            // re-connect forms a fresh, healthy held link and warm-reuse goes
+            // back to instant. Live DATA links are untouched (each ssh/pty op
+            // rides its own stream; the dropped link had no working stream).
+            Ev::DropLink(pid) => {
+                if conn.links.contains_key(&pid) {
+                    ui::debug(&format!("filament: dropping zombie warm link to '{pid}' (black-holed a stream)"));
+                    conn.drop_link(&pid);
+                    l2_muxes.remove(&pid);
+                }
+            }
             Ev::PairMatched(v) => {
                 claim_in_flight = false;
                 let room = v["room"].as_str().unwrap_or_default().to_string();
