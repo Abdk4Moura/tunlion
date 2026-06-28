@@ -1,0 +1,35 @@
+# Exhaustive establishment-protocol proof, as a required gate.
+#
+# proofs/establishment_model.py model-checks the ENTIRE reachable state space of
+# the peer-to-peer connection-establishment protocol (N=2 and N=3, GoodNet +
+# DegradedNet tiers) and exits non-zero if ANY reachable state is invalid, stuck,
+# deadlocked, or cannot self-heal to CONNECTED. See proofs/README.md.
+#
+# The discipline this enforces: a protocol change must keep the proof green. If
+# you change the establishment FSM (cli/src/{net,main}.rs, frontend/src/lib/*.js,
+# signaling.py, CONTRACT.md), update proofs/establishment_model.py + its
+# state<->code mapping table FIRST, then make CI pass.
+
+name: Proof
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  establishment-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Model-check establishment protocol (N=2, N=3; GoodNet + Degraded)
+        run: python3 proofs/establishment_model.py
