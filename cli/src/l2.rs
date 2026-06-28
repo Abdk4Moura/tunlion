@@ -284,7 +284,19 @@ async fn socket_to_dc<R: AsyncRead + Unpin>(
 async fn dc_to_socket<W: AsyncWrite + Unpin>(
     mut rx: mpsc::Receiver<PipeItem>,
     mut wr: W,
+    first: Option<PipeItem>,
 ) -> Result<()> {
+    // A warm-reuse verify already pulled the FIRST inbound frame off the wire to
+    // confirm the link is live; replay it here so no peer bytes are lost.
+    if let Some(item) = first {
+        match item {
+            Some(bytes) => wr.write_all(&bytes).await?,
+            None => {
+                let _ = wr.shutdown().await;
+                return Ok(());
+            }
+        }
+    }
     while let Some(item) = rx.recv().await {
         match item {
             Some(bytes) => wr.write_all(&bytes).await?,
@@ -309,12 +321,16 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     sock: S,
     rx: mpsc::Receiver<PipeItem>,
     send_close: bool,
+    first: Option<PipeItem>,
 ) {
     // Caller sets TCP_NODELAY where applicable (a unix socket has none); split
     // generically so the same plumbing serves a TcpStream OR a local UnixStream
     // (the warm-link reuse path bridges a unix socket to an L2 stream).
     let (rd, wr) = tokio::io::split(sock);
-    let writer = tokio::spawn(dc_to_socket(rx, wr));
+    // `first`: a warm-reuse verify already pulled the first inbound frame off the
+    // wire to PROVE the link is live before the client was committed; replay it
+    // here so no peer bytes are lost.
+    let writer = tokio::spawn(dc_to_socket(rx, wr, first));
     let reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
     mux.set_read_pump(sid, reader.abort_handle()).await;
 
@@ -785,7 +801,7 @@ impl Mux {
                     .transport
                     .send_control(&json!({ "type": "l2-open-ack", "sid": sid, "credit": 0 }))
                     .await;
-                serve_stream(self.clone(), sid, sock, rx, true).await;
+                serve_stream(self.clone(), sid, sock, rx, true, None).await;
                 self.accepted.lock().await.remove(&sid);
             }
             Err(e) => {
@@ -1463,6 +1479,81 @@ pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc
     Ok((sid, rx))
 }
 
+/// How long warm-reuse waits for the first inbound frame proving a held link
+/// still delivers, before treating it as a zombie. A healthy link answers in ~1
+/// RTT; for ssh that frame is sshd's banner and for pty the shell prompt, both of
+/// which the peer sends UNPROMPTED, so the wait overlaps work we needed anyway.
+/// Only a black-holed link burns the whole window. Override with
+/// FILAMENT_WARM_VERIFY_MS.
+#[cfg(unix)]
+pub(crate) fn warm_verify_window() -> std::time::Duration {
+    let ms = std::env::var("FILAMENT_WARM_VERIFY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2500);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Confirm a just-opened warm stream (`sid` + its inbound `rx`) actually delivers,
+/// BEFORE the caller commits the client to it. Waits up to `verify` for the first
+/// inbound frame — data OR an l2-close (a real refusal): either proves the link is
+/// alive. Returns the frame so the caller can replay it (no bytes lost). `Err` if
+/// nothing arrives in time: a ZOMBIE link, up at the QUIC layer but black-holing
+/// new streams, so the caller drops it and falls back to a fresh establish rather
+/// than handing the client a dead connection (which would stall until ITS own
+/// timeout — the 25s ssh ConnectTimeout we measured). Verifying first means the
+/// fallback is immediate and the client never sends bytes into a black hole.
+#[cfg(unix)]
+async fn verify_first_frame(
+    mux: &Arc<Mux>,
+    sid: u32,
+    mut rx: mpsc::Receiver<PipeItem>,
+    verify: std::time::Duration,
+) -> Result<(PipeItem, mpsc::Receiver<PipeItem>)> {
+    match tokio::time::timeout(verify, rx.recv()).await {
+        Ok(Some(first)) => Ok((first, rx)),
+        Ok(None) => Err(anyhow!("warm stream closed before any frame")),
+        Err(_) => {
+            // Best-effort tear-down of the half-open sid on the peer, then bail so
+            // the caller drops this zombie link and establishes fresh.
+            mux.streams.lock().await.remove(&sid);
+            let _ = mux
+                .transport
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            Err(anyhow!("warm link unresponsive after {}ms (zombie)", verify.as_millis()))
+        }
+    }
+}
+
+/// Open an L2 stream over a warm link and CONFIRM the peer responds before the
+/// caller commits the client. Returns (sid, first_frame, remaining_rx) once the
+/// first inbound frame lands. `Err` on a zombie link (see `verify_first_frame`).
+#[cfg(unix)]
+pub(crate) async fn open_stream_verified(
+    mux: &Arc<Mux>,
+    rport: u16,
+    verify: std::time::Duration,
+) -> Result<(u32, PipeItem, mpsc::Receiver<PipeItem>)> {
+    let (sid, rx) = open_stream(mux, rport).await?;
+    let (first, rx) = verify_first_frame(mux, sid, rx, verify).await?;
+    Ok((sid, first, rx))
+}
+
+/// Bridge a verified warm stream to the client `sock`, replaying the already-read
+/// `first` frame so no peer bytes are lost.
+#[cfg(unix)]
+pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    mux: Arc<Mux>,
+    sid: u32,
+    sock: S,
+    first: PipeItem,
+    rx: mpsc::Receiver<PipeItem>,
+) {
+    serve_stream(mux, sid, sock, rx, true, Some(first)).await;
+}
+
 /// WARM pty (daemon side): open a PTY on the peer over an EXISTING link's `mux`,
 /// sending `pty-open` (vs `open_stream`'s `l2-open`). Returns the sid + inbound
 /// pipe; the caller bridges with `serve_opened_stream` and relays `pty-resize` by
@@ -1485,9 +1576,29 @@ pub(crate) async fn open_pty_stream(
     Ok((sid, rx))
 }
 
+/// Warm PTY open that CONFIRMS the held link delivers before the caller commits
+/// the terminal — the pty twin of `open_stream_verified`. A fresh PTY's shell
+/// prompt (or a reattach's replayed buffer) is the first inbound frame and the
+/// peer sends it unprompted, so a healthy link costs nothing here; a zombie link
+/// yields nothing within `verify` and we `Err` so the caller drops it + falls
+/// back to a cold pty instead of handing the user a dead terminal.
+#[cfg(unix)]
+pub(crate) async fn open_pty_stream_verified(
+    mux: &Arc<Mux>,
+    session: &str,
+    cols: u16,
+    rows: u16,
+    term: &str,
+    verify: std::time::Duration,
+) -> Result<(u32, PipeItem, mpsc::Receiver<PipeItem>)> {
+    let (sid, rx) = open_pty_stream(mux, session, cols, rows, term).await?;
+    let (first, rx) = verify_first_frame(mux, sid, rx, verify).await?;
+    Ok((sid, first, rx))
+}
+
 /// Bridge an already-opened L2 stream (`sid` + its inbound `rx`) to a local
 /// `stream` (the warm pty client's unix socket), running to completion (stream
-/// EOF or peer FIN). The daemon's warm-pty path uses this after `open_pty_stream`.
+/// EOF or peer FIN). The daemon's warm-pty path uses this after a verified open.
 #[cfg(unix)]
 pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mux: Arc<Mux>,
@@ -1495,26 +1606,7 @@ pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send
     stream: S,
     rx: mpsc::Receiver<PipeItem>,
 ) {
-    serve_stream(mux, sid, stream, rx, true).await;
-}
-
-/// WARM-LINK REUSE (daemon side): open a NEW L2 stream to `rport` over an
-/// EXISTING peer link (its `mux`) and bridge it to a local `stream` (a unix
-/// socket from a sibling `filament netcat`/`ssh`/`forward` process). This is the
-/// same initiator primitive netcat uses (`open_stream` + `serve_stream`), but the
-/// bytes ride a unix socket instead of stdio, and the underlying QUIC/DC link is
-/// the daemon's already-established one, so signaling + establishment are skipped
-/// entirely. The remote acceptor is UNCHANGED: it serves this `l2-open` exactly
-/// as it serves a cold one. Unix-only (the control socket is a unix-domain socket).
-#[cfg(unix)]
-pub(crate) async fn serve_local_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    mux: Arc<Mux>,
-    rport: u16,
-    stream: S,
-) -> Result<()> {
-    let (sid, rx_pipe) = open_stream(&mux, rport).await?;
-    serve_stream(mux, sid, stream, rx_pipe, true).await;
-    Ok(())
+    serve_stream(mux, sid, stream, rx, true, None).await;
 }
 
 /// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
@@ -1967,7 +2059,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         // flow control (design §4); the warm path avoids this (independent streams).
         let (sid, rx_pipe) = open_stream(&mux, rport).await?;
         tokio::spawn(async move {
-            serve_stream(mux, sid, sock, rx_pipe, true).await;
+            serve_stream(mux, sid, sock, rx_pipe, true, None).await;
         });
     }
 }
@@ -2582,5 +2674,77 @@ mod h1_tests {
         assert!(msg.contains(&format!("{}", u16::MAX)), "must name the conflicting port: {msg}");
         // u16::MAX.saturating_add(1) == u16::MAX, NOT 0.
         assert!(!msg.contains("0 "), "saturating add must not wrap to 0: {msg}");
+    }
+
+    // ---- warm-reuse zombie self-heal (the popos pty/ssh hang) ----------------
+
+    /// THE proof for "filament definitively works no matter what": warm-reuse over
+    /// a ZOMBIE held link (alive at QUIC, black-holing new streams: NOTHING ever
+    /// arrives inbound) must NOT hang. `open_stream_verified` bails within the
+    /// window with an `Err`, removes the half-open stream, and sends an `l2-close`
+    /// so the peer reaps its half. The caller (handle_warm_open) then drops the
+    /// link and rejects, so the client falls through to a fresh establish.
+    /// Crucially it verifies BEFORE the client is committed, so the fallback is
+    /// instant — never the 25s ssh-ConnectTimeout stall an accepted-then-dead
+    /// connection would cause.
+    #[tokio::test]
+    async fn warm_reuse_zombie_link_self_heals_instead_of_hanging() {
+        let t = CapTransport::new();
+        let mux = Mux::new(t.clone());
+
+        let verdict =
+            open_stream_verified(&mux, 22, std::time::Duration::from_millis(50)).await;
+
+        assert!(verdict.is_err(), "a link that delivers no inbound frame must be a zombie Err");
+        assert_eq!(mux.live_streams().await, 0, "zombie stream must be removed, not leaked");
+        let ctrls = t.controls.lock().unwrap();
+        assert!(
+            ctrls.iter().any(|c| c["type"] == "l2-open"),
+            "must have attempted the open"
+        );
+        assert!(
+            ctrls.iter().any(|c| c["type"] == "l2-close"),
+            "must send l2-close so the peer reaps its half of the zombie stream"
+        );
+    }
+
+    /// The flip side, proving the verify costs the happy path NOTHING and never
+    /// false-flags a live link: a HEALTHY link that delivers a first frame within
+    /// the window returns `Ok` with that frame preserved, and `serve_verified_stream`
+    /// replays it to the client byte-for-byte (no peer bytes lost to the probe).
+    #[tokio::test]
+    async fn warm_reuse_healthy_link_passes_and_replays_first_frame() {
+        let t = CapTransport::new();
+        let mux = Mux::new(t.clone());
+
+        // Drive open_stream_verified concurrently; as soon as it registers its
+        // stream, deliver the peer's first frame (sshd banner / shell prompt).
+        let mux2 = mux.clone();
+        let h = tokio::spawn(async move {
+            open_stream_verified(&mux2, 22, std::time::Duration::from_secs(5)).await
+        });
+        let sid = loop {
+            if let Some(&sid) = mux.streams.lock().await.keys().next() {
+                break sid;
+            }
+            tokio::task::yield_now().await;
+        };
+        mux.on_frame(sid, Bytes::from_static(b"BANNER")).await;
+
+        let (got_sid, first, rx) = h.await.expect("task panicked").expect("healthy link must be Ok");
+        assert_eq!(got_sid, sid);
+        assert_eq!(first, Some(Bytes::from_static(b"BANNER")), "first frame must be preserved for replay");
+
+        // serve_verified_stream replays `first` to the client verbatim.
+        let (mut client, srv) = tokio::io::duplex(1024);
+        let mux3 = mux.clone();
+        let s = tokio::spawn(async move { serve_verified_stream(mux3, sid, srv, first, rx).await });
+        let mut buf = [0u8; 6];
+        client.read_exact(&mut buf).await.expect("replayed frame must reach the client");
+        assert_eq!(&buf, b"BANNER", "the verified first frame must be replayed verbatim");
+
+        mux.on_frame(sid, Bytes::new()).await; // peer FIN closes the writer pump
+        drop(client); // client EOF closes the reader pump
+        s.await.expect("serve task panicked");
     }
 }
