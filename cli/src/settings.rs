@@ -548,8 +548,24 @@ pub fn run_get(
     Ok(())
 }
 
+/// Tell a running daemon a key changed and print whether it applied live. On a
+/// daemon that doesn't answer (or a non-unix host), fall back to the restart hint.
+async fn announce_to_daemon(key: &str, color: bool) {
+    #[cfg(unix)]
+    {
+        match crate::ctl::try_reconfigure(key).await {
+            Some(v) if v["live"].as_bool() == Some(true) => {
+                eprintln!("  {}", ui::paint_when(color, ui::Tone::Ok, "applied to the running daemon"));
+                return;
+            }
+            _ => {}
+        }
+    }
+    eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `filament up`"));
+}
+
 /// `filament unset <key> [--peer <d>]`
-pub fn run_unset(key: &str, peer: Option<&str>) -> Result<()> {
+pub async fn run_unset(key: &str, peer: Option<&str>) -> Result<()> {
     let c = unset(key, peer)?;
     let color = ui::stdout_color();
     eprintln!(
@@ -560,14 +576,14 @@ pub fn run_unset(key: &str, peer: Option<&str>) -> Result<()> {
         c.scope
     );
     if c.daemon && crate::daemon_running() {
-        eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `filament up`"));
+        announce_to_daemon(c.key, color).await;
     }
     Ok(())
 }
 
 /// `filament set` with key+value, or no args (readout), or --reset.
 #[allow(clippy::too_many_arguments)]
-pub fn run_set(
+pub async fn run_set(
     key: Option<&str>,
     value: Option<&str>,
     peer: Option<&str>,
@@ -623,10 +639,7 @@ pub fn run_set(
                 );
             }
             if c.daemon && crate::daemon_running() {
-                eprintln!(
-                    "  {}",
-                    ui::paint_when(color, ui::Tone::Dim, "takes effect on next `filament up`")
-                );
+                announce_to_daemon(c.key, color).await;
             }
             Ok(())
         }

@@ -4242,6 +4242,9 @@ async fn handle_warm_req(
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.
         ctl::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,
+        // Reconfigure is handled inline in the daemon loop (it mutates loop state),
+        // so it never reaches this dispatcher; answer defensively if it ever does.
+        ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
     }
 }
 
@@ -4631,11 +4634,11 @@ async fn main() -> Result<()> {
             reset,
             yes,
             json,
-        ),
+        ).await,
         Cmd::Get { key, peer, show_origin, default, json } => {
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
         }
-        Cmd::Unset { key, peer } => settings::run_unset(&key, peer.as_deref()),
+        Cmd::Unset { key, peer } => settings::run_unset(&key, peer.as_deref()).await,
         Cmd::Config { key, value } => {
             match (key, value) {
                 (Some(k), Some(v)) => {
@@ -6020,11 +6023,79 @@ struct IncomingFile {
     bar: ui::Progress,
 }
 
+/// Build the live shell policy from the persistent settings (global `shell` +
+/// per-peer `shell on` overrides). Mirrors `up_cmd`'s startup construction so a
+/// `set shell ...` reconfigure lands the daemon in the same state a restart would.
+fn shell_policy_from_settings() -> ShellPolicy {
+    if settings::get_bool("shell", None) {
+        return ShellPolicy::All;
+    }
+    let peers = settings::peers_with("shell", "on");
+    if peers.is_empty() {
+        ShellPolicy::Granted
+    } else {
+        ShellPolicy::Only(peers.into_iter().collect())
+    }
+}
+
+/// Apply a `filament set <key>` change to the LIVE daemon state, the heart of
+/// live-reconfigure. Returns whether the change took effect without a restart.
+/// Keys woven into startup (relay/server force, or arming the L2 acceptor from
+/// cold) return `false`, so the client tells the user to run `filament up`.
+#[allow(clippy::too_many_arguments)]
+async fn apply_reconfigure(
+    key: &str,
+    dir: &mut PathBuf,
+    shell_policy: &mut ShellPolicy,
+    shell_user: &mut Option<String>,
+    l2_enabled: bool,
+    sess: &mut session::Session,
+    sio: &rust_socketio::asynchronous::Client,
+    my_uid: &str,
+) -> bool {
+    match key {
+        "drop-dir" => {
+            let nd = settings::get_str("drop-dir", None)
+                .map(PathBuf::from)
+                .unwrap_or_else(default_drop_dir);
+            let _ = std::fs::create_dir_all(&nd);
+            *dir = nd;
+            true
+        }
+        "shell-user" => {
+            *shell_user = settings::get_str("shell-user", None);
+            true
+        }
+        // auto-extract is re-read on every received file (finalize_incoming), so
+        // it is already live; nothing to mutate here.
+        "auto-extract" => true,
+        "shell" => {
+            *shell_policy = shell_policy_from_settings();
+            // The per-request accept check consults `shell_policy` live, so a
+            // narrow/disable applies instantly. But going from no-shell to shell
+            // needs the L2 acceptor that was wired at startup: live only if it was
+            // already armed (`l2_enabled`).
+            l2_enabled || !shell_policy.enables_l2()
+        }
+        "name" => {
+            // Re-announce presence with the fresh name. Same uid + room, so peers
+            // update the label without minting a new presence identity (no ghost).
+            if let Some(room) = sess.room.clone() {
+                sess.emit(sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
+            }
+            true
+        }
+        // relay/server are bound into the establishment + signaling setup at
+        // startup; changing them safely needs a fresh `filament up`.
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
-    dir: PathBuf,
+    mut dir: PathBuf,
     yes: bool,
     room: Option<String>,
     to: Option<String>,
@@ -6033,10 +6104,10 @@ async fn recv_cmd(
     remember: Option<String>,
     daemon: bool,
     output: Option<String>,
-    shell_policy: ShellPolicy,
+    mut shell_policy: ShellPolicy,
     // M-1: optional non-root account the web-shell/ssh PTY is dropped to. `None`
     // means the PTY runs as the up-process user (documented root risk).
-    shell_user: Option<String>,
+    mut shell_user: Option<String>,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
     // INTERACTIVE GATE (CLI `recv` only, never the daemon/`up`). With no code,
@@ -6466,7 +6537,17 @@ async fn recv_cmd(
                     // stashes the socket in pending_bootstrap instead.
                     #[cfg(unix)]
                     {
-                        if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
+                        // `filament set` live-reconfigure: re-read the changed key
+                        // into this loop's live state, then report whether it took
+                        // without a restart. Handled here (we own dir/policy/sess).
+                        if let ctl::ReqKind::Reconfigure { key } = &req.kind {
+                            let key = key.clone();
+                            let live = apply_reconfigure(
+                                &key, &mut dir, &mut shell_policy, &mut shell_user,
+                                l2_enabled, &mut sess, &sio, &my_uid,
+                            ).await;
+                            req.reply(&json!({ "ok": true, "live": live })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
                         } else {
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
