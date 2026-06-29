@@ -48,7 +48,7 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
 pub use imp::{
     send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping, try_pty,
-    try_resize, Req, ReqKind,
+    try_reconfigure, try_resize, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
@@ -201,6 +201,27 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Tell a running `up` daemon that setting `key` changed, so it re-reads its
+    /// prefs and applies the change to its live state (the `filament set` live
+    /// path). Returns the daemon's reply (`{"ok":true,"live":<bool>}`) or `None`
+    /// when there is no daemon / it did not answer, so the caller can fall back to
+    /// the "takes effect on next up" message. Bounded so a wedged daemon can't
+    /// hang `filament set`.
+    pub async fn try_reconfigure(key: &str) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "reconfigure", "key": key });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -225,6 +246,13 @@ mod imp {
         /// the facts are local to the daemon (quinn's RTT/addr, the link table), so
         /// unlike Bootstrap there is nothing to await from the peer.
         Ping { peer: String },
+        /// Tell the running daemon a setting changed (`filament set`). The daemon
+        /// re-reads its prefs and applies `key` to its live state where it safely
+        /// can (drop-dir, shell policy/user, name, auto-extract), replying
+        /// `{"ok":true,"live":<bool>}`: `live:true` = applied without a restart;
+        /// `live:false` = the key is woven into startup (relay/server, or arming
+        /// the L2 acceptor from cold) and needs `filament up`. Answered INLINE.
+        Reconfigure { key: String },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -334,6 +362,10 @@ mod imp {
                     Some("ping") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
                         ReqKind::Ping { peer }
+                    }
+                    Some("reconfigure") => {
+                        let Some(key) = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).map(str::to_string) else { return };
+                        ReqKind::Reconfigure { key }
                     }
                     _ => return,
                 };
