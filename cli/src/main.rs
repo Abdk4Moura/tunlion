@@ -29,6 +29,7 @@ mod sdnotify;
 mod protocol;
 mod resilience;
 mod session;
+mod settings;
 mod shutdown;
 mod sshkeys;
 mod ui;
@@ -328,6 +329,10 @@ struct Cli {
     /// without this; the env var FILAMENT_NONINTERACTIVE=1 does the same thing.
     #[arg(long, global = true)]
     no_interactive: bool,
+    /// Colorize output: auto (default; only at a TTY), always, or never. A flag
+    /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
+    #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
+    color: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -449,7 +454,65 @@ enum Cmd {
     /// Vouch between two known devices: mints a fresh secret and delivers it
     /// to both over verified channels (run on the device that knows both)
     Introduce { a: String, b: String },
-    /// Get or set config (keys: name, server, dir) in ~/.config/filament/config
+    /// Show or change settings. No args prints all settings with their value,
+    /// scope, and where each came from (env > peer > config > default). Strictly
+    /// imperative: `set` only changes the key you name.
+    #[command(after_help = "\x1b[1mExamples:\x1b[0m\n  \
+        filament set                          show every setting + where it came from\n  \
+        filament set auto-extract on          change one setting (partial, never resets others)\n  \
+        filament set shell on --peer laptop   per-device override\n  \
+        filament get drop-dir --show-origin   read one value (bare value on stdout)\n  \
+        filament unset relay                  revert one setting to its default\n\n\
+        Keys: name, server, drop-dir, relay, auto-extract, shell, shell-user")]
+    Set {
+        /// Setting name (run `filament set` to list them all)
+        key: Option<String>,
+        /// New value; omit to read the current value
+        value: Option<String>,
+        /// Scope this change to one known device (per-peer settings only)
+        #[arg(long, value_name = "DEVICE")]
+        peer: Option<String>,
+        /// Show what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Reset ALL settings to their defaults (clears global + per-peer)
+        #[arg(long)]
+        reset: bool,
+        /// Skip the confirmation prompt (required for --reset in a pipe/CI)
+        #[arg(long)]
+        yes: bool,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read one setting's effective value (bare value on stdout, for scripts)
+    Get {
+        /// Setting name
+        key: String,
+        /// Resolve as it applies to this device (per-peer settings)
+        #[arg(long, value_name = "DEVICE")]
+        peer: Option<String>,
+        /// Append where the value came from (env/peer/config/default)
+        #[arg(long)]
+        show_origin: bool,
+        /// Value to print if the setting is empty/unset
+        #[arg(long, value_name = "VALUE")]
+        default: Option<String>,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reset a setting to its default (remove the override)
+    Unset {
+        /// Setting name
+        key: String,
+        /// Remove only this device's per-peer override
+        #[arg(long, value_name = "DEVICE")]
+        peer: Option<String>,
+    },
+    /// Raw config escape hatch (key value lines in ~/.config/filament/config).
+    /// Prefer `filament set`; this is kept for scripts that wrote it directly.
+    #[command(hide = true)]
     Config { key: Option<String>, value: Option<String> },
     /// Update filament to the latest release
     Update {
@@ -707,6 +770,12 @@ pub(crate) fn display_name() -> String {
     if let Some(n) = config_get("name") {
         return n;
     }
+    default_display_name()
+}
+
+/// The computed display name when nothing is configured (user@host). Kept
+/// separate so the settings readout can show the true default.
+pub(crate) fn default_display_name() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
     let host = std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
@@ -1215,10 +1284,20 @@ pub(crate) fn fresh_secret() -> String {
 // ------------------------------------------------------------- daemon (C19) --
 
 fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
-    flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join("Filament")
-    })
+    flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(default_drop_dir)
+}
+
+/// The built-in drop directory when nothing is configured (~/Filament). Shared
+/// with the settings readout so it shows the true default.
+pub(crate) fn default_drop_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join("Filament")
+}
+
+/// True when an `up` daemon is currently running (drives the "takes effect on
+/// next up" hint after a settings change).
+pub(crate) fn daemon_running() -> bool {
+    daemon_alive().is_some()
 }
 
 /// Minimal `YYYY-MM-DD HH:MM` UTC stamp (civil-from-days; avoids chrono).
@@ -4503,10 +4582,29 @@ async fn main() -> Result<()> {
         // single-threaded at this point (before the runtime spawns workers)
         unsafe { std::env::set_var("FILAMENT_NAME", n) };
     }
-    // P1 (GAP-4): record the hard direct-only choice before any worker spawns.
-    if cli.no_relay {
-        NO_RELAY.store(true, std::sync::atomic::Ordering::Relaxed);
+    // A --color flag overrides the NO_COLOR/TERM env contract (flags win); record
+    // it before any output so both stdout (readout) and stderr (caps) honor it.
+    if let Some(when) = &cli.color {
+        unsafe { std::env::set_var("FILAMENT_COLOR", when) };
     }
+    // P1 (GAP-4): record the hard direct-only choice before any worker spawns.
+    // Precedence: an explicit --relay/--no-relay flag always wins; otherwise the
+    // persistent `relay` setting (always|never|auto) decides.
+    let relay = if cli.no_relay {
+        NO_RELAY.store(true, std::sync::atomic::Ordering::Relaxed);
+        false
+    } else if cli.relay {
+        true
+    } else {
+        match settings::get_str("relay", None).as_deref() {
+            Some("always") => true,
+            Some("never") => {
+                NO_RELAY.store(true, std::sync::atomic::Ordering::Relaxed);
+                false
+            }
+            _ => false,
+        }
+    };
     // Record the global --no-interactive opt-out before any command runs (the
     // gate also honors FILAMENT_NONINTERACTIVE and a non-TTY stdin).
     if cli.no_interactive {
@@ -4520,11 +4618,24 @@ async fn main() -> Result<()> {
     let server = server.trim_end_matches('/').to_string();
     match cli.cmd {
         Cmd::Send { paths, code, word, room, to, name, remember } => {
-            send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
+            send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output, ShellPolicy::Granted, None).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None).await
         }
+        Cmd::Set { key, value, peer, dry_run, reset, yes, json } => settings::run_set(
+            key.as_deref(),
+            value.as_deref(),
+            peer.as_deref(),
+            dry_run,
+            reset,
+            yes,
+            json,
+        ),
+        Cmd::Get { key, peer, show_origin, default, json } => {
+            settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
+        }
+        Cmd::Unset { key, peer } => settings::run_unset(&key, peer.as_deref()),
         Cmd::Config { key, value } => {
             match (key, value) {
                 (Some(k), Some(v)) => {
@@ -4542,11 +4653,24 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, dir, shell, shell_only, shell_user } => up_cmd(&server, install, dir, cli.relay, shell, shell_only, shell_user).await,
+        Cmd::Up { install, dir, shell, shell_only, shell_user } => {
+            // Flags win; otherwise fall back to persistent settings. Per-peer
+            // `shell on` overrides fold into the shell-only allowlist so
+            // `filament set shell on --peer laptop` unifies with --shell-only.
+            let shell = shell || settings::get_bool("shell", None);
+            let shell_user = shell_user.or_else(|| settings::get_str("shell-user", None));
+            let peer_shell = settings::peers_with("shell", "on");
+            let shell_only = match (shell_only, peer_shell.is_empty()) {
+                (existing, true) => existing,
+                (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
+                (None, false) => Some(peer_shell.join(",")),
+            };
+            up_cmd(&server, install, dir, relay, shell, shell_only, shell_user).await
+        }
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
-        Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
-        Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, cli.relay).await,
+        Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, relay).await,
+        Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
         Cmd::Devices { action } => {
             match action {
                 None => {
@@ -4612,13 +4736,13 @@ async fn main() -> Result<()> {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(())
         }
-        Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, cli.relay).await,
-        Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, cli.relay).await,
-        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
-        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay).await,
-        Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, cli.relay).await,
+        Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
+        Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, relay).await,
+        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
+        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
+        Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
         Cmd::Doctor { device, watch, repeat, json } => {
-            doctor::doctor_cmd(&server, device, watch, repeat, json, cli.relay).await
+            doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
         Cmd::Grant { device, capability } => {
             device_set_cap(&device, &capability, true)?;
@@ -8333,6 +8457,33 @@ async fn finalize_incoming(
         ui::link(&format!("file://{shown}"), &shown),
         if ok { String::new() } else { ui::paint(ui::Tone::Err, "  SIZE MISMATCH") },
     ));
+    // Opt-in auto-extract (settings `auto-extract`, default off, per-peer aware):
+    // unpack received tar/tar.gz into the drop dir so a directory send lands as a
+    // directory. Only recognized archive extensions trigger it; the unpack is
+    // hardened against traversal/symlink/bomb escapes (see settings::extract_archive).
+    if ok {
+        let lname = final_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_archive =
+            lname.ends_with(".tar") || lname.ends_with(".tar.gz") || lname.ends_with(".tgz");
+        let peer = (!from_name.is_empty()).then_some(from_name);
+        if is_archive && settings::get_bool("auto-extract", peer) {
+            match settings::extract_archive(&final_path, dir) {
+                Ok(n) => ui::say(&format!(
+                    "    {} extracted {n} file{} into {}",
+                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                    if n == 1 { "" } else { "s" },
+                    dir.display()
+                )),
+                Err(e) => ui::say(&ui::paint(
+                    ui::Tone::Warn,
+                    &format!("    auto-extract skipped ({e}); the archive is kept as-is"),
+                )),
+            }
+        }
+    }
     if daemon {
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(up_log()) {

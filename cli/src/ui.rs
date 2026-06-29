@@ -93,10 +93,11 @@ pub fn caps() -> &'static Caps {
     C.get_or_init(|| {
         let tty = std::io::stderr().is_terminal();
         let term = std::env::var("TERM").unwrap_or_default();
-        let color = tty
-            && std::env::var_os("NO_COLOR").is_none()
-            && term != "dumb"
-            && std::env::var("FILAMENT_COLOR").as_deref() != Ok("never");
+        let color = match std::env::var("FILAMENT_COLOR").as_deref() {
+            Ok("always") => true,
+            Ok("never") => false,
+            _ => tty && std::env::var_os("NO_COLOR").is_none() && term != "dumb",
+        };
         let truecolor = color
             && std::env::var("COLORTERM")
                 .map(|v| v.contains("truecolor") || v.contains("24bit"))
@@ -123,21 +124,51 @@ pub enum Tone {
     Bold,
 }
 
+fn ansi_code(tone: Tone, truecolor: bool) -> &'static str {
+    match tone {
+        Tone::Brand if truecolor => "\x1b[1;38;2;124;246;200m",
+        Tone::Brand => "\x1b[1;92m",
+        Tone::Ok => "\x1b[32m",
+        Tone::Err => "\x1b[31m",
+        Tone::Warn => "\x1b[33m",
+        Tone::Dim => "\x1b[2m",
+        Tone::Bold => "\x1b[1m",
+    }
+}
+
 pub fn paint(tone: Tone, s: &str) -> String {
     let c = caps();
     if !c.color {
         return s.to_string();
     }
-    let code = match tone {
-        Tone::Brand if c.truecolor => "\x1b[1;38;2;124;246;200m".to_string(),
-        Tone::Brand => "\x1b[1;92m".to_string(),
-        Tone::Ok => "\x1b[32m".to_string(),
-        Tone::Err => "\x1b[31m".to_string(),
-        Tone::Warn => "\x1b[33m".to_string(),
-        Tone::Dim => "\x1b[2m".to_string(),
-        Tone::Bold => "\x1b[1m".to_string(),
-    };
-    format!("{code}{s}\x1b[0m")
+    format!("{}{s}\x1b[0m", ansi_code(tone, c.truecolor))
+}
+
+/// Color decision for STDOUT specifically (the `set`/`get` readout surface).
+/// `caps()` is stderr-scoped; stdout must be judged on its OWN tty-ness so that
+/// piped output never carries ANSI (clig.dev: humans first, machines second).
+/// Same env contract as `caps()`: NO_COLOR, TERM=dumb, FILAMENT_COLOR=never|always.
+pub fn stdout_color() -> bool {
+    match std::env::var("FILAMENT_COLOR").as_deref() {
+        Ok("never") => return false,
+        Ok("always") => return true,
+        _ => {}
+    }
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").as_deref() != Ok("dumb")
+}
+
+/// Paint for an explicit color decision (used for stdout, where consulting the
+/// stderr-scoped `caps()` would pick the wrong stream).
+pub fn paint_when(color: bool, tone: Tone, s: &str) -> String {
+    if !color {
+        return s.to_string();
+    }
+    let truecolor = std::env::var("COLORTERM")
+        .map(|v| v.contains("truecolor") || v.contains("24bit"))
+        .unwrap_or(false);
+    format!("{}{s}\x1b[0m", ansi_code(tone, truecolor))
 }
 
 pub fn glyph_ok() -> &'static str {
