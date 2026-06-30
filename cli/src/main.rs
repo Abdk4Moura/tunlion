@@ -469,9 +469,10 @@ enum Cmd {
         key: Option<String>,
         /// New value; omit to read the current value
         value: Option<String>,
-        /// Scope this change to one known device (per-peer settings only)
-        #[arg(long, value_name = "DEVICE")]
-        peer: Option<String>,
+        /// Scope this change to one or more known devices (per-peer settings
+        /// only). Comma-separated or repeatable: --peer a,b  or  --peer a --peer b
+        #[arg(long, value_name = "DEVICE", value_delimiter = ',')]
+        peer: Vec<String>,
         /// Show what would change without writing
         #[arg(long)]
         dry_run: bool,
@@ -506,9 +507,10 @@ enum Cmd {
     Unset {
         /// Setting name
         key: String,
-        /// Remove only this device's per-peer override
-        #[arg(long, value_name = "DEVICE")]
-        peer: Option<String>,
+        /// Remove the per-peer override for one or more devices (comma-separated
+        /// or repeatable). Omit to clear the global value.
+        #[arg(long, value_name = "DEVICE", value_delimiter = ',')]
+        peer: Vec<String>,
     },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `filament set`; this is kept for scripts that wrote it directly.
@@ -4629,7 +4631,7 @@ async fn main() -> Result<()> {
         Cmd::Set { key, value, peer, dry_run, reset, yes, json } => settings::run_set(
             key.as_deref(),
             value.as_deref(),
-            peer.as_deref(),
+            &peer,
             dry_run,
             reset,
             yes,
@@ -4638,7 +4640,7 @@ async fn main() -> Result<()> {
         Cmd::Get { key, peer, show_origin, default, json } => {
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
         }
-        Cmd::Unset { key, peer } => settings::run_unset(&key, peer.as_deref()).await,
+        Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
         Cmd::Config { key, value } => {
             match (key, value) {
                 (Some(k), Some(v)) => {
