@@ -564,29 +564,41 @@ async fn announce_to_daemon(key: &str, color: bool) {
     eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `filament up`"));
 }
 
-/// `filament unset <key> [--peer <d>]`
-pub async fn run_unset(key: &str, peer: Option<&str>) -> Result<()> {
-    let c = unset(key, peer)?;
+/// `filament unset <key> [--peer a,b]`. `peers` empty = clear the global value;
+/// one or more = remove each device's per-peer override.
+pub async fn run_unset(key: &str, peers: &[String]) -> Result<()> {
+    let s = lookup(key)?;
     let color = ui::stdout_color();
-    eprintln!(
-        "{} {} reset to default: {} ({})",
-        ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
-        c.key,
-        c.new,
-        c.scope
-    );
-    if c.daemon && crate::daemon_running() {
-        announce_to_daemon(c.key, color).await;
+    let targets: Vec<Option<&str>> = if peers.is_empty() {
+        vec![None]
+    } else {
+        peers.iter().map(|p| Some(p.as_str())).collect()
+    };
+    let mut touched_daemon = false;
+    for tgt in targets {
+        let c = unset(key, tgt)?;
+        eprintln!(
+            "{} {} reset to default: {} ({})",
+            ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
+            c.key,
+            c.new,
+            c.scope
+        );
+        touched_daemon = c.daemon;
+    }
+    if touched_daemon && crate::daemon_running() {
+        announce_to_daemon(s.key, color).await;
     }
     Ok(())
 }
 
 /// `filament set` with key+value, or no args (readout), or --reset.
+/// `peers` empty = global; one or more = a per-peer override applied to each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_set(
     key: Option<&str>,
     value: Option<&str>,
-    peer: Option<&str>,
+    peers: &[String],
     dry_run: bool,
     reset: bool,
     yes: bool,
@@ -599,47 +611,60 @@ pub async fn run_set(
         (None, _) => readout(json_out),
         (Some(k), None) => {
             // `set <key>` with no value = read it (ergonomic shortcut to `get`).
-            run_get(k, peer, false, None, json_out)
+            run_get(k, peers.first().map(|s| s.as_str()), false, None, json_out)
         }
         (Some(k), Some(v)) => {
             let s = lookup(k)?;
-            if peer.is_some() && s.scope == ScopeKind::GlobalOnly {
+            if !peers.is_empty() && s.scope == ScopeKind::GlobalOnly {
                 bail!("'{}' is global-only; drop --peer", s.key);
             }
-            if let Some(p) = peer {
+            // Validate the value once (fail fast before writing anything), and
+            // every target device, so a typo in peer 2 never half-applies peer 1.
+            let new = canonicalize(s, v)?;
+            for p in peers {
                 require_peer_known(p)?;
             }
-            let new = canonicalize(s, v)?;
-            let old = resolve(s, peer).0;
-            let scope_str = peer.map(|p| format!("peer:{p}")).unwrap_or_else(|| "global".into());
-            let color = ui::stdout_color();
-            if dry_run {
-                eprintln!(
-                    "would set {} {} {} ({}) {}",
-                    s.key,
-                    ui::paint_when(color, ui::Tone::Dim, &old),
-                    ui::paint_when(color, ui::Tone::Dim, ui::glyph_arrow()),
-                    scope_str,
-                    new
-                );
-                return Ok(());
-            }
-            let c = set(k, v, peer)?;
-            if c.old == c.new {
-                eprintln!("{} already {} ({})", c.key, c.new, c.scope);
+            // Targets: no --peer = the single global scope; else one per device.
+            let targets: Vec<Option<&str>> = if peers.is_empty() {
+                vec![None]
             } else {
-                eprintln!(
-                    "{} {}: {} {} {} ({})",
-                    ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
-                    c.key,
-                    ui::paint_when(color, ui::Tone::Dim, &c.old),
-                    ui::glyph_arrow(),
-                    c.new,
-                    c.scope
-                );
+                peers.iter().map(|p| Some(p.as_str())).collect()
+            };
+            let color = ui::stdout_color();
+            let mut touched_daemon = false;
+            for tgt in targets {
+                if dry_run {
+                    let old = resolve(s, tgt).0;
+                    let scope_str = tgt.map(|p| format!("peer:{p}")).unwrap_or_else(|| "global".into());
+                    eprintln!(
+                        "would set {} {} {} ({}) {}",
+                        s.key,
+                        ui::paint_when(color, ui::Tone::Dim, &old),
+                        ui::paint_when(color, ui::Tone::Dim, ui::glyph_arrow()),
+                        scope_str,
+                        new
+                    );
+                    continue;
+                }
+                let c = set(k, v, tgt)?;
+                if c.old == c.new {
+                    eprintln!("{} already {} ({})", c.key, c.new, c.scope);
+                } else {
+                    eprintln!(
+                        "{} {}: {} {} {} ({})",
+                        ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
+                        c.key,
+                        ui::paint_when(color, ui::Tone::Dim, &c.old),
+                        ui::glyph_arrow(),
+                        c.new,
+                        c.scope
+                    );
+                }
+                touched_daemon = c.daemon;
             }
-            if c.daemon && crate::daemon_running() {
-                announce_to_daemon(c.key, color).await;
+            // One reconfigure ping covers all peers (it re-reads the whole key).
+            if !dry_run && touched_daemon && crate::daemon_running() {
+                announce_to_daemon(s.key, color).await;
             }
             Ok(())
         }
