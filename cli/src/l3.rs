@@ -109,6 +109,20 @@ impl L3 {
         self.identity.as_ref().map(|i| i.addr())
     }
 
+    /// True if `addr` is a currently-routed (verified) peer on the overlay. Any
+    /// datagram on filament0 already came from a paired peer, so this is the
+    /// membership check the expose allowlist builds on.
+    pub async fn is_verified_peer(&self, addr: IpAddr) -> bool {
+        self.routes.lock().await.contains_key(&addr)
+    }
+
+    /// Reverse MagicDNS: the petname of a verified peer by overlay address, so an
+    /// `expose --peer` allowlist can match an incoming connection's source.
+    pub async fn petname_of(&self, addr: IpAddr) -> Option<String> {
+        let IpAddr::V6(v6) = addr else { return None };
+        self.names.lock().await.values().find(|(_, a)| *a == v6).map(|(n, _)| n.clone())
+    }
+
     /// Build a signed announce of our address bound to link channel-binding `cb`.
     /// `None` in manual mode (no identity to sign with).
     pub fn make_announce(&self, cb: &[u8]) -> Option<Announce> {
