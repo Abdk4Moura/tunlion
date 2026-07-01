@@ -2461,7 +2461,15 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
             crate::ui::say(&format!(
                 "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
             ));
-            let st = std::process::Command::new("ssh").arg(&mesh_host).args(extra).status();
+            // The overlay address is cryptographically bound to the peer's key
+            // (self-certifying <name>.mesh), so the link is already authenticated;
+            // accept-new lets the ssh host key pin on first use instead of failing
+            // non-interactively on an unknown host (which would waste the L3 path).
+            let st = std::process::Command::new("ssh")
+                .args(["-o", "StrictHostKeyChecking=accept-new"])
+                .arg(&mesh_host)
+                .args(extra)
+                .status();
             match st {
                 Ok(s) if s.success() || s.code().map(|c| c != 255).unwrap_or(false) => {
                     // 255 = ssh transport/connect failure -> fall back to L2; any
