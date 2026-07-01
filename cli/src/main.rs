@@ -7581,7 +7581,7 @@ async fn recv_cmd(
                                         Ok(ip) => {
                                             let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
                                             l3.add_peer(&pid, &who, ip.into(), t).await;
-                                            ui::say(&format!("  {} L3 peer {who} at {ip} ({who}.mesh)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                                            ui::say(&format!("  {} L3 peer {who}.mesh at {ip}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                                         }
                                         Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
                                     },

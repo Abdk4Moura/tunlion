@@ -245,17 +245,32 @@ fn render_hosts(current: &str, entries: &[(String, Ipv6Addr)]) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    let live: Vec<&(String, Ipv6Addr)> = entries.iter().filter(|(n, _)| !n.is_empty()).collect();
+    let live: Vec<&(String, Ipv6Addr)> = entries.iter().filter(|(n, _)| is_safe_mesh_name(n)).collect();
     if !live.is_empty() {
         out.push_str(HOSTS_BEGIN);
         out.push('\n');
         for (name, addr) in live {
-            out.push_str(&format!("{addr} {name}.mesh {name}\n"));
+            // ONLY the namespaced `<name>.mesh` is emitted, never a bare `<name>`:
+            // a bare entry could shadow a real hostname (localhost, an internal
+            // host, a public domain). Under the reserved `.mesh` suffix a peer
+            // name can never collide with real resolution. (Security: DNS-hijack
+            // hardening; the petname is the locally-assigned one, but this holds
+            // even if a name is ever influenced by the peer.)
+            out.push_str(&format!("{addr} {name}.mesh\n"));
         }
         out.push_str(HOSTS_END);
         out.push('\n');
     }
     out
+}
+
+/// Reject empty or reserved labels so a mesh name can never map to something
+/// load-bearing even under `.mesh` (defense in depth beyond the `.mesh` suffix).
+fn is_safe_mesh_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    !matches!(name.to_ascii_lowercase().as_str(), "localhost" | "localhost4" | "localhost6")
 }
 
 /// Standalone point-to-point serve_tun (no signaling): open `dev` with `tun_addr`
@@ -331,9 +346,12 @@ mod tests {
         let base = "127.0.0.1 localhost\n::1 localhost\n";
         let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
         let with = render_hosts(base, &[("other-do".into(), a)]);
-        // user lines preserved, managed block added with both name forms
+        // user lines preserved, managed block added with the NAMESPACED name only
         assert!(with.contains("127.0.0.1 localhost"));
-        assert!(with.contains(&format!("{a} other-do.mesh other-do")));
+        assert!(with.contains(&format!("{a} other-do.mesh")));
+        // never a bare hostname (would shadow real names); never `localhost`
+        assert!(!with.contains(&format!("{a} other-do.mesh other-do")));
+        assert!(!with.lines().any(|l| l.trim() == format!("{a} other-do")));
         assert!(with.contains("# BEGIN filament-mesh"));
         // re-rendering replaces (not stacks) the block, and empty removes it
         let again = render_hosts(&with, &[("other-do".into(), a)]);
@@ -348,6 +366,18 @@ mod tests {
         assert_eq!(sanitize_host("other-do"), "other-do");
         assert_eq!(sanitize_host("user@cli"), "user-cli");
         assert_eq!(sanitize_host("a b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn reserved_and_empty_names_are_dropped() {
+        use super::is_safe_mesh_name;
+        assert!(!is_safe_mesh_name(""));
+        assert!(!is_safe_mesh_name("localhost"));
+        assert!(!is_safe_mesh_name("LocalHost"));
+        assert!(is_safe_mesh_name("other-do"));
+        // a peer named "localhost" is skipped entirely (no localhost.mesh either)
+        let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
+        assert!(!render_hosts("", &[("localhost".into(), a)]).contains("filament-mesh"));
     }
 
     #[test]
