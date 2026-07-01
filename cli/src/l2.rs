@@ -2506,6 +2506,11 @@ fn l3_ssh_target(peer: &str, port: u16) -> Option<String> {
 }
 
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
+    // Accept the MagicDNS form too: `filament ssh other-do.mesh` means the same
+    // device as `filament ssh other-do`. The petname is the source of truth for
+    // pairing/bootstrap; the .mesh name is only how the overlay resolves it.
+    let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
+
     // ssh matches known_hosts by HOST token only (never user@host), so the pin
     // MUST be keyed on the bare host or it is silently inert.
     let host = format!("filament-{peer}");
