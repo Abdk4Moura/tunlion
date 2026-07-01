@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.2.1-beta.26"
+version = "0.2.1-beta.27"
 edition = "2024"
 description = "P2P file transfer between terminals and browsers — no upload, no account. The terminal end of filament.autumated.com."
 license = "MIT"
@@ -55,10 +55,20 @@ filament-pake = { path = "../pake" }
 # no process-default crypto provider is required.
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
+# L3 overlay crypto: a per-device Ed25519 identity whose public key IS the overlay
+# address (self-certifying, Yggdrasil-style). ring is already in the tree via
+# rustls/quinn/rcgen; this is a direct handle for Ed25519 sign/verify + CSPRNG, so
+# we never hand-roll the crypto.
+ring = "0.17"
 # Interactive guided code entry (raw mode + key events + styled output;
 # cross-platform incl. Windows). Used ONLY behind the interactivity gate; a
 # non-TTY / scripted run never enters its event loop.
 crossterm = "0.29"
+# L3 (serve_tun, unix only): open /dev/net/tun via a TUNSETIFF ioctl and wrap the
+# fd in tokio's AsyncFd. libc is the only addition; the device config (addr/mtu/up)
+# goes through iproute2, so no netlink crate is pulled.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = true

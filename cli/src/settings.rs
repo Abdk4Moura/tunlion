@@ -152,6 +152,17 @@ pub fn registry() -> &'static [Setting] {
             daemon: true,
             help: "Drop the ssh/web-shell PTY to this non-root account (runuser)",
         },
+        Setting {
+            key: "tun-addr",
+            aliases: &["overlay"],
+            store: "tun-addr",
+            kind: Kind::Str,
+            default: "",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "L3 overlay address as IP/PREFIX (e.g. 10.9.0.1/24); empty = L3 off",
+        },
     ];
     R
 }
@@ -501,7 +512,7 @@ pub fn unset(key: &str, peer: Option<&str>) -> Result<Change> {
 
 fn lookup(key: &str) -> Result<&'static Setting> {
     find(key).ok_or_else(|| match did_you_mean(key) {
-        Some(s) => anyhow::anyhow!("unknown key '{key}' — did you mean '{s}'? (`filament set` lists all)"),
+        Some(s) => anyhow::anyhow!("unknown key '{key}' - did you mean '{s}'? (`filament set` lists all)"),
         None => anyhow::anyhow!("unknown key '{key}' (`filament set` lists all keys)"),
     })
 }
