@@ -2064,7 +2064,16 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     };
 
     loop {
-        let (sock, _) = listener.accept().await?;
+        // A transient accept error (e.g. EMFILE/ENFILE under fd pressure) must NOT
+        // tear down the listener; back off briefly and keep serving.
+        let sock = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                crate::ui::status(&format!("filament: accept paused ({e}), retrying..."));
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         let _ = sock.set_nodelay(true);
         // Warm path: bridge this connection straight to the daemon's link. Retried
         // per connection so it is used whenever the daemon holds a warm link.
@@ -2081,8 +2090,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
             // manager is started once, lazily, and self-heals from there.
         }
         // Cold path (also the warm-miss fallback): ensure the managed cold link
-        // exists, then serve over the current live link, waiting through a
-        // reconnect if it is mid-recovery (a blip delays, never drops, a call).
+        // exists, then serve over the current live link.
         if cold_rx.is_none() {
             crate::ui::debug(&format!(
                 "filament: no warm link to {peer}, using a direct link for forwarding"
@@ -2092,29 +2100,60 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
             tokio::spawn(async move { manage_cold_link(server, peer_s, relay, tx).await });
             cold_rx = Some(rx);
         }
-        let mut rx = cold_rx.clone().unwrap();
-        let mux = loop {
-            if let Some(m) = rx.borrow_and_update().clone() {
-                break m;
-            }
-            if rx.changed().await.is_err() {
-                break_forward(&sock);
-                return Ok(());
-            }
-        };
-        // NOTE(scope): concurrent heavy forwards over ONE cold link need credit
-        // flow control (design §4); the warm path avoids this (independent streams).
-        let (sid, rx_pipe) = open_stream(&mux, rport).await?;
-        tokio::spawn(async move {
-            serve_stream(mux, sid, sock, rx_pipe, true, None).await;
-        });
+        let rx = cold_rx.clone().unwrap();
+        // Serve this connection, retrying across a reconnect: a link that died in
+        // the poll window is skipped (is_alive) and open_stream failures re-wait
+        // for the manager's fresh link. On give-up the socket is dropped (closed),
+        // but the ACCEPT LOOP ALWAYS SURVIVES -- one connection is never allowed to
+        // kill the whole forward (the beta.28/29 regression class).
+        tokio::spawn(serve_cold_connection(rx, sock, rport, peer.to_string()));
     }
 }
 
-/// Best-effort close of a forward client socket when the link manager has given
-/// up (so the client sees a clean reset rather than a silent hang).
-fn break_forward(_sock: &TcpStream) {
-    crate::ui::say("filament: link permanently lost, forward stopping");
+/// Serve one accepted forward connection over the managed cold link, tolerant of
+/// a link blip: wait for a LIVE mux (skipping a stale dead one still parked in the
+/// channel), open a stream, and on a transient open failure re-wait for the
+/// manager's reconnected link (bounded). Never propagates errors to the accept
+/// loop; on give-up it just drops `sock`.
+async fn serve_cold_connection(
+    mut rx: tokio::sync::watch::Receiver<Option<Arc<Mux>>>,
+    sock: TcpStream,
+    rport: u16,
+    peer: String,
+) {
+    let mut tries = 0u32;
+    loop {
+        // Wait for a live link (a dead mux may still be parked until the manager's
+        // ~1s poll republishes; is_alive() skips it so we never open on a corpse).
+        let mux = loop {
+            let cur = rx.borrow_and_update().clone();
+            match cur {
+                Some(m) if m.transport().is_alive() => break m,
+                _ => {
+                    if rx.changed().await.is_err() {
+                        return; // manager gone; drop this socket (listener lives on)
+                    }
+                }
+            }
+        };
+        match open_stream(&mux, rport).await {
+            Ok((sid, rx_pipe)) => {
+                serve_stream(mux, sid, sock, rx_pipe, true, None).await;
+                return;
+            }
+            Err(_) => {
+                tries += 1;
+                if tries >= 3 {
+                    crate::ui::debug(&format!(
+                        "filament: dropping a connection to {peer} (link recovering); the forward stays up"
+                    ));
+                    return; // drop sock; accept loop keeps running
+                }
+                // The link died between the liveness check and open_stream; loop
+                // back to wait for the manager to publish a fresh one.
+            }
+        }
+    }
 }
 
 /// Own the cold forward link end to end: establish it, publish it to the accept
