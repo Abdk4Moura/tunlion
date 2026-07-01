@@ -348,7 +348,7 @@ struct Cli {
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     color: Option<String>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -1605,6 +1605,38 @@ async fn up_cmd(
     let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
     let _ = std::fs::remove_file(pidfile());
     res
+}
+
+/// Bare-command tour: what filament is, the current state, and the two or three
+/// things you'd actually do next, adapted to whether you've paired anyone yet. No
+/// flags to learn; `--help` still has the full surface. (CLI-UX work, point #2.)
+fn tour_cmd() -> Result<()> {
+    let color = ui::stdout_color();
+    ui::say(&format!(
+        "  {}  {}",
+        ui::paint_when(color, ui::Tone::Brand, "filament"),
+        ui::paint_when(color, ui::Tone::Dim, "· send files and reach your devices, no account"),
+    ));
+    ui::say("");
+    match daemon_alive() {
+        Some(pid) => ui::say(&format!("  {} daemon up (pid {pid})", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()))),
+        None => ui::say(&format!("  {} daemon not running", ui::paint_when(color, ui::Tone::Dim, "·"))),
+    }
+    let n = devices_load().len();
+    ui::say(&format!("  {n} known device{}", if n == 1 { "" } else { "s" }));
+    ui::say("");
+    ui::say(&ui::paint_when(color, ui::Tone::Dim, "  do this:"));
+    let mut act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));
+    act("filament send <file>", "send files (to a browser or a paired device)");
+    if n == 0 {
+        act("filament pair", "remember a device (unlocks ssh + expose)");
+    } else {
+        act("filament ssh <device>", "shell into a paired device");
+        act("filament expose <port>", "publish a local port on the mesh");
+    }
+    act("filament up", "receive in the background");
+    ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  ·  filament status  ·  filament devices"));
+    Ok(())
 }
 
 fn status_cmd() -> Result<()> {
@@ -4723,7 +4755,12 @@ async fn main() -> Result<()> {
         cli.server.clone()
     };
     let server = server.trim_end_matches('/').to_string();
-    match cli.cmd {
+    // Bare `filament` (no subcommand): a short, state-aware tour of what you'd do
+    // next, instead of clap's wall of subcommands. Power users still get --help.
+    let Some(cmd) = cli.cmd else {
+        return tour_cmd();
+    };
+    match cmd {
         Cmd::Send { paths, code, word, room, to, name, remember } => {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
         }
