@@ -219,10 +219,19 @@ pub(crate) fn sanitize_host(name: &str) -> String {
 fn rewrite_hosts_block(entries: &[(String, Ipv6Addr)]) -> std::io::Result<()> {
     let cur = std::fs::read_to_string(HOSTS_PATH).unwrap_or_default();
     let out = render_hosts(&cur, entries);
-    // Atomic replace: write a sibling temp then rename (same filesystem as /etc).
+    // Preferred: atomic sibling-temp + rename (crash-safe), which needs write on
+    // the /etc DIRECTORY (i.e. root). Fallback for a non-root daemon that only has
+    // a per-file ACL on /etc/hosts: a single-shot in-place truncating write, which
+    // needs write on the file alone. The in-place path writes the whole buffer in
+    // one std::fs::write so the corruption window is one syscall.
     let tmp = format!("{HOSTS_PATH}.filament.tmp");
-    std::fs::write(&tmp, out)?;
-    std::fs::rename(&tmp, HOSTS_PATH)
+    match std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, HOSTS_PATH)) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(HOSTS_PATH, out)
+        }
+    }
 }
 
 /// Pure transform: strip any prior filament-mesh block from `current`, then append

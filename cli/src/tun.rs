@@ -82,12 +82,63 @@ pub fn cap_grant_cmd() -> String {
     format!("sudo setcap cap_net_admin+eip {exe}")
 }
 
+/// True if this process could write the MagicDNS block into /etc/hosts: root
+/// always can; a non-root daemon needs write on the file itself (e.g. a per-file
+/// ACL). Note the file being writable is necessary but the atomic temp+rename in
+/// l3.rs also needs the /etc directory writable, so the writer falls back to an
+/// in-place write when only the file is granted.
+fn hosts_writable() -> bool {
+    unsafe {
+        libc::geteuid() == 0
+            || libc::access(b"/etc/hosts\0".as_ptr() as *const libc::c_char, libc::W_OK) == 0
+    }
+}
+
+/// The one-time command that lets a NON-root daemon write the MagicDNS block in
+/// root-owned /etc/hosts. A per-file ACL for the daemon user is the narrowest
+/// grant possible: only this user, only this file, only rw. No capability
+/// escalation on the binary, unlike cap_dac_override.
+pub fn hosts_grant_cmd() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "$(whoami)".into());
+    format!("sudo setfacl -m u:{user}:rw /etc/hosts")
+}
+
+/// Best-effort: let a non-root daemon publish MagicDNS names (`<peer>.mesh`) by
+/// granting it write on /etc/hosts via a per-file ACL. Interactive => one sudo
+/// prompt; non-interactive => print the command. The overlay works by IP with or
+/// without this, so a failure here is never fatal.
+pub fn ensure_hosts_writable() {
+    if hosts_writable() {
+        return;
+    }
+    let Ok(user) = std::env::var("USER") else { return };
+    let cmd = hosts_grant_cmd();
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprintln!("  MagicDNS names (<peer>.mesh) need write access to root-owned /etc/hosts.");
+        eprintln!("  granting a per-file ACL now: {cmd}");
+        let ok = std::process::Command::new("sudo")
+            .args(["setfacl", "-m", &format!("u:{user}:rw"), "/etc/hosts"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            eprintln!("  done. peer names will resolve after the next announce (overlay already works by IP).");
+        } else {
+            eprintln!("  could not grant automatically (install the `acl` package, or run it yourself):\n    {cmd}");
+            eprintln!("  overlay still works by IP without this.");
+        }
+    } else {
+        eprintln!("  MagicDNS names need /etc/hosts write; run once:\n    {cmd}\n  overlay still works by IP without this.");
+    }
+}
+
 /// Make L3 work for a non-root daemon with as few steps as possible: if we lack
 /// CAP_NET_ADMIN and we're at a terminal, run the one-time `setcap` now (a single
 /// sudo prompt) so a later `filament up` just works; otherwise print the exact
-/// command. A no-op when we already have the capability (root or already granted).
-/// Returns true if the capability is present or was just granted.
+/// command. Also grants /etc/hosts write for MagicDNS names. A no-op for each
+/// grant already in place. Returns true if the capability is present or granted.
 pub fn ensure_net_admin_for_l3() -> bool {
+    ensure_hosts_writable();
     if have_net_admin() {
         return true;
     }
