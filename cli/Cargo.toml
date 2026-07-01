@@ -64,10 +64,11 @@ ring = "0.17"
 # cross-platform incl. Windows). Used ONLY behind the interactivity gate; a
 # non-TTY / scripted run never enters its event loop.
 crossterm = "0.29"
-# L3 (serve_tun, unix only): open /dev/net/tun via a TUNSETIFF ioctl and wrap the
+# L3 (serve_tun, Linux only): open /dev/net/tun via a TUNSETIFF ioctl and wrap the
 # fd in tokio's AsyncFd. libc is the only addition; the device config (addr/mtu/up)
-# goes through iproute2, so no netlink crate is pulled.
-[target.'cfg(unix)'.dependencies]
+# goes through iproute2, so no netlink crate is pulled. Linux-gated because the TUN
+# path is Linux-specific (macOS uses a different utun model).
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [profile.release]

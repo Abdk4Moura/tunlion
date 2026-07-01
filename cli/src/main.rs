@@ -31,11 +31,12 @@ mod protocol;
 mod resilience;
 mod session;
 mod settings;
-/// L3 TUN data plane (serve_tun); Linux-only, so Windows keeps compiling.
-#[cfg(unix)]
+/// L3 TUN data plane (serve_tun). Linux-only: it uses /dev/net/tun + TUNSETIFF,
+/// which macOS (also `unix`) lacks, so gate on `target_os`, not `unix`.
+#[cfg(target_os = "linux")]
 mod tun;
 /// L3 overlay manager (routes IP packets across peer links); Linux-only.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod l3;
 mod shutdown;
 mod sshkeys;
@@ -4682,7 +4683,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
         Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu } => {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
                 let mut h = Sha256::new();
                 h.update(psk.as_bytes());
@@ -4701,7 +4702,7 @@ async fn main() -> Result<()> {
                 ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
             }
-            #[cfg(not(unix))]
+            #[cfg(not(target_os = "linux"))]
             {
                 let _ = (tun_addr, listen, connect, psk, dev, mtu);
                 bail!("serve-tun (L3) is Linux-only")
@@ -6466,9 +6467,9 @@ async fn recv_cmd(
     // `l3_seen`: last announce received per pid, replayed once a datagram-capable
     // transport is installed, so a hello that races ahead of the link is not lost
     // (review fix #3).
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let mut l3_seen: HashMap<String, overlay::Announce> = HashMap::new();
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
         match settings::get_str("tun-addr", None) {
             Some(setting) => {
@@ -7126,7 +7127,7 @@ async fn recv_cmd(
                     l2_muxes.remove(&pid);
                     // Retract this peer's overlay route + reader promptly (the
                     // reader would self-clean within ~5s, but this is immediate).
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     {
                         if let Some(l3) = l3.as_ref() {
                             l3.remove_by_pid(&pid).await;
@@ -7392,7 +7393,7 @@ async fn recv_cmd(
                 // announce on their own ChannelReady, so each learns the other.
                 // Also replay any announce that arrived BEFORE this transport was
                 // installed (fix #3), now that the link can carry datagrams.
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 if let Some(l3) = l3.as_ref() {
                     if let Some(cb) = t.channel_binding() {
                         if let Some(ann) = l3.make_announce(&cb) {
@@ -7539,7 +7540,7 @@ async fn recv_cmd(
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 Some("l3-announce") => {
                     // The peer signed a claim to an overlay address. Verify it
                     // against THIS link's channel binding (rejects a forged addr, a
