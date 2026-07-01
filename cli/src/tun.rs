@@ -12,8 +12,10 @@ use anyhow::{bail, Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
 
-// From <linux/if_tun.h> / <net/if.h>.
-const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+// From <linux/if_tun.h> / <net/if.h>. `libc::Ioctl` is the platform's ioctl
+// request type: c_ulong on glibc but c_int on musl, so use the alias (a bare
+// c_ulong fails to compile for the musl release target).
+const TUNSETIFF: libc::Ioctl = 0x4004_54ca;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000; // no 4-byte packet-info prefix; raw IP
 
