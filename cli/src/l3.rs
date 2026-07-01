@@ -138,7 +138,6 @@ impl L3 {
             self.refresh_hosts().await;
         }
         let tun = self.tun.clone();
-        let routes = self.routes.clone();
         let t_reader = t.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -154,12 +153,12 @@ impl L3 {
                     }
                 }
             }
-            let mut map = routes.lock().await;
-            if let Some(cur) = map.get(&peer_ip) {
-                if Arc::ptr_eq(&cur.transport, &t_reader) {
-                    map.remove(&peer_ip);
-                }
-            }
+            // CONTINUITY: on transport death we do NOT retract the route. The
+            // overlay IP stays in the table pointing at the (now dead) transport,
+            // so datagrams merely drop (the inner TCP pauses, like WireGuard) until
+            // the peer's repair calls add_peer, which atomically SWAPS in the fresh
+            // transport (aborting this finished reader). Retracting here would open
+            // a routability gap that can reset a live session across a link repair.
         });
         let mut map = self.routes.lock().await;
         if let Some(prev) = map.insert(peer_ip, PeerRoute { transport: t, reader: handle.abort_handle() }) {
@@ -174,8 +173,10 @@ impl L3 {
         }
     }
 
-    /// Retract whatever route a link (by pid) installed, on link drop. Keeps the
-    /// route table, reader tasks, and MagicDNS names in step with the link layer.
+    /// Retract whatever route a link (by pid) installed. NOT called on a transient
+    /// link drop (that would break continuity across a repair); reserved for an
+    /// explicit device-forget path. Kept for that use.
+    #[allow(dead_code)]
     pub async fn remove_by_pid(&self, pid: &str) {
         let ip = self.by_pid.lock().await.remove(pid);
         if let Some(ip) = ip {
@@ -207,7 +208,7 @@ const HOSTS_END: &str = "# END filament-mesh";
 /// (`<addr> <name>.mesh <name>` per peer). Atomic via temp-file + rename. An
 /// empty `entries` removes the block. Names are display-only; routing is always
 /// by the cryptographically-verified address.
-fn sanitize_host(name: &str) -> String {
+pub(crate) fn sanitize_host(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })

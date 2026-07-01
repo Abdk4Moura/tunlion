@@ -7149,15 +7149,16 @@ async fn recv_cmd(
                     ui::debug(&format!("filament: dropping zombie warm link to '{pid}' (black-holed a stream)"));
                     conn.drop_link(&pid);
                     l2_muxes.remove(&pid);
-                    // Retract this peer's overlay route + reader promptly (the
-                    // reader would self-clean within ~5s, but this is immediate).
+                    // CONTINUITY: do NOT retract the L3 route here. A dropped link
+                    // is almost always followed by a repair (a fresh transport for
+                    // the same peer), whose add_peer atomically swaps the route. If
+                    // we retracted now, the overlay IP would be briefly unroutable
+                    // and a live ssh/L3 session could reset across the repair. The
+                    // stale route just drops datagrams (the inner TCP pauses) until
+                    // the swap. The cached announce is dropped so the peer's next
+                    // announce is treated fresh.
                     #[cfg(target_os = "linux")]
-                    {
-                        if let Some(l3) = l3.as_ref() {
-                            l3.remove_by_pid(&pid).await;
-                        }
-                        l3_seen.remove(&pid);
-                    }
+                    l3_seen.remove(&pid);
                 }
             }
             Ev::PairMatched(v) => {

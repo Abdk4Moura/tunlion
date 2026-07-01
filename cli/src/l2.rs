@@ -2425,6 +2425,20 @@ fn spawn_ssh(
 /// UserKnownHostsFile) with a `filament netcat` ProxyCommand. No prompts, no
 /// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
 /// peer lacks the `shell` cap we abort HERE, before invoking ssh.
+/// If `peer` is a live L3 overlay peer whose sshd is reachable at its stable
+/// overlay address, return the `<peer>.mesh` host to ssh to. Resolves the name
+/// from the MagicDNS /etc/hosts block and probes the sshd over the overlay so we
+/// only take the resilient L3 path when it will actually work (a loopback-only
+/// sshd, or a peer not on the mesh, yields None -> fall back to the L2 tunnel).
+#[cfg(target_os = "linux")]
+fn l3_ssh_target(peer: &str, port: u16) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    let name = format!("{}.mesh", crate::l3::sanitize_host(peer));
+    let addr = (name.as_str(), port).to_socket_addrs().ok()?.next()?;
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).ok()?;
+    Some(name)
+}
+
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
     // ssh matches known_hosts by HOST token only (never user@host), so the pin
     // MUST be keyed on the bare host or it is silently inert.
@@ -2434,6 +2448,33 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     // FILAMENT_SSH_PORT, mirroring FILAMENT_L2_DIALHOST).
     let rport: u16 =
         std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
+
+    // L3 FAST PATH (resilient): if this node is on the mesh and the peer's sshd is
+    // reachable at its stable overlay address, run NATIVE ssh over <peer>.mesh.
+    // That session rides a stable IP, so it SURVIVES a link repair (the L2
+    // ProxyCommand path below rides a stream pinned to one transport and dies when
+    // filament repairs the link). Falls through to L2 when L3 isn't viable (peer
+    // not on mesh, or its sshd only listens on loopback). Off with FILAMENT_NO_L3_SSH=1.
+    #[cfg(target_os = "linux")]
+    if std::env::var("FILAMENT_NO_L3_SSH").as_deref() != Ok("1") {
+        if let Some(mesh_host) = l3_ssh_target(peer, rport) {
+            crate::ui::say(&format!(
+                "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
+            ));
+            let st = std::process::Command::new("ssh").arg(&mesh_host).args(extra).status();
+            match st {
+                Ok(s) if s.success() || s.code().map(|c| c != 255).unwrap_or(false) => {
+                    // 255 = ssh transport/connect failure -> fall back to L2; any
+                    // other exit (incl. remote command's own non-zero) is a real
+                    // session result, honor it.
+                    std::process::exit(s.code().unwrap_or(0));
+                }
+                _ => {
+                    crate::ui::say("filament: L3 ssh unavailable, falling back to the tunnel");
+                }
+            }
+        }
+    }
 
     // FAST PATH: a device whose host keys are already pinned AND whose bootstrap
     // is still fresh has our key installed + the shell cap granted, so skip the
