@@ -2364,6 +2364,72 @@ fn resolve_login(remote_user: Option<String>) -> String {
 /// known_hosts, with a `filament netcat` ProxyCommand. Returns ssh's exit code
 /// (so a cached fast-path can detect a 255 connect/auth failure and retry after a
 /// fresh bootstrap). The destination is always `<login>@filament-<peer>`.
+/// Run the ssh session, preferring the resilient L3 overlay. The bootstrap has
+/// already installed our managed key on the peer and pinned host keys, so both
+/// paths use the SAME managed identity; L3 just connects to the stable overlay
+/// address directly (no ProxyCommand), so the session survives a link repair.
+/// Falls back to the L2 tunnel when L3 isn't viable or its connect fails (255).
+fn run_ssh(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    host: &str,
+    login: &str,
+    rport: u16,
+    extra: &[String],
+) -> Result<i32> {
+    #[cfg(target_os = "linux")]
+    if std::env::var("FILAMENT_NO_L3_SSH").as_deref() != Ok("1") {
+        if let Some(mesh_host) = l3_ssh_target(peer, rport) {
+            crate::ui::say(&format!(
+                "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
+            ));
+            let code = spawn_ssh_direct(login, &mesh_host, extra)?;
+            // 255 = ssh connect/transport failure -> fall back to the L2 tunnel.
+            // Any other code is a real session result (incl. the remote command's).
+            if code != 255 {
+                return Ok(code);
+            }
+            crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
+        }
+    }
+    spawn_ssh(server, peer, relay, host, login, rport, extra)
+}
+
+/// ssh directly to a stable overlay host (no ProxyCommand), reusing the managed
+/// key + known_hosts the L2 path uses. The overlay address is cryptographically
+/// bound to the peer, so accept-new pins the host key on first use.
+#[cfg(target_os = "linux")]
+fn spawn_ssh_direct(login: &str, mesh_host: &str, extra: &[String]) -> Result<i32> {
+    let key = crate::sshkeys::managed_key_path();
+    let kh = crate::sshkeys::known_hosts_path();
+    let dest_token = format!("{login}@{mesh_host}");
+    let mut cmd = std::process::Command::new("ssh");
+    cmd.arg("-o").arg(format!("IdentityFile={}", key.display()))
+        .arg("-o").arg("IdentitiesOnly=yes")
+        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o").arg("StrictHostKeyChecking=accept-new")
+        .arg("-o").arg("ConnectTimeout=10")
+        .arg("-o").arg("ServerAliveInterval=15")
+        .arg("-o").arg("ServerAliveCountMax=4");
+    let mut split = extra.len();
+    for (i, a) in extra.iter().enumerate() {
+        if !a.starts_with('-') {
+            split = i;
+            break;
+        }
+    }
+    for a in &extra[..split] {
+        cmd.arg(a);
+    }
+    cmd.arg(&dest_token);
+    for a in &extra[split..] {
+        cmd.arg(a);
+    }
+    Ok(cmd.status()?.code().unwrap_or(1))
+}
+
 fn spawn_ssh(
     server: &str,
     peer: &str,
@@ -2449,40 +2515,6 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     let rport: u16 =
         std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
 
-    // L3 FAST PATH (resilient): if this node is on the mesh and the peer's sshd is
-    // reachable at its stable overlay address, run NATIVE ssh over <peer>.mesh.
-    // That session rides a stable IP, so it SURVIVES a link repair (the L2
-    // ProxyCommand path below rides a stream pinned to one transport and dies when
-    // filament repairs the link). Falls through to L2 when L3 isn't viable (peer
-    // not on mesh, or its sshd only listens on loopback). Off with FILAMENT_NO_L3_SSH=1.
-    #[cfg(target_os = "linux")]
-    if std::env::var("FILAMENT_NO_L3_SSH").as_deref() != Ok("1") {
-        if let Some(mesh_host) = l3_ssh_target(peer, rport) {
-            crate::ui::say(&format!(
-                "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
-            ));
-            // The overlay address is cryptographically bound to the peer's key
-            // (self-certifying <name>.mesh), so the link is already authenticated;
-            // accept-new lets the ssh host key pin on first use instead of failing
-            // non-interactively on an unknown host (which would waste the L3 path).
-            let st = std::process::Command::new("ssh")
-                .args(["-o", "StrictHostKeyChecking=accept-new"])
-                .arg(&mesh_host)
-                .args(extra)
-                .status();
-            match st {
-                Ok(s) if s.success() || s.code().map(|c| c != 255).unwrap_or(false) => {
-                    // 255 = ssh transport/connect failure -> fall back to L2; any
-                    // other exit (incl. remote command's own non-zero) is a real
-                    // session result, honor it.
-                    std::process::exit(s.code().unwrap_or(0));
-                }
-                _ => {
-                    crate::ui::say("filament: L3 ssh unavailable, falling back to the tunnel");
-                }
-            }
-        }
-    }
 
     // FAST PATH: a device whose host keys are already pinned AND whose bootstrap
     // is still fresh has our key installed + the shell cap granted, so skip the
@@ -2509,7 +2541,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         }
     };
 
-    let code = spawn_ssh(server, peer, relay, &host, &login, rport, extra)?;
+    let code = run_ssh(server, peer, relay, &host, &login, rport, extra)?;
 
     // A cached skip that failed at the ssh layer (connect/auth, exit 255) may mean
     // the device rotated its key/host-key or revoked the cap. Invalidate, run a
@@ -2525,7 +2557,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
         crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
         let login = resolve_login(info.user);
-        let code = spawn_ssh(server, peer, relay, &host, &login, rport, extra)?;
+        let code = run_ssh(server, peer, relay, &host, &login, rport, extra)?;
         std::process::exit(code);
     }
     std::process::exit(code);
