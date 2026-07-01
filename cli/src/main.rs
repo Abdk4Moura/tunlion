@@ -7425,7 +7425,8 @@ async fn recv_cmd(
                         }
                         if let Some(pending) = l3_seen.get(&pid) {
                             if let Ok(ip) = pending.verify(&cb) {
-                                l3.add_peer(&pid, ip.into(), t.clone()).await;
+                                let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
+                                l3.add_peer(&pid, &who, ip.into(), t.clone()).await;
                             }
                         }
                     }
@@ -7579,8 +7580,8 @@ async fn recv_cmd(
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
                                             let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
-                                            l3.add_peer(&pid, ip.into(), t).await;
-                                            ui::say(&format!("  {} L3 peer {who} at {ip}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                                            l3.add_peer(&pid, &who, ip.into(), t).await;
+                                            ui::say(&format!("  {} L3 peer {who} at {ip} ({who}.mesh)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                                         }
                                         Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
                                     },
