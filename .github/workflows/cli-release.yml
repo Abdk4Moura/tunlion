@@ -83,11 +83,22 @@ jobs:
           # Bundle wintun.dll (WireGuard LLC's signed userspace TUN driver) beside
           # filament.exe so the L3 overlay works on Windows out of the box; the CLI
           # loads it from its own directory. amd64 build for x86_64-pc-windows-msvc.
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path out | Out-Null
           Copy-Item "cli/target/${{ matrix.target }}/release/filament.exe" out/
+          # Supply-chain integrity: pin the archive to its known SHA256 before
+          # extracting anything, then require a valid WireGuard LLC Authenticode
+          # signature on the DLL itself. Either check failing aborts the release.
+          $expected = "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51"
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          $actual = (Get-FileHash wintun.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "wintun.zip SHA256 mismatch: got $actual expected $expected" }
           Expand-Archive -Path wintun.zip -DestinationPath wintun-extract
-          Copy-Item "wintun-extract/wintun/bin/amd64/wintun.dll" out/
+          $dll = "wintun-extract/wintun/bin/amd64/wintun.dll"
+          $sig = Get-AuthenticodeSignature $dll
+          if ($sig.Status -ne "Valid") { throw "wintun.dll Authenticode not Valid: $($sig.Status)" }
+          if ($sig.SignerCertificate.Subject -notmatch "WireGuard LLC") { throw "wintun.dll not signed by WireGuard LLC: $($sig.SignerCertificate.Subject)" }
+          Copy-Item $dll out/
           Compress-Archive -Path "out/*" -DestinationPath "filament-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:

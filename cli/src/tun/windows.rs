@@ -107,20 +107,32 @@ impl Drop for Tun {
     }
 }
 
-/// Load wintun.dll: prefer the copy shipped beside filament.exe, else the loader's
-/// default search (current dir / PATH / System32).
-fn load_wintun() -> Result<Arc<wintun::Wintun>> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let dll = dir.join("wintun.dll");
-            if dll.exists() {
-                if let Ok(w) = unsafe { wintun::load_from_path(&dll) } {
-                    return Ok(w);
-                }
-            }
-        }
-    }
-    unsafe { wintun::load() }.map_err(|e| anyhow::anyhow!("{e}"))
+/// Load wintun.dll from a TRUSTED absolute path only: beside filament.exe, else
+/// System32. Both are admin-writable-only locations.
+///
+/// SECURITY: we deliberately never fall back to the loader's ambient search
+/// (`wintun::load()`, which probes the CWD and PATH). This process runs elevated,
+/// so honoring CWD/PATH would be a classic DLL-planting privilege-escalation
+/// vector - an attacker drops a malicious `wintun.dll` and gets code execution as
+/// Administrator. Refuse to run instead.
+fn load_wintun() -> Result<wintun::Wintun> {
+    let exe = std::env::current_exe().context("resolve current exe")?;
+    let beside = exe.parent().context("exe directory")?.join("wintun.dll");
+    let system32 = {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        std::path::PathBuf::from(root).join("System32\\wintun.dll")
+    };
+    let dll = if beside.exists() {
+        beside
+    } else if system32.exists() {
+        system32
+    } else {
+        bail!(
+            "wintun.dll not found next to filament.exe or in System32; refusing to search CWD/PATH \
+             (DLL-hijack guard). Reinstall filament, or place WireGuard's signed wintun.dll beside filament.exe."
+        );
+    };
+    unsafe { wintun::load_from_path(&dll) }.map_err(|e| anyhow::anyhow!("load {}: {e}", dll.display()))
 }
 
 /// Split `addr/prefixlen`; a bare address defaults to a host route (/128 or /32).
