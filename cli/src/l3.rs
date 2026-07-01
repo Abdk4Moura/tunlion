@@ -49,6 +49,9 @@ pub struct L3 {
     identity: Option<Identity>,
     /// Monotonic announce sequence so a peer can ignore a stale re-announce.
     seq: AtomicU64,
+    /// MagicDNS: pid -> (petname, overlay addr) for VERIFIED peers, mirrored into a
+    /// managed block in /etc/hosts so native tools resolve `<petname>` / `<petname>.mesh`.
+    names: Mutex<HashMap<String, (String, Ipv6Addr)>>,
 }
 
 impl L3 {
@@ -74,7 +77,11 @@ impl L3 {
             by_pid: Mutex::new(HashMap::new()),
             identity,
             seq: AtomicU64::new(1),
+            names: Mutex::new(HashMap::new()),
         });
+        // Clear any stale MagicDNS block from a previous run (best-effort; a
+        // non-root daemon just skips /etc/hosts and the overlay still works by IP).
+        let _ = rewrite_hosts_block(&[]);
 
         // TUN -> datagram: one reader for the whole node. Each packet's dest IP
         // selects the peer link (cryptokey-routing style). A miss (no route) or a
@@ -111,10 +118,10 @@ impl L3 {
 
     /// Attach a VERIFIED peer to the overlay: route `peer_ip` (already checked to
     /// match the announcing key + link, see main.rs) to `t`, keyed by `pid` so a
-    /// link drop can retract it. Aborts any prior reader for this IP or pid, so a
-    /// repair/supersede never leaks the old reader or its connection (fix #2).
-    /// Skips links that can't carry datagrams (relay).
-    pub async fn add_peer(&self, pid: &str, peer_ip: IpAddr, t: Arc<dyn Transport>) {
+    /// link drop can retract it, and register `petname` for MagicDNS. Aborts any
+    /// prior reader for this IP or pid, so a repair/supersede never leaks the old
+    /// reader or its connection (fix #2). Skips links that can't carry datagrams.
+    pub async fn add_peer(&self, pid: &str, petname: &str, peer_ip: IpAddr, t: Arc<dyn Transport>) {
         if !t.supports_datagrams() {
             return;
         }
@@ -124,6 +131,11 @@ impl L3 {
             if old_ip != peer_ip {
                 self.retract(old_ip).await;
             }
+        }
+        // MagicDNS: record <petname> -> addr and refresh /etc/hosts (v6 addr only).
+        if let IpAddr::V6(v6) = peer_ip {
+            self.names.lock().await.insert(pid.to_string(), (sanitize_host(petname), v6));
+            self.refresh_hosts().await;
         }
         let tun = self.tun.clone();
         let routes = self.routes.clone();
@@ -163,13 +175,87 @@ impl L3 {
     }
 
     /// Retract whatever route a link (by pid) installed, on link drop. Keeps the
-    /// route table and reader tasks in step with the link layer.
+    /// route table, reader tasks, and MagicDNS names in step with the link layer.
     pub async fn remove_by_pid(&self, pid: &str) {
         let ip = self.by_pid.lock().await.remove(pid);
         if let Some(ip) = ip {
             self.retract(ip).await;
         }
+        if self.names.lock().await.remove(pid).is_some() {
+            self.refresh_hosts().await;
+        }
     }
+
+    /// Rewrite the managed /etc/hosts block from the current verified names so
+    /// native tools resolve `<petname>` and `<petname>.mesh`. Best-effort: a
+    /// non-root daemon (or read-only /etc/hosts) just skips it and the overlay
+    /// still works by IP.
+    async fn refresh_hosts(&self) {
+        let entries: Vec<(String, Ipv6Addr)> =
+            self.names.lock().await.values().map(|(n, a)| (n.clone(), *a)).collect();
+        if let Err(e) = rewrite_hosts_block(&entries) {
+            crate::ui::debug(&format!("  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"));
+        }
+    }
+}
+
+const HOSTS_PATH: &str = "/etc/hosts";
+const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
+const HOSTS_END: &str = "# END filament-mesh";
+
+/// Replace the filament-mesh managed block in /etc/hosts with `entries`
+/// (`<addr> <name>.mesh <name>` per peer). Atomic via temp-file + rename. An
+/// empty `entries` removes the block. Names are display-only; routing is always
+/// by the cryptographically-verified address.
+fn sanitize_host(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
+        .collect();
+    s.trim_matches('-').to_string()
+}
+
+fn rewrite_hosts_block(entries: &[(String, Ipv6Addr)]) -> std::io::Result<()> {
+    let cur = std::fs::read_to_string(HOSTS_PATH).unwrap_or_default();
+    let out = render_hosts(&cur, entries);
+    // Atomic replace: write a sibling temp then rename (same filesystem as /etc).
+    let tmp = format!("{HOSTS_PATH}.filament.tmp");
+    std::fs::write(&tmp, out)?;
+    std::fs::rename(&tmp, HOSTS_PATH)
+}
+
+/// Pure transform: strip any prior filament-mesh block from `current`, then append
+/// a fresh one for `entries` (none => block removed). Non-filament lines are kept
+/// verbatim, so we never clobber the user's /etc/hosts.
+fn render_hosts(current: &str, entries: &[(String, Ipv6Addr)]) -> String {
+    let mut out = String::with_capacity(current.len() + 256);
+    let mut in_block = false;
+    for line in current.lines() {
+        let t = line.trim_start();
+        if t.starts_with("# BEGIN filament-mesh") {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if t.starts_with(HOSTS_END) {
+                in_block = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let live: Vec<&(String, Ipv6Addr)> = entries.iter().filter(|(n, _)| !n.is_empty()).collect();
+    if !live.is_empty() {
+        out.push_str(HOSTS_BEGIN);
+        out.push('\n');
+        for (name, addr) in live {
+            out.push_str(&format!("{addr} {name}.mesh {name}\n"));
+        }
+        out.push_str(HOSTS_END);
+        out.push('\n');
+    }
+    out
 }
 
 /// Standalone point-to-point serve_tun (no signaling): open `dev` with `tun_addr`
@@ -237,8 +323,32 @@ fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::dest_ip;
-    use std::net::IpAddr;
+    use super::{dest_ip, render_hosts, sanitize_host};
+    use std::net::{IpAddr, Ipv6Addr};
+
+    #[test]
+    fn magicdns_block_roundtrips_without_clobbering() {
+        let base = "127.0.0.1 localhost\n::1 localhost\n";
+        let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
+        let with = render_hosts(base, &[("other-do".into(), a)]);
+        // user lines preserved, managed block added with both name forms
+        assert!(with.contains("127.0.0.1 localhost"));
+        assert!(with.contains(&format!("{a} other-do.mesh other-do")));
+        assert!(with.contains("# BEGIN filament-mesh"));
+        // re-rendering replaces (not stacks) the block, and empty removes it
+        let again = render_hosts(&with, &[("other-do".into(), a)]);
+        assert_eq!(again.matches("# BEGIN filament-mesh").count(), 1);
+        let cleared = render_hosts(&again, &[]);
+        assert!(!cleared.contains("filament-mesh"));
+        assert!(cleared.contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn hostnames_are_sanitized() {
+        assert_eq!(sanitize_host("other-do"), "other-do");
+        assert_eq!(sanitize_host("user@cli"), "user-cli");
+        assert_eq!(sanitize_host("a b/c"), "a-b-c");
+    }
 
     #[test]
     fn parses_ipv4_dest() {
