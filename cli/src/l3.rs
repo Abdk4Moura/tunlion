@@ -65,10 +65,13 @@ impl L3 {
             .and_then(|a| a.parse::<IpAddr>().ok())
             .ok_or_else(|| anyhow!("bad overlay address '{cidr}', want IP/PREFIX"))?;
         let tun = Arc::new(Tun::open(IFNAME, cidr, mtu)?);
+        // Route by the device's ACTUAL name: Linux honors the requested `filament0`,
+        // but macOS assigns `utunN` (utun devices can't be renamed), so the hardcoded
+        // constant would target the wrong interface there.
         // Crypto mode: overlay addresses are scattered /128s across the shared ULA
         // prefix, so route the whole prefix to the TUN (userspace demuxes per /128).
         if identity.is_some() {
-            crate::tun::add_route(&crate::overlay::prefix_cidr(), IFNAME)?;
+            crate::tun::add_route(&crate::overlay::prefix_cidr(), tun.name())?;
         }
         let routes: Arc<Mutex<HashMap<IpAddr, PeerRoute>>> = Arc::new(Mutex::new(HashMap::new()));
         let l3 = Arc::new(L3 {

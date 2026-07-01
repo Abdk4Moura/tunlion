@@ -167,10 +167,10 @@ async fn notify_daemon() {
 // The actual listeners live in the daemon and bind the overlay address, so they
 // need the L3 manager, which is Linux-only (the TUN overlay is Linux-only).
 
-#[cfg(target_os = "linux")]
+#[cfg(l3)]
 pub use imp::Exposer;
 
-#[cfg(target_os = "linux")]
+#[cfg(l3)]
 mod imp {
     use super::{load, Binding};
     use crate::l3::L3;

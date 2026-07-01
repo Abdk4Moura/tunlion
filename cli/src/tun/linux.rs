@@ -1,12 +1,12 @@
-//! L3 TUN device (Linux): open `/dev/net/tun`, hand back an async read/write
-//! handle so the `serve_tun` pump can move raw IP packets between the kernel and
-//! a filament link's QUIC datagrams.
+//! Linux TUN backend for the `tun` module: open `/dev/net/tun`, hand back an async
+//! read/write handle so the overlay pump can move raw IP packets between the kernel
+//! and a filament link's QUIC datagrams.
 //!
 //! Deliberately dependency-light, matching the rest of the CLI: one `TUNSETIFF`
 //! ioctl via `libc`, the device's addr/mtu/up set through `iproute2` (no netlink
 //! crate), and the fd wrapped in tokio's `AsyncFd` for readiness-driven async IO.
-//! Linux-only; the module is `cfg(unix)` and `serve_tun` is gated accordingly so
-//! Windows still compiles (it has no `/dev/net/tun`).
+//! With IFF_NO_PI there is no per-packet framing, so `recv`/`send` exchange bare
+//! IP packets directly (the macOS backend adds/strips a 4-byte header to match).
 
 use anyhow::{bail, Context, Result};
 use std::io::IsTerminal;

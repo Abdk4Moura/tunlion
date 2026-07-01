@@ -679,7 +679,7 @@ pub async fn run_set(
             }
             // Enabling the L3 overlay needs CAP_NET_ADMIN for a non-root daemon;
             // grant it now (one sudo prompt) so `up` just works, no separate step.
-            #[cfg(target_os = "linux")]
+            #[cfg(l3)]
             if !dry_run && s.key == "tun-addr" && !new.is_empty() {
                 crate::tun::ensure_net_admin_for_l3();
             }
