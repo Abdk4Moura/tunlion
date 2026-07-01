@@ -38,16 +38,38 @@ pub fn have_net_admin() -> bool {
 /// `setcap ...+eip` grant puts the cap in Permitted+Inheritable; we raise it into
 /// the ambient set here. Best-effort + harmless for a root daemon (already has it).
 pub fn raise_net_admin_ambient() {
-    const CAP_NET_ADMIN: libc::c_ulong = 12;
+    const CAP_NET_ADMIN: u32 = 12;
+    const VER3: u32 = 0x2008_0522; // _LINUX_CAPABILITY_VERSION_3
     const PR_CAP_AMBIENT: libc::c_int = 47;
     const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
-    // Needs CAP_NET_ADMIN in the process's Permitted AND Inheritable sets, which
-    // the `setcap cap_net_admin+eip` grant provides (the +i is what makes this
-    // work). Best-effort: a no-op + harmless for a root daemon or a binary without
-    // the cap. capset/capget aren't in this libc, so we rely on the file's +i bit
-    // rather than promoting Permitted->Inheritable ourselves.
+    #[repr(C)]
+    struct Hdr {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    // After a normal user execs a setcap'd binary, CAP_NET_ADMIN is in Permitted+
+    // Effective but Inheritable is EMPTY (a user's inheritable set is empty, and a
+    // file +i bit only carries if the PROCESS already had it inheritable). Ambient
+    // raise needs Permitted AND Inheritable, so we must first promote it into
+    // Inheritable (allowed because it is in Permitted). Then children we exec (the
+    // `ip` commands) inherit it. libc lacks capget/capset, so use raw syscalls.
     unsafe {
-        let _ = libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN, 0, 0);
+        let mut hdr = Hdr { version: VER3, pid: 0 };
+        let mut data = [Data { effective: 0, permitted: 0, inheritable: 0 }; 2];
+        if libc::syscall(libc::SYS_capget, &mut hdr as *mut Hdr, data.as_mut_ptr()) == 0
+            && data[0].permitted & (1 << CAP_NET_ADMIN) != 0
+        {
+            data[0].inheritable |= 1 << CAP_NET_ADMIN;
+            let _ = libc::syscall(libc::SYS_capset, &hdr as *const Hdr, data.as_ptr());
+        }
+        let _ = libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN as libc::c_ulong, 0, 0);
     }
 }
 
