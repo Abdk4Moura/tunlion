@@ -143,7 +143,7 @@ impl Mux {
         // The role bit keeps the two ends' sid spaces DISJOINT: each end allocates
         // with its own bit (opposite the peer's, via the deterministic `polite`
         // role), so a sid this end allocates can never equal one the peer
-        // allocated — preventing cross-tunnel frame collisions when both ends open
+        // allocated - preventing cross-tunnel frame collisions when both ends open
         // L2 streams on one link (pty + warm-reuse forward, etc.).
         let n = self.next_sid.fetch_add(1, Ordering::Relaxed) & 0x3FFF_FFFF;
         let role = if self.transport.sid_answerer() { 0x4000_0000 } else { 0 };
@@ -1333,7 +1333,7 @@ pub struct ProbeOutcome {
     /// On failure, the error string.
     pub error: Option<String>,
     /// On success, the path the probe link actually took (interface, address
-    /// class, endpoints) — so `filament doctor` shows the route in the same fine
+    /// class, endpoints) - so `filament doctor` shows the route in the same fine
     /// detail as `filament ping`. `None` when the link never came up.
     pub path: Option<crate::net::PathInfo>,
 }
@@ -1497,12 +1497,12 @@ pub(crate) fn warm_verify_window() -> std::time::Duration {
 
 /// Confirm a just-opened warm stream (`sid` + its inbound `rx`) actually delivers,
 /// BEFORE the caller commits the client to it. Waits up to `verify` for the first
-/// inbound frame — data OR an l2-close (a real refusal): either proves the link is
+/// inbound frame - data OR an l2-close (a real refusal): either proves the link is
 /// alive. Returns the frame so the caller can replay it (no bytes lost). `Err` if
 /// nothing arrives in time: a ZOMBIE link, up at the QUIC layer but black-holing
 /// new streams, so the caller drops it and falls back to a fresh establish rather
 /// than handing the client a dead connection (which would stall until ITS own
-/// timeout — the 25s ssh ConnectTimeout we measured). Verifying first means the
+/// timeout - the 25s ssh ConnectTimeout we measured). Verifying first means the
 /// fallback is immediate and the client never sends bytes into a black hole.
 #[cfg(unix)]
 async fn verify_first_frame(
@@ -1577,7 +1577,7 @@ pub(crate) async fn open_pty_stream(
 }
 
 /// Warm PTY open that CONFIRMS the held link delivers before the caller commits
-/// the terminal — the pty twin of `open_stream_verified`. A fresh PTY's shell
+/// the terminal - the pty twin of `open_stream_verified`. A fresh PTY's shell
 /// prompt (or a reattach's replayed buffer) is the first inbound frame and the
 /// peer sends it unprompted, so a healthy link costs nothing here; a zombie link
 /// yields nothing within `verify` and we `Err` so the caller drops it + falls
@@ -1721,9 +1721,9 @@ impl Drop for RawGuard {
 /// Why a single PTY attach ended.
 enum PtyOutcome {
     /// The remote shell exited (acceptor sent `l2-close` while the link was
-    /// healthy) — we are DONE, do not reconnect.
+    /// healthy) - we are DONE, do not reconnect.
     Exited,
-    /// The link died under us (transport not alive) — the remote PTY session may
+    /// The link died under us (transport not alive) - the remote PTY session may
     /// still be alive on the acceptor; reconnect and REATTACH the same session.
     Dropped,
 }
@@ -1825,7 +1825,7 @@ async fn pty_attach_once(
     });
 
     // Stream remote output to stdout. End when the pipe closes (shell exit OR
-    // link death) — disambiguated by the transport's liveness. A 2s liveness
+    // link death) - disambiguated by the transport's liveness. A 2s liveness
     // poll is the backstop for a silent black-hole that never closes the pipe.
     let mut stdout = tokio::io::stdout();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
@@ -1855,7 +1855,7 @@ async fn pty_attach_once(
     mux.drop_stream(sid).await;
     // Only send our own l2-close on a CLEAN exit. On a drop the link is gone and,
     // crucially, an l2-close would tell the acceptor to END the session we want
-    // to reattach — so we stay silent and let it buffer for the reattach.
+    // to reattach - so we stay silent and let it buffer for the reattach.
     if !dropped {
         let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
     }
@@ -1865,7 +1865,7 @@ async fn pty_attach_once(
 
 /// Warm fast path for `filament pty`: if the local daemon already holds a link to
 /// `peer`, open the PTY over it (via the control socket) and bridge this process's
-/// stdio to it — raw mode + SIGWINCH forwarded as a `resize` op. Returns
+/// stdio to it - raw mode + SIGWINCH forwarded as a `resize` op. Returns
 /// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
 /// warm-link drop -> we exit), or `None` when there is no warm link, so the caller
 /// falls through to the cold resumable path. Unix-only (the control socket is unix).
@@ -1906,7 +1906,7 @@ async fn try_warm_pty(
 
 /// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
 /// terminal (the CLI sibling of the browser web-shell). On a real terminal it is
-/// a FULL interactive client — real tty size, raw mode, SIGWINCH, $TERM — AND
+/// a FULL interactive client - real tty size, raw mode, SIGWINCH, $TERM - AND
 /// RESUMABLE: a per-invocation random session id lets a dropped link reconnect
 /// and reattach the SAME live shell (mosh/tmux-style, the acceptor replays its
 /// output buffer), so a flaky link (e.g. a Coder workspace reconnecting every
@@ -1927,7 +1927,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     let mut raw: Option<RawGuard> = None;
 
     // WARM FAST PATH: if the local `up` daemon already holds a (verified, direct)
-    // link to `peer`, open the PTY over it — no signaling, no establishment, ~0.2s
+    // link to `peer`, open the PTY over it - no signaling, no establishment, ~0.2s
     // instead of seconds. A miss / no daemon / no warm link falls through to the
     // cold resumable path below. Skipped under --relay (the user forced relay; a
     // warm link may be direct) and for non-tty stdio (scripted). Resumability
@@ -1955,7 +1955,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
                 last_up = std::time::Instant::now();
                 backoff = Duration::from_millis(300);
                 role = "reconnect";
-                eprint!("\r\n\x1b[2m[filament: link dropped, reconnecting…]\x1b[0m\r\n");
+                eprint!("\r\n\x1b[2m[filament: link dropped, reconnecting...]\x1b[0m\r\n");
                 continue;
             }
             Err(e) => {
@@ -2023,10 +2023,46 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         }
     };
     crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
-    // Warm path is unix-only (control socket); elsewhere every connection is cold.
+
+    // Ride a local `up` daemon's warm link when one exists (unix control socket):
+    // connections are then instant and open NO new presence on the peer (the
+    // daemon is the one connected), and the daemon reports its own link state.
+    // Probed once, up front.
     #[cfg(unix)]
-    let mut warm = !relay; // try the daemon's warm link until proven unavailable
-    let mut cold: Option<Arc<Mux>> = None; // lazily established fallback link
+    let via_daemon = !relay && crate::ctl::daemon_present().await;
+    #[cfg(not(unix))]
+    let via_daemon = false;
+    let warm = via_daemon; // per-connection warm attempts (unix only)
+
+    // Cold link (no daemon): managed by a background task that establishes it,
+    // WATCHES its liveness, and reconnects on loss, reporting lost/recovered so a
+    // network blip is never silent (the old code held one link and never noticed).
+    // Published via a watch channel the accept loop reads. Not started on the warm
+    // path (that would create the extra presence we are avoiding).
+    let cold_rx = if via_daemon {
+        crate::ui::say(&format!(
+            "filament: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon (connections are instant, no extra presence on {peer})"
+        ));
+        None
+    } else {
+        crate::ui::say(&format!("filament: bringing up the link to {peer} ..."));
+        let (tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
+        {
+            let (server, peer_s) = (server.to_string(), peer.to_string());
+            tokio::spawn(async move { manage_cold_link(server, peer_s, relay, tx).await });
+        }
+        // Wait for the first link so "ready" is honest.
+        while rx.borrow().is_none() {
+            if rx.changed().await.is_err() {
+                bail!("filament: could not establish the link to {peer}");
+            }
+        }
+        crate::ui::say(&format!(
+            "filament: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `filament up` here to avoid a separate presence on {peer})"
+        ));
+        Some(rx)
+    };
+
     loop {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
@@ -2039,20 +2075,21 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
                 });
                 continue;
             }
-            warm = false; // no daemon / no warm link: settle on the cold path
-            crate::ui::trace("filament: no warm link, establishing for forward");
+            crate::ui::say(&format!(
+                "filament: local daemon link unavailable, forwarding to {peer} needs `filament up` here or a restart"
+            ));
+            continue;
         }
-        // Cold path: establish one link on the first connection, reuse it after.
-        let mux = match &cold {
-            Some(m) => m.clone(),
-            None => {
-                let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
-                guard.forget(); // long-lived listener, keep the link alive
-                diag.up("tunnel", "datachannel-or-direct");
-                let m = Mux::new(t);
-                tokio::spawn(pump_initiator(rx, m.clone()));
-                cold = Some(m.clone());
-                m
+        // Cold path: use the current live link, waiting through a reconnect if the
+        // manager is mid-recovery (so a blip delays, never drops, a connection).
+        let Some(mut rx) = cold_rx.clone() else { continue };
+        let mux = loop {
+            if let Some(m) = rx.borrow_and_update().clone() {
+                break m;
+            }
+            if rx.changed().await.is_err() {
+                break_forward(&sock);
+                return Ok(());
             }
         };
         // NOTE(scope): concurrent heavy forwards over ONE cold link need credit
@@ -2061,6 +2098,60 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         tokio::spawn(async move {
             serve_stream(mux, sid, sock, rx_pipe, true, None).await;
         });
+    }
+}
+
+/// Best-effort close of a forward client socket when the link manager has given
+/// up (so the client sees a clean reset rather than a silent hang).
+fn break_forward(_sock: &TcpStream) {
+    crate::ui::say("filament: link permanently lost, forward stopping");
+}
+
+/// Own the cold forward link end to end: establish it, publish it to the accept
+/// loop, watch its liveness, and reconnect on loss, narrating each transition so
+/// a network blip is visible (mirrors the `up` daemon's lost/recovered UX). Never
+/// returns while the watch receiver is live; a send error means the forward
+/// command exited, so the manager stops.
+async fn manage_cold_link(
+    server: String,
+    peer: String,
+    relay: bool,
+    tx: tokio::sync::watch::Sender<Option<Arc<Mux>>>,
+) {
+    let mut backoff_ms = 500u64;
+    loop {
+        // (Re)establish.
+        let mux = match bring_up_to_known(&server, &peer, relay, "init").await {
+            Ok((t, rx, guard, mut diag)) => {
+                guard.forget();
+                diag.up("tunnel", "datachannel-or-direct");
+                let m = Mux::new(t);
+                tokio::spawn(pump_initiator(rx, m.clone()));
+                m
+            }
+            Err(e) => {
+                crate::ui::say(&format!("filament: reaching {peer} failed ({e}), retrying..."));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(8000);
+                continue;
+            }
+        };
+        backoff_ms = 500;
+        if tx.send(Some(mux.clone())).is_err() {
+            return; // forward command gone
+        }
+        // Watch liveness; a dead transport means the link dropped under us.
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if tx.is_closed() {
+                return;
+            }
+            if !mux.transport().is_alive() {
+                crate::ui::say(&format!("filament: link to {peer} lost, reconnecting..."));
+                let _ = tx.send(None);
+                break;
+            }
+        }
     }
 }
 
@@ -2077,7 +2168,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
 /// Result of installing our managed key on a peer (warm or cold path). `sshd` is
 /// the peer's report of whether an sshd is listening on the port `filament ssh`
 /// will dial: `Some(true)` reachable, `Some(false)` nothing there (so ssh would
-/// fail blindly — caller bails with a clear message), `None` when the peer is an
+/// fail blindly - caller bails with a clear message), `None` when the peer is an
 /// older build that didn't report it (caller proceeds, status unknown).
 struct BootstrapInfo {
     hostkeys: Vec<String>,
@@ -2108,7 +2199,7 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
             crate::ui::problem(
                 &format!("filament ssh: can't reach '{peer}'"),
                 &format!(
-                    "couldn't establish a link to '{peer}' in {connect_secs}s — it may be offline or unreachable from here."
+                    "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
                     format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
@@ -2685,7 +2776,7 @@ mod h1_tests {
     /// so the peer reaps its half. The caller (handle_warm_open) then drops the
     /// link and rejects, so the client falls through to a fresh establish.
     /// Crucially it verifies BEFORE the client is committed, so the fallback is
-    /// instant — never the 25s ssh-ConnectTimeout stall an accepted-then-dead
+    /// instant - never the 25s ssh-ConnectTimeout stall an accepted-then-dead
     /// connection would cause.
     #[tokio::test]
     async fn warm_reuse_zombie_link_self_heals_instead_of_hanging() {

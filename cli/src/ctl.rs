@@ -47,8 +47,8 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping, try_pty,
-    try_reconfigure, try_resize, Req, ReqKind,
+    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping,
+    try_pty, try_reconfigure, try_resize, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
@@ -87,6 +87,19 @@ mod imp {
     }
 
     // ----------------------------------------------------------------- client -
+
+    /// Cheap probe: is a local `up` daemon listening on the control socket? Lets
+    /// callers (e.g. `forward`) tell "ride the warm link" from "cold-establish as
+    /// a new identity" UP FRONT, so they can report the right ready-state and not
+    /// surprise the user with a second presence on the peer. A bare connect the
+    /// daemon accepts then drops on our disconnect (harmless: its reader just sees
+    /// EOF). Honors the warm-reuse opt-out.
+    pub async fn daemon_present() -> bool {
+        if reuse_disabled() {
+            return false;
+        }
+        UnixStream::connect(control_sock_path()).await.is_ok()
+    }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
     /// link. Returns the connected socket (positioned for raw bytes) on success,
