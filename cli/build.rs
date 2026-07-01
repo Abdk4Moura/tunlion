@@ -67,4 +67,15 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=FILAMENT_BUILD_SHA");
     println!("cargo:rerun-if-env-changed=FILAMENT_BUILD_DATE");
+
+    // `l3`: one cfg gating the L3 overlay data plane, set on every platform that
+    // has a TUN backend under src/tun/. Portable overlay code uses `#[cfg(l3)]`
+    // instead of enumerating target_os everywhere; adding a backend (e.g. Windows
+    // Wintun) is a one-line change here. Platform-SPECIFIC bits (Linux setcap) keep
+    // their own `cfg(target_os = ...)`.
+    println!("cargo:rustc-check-cfg=cfg(l3)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if matches!(os.as_str(), "linux" | "macos") {
+        println!("cargo:rustc-cfg=l3");
+    }
 }

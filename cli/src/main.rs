@@ -36,10 +36,10 @@ mod session;
 mod settings;
 /// L3 TUN data plane (serve_tun). Linux-only: it uses /dev/net/tun + TUNSETIFF,
 /// which macOS (also `unix`) lacks, so gate on `target_os`, not `unix`.
-#[cfg(target_os = "linux")]
+#[cfg(l3)]
 mod tun;
 /// L3 overlay manager (routes IP packets across peer links); Linux-only.
-#[cfg(target_os = "linux")]
+#[cfg(l3)]
 mod l3;
 mod shutdown;
 mod sshkeys;
@@ -4749,7 +4749,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
         Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(l3)]
             {
                 let mut h = Sha256::new();
                 h.update(psk.as_bytes());
@@ -4768,7 +4768,7 @@ async fn main() -> Result<()> {
                 ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(l3))]
             {
                 let _ = (tun_addr, listen, connect, psk, dev, mtu);
                 bail!("serve-tun (L3) is Linux-only")
@@ -6566,9 +6566,9 @@ async fn recv_cmd(
     // `l3_seen`: last announce received per pid, replayed once a datagram-capable
     // transport is installed, so a hello that races ahead of the link is not lost
     // (review fix #3).
-    #[cfg(target_os = "linux")]
+    #[cfg(l3)]
     let mut l3_seen: HashMap<String, overlay::Announce> = HashMap::new();
-    #[cfg(target_os = "linux")]
+    #[cfg(l3)]
     let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
         match settings::get_str("tun-addr", None) {
             Some(setting) => {
@@ -6610,7 +6610,7 @@ async fn recv_cmd(
     // `filament expose`: once the overlay is up, bind the persisted ports on the
     // overlay address and forward each to its local target. Reconciled live on a
     // ReloadExpose control request (expose/unexpose without a restart).
-    #[cfg(target_os = "linux")]
+    #[cfg(l3)]
     let exposer: Option<std::sync::Arc<expose::Exposer>> = match l3.as_ref() {
         Some(m) => {
             let ex = expose::Exposer::new(m.clone());
@@ -6788,14 +6788,14 @@ async fn recv_cmd(
                             // `filament expose`/`unexpose`: reconcile overlay
                             // listeners from expose.json. live:true only if L3 is up.
                             let (live, count): (bool, usize) = {
-                                #[cfg(target_os = "linux")]
+                                #[cfg(l3)]
                                 {
                                     match exposer.as_ref() {
                                         Some(ex) => (true, ex.reconcile().await),
                                         None => (false, 0),
                                     }
                                 }
-                                #[cfg(not(target_os = "linux"))]
+                                #[cfg(not(l3))]
                                 {
                                     (false, 0)
                                 }
@@ -7269,7 +7269,7 @@ async fn recv_cmd(
                     // stale route just drops datagrams (the inner TCP pauses) until
                     // the swap. The cached announce is dropped so the peer's next
                     // announce is treated fresh.
-                    #[cfg(target_os = "linux")]
+                    #[cfg(l3)]
                     l3_seen.remove(&pid);
                 }
             }
@@ -7530,7 +7530,7 @@ async fn recv_cmd(
                 // announce on their own ChannelReady, so each learns the other.
                 // Also replay any announce that arrived BEFORE this transport was
                 // installed (fix #3), now that the link can carry datagrams.
-                #[cfg(target_os = "linux")]
+                #[cfg(l3)]
                 if let Some(l3) = l3.as_ref() {
                     if let Some(cb) = t.channel_binding() {
                         if let Some(ann) = l3.make_announce(&cb) {
@@ -7678,7 +7678,7 @@ async fn recv_cmd(
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.
-                #[cfg(target_os = "linux")]
+                #[cfg(l3)]
                 Some("l3-announce") => {
                     // The peer signed a claim to an overlay address. Verify it
                     // against THIS link's channel binding (rejects a forged addr, a

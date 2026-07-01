@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.2.1-beta.38"
+version = "0.2.1-beta.39"
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of filament.autumated.com."
 license = "MIT"
@@ -64,11 +64,11 @@ ring = "0.17"
 # cross-platform incl. Windows). Used ONLY behind the interactivity gate; a
 # non-TTY / scripted run never enters its event loop.
 crossterm = "0.29"
-# L3 (serve_tun, Linux only): open /dev/net/tun via a TUNSETIFF ioctl and wrap the
-# fd in tokio's AsyncFd. libc is the only addition; the device config (addr/mtu/up)
-# goes through iproute2, so no netlink crate is pulled. Linux-gated because the TUN
-# path is Linux-specific (macOS uses a different utun model).
-[target.'cfg(target_os = "linux")'.dependencies]
+# L3 TUN backends (unix): Linux opens /dev/net/tun via a TUNSETIFF ioctl; macOS
+# opens a utun via a PF_SYSTEM control socket. Both wrap the fd in tokio's AsyncFd
+# and set addr/mtu/route through the system CLI (iproute2 / ifconfig+route), so no
+# netlink crate is pulled. libc is the only addition on unix.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [profile.release]
