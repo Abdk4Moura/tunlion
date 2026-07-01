@@ -294,14 +294,17 @@ const EXAMPLES: &str = "\
 EXAMPLES:
   filament video.mp4                 send it; mints a speakable one-time code + QR
   filament clever-lynx-63            claim a code and receive
-  filament send ./photos --code      directories tar on the fly
   filament recv <code> -o - | tar x  stream straight into a pipe
-  filament pair --name phone         remember a device, a ceremony, no file needed
-  filament send big.iso --to laptop  no code: a remembered device, verified by proof
+  filament pair --name phone         remember a device (no file transfer)
+  filament send big.iso --to laptop  send to a remembered device, no code
   filament up --install              always-on drop target (trusted devices only)
-  filament introduce laptop phone    vouch two of your devices to each other
 
-  The other end never needs anything installed: https://filament.autumated.com";
+  The other end never needs anything installed: https://filament.autumated.com
+
+  More commands (run `filament <cmd> --help`):
+    ssh · forward         remote shell / port-forward to a device
+    set tun-addr auto     join the encrypted L3 overlay mesh (`filament addr`)
+    ping · doctor         diagnose a link; introduce · grant · serve-tun · netcat · pty";
 
 #[derive(Parser)]
 #[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers, no upload, no account", after_help = EXAMPLES)]
@@ -406,9 +409,10 @@ enum Cmd {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
-    /// Remember a device, a pairing ceremony, no file needed. Mints a code
-    /// (or claims one) and exchanges the pair secret with consent on both ends.
+    /// Remember a device (a pairing ceremony, no file transfer).
     ///
+    /// Mints a code (or claims one) and exchanges the pair secret with consent on
+    /// both ends.
     /// In a terminal with no code (or a malformed one) this opens a guided,
     /// color-coded code entry. Scripts are safe by default: a non-TTY never
     /// prompts; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass --no-interactive
@@ -461,10 +465,13 @@ enum Cmd {
     Down,
     /// Vouch between two known devices: mints a fresh secret and delivers it
     /// to both over verified channels (run on the device that knows both)
+    #[command(hide = true)]
     Introduce { a: String, b: String },
-    /// Show or change settings. No args prints all settings with their value,
-    /// scope, and where each came from (env > peer > config > default). Strictly
-    /// imperative: `set` only changes the key you name.
+    /// Show or change settings (no args = show all).
+    ///
+    /// No args prints all settings with their value, scope, and where each came
+    /// from (env > peer > config > default). Strictly imperative: `set` only
+    /// changes the key you name.
     #[command(after_help = "\x1b[1mExamples:\x1b[0m\n  \
         filament set                          show every setting + where it came from\n  \
         filament set auto-extract on          change one setting (partial, never resets others)\n  \
@@ -494,10 +501,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print this device's L3 overlay address (derived from its Ed25519 overlay
-    /// key; stable across restarts). Creates the key on first use.
+    /// Print this device's L3 overlay address.
+    ///
+    /// Derived from its Ed25519 overlay key; stable across restarts. Creates the
+    /// key on first use.
     Addr,
     /// Read one setting's effective value (bare value on stdout, for scripts)
+    #[command(hide = true)]
     Get {
         /// Setting name
         key: String,
@@ -515,6 +525,7 @@ enum Cmd {
         json: bool,
     },
     /// Reset a setting to its default (remove the override)
+    #[command(hide = true)]
     Unset {
         /// Setting name
         key: String,
@@ -528,6 +539,7 @@ enum Cmd {
     /// One side `--listen <bind>`, the other `--connect <host:port>`; both share
     /// `--psk`. Linux-only. (The `up` daemon's `tun-addr` is the signaling-based
     /// mesh; this is the static two-endpoint case the lab and simple VPNs use.)
+    #[command(hide = true)]
     ServeTun {
         /// This side's overlay address as IP/PREFIX, e.g. 10.9.0.1/24
         #[arg(long, value_name = "CIDR")]
@@ -562,6 +574,7 @@ enum Cmd {
         beta: bool,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
+    #[command(hide = true)]
     Completions {
         shell: clap_complete::Shell,
     },
@@ -571,6 +584,7 @@ enum Cmd {
     /// Tunnel: wire stdio to one TCP stream on a known peer's localhost (the
     /// ssh ProxyCommand primitive). Off by default; FILAMENT_L2=1 enables the
     /// acceptor side in `up`/`recv`.
+    #[command(hide = true)]
     Netcat {
         /// Known device (petname) to tunnel through
         peer: String,
@@ -580,12 +594,15 @@ enum Cmd {
     /// Open a PTY shell on a known device and bridge it to this terminal (the CLI
     /// sibling of the browser web-shell). The peer must run `up --shell` (or grant
     /// shell). Off by default; FILAMENT_L2=1 / --shell enables the acceptor.
+    #[command(hide = true)]
     Pty {
         /// Known device (petname) to open a shell on
         peer: String,
     },
-    /// Tunnel: local TCP listener; each connection becomes one stream to the
-    /// peer's localhost:<rport>.
+    /// Forward a local port to a known peer's port.
+    ///
+    /// Local TCP listener; each connection becomes one stream to the peer's
+    /// localhost:<rport>.
     Forward {
         /// Local port to listen on (127.0.0.1)
         lport: u16,
@@ -594,8 +611,10 @@ enum Cmd {
         /// Remote port on the peer's localhost
         rport: u16,
     },
-    /// Tunnel: run your real `ssh` over the data channel via ProxyCommand
-    /// (reuses your keys, known_hosts, and ~/.ssh/config).
+    /// SSH into a known device over filament.
+    ///
+    /// Runs your real `ssh` over the data channel via ProxyCommand (reuses your
+    /// keys, known_hosts, and ~/.ssh/config).
     Ssh {
         /// Known device (petname) to ssh into
         peer: String,
@@ -608,6 +627,7 @@ enum Cmd {
     /// cold (is a link already held?) and verified identity (paired + proven).
     /// A warm direct link reports quinn's RTT and the real remote IP:port; with no
     /// live link it reports the cold establish cost instead.
+    #[command(hide = true)]
     Ping {
         /// Known device (petname) to ping
         peer: String,
@@ -627,6 +647,7 @@ enum Cmd {
     /// case). With NO device: an environment preflight (signaling reachability,
     /// one STUN binding, local interfaces) plus a history digest of past
     /// connects. `--json` emits machine-readable output for scripting.
+    #[command(hide = true)]
     Doctor {
         /// Known device (petname) to probe; omit for environment preflight
         device: Option<String>,
@@ -643,6 +664,8 @@ enum Cmd {
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
+    /// (Prefer `filament set shell on --peer <device>`.)
+    #[command(hide = true)]
     Grant {
         /// Known device (petname)
         device: String,
@@ -651,6 +674,7 @@ enum Cmd {
     },
     /// Revoke a capability from a known device. Revoking `shell` also strips the
     /// device's filament-managed block from this machine's authorized_keys.
+    #[command(hide = true)]
     Revoke {
         /// Known device (petname)
         device: String,

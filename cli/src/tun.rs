@@ -9,8 +9,72 @@
 //! Windows still compiles (it has no `/dev/net/tun`).
 
 use anyhow::{bail, Context, Result};
+use std::io::IsTerminal;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
+
+/// CAP_NET_ADMIN bit index (from <linux/capability.h>): needed to create a TUN.
+const CAP_NET_ADMIN: u64 = 12;
+
+/// True if this process can create a TUN: running as root, or the binary carries
+/// CAP_NET_ADMIN (which every exec of it, including this one, gets effectively).
+pub fn have_net_admin() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        return true;
+    }
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("CapEff:")).map(|l| l.to_string()))
+        .and_then(|l| u64::from_str_radix(l["CapEff:".len()..].trim(), 16).ok())
+        .map(|caps| caps & (1 << CAP_NET_ADMIN) != 0)
+        .unwrap_or(false)
+}
+
+/// The one-time command that lets a NON-root daemon open the tunnel device.
+pub fn cap_grant_cmd() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "filament".into());
+    format!("sudo setcap cap_net_admin+ep {exe}")
+}
+
+/// Make L3 work for a non-root daemon with as few steps as possible: if we lack
+/// CAP_NET_ADMIN and we're at a terminal, run the one-time `setcap` now (a single
+/// sudo prompt) so a later `filament up` just works; otherwise print the exact
+/// command. A no-op when we already have the capability (root or already granted).
+/// Returns true if the capability is present or was just granted.
+pub fn ensure_net_admin_for_l3() -> bool {
+    if have_net_admin() {
+        return true;
+    }
+    let cmd = cap_grant_cmd();
+    // Only self-grant interactively (a daemon has no tty to answer a sudo prompt).
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprintln!("  L3 needs a one-time capability so a non-root daemon can open the tunnel device (like WireGuard).");
+        eprintln!("  granting now: {cmd}");
+        let granted = std::env::current_exe()
+            .ok()
+            .and_then(|exe| {
+                std::process::Command::new("sudo")
+                    .args(["setcap", "cap_net_admin+ep"])
+                    .arg(exe)
+                    .status()
+                    .ok()
+            })
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if granted {
+            eprintln!("  done. restart the daemon (or run `filament up`) to bring up the overlay.");
+        } else {
+            eprintln!("  could not grant automatically; run it yourself, then restart the daemon:\n    {cmd}");
+        }
+        granted
+    } else {
+        eprintln!("  L3 needs a one-time capability for a non-root daemon; run it, then restart:\n    {cmd}");
+        false
+    }
+}
 
 // From <linux/if_tun.h> / <net/if.h>. `libc::Ioctl` is the platform's ioctl
 // request type: c_ulong on glibc but c_int on musl, so use the alias (a bare
@@ -55,7 +119,14 @@ impl Tun {
             )
         };
         if raw < 0 {
-            bail!("open /dev/net/tun: {} (need CAP_NET_ADMIN / root)", std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+                bail!(
+                    "open /dev/net/tun: permission denied. L3 needs CAP_NET_ADMIN; grant it once:\n    {}\nthen restart the daemon (or run the daemon as root).",
+                    cap_grant_cmd()
+                );
+            }
+            bail!("open /dev/net/tun: {e}");
         }
         // OwnedFd from here on, so any early return below closes the fd.
         let owned = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -67,7 +138,14 @@ impl Tun {
         req.flags = IFF_TUN | IFF_NO_PI;
         let rc = unsafe { libc::ioctl(owned.as_raw_fd(), TUNSETIFF, &mut req as *mut IfReq) };
         if rc < 0 {
-            bail!("TUNSETIFF {name}: {}", std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+                bail!(
+                    "TUNSETIFF {name}: permission denied. L3 needs CAP_NET_ADMIN; grant it once:\n    {}\nthen restart the daemon.",
+                    cap_grant_cmd()
+                );
+            }
+            bail!("TUNSETIFF {name}: {e}");
         }
 
         // Configure via iproute2: robust across distros and avoids a second round
