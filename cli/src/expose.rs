@@ -21,7 +21,7 @@ use crate::ui;
 /// One exposed port: listen on the overlay `port`, forward to `target`
 /// (`host:port`), optionally restricted to `peers` (petnames; `None`/empty = any
 /// paired device).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Binding {
     pub port: u16,
     pub target: String,
@@ -180,13 +180,14 @@ mod imp {
     use std::sync::Arc;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
-    use tokio::task::AbortHandle;
+    use tokio::task::JoinHandle;
 
     /// Owns the live overlay listeners (one per exposed port) and reconciles them
-    /// against `expose.json` on demand.
+    /// against `expose.json` on demand. Keyed by port; each value pairs the binding
+    /// that spawned the listener (to detect changes) with its task handle.
     pub struct Exposer {
         l3: Arc<L3>,
-        active: Mutex<HashMap<u16, AbortHandle>>,
+        active: Mutex<HashMap<u16, (Binding, JoinHandle<()>)>>,
     }
 
     impl Exposer {
@@ -194,20 +195,38 @@ mod imp {
             Arc::new(Exposer { l3, active: Mutex::new(HashMap::new()) })
         }
 
-        /// Abort every current listener and respawn from `expose.json`. In-flight
-        /// proxied connections are separate tasks and are NOT aborted, so editing
-        /// the config never cuts a live connection. Returns the port count now bound.
+        /// Differential reconcile against `expose.json`: leave unchanged ports
+        /// serving untouched, drop removed/changed ones (awaiting each task's exit
+        /// so its socket is released before any rebind on the same port), then bind
+        /// the new/changed ones. In-flight proxied connections are separate tasks
+        /// and survive. Returns the port count now bound.
         pub async fn reconcile(self: &Arc<Self>) -> usize {
-            let want = load();
+            let want: HashMap<u16, Binding> = load().into_iter().map(|b| (b.port, b)).collect();
             let mut active = self.active.lock().await;
-            for (_, h) in active.drain() {
-                h.abort();
+            // Drop listeners that are gone or whose binding changed. AWAIT the task
+            // after abort so the listening socket is fully closed before we might
+            // rebind the same overlay addr:port below (abort alone is async, so an
+            // immediate rebind would race and fail with "address in use").
+            let stale: Vec<u16> = active
+                .iter()
+                .filter(|(p, (b, _))| want.get(p) != Some(b))
+                .map(|(p, _)| *p)
+                .collect();
+            for p in stale {
+                if let Some((_, jh)) = active.remove(&p) {
+                    jh.abort();
+                    let _ = jh.await;
+                }
             }
-            for b in want {
-                let port = b.port;
-                match self.clone().spawn(b).await {
-                    Ok(h) => {
-                        active.insert(port, h);
+            // Bind the ports that are new or changed (unchanged ones are still in
+            // `active` and were skipped above).
+            for (port, b) in want {
+                if active.contains_key(&port) {
+                    continue;
+                }
+                match self.clone().spawn(b.clone()).await {
+                    Ok(jh) => {
+                        active.insert(port, (b, jh));
                     }
                     Err(e) => crate::ui::say(&crate::ui::paint(
                         crate::ui::Tone::Warn,
@@ -218,7 +237,7 @@ mod imp {
             active.len()
         }
 
-        async fn spawn(self: Arc<Self>, b: Binding) -> Result<AbortHandle> {
+        async fn spawn(self: Arc<Self>, b: Binding) -> Result<JoinHandle<()>> {
             let addr = self.l3.my_addr().context("L3 overlay is not up")?;
             let bind = SocketAddr::new(IpAddr::V6(addr), b.port);
             let listener = TcpListener::bind(bind)
@@ -247,7 +266,7 @@ mod imp {
                     });
                 }
             });
-            Ok(jh.abort_handle())
+            Ok(jh)
         }
 
         /// A connection is allowed iff its source is a verified overlay peer and,
