@@ -4985,8 +4985,34 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
     }
+    // Preserve any CAP_NET_ADMIN grant across the update: replacing the binary
+    // drops the file capability, which would silently break L3 on a non-root
+    // daemon until a manual re-setcap. If the OLD binary carried it, re-apply it.
+    #[cfg(target_os = "linux")]
+    let had_cap = std::process::Command::new("getcap")
+        .arg(&me)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("cap_net_admin"))
+        .unwrap_or(false);
     std::fs::rename(&staging, &me).with_context(|| format!("replacing {}", me.display()))?;
     println!("updated to {latest_ver} -> {}", me.display());
+    #[cfg(target_os = "linux")]
+    if had_cap {
+        // Re-grant: directly if root, else via sudo (interactive on a TTY). If it
+        // can't, tell the user the one command so L3 isn't silently broken.
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let ok = if is_root {
+            std::process::Command::new("setcap").args(["cap_net_admin+eip"]).arg(&me).status().map(|s| s.success()).unwrap_or(false)
+        } else {
+            std::process::Command::new("sudo").args(["setcap", "cap_net_admin+eip"]).arg(&me).status().map(|s| s.success()).unwrap_or(false)
+        };
+        if ok {
+            println!("re-applied CAP_NET_ADMIN (L3 overlay); restart the daemon to use it");
+        } else {
+            println!("note: re-grant L3's capability then restart:\n    sudo setcap cap_net_admin+eip {}", me.display());
+        }
+    }
     Ok(())
 }
 

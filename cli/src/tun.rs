@@ -30,13 +30,34 @@ pub fn have_net_admin() -> bool {
         .unwrap_or(false)
 }
 
+/// Raise CAP_NET_ADMIN into this process's AMBIENT set so the `ip` child processes
+/// that configure the overlay (addr/mtu/up/route) inherit it. A file capability
+/// (setcap) is Permitted+Effective in THIS process but is NOT passed to children
+/// across exec unless it is ambient, so without this a non-root daemon opens the
+/// TUN fine (in-process ioctl) yet `ip addr add` fails "permission denied". The
+/// `setcap ...+eip` grant puts the cap in Permitted+Inheritable; we raise it into
+/// the ambient set here. Best-effort + harmless for a root daemon (already has it).
+pub fn raise_net_admin_ambient() {
+    const CAP_NET_ADMIN: libc::c_ulong = 12;
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
+    // Needs CAP_NET_ADMIN in the process's Permitted AND Inheritable sets, which
+    // the `setcap cap_net_admin+eip` grant provides (the +i is what makes this
+    // work). Best-effort: a no-op + harmless for a root daemon or a binary without
+    // the cap. capset/capget aren't in this libc, so we rely on the file's +i bit
+    // rather than promoting Permitted->Inheritable ourselves.
+    unsafe {
+        let _ = libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN, 0, 0);
+    }
+}
+
 /// The one-time command that lets a NON-root daemon open the tunnel device.
 pub fn cap_grant_cmd() -> String {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "filament".into());
-    format!("sudo setcap cap_net_admin+ep {exe}")
+    format!("sudo setcap cap_net_admin+eip {exe}")
 }
 
 /// Make L3 work for a non-root daemon with as few steps as possible: if we lack
@@ -57,7 +78,7 @@ pub fn ensure_net_admin_for_l3() -> bool {
             .ok()
             .and_then(|exe| {
                 std::process::Command::new("sudo")
-                    .args(["setcap", "cap_net_admin+ep"])
+                    .args(["setcap", "cap_net_admin+eip"])
                     .arg(exe)
                     .status()
                     .ok()
@@ -149,7 +170,10 @@ impl Tun {
         }
 
         // Configure via iproute2: robust across distros and avoids a second round
-        // of ioctl/netlink. The interface exists now (the ioctl created it).
+        // of ioctl/netlink. The interface exists now (the ioctl created it). Raise
+        // CAP_NET_ADMIN ambient first so these `ip` children inherit it (a non-root
+        // daemon's file cap does not cross exec on its own).
+        raise_net_admin_ambient();
         ip(&["addr", "add", cidr, "dev", name]).with_context(|| format!("ip addr add {cidr} dev {name}"))?;
         ip(&["link", "set", "dev", name, "mtu", &mtu.to_string()]).context("ip link set mtu")?;
         ip(&["link", "set", "dev", name, "up"]).context("ip link set up")?;
