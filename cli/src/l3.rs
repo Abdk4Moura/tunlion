@@ -217,9 +217,22 @@ impl L3 {
     }
 }
 
-const HOSTS_PATH: &str = "/etc/hosts";
 const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
+
+/// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
+/// under %SystemRoot% (default C:\Windows), which the resolver consults like /etc/hosts.
+fn hosts_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        std::path::PathBuf::from(root).join("System32\\drivers\\etc\\hosts")
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from("/etc/hosts")
+    }
+}
 
 /// Replace the filament-mesh managed block in /etc/hosts with `entries`
 /// (`<addr> <name>.mesh <name>` per peer). Atomic via temp-file + rename. An
@@ -234,19 +247,20 @@ pub(crate) fn sanitize_host(name: &str) -> String {
 }
 
 fn rewrite_hosts_block(entries: &[(String, Ipv6Addr)]) -> std::io::Result<()> {
-    let cur = std::fs::read_to_string(HOSTS_PATH).unwrap_or_default();
+    let path = hosts_path();
+    let cur = std::fs::read_to_string(&path).unwrap_or_default();
     let out = render_hosts(&cur, entries);
     // Preferred: atomic sibling-temp + rename (crash-safe), which needs write on
-    // the /etc DIRECTORY (i.e. root). Fallback for a non-root daemon that only has
-    // a per-file ACL on /etc/hosts: a single-shot in-place truncating write, which
-    // needs write on the file alone. The in-place path writes the whole buffer in
-    // one std::fs::write so the corruption window is one syscall.
-    let tmp = format!("{HOSTS_PATH}.filament.tmp");
-    match std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, HOSTS_PATH)) {
+    // the hosts DIRECTORY (root/Administrator). Fallback for a non-root daemon that
+    // only has a per-file ACL on the hosts file: a single-shot in-place truncating
+    // write, which needs write on the file alone. The in-place path writes the whole
+    // buffer in one std::fs::write so the corruption window is one syscall.
+    let tmp = path.with_extension("filament.tmp");
+    match std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, &path)) {
         Ok(()) => Ok(()),
         Err(_) => {
             let _ = std::fs::remove_file(&tmp);
-            std::fs::write(HOSTS_PATH, out)
+            std::fs::write(&path, out)
         }
     }
 }

@@ -24,4 +24,7 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, Tun};
 
-// Windows (Wintun) backend lands in Phase 3; until then `l3` excludes Windows.
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, Tun};

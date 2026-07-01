@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.2.1-beta.39"
+version = "0.2.1-beta.40"
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of filament.autumated.com."
 license = "MIT"
@@ -70,6 +70,12 @@ crossterm = "0.29"
 # netlink crate is pulled. libc is the only addition on unix.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
+# loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
+# release packaging; adapter creation needs Administrator.
+[target.'cfg(target_os = "windows")'.dependencies]
+wintun = "0.5"
 
 [profile.release]
 lto = true

@@ -75,7 +75,7 @@ fn main() {
     // their own `cfg(target_os = ...)`.
     println!("cargo:rustc-check-cfg=cfg(l3)");
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if matches!(os.as_str(), "linux" | "macos") {
+    if matches!(os.as_str(), "linux" | "macos" | "windows") {
         println!("cargo:rustc-cfg=l3");
     }
 }
