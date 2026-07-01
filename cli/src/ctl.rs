@@ -48,7 +48,7 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
 pub use imp::{
     daemon_present, send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping,
-    try_pty, try_reconfigure, try_resize, Req, ReqKind,
+    try_pty, try_reconfigure, try_reload_expose, try_resize, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
@@ -235,6 +235,24 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask the running daemon to re-read `expose.json` and reconcile its overlay
+    /// listeners (used by `filament expose`/`unexpose`). Returns the daemon reply
+    /// (`{"ok":true,"live":<bool>,"count":<n>}`) or `None` if no daemon answered.
+    pub async fn try_reload_expose() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "reload-expose" });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -266,6 +284,11 @@ mod imp {
         /// `live:false` = the key is woven into startup (relay/server, or arming
         /// the L2 acceptor from cold) and needs `filament up`. Answered INLINE.
         Reconfigure { key: String },
+        /// Tell the daemon to re-read `expose.json` and reconcile its overlay
+        /// listeners (`filament expose`/`unexpose`). Answered INLINE with
+        /// `{"ok":true,"live":true,"count":<n>}` where `n` is the number of ports
+        /// now bound; `live:false` if L3 is not up in the daemon.
+        ReloadExpose,
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -380,6 +403,7 @@ mod imp {
                         let Some(key) = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).map(str::to_string) else { return };
                         ReqKind::Reconfigure { key }
                     }
+                    Some("reload-expose") => ReqKind::ReloadExpose,
                     _ => return,
                 };
                 let _ = tx.send(Req { kind, sock });

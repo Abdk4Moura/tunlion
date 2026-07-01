@@ -207,7 +207,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 // ------------------------------------------------------------------ store --
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
         return PathBuf::from(d);
     }

@@ -20,6 +20,9 @@ mod ctl;
 mod diag;
 mod direct;
 mod doctor;
+/// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
+/// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
+mod expose;
 mod holepunch;
 mod l2;
 mod net;
@@ -610,6 +613,31 @@ enum Cmd {
         peer: String,
         /// Remote port on the peer's localhost
         rport: u16,
+    },
+    /// Publish a local port on this device's mesh address (peers reach it at
+    /// <this-device>.mesh:<port>), like a Tailscale-served port.
+    ///
+    /// The daemon binds the overlay address (a private ULA, reachable only over
+    /// the mesh) and forwards each connection to a local target. Needs L3 up
+    /// (`filament set tun-addr auto`). Persists across restarts.
+    Expose {
+        /// Port to publish on the overlay. Omit together with --list.
+        port: Option<u16>,
+        /// Local target: host:port, a bare port (127.0.0.1:PORT), or a bare host
+        /// (HOST:<port>). Default: 127.0.0.1:<port>.
+        #[arg(long, value_name = "HOST:PORT")]
+        to: Option<String>,
+        /// Restrict to these paired devices (petnames, comma-separated). Default: any.
+        #[arg(long, value_name = "DEVICE", value_delimiter = ',')]
+        peer: Vec<String>,
+        /// List exposed ports and exit.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Stop exposing a port (see `filament expose --list`).
+    Unexpose {
+        /// Port to stop exposing.
+        port: u16,
     },
     /// SSH into a known device over filament.
     ///
@@ -1586,6 +1614,17 @@ fn status_cmd() -> Result<()> {
     }
     let n = devices_load().len();
     ui::say(&format!("  {} known device{}", n, if n == 1 { "" } else { "s" }));
+    let exposed = expose::load();
+    if !exposed.is_empty() {
+        ui::say(&ui::paint(ui::Tone::Dim, "  exposed on .mesh:"));
+        for b in exposed {
+            let scope = match &b.peers {
+                Some(p) if !p.is_empty() => p.join(","),
+                _ => "any".into(),
+            };
+            ui::say(&format!("    :{} {} {}  ({})", b.port, ui::glyph_arrow(), b.target, scope));
+        }
+    }
     if let Ok(log) = std::fs::read_to_string(up_log()) {
         let recent: Vec<&str> = log.lines().rev().take(8).collect();
         if !recent.is_empty() {
@@ -4307,6 +4346,9 @@ async fn handle_warm_req(
         // Reconfigure is handled inline in the daemon loop (it mutates loop state),
         // so it never reaches this dispatcher; answer defensively if it ever does.
         ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
+        // ReloadExpose is likewise handled inline in the daemon loop (it owns the
+        // Exposer); answer defensively if it ever reaches here.
+        ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
     }
 }
 
@@ -4835,6 +4877,8 @@ async fn main() -> Result<()> {
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
         Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
+        Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
+        Cmd::Unexpose { port } => expose::unexpose_cmd(port).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
         Cmd::Doctor { device, watch, repeat, json } => {
@@ -6563,6 +6607,26 @@ async fn recv_cmd(
     } else {
         None
     };
+    // `filament expose`: once the overlay is up, bind the persisted ports on the
+    // overlay address and forward each to its local target. Reconciled live on a
+    // ReloadExpose control request (expose/unexpose without a restart).
+    #[cfg(target_os = "linux")]
+    let exposer: Option<std::sync::Arc<expose::Exposer>> = match l3.as_ref() {
+        Some(m) => {
+            let ex = expose::Exposer::new(m.clone());
+            let n = ex.reconcile().await;
+            if n > 0 {
+                ui::say(&format!(
+                    "  {} exposing {} port{} on the overlay",
+                    ui::paint(ui::Tone::Brand, "●"),
+                    n,
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Some(ex)
+        }
+        None => None,
+    };
     let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
     // P4 (GAP-5): per-transfer count of whole-file-verify FAILURES (the digest
     // didn't match on completion). Each failure re-requests a resume (truncated)
@@ -6720,6 +6784,23 @@ async fn recv_cmd(
                                 l2_enabled, &mut sess, &sio, &my_uid,
                             ).await;
                             req.reply(&json!({ "ok": true, "live": live })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::ReloadExpose) {
+                            // `filament expose`/`unexpose`: reconcile overlay
+                            // listeners from expose.json. live:true only if L3 is up.
+                            let (live, count): (bool, usize) = {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    match exposer.as_ref() {
+                                        Some(ex) => (true, ex.reconcile().await),
+                                        None => (false, 0),
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    (false, 0)
+                                }
+                            };
+                            req.reply(&json!({ "ok": true, "live": live, "count": count })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
                         } else {
