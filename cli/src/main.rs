@@ -5012,6 +5012,11 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         } else {
             println!("note: re-grant L3's capability then restart:\n    sudo setcap cap_net_admin+eip {}", me.display());
         }
+        // A non-root L3 node also needs write on /etc/hosts to publish MagicDNS
+        // names; grant the narrow per-file ACL here too so a plain `filament
+        // update` is all it takes (no separate `set tun-addr` step). No-op for
+        // root or if already granted.
+        crate::tun::ensure_hosts_writable();
     }
     Ok(())
 }
