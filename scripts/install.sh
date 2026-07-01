@@ -41,17 +41,26 @@ trap 'rm -rf "$TMP"' EXIT
 
 # /releases/latest redirects to the newest release; CLI releases are tagged
 # cli-vX.Y.Z, so resolve the newest cli-v* tag via the API (no auth needed).
-# Stable tags are digits-and-dots only — prereleases (cli-v0.2.1-beta.1) are
-# skipped unless the caller opts in with FILAMENT_CHANNEL=beta.
-if [ "${FILAMENT_CHANNEL:-stable}" = "beta" ]; then
-  TAG_PATTERN='"tag_name": *"cli-v[^"]*"'
-else
-  TAG_PATTERN='"tag_name": *"cli-v[0-9.]*"'
-fi
+# Stable tags are digits-and-dots only; prereleases (cli-v0.2.1-beta.1) are
+# skipped unless the caller opts in with FILAMENT_CHANNEL=beta. Fetch once.
+RELEASES=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20") \
+  || die "could not reach the GitHub releases API"
 # Highest version, NOT first listed — the API's order is not newest-tag-first
 # (observed live). sort -V orders 0.2.0 < 0.2.1-beta.1 < 0.2.1 correctly.
-TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20" \
-      | grep -o "$TAG_PATTERN" | cut -d'"' -f4 | sort -V | tail -n 1)
+pick_tag() { printf '%s\n' "$RELEASES" | grep -o "$1" | cut -d'"' -f4 | sort -V | tail -n 1; }
+
+if [ "${FILAMENT_CHANNEL:-stable}" = "beta" ]; then
+  TAG=$(pick_tag '"tag_name": *"cli-v[^"]*"')
+else
+  TAG=$(pick_tag '"tag_name": *"cli-v[0-9.]*"')
+  # No stable release yet (beta period): fall back to the newest prerelease so
+  # the default installer still works, with a clear notice. Once a stable exists
+  # it is preferred automatically.
+  if [ -z "$TAG" ]; then
+    TAG=$(pick_tag '"tag_name": *"cli-v[^"]*"')
+    [ -n "$TAG" ] && say "no stable release yet; installing prerelease $TAG (FILAMENT_CHANNEL=beta to silence)"
+  fi
+fi
 [ -n "$TAG" ] || die "could not find a CLI release"
 BASE="https://github.com/$REPO/releases/download/$TAG"
 
