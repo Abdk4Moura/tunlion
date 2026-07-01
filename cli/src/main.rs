@@ -639,6 +639,19 @@ enum Cmd {
         /// Port to stop exposing.
         port: u16,
     },
+    /// Reach mesh peers by name from any app - no TUN, no sudo. Runs a local SOCKS5
+    /// proxy; point a browser/curl at it and `<peer>.mesh:<port>` rides the mesh.
+    ///
+    /// The userspace path (like Tailscale's userspace mode): works in containers and
+    /// locked-down boxes with zero privilege. Non-.mesh hosts are dialed directly.
+    Proxy {
+        /// Port to listen on (SOCKS5).
+        #[arg(long, default_value_t = 1080)]
+        port: u16,
+        /// Address to bind (default: loopback only).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
     /// SSH into a known device over filament.
     ///
     /// Runs your real `ssh` over the data channel via ProxyCommand (reuses your
@@ -4916,6 +4929,7 @@ async fn main() -> Result<()> {
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
         Cmd::Unexpose { port } => expose::unexpose_cmd(port).await,
+        Cmd::Proxy { port, bind } => l2::proxy_cmd(&server, &bind, port, relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
         Cmd::Doctor { device, watch, repeat, json } => {

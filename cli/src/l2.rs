@@ -2110,6 +2110,168 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     }
 }
 
+/// `filament proxy`: a local SOCKS5 proxy that reaches mesh peers by name with NO
+/// TUN and NO privilege (Tailscale's userspace-networking model). A SOCKS5 CONNECT
+/// to `<peer>.mesh:<port>` opens an L2 stream to that peer's `localhost:<port>` over
+/// filament (warm via a local daemon, else a self-healing cold link); any other
+/// host is dialed directly, so the proxy is a drop-in that only diverts `.mesh`.
+/// Pure userspace: no CAP_NET_ADMIN, no sudo, works in containers.
+pub async fn proxy_cmd(server: &str, bind: &str, port: u16, relay: bool) -> Result<()> {
+    let listener = match TcpListener::bind((bind, port)).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            bail!("filament: {bind}:{port} is already in use; pick another with --port");
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("filament: failed to bind {bind}:{port}")));
+        }
+    };
+    crate::ui::say(&format!("filament: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"));
+    crate::ui::say(&format!(
+        "  point apps here; {}.mesh rides the mesh, everything else connects directly",
+        "<peer>"
+    ));
+    crate::ui::say(&format!("  e.g.  curl --socks5-hostname {bind}:{port} http://<peer>.mesh:8080/"));
+    #[cfg(unix)]
+    if !crate::ctl::daemon_present().await {
+        crate::ui::say(&crate::ui::paint(
+            crate::ui::Tone::Dim,
+            "  note: no local daemon; each .mesh connection brings up its own link. `filament up` makes them instant.",
+        ));
+    }
+    // Per-peer self-healing cold links, started lazily on first use of a peer (only
+    // when the warm daemon path misses), mirroring `forward`'s cold manager.
+    let cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    loop {
+        let sock = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                crate::ui::status(&format!("filament: accept paused ({e}), retrying..."));
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let _ = sock.set_nodelay(true);
+        let (server, cold) = (server.to_string(), cold.clone());
+        tokio::spawn(async move {
+            if let Err(e) = handle_socks(sock, &server, relay, cold).await {
+                crate::ui::debug(&format!("filament: proxy connection ended: {e}"));
+            }
+        });
+    }
+}
+
+/// Write a minimal SOCKS5 reply (`code` 0x00 = success) with a zero BND.ADDR/PORT.
+async fn socks_reply(sock: &mut TcpStream, code: u8) -> std::io::Result<()> {
+    sock.write_all(&[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+}
+
+/// Handle one SOCKS5 client: no-auth handshake, parse the CONNECT target, then
+/// route `<peer>.mesh:<port>` over filament (warm-first, cold fallback) or dial any
+/// other host directly. Errors here only affect this one connection.
+async fn handle_socks(
+    mut sock: TcpStream,
+    server: &str,
+    relay: bool,
+    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+) -> Result<()> {
+    // Greeting: VER, NMETHODS, METHODS...; we only offer no-auth (0x00).
+    let mut greet = [0u8; 2];
+    sock.read_exact(&mut greet).await?;
+    if greet[0] != 0x05 {
+        bail!("not a SOCKS5 client");
+    }
+    let mut methods = vec![0u8; greet[1] as usize];
+    sock.read_exact(&mut methods).await?;
+    sock.write_all(&[0x05, 0x00]).await?;
+
+    // Request: VER, CMD, RSV, ATYP, ADDR, PORT.
+    let mut req = [0u8; 4];
+    sock.read_exact(&mut req).await?;
+    if req[0] != 0x05 {
+        bail!("bad SOCKS5 request");
+    }
+    let host = match req[3] {
+        0x01 => {
+            let mut a = [0u8; 4];
+            sock.read_exact(&mut a).await?;
+            std::net::Ipv4Addr::from(a).to_string()
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            sock.read_exact(&mut a).await?;
+            std::net::Ipv6Addr::from(a).to_string()
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            sock.read_exact(&mut len).await?;
+            let mut d = vec![0u8; len[0] as usize];
+            sock.read_exact(&mut d).await?;
+            String::from_utf8_lossy(&d).into_owned()
+        }
+        _ => {
+            socks_reply(&mut sock, 0x08).await?; // address type not supported
+            return Ok(());
+        }
+    };
+    let mut pb = [0u8; 2];
+    sock.read_exact(&mut pb).await?;
+    let dport = u16::from_be_bytes(pb);
+    if req[1] != 0x01 {
+        socks_reply(&mut sock, 0x07).await?; // only CONNECT
+        return Ok(());
+    }
+
+    match host.strip_suffix(".mesh") {
+        Some(peer) => {
+            let peer = peer.to_string();
+            // Warm path: ride the local daemon's live mesh link (instant, no extra
+            // presence on the peer).
+            #[cfg(unix)]
+            if crate::ctl::daemon_present().await {
+                if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
+                    socks_reply(&mut sock, 0x00).await?;
+                    return bridge_streams(sock, usock).await.map_err(Into::into);
+                }
+            }
+            // Cold fallback (no daemon, or a warm miss): a per-peer self-healing
+            // link, reused across connections.
+            let rx = {
+                let mut map = cold.lock().await;
+                if let Some(rx) = map.get(&peer) {
+                    rx.clone()
+                } else {
+                    let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
+                    let (s, pr) = (server.to_string(), peer.clone());
+                    tokio::spawn(async move { manage_cold_link(s, pr, relay, tx).await });
+                    map.insert(peer.clone(), rx.clone());
+                    rx
+                }
+            };
+            socks_reply(&mut sock, 0x00).await?;
+            serve_cold_connection(rx, sock, dport, peer).await;
+            Ok(())
+        }
+        None => {
+            // Not a mesh name: behave like a plain SOCKS5 proxy (dial directly), so
+            // the user can set filament as their one proxy and only .mesh is diverted.
+            match TcpStream::connect((host.as_str(), dport)).await {
+                Ok(mut up) => {
+                    let _ = up.set_nodelay(true);
+                    socks_reply(&mut sock, 0x00).await?;
+                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
+                    Ok(())
+                }
+                Err(_) => {
+                    socks_reply(&mut sock, 0x05).await?; // connection refused
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 /// Serve one accepted forward connection over the managed cold link, tolerant of
 /// a link blip: wait for a LIVE mux (skipping a stale dead one still parked in the
 /// channel), open a stream, and on a transient open failure re-wait for the
