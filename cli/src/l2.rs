@@ -2039,13 +2039,13 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // network blip is never silent (the old code held one link and never noticed).
     // Published via a watch channel the accept loop reads. Not started on the warm
     // path (that would create the extra presence we are avoiding).
-    let cold_rx = if via_daemon {
+    let mut cold_rx = if via_daemon {
         crate::ui::say(&format!(
             "filament: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon (connections are instant, no extra presence on {peer})"
         ));
         None
     } else {
-        crate::ui::say(&format!("filament: bringing up the link to {peer} ..."));
+        crate::ui::status(&format!("filament: bringing up the link to {peer} ..."));
         let (tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
         {
             let (server, peer_s) = (server.to_string(), peer.to_string());
@@ -2066,7 +2066,8 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     loop {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
-        // Warm path: bridge this connection straight to the daemon's link.
+        // Warm path: bridge this connection straight to the daemon's link. Retried
+        // per connection so it is used whenever the daemon holds a warm link.
         #[cfg(unix)]
         if warm {
             if let Some(usock) = crate::ctl::try_open(peer, rport).await {
@@ -2075,14 +2076,23 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
                 });
                 continue;
             }
-            crate::ui::say(&format!(
-                "filament: local daemon link unavailable, forwarding to {peer} needs `filament up` here or a restart"
-            ));
-            continue;
+            // Warm miss (the daemon has no live link to the peer right now): fall
+            // through to a cold link instead of dropping the connection. The cold
+            // manager is started once, lazily, and self-heals from there.
         }
-        // Cold path: use the current live link, waiting through a reconnect if the
-        // manager is mid-recovery (so a blip delays, never drops, a connection).
-        let Some(mut rx) = cold_rx.clone() else { continue };
+        // Cold path (also the warm-miss fallback): ensure the managed cold link
+        // exists, then serve over the current live link, waiting through a
+        // reconnect if it is mid-recovery (a blip delays, never drops, a call).
+        if cold_rx.is_none() {
+            crate::ui::debug(&format!(
+                "filament: no warm link to {peer}, using a direct link for forwarding"
+            ));
+            let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
+            let (server, peer_s) = (server.to_string(), peer.to_string());
+            tokio::spawn(async move { manage_cold_link(server, peer_s, relay, tx).await });
+            cold_rx = Some(rx);
+        }
+        let mut rx = cold_rx.clone().unwrap();
         let mux = loop {
             if let Some(m) = rx.borrow_and_update().clone() {
                 break m;
@@ -2119,8 +2129,11 @@ async fn manage_cold_link(
     tx: tokio::sync::watch::Sender<Option<Arc<Mux>>>,
 ) {
     let mut backoff_ms = 500u64;
+    let mut had_link = false; // distinguishes first bring-up from a recovery
     loop {
-        // (Re)establish.
+        // (Re)establish. Transient states (retrying / reconnecting) update ONE
+        // status line in place via ui::status; only real transitions (recovered)
+        // print a permanent line via ui::say, which clears the live status line.
         let mux = match bring_up_to_known(&server, &peer, relay, "init").await {
             Ok((t, rx, guard, mut diag)) => {
                 guard.forget();
@@ -2130,13 +2143,17 @@ async fn manage_cold_link(
                 m
             }
             Err(e) => {
-                crate::ui::say(&format!("filament: reaching {peer} failed ({e}), retrying..."));
+                crate::ui::status(&format!("filament: reaching {peer} failed ({e}), retrying..."));
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(8000);
                 continue;
             }
         };
         backoff_ms = 500;
+        if had_link {
+            crate::ui::say(&format!("filament: link to {peer} recovered"));
+        }
+        had_link = true;
         if tx.send(Some(mux.clone())).is_err() {
             return; // forward command gone
         }
@@ -2147,7 +2164,7 @@ async fn manage_cold_link(
                 return;
             }
             if !mux.transport().is_alive() {
-                crate::ui::say(&format!("filament: link to {peer} lost, reconnecting..."));
+                crate::ui::status(&format!("filament: link to {peer} lost, reconnecting..."));
                 let _ = tx.send(None);
                 break;
             }
