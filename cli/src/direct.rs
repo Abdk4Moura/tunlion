@@ -456,6 +456,11 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(21)) {
         tc.max_idle_timeout(Some(idle));
     }
+    // L3 data plane: enable QUIC unreliable DATAGRAMs (the serve_tun path rides
+    // these, not the reliable streams L2 uses, to avoid TCP-over-TCP meltdown).
+    // A 1 MiB receive ring absorbs bursts; advertising it lets the peer send to us.
+    tc.datagram_receive_buffer_size(Some(1024 * 1024));
+    tc.datagram_send_buffer_size(1024 * 1024);
     Arc::new(tc)
 }
 
@@ -561,6 +566,87 @@ async fn authenticate(
         bail!("DIRECT-AUTH-FAIL: pair-secret MAC mismatch, rejecting peer");
     }
     Ok((send, recv))
+}
+
+// ===================================================== direct-endpoint L3 (serve_tun)
+
+/// serve_tun LISTEN: bind a QUIC server on `bind` and return the FIRST peer that
+/// completes the PSK channel-binding auth. No signaling/pairing: the two ends
+/// share `secret` out of band (the WireGuard model). The endpoint is kept alive
+/// for the connection's lifetime.
+///
+/// DoS-hardened: each inbound connection is authenticated in its own task under a
+/// timeout, so a peer that completes the QUIC handshake but then stalls (or sends
+/// a bad tag) neither blocks `accept()` nor tears the listener down. Only a
+/// genuinely authenticated peer is returned; everyone else is dropped silently.
+pub async fn serve_tun_listen(bind: SocketAddr, secret: &[u8; 32]) -> Result<quinn::Connection> {
+    let ep = Endpoint::server(server_config()?, bind).context("bind serve-tun listener")?;
+    let secret = *secret;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<quinn::Connection>(1);
+    loop {
+        tokio::select! {
+            // A candidate finished auth: keep it, let the rest of the in-flight
+            // handshakes fall away (their tasks end and drop their connections).
+            Some(conn) = rx.recv() => {
+                keep_endpoint_alive(ep, &conn);
+                return Ok(conn);
+            }
+            incoming = ep.accept() => {
+                let Some(incoming) = incoming else {
+                    return Err(anyhow!("listener closed before a peer authenticated"));
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let ok = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        let conn = incoming.await?;
+                        authenticate(&conn, &secret, false).await?;
+                        Ok::<_, anyhow::Error>(conn)
+                    })
+                    .await;
+                    if let Ok(Ok(conn)) = ok {
+                        let _ = tx.send(conn).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// serve_tun CONNECT: dial `peer`, run the PSK auth, return the connection.
+/// Retries briefly so the connector can start before, or alongside, the listener
+/// (the lab and most setups don't guarantee ordering).
+pub async fn serve_tun_connect(peer: SocketAddr, secret: &[u8; 32]) -> Result<quinn::Connection> {
+    let mut ep = Endpoint::client("0.0.0.0:0".parse().unwrap()).context("bind serve-tun client")?;
+    ep.set_default_client_config(client_config()?);
+    let mut last = anyhow!("serve-tun connect: no attempt made");
+    for _ in 0..8 {
+        let attempt = async {
+            let conn = ep.connect(peer, "filament-direct")?.await?;
+            authenticate(&conn, secret, true).await?;
+            Ok::<_, anyhow::Error>(conn)
+        };
+        match attempt.await {
+            Ok(conn) => {
+                keep_endpoint_alive(ep, &conn);
+                return Ok(conn);
+            }
+            Err(e) => {
+                last = e;
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+        }
+    }
+    Err(last.context("serve-tun connect failed after retries"))
+}
+
+/// Dropping a quinn `Endpoint` closes every connection it owns, so hold it until
+/// THIS connection closes (a detached waiter), then let it drop.
+fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
+    let c = conn.clone();
+    tokio::spawn(async move {
+        c.closed().await;
+        drop(ep);
+    });
 }
 
 // ============================================================= DirectTransport
@@ -794,6 +880,42 @@ impl Transport for DirectTransport {
         MAX_DIRECT_PAYLOAD
     }
 
+    // --- L3 data plane (serve_tun): IP packets over QUIC unreliable datagrams ---
+    // Datagrams, NOT the reliable streams send_frame uses: tunneling a reliable
+    // transport over another reliable one collapses under loss (double retransmit).
+    // Datagrams are lossy + unordered, like the UDP WireGuard rides, so the inner
+    // flow's own congestion control stays in charge.
+    fn supports_datagrams(&self) -> bool {
+        true
+    }
+
+    fn send_datagram(&self, packet: &[u8]) -> Result<()> {
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow!("direct connection closed"));
+        }
+        self.conn
+            .send_datagram(bytes::Bytes::copy_from_slice(packet))
+            .map_err(|e| anyhow!("send_datagram: {e}"))
+    }
+
+    async fn recv_datagram(&self) -> Result<bytes::Bytes> {
+        self.conn
+            .read_datagram()
+            .await
+            .map_err(|e| anyhow!("read_datagram: {e}"))
+    }
+
+    fn max_datagram_size(&self) -> Option<usize> {
+        self.conn.max_datagram_size()
+    }
+
+    fn channel_binding(&self) -> Option<Vec<u8>> {
+        // The same RFC-5705 exporter the pair-secret auth binds to; a relay that
+        // terminates TLS on each leg derives a DIFFERENT value, so an announce
+        // signed against it cannot be forwarded/replayed across the relay.
+        keying_material(&self.conn).ok().map(|km| km.to_vec())
+    }
+
     fn sid_answerer(&self) -> bool {
         self.answerer
     }
@@ -823,7 +945,7 @@ impl Transport for DirectTransport {
 
     fn rtt_ms(&self) -> Option<u64> {
         // quinn's smoothed RTT estimate, measured continuously from ACKs (kept
-        // fresh by the 7s keepalive) — no peer cooperation or round-trip needed.
+        // fresh by the 7s keepalive) - no peer cooperation or round-trip needed.
         Some(self.conn.rtt().as_millis() as u64)
     }
 

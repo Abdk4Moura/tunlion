@@ -1,67 +1,37 @@
-"""provider: filament — filament's data channel as the L3 carrier.
+"""provider: filament — native L3 (serve_tun) carrier.
 
-THE INTEGRATION TARGET. The point of the whole lab is to develop native L3
-(``filament serve_tun``: a TUN whose IP packets ride the data channel directly).
-That does NOT exist yet. So this provider is the FIRST APPROXIMATION: it tunnels
-the TUN's IP packets over an existing filament **L2 forward/netcat stream**
-between two isolated filament identities. It proves filament can carry L3 today
-and is the scaffold the native path will replace.
+THE INTEGRATION TARGET, now REALIZED. Each node runs ``filament serve-tun``: a
+TUN whose IP packets ride QUIC **datagrams** directly over a point-to-point link
+to the peer's underlay endpoint. No signaling, no pairing, no userspace relay —
+the two ends share a PSK out of band (the WireGuard model) and connect over the
+lab's private underlay veth. This is the collapse the L2-forward approximation
+was a placeholder for:
 
-  TODO(serve_tun): replace the TCP-stream hop (forward + two relays) with a
-  native ``filament serve_tun`` that reads/writes IP packets on the data channel
-  directly — no localhost TCP, no userspace relay framing. When that lands, this
-  provider collapses to: create TUN in each netns, run serve_tun on each side.
+    node-a ns:  filament serve-tun --listen  <a.underlay>:PORT --tun-addr a/NN ...
+    node-b ns:  filament serve-tun --connect <a.underlay>:PORT --tun-addr b/NN ...
 
-Datapath today (a -> b)::
+Each ``serve-tun`` creates its own TUN (``labtun-<node>``) inside its netns and
+adds the connected overlay route itself, so the provider has nothing else to
+wire. Data path (a <-> b):
 
-    TUN-a (node-a ns)
-      -> fil_relay (connect)  --TCP 127.0.0.1:LPORT (host ns)-->
-      -> `filament forward LPORT labB RPORT` (config A, host ns)
-      ==[ filament DATA CHANNEL / L2 stream ]==>
-      -> `filament up` acceptor (config B, host ns, FILAMENT_L2=1)
-      -> dials 127.0.0.1:RPORT (host ns)
-      -> fil_relay (listen)
-      -> TUN-b (node-b ns)
+    TUN-a (node-a ns)  <->  QUIC datagrams over the underlay veth  <->  TUN-b
 
-SAFETY: two FULLY ISOLATED filament identities under per-lab FILAMENT_CONFIG_DIRs
-— never ~/.config/filament, never the running `up` daemon, never the installed
-binary. The locally-built ``cli/target/release/filament`` is used. The filament
-processes run in the HOST netns (they need internet for signaling); the TUN fds
-are opened via setns from the relays. No host-network mutation.
+SAFETY: the locally-built ``cli/target/release/filament`` only; the processes run
+INSIDE the lab netns (serve-tun needs no internet — it dials the peer's underlay
+IP directly), so this never touches host networking, ``~/.config/filament``, or
+the running ``up`` daemon. serve-tun reads no config at all (PSK on the CLI).
 """
 
 from __future__ import annotations
 
-import json
-import os
 import secrets
-import sys
 
 from labkit import netns
 from labkit.context import LinkContext, FILAMENT_BIN
+from providers import underlay
 
-
-# Deterministic localhost ports for the L2 forward hop (host-ns localhost).
-LPORT = 19098   # filament `forward` listener (node-a side)
-RPORT = 19099   # the relay target the acceptor dials (node-b side)
-
-
-def _seed_identity(config_dir: str, peer_name: str, secret: str,
-                   uid_tag: str) -> None:
-    os.makedirs(config_dir, exist_ok=True)
-    # devices.json: this identity knows the peer under `peer_name`, shared secret,
-    # with the caps the L2 acceptor needs (transfer baseline + shell, which also
-    # covers the trusted-device gate the L2 forward acceptor checks).
-    devices = [{
-        "name": peer_name, "secret": secret, "v": 2,
-        "caps": ["transfer", "shell"],
-    }]
-    with open(os.path.join(config_dir, "devices.json"), "w") as f:
-        json.dump(devices, f)
-    # Pin a distinct device.id so the two identities never see each other as
-    # "self" (is_self_uid keys on device.id).
-    with open(os.path.join(config_dir, "device.id"), "w") as f:
-        f.write(uid_tag)
+# serve-tun rendezvous port on the listener's (node-a's) underlay IP.
+PORT = 51820
 
 
 def up(ctx: LinkContext) -> None:
@@ -69,114 +39,62 @@ def up(ctx: LinkContext) -> None:
         raise RuntimeError(
             f"locally-built filament not found at {FILAMENT_BIN}; "
             f"build it: (cd cli && cargo build --release).")
-
-    # --- per-lab isolated config dirs ---
-    cfg_a = os.path.join(ctx.log_dir, "fil-A")
-    cfg_b = os.path.join(ctx.log_dir, "fil-B")
-    secret = ctx.ledger.meta("fil_secret") or secrets.token_hex(32)
-    ctx.ledger.set_meta("fil_secret", secret)
-
-    # A knows B as "labB-<lab>"; B knows A as "labA-<lab>" (names unique per lab
-    # so concurrent labs never cross-talk on the shared signaling channel).
-    name_b = f"labB-{ctx.topo.name}"
-    name_a = f"labA-{ctx.topo.name}"
-    _seed_identity(cfg_a, name_b, secret, f"labA{ctx.topo.name}")
-    _seed_identity(cfg_b, name_a, secret, f"labB{ctx.topo.name}")
-    ctx.ledger.add("file", cfg_a)
-    ctx.ledger.add("file", cfg_b)
-    ctx.ledger.set_meta("fil_names", {"a": name_a, "b": name_b})
-
-    server = os.environ.get("FILAMENT_SERVER",
-                            "https://api.filament.autumated.com")
     fb = str(FILAMENT_BIN)
 
-    # The TUN is the data path for filament: address the overlay on it. The relay
-    # bridges TUN <-> filament L2 stream.
-    for ep in ctx.endpoints:
-        netns.addr_add(ep.ns, ctx.tun_iface(ep),
-                       f"{ep.overlay_ip}/{ctx.overlay_prefixlen}")
+    # The veth underlay between the two netns is serve-tun's transport (unlike the
+    # old host-ns relay model, native serve-tun connects directly over it).
+    underlay.establish(ctx)
 
-    # --- node-b relay: listen on RPORT, bridge to TUN-b ---
-    relay_b = netns.spawn(
-        [sys.executable, os.path.join(os.path.dirname(__file__), "fil_relay.py"),
-         "--ns", ctx.b.ns, "--tun", ctx.tun_iface(ctx.b),
-         "--role", "listen", "--port", str(RPORT)],
-        ns=None, logfile=ctx.log("relay-b"))
-    ctx.ledger.add("pid", str(relay_b), role="relay-b")
+    # PSK shared by both ends (stored so a re-`up` of the same lab is idempotent).
+    psk = ctx.ledger.meta("fil_psk") or secrets.token_hex(16)
+    ctx.ledger.set_meta("fil_psk", psk)
 
-    # --- node-b filament acceptor (up, FILAMENT_L2=1, isolated config) ---
-    up_pid = netns.spawn(
-        [fb, "--server", server, "up", "--name-as", f"{name_b}-acceptor"],
-        ns=None, logfile=ctx.log("fil-up-b"),
-        env={"FILAMENT_CONFIG_DIR": cfg_b, "FILAMENT_L2": "1",
-             "FILAMENT_UID": f"labBuid{ctx.topo.name}"})
-    ctx.ledger.add("pid", str(up_pid), role="fil-up-b")
+    a, b = ctx.a, ctx.b
+    connect_to = f"{a.underlay_ip}:{PORT}"
+    mtu = str(ctx.mtu)
+    a_cidr = f"{a.overlay_ip}/{ctx.overlay_prefixlen}"
+    b_cidr = f"{b.overlay_ip}/{ctx.overlay_prefixlen}"
 
-    # Let the acceptor reach the signaling server and subscribe BEFORE the
-    # initiator starts dialing. Without this head-start the forward can dial
-    # before the acceptor is present/subscribed, producing connect churn (the
-    # initiator rotates candidates) that delays — or, on a same-host loopback
-    # direct-quic race, destabilizes — the first link.
-    _await_acceptor_ready(ctx.log("fil-up-b"), timeout=15.0)
+    # The engine pre-creates a BARE TUN per node; serve-tun creates and addresses
+    # its own (with IFF_NO_PI), so drop the engine's placeholder first to avoid a
+    # name clash / flag mismatch. serve-tun's TUN is non-persistent: it vanishes
+    # when the process is signalled on teardown.
+    for ep in (a, b):
+        netns.nsx(ep.ns, "ip", "link", "del", ctx.tun_iface(ep), check=False)
 
-    # --- node-a filament forward: LPORT -> labB:127.0.0.1:RPORT ---
-    fwd_pid = netns.spawn(
-        [fb, "--server", server, "forward", str(LPORT), name_b, str(RPORT)],
-        ns=None, logfile=ctx.log("fil-fwd-a"),
-        env={"FILAMENT_CONFIG_DIR": cfg_a,
-             "FILAMENT_UID": f"labAuid{ctx.topo.name}"})
-    ctx.ledger.add("pid", str(fwd_pid), role="fil-fwd-a")
+    # Listener in node-a's netns: bind 0.0.0.0:PORT (reachable at the underlay IP),
+    # create TUN labtun-a, and add the connected overlay route (all inside the
+    # netns, since the process is spawned via `ip netns exec`).
+    a_pid = netns.spawn(
+        [fb, "serve-tun", "--listen", f"0.0.0.0:{PORT}", "--tun-addr", a_cidr,
+         "--psk", psk, "--dev", ctx.tun_iface(a), "--mtu", mtu],
+        ns=a.ns, logfile=ctx.log("serve-tun-a"))
+    ctx.ledger.add("pid", str(a_pid), role="serve-tun-a")
 
-    # --- node-a relay: connect to LPORT, bridge to TUN-a ---
-    relay_a = netns.spawn(
-        [sys.executable, os.path.join(os.path.dirname(__file__), "fil_relay.py"),
-         "--ns", ctx.a.ns, "--tun", ctx.tun_iface(ctx.a),
-         "--role", "connect", "--port", str(LPORT)],
-        ns=None, logfile=ctx.log("relay-a"))
-    ctx.ledger.add("pid", str(relay_a), role="relay-a")
+    # Connector in node-b's netns dials the listener over the underlay veth.
+    # serve_tun_connect retries internally, so a small start-order gap is fine.
+    b_pid = netns.spawn(
+        [fb, "serve-tun", "--connect", connect_to, "--tun-addr", b_cidr,
+         "--psk", psk, "--dev", ctx.tun_iface(b), "--mtu", mtu],
+        ns=b.ns, logfile=ctx.log("serve-tun-b"))
+    ctx.ledger.add("pid", str(b_pid), role="serve-tun-b")
 
-    # Route: each node reaches the peer's overlay IP via its own TUN (the relay
-    # carries it). Add an explicit /32 route to the peer over the TUN.
-    for ep in ctx.endpoints:
-        peer = ctx.other(ep)
-        netns.route_add(ep.ns, f"{peer.overlay_ip}/32",
-                        dev=ctx.tun_iface(ep))
-
-    ctx.ledger.set_meta("fil_ports", {"lport": LPORT, "rport": RPORT})
     ctx.ledger.set_meta(
         "fil_note",
-        "L2-forward APPROXIMATION (TODO: native serve_tun). The filament data "
-        "channel + relay chain can take several seconds to wire; `up` waits for "
-        "the path, and `lab probe ping` also retries.")
+        "native serve_tun: TUN <-> QUIC datagrams, point-to-point over the "
+        "underlay, PSK channel-binding auth (no signaling).")
 
-    # Wait for the data path to actually carry a packet before returning, so the
-    # caller (and the very next `lab probe`) sees a ready tunnel. The filament
-    # data channel + 4-hop relay chain typically wires in 2-6s; we allow 30s.
-    _wait_data_path(ctx, timeout=30.0)
-
-
-def _await_acceptor_ready(logpath: str, timeout: float) -> None:
-    """Wait until the acceptor's `up` log shows it is live (ready banner), so the
-    initiator only starts dialing once the peer is present + subscribed."""
-    import time
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with open(logpath) as f:
-                txt = f.read()
-            if "filament up" in txt or "known device" in txt:
-                time.sleep(1.0)  # small settle for the subscribe round-trip
-                return
-        except OSError:
-            pass
-        time.sleep(0.5)
+    # Wait for a packet to actually cross before returning, so the next
+    # `lab probe` sees a ready tunnel (the QUIC handshake wires in well under 1s).
+    _wait_data_path(ctx, timeout=20.0)
 
 
 def _wait_data_path(ctx: LinkContext, timeout: float) -> None:
-    """Poll a ping across the overlay until it succeeds (or timeout). Best-effort
-    — a failure here is not fatal (the probe will report it), but waiting makes
-    bring-up deterministic for scripted/AI use."""
+    """Poll a ping across the overlay until it succeeds (or timeout). Best-effort:
+    a failure here is not fatal (the probe reports it), but waiting makes bring-up
+    deterministic for scripted/AI use."""
     import time
+
     deadline = time.time() + timeout
     target = ctx.b.overlay_ip
     while time.time() < deadline:
@@ -184,11 +102,11 @@ def _wait_data_path(ctx: LinkContext, timeout: float) -> None:
         if ok:
             ctx.ledger.set_meta("fil_ready", True)
             return
-        time.sleep(1.0)
+        time.sleep(0.5)
     ctx.ledger.set_meta("fil_ready", False)
 
 
 def down(ctx: LinkContext) -> None:
-    # All filament processes + relays are tracked as `pid` resources and the
-    # config dirs as `file` resources; the ledger sweep handles them.
+    # serve-tun processes are tracked as `pid` resources; the ledger sweep signals
+    # them and each TUN is removed by the kernel when its fd closes. Nothing else.
     pass

@@ -23,6 +23,7 @@ mod doctor;
 mod holepunch;
 mod l2;
 mod net;
+mod overlay;
 mod pake_ceremony;
 mod ping;
 mod sdnotify;
@@ -30,6 +31,12 @@ mod protocol;
 mod resilience;
 mod session;
 mod settings;
+/// L3 TUN data plane (serve_tun); Linux-only, so Windows keeps compiling.
+#[cfg(unix)]
+mod tun;
+/// L3 overlay manager (routes IP packets across peer links); Linux-only.
+#[cfg(unix)]
+mod l3;
 mod shutdown;
 mod sshkeys;
 mod ui;
@@ -259,7 +266,7 @@ const MAX_VERIFY_FAILS: u32 = 3;
 ///
 /// The pure file-transfer decisions `recv_transfer_done` and `decide_ack_fallback`
 /// (+ the `AckFallback` enum) now live in `protocol.rs` (the Rust mirror of the JS
-/// net/protocol layer); the send/recv loops call `protocol::…`.
+/// net/protocol layer); the send/recv loops call `protocol::...`.
 
 /// Bug 5: after repeated stuck-while-connecting on establishment, the user has
 /// no clue WHY. The dominant single-host cause is a browser publishing mDNS
@@ -486,6 +493,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print this device's L3 overlay address (derived from its Ed25519 overlay
+    /// key; stable across restarts). Creates the key on first use.
+    Addr,
     /// Read one setting's effective value (bare value on stdout, for scripts)
     Get {
         /// Setting name
@@ -511,6 +521,31 @@ enum Cmd {
         /// or repeatable). Omit to clear the global value.
         #[arg(long, value_name = "DEVICE", value_delimiter = ',')]
         peer: Vec<String>,
+    },
+    /// L3 point-to-point overlay between two KNOWN endpoints, no signaling or
+    /// pairing (the WireGuard model): a TUN whose IP packets ride QUIC datagrams.
+    /// One side `--listen <bind>`, the other `--connect <host:port>`; both share
+    /// `--psk`. Linux-only. (The `up` daemon's `tun-addr` is the signaling-based
+    /// mesh; this is the static two-endpoint case the lab and simple VPNs use.)
+    ServeTun {
+        /// This side's overlay address as IP/PREFIX, e.g. 10.9.0.1/24
+        #[arg(long, value_name = "CIDR")]
+        tun_addr: String,
+        /// Bind a listener here (e.g. 0.0.0.0:51820); the peer --connects to it
+        #[arg(long, value_name = "BIND", conflicts_with = "connect")]
+        listen: Option<String>,
+        /// Dial the peer's listener (e.g. 10.79.0.1:51820)
+        #[arg(long, value_name = "HOST:PORT")]
+        connect: Option<String>,
+        /// Shared secret both ends must match (channel-binding auth)
+        #[arg(long)]
+        psk: String,
+        /// TUN interface name
+        #[arg(long, default_value = "filament0")]
+        dev: String,
+        /// TUN MTU (under the link datagram size; ~1280 is safe)
+        #[arg(long, default_value_t = 1280)]
+        mtu: u32,
     },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `filament set`; this is kept for scripts that wrote it directly.
@@ -568,7 +603,7 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Ping a known device: show the live route, RTT, and whether `ssh`/`pty`
-    /// will be instant. Like `tailscale ping`, plus what it can't show — warm vs
+    /// will be instant. Like `tailscale ping`, plus what it can't show - warm vs
     /// cold (is a link already held?) and verified identity (paired + proven).
     /// A warm direct link reports quinn's RTT and the real remote IP:port; with no
     /// live link it reports the cold establish cost instead.
@@ -903,7 +938,7 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// no `FILAMENT_L2`): two such daemons that are known devices to each other each
 /// fire a KnownPeer for the other and each tries to be the WebRTC initiator. The
 /// two offers collide (GLARE); the polite side drops and rebuilds as a responder,
-/// the supersede churn loops ("appeared, connecting" repeatedly, "reconnecting…")
+/// the supersede churn loops ("appeared, connecting" repeatedly, "reconnecting...")
 /// and never settles to one stable link. Answering the direct-QUIC dial instead is
 /// sequential (one `direct_pending` per peer, one race, one link) and authenticated
 /// by the pair-secret MAC, so it neither glares nor depends on cross-NAT ICE.
@@ -938,16 +973,16 @@ pub(crate) fn devices_load() -> Vec<(String, String)> {
 
 /// Strip terminal escape sequences and control characters from a device petname
 /// before it is stored. A name typed or pasted in a terminal can capture the
-/// terminal's own device-attributes reply (`ESC[?1;2c…`); that junk then never
+/// terminal's own device-attributes reply (`ESC[?1;2c...`); that junk then never
 /// matches `--to <name>`, silently breaking targeting (observed live: a `send
-/// --to pixel` whose stored name was `…escapes…pixel` fell back to the local
+/// --to pixel` whose stored name was `...escapes...pixel` fell back to the local
 /// room and the Pixel never received). Keep only printable, non-control chars.
 fn sanitize_device_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut chars = name.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            // ESC: drop a CSI escape (`ESC [ … final-letter`) wholesale.
+            // ESC: drop a CSI escape (`ESC [ ... final-letter`) wholesale.
             if chars.peek() == Some(&'[') {
                 chars.next();
                 while let Some(&n) = chars.peek() {
@@ -1576,7 +1611,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     sess.channels = vec![channel_of(&a_sec), channel_of(&b_sec)];
     sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
     sess.emit(&sio, "subscribe", json!({ "channels": [channel_of(&a_sec), channel_of(&b_sec)] })).await;
-    ui::say(&format!("  waiting for {} and {} to be online…", ui::paint(ui::Tone::Bold, &a_name), ui::paint(ui::Tone::Bold, &b_name)));
+    ui::say(&format!("  waiting for {} and {} to be online...", ui::paint(ui::Tone::Bold, &a_name), ui::paint(ui::Tone::Bold, &b_name)));
 
     let mut conn = Conn {
         server: server.to_string(),
@@ -1850,7 +1885,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             }
             my_words = pw;
             my_nameplate = np.clone();
-            ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, c)));
+            ui::say(&format!("  claiming {}...", ui::paint(ui::Tone::Brand, c)));
             sio.emit("pair-claim", json!({ "nameplate": np, "v": 2 })).await.ok();
         }
         None => {
@@ -2028,7 +2063,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 bail!("this server returned a legacy code. Update the server (or the peer) to pair securely.");
             }
             Ev::PairUsed(_) => {
-                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting…"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting..."));
                 ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
             }
             Ev::PairMatched(v) => {
@@ -2171,7 +2206,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
                 conn.on_peer_left(&v);
                 let n = gone.unwrap_or_else(|| "the other device".into());
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} disconnected, waiting briefly in case it reconnects…")));
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} disconnected, waiting briefly in case it reconnects...")));
             }
             Ev::Interrupted => bail!("interrupted"),
             _ => {}
@@ -2242,8 +2277,8 @@ fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
     match p {
         Presence::Ready => (ui::glyph_ok(), ui::Tone::Ok, ""),
         Presence::Away => ("●", ui::Tone::Warn, "away"),
-        Presence::Reconnecting => ("◌", ui::Tone::Warn, "reconnecting…"),
-        Presence::Connecting => ("◌", ui::Tone::Dim, "connecting…"),
+        Presence::Reconnecting => ("◌", ui::Tone::Warn, "reconnecting..."),
+        Presence::Connecting => ("◌", ui::Tone::Dim, "connecting..."),
     }
 }
 
@@ -2354,7 +2389,7 @@ struct Conn {
     /// stuck/lost link instead of re-establishing it: there is nothing left to
     /// fetch, so reconnect attempts are pointless and a sender that departs
     /// AFTER delivering every byte would otherwise FLAP the link forever
-    /// (establish → connect → die → Stuck → establish …), each cycle resetting
+    /// (establish → connect → die → Stuck → establish ...), each cycle resetting
     /// `attempts` (so MAX_ATTEMPTS never caps it) and re-arming `expected_secret`
     /// (so `digest_says_alone` never holds), `conn.links` never empties and the
     /// quiet-exit never fires → RC=124 hang. Dropping the link empties
@@ -3013,7 +3048,7 @@ impl Conn {
             // rung-1: direct-dial QUIC over host candidates. answerer=true: this
             // is on_transport_offer (the side whose daemon received the offer), so
             // it allocates from the high L2 sid half (the connector side uses the
-            // low half) — keeps the two ends' sids disjoint.
+            // low half) - keeps the two ends' sids disjoint.
             if let Some(t) =
                 direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone(), true).await
             {
@@ -3264,7 +3299,7 @@ impl Conn {
         // it pairs each phase with its own clock, so an ESTABLISHING link (no first
         // byte yet) is judged by the generous grace and a FLOWING one by the tight
         // stall threshold. This makes "judge a still-establishing link by the 6 s
-        // flowing threshold" — the high-RTT relay repair loop — unrepresentable.
+        // flowing threshold" - the high-RTT relay repair loop - unrepresentable.
         // See docs/transfer-state-machine.md.
         let transport = self.links.get(pid).and_then(|l| l.transport.as_ref());
         let obs = resilience::LiveObs {
@@ -3290,7 +3325,7 @@ impl Conn {
                 None
             }
             // No progress past the phase threshold. Open a new episode, or (if one
-            // is already open) re-fire the ladder UNLESS a repair is converging —
+            // is already open) re-fire the ladder UNLESS a repair is converging -
             // re-emitting every tick would thrash while the replacement transport
             // is still establishing.
             resilience::Liveness::Stalled => {
@@ -3728,7 +3763,7 @@ impl Conn {
             // DEBUG, resilience internal (upgrade probe attempt).
             ui::debug(&ui::paint(
                 ui::Tone::Dim,
-                "  probing for a direct path (alongside the relay)…",
+                "  probing for a direct path (alongside the relay)...",
             ));
             // Pre-set the NEXT backoff deadline so a probe that silently makes no
             // progress still re-schedules (expired_direct also calls
@@ -3906,7 +3941,7 @@ impl Conn {
         // DEBUG, resilience internal (upgrade verify window opening).
         ui::debug(&ui::paint(
             ui::Tone::Dim,
-            "  direct path connected, verifying it holds before upgrading…",
+            "  direct path connected, verifying it holds before upgrading...",
         ));
     }
 
@@ -3938,7 +3973,7 @@ impl Conn {
                     }
                 } else {
                     l.presence = Presence::Reconnecting;
-                    announce = Some(("◌", ui::Tone::Warn, "reconnecting…"));
+                    announce = Some(("◌", ui::Tone::Warn, "reconnecting..."));
                     Duration::from_secs(6)
                 };
                 if let Some(p) = &l.peer {
@@ -4088,7 +4123,7 @@ impl Conn {
     }
 
     /// C26: one static colored status line showing EVERY peer, the changed
-    /// one carrying the note, `✓ daring-wombat   ● deft-gibbon  away…`.
+    /// one carrying the note, `✓ daring-wombat   ● deft-gibbon  away...`.
     /// `fallback_name` covers a peer already dropped from the map (peer-left).
     fn roster(&self, pid: &str, mark: &str, tone: ui::Tone, note: &str, fallback_name: &str) -> String {
         let mut links: Vec<(&String, &Link)> = self.links.iter().collect();
@@ -4216,7 +4251,7 @@ type WarmPtys = std::sync::Arc<std::sync::Mutex<HashMap<String, (String, u32)>>>
 
 /// Dispatch one warm-reuse control request to the right handler. Warm reuse is
 /// unix-only (the control socket is a unix-domain socket); on non-unix `ctl::Req`
-/// is uninhabited so this is never reached — it only keeps the event loop portable.
+/// is uninhabited so this is never reached - it only keeps the event loop portable.
 #[cfg(not(unix))]
 async fn handle_warm_req(
     _conn: &Conn,
@@ -4250,7 +4285,7 @@ async fn handle_warm_req(
     }
 }
 
-/// Is something listening on this host's own loopback `port` — i.e. an sshd a
+/// Is something listening on this host's own loopback `port` - i.e. an sshd a
 /// `filament ssh` initiator could actually reach? A fast connect probe: a
 /// successful connect means a listener (we close it at once); refused/timeout
 /// means nothing is there. Reported in the shell-bootstrap ack so the initiator
@@ -4267,7 +4302,7 @@ async fn sshd_listening(port: u16) -> bool {
 }
 
 /// Answer a `filament ping`: report the daemon's warm link to `peer` (route,
-/// remote address, RTT, verified name). Synchronous — every fact is local (quinn
+/// remote address, RTT, verified name). Synchronous - every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
 /// miss `reject`s so the client falls back to a cold establish-probe.
@@ -4378,9 +4413,9 @@ async fn handle_warm_open(
     let tx = tx.clone();
     // SELF-HEALING warm-reuse: VERIFY the held link still delivers BEFORE committing
     // the client. Open the stream and wait for the first inbound frame (sshd's
-    // banner — the byte we needed anyway, so a healthy link pays ~1 RTT and nothing
+    // banner - the byte we needed anyway, so a healthy link pays ~1 RTT and nothing
     // extra), then accept. A zombie link (alive at the QUIC layer but black-holing
-    // new streams — the popos hang) yields nothing within the window, so we DROP it
+    // new streams - the popos hang) yields nothing within the window, so we DROP it
     // (the loop re-forms a healthy one, keeping warm-reuse fast) and REJECT, which
     // makes the client's `try_open` return None and fall straight through to a fresh
     // establish. Verifying before accepting is what makes the fallback INSTANT: an
@@ -4640,7 +4675,38 @@ async fn main() -> Result<()> {
         Cmd::Get { key, peer, show_origin, default, json } => {
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
         }
+        Cmd::Addr => {
+            let id = overlay::Identity::load_or_create()?;
+            println!("{}", id.addr());
+            Ok(())
+        }
         Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
+        Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu } => {
+            #[cfg(unix)]
+            {
+                let mut h = Sha256::new();
+                h.update(psk.as_bytes());
+                let secret: [u8; 32] = h.finalize().into();
+                let conn = match (listen, connect) {
+                    (Some(b), None) => {
+                        ui::say(&format!("  serve-tun: listening on {b} (dev {dev}, {tun_addr})"));
+                        direct::serve_tun_listen(b.parse().context("bad --listen address")?, &secret).await?
+                    }
+                    (None, Some(p)) => {
+                        ui::say(&format!("  serve-tun: connecting to {p} (dev {dev}, {tun_addr})"));
+                        direct::serve_tun_connect(p.parse().context("bad --connect address")?, &secret).await?
+                    }
+                    _ => bail!("serve-tun needs exactly one of --listen <bind> or --connect <host:port>"),
+                };
+                ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (tun_addr, listen, connect, psk, dev, mtu);
+                bail!("serve-tun (L3) is Linux-only")
+            }
+        }
         Cmd::Config { key, value } => {
             match (key, value) {
                 (Some(k), Some(v)) => {
@@ -5080,7 +5146,7 @@ async fn send_cmd(
         let waiting = waiting.clone();
         tokio::spawn(async move {
             while waiting.load(std::sync::atomic::Ordering::Relaxed) {
-                ui::status(&format!("  {} waiting…", ui::spinner_frame()));
+                ui::status(&format!("  {} waiting...", ui::spinner_frame()));
                 tokio::time::sleep(Duration::from_millis(120)).await;
             }
         });
@@ -5532,7 +5598,7 @@ async fn send_cmd(
                     if use_code && !is_direct && !pake_done {
                         pake_peer.get_or_insert(pid.clone());
                         pake_deadline.get_or_insert_with(|| Instant::now() + pake_budget);
-                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticating…"));
+                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         continue; // offers/remember wait for PAKE confirm
                     }
                     // C12: prove identity to a known device (their daemon
@@ -6392,6 +6458,55 @@ async fn recv_cmd(
             }
         });
     }
+    // L3 (serve_tun mesh): the up daemon opens a TUN and routes IP packets across
+    // its peer links when `tun-addr` is set. `auto` (recommended) derives a stable,
+    // self-certifying overlay address from this device's Ed25519 overlay key; peers
+    // learn+trust it via a signed `l3-announce` (below). A manual CIDR is the
+    // advanced/PSK case (no announce). Off otherwise; Linux-only.
+    // `l3_seen`: last announce received per pid, replayed once a datagram-capable
+    // transport is installed, so a hello that races ahead of the link is not lost
+    // (review fix #3).
+    #[cfg(unix)]
+    let mut l3_seen: HashMap<String, overlay::Announce> = HashMap::new();
+    #[cfg(unix)]
+    let l3: Option<std::sync::Arc<l3::L3>> = if daemon {
+        match settings::get_str("tun-addr", None) {
+            Some(setting) => {
+                let (cidr, identity) = if setting == "auto" {
+                    match overlay::Identity::load_or_create() {
+                        Ok(id) => (format!("{}/128", id.addr()), Some(id)),
+                        Err(e) => {
+                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  L3 disabled: {e}")));
+                            (String::new(), None)
+                        }
+                    }
+                } else {
+                    (setting.clone(), None) // manual/PSK address, no crypto announce
+                };
+                if cidr.is_empty() {
+                    None
+                } else {
+                    match l3::L3::start(&cidr, 1280, identity) {
+                        Ok(m) => {
+                            ui::say(&format!(
+                                "  {} L3 overlay {} on filament0",
+                                ui::paint(ui::Tone::Brand, "●"),
+                                m.my_addr().map(|a| a.to_string()).unwrap_or(cidr)
+                            ));
+                            Some(m)
+                        }
+                        Err(e) => {
+                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  L3 disabled: {e}")));
+                            None
+                        }
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
     // P4 (GAP-5): per-transfer count of whole-file-verify FAILURES (the digest
     // didn't match on completion). Each failure re-requests a resume (truncated)
@@ -6508,13 +6623,13 @@ async fn recv_cmd(
     // run, then ping the watchdog below. No-op when not run under systemd.
     if daemon {
         sdnotify::ready();
-        sdnotify::status("up — serving");
+        sdnotify::status("up - serving");
     }
 
     loop {
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
-        // — the backstop for the stall that also freezes the reconnect code.
+        // - the backstop for the stall that also freezes the reconnect code.
         if daemon && last_watchdog.elapsed() >= Duration::from_secs(5) {
             sdnotify::watchdog();
             last_watchdog = Instant::now();
@@ -6675,8 +6790,8 @@ async fn recv_cmd(
                     // Visible (not just debug): a node dropping off signaling was
                     // previously silent until it bit someone. Surface it + reflect
                     // it in `systemctl status` so it's diagnosable at a glance.
-                    ui::say(&ui::paint(ui::Tone::Warn, "signaling link closed, reconnecting…"));
-                    sdnotify::status("signaling down — reconnecting");
+                    ui::say(&ui::paint(ui::Tone::Warn, "signaling link closed, reconnecting..."));
+                    sdnotify::status("signaling down - reconnecting");
                 } else if silent_ms >= silence {
                     if !probed_silence {
                         // Heartbeat probe: an ACK'd `sync` round-trip, the only
@@ -6695,8 +6810,8 @@ async fn recv_cmd(
                         last_reconnect_try = Instant::now() - Duration::from_secs(60);
                         // Visible: a silent (half-open) signaling link is the exact
                         // way a node falls off presence without anyone noticing.
-                        ui::say(&ui::paint(ui::Tone::Warn, &format!("signaling silent for {silent_ms}ms, reconnecting…")));
-                        sdnotify::status("signaling silent — reconnecting");
+                        ui::say(&ui::paint(ui::Tone::Warn, &format!("signaling silent for {silent_ms}ms, reconnecting...")));
+                        sdnotify::status("signaling silent - reconnecting");
                     }
                 }
             }
@@ -6707,7 +6822,7 @@ async fn recv_cmd(
             // down, they ride independent WebRTC/QUIC transports and keep
             // flowing across the cosmetic signaling reconnect (the #28 contract).
             if let Some(down_at) = signaling_down_since {
-                // backoff: 0.5s, 1s, 2s, 4s … capped at 8s, +/-25% jitter.
+                // backoff: 0.5s, 1s, 2s, 4s ... capped at 8s, +/-25% jitter.
                 let base = 500u64.saturating_mul(1 << reconnect_attempt.min(4)).min(8_000);
                 let jitter = (down_at.elapsed().as_nanos() as u64 % (base / 2 + 1)) as i64 - (base as i64 / 4);
                 let backoff = Duration::from_millis((base as i64 + jitter).max(100) as u64);
@@ -6736,10 +6851,10 @@ async fn recv_cmd(
                             last_signaling = Instant::now();
                             signaling_down_since = None;
                             probed_silence = false;
-                            // Visible: pairs with the "reconnecting…" line so the
+                            // Visible: pairs with the "reconnecting..." line so the
                             // recovery is observable end to end.
                             ui::say(&ui::paint(ui::Tone::Ok, "signaling reconnected, re-announcing presence"));
-                            sdnotify::status("up — serving");
+                            sdnotify::status("up - serving");
                         }
                         Err(e) => {
                             // DEBUG, resilience internal (signaling reconnect retry).
@@ -7009,6 +7124,15 @@ async fn recv_cmd(
                     ui::debug(&format!("filament: dropping zombie warm link to '{pid}' (black-holed a stream)"));
                     conn.drop_link(&pid);
                     l2_muxes.remove(&pid);
+                    // Retract this peer's overlay route + reader promptly (the
+                    // reader would self-clean within ~5s, but this is immediate).
+                    #[cfg(unix)]
+                    {
+                        if let Some(l3) = l3.as_ref() {
+                            l3.remove_by_pid(&pid).await;
+                        }
+                        l3_seen.remove(&pid);
+                    }
                 }
             }
             Ev::PairMatched(v) => {
@@ -7069,7 +7193,7 @@ async fn recv_cmd(
                 ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud, they type it in the web app or `filament pair <code>` · one claim · 10 min"));
             }
             Ev::PairUsed(_) => {
-                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting…"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting..."));
             }
             Ev::PairError(v) => {
                 let why = v["error"].as_str().unwrap_or("?").to_string();
@@ -7262,6 +7386,25 @@ async fn recv_cmd(
                 // shows its per-device shell button ONLY when this is true; the
                 // actual pty-open is still gated server-side by the cap/policy.
                 let _ = t.send_control(&json!({ "type": "caps", "shell": l2_enabled })).await;
+                // L3 (serve_tun mesh): on a datagram-capable (direct) link, send a
+                // SIGNED announce of our overlay address, bound to THIS link's
+                // channel binding so it can't be replayed elsewhere. Both ends
+                // announce on their own ChannelReady, so each learns the other.
+                // Also replay any announce that arrived BEFORE this transport was
+                // installed (fix #3), now that the link can carry datagrams.
+                #[cfg(unix)]
+                if let Some(l3) = l3.as_ref() {
+                    if let Some(cb) = t.channel_binding() {
+                        if let Some(ann) = l3.make_announce(&cb) {
+                            let _ = t.send_control(&ann.to_json()).await;
+                        }
+                        if let Some(pending) = l3_seen.get(&pid) {
+                            if let Ok(ip) = pending.verify(&cb) {
+                                l3.add_peer(&pid, ip.into(), t.clone()).await;
+                            }
+                        }
+                    }
+                }
                 if let Some(l) = conn.link_mut(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, l.shown())));
                     l.transport = Some(t.clone());
@@ -7361,7 +7504,7 @@ async fn recv_cmd(
                                 .insert(pid.clone(), Instant::now() + recv_pake_budget);
                             recv_pake_overall_deadline
                                 .get_or_insert_with(|| Instant::now() + recv_pake_budget);
-                            ui::say(&ui::paint(ui::Tone::Dim, "  authenticating…"));
+                            ui::say(&ui::paint(ui::Tone::Dim, "  authenticating..."));
                         }
                     }
                 }
@@ -7393,6 +7536,37 @@ async fn recv_cmd(
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 _ if !conn.links.contains_key(&pid) => {}
+                // L3 (serve_tun): the peer announced its overlay IP. Route that IP
+                // to this link and start pumping its datagrams into our TUN. Only
+                // when we run an overlay ourselves; ignored otherwise.
+                #[cfg(unix)]
+                Some("l3-announce") => {
+                    // The peer signed a claim to an overlay address. Verify it
+                    // against THIS link's channel binding (rejects a forged addr, a
+                    // replayed announce, or a peer that doesn't hold the key), then
+                    // route to the VERIFIED address. Cache it either way so a hello
+                    // that raced ahead of the transport is replayed on ChannelReady.
+                    if let Some(l3) = l3.as_ref() {
+                        match overlay::Announce::from_json(&v) {
+                            Ok(ann) => {
+                                l3_seen.insert(pid.clone(), ann.clone());
+                                match conn.transport_of(&pid).and_then(|t| t.channel_binding().map(|cb| (t, cb))) {
+                                    Some((t, cb)) => match ann.verify(&cb) {
+                                        Ok(ip) => {
+                                            let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
+                                            l3.add_peer(&pid, ip.into(), t).await;
+                                            ui::say(&format!("  {} L3 peer {who} at {ip}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                                        }
+                                        Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
+                                    },
+                                    // Transport not installed yet: kept in l3_seen, replayed on ChannelReady.
+                                    None => {}
+                                }
+                            }
+                            Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
+                        }
+                    }
+                }
                 // L2 (ssh/TCP tunnel) acceptor. Opt-in (FILAMENT_L2=1). The
                 // capability gate is the proof-verified `trusted` flag on this
                 // link (placeholder for L1-a caps); localhost-only is enforced in
@@ -7451,7 +7625,7 @@ async fn recv_cmd(
                             }
                             l2::OpenVerdict::Deny { sid, err } => {
                                 // Log refused dials at INFO (visible by default,
-                                // suppressed under -q) — a refused SSRF/port-scan or
+                                // suppressed under -q) - a refused SSRF/port-scan or
                                 // untrusted/over-cap open is a security event the
                                 // operator should see, mirroring the
                                 // shell-bootstrap-deny path (`ui::say`). Normal
@@ -7605,7 +7779,7 @@ async fn recv_cmd(
                     // the same persistent PTY. DEVICE-SCOPED: prefixed with the
                     // verified device so a client id from device A can never
                     // address device B's session (no cross-device collision or
-                    // hijack) — the random per-invocation client id then only
+                    // hijack) - the random per-invocation client id then only
                     // needs to be unique per device. Absent (older client) -> a
                     // per-sid id that never reattaches (old behavior).
                     let session_id = match v["session"].as_str().filter(|s| !s.is_empty() && s.len() <= 128) {
@@ -8296,7 +8470,7 @@ async fn recv_cmd(
                     if claim_in_flight {
                         ui::say(&ui::paint(ui::Tone::Dim, "  (a claim is already in flight, wait for it to resolve)"));
                     } else {
-                        ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
+                        ui::say(&format!("  claiming {}...", ui::paint(ui::Tone::Brand, &line)));
                         paired = true;
                         claim_in_flight = true;
                         if daemon {
@@ -8685,7 +8859,7 @@ fn consent_token() -> &'static str {
 /// equivalent of the web UI's amber 'away' tile.
 ///   ✓ deft-gibbon                    (connected)
 ///   ● deft-gibbon  away, choosing a file
-///   ◌ deft-gibbon  reconnecting…
+///   ◌ deft-gibbon  reconnecting...
 fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
     let mut s = format!("{} {}", ui::paint(tone, mark), ui::paint(ui::Tone::Bold, name));
     if !note.is_empty() {
@@ -8905,7 +9079,7 @@ mod tests {
         assert!(device_allows_at(&p, "shellbox", "shell"), "forget wiped a survivor's shell cap");
         assert!(device_caps_at(&p, "dupe").is_none(), "dupe should be gone");
 
-        // Storing a NEW pairing must also preserve 'shellbox'’s caps.
+        // Storing a NEW pairing must also preserve 'shellbox''s caps.
         devices_store("newpeer", &sec).unwrap();
         assert!(device_allows_at(&p, "shellbox", "shell"), "store wiped a survivor's shell cap");
         // And re-storing an existing name keeps its caps (only the secret rotates).

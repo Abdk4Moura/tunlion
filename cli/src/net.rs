@@ -293,7 +293,7 @@ pub enum Ev {
     #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
     SignalingDown(String),
     /// Warm-reuse opened a stream over this held link and it black-holed (no
-    /// response within the verify window) — the link is a zombie (alive at the
+    /// response within the verify window) - the link is a zombie (alive at the
     /// QUIC layer but dead for new streams). The loop drops it so the daemon
     /// re-forms a healthy one and warm-reuse goes back to instant. Carries the pid.
     DropLink(String),
@@ -332,7 +332,7 @@ pub trait Transport: Send + Sync {
     fn max_payload(&self) -> usize;
     /// Which half of the L2 sid space THIS end allocates from. Both ends of a
     /// link MUST return opposite values (derived from the deterministic `polite`
-    /// role) so a sid this end allocates can never equal one the peer allocated —
+    /// role) so a sid this end allocates can never equal one the peer allocated -
     /// otherwise, when BOTH ends open L2 streams on one link (e.g. a pty plus a
     /// warm-reuse forward sharing the up-daemon's link), their sids collide and
     /// frames cross between unrelated tunnels. Default `false` (the low half);
@@ -354,6 +354,35 @@ pub trait Transport: Send + Sync {
     fn is_alive(&self) -> bool {
         true
     }
+    // --- L3 data plane (serve_tun): IP packets over unreliable datagrams ---
+    /// Whether this transport can carry L3 datagrams. Only the direct-QUIC link
+    /// does today; relay/DataChannel links return false, so the daemon simply
+    /// does not start an L3 pump over them (no L3 on relay yet).
+    fn supports_datagrams(&self) -> bool {
+        false
+    }
+    /// Send one IP packet as an unreliable datagram (non-blocking). Default errors
+    /// for transports without datagram support.
+    fn send_datagram(&self, _packet: &[u8]) -> Result<()> {
+        anyhow::bail!("transport has no L3 datagram support")
+    }
+    /// Await the next inbound IP packet. Default errors immediately so a pump
+    /// mistakenly started on a non-datagram link exits at once.
+    async fn recv_datagram(&self) -> Result<bytes::Bytes> {
+        anyhow::bail!("transport has no L3 datagram support")
+    }
+    /// Largest packet that fits in one datagram now (`None` = unsupported).
+    fn max_datagram_size(&self) -> Option<usize> {
+        None
+    }
+    /// This link's channel binding: a value unique to THIS end-to-end connection
+    /// that a MITM/relay terminating the transport cannot reproduce (the RFC-5705
+    /// TLS exporter for direct-QUIC). The L3 `l3-announce` signs over it so a
+    /// genuine announce captured on one link can't be replayed onto another.
+    /// `None` for transports that expose no binding (they can't carry L3 today).
+    fn channel_binding(&self) -> Option<Vec<u8>> {
+        None
+    }
     /// The literal remote socket address the underlying connection is pinned to
     /// (the `IP:port` `filament ping` shows for a direct link). `None` for a
     /// transport with no single socket endpoint (a relay/DataChannel link, whose
@@ -368,7 +397,7 @@ pub trait Transport: Send + Sync {
         None
     }
     /// Local IP this transport's socket is bound to (so `filament ping` can name
-    /// the network INTERFACE the path uses — tailscale0 / eth0 / docker0). Direct-
+    /// the network INTERFACE the path uses - tailscale0 / eth0 / docker0). Direct-
     /// QUIC reports quinn's local_ip; `None` for transports that don't expose it
     /// (a relay/DataChannel link's local candidate is read from the ICE pair).
     fn local_ip(&self) -> Option<std::net::IpAddr> {
@@ -1446,7 +1475,7 @@ impl PathInfo {
 /// `peer` Arc rode along on the guard; only when the transport has no address (a
 /// relay/DataChannel link) do we read the ICE candidate pair off the peer. The
 /// local interface comes from quinn's `local_ip` when available, else from the
-/// kernel's route to the remote (`source_ip_for`) — so the interface name shows
+/// kernel's route to the remote (`source_ip_for`) - so the interface name shows
 /// even for holepunched sockets.
 pub async fn describe_path(t: &dyn Transport, peer: Option<&Peer>) -> PathInfo {
     let mut info = PathInfo::default();

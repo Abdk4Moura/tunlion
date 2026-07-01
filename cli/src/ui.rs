@@ -277,7 +277,7 @@ pub fn critical(line: &str) {
 
 /// A structured, must-see PROBLEM block, for an error the user has to act on.
 /// Instead of one dense sentence, it breaks the message into a red `✗` headline,
-/// an optional one-line explanation, and a list of concrete next steps — far
+/// an optional one-line explanation, and a list of concrete next steps - far
 /// easier to scan than a wall of prose. Each line rides the CRITICAL channel
 /// (always shown, even under `-q`) and `paint()` (color only on a tty, clean in a
 /// pipe). Steps are pre-formatted by the caller, so a step may embed a command in
