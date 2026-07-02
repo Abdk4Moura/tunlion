@@ -14,17 +14,35 @@
 //! (macOS prepends a 4-byte address-family header, Linux with IFF_NO_PI does not)
 //! is added/stripped inside the backend so the overlay logic stays portable.
 
+/// The overlay's packet endpoint, abstracted so `l3.rs` is agnostic to HOW bare IP
+/// packets reach the wire. `KernelTun` (below) is the privileged backend that hands
+/// packets to the OS stack via a kernel TUN; a userspace smoltcp `NetstackTun`
+/// (added later) implements the same surface with ZERO privilege. `recv` yields an
+/// OUTBOUND packet the local stack wants sent to a peer (l3.rs routes it by dest IP
+/// to that peer's datagram transport); `send` injects a peer's INBOUND packet into
+/// the local stack. Byte-exact bare IP in both directions (per-OS framing, e.g.
+/// macOS's 4-byte AF header, is added/stripped inside the backend).
+#[async_trait::async_trait]
+pub trait TunDevice: Send + Sync {
+    /// The interface name (Linux honors `filament0`; macOS assigns `utunN`).
+    fn name(&self) -> &str;
+    /// Await the next OUTBOUND bare IP packet the local stack wants on the wire.
+    async fn recv(&self, buf: &mut [u8]) -> anyhow::Result<usize>;
+    /// Inject one INBOUND bare IP packet (received from a peer) into the local stack.
+    async fn send(&self, packet: &[u8]) -> anyhow::Result<usize>;
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, Tun};
+pub use linux::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, Tun};
+pub use macos::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, Tun};
+pub use windows::{add_route, ensure_hosts_writable, ensure_net_admin_for_l3, KernelTun};

@@ -15,21 +15,21 @@ use tokio::sync::{mpsc, Mutex};
 
 /// A Wintun adapter session plus the async plumbing. Dropping it shuts the session
 /// down (unblocking the reader thread) and removes the adapter.
-pub struct Tun {
+pub struct KernelTun {
     session: Arc<wintun::Session>,
     name: String,
     rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     _reader: std::thread::JoinHandle<()>,
 }
 
-impl Tun {
+impl KernelTun {
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Open (or create) the `name` adapter, assign `cidr`, set `mtu`, and start
     /// pumping. Needs Administrator + wintun.dll.
-    pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<Tun> {
+    pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
         let wintun = load_wintun().context("load wintun.dll (bundle it beside filament.exe)")?;
         let adapter = wintun::Adapter::open(&wintun, name)
             .or_else(|_| wintun::Adapter::create(&wintun, name, "Filament", None))
@@ -70,7 +70,7 @@ impl Tun {
         // MTU is best-effort (a Wintun default is fine if this fails).
         let _ = netsh(&["interface", proto, "set", "subinterface", name, &format!("mtu={mtu}"), "store=active"]);
 
-        Ok(Tun { session, name: name.to_string(), rx: Mutex::new(rx), _reader: reader })
+        Ok(KernelTun { session, name: name.to_string(), rx: Mutex::new(rx), _reader: reader })
     }
 
     /// Await one IP packet from the reader thread's channel.
@@ -99,7 +99,22 @@ impl Tun {
     }
 }
 
-impl Drop for Tun {
+// Expose the Wintun device through the overlay's device seam (fully-qualified
+// inherent calls: no ambiguity with the trait methods, no accidental recursion).
+#[async_trait::async_trait]
+impl crate::tun::TunDevice for KernelTun {
+    fn name(&self) -> &str {
+        KernelTun::name(self)
+    }
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        KernelTun::recv(self, buf).await
+    }
+    async fn send(&self, packet: &[u8]) -> Result<usize> {
+        KernelTun::send(self, packet).await
+    }
+}
+
+impl Drop for KernelTun {
     fn drop(&mut self) {
         // Unblock the reader thread's receive_blocking() so it exits; the adapter is
         // removed when the last Arc<Session>/Adapter drops.

@@ -189,19 +189,19 @@ struct IfReq {
 
 /// A TUN device plus an async handle on its fd. Dropping it closes the fd; the
 /// kernel removes the interface once the last fd is gone.
-pub struct Tun {
+pub struct KernelTun {
     fd: AsyncFd<OwnedFd>,
     name: String,
 }
 
-impl Tun {
+impl KernelTun {
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Open `name` as a TUN (IFF_TUN | IFF_NO_PI), then assign `cidr`, set `mtu`,
     /// and bring it up via iproute2. `name` must be < 16 bytes.
-    pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<Tun> {
+    pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
         if name.is_empty() || name.len() >= libc::IFNAMSIZ {
             bail!("tun name '{name}' must be 1..15 bytes");
         }
@@ -252,7 +252,7 @@ impl Tun {
         ip(&["link", "set", "dev", name, "up"]).context("ip link set up")?;
 
         let fd = AsyncFd::new(owned).context("register tun fd with the reactor")?;
-        Ok(Tun { fd, name: name.to_string() })
+        Ok(KernelTun { fd, name: name.to_string() })
     }
 
     /// Read one IP packet from the kernel (one packet per read for IFF_NO_PI TUN).
@@ -295,6 +295,22 @@ impl Tun {
                 Err(_would_block) => continue,
             }
         }
+    }
+}
+
+// Expose the kernel TUN through the overlay's device seam. Fully-qualified inherent
+// calls (no `self.recv(..)`) so there is zero ambiguity with the trait methods and
+// no chance of accidental recursion.
+#[async_trait::async_trait]
+impl crate::tun::TunDevice for KernelTun {
+    fn name(&self) -> &str {
+        KernelTun::name(self)
+    }
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        KernelTun::recv(self, buf).await
+    }
+    async fn send(&self, packet: &[u8]) -> Result<usize> {
+        KernelTun::send(self, packet).await
     }
 }
 
