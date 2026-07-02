@@ -2549,7 +2549,7 @@ fn resolve_login(remote_user: Option<String>) -> String {
 /// paths use the SAME managed identity; L3 just connects to the stable overlay
 /// address directly (no ProxyCommand), so the session survives a link repair.
 /// Falls back to the L2 tunnel when L3 isn't viable or its connect fails (255).
-fn run_ssh(
+async fn run_ssh(
     server: &str,
     peer: &str,
     relay: bool,
@@ -2557,20 +2557,46 @@ fn run_ssh(
     login: &str,
     rport: u16,
     extra: &[String],
+    revive: bool,
 ) -> Result<i32> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = revive;
     #[cfg(target_os = "linux")]
     if std::env::var("FILAMENT_NO_L3_SSH").as_deref() != Ok("1") {
-        if let Some(mesh_host) = l3_ssh_target(peer, rport) {
-            crate::ui::say(&format!(
-                "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
-            ));
-            let code = spawn_ssh_direct(login, &mesh_host, extra)?;
-            // 255 = ssh connect/transport failure -> fall back to the L2 tunnel.
-            // Any other code is a real session result (incl. the remote command's).
-            if code != 255 {
-                return Ok(code);
+        if let Some((mesh_host, addr)) = l3_mesh_addr(peer, rport) {
+            // The peer IS on the overlay. PREFER L3 (survives link repairs); only
+            // fall to L2 when the overlay genuinely can't carry ssh.
+            if probe_sshd(addr, std::time::Duration::from_millis(600)) {
+                crate::ui::say(&format!(
+                    "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
+                ));
+                let code = spawn_ssh_direct(login, &mesh_host, extra)?;
+                if code != 255 {
+                    return Ok(code);
+                }
+                crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
+            } else if revive {
+                // The route exists but the overlay path looks dead (a lapsed/zombie
+                // transport). Rather than time out toward L2, ACTIVELY REVIVE it: the
+                // ctl warm-open nudges the daemon to verify + drop the zombie, which
+                // its re-dial / self-heal rebuilds under the SAME stable overlay IP.
+                // Poll briefly, then take L3 if it comes back. (If L2 can reach the
+                // peer, L3 can too - they ride the same transport.)
+                crate::ui::say(&format!("filament: L3 overlay to '{peer}' looks down, reviving..."));
+                revive_l3(peer, rport).await;
+                if wait_for_overlay(addr, l3_revive_deadline()).await {
+                    crate::ui::say("filament: L3 overlay back, using it");
+                    let code = spawn_ssh_direct(login, &mesh_host, extra)?;
+                    if code != 255 {
+                        return Ok(code);
+                    }
+                    crate::ui::say("filament: L3 ssh failed after revive, falling back to the tunnel");
+                } else {
+                    crate::ui::say("filament: L3 overlay still down, using the tunnel");
+                }
             }
-            crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
+            // else (revive=false, e.g. the post-255 re-bootstrap retry): don't pay the
+            // revive wait twice - go straight to the L2 tunnel below.
         }
     }
     spawn_ssh(server, peer, relay, host, login, rport, extra)
@@ -2671,18 +2697,78 @@ fn spawn_ssh(
 /// UserKnownHostsFile) with a `filament netcat` ProxyCommand. No prompts, no
 /// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
 /// peer lacks the `shell` cap we abort HERE, before invoking ssh.
-/// If `peer` is a live L3 overlay peer whose sshd is reachable at its stable
-/// overlay address, return the `<peer>.mesh` host to ssh to. Resolves the name
-/// from the MagicDNS /etc/hosts block and probes the sshd over the overlay so we
-/// only take the resilient L3 path when it will actually work (a loopback-only
-/// sshd, or a peer not on the mesh, yields None -> fall back to the L2 tunnel).
+/// Resolve `<peer>.mesh` (the MagicDNS /etc/hosts entry) to its overlay socket
+/// address. `Some` iff the peer is on the overlay (has a route); the address is the
+/// crypto-derived, STABLE overlay IP (only the transport swaps under it on a
+/// repair), so it's a valid target to probe/connect across repairs. `None` means
+/// the peer isn't on the mesh at all -> the caller goes straight to the L2 tunnel.
+/// (Note: unlike the old `l3_ssh_target`, this does NOT probe here - the caller
+/// probes and, if the route is present but dead, REVIVES rather than dumping to L2.)
 #[cfg(target_os = "linux")]
-fn l3_ssh_target(peer: &str, port: u16) -> Option<String> {
+fn l3_mesh_addr(peer: &str, port: u16) -> Option<(String, std::net::SocketAddr)> {
     use std::net::ToSocketAddrs;
     let name = format!("{}.mesh", crate::l3::sanitize_host(peer));
     let addr = (name.as_str(), port).to_socket_addrs().ok()?.next()?;
-    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(600)).ok()?;
-    Some(name)
+    Some((name, addr))
+}
+
+/// Quick reachability probe of an sshd over the overlay: a bounded TCP connect.
+#[cfg(target_os = "linux")]
+fn probe_sshd(addr: std::net::SocketAddr, to: std::time::Duration) -> bool {
+    std::net::TcpStream::connect_timeout(&addr, to).is_ok()
+}
+
+/// Nudge the daemon to revive the overlay link to `peer`: a warm-open over the
+/// control socket triggers the daemon's verify-before-accept, which drops a zombie
+/// link so its re-dial / 8s self-heal rebuilds it (add_peer re-installs the SAME
+/// stable overlay IP). The opened stream is discarded - the open itself is the
+/// nudge. Bounded (ctl's open has no internal timeout).
+#[cfg(target_os = "linux")]
+async fn revive_l3(peer: &str, rport: u16) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), crate::ctl::try_open(peer, rport)).await;
+}
+
+/// How long to wait for the overlay to come back after a revive nudge (default 15s;
+/// override with FILAMENT_L3_REVIVE_MS). This is a CEILING, not a fixed wait:
+/// `wait_for_overlay` polls every 500ms and returns the instant L3 answers, so a
+/// fast heal connects fast. The ceiling must clear the actual re-establish floor:
+/// the nudge drops the zombie link at once, but the re-dial rides KnownPeer's ~5s
+/// sync + establish (~2-3s), and a full-outage heal (dead-link scan + re-dial) was
+/// measured at ~12s post-blackhole. 15s covers that with margin.
+///
+/// TRADEOFF (honest worst case): this wait runs BEFORE the L2 fallback, not
+/// racing it - so for a peer that is genuinely down on BOTH planes, a single
+/// `filament ssh` now pays the full poll (~15s) before it even attempts L2, on
+/// top of L2's own establish/timeout. That is the deliberate cost of preferring
+/// L3: we would rather wait for the overlay to heal than silently settle onto a
+/// tunnel it will outlive. In practice L2 to a truly offline peer fails fast
+/// (signaling reports it absent), so the added cost is ~the poll, not a doubled
+/// ConnectTimeout. A future refinement could early-abort the poll once the daemon
+/// reports no re-establishment in progress (needs a link-state ctl query we don't
+/// have yet); until then the ceiling bounds it.
+#[cfg(target_os = "linux")]
+fn l3_revive_deadline() -> std::time::Duration {
+    let ms = std::env::var("FILAMENT_L3_REVIVE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(15000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Poll the overlay sshd until it answers or the deadline passes. Each probe is a
+/// bounded blocking connect run OFF the async runtime.
+#[cfg(target_os = "linux")]
+async fn wait_for_overlay(addr: std::net::SocketAddr, deadline: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        if tokio::task::spawn_blocking(move || probe_sshd(addr, std::time::Duration::from_millis(400)))
+            .await
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
@@ -2726,7 +2812,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         }
     };
 
-    let code = run_ssh(server, peer, relay, &host, &login, rport, extra)?;
+    let code = run_ssh(server, peer, relay, &host, &login, rport, extra, true).await?;
 
     // A cached skip that failed at the ssh layer (connect/auth, exit 255) may mean
     // the device rotated its key/host-key or revoked the cap. Invalidate, run a
@@ -2742,7 +2828,8 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
         crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
         let login = resolve_login(info.user);
-        let code = run_ssh(server, peer, relay, &host, &login, rport, extra)?;
+        // revive=false: don't pay the L3 revive-wait twice on the same invocation.
+        let code = run_ssh(server, peer, relay, &host, &login, rport, extra, false).await?;
         ssh_failed_hint(peer, code);
         std::process::exit(code);
     }
