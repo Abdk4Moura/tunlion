@@ -1740,6 +1740,7 @@ async fn pty_attach_once(
     session_id: &str,
     term: &str,
     interactive: bool,
+    resume: bool,
     raw: &mut Option<RawGuard>,
 ) -> Result<PtyOutcome> {
     let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, role).await?;
@@ -1768,7 +1769,7 @@ async fn pty_attach_once(
     mux.transport()
         .send_control(&json!({
             "type": "pty-open", "sid": sid, "session": session_id,
-            "cols": cols, "rows": rows, "term": term,
+            "cols": cols, "rows": rows, "term": term, "resume": resume,
         }))
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
@@ -1932,19 +1933,34 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     // cold resumable path below. Skipped under --relay (the user forced relay; a
     // warm link may be direct) and for non-tty stdio (scripted). Resumability
     // lives on the cold path, where flaky peers (no warm link) need it anyway.
-    #[cfg(unix)]
-    if interactive && !relay {
-        if let Some(r) = try_warm_pty(peer, &session_id, &term, &mut raw).await {
-            return r;
-        }
-    }
-
+    // Loop state up front so the warm path can hand off INTO the resumable loop
+    // instead of returning (the old behavior, which re-logged-in on a warm drop).
     let mut ever_connected = false;
     let mut last_up = std::time::Instant::now();
     let mut backoff = Duration::from_millis(300);
     let mut role: &'static str = "init";
+    // Set when a WARM session ended (a drop OR a clean shell exit - the warm bridge
+    // can't tell). The first cold attach after that is RESUME-ONLY: a warm drop
+    // reattaches the SAME live shell/TUI (seamless, no re-login); a clean warm exit
+    // finds no session and the acceptor closes it, so we exit cleanly.
+    let mut warm_ended = false;
+
+    #[cfg(unix)]
+    if interactive && !relay {
+        match try_warm_pty(peer, &session_id, &term, &mut raw).await {
+            Some(Err(e)) => return Err(e),
+            Some(Ok(())) => {
+                warm_ended = true;
+                role = "reconnect";
+            }
+            None => {} // no warm link -> normal cold path below
+        }
+    }
+
     loop {
-        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive, &mut raw).await {
+        // Resume-only for the FIRST attach right after a warm session ended.
+        let resume = warm_ended && !ever_connected;
+        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive, resume, &mut raw).await {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Dropped) => {
                 // Non-tty (scripted) sessions don't resume; a drop is the end.
@@ -1959,8 +1975,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
                 continue;
             }
             Err(e) => {
-                // First connect failed (peer offline, no pair, ...): surface it.
-                if !ever_connected {
+                // A first COLD connect (no warm session) failing is fatal. But if a
+                // warm session just ended, a failed reattach should RETRY (the mesh
+                // may be mid-repair) until the reaper window, not bail.
+                if !ever_connected && !warm_ended {
                     return Err(e);
                 }
                 // A reconnect attempt failed. Keep trying until the acceptor would
