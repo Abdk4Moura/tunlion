@@ -60,6 +60,12 @@ rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pe
 # rustls/quinn/rcgen; this is a direct handle for Ed25519 sign/verify + CSPRNG, so
 # we never hand-roll the crypto.
 ring = "0.17"
+# Userspace L3 netstack: an in-process TCP/IP stack so a zero-privilege node (no
+# CAP_NET_ADMIN, no /dev/net/tun, e.g. a container) is a first-class overlay member.
+# Pure Rust, no OS device (more portable than the kernel-TUN/Wintun backends); it
+# feeds/drains bare IPv6 packets to/from the same direct-QUIC datagram carrier. IPv6
+# is mandatory (the overlay is an IPv6 ULA); TCP only for now.
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv6", "socket-tcp"] }
 # Interactive guided code entry (raw mode + key events + styled output;
 # cross-platform incl. Windows). Used ONLY behind the interactivity gate; a
 # non-TTY / scripted run never enters its event loop.

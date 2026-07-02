@@ -32,6 +32,12 @@ pub trait TunDevice: Send + Sync {
     async fn send(&self, packet: &[u8]) -> anyhow::Result<usize>;
 }
 
+// Userspace (zero-privilege) overlay backend. Platform-independent (pure smoltcp,
+// no OS device). Wired into l3.rs's device selection in a later milestone (which
+// will re-export NetstackTun); exercised by its own tests today.
+#[allow(dead_code)]
+mod netstack;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
