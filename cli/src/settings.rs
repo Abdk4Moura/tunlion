@@ -72,6 +72,7 @@ pub struct Setting {
 }
 
 const RELAY_VALS: &[&str] = &["auto", "always", "never"];
+const L3_MODE_VALS: &[&str] = &["auto", "kernel", "userspace"];
 
 pub fn registry() -> &'static [Setting] {
     static R: &[Setting] = &[
@@ -162,6 +163,17 @@ pub fn registry() -> &'static [Setting] {
             env: None,
             daemon: true,
             help: "L3 overlay address as IP/PREFIX (e.g. 10.9.0.1/24); empty = L3 off",
+        },
+        Setting {
+            key: "l3-mode",
+            aliases: &[],
+            store: "l3-mode",
+            kind: Kind::Enum(L3_MODE_VALS),
+            default: "auto",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "L3 backend: auto (kernel TUN when privileged, else userspace netstack), kernel (require the TUN), userspace (zero-privilege netstack; host firewall NOT enforced, expose honored)",
         },
     ];
     R
