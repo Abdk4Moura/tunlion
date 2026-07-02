@@ -8114,6 +8114,10 @@ async fn recv_cmd(
                         .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
                         .unwrap_or("xterm-256color")
                         .to_string();
+                    // RESUME-ONLY (warm-drop fall-through): the client wants to
+                    // REATTACH an existing session and never start a fresh shell, so a
+                    // clean warm exit can't turn into a surprise re-login.
+                    let resume = v["resume"].as_bool().unwrap_or(false);
                     let mux = l2_muxes
                         .entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
@@ -8137,6 +8141,14 @@ async fn recv_cmd(
                         pty_bindings.entry(pid.clone()).or_default().insert(sid, session_id.clone());
                         spawn_session_pumps(sess.clone(), rx, rrx);
                         ui::say(&format!("l2: pty REATTACHED to '{}', {cols}x{rows}", dev.unwrap_or_default()));
+                        continue;
+                    }
+                    // Resume-only + no live session: the client is a warm-drop
+                    // fall-through and the session is gone (the shell exited cleanly).
+                    // Close instead of spawning a fresh shell, so the client exits
+                    // cleanly rather than getting a surprise re-login.
+                    if resume {
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "no such session" })).await;
                         continue;
                     }
                     // H-1 (DoS): refuse over the per-link stream cap or the global
