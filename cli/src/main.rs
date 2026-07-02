@@ -436,6 +436,9 @@ enum Cmd {
     Devices {
         #[command(subcommand)]
         action: Option<DevicesAction>,
+        /// Machine-readable JSON (for scripts): [{name, channel, caps}].
+        #[arg(long)]
+        json: bool,
     },
     /// Always-on receiver: trusted known devices only, invisible to strangers
     Up {
@@ -463,7 +466,11 @@ enum Cmd {
         shell_user: Option<String>,
     },
     /// Show whether the daemon runs and what it received recently
-    Status,
+    Status {
+        /// Machine-readable JSON (for scripts): {running, pid, devices, exposed, recent}.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop the daemon
     Down,
     /// Vouch between two known devices: mints a fresh secret and delivers it
@@ -1652,7 +1659,29 @@ fn tour_cmd() -> Result<()> {
     Ok(())
 }
 
-fn status_cmd() -> Result<()> {
+fn status_cmd(json: bool) -> Result<()> {
+    if json {
+        let pid = daemon_alive();
+        let exposed: Vec<Value> = expose::load()
+            .iter()
+            .map(|b| json!({ "port": b.port, "target": b.target, "peers": b.peers.clone().unwrap_or_default() }))
+            .collect();
+        let mut recent: Vec<String> = std::fs::read_to_string(up_log())
+            .map(|log| log.lines().rev().take(8).map(str::to_string).collect())
+            .unwrap_or_default();
+        recent.reverse();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "running": pid.is_some(),
+                "pid": pid,
+                "devices": devices_load().len(),
+                "exposed": exposed,
+                "recent": recent,
+            }))?
+        );
+        return Ok(());
+    }
     match daemon_alive() {
         Some(pid) => ui::say(&format!("  {} up (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
         None => ui::say(&format!("  {} not running, start with: filament up", ui::paint(ui::Tone::Dim, "·"))),
@@ -4729,6 +4758,25 @@ async fn main() -> Result<()> {
                 // shortest-path muscle memory; a real subcommand still wins (checked
                 // above via CMDS), and this only fires for a name you've paired.
                 argv.insert(1, "ssh".into());
+            } else {
+                // Not a command, path, code, or paired device. Give a filament-native
+                // error with a did-you-mean over BOTH commands and device names,
+                // instead of clap's bare "unrecognized subcommand" (smart errors).
+                let first = first.clone();
+                let mut cands: Vec<String> = CMDS.iter().map(|s| s.to_string()).collect();
+                cands.extend(devices_load().into_iter().map(|(n, _)| n));
+                let hint = cands
+                    .iter()
+                    .map(|c| (settings::levenshtein(&first, c), c))
+                    .filter(|(d, _)| *d <= 2)
+                    .min_by_key(|(d, _)| *d)
+                    .map(|(_, c)| c.clone());
+                eprintln!("filament: unknown command or device '{first}'");
+                if let Some(h) = hint {
+                    eprintln!("  did you mean '{h}'?");
+                }
+                eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
+                std::process::exit(2);
             }
         }
     }
@@ -4861,22 +4909,36 @@ async fn main() -> Result<()> {
             };
             up_cmd(&server, install, dir, relay, shell, shell_only, shell_user).await
         }
-        Cmd::Status => status_cmd(),
+        Cmd::Status { json } => status_cmd(json),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, relay).await,
         Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
-        Cmd::Devices { action } => {
+        Cmd::Devices { action, json } => {
             match action {
                 None => {
                     let all = devices_load();
-                    if all.is_empty() {
-                        println!("no known devices yet, run `filament pair` to add one");
-                    }
-                    for (n, s) in all {
-                        // Show the granted capability set so `grant shell` is
-                        // visible here (v1 records read as [transfer]).
-                        let caps = device_caps(&n).unwrap_or_else(|| vec!["transfer".to_string()]);
-                        println!("{n}  (channel {})  [{}]", &channel_of(&s)[..12], caps.join(", "));
+                    if json {
+                        let arr: Vec<Value> = all
+                            .iter()
+                            .map(|(n, s)| {
+                                json!({
+                                    "name": n,
+                                    "channel": channel_of(s),
+                                    "caps": device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]),
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&arr)?);
+                    } else {
+                        if all.is_empty() {
+                            println!("no known devices yet, run `filament pair` to add one");
+                        }
+                        for (n, s) in all {
+                            // Show the granted capability set so `grant shell` is
+                            // visible here (v1 records read as [transfer]).
+                            let caps = device_caps(&n).unwrap_or_else(|| vec!["transfer".to_string()]);
+                            println!("{n}  (channel {})  [{}]", &channel_of(&s)[..12], caps.join(", "));
+                        }
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {

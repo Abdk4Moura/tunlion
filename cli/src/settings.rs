@@ -189,7 +189,7 @@ pub fn did_you_mean(name: &str) -> Option<&'static str> {
     best.map(|(k, _)| k)
 }
 
-fn levenshtein(a: &str, b: &str) -> usize {
+pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
