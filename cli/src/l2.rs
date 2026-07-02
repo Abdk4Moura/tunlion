@@ -2054,7 +2054,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         // Wait for the first link so "ready" is honest.
         while rx.borrow().is_none() {
             if rx.changed().await.is_err() {
-                bail!("filament: could not establish the link to {peer}");
+                bail!("filament: could not establish the link to {peer}; is it online? check with `filament ping {peer}` (or `filament devices`)");
             }
         }
         crate::ui::say(&format!(

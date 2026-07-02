@@ -4732,8 +4732,21 @@ async fn main() -> Result<()> {
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
-        const CMDS: [&str; 18] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh", "ping", "grant", "revoke"];
-        if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
+        // The real subcommand set, derived from clap so it can NEVER go stale. A
+        // hardcoded list drifted (it missed proxy/expose/pair/set/pty/... and the
+        // unknown-token branch below then wrongly rejected them). Includes hidden
+        // commands + aliases, so every real verb is recognized.
+        use clap::CommandFactory;
+        let cmd_names: std::collections::HashSet<String> = {
+            let c = Cli::command();
+            let mut s = std::collections::HashSet::new();
+            for sc in c.get_subcommands() {
+                s.insert(sc.get_name().to_string());
+                s.extend(sc.get_all_aliases().map(str::to_string));
+            }
+            s
+        };
+        if !first.starts_with('-') && !cmd_names.contains(first.as_str()) {
             if std::path::Path::new(first).exists() {
                 argv.insert(1, "send".into());
                 argv.push("--code".into());
@@ -4758,7 +4771,7 @@ async fn main() -> Result<()> {
                 // the "just works" default. `filament dovm <cmd>` runs a one-off
                 // command, which needs a real command runner, so that routes to ssh.
                 // Deterministic on what you typed (no runtime fallback magic); a real
-                // subcommand still wins (CMDS above); only fires for a paired name.
+                // subcommand still wins (cmd_names above); only fires for a paired name.
                 let verb = if argv.len() > 2 { "ssh" } else { "pty" };
                 argv.insert(1, verb.into());
             } else {
@@ -4766,7 +4779,7 @@ async fn main() -> Result<()> {
                 // error with a did-you-mean over BOTH commands and device names,
                 // instead of clap's bare "unrecognized subcommand" (smart errors).
                 let first = first.clone();
-                let mut cands: Vec<String> = CMDS.iter().map(|s| s.to_string()).collect();
+                let mut cands: Vec<String> = cmd_names.iter().cloned().collect();
                 cands.extend(devices_load().into_iter().map(|(n, _)| n));
                 let hint = cands
                     .iter()
@@ -6095,12 +6108,12 @@ async fn send_cmd(
                     }
                 }
                 if conn.on_stuck(&pid, generation, "stuck while connecting").await? {
-                    bail!("lost the receiving peer after {} attempts", MAX_ATTEMPTS);
+                    bail!("lost the receiving peer after {} attempts; the partial is kept, re-run the same `filament send` to resume", MAX_ATTEMPTS);
                 }
             }
             Ev::GraceExpired(pid, generation) => {
                 if conn.on_stuck(&pid, generation, "lost").await? {
-                    bail!("lost the receiving peer after {} attempts", MAX_ATTEMPTS);
+                    bail!("lost the receiving peer after {} attempts; the partial is kept, re-run the same `filament send` to resume", MAX_ATTEMPTS);
                 }
             }
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
@@ -8828,7 +8841,7 @@ async fn recv_cmd(
                     // lost its file-end, finalize before deciding it's fatal.
                     sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
                     if completed == 0 {
-                        bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                        bail!("lost the sender after {} attempts; the partial is kept, re-run `filament recv <code>` to resume", MAX_ATTEMPTS);
                     }
                 }
             }
@@ -8836,7 +8849,7 @@ async fn recv_cmd(
                 if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
                     sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
                     if completed == 0 {
-                        bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                        bail!("lost the sender after {} attempts; the partial is kept, re-run `filament recv <code>` to resume", MAX_ATTEMPTS);
                     }
                 }
             }
