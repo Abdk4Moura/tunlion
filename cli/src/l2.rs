@@ -2725,9 +2725,23 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
         let login = resolve_login(info.user);
         let code = run_ssh(server, peer, relay, &host, &login, rport, extra)?;
+        ssh_failed_hint(peer, code);
         std::process::exit(code);
     }
+    ssh_failed_hint(peer, code);
     std::process::exit(code);
+}
+
+/// ssh exit 255 is ssh's own connect/session failure (no sshd reachable, timed
+/// out, auth) - distinct from a remote command's non-zero exit. In that case point
+/// the user at the filament-native shell, which needs no sshd and survives repairs.
+fn ssh_failed_hint(peer: &str, code: i32) {
+    if code == 255 {
+        crate::ui::say(&crate::ui::paint(
+            crate::ui::Tone::Dim,
+            &format!("  tip: `filament {peer}` opens a filament shell instead (no sshd needed, survives link repairs)"),
+        ));
+    }
 }
 
 /// Confirm an sshd is reachable on `rport` before spawning ssh, so it fails fast

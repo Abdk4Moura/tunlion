@@ -4753,11 +4753,14 @@ async fn main() -> Result<()> {
                 // if the peer can't run the handshake).
                 argv.insert(1, "recv".into());
             } else if devices_load().iter().any(|(n, _)| n == first) {
-                // Bare device name = ssh into it: `filament dovm` == `filament ssh
-                // dovm` (and `filament dovm ls -la` runs the command). Matches the
-                // shortest-path muscle memory; a real subcommand still wins (checked
-                // above via CMDS), and this only fires for a name you've paired.
-                argv.insert(1, "ssh".into());
+                // Bare device name = shell in. `filament dovm` opens filament's OWN
+                // pty (universal: no sshd needed, resumable, survives link repairs) -
+                // the "just works" default. `filament dovm <cmd>` runs a one-off
+                // command, which needs a real command runner, so that routes to ssh.
+                // Deterministic on what you typed (no runtime fallback magic); a real
+                // subcommand still wins (CMDS above); only fires for a paired name.
+                let verb = if argv.len() > 2 { "ssh" } else { "pty" };
+                argv.insert(1, verb.into());
             } else {
                 // Not a command, path, code, or paired device. Give a filament-native
                 // error with a did-you-mean over BOTH commands and device names,
