@@ -330,21 +330,47 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // `first`: a warm-reuse verify already pulled the first inbound frame off the
     // wire to PROVE the link is live before the client was committed; replay it
     // here so no peer bytes are lost.
-    let writer = tokio::spawn(dc_to_socket(rx, wr, first));
-    let reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
+    let mut writer = tokio::spawn(dc_to_socket(rx, wr, first));
+    let mut reader = tokio::spawn(socket_to_dc(mux.transport.clone(), sid, rd));
     mux.set_read_pump(sid, reader.abort_handle()).await;
 
-    // Wait for the read pump: Ok = local FIN sent; Err = socket error -> RST;
-    // Aborted = teardown already cleaned us up.
-    let read_result = reader.await;
-    let _ = writer.await;
+    // Tear the bridge down when EITHER direction ends, not just the client->peer
+    // reader. When the PEER dies, dc_to_socket (writer) finishes as the mux pipe
+    // closes, but socket_to_dc (reader) stays parked on an IDLE client socket and
+    // never notices - so awaiting only the reader (the old behavior) DEADLOCKED the
+    // warm bridge, and thus the client's warm pty, until the user happened to type.
+    // A 2s liveness poll is the backstop for a transport that black-holes without
+    // ever closing the pipe. Whichever fires, we drop the socket so the client sees
+    // EOF and (for the pty) falls through to a cold reattach.
+    // read_result: Some = reader finished (Ok=FIN sent, Err(join)=teardown aborted
+    // us); None = we tore down because the peer/link ended.
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    ticker.tick().await; // consume the immediate tick
+    let read_result;
+    loop {
+        tokio::select! {
+            r = &mut reader => { read_result = Some(r); writer.abort(); break; }
+            _ = &mut writer => { reader.abort(); read_result = None; break; }
+            _ = ticker.tick() => {
+                if !mux.transport.is_alive() {
+                    reader.abort();
+                    writer.abort();
+                    read_result = None;
+                    break;
+                }
+            }
+        }
+    }
     // The stream may already be gone (teardown). Remove if still present.
     mux.streams.lock().await.remove(&sid);
     if send_close {
         let close = match read_result {
-            Ok(Ok(())) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
-            Ok(Err(e)) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
-            Err(_aborted) => return, // teardown owns the close; don't double-send
+            Some(Ok(Ok(()))) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
+            Some(Ok(Err(e))) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
+            Some(Err(_aborted)) => return, // teardown owns the close; don't double-send
+            // Peer FIN or link death: ack a close so the peer reaps its half (a
+            // no-op if the transport is already gone).
+            None => json!({ "type": "l2-close", "sid": sid }),
         };
         let _ = mux.transport.send_control(&close).await;
     }
@@ -1611,7 +1637,9 @@ pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send
 
 /// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
 /// sock -> stdout. Exit when the remote half closes (sock read EOF), the same
-/// "session over" semantics the cold netcat path has; then abort the stdin pump.
+/// "session over" semantics the cold netcat path has. Its OWN `tokio::io::stdin()`
+/// is fine here because netcat is a single-shot ProxyCommand (one process, one
+/// attach, no reconnect): the singleton is created once and never handed off.
 #[cfg(unix)]
 async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(sock);
@@ -1624,6 +1652,49 @@ async fn pump_stdio_over(sock: tokio::net::UnixStream) -> Result<()> {
     tokio::io::copy(&mut rd, &mut stdout).await?;
     let _ = stdout.flush().await;
     writer.abort();
+    Ok(())
+}
+
+/// Warm-pty variant of `pump_stdio_over` that draws input from the SHARED,
+/// invocation-long stdin reader instead of its own `tokio::io::stdin()`. The pty
+/// client can hand off warm->cold on a drop, so both halves MUST consume the one
+/// fd0 reader or a stale singleton swallows input after the handoff (see
+/// `spawn_stdin_reader`). `pending` preserves an input chunk pulled just as the
+/// warm socket died so the cold reattach re-sends it. Returns when the socket's
+/// remote half closes (warm session over: a drop OR a clean shell exit).
+#[cfg(unix)]
+async fn pump_warm_pty_stdio(
+    sock: tokio::net::UnixStream,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
+) -> Result<()> {
+    let (mut rd, mut wr) = tokio::io::split(sock);
+    if let Some(buf) = pending.take() {
+        if wr.write_all(&buf).await.is_err() {
+            *pending = Some(buf);
+            return Ok(());
+        }
+        let _ = wr.flush().await;
+    }
+    let mut stdout = tokio::io::stdout();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            r = rd.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break, // remote half closed: warm session over
+                Ok(n) => { stdout.write_all(&buf[..n]).await?; stdout.flush().await?; }
+            },
+            chunk = stdin_rx.recv() => match chunk {
+                Some(c) if c.is_empty() => { let _ = wr.shutdown().await; } // fd0 EOF
+                Some(c) => {
+                    if wr.write_all(&c).await.is_err() { *pending = Some(c); break; }
+                    let _ = wr.flush().await;
+                }
+                None => { let _ = wr.shutdown().await; }
+            },
+        }
+    }
+    let _ = stdout.flush().await;
     Ok(())
 }
 
@@ -1728,9 +1799,62 @@ enum PtyOutcome {
     Dropped,
 }
 
+/// A single, process-lifetime reader of fd0 for the resumable pty client.
+///
+/// tokio's `io::stdin()` is a GLOBAL singleton backed by an UNCANCELLABLE blocking
+/// read thread. The resumable client re-attaches on every link drop (and hands off
+/// warm->cold), and the old code spawned a fresh stdin reader per attach then
+/// `abort()`ed the previous one. Aborting a task parked in that shared blocking
+/// read does NOT stop the read: a stale reader keeps draining fd0 and routing bytes
+/// to a DEAD stream, so after a real reattach every keystroke is silently swallowed
+/// (observed live: a 30s outage closes QUIC, forces a true reattach, input dies -
+/// the read even shows up in strace, it just goes nowhere). Fix: read fd0 exactly
+/// ONCE, on a dedicated thread that lives for the whole invocation, and fan chunks
+/// to whichever attach is current over an mpsc channel. An empty Vec is the EOF
+/// sentinel (matches the `send_frame(sid, &[])` FIN convention). The thread ends on
+/// EOF/error; on a clean session exit the process exits right after, reaping it.
+fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(Vec::new()); // EOF sentinel
+                    break;
+                }
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break; // the client hung up
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Send `data` to the peer over one L2 stream, split into transport-sized frames.
+/// `Err(())` means a frame was rejected (the link is gone); the caller stashes the
+/// unsent input for the next attach so a keystroke typed at the drop is not lost.
+async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> std::result::Result<(), ()> {
+    let cap = t.max_payload().max(1);
+    for chunk in data.chunks(cap) {
+        if t.send_frame(sid, chunk).await.is_err() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
 /// One attach to the peer's PTY over a freshly-established link: open/reattach the
 /// `session_id`, bridge stdio, and return why it ended. Raw mode is owned by the
-/// caller (held across reconnects), so this only does size/resize/IO.
+/// caller (held across reconnects), so this only does size/resize/IO. `stdin_rx`
+/// is the shared, invocation-long stdin source (see `spawn_stdin_reader`); `pending`
+/// carries input pulled-but-unsent when the previous attach dropped, so a keystroke
+/// at the seam survives the reconnect.
 #[allow(clippy::too_many_arguments)]
 async fn pty_attach_once(
     server: &str,
@@ -1742,6 +1866,8 @@ async fn pty_attach_once(
     interactive: bool,
     resume: bool,
     raw: &mut Option<RawGuard>,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
 ) -> Result<PtyOutcome> {
     let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, role).await?;
     guard.forget();
@@ -1806,31 +1932,31 @@ async fn pty_attach_once(
     };
 
     let t_in = mux.transport();
-    let reader = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let cap = t_in.max_payload();
-        let mut buf = vec![0u8; cap];
-        loop {
-            match stdin.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    let _ = t_in.send_frame(sid, &[]).await;
-                    break;
-                }
-                Ok(n) => {
-                    if t_in.send_frame(sid, &buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
+    // Input buffered-but-unsent by the PREVIOUS (dropped) attach goes out first, so
+    // a keystroke typed right at the seam survives the reconnect. If this link is
+    // already dead, keep it stashed and report a drop so the loop reattaches again.
+    if let Some(buf) = pending.take() {
+        if send_frames_chunked(&t_in, sid, &buf).await.is_err() {
+            *pending = Some(buf);
+            #[cfg(unix)]
+            if let Some(w) = winch {
+                w.abort();
             }
+            mux.drop_stream(sid).await;
+            pump.abort();
+            return Ok(PtyOutcome::Dropped);
         }
-    });
+    }
 
-    // Stream remote output to stdout. End when the pipe closes (shell exit OR
-    // link death) - disambiguated by the transport's liveness. A 2s liveness
-    // poll is the backstop for a silent black-hole that never closes the pipe.
+    // Stream remote output to stdout AND forward local input, driven by the SHARED
+    // stdin reader (see `spawn_stdin_reader`) so reconnects never spawn a second
+    // fd0 consumer. End when the pipe closes (shell exit OR link death) - disambiguated
+    // by the transport's liveness. A 2s liveness poll is the backstop for a silent
+    // black-hole that never closes the pipe.
     let mut stdout = tokio::io::stdout();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.tick().await; // consume the immediate tick
+    let mut stdin_done = false; // fd0 hit EOF: stop reading it, keep pumping stdout
     let dropped;
     loop {
         tokio::select! {
@@ -1842,13 +1968,27 @@ async fn pty_attach_once(
                 // Pipe closed: clean exit (l2-close, link still alive) vs drop.
                 _ => { dropped = !mux.transport().is_alive(); break; }
             },
+            chunk = stdin_rx.recv(), if !stdin_done => match chunk {
+                // Empty Vec = fd0 EOF: send the FIN once, then stop reading stdin but
+                // keep draining remote output until the shell actually closes.
+                Some(c) if c.is_empty() => { let _ = t_in.send_frame(sid, &[]).await; stdin_done = true; }
+                Some(c) => {
+                    if send_frames_chunked(&t_in, sid, &c).await.is_err() {
+                        // Link died mid-send: stash the input for the next attach and
+                        // reconnect rather than lose it.
+                        *pending = Some(c);
+                        dropped = true;
+                        break;
+                    }
+                }
+                None => { stdin_done = true; } // shared reader gone (only at shutdown)
+            },
             _ = ticker.tick() => {
                 if !mux.transport().is_alive() { dropped = true; break; }
             }
         }
     }
 
-    reader.abort();
     #[cfg(unix)]
     if let Some(w) = winch {
         w.abort();
@@ -1876,6 +2016,8 @@ async fn try_warm_pty(
     session: &str,
     term: &str,
     raw: &mut Option<RawGuard>,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
 ) -> Option<Result<()>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let sock = crate::ctl::try_pty(peer, session, cols, rows, term).await?; // None = no warm link
@@ -1900,7 +2042,7 @@ async fn try_warm_pty(
             }
         }
     });
-    let r = pump_stdio_over(sock).await;
+    let r = pump_warm_pty_stdio(sock, stdin_rx, pending).await;
     winch.abort();
     Some(r)
 }
@@ -1927,6 +2069,14 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     // reconnects, and is restored on every exit path by this guard's Drop.
     let mut raw: Option<RawGuard> = None;
 
+    // ONE fd0 reader for the whole invocation, shared across the warm bridge and
+    // every cold reattach. tokio's stdin singleton can't be cancelled, so a
+    // per-attach reader leaks and swallows input after a reconnect (see
+    // `spawn_stdin_reader`). `pending` carries input pulled just as a link died so
+    // the reattach re-sends it instead of losing the keystroke.
+    let mut stdin_rx = spawn_stdin_reader();
+    let mut pending: Option<Vec<u8>> = None;
+
     // WARM FAST PATH: if the local `up` daemon already holds a (verified, direct)
     // link to `peer`, open the PTY over it - no signaling, no establishment, ~0.2s
     // instead of seconds. A miss / no daemon / no warm link falls through to the
@@ -1947,7 +2097,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
 
     #[cfg(unix)]
     if interactive && !relay {
-        match try_warm_pty(peer, &session_id, &term, &mut raw).await {
+        match try_warm_pty(peer, &session_id, &term, &mut raw, &mut stdin_rx, &mut pending).await {
             Some(Err(e)) => return Err(e),
             Some(Ok(())) => {
                 warm_ended = true;
@@ -1960,7 +2110,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     loop {
         // Resume-only for the FIRST attach right after a warm session ended.
         let resume = warm_ended && !ever_connected;
-        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive, resume, &mut raw).await {
+        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive, resume, &mut raw, &mut stdin_rx, &mut pending).await {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Dropped) => {
                 // Non-tty (scripted) sessions don't resume; a drop is the end.
@@ -3079,6 +3229,62 @@ mod h1_tests {
         fn max_payload(&self) -> usize {
             1024
         }
+    }
+
+    /// A transport whose liveness we can flip, to prove the daemon bridge tears
+    /// down on transport death (not just on a clean FIN) even with an IDLE client.
+    struct KillableTransport {
+        alive: std::sync::atomic::AtomicBool,
+    }
+    impl KillableTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(KillableTransport { alive: std::sync::atomic::AtomicBool::new(true) })
+        }
+        fn kill(&self) {
+            self.alive.store(false, Ordering::SeqCst);
+        }
+    }
+    #[async_trait]
+    impl Transport for KillableTransport {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Regression for the warm-pty deadlock: the daemon bridge (`serve_stream`) must
+    /// tear down when the PEER TRANSPORT dies even while the local client is IDLE.
+    /// The client->peer reader parks on the silent client socket and never notices
+    /// the death; awaiting only that reader (the old code) hung the warm bridge - and
+    /// the user's warm pty - until they happened to type. The liveness ticker now
+    /// catches it: with an idle client and a killed transport, this returns instead
+    /// of blocking forever.
+    #[tokio::test]
+    async fn serve_stream_tears_down_on_transport_death_with_idle_client() {
+        let t = KillableTransport::new();
+        let mux = Mux::new(t.clone());
+        let sid = L2_SID_BASE | 7;
+        let rx = mux.register(sid).await;
+        // A duplex pair: one half is the bridge's "client socket", the other we keep
+        // and NEVER write to, so the reader stays parked (the deadlock precondition).
+        let (client, server_side) = tokio::io::duplex(1024);
+        let bridge = tokio::spawn(serve_stream(mux.clone(), sid, server_side, rx, true, None));
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the reader park
+        t.kill(); // transport dies with no clean FIN and no client input
+        let r = tokio::time::timeout(Duration::from_secs(4), bridge).await;
+        assert!(r.is_ok(), "serve_stream deadlocked on an idle client after transport death");
+        drop(client);
     }
 
     /// `push_ring` keeps the buffer bounded by `cap`, evicting the OLDEST bytes,
