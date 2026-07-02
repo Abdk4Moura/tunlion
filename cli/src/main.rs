@@ -6888,6 +6888,16 @@ async fn recv_cmd(
     let mut last_reconnect_try = Instant::now();
     let mut probed_silence = false; // fired one forced sync before declaring down
     let mut last_watchdog = Instant::now();
+    // Link self-heal cadence (the multi-minute-outage fix, #3). A transport that
+    // died past the QUIC idle timeout lingers in `links` as a zombie and SUPPRESSES
+    // the KnownPeer re-dial (start_direct early-returns when a link exists), so the
+    // overlay never recovers. We DROP dead links here (so the next KnownPeer
+    // re-push re-establishes, single-driver + glare-safe = the model's proven
+    // disconnect->recover) but do NOT re-dial ourselves - a timer-based re-dial on
+    // BOTH ends caused a supersede storm. The L3 route is intentionally KEPT
+    // (continuity), so the re-establish's add_peer swaps the transport under the
+    // same overlay IP and the session resumes.
+    let mut last_link_health = Instant::now();
 
     // systemd Type=notify: announce readiness once the serving loop is about to
     // run, then ping the watchdog below. No-op when not run under systemd.
@@ -7149,6 +7159,28 @@ async fn recv_cmd(
                         }
                     }
                 }
+            }
+        }
+
+        // Link self-heal (#3): drop links whose transport has DIED so the KnownPeer
+        // re-dial (re-pushed on signaling reconnect + periodic sync) can rebuild
+        // them. Same action as the on-demand DropLink handler, just proactive; the
+        // L3 route is intentionally NOT retracted (continuity), so the re-establish's
+        // add_peer swaps the fresh transport under the same overlay IP. We do NOT
+        // re-dial here on purpose (single-driver = the model's proven, churn-free
+        // recovery; a both-ends timer re-dial storms).
+        if daemon && last_link_health.elapsed() >= Duration::from_secs(8) {
+            last_link_health = Instant::now();
+            let dead: Vec<String> = conn
+                .links
+                .iter()
+                .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| !t.is_alive()))
+                .map(|(pid, _)| pid.clone())
+                .collect();
+            for pid in dead {
+                ui::debug(&format!("filament: link to '{pid}' died, dropping so it can re-connect"));
+                conn.drop_link(&pid);
+                l2_muxes.remove(&pid);
             }
         }
 
