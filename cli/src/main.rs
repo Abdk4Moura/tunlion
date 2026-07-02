@@ -6998,17 +6998,35 @@ async fn recv_cmd(
     #[cfg(l3)]
     let exposer: Option<std::sync::Arc<expose::Exposer>> = match l3.as_ref() {
         Some(m) => {
-            let ex = expose::Exposer::new(m.clone());
-            let n = ex.reconcile().await;
-            if n > 0 {
-                ui::say(&format!(
-                    "  {} exposing {} port{} on the overlay",
-                    ui::paint(ui::Tone::Brand, "●"),
-                    n,
-                    if n == 1 { "" } else { "s" }
-                ));
+            // POSTURE (user decision): a node that SILENTLY fell back to userspace
+            // (Auto, no explicit opt-in) must NOT auto-honor expose.json, because
+            // userspace bypasses host firewall/nftables on filament0 - an operator
+            // who assumed kernel-mode scoping would silently lose it. Only honor
+            // expose in userspace when the user opted in (`--userspace` / the env /
+            // `l3-mode=userspace`). Kernel mode always honors it.
+            let userspace_opt_in = std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1")
+                || settings::get_str("l3-mode", None).as_deref() == Some("userspace");
+            if m.is_userspace() && !userspace_opt_in {
+                if !expose::load().is_empty() {
+                    ui::say(&ui::paint(ui::Tone::Warn,
+                        "  expose.json NOT honored: L3 fell back to userspace (host firewall is bypassed there)."));
+                    ui::say("    opt in with `filament up --userspace` or `filament set l3-mode userspace` to expose in userspace mode");
+                }
+                let ex = expose::Exposer::new(m.clone());
+                Some(ex) // held so a later live opt-in via ReloadExpose can still bind
+            } else {
+                let ex = expose::Exposer::new(m.clone());
+                let n = ex.reconcile().await;
+                if n > 0 {
+                    ui::say(&format!(
+                        "  {} exposing {} port{} on the overlay",
+                        ui::paint(ui::Tone::Brand, "●"),
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                Some(ex)
             }
-            Some(ex)
         }
         None => None,
     };

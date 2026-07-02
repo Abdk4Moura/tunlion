@@ -24,7 +24,7 @@ use tokio::task::AbortHandle;
 
 use crate::net::Transport;
 use crate::overlay::{Announce, Identity};
-use crate::tun::{KernelTun, NetstackTun, TunDevice};
+use crate::tun::{KernelTun, NetstackListener, NetstackStream, NetstackTun, TunDevice};
 
 /// How the overlay's packet endpoint is provided.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -35,6 +35,80 @@ pub enum L3Mode {
     Kernel,
     /// Force the userspace smoltcp netstack (zero privilege; containers/CI/no-sudo).
     Userspace,
+}
+
+/// A mode-agnostic accepted overlay connection: a kernel `TcpStream` (bound on the
+/// overlay IP) or a userspace smoltcp stream. Implements the same async byte-stream
+/// traits either way, so `expose`'s splice code is identical in both modes.
+pub enum OverlayStream {
+    Kernel(tokio::net::TcpStream),
+    Netstack(NetstackStream),
+}
+
+impl tokio::io::AsyncRead for OverlayStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            OverlayStream::Kernel(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OverlayStream::Netstack(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for OverlayStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            OverlayStream::Kernel(s) => std::pin::Pin::new(s).poll_write(cx, b),
+            OverlayStream::Netstack(s) => std::pin::Pin::new(s).poll_write(cx, b),
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            OverlayStream::Kernel(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OverlayStream::Netstack(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            OverlayStream::Kernel(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OverlayStream::Netstack(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// A mode-agnostic overlay listener. `accept` yields the next connection and the
+/// peer's overlay SOURCE address (the expose allowlist matches on it).
+pub enum OverlayListener {
+    Kernel(tokio::net::TcpListener),
+    Netstack(NetstackListener),
+}
+
+impl OverlayListener {
+    pub async fn accept(&self) -> Result<(OverlayStream, IpAddr)> {
+        match self {
+            OverlayListener::Kernel(l) => {
+                let (s, src) = l.accept().await?;
+                Ok((OverlayStream::Kernel(s), src.ip()))
+            }
+            OverlayListener::Netstack(nl) => {
+                let (s, src) = nl.accept().await?;
+                Ok((OverlayStream::Netstack(s), IpAddr::V6(src)))
+            }
+        }
+    }
 }
 
 /// The TUN interface name the daemon creates for the overlay.
@@ -63,11 +137,11 @@ pub struct L3 {
     /// MagicDNS: pid -> (petname, overlay addr) for VERIFIED peers, mirrored into a
     /// managed block in /etc/hosts so native tools resolve `<petname>` / `<petname>.mesh`.
     names: Mutex<HashMap<String, (String, Ipv6Addr)>>,
-    /// True when the endpoint is the userspace netstack (no kernel TUN). Then there
-    /// is no kernel route to the overlay, so we do NOT write /etc/hosts (names would
-    /// resolve but not route, which is worse than not resolving) and `add_route` is a
-    /// no-op (the netstack owns the prefix internally).
-    userspace: bool,
+    /// `Some` when the endpoint is the userspace netstack (no kernel TUN). Held as
+    /// the concrete type so `bind`/`dial` can open smoltcp sockets; its presence also
+    /// means there is no kernel route to the overlay, so we do NOT write /etc/hosts
+    /// (names would resolve but not route) and `add_route` is a no-op.
+    netstack: Option<Arc<NetstackTun>>,
 }
 
 impl L3 {
@@ -89,20 +163,27 @@ impl L3 {
             mode
         };
         let crypto = identity.is_some();
-        let (tun, userspace): (Arc<dyn TunDevice>, bool) = match mode {
-            L3Mode::Userspace => (Arc::new(NetstackTun::open(IFNAME, cidr, mtu)?), true),
-            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto)?, false),
+        // Keep the concrete NetstackTun (for bind/dial) AND the dyn handle (for the
+        // datagram pumps) when userspace; `None` netstack == kernel TUN.
+        let open_netstack = || -> Result<(Arc<dyn TunDevice>, Option<Arc<NetstackTun>>)> {
+            let ns = Arc::new(NetstackTun::open(IFNAME, cidr, mtu)?);
+            Ok((ns.clone() as Arc<dyn TunDevice>, Some(ns)))
+        };
+        let (tun, netstack): (Arc<dyn TunDevice>, Option<Arc<NetstackTun>>) = match mode {
+            L3Mode::Userspace => open_netstack()?,
+            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto)?, None),
             L3Mode::Auto => match open_kernel(cidr, mtu, crypto) {
-                Ok(t) => (t, false),
+                Ok(t) => (t, None),
                 Err(e) => {
                     crate::ui::say(&format!(
                         "  {} no kernel TUN ({e}); using the userspace overlay (zero privilege)",
                         crate::ui::paint(crate::ui::Tone::Brand, "●")
                     ));
-                    (Arc::new(NetstackTun::open(IFNAME, cidr, mtu)?), true)
+                    open_netstack()?
                 }
             },
         };
+        let userspace = netstack.is_some();
         let routes: Arc<Mutex<HashMap<IpAddr, PeerRoute>>> = Arc::new(Mutex::new(HashMap::new()));
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
@@ -111,7 +192,7 @@ impl L3 {
             identity,
             seq: AtomicU64::new(1),
             names: Mutex::new(HashMap::new()),
-            userspace,
+            netstack,
         });
         // Clear any stale MagicDNS block from a previous run - but only in kernel
         // mode; the userspace path never writes /etc/hosts (see `userspace`).
@@ -149,7 +230,21 @@ impl L3 {
     /// Callers use this to warn that host firewalling is bypassed and that native
     /// tools need the proxy/dial to reach `<peer>.mesh`.
     pub fn is_userspace(&self) -> bool {
-        self.userspace
+        self.netstack.is_some()
+    }
+
+    /// Listen on `port` on this node's overlay address, returning an endpoint that
+    /// works in BOTH modes: a kernel `TcpListener` bound to the overlay IP, or a
+    /// userspace smoltcp listener. `expose` rides this so it is TUN-free.
+    pub async fn bind(&self, port: u16) -> Result<OverlayListener> {
+        match &self.netstack {
+            Some(ns) => Ok(OverlayListener::Netstack(ns.listen(port).await?)),
+            None => {
+                let addr = self.my_addr().ok_or_else(|| anyhow!("L3 overlay address not set"))?;
+                let l = tokio::net::TcpListener::bind(std::net::SocketAddr::new(IpAddr::V6(addr), port)).await?;
+                Ok(OverlayListener::Kernel(l))
+            }
+        }
     }
 
     /// True if `addr` is a currently-routed (verified) peer on the overlay. Any
@@ -252,7 +347,7 @@ impl L3 {
         // Userspace mode has no kernel route to the overlay, so a resolved
         // `<peer>.mesh` would point at an unroutable IP (worse than not resolving);
         // skip /etc/hosts entirely and let dial/proxy resolve names in-process.
-        if self.userspace {
+        if self.netstack.is_some() {
             return;
         }
         let entries: Vec<(String, Ipv6Addr)> =
