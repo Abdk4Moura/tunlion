@@ -22,19 +22,19 @@ const UTUN_OPT_IFNAME: libc::c_int = 2;
 
 /// A utun device plus an async handle on its fd. Dropping it closes the fd; the
 /// kernel removes the interface once the last fd is gone.
-pub struct Tun {
+pub struct KernelTun {
     fd: AsyncFd<OwnedFd>,
     name: String,
 }
 
-impl Tun {
+impl KernelTun {
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Create a utun (kernel picks `utunN`), assign `cidr`, set `mtu`, bring it up.
     /// `requested` is ignored (utun devices can't be named); use `name()` after.
-    pub fn open(_requested: &str, cidr: &str, mtu: u32) -> Result<Tun> {
+    pub fn open(_requested: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
         let raw = unsafe { libc::socket(libc::PF_SYSTEM, libc::SOCK_DGRAM, libc::SYSPROTO_CONTROL) };
         if raw < 0 {
             let e = std::io::Error::last_os_error();
@@ -111,7 +111,7 @@ impl Tun {
         let _ = ifconfig(&[&name, "mtu", &mtu.to_string()]);
 
         let fd = AsyncFd::new(owned).context("register utun fd with the reactor")?;
-        Ok(Tun { fd, name })
+        Ok(KernelTun { fd, name })
     }
 
     /// Read one IP packet. utun prepends a 4-byte address-family word; readv lands
@@ -165,6 +165,21 @@ impl Tun {
                 Err(_would_block) => continue,
             }
         }
+    }
+}
+
+// Expose the kernel utun through the overlay's device seam (fully-qualified inherent
+// calls: no ambiguity with the trait methods, no accidental recursion).
+#[async_trait::async_trait]
+impl crate::tun::TunDevice for KernelTun {
+    fn name(&self) -> &str {
+        KernelTun::name(self)
+    }
+    async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        KernelTun::recv(self, buf).await
+    }
+    async fn send(&self, packet: &[u8]) -> Result<usize> {
+        KernelTun::send(self, packet).await
     }
 }
 

@@ -24,7 +24,7 @@ use tokio::task::AbortHandle;
 
 use crate::net::Transport;
 use crate::overlay::{Announce, Identity};
-use crate::tun::Tun;
+use crate::tun::{KernelTun, TunDevice};
 
 /// The TUN interface name the daemon creates for the overlay.
 const IFNAME: &str = "filament0";
@@ -37,7 +37,7 @@ struct PeerRoute {
 }
 
 pub struct L3 {
-    tun: Arc<Tun>,
+    tun: Arc<dyn TunDevice>,
     /// overlay dest IP -> that peer's route. Read on the TUN hot path, written as
     /// links come and go. The hot path takes the lock only to clone one Arc.
     routes: Arc<Mutex<HashMap<IpAddr, PeerRoute>>>,
@@ -64,7 +64,7 @@ impl L3 {
             .next()
             .and_then(|a| a.parse::<IpAddr>().ok())
             .ok_or_else(|| anyhow!("bad overlay address '{cidr}', want IP/PREFIX"))?;
-        let tun = Arc::new(Tun::open(IFNAME, cidr, mtu)?);
+        let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(IFNAME, cidr, mtu)?);
         // Route by the device's ACTUAL name: Linux honors the requested `filament0`,
         // but macOS assigns `utunN` (utun devices can't be renamed), so the hardcoded
         // constant would target the wrong interface there.
@@ -324,7 +324,7 @@ pub async fn run_point_to_point(
     tun_addr: &str,
     mtu: u32,
 ) -> Result<()> {
-    let tun = Arc::new(Tun::open(dev, tun_addr, mtu)?);
+    let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(dev, tun_addr, mtu)?);
     // datagram -> TUN (background)
     let c = conn.clone();
     let t = tun.clone();
