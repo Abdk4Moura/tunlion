@@ -5159,7 +5159,7 @@ async fn send_cmd(
     mut use_code: bool,
     mut word: Option<String>,
     room: Option<String>,
-    to: Option<String>,
+    mut to: Option<String>,
     name: Option<String>,
     relay: bool,
     remember: Option<String>,
@@ -5168,23 +5168,38 @@ async fn send_cmd(
         bail!("nothing to send, pass files, directories, or '-' for stdin");
     }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
-    // from stdin -> offer to mint a shareable code. Enter = local network
-    // (today's default); typing words drops into the CREATE entry. Kept minimal:
-    // a one-key choice gates the create-entry, nothing else about send changes.
-    // Skipped when reading payload from stdin ('-') so we never fight for stdin.
+    // from stdin. First offer to pick a PAIRED DEVICE (arrow-key list); the last
+    // item / Esc drops to the code path: Enter = local network, typed words mint a
+    // shareable code. Skipped when reading payload from stdin ('-').
     if !use_code && to.is_none() && !paths.iter().any(|p| p == "-") && interactive_allowed() {
-        ui::say(&ui::paint(
-            ui::Tone::Dim,
-            "  press enter to send over the local network, or type words to create a shareable code",
-        ));
-        let auto_np = filament_pake::words::mint_nameplate();
-        match codeentry::run("  send · code  ", codeentry::Mode::Create, "", &auto_np)? {
-            codeentry::Outcome::Submitted(words) => {
-                use_code = true;
-                word = Some(words);
+        let names: Vec<String> = devices_load().into_iter().map(|(n, _)| n).collect();
+        let mut chose_device = false;
+        if !names.is_empty() {
+            let mut items = names.clone();
+            items.push("shareable code / local network".into());
+            let header = ui::paint(ui::Tone::Dim, "  send to which device?  (up/down, enter, esc)");
+            if let Some(i) = codeentry::pick(&header, &items)? {
+                if i < names.len() {
+                    ui::say(&format!("  {} sending to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), names[i]));
+                    to = Some(names[i].clone());
+                    chose_device = true;
+                }
             }
-            codeentry::Outcome::Empty => { /* fall through to local-network send */ }
-            codeentry::Outcome::Cancelled => return Err(cancelled()),
+        }
+        if !chose_device {
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                "  press enter to send over the local network, or type words to create a shareable code",
+            ));
+            let auto_np = filament_pake::words::mint_nameplate();
+            match codeentry::run("  send · code  ", codeentry::Mode::Create, "", &auto_np)? {
+                codeentry::Outcome::Submitted(words) => {
+                    use_code = true;
+                    word = Some(words);
+                }
+                codeentry::Outcome::Empty => { /* fall through to local-network send */ }
+                codeentry::Outcome::Cancelled => return Err(cancelled()),
+            }
         }
     }
     // --name overrides the offered name, but only makes sense for a SINGLE
