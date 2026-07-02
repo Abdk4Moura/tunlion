@@ -47,8 +47,8 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping,
-    try_pty, try_reconfigure, try_reload, try_reload_expose, try_resize, Req, ReqKind,
+    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_open, try_open_at,
+    try_ping, try_pty, try_reconfigure, try_reload, try_reload_expose, try_resize, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
@@ -99,6 +99,27 @@ mod imp {
             return false;
         }
         UnixStream::connect(control_sock_path()).await.is_ok()
+    }
+
+    /// Try to DIAL `peer`'s OVERLAY address:`port` through the daemon's L3 plane
+    /// (an `expose`d overlay service, which an L2 loopback open cannot reach), and
+    /// on a userspace node the only way to reach `<peer>.mesh:port` at all. The
+    /// daemon resolves `peer` to its verified overlay address itself (never client-
+    /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
+    /// peer is unknown / L3 is down, so the caller can report a clean failure.
+    pub async fn try_dial(peer: &str, port: u16) -> Option<UnixStream> {
+        if reuse_disabled() {
+            return None;
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "dial", "peer": peer, "port": port });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = read_line(&mut s, 4096).await.ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(s)
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
@@ -282,6 +303,10 @@ mod imp {
     pub enum ReqKind {
         /// Open one raw L2 stream to `peer`'s localhost:`rport` (netcat/ssh/forward).
         Open { peer: String, rport: u16 },
+        /// Dial `peer`'s OVERLAY address:`port` over L3 (reaches an `expose`d overlay
+        /// service; the daemon resolves the peer to its verified overlay addr). The
+        /// proxy `.mesh` path uses this as a FALLBACK after the L2 `Open`.
+        Dial { peer: String, port: u16 },
         /// Open a PTY shell on `peer` (the warm pty fast path). `session` keys the
         /// peer's persistent PTY so a later reconnect reattaches the same shell.
         Pty { peer: String, session: String, cols: u16, rows: u16, term: String },
@@ -401,6 +426,11 @@ mod imp {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
                         let Some(rport) = v["rport"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
                         ReqKind::Open { peer, rport }
+                    }
+                    Some("dial") => {
+                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
+                        let Some(port) = v["port"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
+                        ReqKind::Dial { peer, port }
                     }
                     Some("pty") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };

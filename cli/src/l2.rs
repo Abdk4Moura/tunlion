@@ -1698,6 +1698,26 @@ async fn pump_warm_pty_stdio(
     Ok(())
 }
 
+/// `filament dial <peer> <port>`: wire this process's stdio to a service the peer
+/// EXPOSED on its overlay address, over L3 (the overlay-port counterpart of
+/// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
+/// local daemon, which resolves the peer to its verified overlay address and dials
+/// it, so it works from a userspace node with no kernel route.
+#[cfg(unix)]
+pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
+    match crate::ctl::try_dial(peer, port).await {
+        Some(sock) => pump_stdio_over(sock).await,
+        None => bail!(
+            "could not dial {peer}.mesh:{port} over the overlay (is the daemon up, the peer paired, and the port expose'd on it?)"
+        ),
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
+    bail!("filament dial needs the local daemon's control socket (unix only)")
+}
+
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
 /// This is the ssh ProxyCommand primitive.
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
@@ -2398,7 +2418,17 @@ async fn handle_socks(
             // presence on the peer).
             #[cfg(unix)]
             if crate::ctl::daemon_present().await {
+                // PRIMARY: the L2 loopback open reaches the peer's 127.0.0.1:dport
+                // over its opt-in acceptor (unchanged semantics).
                 if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
+                    socks_reply(&mut sock, 0x00).await?;
+                    return bridge_streams(sock, usock).await.map_err(Into::into);
+                }
+                // FALLBACK: reach a service the peer EXPOSED on its OVERLAY address
+                // (which the loopback open can't), and the only path on a userspace
+                // node. Tried only after the L2 open misses, so nothing that worked
+                // before changes; this only adds reachability to expose'd ports.
+                if let Some(usock) = crate::ctl::try_dial(&peer, dport).await {
                     socks_reply(&mut sock, 0x00).await?;
                     return bridge_streams(sock, usock).await.map_err(Into::into);
                 }
