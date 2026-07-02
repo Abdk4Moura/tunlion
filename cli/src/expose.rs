@@ -174,11 +174,11 @@ pub use imp::Exposer;
 mod imp {
     use super::{load, Binding};
     use crate::l3::L3;
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use std::collections::HashMap;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::IpAddr;
     use std::sync::Arc;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpStream;
     use tokio::sync::Mutex;
     use tokio::task::JoinHandle;
 
@@ -238,11 +238,10 @@ mod imp {
         }
 
         async fn spawn(self: Arc<Self>, b: Binding) -> Result<JoinHandle<()>> {
-            let addr = self.l3.my_addr().context("L3 overlay is not up")?;
-            let bind = SocketAddr::new(IpAddr::V6(addr), b.port);
-            let listener = TcpListener::bind(bind)
-                .await
-                .with_context(|| format!("bind [{addr}]:{}", b.port))?;
+            // Mode-agnostic listen on the overlay: a kernel TcpListener bound on the
+            // overlay IP, or the userspace smoltcp listener (TUN-free). The accept +
+            // splice below is identical either way.
+            let listener = self.l3.bind(b.port).await?;
             let me = self.clone();
             let jh = tokio::spawn(async move {
                 loop {
@@ -254,7 +253,7 @@ mod imp {
                             continue;
                         }
                     };
-                    if !me.allowed(&b, src.ip()).await {
+                    if !me.allowed(&b, src).await {
                         continue; // not a permitted peer; drop
                     }
                     let target = b.target.clone();
