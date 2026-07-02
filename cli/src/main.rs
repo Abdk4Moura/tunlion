@@ -1647,6 +1647,54 @@ fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: 
     } else {
         ui::say("  wrote the unit; enable it with: sudo systemctl enable --now filament");
     }
+
+    // Belt-and-suspenders: a NOPASSWD sudoers drop-in scoped to JUST restarting this
+    // one service, so any fallback `sudo systemctl restart filament` (e.g. when the
+    // reload op is unavailable) is password-free too. Written the same TOCTOU-safe
+    // way (piped to tee, no world-writable staging), mode 0440, and validated with
+    // visudo - a malformed sudoers drop-in must NEVER be left in place, so it is
+    // removed if it does not parse.
+    let systemctl = ["/usr/bin/systemctl", "/bin/systemctl"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .unwrap_or("/usr/bin/systemctl");
+    let sudoers_path = "/etc/sudoers.d/filament";
+    let sudoers = format!(
+        "{user} ALL=(root) NOPASSWD: {systemctl} restart filament, {systemctl} daemon-reload\n"
+    );
+    let wrote_sudoers = {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut cmd = if am_root {
+            std::process::Command::new("tee")
+        } else {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("tee");
+            c
+        };
+        match cmd.arg(sudoers_path).stdin(Stdio::piped()).stdout(Stdio::null()).spawn() {
+            Ok(mut ch) => {
+                if let Some(mut si) = ch.stdin.take() {
+                    let _ = si.write_all(sudoers.as_bytes());
+                }
+                ch.wait().map(|s| s.success()).unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    };
+    if wrote_sudoers {
+        let _ = run_priv(&["chmod", "0440", sudoers_path]);
+        if run_priv(&["visudo", "-cf", sudoers_path]) {
+            ui::say(&format!(
+                "  {} passwordless `systemctl restart filament` for {user}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            ));
+        } else {
+            let _ = run_priv(&["rm", "-f", sudoers_path]);
+            ui::say("  (skipped the restart sudoers rule: visudo validation failed)");
+        }
+    }
     Ok(())
 }
 
@@ -4560,6 +4608,9 @@ async fn handle_warm_req(
         // ReloadExpose is likewise handled inline in the daemon loop (it owns the
         // Exposer); answer defensively if it ever reaches here.
         ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
+        // Reload is handled inline in the daemon loop (it self-SIGTERMs); answer
+        // defensively if it ever reaches here.
+        ctl::ReqKind::Reload => req.reply(&json!({ "ok": true, "reloading": false })).await,
     }
 }
 
@@ -5324,15 +5375,29 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
             std::process::Command::new("sudo").args(["setcap", "cap_net_admin+eip"]).arg(&me).status().map(|s| s.success()).unwrap_or(false)
         };
         if ok {
-            println!("re-applied CAP_NET_ADMIN (L3 overlay); restart the daemon to use it");
+            println!("re-applied CAP_NET_ADMIN (L3 overlay)");
         } else {
-            println!("note: re-grant L3's capability then restart:\n    sudo setcap cap_net_admin+eip {}", me.display());
+            println!("note: re-grant L3's capability:\n    sudo setcap cap_net_admin+eip {}", me.display());
         }
         // A non-root L3 node also needs write on /etc/hosts to publish MagicDNS
         // names; grant the narrow per-file ACL here too so a plain `filament
         // update` is all it takes (no separate `set tun-addr` step). No-op for
         // root or if already granted.
         crate::tun::ensure_hosts_writable();
+    }
+    // Reload a running daemon onto the new binary with no manual restart. A
+    // supervised daemon (systemd) takes the graceful SIGTERM path - which cleanly
+    // closes the QUIC links so peers re-establish and L3 recovers - and its
+    // supervisor restarts it with fresh ambient caps: no sudo. If it isn't
+    // supervised (or predates this op), tell the user to restart it.
+    #[cfg(unix)]
+    {
+        let reloading = matches!(ctl::try_reload().await, Some(ref v) if v["reloading"].as_bool() == Some(true));
+        if reloading {
+            println!("reloading the daemon onto the new binary (graceful restart, no sudo)");
+        } else if daemon_alive().is_some() {
+            println!("restart the daemon to run the new binary: `systemctl restart filament` (or `filament down` then `filament up ...`)");
+        }
     }
     Ok(())
 }
@@ -7098,6 +7163,23 @@ async fn recv_cmd(
                                 }
                             };
                             req.reply(&json!({ "ok": true, "live": live, "count": count })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::Reload) {
+                            // `filament update` reload: only safe when a supervisor
+                            // will bring us back (systemd sets INVOCATION_ID). Reply
+                            // FIRST (the shutdown closes the ctl socket), then take the
+                            // SAME graceful path SIGTERM does - which cleanly closes the
+                            // QUIC links so peers re-establish and L3 recovers - by
+                            // raising SIGTERM on ourselves. systemd's Restart=always
+                            // then starts the new binary with fresh ambient caps: no
+                            // manual restart, no sudo. Unsupervised, we decline (exiting
+                            // would just leave the node down).
+                            let supervised = std::env::var("INVOCATION_ID").is_ok();
+                            req.reply(&json!({ "ok": true, "reloading": supervised })).await;
+                            if supervised {
+                                ui::say("filament: reloading onto the updated binary (graceful restart)");
+                                #[cfg(unix)]
+                                unsafe { libc::raise(libc::SIGTERM); }
+                            }
                         } else if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
                         } else {

@@ -48,7 +48,7 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
 pub use imp::{
     daemon_present, send_reply, serve, serve_at, try_bootstrap, try_open, try_open_at, try_ping,
-    try_pty, try_reconfigure, try_reload_expose, try_resize, Req, ReqKind,
+    try_pty, try_reconfigure, try_reload, try_reload_expose, try_resize, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
@@ -253,6 +253,29 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask a running `up` daemon to RELOAD onto a freshly `filament update`d binary
+    /// with no manual restart and no sudo. The daemon gracefully shuts down (the
+    /// same path a `systemctl restart` / SIGTERM takes, which cleanly closes the
+    /// QUIC links so peers re-establish and L3 recovers) and its supervisor
+    /// (systemd `Restart=always`) starts it again on the new binary with fresh
+    /// AmbientCapabilities. Reply `{"ok":true,"reloading":true}` when it will do
+    /// so, `{"ok":true,"reloading":false,...}` when it is NOT under a supervisor
+    /// (exiting would leave it down, so it declines), or `None` if no daemon answered.
+    pub async fn try_reload() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "reload" });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -289,6 +312,10 @@ mod imp {
         /// `{"ok":true,"live":true,"count":<n>}` where `n` is the number of ports
         /// now bound; `live:false` if L3 is not up in the daemon.
         ReloadExpose,
+        /// Gracefully restart to pick up an updated binary (`filament update`).
+        /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
+        /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
+        Reload,
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -404,6 +431,7 @@ mod imp {
                         ReqKind::Reconfigure { key }
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
+                    Some("reload") => ReqKind::Reload,
                     _ => return,
                 };
                 let _ = tx.send(Req { kind, sock });
