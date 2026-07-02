@@ -1644,7 +1644,7 @@ fn tour_cmd() -> Result<()> {
     if n == 0 {
         act("filament pair", "remember a device (unlocks ssh + expose)");
     } else {
-        act("filament ssh <device>", "shell into a paired device");
+        act("filament <device>", "shell into a paired device (e.g. filament dovm)");
         act("filament expose <port>", "publish a local port on the mesh");
     }
     act("filament up", "receive in the background");
@@ -4723,6 +4723,12 @@ async fn main() -> Result<()> {
                 // sender, receive it (no v2 ceremony; the recv path fails loudly
                 // if the peer can't run the handshake).
                 argv.insert(1, "recv".into());
+            } else if devices_load().iter().any(|(n, _)| n == first) {
+                // Bare device name = ssh into it: `filament dovm` == `filament ssh
+                // dovm` (and `filament dovm ls -la` runs the command). Matches the
+                // shortest-path muscle memory; a real subcommand still wins (checked
+                // above via CMDS), and this only fires for a name you've paired.
+                argv.insert(1, "ssh".into());
             }
         }
     }
