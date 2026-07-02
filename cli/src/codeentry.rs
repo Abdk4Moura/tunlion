@@ -251,6 +251,59 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
     let _ = err.flush();
 }
 
+/// Redraw the picker list in place: a header plus one line per item, the selected
+/// one marked and colored. After the first paint the cursor is parked below the
+/// list, so subsequent paints move up `items+1` lines first. Raw mode disables
+/// newline translation, hence explicit `\r\n`.
+fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool) {
+    let mut err = std::io::stderr();
+    let color = ui::caps().color;
+    if redraw {
+        let _ = write!(err, "\x1b[{}A", items.len() + 1);
+    }
+    let _ = write!(err, "\r\x1b[2K{header}\r\n");
+    for (i, it) in items.iter().enumerate() {
+        let (mark, c, r) = if i == sel {
+            ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
+        } else {
+            (" ", "", "")
+        };
+        let _ = write!(err, "\r\x1b[2K  {c}{mark} {it}{r}\r\n");
+    }
+    let _ = err.flush();
+}
+
+/// Interactive picker: Up/Down (or k/j) to move, Enter to choose, Esc/q/Ctrl-C to
+/// cancel. Returns the chosen index, or None on cancel. The terminal is ALWAYS
+/// restored (RawGuard). Callers append their own "none of these" item if they want
+/// an in-list escape hatch.
+pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let _guard = RawGuard::enable()?;
+    let mut sel = 0usize;
+    let mut redraw = false;
+    loop {
+        render_picker(header, items, sel, redraw);
+        redraw = true;
+        let ev = event::read()?;
+        let Event::Key(k) = ev else { continue };
+        if k.kind == KeyEventKind::Release {
+            continue;
+        }
+        match k.code {
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+            KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
+            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
+            KeyCode::Enter => return Ok(Some(sel)),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
 /// Drive the live, steered entry. Returns the user's outcome. The terminal is
 /// ALWAYS restored before returning (RawGuard). `prefill` seeds the buffer (used
 /// for the malformed-arg "fix it" path). Pass the SAME `auto_nameplate` you'll
