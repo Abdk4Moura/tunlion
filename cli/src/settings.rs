@@ -679,9 +679,15 @@ pub async fn run_set(
             }
             // Enabling the L3 overlay needs CAP_NET_ADMIN for a non-root daemon;
             // grant it now (one sudo prompt) so `up` just works, no separate step.
+            // BUT the userspace backend needs no privilege, so don't prompt for a
+            // setcap the user explicitly opted out of (l3-mode=userspace or the env).
             #[cfg(l3)]
             if !dry_run && s.key == "tun-addr" && !new.is_empty() {
-                crate::tun::ensure_net_admin_for_l3();
+                let userspace = std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1")
+                    || get_str("l3-mode", None).as_deref() == Some("userspace");
+                if !userspace {
+                    crate::tun::ensure_net_admin_for_l3();
+                }
             }
             Ok(())
         }

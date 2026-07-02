@@ -451,6 +451,13 @@ enum Cmd {
         /// for a password again. Recommended for the kernelspace (kernel-TUN) path.
         #[arg(long)]
         system: bool,
+        /// Force the ZERO-PRIVILEGE userspace overlay (an in-process smoltcp netstack
+        /// instead of a kernel TUN): no CAP_NET_ADMIN, no /dev/net/tun, works in a
+        /// container. Note: host firewall rules do not apply and native tools reach
+        /// <peer>.mesh only via `filament proxy`/`dial`. Default is auto (kernel TUN
+        /// when available, userspace otherwise).
+        #[arg(long)]
+        userspace: bool,
         /// Drop directory (default: `filament config dir`, else ~/Filament)
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -5099,7 +5106,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, dir, shell, shell_only, shell_user } => {
+        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_user } => {
+            // `--userspace` forces the netstack backend; L3::start reads this env, so
+            // set it before the daemon brings L3 up (same process). Safe: single
+            // threaded at this point (the daemon's tasks are not spawned yet).
+            if userspace {
+                unsafe { std::env::set_var("FILAMENT_L3_USERSPACE", "1") };
+            }
             // Flags win; otherwise fall back to persistent settings. Per-peer
             // `shell on` overrides fold into the shell-only allowlist so
             // `filament set shell on --peer laptop` unifies with --shell-only.
@@ -6938,13 +6951,33 @@ async fn recv_cmd(
                 if cidr.is_empty() {
                     None
                 } else {
-                    match l3::L3::start(&cidr, 1280, identity) {
+                    // Endpoint selection: `l3-mode` setting (kernel|userspace|auto),
+                    // default Auto; FILAMENT_L3_USERSPACE / `up --userspace` force
+                    // userspace (handled inside L3::start via the env).
+                    let mode = match settings::get_str("l3-mode", None).as_deref() {
+                        Some("kernel") => l3::L3Mode::Kernel,
+                        Some("userspace") => l3::L3Mode::Userspace,
+                        _ => l3::L3Mode::Auto,
+                    };
+                    match l3::L3::start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
-                            ui::say(&format!(
-                                "  {} L3 overlay {} on filament0",
-                                ui::paint(ui::Tone::Brand, "●"),
-                                m.my_addr().map(|a| a.to_string()).unwrap_or(cidr)
-                            ));
+                            let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
+                            if m.is_userspace() {
+                                ui::say(&format!(
+                                    "  {} L3 overlay {} (userspace, zero privilege)",
+                                    ui::paint(ui::Tone::Brand, "●"),
+                                    addr
+                                ));
+                                ui::say(&ui::paint(ui::Tone::Warn,
+                                    "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
+                                ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
+                            } else {
+                                ui::say(&format!(
+                                    "  {} L3 overlay {} on filament0",
+                                    ui::paint(ui::Tone::Brand, "●"),
+                                    addr
+                                ));
+                            }
                             Some(m)
                         }
                         Err(e) => {
