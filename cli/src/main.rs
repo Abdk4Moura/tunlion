@@ -614,6 +614,17 @@ enum Cmd {
         /// Remote port on the peer's localhost
         rport: u16,
     },
+    /// Connect stdio to a service a peer EXPOSED on its overlay address, over L3.
+    ///
+    /// The overlay-port counterpart of `netcat` (which reaches the peer's localhost):
+    /// `dial` reaches a port the peer published with `filament expose`, and is the
+    /// way a userspace node (no kernel route) reaches `<peer>.mesh:<port>`.
+    Dial {
+        /// Known device (petname) whose overlay service to reach
+        peer: String,
+        /// Port the peer exposed on its overlay address
+        port: u16,
+    },
     /// Open a PTY shell on a known device and bridge it to this terminal (the CLI
     /// sibling of the browser web-shell). The peer must run `up --shell` (or grant
     /// shell). Off by default; FILAMENT_L2=1 / --shell enables the acceptor.
@@ -4603,6 +4614,9 @@ async fn handle_warm_req(
 ) {
     match &req.kind {
         ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req).await,
+        // Dial is handled inline in the daemon loop (it needs the L3 manager);
+        // answer defensively if it ever reaches here.
+        ctl::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
         ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
         ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, req).await,
@@ -5210,6 +5224,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
+        Cmd::Dial { peer, port } => l2::dial_cmd(&peer, port).await,
         Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
@@ -7231,6 +7246,36 @@ async fn recv_cmd(
                                 #[cfg(unix)]
                                 unsafe { libc::raise(libc::SIGTERM); }
                             }
+                        } else if matches!(&req.kind, ctl::ReqKind::Dial { .. }) {
+                            // Overlay dial (proxy `.mesh` fallback): resolve the peer
+                            // to its VERIFIED overlay address ourselves, dial it over
+                            // L3, and bridge the ctl socket to it. Spawned so the
+                            // long-lived splice never blocks the event loop.
+                            #[cfg(l3)]
+                            if let ctl::ReqKind::Dial { peer, port } = &req.kind {
+                                let (peer, port) = (peer.clone(), *port);
+                                match l3.as_ref() {
+                                    Some(m) => {
+                                        let m = m.clone();
+                                        tokio::spawn(async move {
+                                            let Some(addr) = m.addr_of(&peer).await else {
+                                                req.reject("unknown overlay peer").await;
+                                                return;
+                                            };
+                                            match m.dial(addr, port).await {
+                                                Ok(mut stream) => {
+                                                    let mut sock = req.accept().await;
+                                                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                                                }
+                                                Err(e) => req.reject(&format!("overlay dial failed: {e}")).await,
+                                            }
+                                        });
+                                    }
+                                    None => req.reject("L3 overlay is not up").await,
+                                }
+                            }
+                            #[cfg(not(l3))]
+                            req.reject("L3 overlay not supported on this build").await;
                         } else if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
                         } else {

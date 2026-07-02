@@ -233,6 +233,21 @@ impl L3 {
         self.netstack.is_some()
     }
 
+    /// Dial `dst:port` over the overlay, in BOTH modes: a kernel `TcpStream`
+    /// (routed via filament0) or an in-process smoltcp connection. This is what lets
+    /// a node reach a peer's OVERLAY-exposed service (an `expose` bound on the
+    /// overlay IP, which an L2 loopback open cannot reach) - and the ONLY way a
+    /// userspace node (no kernel route) reaches `<peer>.mesh:port` at all.
+    pub async fn dial(&self, dst: Ipv6Addr, port: u16) -> Result<OverlayStream> {
+        match &self.netstack {
+            Some(ns) => Ok(OverlayStream::Netstack(ns.dial(dst, port).await?)),
+            None => {
+                let s = tokio::net::TcpStream::connect(std::net::SocketAddr::new(IpAddr::V6(dst), port)).await?;
+                Ok(OverlayStream::Kernel(s))
+            }
+        }
+    }
+
     /// Listen on `port` on this node's overlay address, returning an endpoint that
     /// works in BOTH modes: a kernel `TcpListener` bound to the overlay IP, or a
     /// userspace smoltcp listener. `expose` rides this so it is TUN-free.
@@ -259,6 +274,14 @@ impl L3 {
     pub async fn petname_of(&self, addr: IpAddr) -> Option<String> {
         let IpAddr::V6(v6) = addr else { return None };
         self.names.lock().await.values().find(|(_, a)| *a == v6).map(|(n, _)| n.clone())
+    }
+
+    /// Resolve a verified peer's petname to its overlay address (the inverse of
+    /// `petname_of`). The daemon uses this so a `dial` targets an address DERIVED
+    /// from a paired identity, never one the client asserts.
+    pub async fn addr_of(&self, name: &str) -> Option<Ipv6Addr> {
+        let name = sanitize_host(name);
+        self.names.lock().await.values().find(|(n, _)| *n == name).map(|(_, a)| *a)
     }
 
     /// Build a signed announce of our address bound to link channel-binding `cb`.
