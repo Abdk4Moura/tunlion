@@ -1593,13 +1593,38 @@ fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: 
     if !am_root {
         ui::say("  (one-time sudo for the system unit; updates afterward need none)");
     }
-    // Stage the unit in a temp file we own, then `install` it into place privileged
-    // (no shell, no redirect-as-root gymnastics).
-    let tmp = std::env::temp_dir().join("filament.service.tmp");
-    std::fs::write(&tmp, &unit)?;
-    let tmp_s = tmp.display().to_string();
-    let wrote = run_priv(&["install", "-m", "644", &tmp_s, unit_path]);
-    let _ = std::fs::remove_file(&tmp);
+    // Write the unit as root by PIPING it to `tee` under the privileged runner.
+    // Deliberately NO on-disk staging: a predictable, world-writable temp file
+    // (e.g. /tmp/filament.service.tmp) is a TOCTOU - another local user could
+    // swap or symlink it between our write and the privileged copy, yielding an
+    // attacker-controlled ROOT-owned systemd unit (root code execution). Piping to
+    // `tee` has no intermediary to race; sudo still reads its password from the tty,
+    // not our stdin, so the small unit content flows to tee uncontended.
+    let wrote = {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut cmd = if am_root {
+            std::process::Command::new("tee")
+        } else {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("tee");
+            c
+        };
+        match cmd.arg(unit_path).stdin(Stdio::piped()).stdout(Stdio::null()).spawn() {
+            Ok(mut child) => {
+                if let Some(mut si) = child.stdin.take() {
+                    let _ = si.write_all(unit.as_bytes());
+                    // si drops here, closing stdin so tee finalizes the file.
+                }
+                child.wait().map(|s| s.success()).unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    };
+    if wrote {
+        // tee creates with the (root) umask; pin the mode explicitly.
+        let _ = run_priv(&["chmod", "644", unit_path]);
+    }
     if !wrote {
         ui::say("filament: could not elevate; install the system unit by hand:");
         ui::say(&format!("  sudo tee {unit_path} >/dev/null <<'UNIT'\n{unit}UNIT"));
