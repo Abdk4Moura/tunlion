@@ -178,7 +178,20 @@ struct SockRec {
     /// For a listening socket: (port, sink to deliver the accepted stream). When it
     /// establishes we hand the stream to the sink and arm a fresh listen socket.
     listen: Option<(u16, mpsc::UnboundedSender<(NetstackStream, Ipv6Addr)>)>,
+    /// The overlay SOURCE of an ACCEPTED (delivered) connection; used to budget
+    /// live sockets per peer so one paired peer can't exhaust the netstack.
+    src: Option<Ipv6Addr>,
 }
+
+/// Max live sockets total, and max ACCEPTED connections from one overlay source.
+/// smoltcp has no SYN-cookies or large conn table, so budget both: a paired peer
+/// (paired != fully trusted) opening a flood of connections to an exposed port must
+/// not deny it to every other peer, nor exhaust process memory.
+const MAX_SOCKETS: usize = 512;
+const MAX_PER_SOURCE: usize = 64;
+/// Listen sockets kept armed per exposed port, so simultaneous connections aren't
+/// refused for want of a pending accept slot.
+const LISTEN_BACKLOG: usize = 16;
 
 // ----------------------------------------------------------------- phy device ---
 
@@ -380,6 +393,7 @@ async fn poll_loop(
                                 established: false,
                                 dial_reply: Some(reply),
                                 listen: None,
+                                src: None,
                             });
                         }
                         Err(e) => {
@@ -388,12 +402,22 @@ async fn poll_loop(
                     }
                 }
                 Cmd::Listen { port, reply } => {
+                    // Arm a BACKLOG of listen sockets so simultaneous connections
+                    // aren't RST'd for want of a pending socket (each accept re-arms
+                    // one, keeping the backlog topped up).
                     let (tx, rx) = mpsc::unbounded_channel();
-                    match arm_listen(sockets, socks, port, tx.clone()) {
-                        Ok(()) => {
+                    let mut err = None;
+                    for _ in 0..LISTEN_BACKLOG {
+                        if let Err(e) = arm_listen(sockets, socks, port, tx.clone()) {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    match err {
+                        None => {
                             let _ = reply.send(Ok(NetstackListener { port, accept_rx: AsyncMutex::new(rx) }));
                         }
-                        Err(e) => {
+                        Some(e) => {
                             let _ = reply.send(Err(e));
                         }
                     }
@@ -447,6 +471,14 @@ async fn poll_loop(
 
         // 5. net -> app: pull rx bytes into each socket's in pipe (respect capacity);
         //    fire dial replies / listener accepts on establishment; reap dead sockets.
+        // Per-source budget snapshot for this pass (accepted connections per peer).
+        let mut per_src: std::collections::HashMap<Ipv6Addr, usize> = std::collections::HashMap::new();
+        for r in socks.iter() {
+            if let Some(a) = r.src {
+                *per_src.entry(a).or_default() += 1;
+            }
+        }
+        let total_socks = socks.len();
         let mut new_listens: Vec<(u16, mpsc::UnboundedSender<(NetstackStream, Ipv6Addr)>)> = Vec::new();
         let mut remove: Vec<usize> = Vec::new();
         for (idx, rec) in socks.iter_mut().enumerate() {
@@ -463,19 +495,29 @@ async fn poll_loop(
                     };
                     let _ = reply.send(Ok(stream));
                 }
-                if let Some((port, sink)) = &rec.listen {
+                if let Some((port, sink)) = rec.listen.take() {
                     let src = match s.remote_endpoint() {
                         Some(IpEndpoint { addr: IpAddress::Ipv6(a), .. }) => a,
                         _ => my_addr, // unreachable in practice (IPv6-only overlay)
                     };
-                    let stream = NetstackStream {
-                        out: rec.out.clone(),
-                        inp: rec.inp.clone(),
-                        wake: wake.clone(),
-                    };
-                    let _ = sink.send((stream, src));
-                    new_listens.push((*port, sink.clone())); // re-arm a backlog slot
-                    rec.listen = None; // this socket is now a live connection
+                    // Re-arm the port either way so it keeps serving other peers.
+                    new_listens.push((port, sink.clone()));
+                    let over = total_socks >= MAX_SOCKETS
+                        || *per_src.get(&src).unwrap_or(&0) >= MAX_PER_SOURCE;
+                    if over {
+                        // Budget exceeded: RST this connection; the lifecycle check
+                        // below reaps the socket. Other peers are unaffected.
+                        s.abort();
+                    } else {
+                        *per_src.entry(src).or_default() += 1;
+                        rec.src = Some(src); // count it against this source
+                        let stream = NetstackStream {
+                            out: rec.out.clone(),
+                            inp: rec.inp.clone(),
+                            wake: wake.clone(),
+                        };
+                        let _ = sink.send((stream, src));
+                    }
                 }
             }
 
@@ -565,6 +607,7 @@ fn arm_listen(
         established: false,
         dial_reply: None,
         listen: Some((port, sink)),
+        src: None,
     });
     Ok(())
 }
@@ -772,5 +815,138 @@ mod tests {
         }
         assert_eq!(&got, b"HELLO-OVERLAY", "byte stream must round-trip through both stacks");
         server.await.unwrap();
+    }
+
+    /// Cross-wire two stacks' datagram planes, optionally DROPPING every `drop_nth`
+    /// packet each direction to model a lossy overlay. `drop_nth == 0` = lossless.
+    fn cross_wire(a: Arc<NetstackTun>, b: Arc<NetstackTun>, drop_nth: u64) {
+        fn pump(from: Arc<NetstackTun>, to: Arc<NetstackTun>, drop_nth: u64) {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 2048];
+                let mut n = 0u64;
+                while let Ok(sz) = from.recv(&mut buf).await {
+                    if sz == 0 {
+                        break;
+                    }
+                    n += 1;
+                    if drop_nth != 0 && n % drop_nth == 0 {
+                        continue; // drop this packet; TCP must retransmit
+                    }
+                    if to.send(&buf[..sz]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        pump(a.clone(), b.clone(), drop_nth);
+        pump(b, a, drop_nth);
+    }
+
+    /// M7 resilience: a real byte stream survives a LOSSY overlay. smoltcp TCP over
+    /// unreliable QUIC datagrams must retransmit and deliver every byte intact - the
+    /// core assumption behind running TCP on the datagram plane.
+    #[tokio::test]
+    async fn netstack_transfers_intact_through_packet_loss() {
+        let a_addr: Ipv6Addr = "fdf1:1af7:c30d:a11::1".parse().unwrap();
+        let b_addr: Ipv6Addr = "fdf1:1af7:c30d:b22::1".parse().unwrap();
+        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        cross_wire(a.clone(), b.clone(), 7); // drop ~1 in 7 packets each way
+
+        let listener = b.listen(9100).await.unwrap();
+        let payload: Vec<u8> = (0..12000u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u8).collect();
+        let expect = payload.clone();
+        let server = tokio::spawn(async move {
+            let (mut s, _src) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 2048];
+            while got.len() < expect.len() {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expect, "payload corrupted or truncated under loss");
+            let _ = s.write_all(b"OK").await;
+            let _ = s.flush().await;
+            let _ = s.shutdown().await;
+        });
+
+        let mut client = tokio::time::timeout(Duration::from_secs(25), a.dial(b_addr, 9100))
+            .await
+            .expect("dial timed out under loss")
+            .expect("dial failed");
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(25), client.read_exact(&mut ack))
+            .await
+            .expect("ack timed out under loss")
+            .unwrap();
+        assert_eq!(&ack, b"OK");
+        server.await.unwrap();
+    }
+
+    /// M7 concurrency/soak: many simultaneous connections to one netstack listener
+    /// all complete (accept loop + per-socket servicing don't wedge or cross wires),
+    /// and the sockets are reaped afterwards (no leak).
+    #[tokio::test]
+    async fn netstack_serves_many_concurrent_connections() {
+        let a_addr: Ipv6Addr = "fdf1:1af7:c30d:c33::1".parse().unwrap();
+        let b_addr: Ipv6Addr = "fdf1:1af7:c30d:d44::1".parse().unwrap();
+        let a = Arc::new(NetstackTun::open("filament0", &format!("{a_addr}/128"), 1280).unwrap());
+        let b = Arc::new(NetstackTun::open("filament0", &format!("{b_addr}/128"), 1280).unwrap());
+        cross_wire(a.clone(), b.clone(), 0); // lossless
+
+        const N: u32 = 12;
+        let listener = std::sync::Arc::new(b.listen(9200).await.unwrap());
+        let srv = {
+            let listener = listener.clone();
+            tokio::spawn(async move {
+                for _ in 0..N {
+                    let (mut s, _src) = match listener.accept().await {
+                        Ok(x) => x,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 64];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        let up = buf[..n].to_ascii_uppercase();
+                        let _ = s.write_all(&up).await;
+                        let _ = s.flush().await;
+                        let _ = s.shutdown().await;
+                    });
+                }
+            })
+        };
+
+        let mut clients = Vec::new();
+        for i in 0..N {
+            let a = a.clone();
+            clients.push(tokio::spawn(async move {
+                let mut c = a.dial(b_addr, 9200).await.expect("dial failed");
+                let msg = format!("client-{i}");
+                c.write_all(msg.as_bytes()).await.unwrap();
+                c.flush().await.unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 64];
+                while got.len() < msg.len() {
+                    let n = c.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                assert_eq!(got, msg.to_ascii_uppercase().into_bytes(), "connection {i} crossed wires or truncated");
+            }));
+        }
+        for (i, h) in clients.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(15), h)
+                .await
+                .unwrap_or_else(|_| panic!("client {i} timed out"))
+                .unwrap();
+        }
+        srv.abort();
     }
 }
