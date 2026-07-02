@@ -1,0 +1,64 @@
+# Test + cross-compile gate on every push/PR.
+#
+# `cargo test` runs the full suite, including the userspace L3 netstack interop
+# tests (src/tun/netstack.rs): ICMPv6 echo + malformed-input fuzz, a two-stack
+# dial->listen->byte-roundtrip, TCP survival through ~1-in-7 packet loss, and many
+# concurrent connections. These are the netstack<->netstack interop + resilience
+# proofs and need NO kernel TUN, so they run on a stock runner. The cross-build job
+# confirms the smoltcp netstack still compiles on every shipped target (musl,
+# macOS, Windows), not just at release time.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        working-directory: cli
+        run: cargo test --release
+
+  cross-build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            features: "--features static"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            features: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            features: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - name: Build
+        working-directory: cli
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *windows-msvc* ]]; then
+            export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+          fi
+          cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
