@@ -33,10 +33,9 @@ pub trait TunDevice: Send + Sync {
 }
 
 // Userspace (zero-privilege) overlay backend. Platform-independent (pure smoltcp,
-// no OS device). Wired into l3.rs's device selection in a later milestone (which
-// will re-export NetstackTun); exercised by its own tests today.
-#[allow(dead_code)]
+// no OS device). Selected by l3.rs when there is no kernel TUN.
 mod netstack;
+pub use netstack::NetstackTun;
 
 #[cfg(target_os = "linux")]
 mod linux;

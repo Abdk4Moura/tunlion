@@ -24,7 +24,18 @@ use tokio::task::AbortHandle;
 
 use crate::net::Transport;
 use crate::overlay::{Announce, Identity};
-use crate::tun::{KernelTun, TunDevice};
+use crate::tun::{KernelTun, NetstackTun, TunDevice};
+
+/// How the overlay's packet endpoint is provided.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum L3Mode {
+    /// Kernel TUN when it can be created, else the userspace netstack. The default.
+    Auto,
+    /// Force the kernel TUN; fail if it can't be created.
+    Kernel,
+    /// Force the userspace smoltcp netstack (zero privilege; containers/CI/no-sudo).
+    Userspace,
+}
 
 /// The TUN interface name the daemon creates for the overlay.
 const IFNAME: &str = "filament0";
@@ -52,27 +63,46 @@ pub struct L3 {
     /// MagicDNS: pid -> (petname, overlay addr) for VERIFIED peers, mirrored into a
     /// managed block in /etc/hosts so native tools resolve `<petname>` / `<petname>.mesh`.
     names: Mutex<HashMap<String, (String, Ipv6Addr)>>,
+    /// True when the endpoint is the userspace netstack (no kernel TUN). Then there
+    /// is no kernel route to the overlay, so we do NOT write /etc/hosts (names would
+    /// resolve but not route, which is worse than not resolving) and `add_route` is a
+    /// no-op (the netstack owns the prefix internally).
+    userspace: bool,
 }
 
 impl L3 {
-    /// Start the overlay. In CRYPTO mode (`identity` set) the TUN takes this node's
-    /// derived `<addr>/128` and the whole overlay prefix is routed to it; in manual
-    /// mode `cidr` is used verbatim (PSK/lab). Spawns the TUN->datagram reader.
-    /// Needs CAP_NET_ADMIN.
-    pub fn start(cidr: &str, mtu: u32, identity: Option<Identity>) -> Result<Arc<L3>> {
+    /// Start the overlay. In CRYPTO mode (`identity` set) the endpoint takes this
+    /// node's derived `<addr>/128` and the whole overlay prefix routes to it; in
+    /// manual mode `cidr` is used verbatim (PSK/lab). `mode` picks the packet
+    /// endpoint: Kernel needs CAP_NET_ADMIN; Userspace needs none; Auto tries the
+    /// kernel TUN and silently falls back to the userspace netstack if it can't be
+    /// created (no cap, no /dev/net/tun, container without `ip`, locked netns).
+    /// `FILAMENT_L3_USERSPACE=1` forces Userspace regardless of `mode`.
+    pub fn start(cidr: &str, mtu: u32, identity: Option<Identity>, mode: L3Mode) -> Result<Arc<L3>> {
         cidr.split('/')
             .next()
             .and_then(|a| a.parse::<IpAddr>().ok())
             .ok_or_else(|| anyhow!("bad overlay address '{cidr}', want IP/PREFIX"))?;
-        let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(IFNAME, cidr, mtu)?);
-        // Route by the device's ACTUAL name: Linux honors the requested `filament0`,
-        // but macOS assigns `utunN` (utun devices can't be renamed), so the hardcoded
-        // constant would target the wrong interface there.
-        // Crypto mode: overlay addresses are scattered /128s across the shared ULA
-        // prefix, so route the whole prefix to the TUN (userspace demuxes per /128).
-        if identity.is_some() {
-            crate::tun::add_route(&crate::overlay::prefix_cidr(), tun.name())?;
-        }
+        let mode = if std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1") {
+            L3Mode::Userspace
+        } else {
+            mode
+        };
+        let crypto = identity.is_some();
+        let (tun, userspace): (Arc<dyn TunDevice>, bool) = match mode {
+            L3Mode::Userspace => (Arc::new(NetstackTun::open(IFNAME, cidr, mtu)?), true),
+            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto)?, false),
+            L3Mode::Auto => match open_kernel(cidr, mtu, crypto) {
+                Ok(t) => (t, false),
+                Err(e) => {
+                    crate::ui::say(&format!(
+                        "  {} no kernel TUN ({e}); using the userspace overlay (zero privilege)",
+                        crate::ui::paint(crate::ui::Tone::Brand, "●")
+                    ));
+                    (Arc::new(NetstackTun::open(IFNAME, cidr, mtu)?), true)
+                }
+            },
+        };
         let routes: Arc<Mutex<HashMap<IpAddr, PeerRoute>>> = Arc::new(Mutex::new(HashMap::new()));
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
@@ -81,10 +111,13 @@ impl L3 {
             identity,
             seq: AtomicU64::new(1),
             names: Mutex::new(HashMap::new()),
+            userspace,
         });
-        // Clear any stale MagicDNS block from a previous run (best-effort; a
-        // non-root daemon just skips /etc/hosts and the overlay still works by IP).
-        let _ = rewrite_hosts_block(&[]);
+        // Clear any stale MagicDNS block from a previous run - but only in kernel
+        // mode; the userspace path never writes /etc/hosts (see `userspace`).
+        if !userspace {
+            let _ = rewrite_hosts_block(&[]);
+        }
 
         // TUN -> datagram: one reader for the whole node. Each packet's dest IP
         // selects the peer link (cryptokey-routing style). A miss (no route) or a
@@ -110,6 +143,13 @@ impl L3 {
     /// This node's overlay address (crypto mode only).
     pub fn my_addr(&self) -> Option<Ipv6Addr> {
         self.identity.as_ref().map(|i| i.addr())
+    }
+
+    /// True when running on the userspace netstack (no kernel TUN / no privilege).
+    /// Callers use this to warn that host firewalling is bypassed and that native
+    /// tools need the proxy/dial to reach `<peer>.mesh`.
+    pub fn is_userspace(&self) -> bool {
+        self.userspace
     }
 
     /// True if `addr` is a currently-routed (verified) peer on the overlay. Any
@@ -209,12 +249,34 @@ impl L3 {
     /// non-root daemon (or read-only /etc/hosts) just skips it and the overlay
     /// still works by IP.
     async fn refresh_hosts(&self) {
+        // Userspace mode has no kernel route to the overlay, so a resolved
+        // `<peer>.mesh` would point at an unroutable IP (worse than not resolving);
+        // skip /etc/hosts entirely and let dial/proxy resolve names in-process.
+        if self.userspace {
+            return;
+        }
         let entries: Vec<(String, Ipv6Addr)> =
             self.names.lock().await.values().map(|(n, a)| (n.clone(), *a)).collect();
         if let Err(e) = rewrite_hosts_block(&entries) {
             crate::ui::debug(&format!("  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"));
         }
     }
+}
+
+/// Open the KERNEL TUN end to end: create the device AND install the overlay-prefix
+/// route (crypto mode). Both steps can fail in a container (no cap, no /dev/net/tun,
+/// no `ip`, locked netns); doing them together lets `L3Mode::Auto` catch ANY failure
+/// and fall back to the userspace netstack instead of dropping off the overlay.
+#[cfg(l3)]
+fn open_kernel(cidr: &str, mtu: u32, crypto: bool) -> Result<Arc<dyn TunDevice>> {
+    let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(IFNAME, cidr, mtu)?);
+    // Route by the device's ACTUAL name: Linux honors `filament0`, but macOS assigns
+    // `utunN` (utun devices can't be renamed). Crypto mode scatters /128s across the
+    // shared ULA prefix, so route the whole prefix to the TUN (userspace demuxes).
+    if crypto {
+        crate::tun::add_route(&crate::overlay::prefix_cidr(), tun.name())?;
+    }
+    Ok(tun)
 }
 
 const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
