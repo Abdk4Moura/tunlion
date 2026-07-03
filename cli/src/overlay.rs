@@ -63,6 +63,41 @@ pub fn addr_from_pubkey(pubkey: &[u8; 32]) -> Ipv6Addr {
     Ipv6Addr::from(octets)
 }
 
+// ------------------------------------------------------ v4 overlay (opt-in) --
+//
+// The OPT-IN dual-stack v4 plane lets v4-only services (a server on 0.0.0.0 or a
+// specific v4 iface) be reached over the mesh. Reserved range `198.18.0.0/15` (RFC
+// 2544 benchmark space): never internet-routed, and clear of tailscale's 100.64/10
+// and typical LAN/docker ranges, so it never shadows a real host. UNLIKE the v6
+// address this is NOT self-certifying - 17 host bits can't cryptographically bind a
+// key - so the v4 address is carried in the SAME signed `Announce` as the v6 address
+// and trusted via that signature + channel binding. The v6 self-cert stays the
+// anchor; v4 rides its trust. Collisions are birthday-bounded (~1 at a few hundred
+// peers) and handled separately.
+
+const V4_PREFIX: [u8; 4] = [198, 18, 0, 0];
+const V4_PREFIX_LEN: u8 = 15;
+/// Low 17 bits = the host part of a `/15`.
+const V4_HOST_MASK: u32 = 0x0001_FFFF;
+/// Domain tag for the v4 host derivation, distinct from the v6 addr tag.
+const ADDR_V4_DOMAIN: &[u8] = b"filament/overlay-v4-addr/v1\0";
+
+/// The v4 overlay prefix as a CIDR string for route installation.
+pub fn prefix_v4_cidr() -> String {
+    format!("{}/{}", std::net::Ipv4Addr::from(V4_PREFIX), V4_PREFIX_LEN)
+}
+
+/// Derive this device's v4 overlay address: the `198.18.0.0/15` prefix with the low
+/// 17 bits taken from `SHA256(ADDR_V4_DOMAIN || pubkey)`.
+pub fn addr_v4_from_pubkey(pubkey: &[u8; 32]) -> std::net::Ipv4Addr {
+    let mut h = Sha256::new();
+    h.update(ADDR_V4_DOMAIN);
+    h.update(pubkey);
+    let digest = h.finalize();
+    let host = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) & V4_HOST_MASK;
+    std::net::Ipv4Addr::from(u32::from_be_bytes(V4_PREFIX) | host)
+}
+
 // ------------------------------------------------------------- identity key --
 
 fn key_path() -> PathBuf {
@@ -123,6 +158,11 @@ impl Identity {
     }
     pub fn addr(&self) -> Ipv6Addr {
         self.addr
+    }
+    /// This device's v4 overlay address (opt-in dual-stack). Always derivable; only
+    /// installed as a route when the v4 overlay is enabled.
+    pub fn addr_v4(&self) -> std::net::Ipv4Addr {
+        addr_v4_from_pubkey(&self.pubkey)
     }
 
     /// Build a signed announcement of our address bound to `cb` (this link's
@@ -274,6 +314,19 @@ mod tests {
     #[test]
     fn distinct_keys_distinct_addrs() {
         assert_ne!(addr_from_pubkey(&[1u8; 32]), addr_from_pubkey(&[2u8; 32]));
+    }
+
+    #[test]
+    fn v4_addr_in_benchmark_range_deterministic_and_distinct() {
+        let pk = [7u8; 32];
+        let a = addr_v4_from_pubkey(&pk);
+        assert_eq!(a, addr_v4_from_pubkey(&pk), "deterministic");
+        // Inside 198.18.0.0/15 (first octet 198; second 18 or 19).
+        let o = a.octets();
+        assert_eq!(o[0], 198, "must carry the benchmark prefix: {a}");
+        assert!(o[1] == 18 || o[1] == 19, "must be within /15: {a}");
+        assert_ne!(a, addr_v4_from_pubkey(&[8u8; 32]), "distinct keys -> distinct addrs");
+        assert_eq!(prefix_v4_cidr(), "198.18.0.0/15");
     }
 
     #[test]
