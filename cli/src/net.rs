@@ -744,16 +744,20 @@ pub(crate) async fn resolve_warm(host: &str, port: u16) -> Vec<SocketAddr> {
     prefer_v4(result)
 }
 
-/// Order IPv4 targets before IPv6 for these CONTROL-PLANE calls (config/signaling).
-/// Many hosts have no route to public IPv6 - a home network with v4-only internet,
-/// or any overlay node whose `filament0` ULA nudges the stack into "thinking" it has
-/// v6 - so a v6-first list dead-ends the connect with ENETUNREACH. v4-first connects
-/// immediately there and still falls back to v6 on a v4-less host (reqwest tries the
-/// whole list). Stable sort, so it only moves v6 after v4 without reshuffling within
-/// a family.
-fn prefer_v4(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    addrs.sort_by_key(|a| a.is_ipv6());
-    addrs
+/// Steer CONTROL-PLANE calls (config/signaling) at targets the host can actually
+/// reach, then order IPv4 first. Many hosts have NO route to public IPv6 - a home
+/// network with v4-only internet, or any overlay node whose `filament0` ULA nudges
+/// the stack into "thinking" it has v6 - so a v6 target dead-ends the connect with
+/// ENETUNREACH (the "Network unreachable (os error 101)" a v4-only box hit). We DROP
+/// any address the host has no source route to (a route lookup via `source_ip_for`,
+/// no packets sent), so reqwest can't even attempt the unroutable family, then put
+/// v4 first. Filtering to empty (paranoia) falls back to the original list so we
+/// never make things worse than before.
+fn prefer_v4(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let routable: Vec<SocketAddr> = addrs.iter().copied().filter(|a| source_ip_for(*a).is_some()).collect();
+    let mut result = if routable.is_empty() { addrs } else { routable };
+    result.sort_by_key(|a| a.is_ipv6());
+    result
 }
 
 // ------------------------------------------------------------- HTTP config --
