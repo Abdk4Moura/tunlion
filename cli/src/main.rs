@@ -8217,6 +8217,20 @@ async fn recv_cmd(
                         }
                     }
                 }
+                // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
+                // (a warm `open`) is connected end to end. Route it to the mux so
+                // verify_first_frame passes even for a client-speaks-first service
+                // (HTTP, DB clients) that sends no bytes until we do, instead of the
+                // verify window expiring and a HEALTHY link being dropped as a zombie
+                // (which made every warm `forward` fall to a cold link). See
+                // l2::Mux::on_open_ack.
+                Some("l2-open-ack") if l2_enabled => {
+                    if let Some(sid) = v["sid"].as_u64() {
+                        if let Some(mux) = l2_muxes.get(&pid) {
+                            mux.on_open_ack(sid as u32).await;
+                        }
+                    }
+                }
                 // L2 (ssh/TCP tunnel) acceptor. Opt-in (FILAMENT_L2=1). The
                 // capability gate is the proof-verified `trusted` flag on this
                 // link (placeholder for L1-a caps); localhost-only is enforced in

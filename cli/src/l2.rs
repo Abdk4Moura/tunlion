@@ -231,6 +231,23 @@ impl Mux {
         }
     }
 
+    /// Deliver a liveness marker for `sid` when the acceptor's `l2-open-ack` lands.
+    /// Warm-reuse verification (`verify_first_frame`) needs proof the held link still
+    /// delivers BEFORE it commits the client. A server-speaks-first protocol supplies
+    /// that proof itself (sshd's banner), but a CLIENT-speaks-first one (HTTP, most DB
+    /// clients) sends no app bytes until the client does - so without this the verify
+    /// window expired and a HEALTHY link was wrongly dropped as a zombie, making every
+    /// `forward` connection fall to a fresh cold link (the "no extra presence" promise
+    /// broke). The ack is an empty `Some`: `on_frame` maps real empty payloads to
+    /// `None`/EOF, so `Some(empty)` never occurs organically and is an unambiguous
+    /// marker; replaying it writes zero bytes to the client.
+    pub async fn on_open_ack(&self, sid: u32) {
+        let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send(Some(Bytes::new())).await;
+        }
+    }
+
     /// Inbound l2-close. `err` set = RST/abort (drop, do NOT deliver clean EOF);
     /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
@@ -1461,8 +1478,9 @@ pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<Pr
 
 /// Drive the initiator's inbound event pump: route L2 control/data into the mux
 /// and tear everything down on data-channel death. The initiator never accepts
-/// inbound opens (it allocates ids); an l2-open-ack unparks nothing today (no
-/// credits) but is consumed so the protocol stays honest.
+/// inbound opens (it allocates ids); an l2-open-ack is delivered to the stream as a
+/// liveness marker so warm-reuse verification passes even for a client-speaks-first
+/// protocol (see `Mux::on_open_ack`).
 async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -1472,7 +1490,11 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                         mux.on_close(sid as u32, v["err"].as_str()).await;
                     }
                 }
-                Some("l2-open-ack") => { /* TODO(credits): seed the send window */ }
+                Some("l2-open-ack") => {
+                    if let Some(sid) = v["sid"].as_u64() {
+                        mux.on_open_ack(sid as u32).await;
+                    }
+                }
                 _ => {}
             },
             Ev::Chunk(_pid, sid, data) if is_l2_sid(sid) => {
@@ -2197,12 +2219,132 @@ async fn bridge_streams(mut tcp: TcpStream, mut unix: tokio::net::UnixStream) ->
 /// establishing ONE cold link lazily and multiplexing connections over it, the
 /// original behavior. The warm path also sidesteps the single-link credit caveat:
 /// each connection is an independent stream over the daemon's link.
+/// Normalize a device name for self-comparison: lowercase, alphanumerics only, so
+/// "pop-os", "popos", and "Pop_OS" all compare equal.
+fn norm_device_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// True when `peer` names THIS device (its configured name, that name's host part,
+/// or the system hostname), so the forward would just loop back to this machine.
+fn forward_target_is_self(peer: &str) -> bool {
+    let p = norm_device_name(peer);
+    if p.is_empty() {
+        return false;
+    }
+    let dn = crate::display_name();
+    let host_part = dn.rsplit('@').next().unwrap_or("").to_string();
+    let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    [dn.as_str(), host_part.as_str(), hostname.trim()]
+        .iter()
+        .any(|c| !c.is_empty() && norm_device_name(c) == p)
+}
+
+/// Live per-connection accounting for `forward`, so the user can SEE it working
+/// instead of staring at a static "ready" line. Increments on accept, decrements on
+/// close (RAII), keeps one updating status line ("N active, M total"), and prints a
+/// one-time confirmation on the very first forwarded connection.
+struct ForwardActivity {
+    active: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    first: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    peer: String,
+    rport: u16,
+}
+
+impl ForwardActivity {
+    fn new(peer: &str, rport: u16) -> Self {
+        Self {
+            active: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            peer: peer.to_string(),
+            rport,
+        }
+    }
+    fn line(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::ui::status(&format!(
+            "filament: forwarding to {}:{} - {} active, {} total",
+            self.peer,
+            self.rport,
+            self.active.load(Relaxed),
+            self.total.load(Relaxed)
+        ));
+    }
+    /// Register a newly accepted connection; the returned guard decrements on drop.
+    fn begin(&self) -> ConnGuard {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.total.fetch_add(1, Relaxed);
+        self.active.fetch_add(1, Relaxed);
+        if !self.first.swap(true, Relaxed) {
+            crate::ui::say(&format!(
+                "filament: first connection forwarded to {}:{} - the link is live",
+                self.peer, self.rport
+            ));
+        }
+        self.line();
+        ConnGuard {
+            active: self.active.clone(),
+            total: self.total.clone(),
+            peer: self.peer.clone(),
+            rport: self.rport,
+        }
+    }
+}
+
+struct ConnGuard {
+    active: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    peer: String,
+    rport: u16,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.active.fetch_sub(1, Relaxed);
+        crate::ui::status(&format!(
+            "filament: forwarding to {}:{} - {} active, {} total",
+            self.peer,
+            self.rport,
+            self.active.load(Relaxed),
+            self.total.load(Relaxed)
+        ));
+    }
+}
+
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
+    // Refuse a forward to THIS device before doing anything: it would just loop back,
+    // and the generic "no known device" error hides what actually happened.
+    if forward_target_is_self(peer) {
+        bail!(
+            "filament: '{peer}' is this device - a forward reaches a DIFFERENT machine. \
+             Whatever runs on this host's :{rport} is already here as 127.0.0.1:{rport}; \
+             point the forward at another peer (see `filament devices`)."
+        );
+    }
+    // Resolve the peer against the paired devices UP FRONT, so an unknown/typo'd
+    // target fails immediately with a clear message instead of after a premature
+    // "ready" (the warm path used to announce success before ever reaching the peer).
+    if !crate::devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(peer)) {
+        bail!(
+            "filament: no known device named '{peer}'. Pair it first with `filament pair`, \
+             then `filament devices` shows who you can reach."
+        );
+    }
     // Bind first so a port conflict fails fast, before any network work.
     let listener = match TcpListener::bind(("127.0.0.1", lport)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             bail!("{}", port_in_use_msg(lport, peer, rport));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            bail!(
+                "filament: cannot bind 127.0.0.1:{lport}: permission denied. Local ports below \
+                 1024 need root; pick a higher local port (e.g. `filament forward 8{lport:0>3} {peer} {rport}`) \
+                 or run with sudo."
+            );
         }
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!(
@@ -2228,9 +2370,23 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // Published via a watch channel the accept loop reads. Not started on the warm
     // path (that would create the extra presence we are avoiding).
     let mut cold_rx = if via_daemon {
-        crate::ui::say(&format!(
-            "filament: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon (connections are instant, no extra presence on {peer})"
-        ));
+        // Report the ACTUAL peer link state, not a blanket "ready". The daemon may
+        // hold a live warm link (then connections really are instant) or none yet
+        // (then it opens on the first connection) - saying "ready, instant" in the
+        // second case is what left the user unsure whether it was forwarding.
+        match crate::ctl::try_ping(peer).await {
+            Some(facts) => {
+                let route = facts["route"].as_str().unwrap_or("link");
+                crate::ui::say(&format!(
+                    "filament: ready - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})"
+                ));
+            }
+            None => {
+                crate::ui::say(&format!(
+                    "filament: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `filament ping {peer}`)"
+                ));
+            }
+        }
         None
     } else {
         crate::ui::status(&format!("filament: bringing up the link to {peer} ..."));
@@ -2251,6 +2407,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         Some(rx)
     };
 
+    let activity = ForwardActivity::new(peer, rport);
     loop {
         // A transient accept error (e.g. EMFILE/ENFILE under fd pressure) must NOT
         // tear down the listener; back off briefly and keep serving.
@@ -2268,7 +2425,9 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         #[cfg(unix)]
         if warm {
             if let Some(usock) = crate::ctl::try_open(peer, rport).await {
+                let guard = activity.begin();
                 tokio::spawn(async move {
+                    let _guard = guard; // decrements + refreshes the activity line on close
                     let _ = bridge_streams(sock, usock).await;
                 });
                 continue;
@@ -2289,12 +2448,17 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
             cold_rx = Some(rx);
         }
         let rx = cold_rx.clone().unwrap();
+        let guard = activity.begin();
+        let peer_c = peer.to_string();
         // Serve this connection, retrying across a reconnect: a link that died in
         // the poll window is skipped (is_alive) and open_stream failures re-wait
         // for the manager's fresh link. On give-up the socket is dropped (closed),
         // but the ACCEPT LOOP ALWAYS SURVIVES -- one connection is never allowed to
         // kill the whole forward (the beta.28/29 regression class).
-        tokio::spawn(serve_cold_connection(rx, sock, rport, peer.to_string()));
+        tokio::spawn(async move {
+            let _guard = guard; // decrements + refreshes the activity line on close
+            serve_cold_connection(rx, sock, rport, peer_c).await;
+        });
     }
 }
 
@@ -3495,6 +3659,53 @@ mod h1_tests {
 
         mux.on_frame(sid, Bytes::new()).await; // peer FIN closes the writer pump
         drop(client); // client EOF closes the reader pump
+        s.await.expect("serve task panicked");
+    }
+
+    /// The client-speaks-first case (HTTP, most DB clients): the peer sends NO app
+    /// bytes until we do, only the `l2-open-ack` confirming its local connect. Warm
+    /// verify must pass on that ack - not hang until the window expires and wrongly
+    /// drop a healthy link (the bug that sent every warm `forward` to a cold link) -
+    /// and replay it as ZERO bytes so the client sees no spurious data before its own
+    /// exchange.
+    #[tokio::test]
+    async fn warm_reuse_client_first_link_passes_on_open_ack() {
+        let t = CapTransport::new();
+        let mux = Mux::new(t.clone());
+
+        let mux2 = mux.clone();
+        let h = tokio::spawn(async move {
+            open_stream_verified(&mux2, 80, std::time::Duration::from_secs(5)).await
+        });
+        let sid = loop {
+            if let Some(&sid) = mux.streams.lock().await.keys().next() {
+                break sid;
+            }
+            tokio::task::yield_now().await;
+        };
+        // Only the acceptor's connect confirmation arrives - no app data yet.
+        mux.on_open_ack(sid).await;
+
+        let (got_sid, first, rx) =
+            h.await.expect("task panicked").expect("open-ack must prove the link live");
+        assert_eq!(got_sid, sid);
+        assert_eq!(first, Some(Bytes::new()), "the ack is an empty liveness marker");
+
+        // Replaying the empty ack writes nothing; real app data (sent only after the
+        // client would have spoken) still reaches the client intact.
+        let (mut client, srv) = tokio::io::duplex(1024);
+        let mux3 = mux.clone();
+        let s = tokio::spawn(async move { serve_verified_stream(mux3, sid, srv, first, rx).await });
+        mux.on_frame(sid, Bytes::from_static(b"HTTP/1.1 200 OK")).await;
+        let mut buf = [0u8; 15];
+        client
+            .read_exact(&mut buf)
+            .await
+            .expect("real data must reach the client after the empty ack");
+        assert_eq!(&buf, b"HTTP/1.1 200 OK", "the empty ack must not corrupt the stream");
+
+        mux.on_frame(sid, Bytes::new()).await;
+        drop(client);
         s.await.expect("serve task panicked");
     }
 }
