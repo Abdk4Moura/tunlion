@@ -229,6 +229,12 @@ impl L3 {
         self.identity.as_ref().map(|i| i.addr())
     }
 
+    /// This node's dual-stack IPv4 overlay address (crypto mode only), key-derived
+    /// in the reserved 198.18.0.0/15 range.
+    pub fn my_addr_v4(&self) -> Option<std::net::Ipv4Addr> {
+        self.identity.as_ref().map(|i| i.addr_v4())
+    }
+
     /// True when running on the userspace netstack (no kernel TUN / no privilege).
     /// Callers use this to warn that host firewalling is bypassed and that native
     /// tools need the proxy/dial to reach `<peer>.mesh`.
