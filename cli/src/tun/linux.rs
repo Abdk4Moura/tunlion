@@ -329,6 +329,25 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Assign an ADDITIONAL address `cidr` to `dev` (the node's v4 overlay address on
+/// top of the primary v6 ULA, so the kernel delivers inbound v4 overlay packets
+/// locally). CAP_NET_ADMIN ambient is already raised by `KernelTun::open`, so the
+/// child `ip` inherits it. An existing identical address ("File exists") is success.
+pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
+    let fam = if cidr.contains(':') { "-6" } else { "-4" };
+    let out = std::process::Command::new("ip")
+        .args([fam, "addr", "add", cidr, "dev", dev])
+        .output()
+        .context("exec ip addr")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.contains("File exists") {
+            bail!("ip {fam} addr add {cidr} dev {dev}: {}", err.trim());
+        }
+    }
+    Ok(())
+}
+
 /// Run an `ip` (iproute2) command, mapping a non-zero exit to an error with the
 /// captured stderr so a misconfig is legible.
 fn ip(args: &[&str]) -> Result<()> {

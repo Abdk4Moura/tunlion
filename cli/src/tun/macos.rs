@@ -208,6 +208,25 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Assign an ADDITIONAL (alias) address `cidr` to `dev` (the node's v4 overlay
+/// address alongside the primary v6 ULA). Best-effort second family for the dual-
+/// stack overlay; an already-present alias is treated as success.
+pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
+    let (addr, prefixlen) = split_cidr(cidr);
+    let fam = if addr.contains(':') { "inet6" } else { "inet" };
+    let out = std::process::Command::new("ifconfig")
+        .args([dev, fam, &format!("{addr}/{prefixlen}"), "alias"])
+        .output()
+        .context("exec ifconfig")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.contains("File exists") && !err.to_lowercase().contains("already") {
+            bail!("ifconfig {dev} {fam} {addr} alias: {}", err.trim());
+        }
+    }
+    Ok(())
+}
+
 /// macOS has no capability model; creating a utun needs root. Report clearly.
 pub fn ensure_net_admin_for_l3() -> bool {
     if unsafe { libc::geteuid() } == 0 {

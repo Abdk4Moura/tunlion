@@ -114,21 +114,20 @@ impl OverlayListener {
 /// The TUN interface name the daemon creates for the overlay.
 const IFNAME: &str = "filament0";
 
-/// A routed peer: the transport its overlay packets ride, plus the reader task so
-/// a replaced/removed peer's reader is aborted (never leaked, review fix #2).
-struct PeerRoute {
-    transport: Arc<dyn Transport>,
-    reader: AbortHandle,
-}
-
 pub struct L3 {
     tun: Arc<dyn TunDevice>,
-    /// overlay dest IP -> that peer's route. Read on the TUN hot path, written as
-    /// links come and go. The hot path takes the lock only to clone one Arc.
-    routes: Arc<Mutex<HashMap<IpAddr, PeerRoute>>>,
-    /// pid -> overlay IP, so a link drop (keyed by pid in main.rs) can retract the
-    /// right route.
-    by_pid: Mutex<HashMap<String, IpAddr>>,
+    /// overlay dest IP -> the transport that peer's packets ride. Read on the TUN hot
+    /// path, written as links come and go. A dual-stack peer has TWO entries here (its
+    /// v6 ULA and its v4 address) both pointing at the same transport. The hot path
+    /// takes the lock only to clone one Arc.
+    routes: Arc<Mutex<HashMap<IpAddr, Arc<dyn Transport>>>>,
+    /// pid -> that link's datagram->TUN pump. ONE reader per link (a peer's datagrams
+    /// carry both families; the pump just forwards each to the TUN, which demuxes by
+    /// dest), aborted when the link is replaced/removed so it is never leaked (fix #2).
+    readers: Mutex<HashMap<String, AbortHandle>>,
+    /// pid -> every overlay IP that link installed (v6 always; v4 in dual-stack), so a
+    /// link drop or re-key (keyed by pid in main.rs) can retract exactly those routes.
+    by_pid: Mutex<HashMap<String, Vec<IpAddr>>>,
     /// This node's overlay identity (crypto mode) for signing announces; `None` in
     /// manual/PSK addressing mode (no announce, routes added out of band).
     identity: Option<Identity>,
@@ -163,6 +162,9 @@ impl L3 {
             mode
         };
         let crypto = identity.is_some();
+        // This node's v4 overlay address (crypto mode), derived from its identity key.
+        // Passed to the kernel path so the TUN also carries our v4 address + route.
+        let my_v4 = identity.as_ref().map(|id| id.addr_v4());
         // Keep the concrete NetstackTun (for bind/dial) AND the dyn handle (for the
         // datagram pumps) when userspace; `None` netstack == kernel TUN.
         let open_netstack = || -> Result<(Arc<dyn TunDevice>, Option<Arc<NetstackTun>>)> {
@@ -171,8 +173,8 @@ impl L3 {
         };
         let (tun, netstack): (Arc<dyn TunDevice>, Option<Arc<NetstackTun>>) = match mode {
             L3Mode::Userspace => open_netstack()?,
-            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto)?, None),
-            L3Mode::Auto => match open_kernel(cidr, mtu, crypto) {
+            L3Mode::Kernel => (open_kernel(cidr, mtu, crypto, my_v4)?, None),
+            L3Mode::Auto => match open_kernel(cidr, mtu, crypto, my_v4) {
                 Ok(t) => (t, None),
                 Err(e) => {
                     crate::ui::say(&format!(
@@ -184,10 +186,11 @@ impl L3 {
             },
         };
         let userspace = netstack.is_some();
-        let routes: Arc<Mutex<HashMap<IpAddr, PeerRoute>>> = Arc::new(Mutex::new(HashMap::new()));
+        let routes: Arc<Mutex<HashMap<IpAddr, Arc<dyn Transport>>>> = Arc::new(Mutex::new(HashMap::new()));
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
             routes: routes.clone(),
+            readers: Mutex::new(HashMap::new()),
             by_pid: Mutex::new(HashMap::new()),
             identity,
             seq: AtomicU64::new(1),
@@ -212,7 +215,7 @@ impl L3 {
                     Err(_) => break, // TUN closed -> daemon shutting down
                 };
                 let Some(dst) = dest_ip(&buf[..n]) else { continue };
-                let peer = routes.lock().await.get(&dst).map(|r| r.transport.clone());
+                let peer = routes.lock().await.get(&dst).cloned();
                 if let Some(t) = peer {
                     let _ = t.send_datagram(&buf[..n]);
                 }
@@ -291,27 +294,48 @@ impl L3 {
         Some(id.announce(self.seq.fetch_add(1, Ordering::Relaxed), cb))
     }
 
-    /// Attach a VERIFIED peer to the overlay: route `peer_ip` (already checked to
-    /// match the announcing key + link, see main.rs) to `t`, keyed by `pid` so a
-    /// link drop can retract it, and register `petname` for MagicDNS. Aborts any
-    /// prior reader for this IP or pid, so a repair/supersede never leaks the old
-    /// reader or its connection (fix #2). Skips links that can't carry datagrams.
-    pub async fn add_peer(&self, pid: &str, petname: &str, peer_ip: IpAddr, t: Arc<dyn Transport>) {
+    /// Attach a VERIFIED peer to the overlay: route its overlay addresses (already
+    /// checked to match the announcing key + link, see main.rs) to `t`, keyed by
+    /// `pid` so a link drop can retract them, and register `petname` for MagicDNS.
+    /// `peer_ip` is the v6 ULA (always); `peer_ip_v4` is the peer's v4 address in
+    /// dual-stack mode (both derive from the same verified key). Both families point
+    /// at ONE transport with ONE datagram pump. Aborts any prior pump for this pid,
+    /// so a repair/supersede never leaks the old reader or its connection (fix #2).
+    /// Skips links that can't carry datagrams.
+    pub async fn add_peer(
+        &self,
+        pid: &str,
+        petname: &str,
+        peer_ip: IpAddr,
+        peer_ip_v4: Option<IpAddr>,
+        t: Arc<dyn Transport>,
+    ) {
         if !t.supports_datagrams() {
             return;
         }
-        // Retire any previous route this pid pointed at (its overlay IP may even
-        // have changed), then the one currently at this IP.
-        if let Some(old_ip) = self.by_pid.lock().await.insert(pid.to_string(), peer_ip) {
-            if old_ip != peer_ip {
-                self.retract(old_ip).await;
+        // Every overlay address this peer answers to (v6 always; v4 in dual-stack).
+        let mut ips = vec![peer_ip];
+        if let Some(v4) = peer_ip_v4 {
+            if !ips.contains(&v4) {
+                ips.push(v4);
             }
         }
-        // MagicDNS: record <petname> -> addr and refresh /etc/hosts (v6 addr only).
+        // Retire any address a prior incarnation of this pid installed that is no
+        // longer ours to serve (its overlay IP may have changed across a re-key).
+        if let Some(old) = self.by_pid.lock().await.insert(pid.to_string(), ips.clone()) {
+            for ip in old {
+                if !ips.contains(&ip) {
+                    self.retract_route(ip).await;
+                }
+            }
+        }
+        // MagicDNS: record <petname> -> v6 addr and refresh /etc/hosts (v6 only).
         if let IpAddr::V6(v6) = peer_ip {
             self.names.lock().await.insert(pid.to_string(), (sanitize_host(petname), v6));
             self.refresh_hosts().await;
         }
+        // ONE datagram->TUN pump per link (a peer's datagrams carry both families;
+        // the pump just forwards each packet to the TUN, which demuxes by dest).
         let tun = self.tun.clone();
         let t_reader = t.clone();
         let handle = tokio::spawn(async move {
@@ -328,34 +352,42 @@ impl L3 {
                     }
                 }
             }
-            // CONTINUITY: on transport death we do NOT retract the route. The
-            // overlay IP stays in the table pointing at the (now dead) transport,
+            // CONTINUITY: on transport death we do NOT retract the routes. The
+            // overlay IPs stay in the table pointing at the (now dead) transport,
             // so datagrams merely drop (the inner TCP pauses, like WireGuard) until
             // the peer's repair calls add_peer, which atomically SWAPS in the fresh
-            // transport (aborting this finished reader). Retracting here would open
-            // a routability gap that can reset a live session across a link repair.
+            // transport (aborting this finished pump). Retracting here would open a
+            // routability gap that can reset a live session across a link repair.
         });
+        if let Some(old) = self.readers.lock().await.insert(pid.to_string(), handle.abort_handle()) {
+            old.abort(); // stop the superseded pump now
+        }
+        // Install/replace every route for this peer, all pointing at the fresh transport.
         let mut map = self.routes.lock().await;
-        if let Some(prev) = map.insert(peer_ip, PeerRoute { transport: t, reader: handle.abort_handle() }) {
-            prev.reader.abort(); // stop the superseded reader now
+        for ip in &ips {
+            map.insert(*ip, t.clone());
         }
     }
 
-    /// Retract the route for a specific overlay IP (aborting its reader).
-    async fn retract(&self, ip: IpAddr) {
-        if let Some(r) = self.routes.lock().await.remove(&ip) {
-            r.reader.abort();
-        }
+    /// Drop the route for a specific overlay IP. The datagram pump is keyed by pid,
+    /// not by IP, so it is aborted separately (add_peer supersede / remove_by_pid).
+    async fn retract_route(&self, ip: IpAddr) {
+        self.routes.lock().await.remove(&ip);
     }
 
-    /// Retract whatever route a link (by pid) installed. NOT called on a transient
-    /// link drop (that would break continuity across a repair); reserved for an
-    /// explicit device-forget path. Kept for that use.
+    /// Retract every route a link (by pid) installed and abort its pump. NOT called
+    /// on a transient link drop (that would break continuity across a repair);
+    /// reserved for an explicit device-forget path. Kept for that use.
     #[allow(dead_code)]
     pub async fn remove_by_pid(&self, pid: &str) {
-        let ip = self.by_pid.lock().await.remove(pid);
-        if let Some(ip) = ip {
-            self.retract(ip).await;
+        if let Some(ips) = self.by_pid.lock().await.remove(pid) {
+            let mut map = self.routes.lock().await;
+            for ip in ips {
+                map.remove(&ip);
+            }
+        }
+        if let Some(r) = self.readers.lock().await.remove(pid) {
+            r.abort();
         }
         if self.names.lock().await.remove(pid).is_some() {
             self.refresh_hosts().await;
@@ -386,13 +418,31 @@ impl L3 {
 /// no `ip`, locked netns); doing them together lets `L3Mode::Auto` catch ANY failure
 /// and fall back to the userspace netstack instead of dropping off the overlay.
 #[cfg(l3)]
-fn open_kernel(cidr: &str, mtu: u32, crypto: bool) -> Result<Arc<dyn TunDevice>> {
+fn open_kernel(
+    cidr: &str,
+    mtu: u32,
+    crypto: bool,
+    addr_v4: Option<std::net::Ipv4Addr>,
+) -> Result<Arc<dyn TunDevice>> {
     let tun: Arc<dyn TunDevice> = Arc::new(KernelTun::open(IFNAME, cidr, mtu)?);
     // Route by the device's ACTUAL name: Linux honors `filament0`, but macOS assigns
     // `utunN` (utun devices can't be renamed). Crypto mode scatters /128s across the
     // shared ULA prefix, so route the whole prefix to the TUN (userspace demuxes).
     if crypto {
-        crate::tun::add_route(&crate::overlay::prefix_cidr(), tun.name())?;
+        let name = tun.name().to_string();
+        crate::tun::add_route(&crate::overlay::prefix_cidr(), &name)?;
+        // Dual-stack v4 is ADDITIVE and BEST-EFFORT. The v6 ULA is the load-bearing,
+        // self-certifying stack; a v4 quirk on any platform must never knock a working
+        // overlay off the kernel path (that would force a needless userspace fallback).
+        // So assign our v4 address + route the v4 prefix, logging on failure rather
+        // than bailing. `add_addr` first so the /32 is local before the /15 is routed.
+        if let Some(v4) = addr_v4 {
+            if let Err(e) = crate::tun::add_addr(&format!("{v4}/32"), &name) {
+                crate::ui::debug(&format!("  L3 v4 address not assigned ({e}); v6 overlay unaffected"));
+            } else if let Err(e) = crate::tun::add_route(&crate::overlay::prefix_v4_cidr(), &name) {
+                crate::ui::debug(&format!("  L3 v4 route not installed ({e}); v6 overlay unaffected"));
+            }
+        }
     }
     Ok(tun)
 }
@@ -632,5 +682,90 @@ mod tests {
         assert_eq!(dest_ip(&[]), None);
         assert_eq!(dest_ip(&[0x45, 0, 0]), None); // too short for v4
         assert_eq!(dest_ip(&[0x70, 0, 0, 0]), None); // not v4/v6
+    }
+
+    // A transport that carries datagrams but never delivers one, so add_peer's pump
+    // parks; we only inspect the route/reader bookkeeping it leaves behind.
+    struct DgramTransport;
+    #[async_trait::async_trait]
+    impl super::Transport for DgramTransport {
+        async fn send_control(&self, _m: &serde_json::Value) -> super::Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _p: &[u8]) -> super::Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> super::Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1200
+        }
+        fn supports_datagrams(&self) -> bool {
+            true
+        }
+        fn is_alive(&self) -> bool {
+            true
+        }
+        fn send_datagram(&self, _p: &[u8]) -> super::Result<()> {
+            Ok(())
+        }
+        async fn recv_datagram(&self) -> super::Result<bytes::Bytes> {
+            std::future::pending().await
+        }
+    }
+
+    // Build an L3 backed by the userspace netstack (no privilege, and refresh_hosts
+    // early-returns so the test never touches /etc/hosts). Routing bookkeeping is the
+    // same in kernel and userspace mode - it is just a HashMap keyed by dest IP.
+    fn test_l3() -> std::sync::Arc<super::L3> {
+        use super::*;
+        let ns = std::sync::Arc::new(NetstackTun::open(IFNAME, "fdf1:1af7:c30d::1/128", 1280).unwrap());
+        std::sync::Arc::new(L3 {
+            tun: ns.clone() as std::sync::Arc<dyn TunDevice>,
+            routes: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            readers: tokio::sync::Mutex::new(HashMap::new()),
+            by_pid: tokio::sync::Mutex::new(HashMap::new()),
+            identity: None,
+            seq: std::sync::atomic::AtomicU64::new(1),
+            names: tokio::sync::Mutex::new(HashMap::new()),
+            netstack: Some(ns),
+        })
+    }
+
+    #[tokio::test]
+    async fn dual_stack_add_peer_routes_both_families_and_retracts() {
+        use super::Transport;
+        let l3 = test_l3();
+        let v6: IpAddr = "fdf1:1af7:c30d::1".parse().unwrap();
+        let v4: IpAddr = "198.18.5.6".parse().unwrap();
+        let t: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+
+        // A verified dual-stack peer installs BOTH families, one pump for the link.
+        l3.add_peer("pidA", "alice", v6, Some(v4), t.clone()).await;
+        {
+            let map = l3.routes.lock().await;
+            assert!(map.contains_key(&v6), "v6 route installed");
+            assert!(map.contains_key(&v4), "v4 route installed");
+        }
+        assert_eq!(l3.readers.lock().await.len(), 1, "exactly one pump per link");
+
+        // Re-key: the same link now announces a different v6+v4; the old pair is
+        // retracted and only the new pair remains, still one pump.
+        let v6b: IpAddr = "fdf1:1af7:c30d::2".parse().unwrap();
+        let v4b: IpAddr = "198.18.9.9".parse().unwrap();
+        l3.add_peer("pidA", "alice", v6b, Some(v4b), t.clone()).await;
+        {
+            let map = l3.routes.lock().await;
+            assert!(!map.contains_key(&v6) && !map.contains_key(&v4), "stale pair retracted on re-key");
+            assert!(map.contains_key(&v6b) && map.contains_key(&v4b), "new pair installed");
+            assert_eq!(map.len(), 2, "no leaked routes");
+        }
+        assert_eq!(l3.readers.lock().await.len(), 1, "still one pump after supersede");
+
+        // Explicit forget drops every route and the pump for that link.
+        l3.remove_by_pid("pidA").await;
+        assert!(l3.routes.lock().await.is_empty(), "all routes gone");
+        assert!(l3.readers.lock().await.is_empty(), "pump aborted");
     }
 }

@@ -180,6 +180,19 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Assign an ADDITIONAL address `cidr` to `dev` (the node's v4 overlay address
+/// alongside the primary v6 ULA). `set` first (idempotent for an existing adapter),
+/// then `add`, mirroring `open`.
+pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
+    let (addr, prefixlen) = split_cidr(cidr);
+    let proto = if addr.contains(':') { "ipv6" } else { "ipv4" };
+    let addr_spec = format!("address={addr}/{prefixlen}");
+    let iface = format!("interface={dev}");
+    netsh(&["interface", proto, "set", "address", &iface, &addr_spec])
+        .or_else(|_| netsh(&["interface", proto, "add", "address", &iface, &addr_spec]))
+        .with_context(|| format!("netsh add address {addr}/{prefixlen} on {dev}"))
+}
+
 /// Windows has no capability model; Wintun adapter creation needs Administrator.
 /// We can't self-elevate, so guide; the real check is the adapter-create error.
 pub fn ensure_net_admin_for_l3() -> bool {
