@@ -727,20 +727,33 @@ pub(crate) async fn resolve_warm(host: &str, port: u16) -> Vec<SocketAddr> {
         }
     });
 
-    if cached.is_empty() {
+    let result = if cached.is_empty() {
         // Nothing to fall back to: take whatever fresh resolution returns
         // (bounded inside the task by dns_timeout_ms). Empty => caller resolves
         // normally as a last resort.
-        return fresh.await.unwrap_or_default();
-    }
+        fresh.await.unwrap_or_default()
+    } else {
+        // Have a fallback: give fresh DNS a short head start, else use the cache.
+        match tokio::time::timeout(Duration::from_millis(dns_race_ms()), fresh).await {
+            Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+            // Fresh lost the race (still resolving) or failed: use the cache now.
+            // The spawned task keeps running and refreshes the cache when it lands.
+            _ => cached,
+        }
+    };
+    prefer_v4(result)
+}
 
-    // Have a fallback: give fresh DNS a short head start, else use the cache.
-    match tokio::time::timeout(Duration::from_millis(dns_race_ms()), fresh).await {
-        Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
-        // Fresh lost the race (still resolving) or failed: use the cache now.
-        // The spawned task keeps running and refreshes the cache when it lands.
-        _ => cached,
-    }
+/// Order IPv4 targets before IPv6 for these CONTROL-PLANE calls (config/signaling).
+/// Many hosts have no route to public IPv6 - a home network with v4-only internet,
+/// or any overlay node whose `filament0` ULA nudges the stack into "thinking" it has
+/// v6 - so a v6-first list dead-ends the connect with ENETUNREACH. v4-first connects
+/// immediately there and still falls back to v6 on a v4-less host (reqwest tries the
+/// whole list). Stable sort, so it only moves v6 after v4 without reshuffling within
+/// a family.
+fn prefer_v4(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addrs.sort_by_key(|a| a.is_ipv6());
+    addrs
 }
 
 // ------------------------------------------------------------- HTTP config --

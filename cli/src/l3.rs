@@ -466,7 +466,15 @@ fn render_hosts(current: &str, entries: &[(String, Ipv6Addr)]) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    let live: Vec<&(String, Ipv6Addr)> = entries.iter().filter(|(n, _)| is_safe_mesh_name(n)).collect();
+    // Dedup exact (name, addr) pairs: the names table is keyed per-link, so a peer
+    // that reconnected under several link ids can appear more than once and would
+    // otherwise emit duplicate /etc/hosts lines.
+    let mut seen = std::collections::HashSet::new();
+    let live: Vec<&(String, Ipv6Addr)> = entries
+        .iter()
+        .filter(|(n, _)| is_safe_mesh_name(n))
+        .filter(|(n, a)| seen.insert((n.clone(), *a)))
+        .collect();
     if !live.is_empty() {
         out.push_str(HOSTS_BEGIN);
         out.push('\n');
