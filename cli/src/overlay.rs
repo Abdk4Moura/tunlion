@@ -198,12 +198,25 @@ pub struct Announce {
 }
 
 impl Announce {
-    /// Serialize for the `l3-announce` control message (base64 fields).
+    /// The announcer's v4 overlay address, DERIVED from its pubkey. The v4 address
+    /// is not carried in the signature or trusted from the wire: it is a pure
+    /// function of the pubkey, which `verify` already authenticates (possession +
+    /// self-cert + channel binding). So a verified announce yields a trustworthy v4
+    /// address with no wire-format or signature change - old and new peers stay
+    /// mutually verifiable. Only meaningful once `verify` has passed.
+    pub fn addr_v4(&self) -> std::net::Ipv4Addr {
+        addr_v4_from_pubkey(&self.pubkey)
+    }
+
+    /// Serialize for the `l3-announce` control message (base64 fields). `addr4` is
+    /// INFORMATIONAL only (a reader/log sees the v4 addr without deriving it); the
+    /// receiver always recomputes it from the verified pubkey, never trusts this.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "l3-announce",
             "pubkey": b64(&self.pubkey),
             "addr": self.addr.to_string(),
+            "addr4": self.addr_v4().to_string(),
             "seq": self.seq,
             "sig": b64(&self.sig),
         })
@@ -335,9 +348,14 @@ mod tests {
         let cb = b"link-channel-binding-xyz";
         let ann = id.announce(1, cb);
         let wire = ann.to_json();
+        // the wire carries addr4 informationally, but it is derived, never trusted.
+        assert_eq!(wire["addr4"].as_str().unwrap(), id.addr_v4().to_string());
         let parsed = Announce::from_json(&wire).unwrap();
         let addr = parsed.verify(cb).expect("verifies under the same cb");
         assert_eq!(addr, id.addr());
+        // V2: a verified announce yields the announcer's v4 address, derived from
+        // the pubkey `verify` just authenticated (no separate v4 signature).
+        assert_eq!(parsed.addr_v4(), id.addr_v4());
     }
 
     #[test]
