@@ -527,8 +527,13 @@ enum Cmd {
     /// Print this device's L3 overlay address.
     ///
     /// Derived from its Ed25519 overlay key; stable across restarts. Creates the
-    /// key on first use.
-    Addr,
+    /// key on first use. `--v4` prints the dual-stack IPv4 overlay address instead
+    /// (also key-derived, in the reserved 198.18.0.0/15 range).
+    Addr {
+        /// Print the IPv4 overlay address (dual-stack) instead of the IPv6 one.
+        #[arg(long)]
+        v4: bool,
+    },
     /// Read one setting's effective value (bare value on stdout, for scripts)
     #[command(hide = true)]
     Get {
@@ -5071,9 +5076,13 @@ async fn main() -> Result<()> {
         Cmd::Get { key, peer, show_origin, default, json } => {
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
         }
-        Cmd::Addr => {
+        Cmd::Addr { v4 } => {
             let id = overlay::Identity::load_or_create()?;
-            println!("{}", id.addr());
+            if v4 {
+                println!("{}", id.addr_v4());
+            } else {
+                println!("{}", id.addr());
+            }
             Ok(())
         }
         Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
@@ -6987,10 +6996,15 @@ async fn recv_cmd(
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
                                 ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
                             } else {
+                                // Kernel mode is dual-stack: show the v4 address too
+                                // (userspace has no v4 endpoint yet, so it is omitted
+                                // above to avoid implying a route that does not exist).
+                                let v4 = m.my_addr_v4().map(|a| format!(" / {a}")).unwrap_or_default();
                                 ui::say(&format!(
-                                    "  {} L3 overlay {} on filament0",
+                                    "  {} L3 overlay {}{} on filament0",
                                     ui::paint(ui::Tone::Brand, "●"),
-                                    addr
+                                    addr,
+                                    v4
                                 ));
                             }
                             Some(m)
