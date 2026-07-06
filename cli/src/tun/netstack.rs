@@ -294,7 +294,7 @@ impl NetstackTun {
             let mut socks: Vec<SockRec> = Vec::new();
             let mut eph: u16 = 49152;
             poll_loop(
-                &mut iface, &mut dev, &mut sockets, &mut socks, &mut eph, addr, wake_poll,
+                &mut iface, &mut dev, &mut sockets, &mut socks, &mut eph, addr, None, wake_poll,
                 &mut inject_rx, &mut cmd_rx, &out_tx,
             )
             .await;
@@ -354,6 +354,10 @@ impl NetstackTun {
                 iface.update_ip_addrs(|a| {
                     let _ = a.push(IpCidr::new(IpAddress::from(v4addr), prefix4));
                 });
+                iface
+                    .routes_mut()
+                    .add_default_ipv4_route(Ipv4Addr::new(0, 0, 0, 1))
+                    .map_err(|_| anyhow!("netstack route table full"))?;
                 Some(v4addr)
             }
             None => None,
@@ -372,7 +376,7 @@ impl NetstackTun {
             let mut socks: Vec<SockRec> = Vec::new();
             let mut eph: u16 = 49152;
             poll_loop(
-                &mut iface, &mut dev, &mut sockets, &mut socks, &mut eph, addr, wake_poll,
+                &mut iface, &mut dev, &mut sockets, &mut socks, &mut eph, addr, addr_v4, wake_poll,
                 &mut inject_rx, &mut cmd_rx, &out_tx,
             )
             .await;
@@ -441,6 +445,7 @@ async fn poll_loop(
     socks: &mut Vec<SockRec>,
     eph: &mut u16,
     my_addr: Ipv6Addr,
+    my_addr_v4: Option<Ipv4Addr>,
     wake: Arc<Notify>,
     inject_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
@@ -771,7 +776,10 @@ mod tests {
     use super::*;
     use crate::tun::TunDevice;
     use smoltcp::phy::ChecksumCapabilities;
-    use smoltcp::wire::{Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv6Packet, Ipv6Repr};
+    use smoltcp::wire::{
+        Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr,
+        Ipv6Packet, Ipv6Repr,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn build_echo_request(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
@@ -1090,5 +1098,92 @@ mod tests {
         assert_eq!(rp.src_addr(), me6);
         assert_eq!(rp.dst_addr(), peer);
         assert_eq!(rbuf[40], 0x81, "expected an ICMPv6 echo reply");
+    }
+
+    fn build_icmpv4_echo_request(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+        let echo = Icmpv4Repr::EchoRequest { ident: 0x5678, seq_no: 1, data: b"filament" };
+        let ipr = Ipv4Repr {
+            src_addr: src.into(),
+            dst_addr: dst.into(),
+            next_header: IpProtocol::Icmp,
+            payload_len: echo.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut buf = vec![0u8; ipr.buffer_len() + echo.buffer_len()];
+        {
+            let mut p = Ipv4Packet::new_unchecked(&mut buf[..]);
+            ipr.emit(&mut p, &ChecksumCapabilities::default());
+            let mut icmp = Icmpv4Packet::new_unchecked(p.payload_mut());
+            echo.emit(&mut icmp, &ChecksumCapabilities::default());
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn netstack_ipv4_route_works() {
+        let a6: Ipv6Addr = "fdf1:1af7:c30d:e41::1".parse().unwrap();
+        let a4: Ipv4Addr = "10.0.42.1".parse().unwrap();
+        let b6: Ipv6Addr = "fdf1:1af7:c30d:e42::1".parse().unwrap();
+        let b4: Ipv4Addr = "10.0.42.2".parse().unwrap();
+        let peer4: Ipv4Addr = "10.0.42.99".parse().unwrap();
+
+        let a = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+                .unwrap(),
+        );
+        let b = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+                .unwrap(),
+        );
+
+        assert!(a.is_dual_stack());
+        assert!(b.is_dual_stack());
+
+        // B: inject ICMPv4 echo request → B replies with its own IPv4 address.
+        b.send(&build_icmpv4_echo_request(peer4, b4)).await.unwrap();
+        let mut rbuf = vec![0u8; 1500];
+        let n = tokio::time::timeout(Duration::from_secs(2), b.recv(&mut rbuf))
+            .await
+            .expect("B: no IPv4 echo reply within 2s")
+            .unwrap();
+        assert!(n >= 28, "reply too short: {n}");
+        let rp = Ipv4Packet::new_checked(&rbuf[..n]).unwrap();
+        let b4_addr: smoltcp::wire::Ipv4Address = b4.into();
+        let peer4_addr: smoltcp::wire::Ipv4Address = peer4.into();
+        assert_eq!(rp.src_addr(), b4_addr);
+        assert_eq!(rp.dst_addr(), peer4_addr);
+        assert_eq!(rbuf[20], 0x00, "expected ICMPv4 echo reply (type 0)");
+
+        // A: inject ICMPv4 echo request → A replies with its own IPv4 address.
+        a.send(&build_icmpv4_echo_request(peer4, a4)).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), a.recv(&mut rbuf))
+            .await
+            .expect("A: no IPv4 echo reply within 2s")
+            .unwrap();
+        assert!(n >= 28, "reply too short: {n}");
+        let rp = Ipv4Packet::new_checked(&rbuf[..n]).unwrap();
+        let a4_addr: smoltcp::wire::Ipv4Address = a4.into();
+        assert_eq!(rp.src_addr(), a4_addr);
+        assert_eq!(rp.dst_addr(), peer4_addr);
+        assert_eq!(rbuf[20], 0x00, "expected ICMPv4 echo reply (type 0)");
+
+        // Verify IPv6 still works on both dual-stack nodes.
+        let peer6: Ipv6Addr = "fdf1:1af7:c30d:e41::99".parse().unwrap();
+        a.send(&build_echo_request(peer6, a6)).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), a.recv(&mut rbuf))
+            .await
+            .expect("A: no IPv6 echo reply within 2s")
+            .unwrap();
+        assert!(n >= 40);
+        assert_eq!(rbuf[40], 0x81, "expected ICMPv6 echo reply");
+
+        let peer6b: Ipv6Addr = "fdf1:1af7:c30d:e42::99".parse().unwrap();
+        b.send(&build_echo_request(peer6b, b6)).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), b.recv(&mut rbuf))
+            .await
+            .expect("B: no IPv6 echo reply within 2s")
+            .unwrap();
+        assert!(n >= 40);
+        assert_eq!(rbuf[40], 0x81, "expected ICMPv6 echo reply");
     }
 }
