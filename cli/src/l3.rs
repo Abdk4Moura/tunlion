@@ -105,7 +105,7 @@ impl OverlayListener {
             }
             OverlayListener::Netstack(nl) => {
                 let (s, src) = nl.accept().await?;
-                Ok((OverlayStream::Netstack(s), IpAddr::V6(src)))
+                Ok((OverlayStream::Netstack(s), src.as_ipv6().into()))
             }
         }
     }
