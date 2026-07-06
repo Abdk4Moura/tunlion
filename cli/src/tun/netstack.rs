@@ -639,6 +639,22 @@ fn parse_v6_cidr(cidr: &str) -> Result<(Ipv6Addr, u8)> {
     Ok((addr, p))
 }
 
+/// Parse an IPv4 CIDR string (e.g., "192.168.1.1/24") into (Ipv4Addr, prefix).
+/// Defaults to /32 if no prefix specified.
+fn parse_v4_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
+    let (a, p) = match cidr.split_once('/') {
+        Some((a, p)) => (a, p.parse::<u8>().map_err(|_| anyhow!("bad prefix in '{cidr}'"))?),
+        None => (cidr, 32),
+    };
+    let addr: std::net::Ipv4Addr = a
+        .parse()
+        .map_err(|_| anyhow!("netstack overlay address must be IPv4, got '{a}'"))?;
+    if p > 32 {
+        bail!("prefix /{p} out of range for IPv4");
+    }
+    Ok((addr, p))
+}
+
 /// A CSPRNG seed for smoltcp (ISN/ephemeral-port randomization) from ring.
 fn rand_seed() -> Result<u64> {
     use ring::rand::SecureRandom;
@@ -948,5 +964,25 @@ mod tests {
                 .unwrap();
         }
         srv.abort();
+    }
+
+    #[test]
+    fn parses_ipv4_cidr() {
+        let (addr, prefix) = parse_v4_cidr("192.168.1.1/24").unwrap();
+        assert_eq!(addr, std::net::Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(prefix, 24);
+
+        let (addr, prefix) = parse_v4_cidr("10.0.0.1").unwrap();
+        assert_eq!(addr, std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(prefix, 32);
+
+        let (addr, prefix) = parse_v4_cidr("0.0.0.0/0").unwrap();
+        assert_eq!(addr, std::net::Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(prefix, 0);
+
+        assert!(parse_v4_cidr("192.168.1.1/33").is_err());
+        assert!(parse_v4_cidr("192.168.1.1/128").is_err());
+        assert!(parse_v4_cidr("not-an-ip/24").is_err());
+        assert!(parse_v4_cidr("192.168.1.1/not-a-number").is_err());
     }
 }
