@@ -15,7 +15,7 @@
 //! the rest of the overlay `/48` is a default ROUTE, never a widened `ip_addrs`.
 
 use std::collections::VecDeque;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -254,6 +254,7 @@ impl<'a> phy::TxToken for QTx<'a> {
 pub struct NetstackTun {
     name: String,
     addr: Ipv6Addr,
+    addr_v4: Option<Ipv4Addr>,
     inject_tx: mpsc::UnboundedSender<Vec<u8>>,
     out_rx: AsyncMutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
@@ -302,6 +303,7 @@ impl NetstackTun {
         Ok(NetstackTun {
             name: name.to_string(),
             addr,
+            addr_v4: None,
             inject_tx,
             out_rx: AsyncMutex::new(out_rx),
             cmd_tx,
@@ -314,6 +316,78 @@ impl NetstackTun {
     #[allow(dead_code)]
     pub fn addr(&self) -> Ipv6Addr {
         self.addr
+    }
+
+    /// This node's optional IPv4 overlay address.
+    #[allow(dead_code)]
+    pub fn addr_v4(&self) -> Option<Ipv4Addr> {
+        self.addr_v4
+    }
+
+    /// Whether this netstack is configured with both IPv4 and IPv6 addresses.
+    #[allow(dead_code)]
+    pub fn is_dual_stack(&self) -> bool {
+        self.addr_v4.is_some()
+    }
+
+    /// Bring up a dual-stack userspace stack with IPv6 (`cidr6`) and optional IPv4
+    /// (`cidr4`). `cidr6` is required; `cidr4` may be `None` for IPv6-only.
+    pub fn open_dual(name: &str, cidr6: &str, cidr4: Option<&str>, mtu: u32) -> Result<NetstackTun> {
+        let (addr, prefix6) = parse_v6_cidr(cidr6)?;
+        let mtu = mtu as usize;
+
+        let mut dev = QueueDevice { rx: VecDeque::new(), tx: VecDeque::new(), mtu };
+        let mut cfg = Config::new(HardwareAddress::Ip);
+        cfg.random_seed = rand_seed()?;
+        let mut iface = Interface::new(cfg, &mut dev, Instant::now());
+        iface.update_ip_addrs(|a| {
+            let _ = a.push(IpCidr::new(IpAddress::from(addr), prefix6));
+        });
+        iface
+            .routes_mut()
+            .add_default_ipv6_route(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
+            .map_err(|_| anyhow!("netstack route table full"))?;
+
+        let addr_v4 = match cidr4 {
+            Some(c4) => {
+                let (v4addr, prefix4) = parse_v4_cidr(c4)?;
+                iface.update_ip_addrs(|a| {
+                    let _ = a.push(IpCidr::new(IpAddress::from(v4addr), prefix4));
+                });
+                Some(v4addr)
+            }
+            None => None,
+        };
+
+        let (inject_tx, inject_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+        let wake = Arc::new(Notify::new());
+        let wake_poll = wake.clone();
+
+        let poll = tokio::spawn(async move {
+            let mut sockets = SocketSet::new(Vec::new());
+            let mut inject_rx = inject_rx;
+            let mut cmd_rx = cmd_rx;
+            let mut socks: Vec<SockRec> = Vec::new();
+            let mut eph: u16 = 49152;
+            poll_loop(
+                &mut iface, &mut dev, &mut sockets, &mut socks, &mut eph, addr, wake_poll,
+                &mut inject_rx, &mut cmd_rx, &out_tx,
+            )
+            .await;
+        });
+
+        Ok(NetstackTun {
+            name: name.to_string(),
+            addr,
+            addr_v4,
+            inject_tx,
+            out_rx: AsyncMutex::new(out_rx),
+            cmd_tx,
+            wake,
+            _poll: poll,
+        })
     }
 
     /// Dial `dst:port` over the overlay in userspace. Resolves once the TCP
@@ -984,5 +1058,37 @@ mod tests {
         assert!(parse_v4_cidr("192.168.1.1/128").is_err());
         assert!(parse_v4_cidr("not-an-ip/24").is_err());
         assert!(parse_v4_cidr("192.168.1.1/not-a-number").is_err());
+    }
+
+    #[tokio::test]
+    async fn netstack_opens_with_ipv4() {
+        let me6: Ipv6Addr = "fdf1:1af7:c30d:d01::1".parse().unwrap();
+        let me4: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let peer: Ipv6Addr = "fdf1:1af7:c30d:d01::99".parse().unwrap();
+
+        let tun = NetstackTun::open_dual(
+            "filament0",
+            &format!("{me6}/128"),
+            Some("10.0.0.1/24"),
+            1280,
+        )
+        .unwrap();
+
+        assert!(tun.is_dual_stack());
+        assert_eq!(tun.addr_v4(), Some(me4));
+        assert_eq!(tun.addr(), me6);
+
+        // IPv6 still works
+        tun.send(&build_echo_request(peer, me6)).await.unwrap();
+        let mut rbuf = vec![0u8; 1500];
+        let n = tokio::time::timeout(Duration::from_secs(2), tun.recv(&mut rbuf))
+            .await
+            .expect("no echo reply within 2s")
+            .unwrap();
+        assert!(n >= 40);
+        let rp = Ipv6Packet::new_checked(&rbuf[..n]).unwrap();
+        assert_eq!(rp.src_addr(), me6);
+        assert_eq!(rp.dst_addr(), peer);
+        assert_eq!(rbuf[40], 0x81, "expected an ICMPv6 echo reply");
     }
 }
