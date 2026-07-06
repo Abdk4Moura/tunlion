@@ -130,24 +130,55 @@ impl AsyncWrite for NetstackStream {
     }
 }
 
+/// The overlay source address of an accepted connection, which may be IPv4 or IPv6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OverlayAddr {
+    V4(Ipv4Addr),
+    V6(Ipv6Addr),
+}
+
+impl OverlayAddr {
+    pub fn as_ipv6(&self) -> Ipv6Addr {
+        match self {
+            OverlayAddr::V4(a) => {
+                // IPv4-mapped IPv6: ::ffff:a.b.c.d
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0xFFFF, u16::from(a.octets()[0]) << 8 | u16::from(a.octets()[1]), u16::from(a.octets()[2]) << 8 | u16::from(a.octets()[3]))
+            }
+            OverlayAddr::V6(a) => *a,
+        }
+    }
+    pub fn as_ipv4(&self) -> Option<Ipv4Addr> {
+        match self {
+            OverlayAddr::V4(a) => Some(*a),
+            OverlayAddr::V6(_) => None,
+        }
+    }
+}
+
 /// A listening overlay port. `accept()` yields the next inbound connection and the
 /// peer's overlay source address (load-bearing for the expose allowlist).
 pub struct NetstackListener {
     port: u16,
-    accept_rx: AsyncMutex<mpsc::UnboundedReceiver<(NetstackStream, Ipv6Addr)>>,
+    accept_rx: AsyncMutex<mpsc::UnboundedReceiver<(NetstackStream, OverlayAddr)>>,
 }
 
 impl NetstackListener {
     pub fn port(&self) -> u16 {
         self.port
     }
-    pub async fn accept(&self) -> Result<(NetstackStream, Ipv6Addr)> {
+    pub async fn accept(&self) -> Result<(NetstackStream, OverlayAddr)> {
         self.accept_rx
             .lock()
             .await
             .recv()
             .await
             .ok_or_else(|| anyhow!("netstack poll loop ended"))
+    }
+    /// Accept returning an Ipv6Addr for backward compatibility. IPv4 connections
+    /// are returned as IPv4-mapped IPv6 addresses (::ffff:a.b.c.d).
+    pub async fn accept_v6(&self) -> Result<(NetstackStream, Ipv6Addr)> {
+        let (stream, addr) = self.accept().await?;
+        Ok((stream, addr.as_ipv6()))
     }
 }
 
@@ -156,6 +187,11 @@ impl NetstackListener {
 enum Cmd {
     Dial {
         dst: Ipv6Addr,
+        port: u16,
+        reply: oneshot::Sender<Result<NetstackStream>>,
+    },
+    DialV4 {
+        dst: Ipv4Addr,
         port: u16,
         reply: oneshot::Sender<Result<NetstackStream>>,
     },
@@ -177,10 +213,10 @@ struct SockRec {
     dial_reply: Option<oneshot::Sender<Result<NetstackStream>>>,
     /// For a listening socket: (port, sink to deliver the accepted stream). When it
     /// establishes we hand the stream to the sink and arm a fresh listen socket.
-    listen: Option<(u16, mpsc::UnboundedSender<(NetstackStream, Ipv6Addr)>)>,
+    listen: Option<(u16, mpsc::UnboundedSender<(NetstackStream, OverlayAddr)>)>,
     /// The overlay SOURCE of an ACCEPTED (delivered) connection; used to budget
     /// live sockets per peer so one paired peer can't exhaust the netstack.
-    src: Option<Ipv6Addr>,
+    src: Option<OverlayAddr>,
 }
 
 /// Max live sockets total, and max ACCEPTED connections from one overlay source.
@@ -416,6 +452,31 @@ impl NetstackTun {
         self.wake.notify_one();
         rx.await.map_err(|_| anyhow!("netstack poll loop ended"))?
     }
+
+    /// Dial `dst:port` over IPv4 on the overlay. Resolves once the TCP
+    /// connection is Established.
+    #[allow(dead_code)]
+    pub async fn dial_v4(&self, dst: Ipv4Addr, port: u16) -> Result<NetstackStream> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::DialV4 { dst, port, reply })
+            .map_err(|_| anyhow!("netstack poll loop ended"))?;
+        self.wake.notify_one();
+        rx.await.map_err(|_| anyhow!("netstack poll loop ended"))?
+    }
+
+    /// Listen on `port` accepting both IPv4 and IPv6 connections. `accept()`
+    /// yields connections. The overlay address family of the accepted connection
+    /// is passed to the caller.
+    #[allow(dead_code)]
+    pub async fn listen_v4(&self, port: u16) -> Result<NetstackListener> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Cmd::Listen { port, reply })
+            .map_err(|_| anyhow!("netstack poll loop ended"))?;
+        self.wake.notify_one();
+        rx.await.map_err(|_| anyhow!("netstack poll loop ended"))?
+    }
 }
 
 fn new_tcp_socket() -> tcp::Socket<'static> {
@@ -456,6 +517,31 @@ async fn poll_loop(
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Dial { dst, port, reply } => {
+                    let mut sock = new_tcp_socket();
+                    let local = next_eph(eph);
+                    let r = sock.connect(iface.context(), (IpAddress::from(dst), port), local);
+                    match r {
+                        Ok(()) => {
+                            let handle = sockets.add(sock);
+                            let (out, inp, _stream) = wire_stream_placeholder();
+                            // stream is handed out only once Established (below).
+                            socks.push(SockRec {
+                                handle,
+                                out,
+                                inp,
+                                out_residual: Vec::new(),
+                                established: false,
+                                dial_reply: Some(reply),
+                                listen: None,
+                                src: None,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(anyhow!("connect: {e}")));
+                        }
+                    }
+                }
+                Cmd::DialV4 { dst, port, reply } => {
                     let mut sock = new_tcp_socket();
                     let local = next_eph(eph);
                     let r = sock.connect(iface.context(), (IpAddress::from(dst), port), local);
@@ -551,14 +637,14 @@ async fn poll_loop(
         // 5. net -> app: pull rx bytes into each socket's in pipe (respect capacity);
         //    fire dial replies / listener accepts on establishment; reap dead sockets.
         // Per-source budget snapshot for this pass (accepted connections per peer).
-        let mut per_src: std::collections::HashMap<Ipv6Addr, usize> = std::collections::HashMap::new();
+        let mut per_src: std::collections::HashMap<OverlayAddr, usize> = std::collections::HashMap::new();
         for r in socks.iter() {
             if let Some(a) = r.src {
                 *per_src.entry(a).or_default() += 1;
             }
         }
         let total_socks = socks.len();
-        let mut new_listens: Vec<(u16, mpsc::UnboundedSender<(NetstackStream, Ipv6Addr)>)> = Vec::new();
+        let mut new_listens: Vec<(u16, mpsc::UnboundedSender<(NetstackStream, OverlayAddr)>)> = Vec::new();
         let mut remove: Vec<usize> = Vec::new();
         for (idx, rec) in socks.iter_mut().enumerate() {
             let s = sockets.get_mut::<tcp::Socket>(rec.handle);
@@ -576,8 +662,9 @@ async fn poll_loop(
                 }
                 if let Some((port, sink)) = rec.listen.take() {
                     let src = match s.remote_endpoint() {
-                        Some(IpEndpoint { addr: IpAddress::Ipv6(a), .. }) => a,
-                        _ => my_addr, // unreachable in practice (IPv6-only overlay)
+                        Some(IpEndpoint { addr: IpAddress::Ipv6(a), .. }) => OverlayAddr::V6(a),
+                        Some(IpEndpoint { addr: IpAddress::Ipv4(a), .. }) => OverlayAddr::V4(a),
+                        _ => OverlayAddr::V6(my_addr),
                     };
                     // Re-arm the port either way so it keeps serving other peers.
                     new_listens.push((port, sink.clone()));
@@ -672,7 +759,7 @@ fn arm_listen(
     sockets: &mut SocketSet<'static>,
     socks: &mut Vec<SockRec>,
     port: u16,
-    sink: mpsc::UnboundedSender<(NetstackStream, Ipv6Addr)>,
+    sink: mpsc::UnboundedSender<(NetstackStream, OverlayAddr)>,
 ) -> Result<()> {
     let mut sock = new_tcp_socket();
     sock.listen(IpListenEndpoint::from(port)).map_err(|e| anyhow!("listen: {e}"))?;
@@ -879,7 +966,7 @@ mod tests {
 
         // Server: echo one message back, uppercased, then shut down.
         let server = tokio::spawn(async move {
-            let (mut s, src) = listener.accept().await.unwrap();
+            let (mut s, src) = listener.accept_v6().await.unwrap();
             assert_eq!(src, a_addr, "listener must see the dialer's overlay src");
             let mut buf = [0u8; 64];
             let n = s.read(&mut buf).await.unwrap();
@@ -955,7 +1042,7 @@ mod tests {
         let payload: Vec<u8> = (0..12000u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u8).collect();
         let expect = payload.clone();
         let server = tokio::spawn(async move {
-            let (mut s, _src) = listener.accept().await.unwrap();
+            let (mut s, _src) = listener.accept_v6().await.unwrap();
             let mut got = Vec::new();
             let mut buf = [0u8; 2048];
             while got.len() < expect.len() {
@@ -1003,7 +1090,7 @@ mod tests {
             let listener = listener.clone();
             tokio::spawn(async move {
                 for _ in 0..N {
-                    let (mut s, _src) = match listener.accept().await {
+                    let (mut s, _src) = match listener.accept_v6().await {
                         Ok(x) => x,
                         Err(_) => break,
                     };
@@ -1185,5 +1272,68 @@ mod tests {
             .unwrap();
         assert!(n >= 40);
         assert_eq!(rbuf[40], 0x81, "expected ICMPv6 echo reply");
+    }
+
+    /// IPv4 dial/listen: two dual-stack netstacks cross-wire, B listens on IPv4,
+    /// A dials B over IPv4, and the byte stream round-trips correctly. This
+    /// validates Cmd::DialV4 and dual-stack listen acceptance.
+    #[tokio::test]
+    async fn netstack_ipv4_dial_listen() {
+        let a6: Ipv6Addr = "fdf1:1af7:c30d:f01::1".parse().unwrap();
+        let a4: Ipv4Addr = "10.0.50.1".parse().unwrap();
+        let b6: Ipv6Addr = "fdf1:1af7:c30d:f02::1".parse().unwrap();
+        let b4: Ipv4Addr = "10.0.50.2".parse().unwrap();
+
+        let a = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+                .unwrap(),
+        );
+        let b = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+                .unwrap(),
+        );
+
+        cross_wire(a.clone(), b.clone(), 0);
+
+        // B listens; accept via listen_v4() (dual-stack).
+        let listener = b.listen_v4(9300).await.unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut s, src) = listener.accept().await.unwrap();
+            // Source must be the IPv4 overlay address of A.
+            assert_eq!(src.as_ipv4(), Some(a4), "listener must see the dialer's IPv4 overlay src");
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            let up = buf[..n].to_ascii_uppercase();
+            s.write_all(&up).await.unwrap();
+            s.flush().await.unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        // A dials B over IPv4.
+        let mut client = tokio::time::timeout(Duration::from_secs(5), a.dial_v4(b4, 9300))
+            .await
+            .expect("IPv4 dial timed out")
+            .expect("IPv4 dial failed");
+        client.write_all(b"hello-ipv4").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if got.len() >= b"HELLO-IPV4".len() {
+                break;
+            }
+        }
+        assert_eq!(&got, b"HELLO-IPV4", "IPv4 byte stream must round-trip through both stacks");
+        server.await.unwrap();
     }
 }
