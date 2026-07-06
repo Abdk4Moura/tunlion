@@ -25,6 +25,8 @@ mod doctor;
 mod expose;
 mod holepunch;
 mod l2;
+mod mount;
+mod backup;
 mod net;
 mod overlay;
 mod pake_ceremony;
@@ -762,6 +764,54 @@ enum Cmd {
         device: String,
         /// Capability to revoke (e.g. `shell`)
         capability: String,
+    },
+    /// Mount a remote directory over the mesh via sshfs.
+    ///
+    /// Requires sshfs on both ends. Uses the same transport as `filament ssh`
+    /// (L3 overlay preferred, L2 tunnel fallback). The peer must have sshd
+    /// running and shell access granted.
+    Mount {
+        /// Known device (petname) to mount from
+        peer: String,
+        /// Remote directory path
+        remote: String,
+        /// Local mount point (default: basename of remote path)
+        local: Option<String>,
+        /// Mount read-only
+        #[arg(long)]
+        read_only: bool,
+        /// Extra sshfs options (comma-separated)
+        #[arg(long)]
+        options: Option<String>,
+    },
+    /// Unmount a filament mount point.
+    Unmount {
+        /// Local mount point to unmount
+        path: String,
+    },
+    /// Sync files to/from a peer via rsync over the mesh.
+    ///
+    /// Requires rsync on both ends. Uses `filament ssh` as the remote shell,
+    /// so the same transport and bootstrap logic applies.
+    Backup {
+        /// Known device (petname) to back up from/to
+        peer: String,
+        /// Source path (local or remote as peer:path)
+        source: String,
+        /// Destination path (local or remote as peer:path)
+        dest: String,
+        /// Exclude files matching pattern (repeatable)
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Show what would be transferred without doing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete extraneous files in destination
+        #[arg(long)]
+        delete: bool,
+        /// Extra rsync options (space-separated)
+        #[arg(long)]
+        options: Option<String>,
     },
 }
 
@@ -5371,6 +5421,13 @@ async fn main() -> Result<()> {
                 println!("revoked '{capability}' from '{device}'.");
             }
             Ok(())
+        }
+        Cmd::Mount { peer, remote, local, read_only, options } => {
+            mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay).await
+        }
+        Cmd::Unmount { path } => mount::unmount_cmd(&path),
+        Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
+            backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
     }
 }

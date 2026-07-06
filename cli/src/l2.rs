@@ -3115,27 +3115,25 @@ async fn wait_for_overlay(addr: std::net::SocketAddr, deadline: std::time::Durat
     }
 }
 
-pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
-    // Accept the MagicDNS form too: `filament ssh other-do.mesh` means the same
-    // device as `filament ssh other-do`. The petname is the source of truth for
-    // pairing/bootstrap; the .mesh name is only how the overlay resolves it.
+/// Info needed to connect to a peer over SSH (or sshfs/rsync). Returned by
+/// `ensure_peer_bootstrap` after key installation + host key pinning.
+pub(crate) struct PeerSshInfo {
+    pub login: String,
+    pub host: String,
+    pub rport: u16,
+    pub key_path: std::path::PathBuf,
+    pub known_hosts_path: std::path::PathBuf,
+    pub took_fast_path: bool,
+}
+
+/// Ensure our managed key is installed on the peer and host keys are pinned.
+/// Returns `PeerSshInfo` with everything needed to spawn sshfs/rsync/ssh.
+pub(crate) async fn ensure_peer_bootstrap(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-
-    // ssh matches known_hosts by HOST token only (never user@host), so the pin
-    // MUST be keyed on the bare host or it is silently inert.
     let host = format!("filament-{peer}");
-
-    // The ProxyCommand data link talks to peer:22 (or a test port via
-    // FILAMENT_SSH_PORT, mirroring FILAMENT_L2_DIALHOST).
     let rport: u16 =
         std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
 
-
-    // FAST PATH: a device whose host keys are already pinned AND whose bootstrap
-    // is still fresh has our key installed + the shell cap granted, so skip the
-    // pre-flight bootstrap (a whole extra establish) and go straight to ssh. It
-    // self-heals: a stale skip that fails at the ssh layer (255) falls back to a
-    // full bootstrap + one retry below.
     let cached = if crate::sshkeys::host_pinned(&host) {
         crate::sshkeys::bootstrap_cache_get(peer)
     } else {
@@ -3145,9 +3143,6 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     let (login, took_fast_path) = match cached {
         Some(cached_user) => (resolve_login(cached_user), true),
         None => {
-            // Bootstrap over the trusted channel (deny-by-default gate), WARM-first
-            // (ride the daemon's link, no cold establish), pin host keys, and
-            // record the cache for next time.
             let info = bootstrap_key(server, peer, relay, rport).await?;
             ensure_sshd(peer, rport, info.sshd).await;
             crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
@@ -3156,24 +3151,92 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         }
     };
 
-    let code = run_ssh(server, peer, relay, &host, &login, rport, extra, true).await?;
+    Ok(PeerSshInfo {
+        login,
+        host,
+        rport,
+        key_path: crate::sshkeys::managed_key_path(),
+        known_hosts_path: crate::sshkeys::known_hosts_path(),
+        took_fast_path,
+    })
+}
+
+/// Invalidate bootstrap cache and re-bootstrap a peer (for retry after exit 255).
+pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
+    let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
+    let host = format!("filament-{peer}");
+    let rport: u16 =
+        std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
+
+    crate::sshkeys::bootstrap_cache_clear(peer);
+    let info = shell_bootstrap(server, peer, relay, rport).await?;
+    ensure_sshd(peer, rport, info.sshd).await;
+    crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
+    crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
+
+    Ok(PeerSshInfo {
+        login: resolve_login(info.user),
+        host,
+        rport,
+        key_path: crate::sshkeys::managed_key_path(),
+        known_hosts_path: crate::sshkeys::known_hosts_path(),
+        took_fast_path: false,
+    })
+}
+
+/// Build ssh option args for use with sshfs/rsync (identity, known_hosts, etc).
+pub(crate) fn ssh_transport_args(info: &PeerSshInfo, server: &str, peer: &str, relay: bool) -> Vec<String> {
+    let mut args = vec![
+        "-o".into(), format!("IdentityFile={}", info.key_path.display()),
+        "-o".into(), "IdentitiesOnly=yes".into(),
+        "-o".into(), format!("UserKnownHostsFile={}", info.known_hosts_path.display()),
+        "-o".into(), "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(), "ConnectTimeout=10".into(),
+        "-o".into(), "ServerAliveInterval=15".into(),
+        "-o".into(), "ServerAliveCountMax=4".into(),
+    ];
+    let exe = std::env::current_exe().unwrap();
+    let exe = exe.to_string_lossy();
+    let mut proxy = format!("{exe} --server {server}");
+    if relay {
+        proxy.push_str(" --relay");
+    }
+    proxy.push_str(&format!(" netcat {peer} {}", info.rport));
+    args.push("-o".into());
+    args.push(format!("ProxyCommand={proxy}"));
+    args
+}
+
+/// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
+pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
+    let peer = info.host.strip_prefix("filament-").unwrap_or(&info.host);
+    if let Some((mesh_host, addr)) = l3_mesh_addr(peer, info.rport) {
+        if probe_sshd(addr, std::time::Duration::from_millis(600)) {
+            Some(format!("{}@{mesh_host}", info.login))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
+    let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
+
+    let info = ensure_peer_bootstrap(server, peer, relay).await?;
+
+    let code = run_ssh(server, peer, relay, &info.host, &info.login, info.rport, extra, true).await?;
 
     // A cached skip that failed at the ssh layer (connect/auth, exit 255) may mean
     // the device rotated its key/host-key or revoked the cap. Invalidate, run a
-    // real bootstrap (which surfaces a clear deny if revoked, or re-installs our
-    // key + re-pins host keys), and retry ssh ONCE.
-    if code == 255 && took_fast_path {
+    // real bootstrap, and retry ssh ONCE.
+    if code == 255 && info.took_fast_path {
         crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
-        crate::sshkeys::bootstrap_cache_clear(peer);
-        let info = shell_bootstrap(server, peer, relay, rport).await?;
-        // A stale fast-path 255 can simply mean the peer's sshd went away; the
-        // re-bootstrap now reports that, so say so plainly instead of looping.
-        ensure_sshd(peer, rport, info.sshd).await;
-        crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
-        crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
-        let login = resolve_login(info.user);
+        let retry = rebootstrap_peer(server, peer, relay).await?;
         // revive=false: don't pay the L3 revive-wait twice on the same invocation.
-        let code = run_ssh(server, peer, relay, &host, &login, rport, extra, false).await?;
+        let code = run_ssh(server, peer, relay, &retry.host, &retry.login, retry.rport, extra, false).await?;
         ssh_failed_hint(peer, code);
         std::process::exit(code);
     }
