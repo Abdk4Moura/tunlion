@@ -31,6 +31,7 @@ openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 bytes = "1.11.1"
+chrono = "0.4"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 futures-util = "0.3.32"
 reqwest = { version = "0.13.4", features = ["json"] }
