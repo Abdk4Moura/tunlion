@@ -770,11 +770,14 @@ enum Cmd {
     /// Requires sshfs on both ends. Uses the same transport as `filament ssh`
     /// (L3 overlay preferred, L2 tunnel fallback). The peer must have sshd
     /// running and shell access granted.
+    ///
+    /// By default runs in background with auto-recovery. Use --foreground to
+    /// run sshfs in the foreground (blocks the terminal).
     Mount {
         /// Known device (petname) to mount from
-        peer: String,
+        peer: Option<String>,
         /// Remote directory path
-        remote: String,
+        remote: Option<String>,
         /// Local mount point (default: basename of remote path)
         local: Option<String>,
         /// Mount read-only
@@ -783,6 +786,15 @@ enum Cmd {
         /// Extra sshfs options (comma-separated)
         #[arg(long)]
         options: Option<String>,
+        /// Run sshfs in the foreground (blocks terminal)
+        #[arg(long)]
+        foreground: bool,
+        /// List all filament mounts and their status
+        #[arg(long)]
+        list: bool,
+        /// Check if a mount is healthy
+        #[arg(long, value_name = "PATH")]
+        check: Option<String>,
     },
     /// Unmount a filament mount point.
     Unmount {
@@ -5422,8 +5434,16 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { peer, remote, local, read_only, options } => {
-            mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay).await
+        Cmd::Mount { peer, remote, local, read_only, options, foreground, list, check } => {
+            if list {
+                mount::list_cmd()
+            } else if let Some(path) = check {
+                mount::check_cmd(&path)
+            } else {
+                let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
+                let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
+                mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground).await
+            }
         }
         Cmd::Unmount { path } => mount::unmount_cmd(&path),
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
