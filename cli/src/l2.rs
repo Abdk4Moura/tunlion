@@ -2911,8 +2911,8 @@ async fn run_ssh(
             // The peer IS on the overlay. PREFER L3 (survives link repairs); only
             // fall to L2 when the overlay genuinely can't carry ssh.
             if probe_sshd(addr, std::time::Duration::from_millis(600)) {
-                crate::ui::say(&format!(
-                    "filament: ssh over the L3 overlay ({mesh_host}) - survives link repairs"
+                crate::ui::debug(&format!(
+                    "ssh over the L3 overlay ({mesh_host}) - survives link repairs"
                 ));
                 let code = spawn_ssh_direct(login, &mesh_host, extra)?;
                 if code != 255 {

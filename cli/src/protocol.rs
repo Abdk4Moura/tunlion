@@ -1,4 +1,4 @@
-//! PROTOCOL — the filament file-transfer ceremony decisions (the Rust mirror of
+//! PROTOCOL: the filament file-transfer ceremony decisions (the Rust mirror of
 //! the JS `net/protocol` layer). Pure: bytes/state in, a decision out, NO timers,
 //! NO retries, NO transport. The stateful event loops (`send_cmd`/`recv_cmd` in
 //! `main.rs`) own the I/O and call in here. Mirrors
@@ -64,7 +64,7 @@ pub fn delivery_ack_msg(id: &str, sid: u32) -> Value {
 /// - `completed`: files fully placed on disk so far.
 /// - `keep_open`: the receiver was asked to stay resident (gate 13).
 /// - `by_sid_empty`: NO stream is in flight (an in-progress reconnect/resume keeps
-///   a by_sid entry, which must keep the link reconnecting — gate 2/11c).
+///   a by_sid entry, which must keep the link reconnecting (gate 2/11c).
 pub fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> bool {
     completed > 0 && !keep_open && by_sid_empty
 }
@@ -77,11 +77,11 @@ pub fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool)
 /// unit-testable without a live peer.
 ///
 /// - `link_alive`: a live transport is still attached (mirrors "channel open").
-///   When false the link is gone — nothing can prompt or carry a re-ack.
+///   When false the link is gone, nothing can prompt or carry a re-ack.
 /// - `reprobed`: we have already re-sent `file-end` once this window.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AckFallback {
-    /// link looks alive and we have not re-probed — the ack may be lost; re-send
+    /// link looks alive and we have not re-probed, the ack may be lost; re-send
     /// `file-end` once to prompt it and extend the window.
     Reprobe,
     /// end honestly (nonzero exit, partial kept resumable), never a false
@@ -102,11 +102,11 @@ pub fn decide_ack_fallback(link_alive: bool, reprobed: bool) -> AckFallback {
 /// P4 (GAP-5): outcome of the RECEIVER's whole-file integrity check at file-end.
 #[derive(Debug, PartialEq, Eq)]
 pub enum VerifyResult {
-    /// Received bytes hash to the sender's offered digest — accept + ack.
+    /// Received bytes hash to the sender's offered digest, accept + ack.
     Match,
     /// Hash didn't match. `restart_from_zero` distinguishes the two cases: a SHORT
-    /// file (received < size) is merely TRUNCATED — resume the tail; a FULL-SIZE
-    /// file with the wrong hash has a CORRUPT BODY (the partial is poisoned) — so
+    /// file (received < size) is merely TRUNCATED, resume the tail; a FULL-SIZE
+    /// file with the wrong hash has a CORRUPT BODY (the partial is poisoned), so
     /// re-fetch from 0.
     Mismatch { restart_from_zero: bool },
 }
@@ -120,7 +120,7 @@ pub enum VerifyResult {
 ///   hash_matches  Some(true/false) once hashed; None when skipped (truncated)
 pub fn decide_verify(received: u64, size: u64, hash_matches: Option<bool>) -> VerifyResult {
     if received < size {
-        // Truncated — can't possibly match yet; resume the tail.
+        // Truncated, can't possibly match yet; resume the tail.
         return VerifyResult::Mismatch { restart_from_zero: false };
     }
     match hash_matches {
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn recv_done_false_mid_transfer_protects_resume() {
         // by_sid NON-empty == a stream in flight (an in-progress reconnect/resume).
-        // Must NOT drop — gate 2 / gate 11c reconnect paths depend on this.
+        // Must NOT drop, gate 2 / gate 11c reconnect paths depend on this.
         assert!(!recv_transfer_done(0, false, false)); // nothing done, mid-stream
         assert!(!recv_transfer_done(1, false, false)); // file done but another in flight
         // keep_open (gate 13): a resident receiver never self-drops its links.
@@ -188,7 +188,7 @@ mod tests {
         // Link alive, first window: the ack may be lost, re-probe once.
         assert_eq!(decide_ack_fallback(true, false), AckFallback::Reprobe);
         // Link alive but already re-probed and STILL no ack: fail as unconfirmed
-        // (resumable) — the exact case the old code falsely completed.
+        // (resumable), the exact case the old code falsely completed.
         assert_eq!(decide_ack_fallback(true, true), AckFallback::FailUnconfirmed);
     }
 

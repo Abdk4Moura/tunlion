@@ -1,4 +1,4 @@
-//! SHUTDOWN — prompt, bounded exit on SIGTERM/SIGINT regardless of link count.
+//! SHUTDOWN: prompt, bounded exit on SIGTERM/SIGINT regardless of link count.
 //!
 //! The daemon acceptor's signal handling used to route a signal through the
 //! event-loop channel (`Ev::Interrupted`): the loop had to be FREE to see it,

@@ -1,10 +1,10 @@
-//! RESILIENCE — keeping a hostile link alive (the Rust mirror of the JS
+//! RESILIENCE: keeping a hostile link alive (the Rust mirror of the JS
 //! `net/resilience` layer). This module holds the timer-free POLICY of the stall
 //! correction ladder; `Conn::correct_stall` in `main.rs` owns the state + I/O
 //! (the repair/escalate side effects) and calls in here to classify each tick.
 //!
 //! Discipline (consolidation-GOAL.md §3): if it has a timer/retry/reconnect it is
-//! RESILIENCE — but the *decision* of which rung to take is pure, so it lives here
+//! RESILIENCE, but the *decision* of which rung to take is pure, so it lives here
 //! and is unit-tested directly. Mirrors `frontend/src/net/resilience/stall.js`
 //! (`nextStallRung`) + `net/app/recovery.js` (`decideStallEscalation`).
 
@@ -62,7 +62,7 @@ pub fn decide_stall_action(
 }
 
 // ============================================================================
-// LIVENESS state machine — the data-flow phase of ONE link carrying an in-flight
+// LIVENESS state machine: the data-flow phase of ONE link carrying an in-flight
 // transfer, as seen by the bytes-moved stall watchdog.
 //
 // Why a machine: the watchdog's job is "no data for too long -> correct", but
@@ -101,12 +101,12 @@ pub fn decide_stall_action(
 // Establishing can ONLY be judged by GRACE; Flowing/Stalled by STALL. There is
 // no path that judges a not-yet-flowed link by STALL. After a repair, the new
 // transport reports flowed=false, so the machine re-enters Establishing and the
-// generous grace applies again — structurally preventing the loop.
+// generous grace applies again, structurally preventing the loop.
 
 /// The data-flow phase of one link carrying an in-flight transfer.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Liveness {
-    /// No transfer in flight on this link — nothing for the watchdog to judge.
+    /// No transfer in flight on this link, nothing for the watchdog to judge.
     Idle,
     /// A transfer is in flight but the link has not moved its first DATA byte yet
     /// (no transport, or a transport that has not yet delivered a chunk). Judged
@@ -139,7 +139,7 @@ pub struct LiveObs {
 /// The no-progress timeout a phase is judged against. The SINGLE place a phase
 /// maps to its clock: a not-yet-flowed link gets the grace, a flowing one the
 /// tight threshold. Centralizing this is what makes the wrong-threshold bug
-/// unrepresentable — callers ask `classify`, they never pick a threshold.
+/// unrepresentable, callers ask `classify`, they never pick a threshold.
 pub fn phase_threshold(flowed: bool, grace_ms: u64, stall_ms: u64) -> u64 {
     if flowed {
         stall_ms
@@ -253,7 +253,7 @@ mod tests {
     fn no_transport_is_always_establishing() {
         // No transport at all: the ESTABLISHMENT watchdog (C3 / Ev::Stuck) owns
         // "never connects", not the bytes watchdog. So this is Establishing
-        // regardless of idle — the bytes watchdog must never declare a link with
+        // regardless of idle, the bytes watchdog must never declare a link with
         // nothing to repair Stalled (firing the ladder would repair nothing).
         for idle in [0u64, STALL + 1, GRACE, u64::MAX] {
             assert_eq!(classify(&obs(true, false, false, idle)), Liveness::Establishing);
@@ -264,7 +264,7 @@ mod tests {
     fn pre_first_byte_is_judged_by_grace_not_stall() {
         // THE REGRESSION: a transport that is up but has not delivered its first
         // byte, idle PAST the flowing threshold but WITHIN the grace, MUST be
-        // Establishing — never Stalled. The old code declared this Stalled and
+        // Establishing, never Stalled. The old code declared this Stalled and
         // looped the repair forever, delivering zero bytes.
         let o = obs(true, true, /*flowed*/ false, STALL + 1);
         assert_eq!(classify(&o), Liveness::Establishing);
@@ -299,7 +299,7 @@ mod tests {
     fn repair_re_enters_establishing_grace_breaking_the_loop() {
         // The loop-breaker, as a state sequence: a flowing link stalls; the repair
         // brings up a FRESH transport (flowed=false), which the machine judges by
-        // GRACE again (Establishing), not STALL — so a high-RTT relay re-establish
+        // GRACE again (Establishing), not STALL, so a high-RTT relay re-establish
         // that takes > STALL but < GRACE is NOT re-declared Stalled.
         assert_eq!(classify(&obs(true, true, true, STALL)), Liveness::Stalled); // stalls
         // fresh transport after repair, mid-establish over a slow relay:
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn grace_never_below_stall_via_classify_inputs() {
         // Even if a caller passed a grace smaller than stall (misconfig), a
-        // not-yet-flowed link is judged by whatever grace was given — net::
+        // not-yet-flowed link is judged by whatever grace was given, net::
         // establish_grace_ms() enforces grace >= stall, so this documents the
         // contract the classifier relies on.
         let weird = LiveObs { in_flight: true, transport_up: true, flowed: false, idle_ms: 5_000, grace_ms: 1_000, stall_ms: 6_000 };
