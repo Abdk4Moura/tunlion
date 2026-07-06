@@ -1336,4 +1336,234 @@ mod tests {
         assert_eq!(&got, b"HELLO-IPV4", "IPv4 byte stream must round-trip through both stacks");
         server.await.unwrap();
     }
+
+    /// Cross-wire two dual-stack netstacks and verify IPv4 connectivity: B listens
+    /// on IPv4, A dials B over IPv4, then B dials A over IPv4. Both directions must
+    /// carry the byte stream correctly and the listener must identify each peer's
+    /// IPv4 overlay address.
+    #[tokio::test]
+    async fn netstack_ipv4_connectivity() {
+        let a6: Ipv6Addr = "fdf1:1af7:c30d:c11::1".parse().unwrap();
+        let a4: Ipv4Addr = "10.0.80.1".parse().unwrap();
+        let b6: Ipv6Addr = "fdf1:1af7:c30d:c12::1".parse().unwrap();
+        let b4: Ipv4Addr = "10.0.80.2".parse().unwrap();
+
+        let a = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+                .unwrap(),
+        );
+        let b = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+                .unwrap(),
+        );
+
+        cross_wire(a.clone(), b.clone(), 0);
+
+        // B listens on port 9601; A dials B over IPv4.
+        let listener_b = std::sync::Arc::new(b.listen_v4(9601).await.unwrap());
+        let srv_b = {
+            let listener = listener_b.clone();
+            tokio::spawn(async move {
+                let (mut s, src) = listener.accept().await.unwrap();
+                assert_eq!(src.as_ipv4(), Some(a4), "B's listener must see A's IPv4 src");
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).await.unwrap();
+                let up = buf[..n].to_ascii_uppercase();
+                s.write_all(&up).await.unwrap();
+                s.flush().await.unwrap();
+                s.shutdown().await.unwrap();
+            })
+        };
+
+        let mut client = tokio::time::timeout(Duration::from_secs(5), a.dial_v4(b4, 9601))
+            .await
+            .expect("A->B IPv4 dial timed out")
+            .expect("A->B IPv4 dial failed");
+        client.write_all(b"ping").await.unwrap();
+        client.flush().await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if got.len() >= b"PING".len() {
+                break;
+            }
+        }
+        assert_eq!(&got, b"PING", "A->B IPv4 byte stream corrupted");
+        srv_b.await.unwrap();
+
+        // Reverse direction: A listens on port 9602; B dials A over IPv4.
+        let listener_a = std::sync::Arc::new(a.listen_v4(9602).await.unwrap());
+        let srv_a = {
+            let listener = listener_a.clone();
+            tokio::spawn(async move {
+                let (mut s, src) = listener.accept().await.unwrap();
+                assert_eq!(src.as_ipv4(), Some(b4), "A's listener must see B's IPv4 src");
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).await.unwrap();
+                let up = buf[..n].to_ascii_uppercase();
+                s.write_all(&up).await.unwrap();
+                s.flush().await.unwrap();
+                s.shutdown().await.unwrap();
+            })
+        };
+
+        let mut client2 = tokio::time::timeout(Duration::from_secs(5), b.dial_v4(a4, 9602))
+            .await
+            .expect("B->A IPv4 dial timed out")
+            .expect("B->A IPv4 dial failed");
+        client2.write_all(b"pong").await.unwrap();
+        client2.flush().await.unwrap();
+        let mut got2 = Vec::new();
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(3), client2.read(&mut buf))
+                .await
+                .expect("read timed out")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            got2.extend_from_slice(&buf[..n]);
+            if got2.len() >= b"PONG".len() {
+                break;
+            }
+        }
+        assert_eq!(&got2, b"PONG", "B->A IPv4 byte stream corrupted");
+        srv_a.await.unwrap();
+    }
+
+    /// Two dual-stack netstacks cross-wired with packet loss. IPv4 TCP must
+    /// retransmit and deliver the full byte stream intact despite dropped packets.
+    #[tokio::test]
+    async fn netstack_ipv4_lossy_overlay() {
+        let a6: Ipv6Addr = "fdf1:1af7:c30d:c21::1".parse().unwrap();
+        let a4: Ipv4Addr = "10.0.81.1".parse().unwrap();
+        let b6: Ipv6Addr = "fdf1:1af7:c30d:c22::1".parse().unwrap();
+        let b4: Ipv4Addr = "10.0.81.2".parse().unwrap();
+
+        let a = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+                .unwrap(),
+        );
+        let b = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+                .unwrap(),
+        );
+
+        cross_wire(a.clone(), b.clone(), 7);
+
+        let listener = b.listen_v4(9400).await.unwrap();
+        let payload: Vec<u8> = (0..12000u32).map(|i| (i.wrapping_mul(2654435761) >> 16) as u8).collect();
+        let expect = payload.clone();
+        let server = tokio::spawn(async move {
+            let (mut s, src) = listener.accept().await.unwrap();
+            assert_eq!(src.as_ipv4(), Some(a4), "accepted connection must be IPv4");
+            let mut got = Vec::new();
+            let mut buf = [0u8; 2048];
+            while got.len() < expect.len() {
+                let n = s.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expect, "IPv4 payload corrupted under loss");
+            let _ = s.write_all(b"OK").await;
+            let _ = s.flush().await;
+            let _ = s.shutdown().await;
+        });
+
+        let mut client = tokio::time::timeout(Duration::from_secs(25), a.dial_v4(b4, 9400))
+            .await
+            .expect("IPv4 dial timed out under loss")
+            .expect("IPv4 dial failed");
+        client.write_all(&payload).await.unwrap();
+        client.flush().await.unwrap();
+        let mut ack = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(25), client.read_exact(&mut ack))
+            .await
+            .expect("IPv4 ack timed out under loss")
+            .unwrap();
+        assert_eq!(&ack, b"OK");
+        server.await.unwrap();
+    }
+
+    /// Many simultaneous IPv4 connections to one dual-stack listener. Each client
+    /// dials over IPv4, sends a message, receives the uppercased echo, and verifies
+    /// no cross-wiring or truncation occurred.
+    #[tokio::test]
+    async fn netstack_ipv4_many_connections() {
+        let a6: Ipv6Addr = "fdf1:1af7:c30d:c31::1".parse().unwrap();
+        let a4: Ipv4Addr = "10.0.82.1".parse().unwrap();
+        let b6: Ipv6Addr = "fdf1:1af7:c30d:c32::1".parse().unwrap();
+        let b4: Ipv4Addr = "10.0.82.2".parse().unwrap();
+
+        let a = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{a6}/128"), Some(&format!("{a4}/24")), 1280)
+                .unwrap(),
+        );
+        let b = Arc::new(
+            NetstackTun::open_dual("filament0", &format!("{b6}/128"), Some(&format!("{b4}/24")), 1280)
+                .unwrap(),
+        );
+
+        cross_wire(a.clone(), b.clone(), 0);
+
+        const N: u32 = 12;
+        let listener = std::sync::Arc::new(b.listen_v4(9500).await.unwrap());
+        let srv = {
+            let listener = listener.clone();
+            tokio::spawn(async move {
+                for _ in 0..N {
+                    let (mut s, _src) = match listener.accept().await {
+                        Ok(x) => x,
+                        Err(_) => break,
+                    };
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 64];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        let up = buf[..n].to_ascii_uppercase();
+                        let _ = s.write_all(&up).await;
+                        let _ = s.flush().await;
+                        let _ = s.shutdown().await;
+                    });
+                }
+            })
+        };
+
+        let mut clients = Vec::new();
+        for i in 0..N {
+            let a = a.clone();
+            clients.push(tokio::spawn(async move {
+                let mut c = a.dial_v4(b4, 9500).await.expect("IPv4 dial failed");
+                let msg = format!("v4client-{i}");
+                c.write_all(msg.as_bytes()).await.unwrap();
+                c.flush().await.unwrap();
+                let mut got = Vec::new();
+                let mut buf = [0u8; 64];
+                while got.len() < msg.len() {
+                    let n = c.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                assert_eq!(got, msg.to_ascii_uppercase().into_bytes(), "IPv4 connection {i} crossed wires or truncated");
+            }));
+        }
+        for (i, h) in clients.into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(15), h)
+                .await
+                .unwrap_or_else(|_| panic!("IPv4 client {i} timed out"))
+                .unwrap();
+        }
+        srv.abort();
+    }
 }
