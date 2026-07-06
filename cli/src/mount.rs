@@ -51,18 +51,32 @@ pub async fn mount_cmd(
 
     // Try L3 direct first, fall back to L2.
     let mut cmd = std::process::Command::new("sshfs");
+    // Always add SSH identity options for authentication.
+    cmd.arg("-o").arg(format!("IdentityFile={}", info.key_path.display()));
+    cmd.arg("-o").arg("IdentitiesOnly=yes");
+    cmd.arg("-o").arg(format!("UserKnownHostsFile={}", info.known_hosts_path.display()));
+    cmd.arg("-o").arg("GlobalKnownHostsFile=/dev/null");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("ServerAliveInterval=15");
+    cmd.arg("-o").arg("ServerAliveCountMax=4");
+
     if let Some(dest) = crate::l2::l3_dest(&info) {
         crate::ui::debug("mounting over the L3 overlay (survives link repairs)");
         cmd.arg(format!("{dest}:{remote}"));
     } else {
         // L2 fallback: use ProxyCommand.
         let peer_name = peer.strip_suffix(".mesh").unwrap_or(peer);
-        let transport_args = crate::l2::ssh_transport_args(&info, server, peer_name, relay);
+        let exe = std::env::current_exe()?;
+        let exe = exe.to_string_lossy();
+        let mut proxy = format!("{exe} --server {server}");
+        if relay {
+            proxy.push_str(" --relay");
+        }
+        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
         let dest_token = format!("{}@{}", info.login, info.host);
         cmd.arg(format!("{dest_token}:{remote}"));
-        for arg in &transport_args {
-            cmd.arg(arg);
-        }
     }
     cmd.arg(&local_path);
     if read_only {
@@ -92,16 +106,28 @@ pub async fn mount_cmd(
                 crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
                 let retry = crate::l2::rebootstrap_peer(server, peer, relay).await?;
                 let mut cmd = std::process::Command::new("sshfs");
+                // Always add SSH identity options.
+                cmd.arg("-o").arg(format!("IdentityFile={}", retry.key_path.display()));
+                cmd.arg("-o").arg("IdentitiesOnly=yes");
+                cmd.arg("-o").arg(format!("UserKnownHostsFile={}", retry.known_hosts_path.display()));
+                cmd.arg("-o").arg("GlobalKnownHostsFile=/dev/null");
+                cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+                cmd.arg("-o").arg("ConnectTimeout=10");
+                cmd.arg("-o").arg("ServerAliveInterval=15");
+                cmd.arg("-o").arg("ServerAliveCountMax=4");
+
                 if let Some(dest) = crate::l2::l3_dest(&retry) {
                     cmd.arg(format!("{dest}:{remote}"));
                 } else {
                     let peer_name = peer.strip_suffix(".mesh").unwrap_or(peer);
-                    let transport_args = crate::l2::ssh_transport_args(&retry, server, peer_name, relay);
+                    let exe = std::env::current_exe()?;
+                    let exe = exe.to_string_lossy();
+                    let mut proxy = format!("{exe} --server {server}");
+                    if relay { proxy.push_str(" --relay"); }
+                    proxy.push_str(&format!(" netcat {peer_name} {}", retry.rport));
+                    cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
                     let dest_token = format!("{}@{}", retry.login, retry.host);
                     cmd.arg(format!("{dest_token}:{remote}"));
-                    for arg in &transport_args {
-                        cmd.arg(arg);
-                    }
                 }
                 cmd.arg(&local_path);
                 if read_only {
