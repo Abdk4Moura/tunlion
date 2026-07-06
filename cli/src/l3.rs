@@ -168,8 +168,14 @@ impl L3 {
         let my_v4 = identity.as_ref().map(|id| id.addr_v4());
         // Keep the concrete NetstackTun (for bind/dial) AND the dyn handle (for the
         // datagram pumps) when userspace; `None` netstack == kernel TUN.
+        let v4_cidr = my_v4.map(|v4| format!("{v4}/32"));
         let open_netstack = || -> Result<(Arc<dyn TunDevice>, Option<Arc<NetstackTun>>)> {
-            let ns = Arc::new(NetstackTun::open(IFNAME, cidr, mtu)?);
+            let ns = Arc::new(NetstackTun::open_dual(
+                IFNAME,
+                cidr,
+                v4_cidr.as_deref(),
+                mtu,
+            )?);
             Ok((ns.clone() as Arc<dyn TunDevice>, Some(ns)))
         };
         let (tun, netstack): (Arc<dyn TunDevice>, Option<Arc<NetstackTun>>) = match mode {
@@ -929,5 +935,19 @@ mod tests {
             assert!(out.contains("fdf1:1af7:c30d::aa host1.mesh"));
             assert!(out.contains("fdf1:1af7:c30d::bb host1.mesh"));
         });
+    }
+
+    #[tokio::test]
+    async fn l3_start_with_ipv4() {
+        use super::*;
+        let identity = Identity::load_or_create().unwrap();
+        let expected_v4 = identity.addr_v4();
+        let cidr = format!("{}/128", identity.addr());
+        let l3 = L3::start(&cidr, 1280, Some(identity), L3Mode::Userspace).unwrap();
+        assert!(l3.is_userspace(), "should be userspace mode");
+        assert_eq!(l3.my_addr_v4(), Some(expected_v4), "v4 address from identity");
+        // The netstack should be dual-stack when v4 is available
+        let ns = l3.netstack.as_ref().unwrap();
+        assert!(ns.is_dual_stack(), "netstack should be dual-stack with v4 CIDR");
     }
 }
