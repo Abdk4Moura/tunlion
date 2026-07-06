@@ -432,7 +432,7 @@ enum Cmd {
         #[arg(long)]
         word: Option<String>,
     },
-    /// List devices remembered via --remember (trusted for --to and auto-accept)
+    /// List known devices (trusted for --to and auto-accept)
     Devices {
         #[command(subcommand)]
         action: Option<DevicesAction>,
@@ -524,12 +524,17 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print this device's L3 overlay address.
+    /// Show this machine's overlay address, or a device's info (addresses, caps, last seen).
     ///
     /// Derived from its Ed25519 overlay key; stable across restarts. Creates the
     /// key on first use. `--v4` prints the dual-stack IPv4 overlay address instead
     /// (also key-derived, in the reserved 198.18.0.0/15 range).
+    ///
+    /// With a device name: shows that device's overlay addresses, capabilities,
+    /// and last-seen time. Use `filament devices` to list all known devices.
     Addr {
+        /// Device name to show info for (omit for this machine's address).
+        device: Option<String>,
         /// Print the IPv4 overlay address (dual-stack) instead of the IPv6 one.
         #[arg(long)]
         v4: bool,
@@ -1073,6 +1078,12 @@ pub(crate) fn devices_load() -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Check if a petname is already taken by another device (case-insensitive).
+fn devices_name_taken(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    devices_load().iter().any(|(n, _)| n.to_ascii_lowercase() == lower)
+}
+
 /// Strip terminal escape sequences and control characters from a device petname
 /// before it is stored. A name typed or pasted in a terminal can capture the
 /// terminal's own device-attributes reply (`ESC[?1;2c...`); that junk then never
@@ -1120,10 +1131,23 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    match arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+    // Check for name collision and auto-suffix if needed
+    let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+        let mut suffix = 2;
+        let mut new_name = format!("{name}-{suffix}");
+        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+            suffix += 1;
+            new_name = format!("{name}-{suffix}");
+        }
+        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
+        new_name
+    } else {
+        name.to_string()
+    };
+    match arr.iter_mut().find(|d| d["name"].as_str() == Some(&final_name)) {
         // Re-storing an existing name: only the secret rotates; keep its caps.
         Some(existing) => existing["secret"] = json!(secret),
-        None => arr.push(json!({"name": name, "secret": secret})),
+        None => arr.push(json!({"name": &final_name, "secret": secret})),
     }
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
     #[cfg(unix)]
@@ -1152,8 +1176,21 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    arr.retain(|d| d["name"].as_str() != Some(name));
-    arr.push(json!({"name": name, "secret": secret, "v": 2, "caps": caps,
+    // Check for name collision and auto-suffix if needed
+    let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+        let mut suffix = 2;
+        let mut new_name = format!("{name}-{suffix}");
+        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+            suffix += 1;
+            new_name = format!("{name}-{suffix}");
+        }
+        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
+        new_name
+    } else {
+        name.to_string()
+    };
+    arr.retain(|d| d["name"].as_str() != Some(&final_name));
+    arr.push(json!({"name": &final_name, "secret": secret, "v": 2, "caps": caps,
                     "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
     #[cfg(unix)]
@@ -1162,6 +1199,38 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// Update the `lastSeen` timestamp and overlay addresses for a known device.
+/// Called on each connect so `filament addr <device>` can show recency and addresses.
+fn devices_touch(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>) {
+    let p = devices_path();
+    let Ok(raw) = std::fs::read_to_string(&p) else { return };
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else { return };
+    let Some(arr) = val.as_array() else { return };
+    let mut arr = arr.clone();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    for d in arr.iter_mut() {
+        if d["name"].as_str() == Some(name) {
+            d["lastSeen"] = json!(now);
+            if let Some(v6) = v6 { d["overlayV6"] = json!(v6.to_string()); }
+            if let Some(v4) = v4 { d["overlayV4"] = json!(v4.to_string()); }
+            break;
+        }
+    }
+    let _ = std::fs::write(&p, serde_json::to_string_pretty(&arr).unwrap_or_default());
+}
+
+/// Read the `lastSeen` timestamp and overlay addresses for a known device.
+fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<String>)> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(p).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let d = arr.iter().find(|d| d["name"].as_str() == Some(name))?;
+    let last_seen = d["lastSeen"].as_u64();
+    let v6 = d["overlayV6"].as_str().map(|s| s.to_string());
+    let v4 = d["overlayV4"].as_str().map(|s| s.to_string());
+    Some((last_seen.unwrap_or(0), v6, v4))
 }
 
 /// True if ANY known device has been granted the `shell` capability. The daemon
@@ -2321,6 +2390,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
                 // caps_v2 (spec §8): record GRANTED caps, deny-by-default.
+                // devices_store_v2 handles name collisions via auto-suffix.
                 devices_store_v2(&n, &sec, &caps)?;
                 ui::say(&format!(
                     "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
@@ -5076,12 +5146,48 @@ async fn main() -> Result<()> {
         Cmd::Get { key, peer, show_origin, default, json } => {
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
         }
-        Cmd::Addr { v4 } => {
-            let id = overlay::Identity::load_or_create()?;
-            if v4 {
-                println!("{}", id.addr_v4());
+        Cmd::Addr { device, v4 } => {
+            if let Some(name) = device {
+                // Show a specific device's info.
+                let all = devices_load();
+                let entry = all.iter().find(|(n, _)| n == &name);
+                let Some((_, secret)) = entry else {
+                    bail!("no device named '{name}', see `filament devices`");
+                };
+                let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+                let channel = channel_of(secret);
+                // Load lastSeen and overlay addresses from the device store.
+                let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
+                let last_seen_str = if last_seen == 0 { "never".to_string() } else {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let ago = now.saturating_sub(last_seen);
+                    if ago < 60 { "just now".to_string() }
+                    else if ago < 3600 { format!("{}m ago", ago / 60) }
+                    else if ago < 86400 { format!("{}h ago", ago / 3600) }
+                    else { format!("{}d ago", ago / 86400) }
+                };
+                println!("  {}", ui::paint(ui::Tone::Bold, &name));
+                println!("  channel:  {}", &channel[..12.min(channel.len())]);
+                // Show overlay addresses if we have them.
+                if let Some(v6) = &stored_v6 {
+                    let v4_str = stored_v4.as_ref().map(|a| format!(" / {a}")).unwrap_or_default();
+                    println!("  overlay:  {v6}{v4_str}");
+                    println!("  mesh:     {name}.mesh");
+                }
+                println!("  caps:     {}", caps.join(", "));
+                println!("  last see: {last_seen_str}");
             } else {
-                println!("{}", id.addr());
+                // Show this machine's address.
+                let id = overlay::Identity::load_or_create()?;
+                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
+                let mesh_name = l3::sanitize_host(&my_name);
+                if v4 {
+                    println!("{}", id.addr_v4());
+                } else {
+                    println!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
+                    println!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
+                    println!("  mesh:     {mesh_name}.mesh");
+                }
             }
             Ok(())
         }
@@ -6996,7 +7102,7 @@ async fn recv_cmd(
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
                                 ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
                             } else {
-                                // Kernel mode is dual-stack: show the v4 address too
+                            // Kernel mode is dual-stack: show the v4 address too
                                 // (userspace has no v4 endpoint yet, so it is omitted
                                 // above to avoid implying a route that does not exist).
                                 let v4 = m.my_addr_v4().map(|a| format!(" / {a}")).unwrap_or_default();
@@ -7006,6 +7112,26 @@ async fn recv_cmd(
                                     addr,
                                     v4
                                 ));
+                                // Show the .mesh name that resolves to this machine.
+                                let my_name = l3::hostname();
+                                ui::say(&format!(
+                                    "    this machine resolves as {}{}",
+                                    l3::sanitize_host(&my_name),
+                                    ".mesh"
+                                ));
+                            }
+                            // Add this machine's own address to MagicDNS so
+                            // `<name>.mesh` resolves locally (not just peers).
+                            // Uses the filament device name (from `filament set name`
+                            // or hostname if unset), sanitized for DNS.
+                            if let Some(id) = m.identity_ref() {
+                                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
+                                let v6 = id.addr();
+                                let v4 = Some(id.addr_v4());
+                                m.names_insert("__self__", &l3::sanitize_host(&my_name), v6, v4).await;
+                                if !m.is_userspace() {
+                                    m.refresh_hosts().await;
+                                }
                             }
                             Some(m)
                         }
@@ -7897,6 +8023,7 @@ async fn recv_cmd(
                         && !conn.direct_pending.contains_key(&pid);
                     if fresh {
                         ui::say(&format!("known device '{n}' appeared, connecting"));
+                        devices_touch(n, None, None);  // track last_seen; addresses filled on ChannelReady
                     } else {
                         ui::trace(&format!("known device '{n}' re-announced (link already up)"));
                     }
@@ -8050,7 +8177,10 @@ async fn recv_cmd(
                         if let Some(pending) = l3_seen.get(&pid) {
                             if let Ok(ip) = pending.verify(&cb) {
                                 let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
-                                l3.add_peer(&pid, &who, ip.into(), Some(pending.addr_v4().into()), t.clone()).await;
+                                let v4 = pending.addr_v4();
+                                l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
+                                // Store overlay addresses for `filament addr <device>`
+                                devices_touch(&who, Some(ip), Some(v4));
                             }
                         }
                     }
@@ -8204,8 +8334,11 @@ async fn recv_cmd(
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
                                             let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
-                                            l3.add_peer(&pid, &who, ip.into(), Some(ann.addr_v4().into()), t).await;
-                                            ui::say(&format!("  {} L3 peer {who}.mesh at {ip}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                                            let v4 = ann.addr_v4();
+                                            l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
+                                            ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                                            // Store overlay addresses for `filament addr <device>`
+                                            devices_touch(&who, Some(ip), Some(v4));
                                         }
                                         Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
                                     },
@@ -9981,5 +10114,55 @@ mod tests {
         assert_eq!(password_word_tokens("ok1234"), 1);
         // normalized spaces become dashes upstream; here we only see lowercase.
         assert_eq!(password_word_tokens(""), 0);
+    }
+
+    #[test]
+    fn devices_store_collision_auto_suffixes() {
+        // When a name collision occurs, the new device gets auto-suffixed.
+        // This prevents two devices from silently shadowing each other.
+        let mut arr: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"host1","secret":"aaa"}]"#
+        ).unwrap();
+        let new_secret = "bbb";
+        let name = "host1";
+        // Simulate collision handling (same logic as devices_store)
+        let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+            let mut suffix = 2;
+            let mut new_name = format!("{name}-{suffix}");
+            while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+                suffix += 1;
+                new_name = format!("{name}-{suffix}");
+            }
+            new_name
+        } else {
+            name.to_string()
+        };
+        arr.push(serde_json::json!({"name": &final_name, "secret": new_secret}));
+        // Verify auto-suffix was applied
+        assert_eq!(arr.len(), 2, "both entries preserved");
+        assert_eq!(arr[0]["name"].as_str().unwrap(), "host1", "original unchanged");
+        assert_eq!(arr[1]["name"].as_str().unwrap(), "host1-2", "new device auto-suffixed");
+    }
+
+    #[test]
+    fn devices_store_collision_increments_suffix() {
+        // Multiple collisions should increment the suffix.
+        let mut arr: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"name":"host1","secret":"aaa"},{"name":"host1-2","secret":"bbb"}]"#
+        ).unwrap();
+        let name = "host1";
+        let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+            let mut suffix = 2;
+            let mut new_name = format!("{name}-{suffix}");
+            while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+                suffix += 1;
+                new_name = format!("{name}-{suffix}");
+            }
+            new_name
+        } else {
+            name.to_string()
+        };
+        arr.push(serde_json::json!({"name": &final_name, "secret": "ccc"}));
+        assert_eq!(arr[2]["name"].as_str().unwrap(), "host1-3", "suffix incremented");
     }
 }

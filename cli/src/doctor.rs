@@ -596,7 +596,7 @@ pub(crate) fn ip_class(ip: std::net::IpAddr) -> String {
 
 /// Map a local IP (the near end of a selected path) to the interface it belongs
 /// to, plus whether that interface is a VPN/tailscale tunnel. `None` when the IP
-/// isn't among local interfaces or `ip` is unavailable — the caller then just
+/// isn't among local interfaces or `ip` is unavailable, the caller then just
 /// omits the interface name rather than guessing one.
 pub(crate) fn iface_for_ip(ip: std::net::IpAddr) -> Option<(String, bool)> {
     list_interfaces()

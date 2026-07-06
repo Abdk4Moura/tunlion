@@ -1,4 +1,4 @@
-// `filament ping <peer>`: show the live link to a known device — route, RTT, and
+// `filament ping <peer>`: show the live link to a known device, including route, RTT, and
 // whether ssh/pty will be instant. Mirrors `tailscale ping` and elevates it with
 // two things Tailscale has no concept of: WARM vs COLD (is a link already held by
 // the local `up` daemon, so ssh/pty is instant?) and VERIFIED identity (paired +
@@ -50,7 +50,7 @@ pub async fn ping_cmd(server: &str, peer: &str, count: u32, json_out: bool, rela
     Ok(())
 }
 
-/// A relay/TURN path (no direct line of sight) — the only case we tint amber.
+/// A relay/TURN path (no direct line of sight), the only case we tint amber.
 fn is_relay(route: &str) -> bool {
     matches!(route, "relay" | "relayed")
 }
@@ -81,7 +81,7 @@ fn fmt_ms(ms: u64) -> String {
 
 /// One result line for a held (warm) link. The path is shown in fine detail but
 /// compactly: the local network INTERFACE, the remote-address class, and the
-/// concrete addresses — so you can see exactly which route the link takes (e.g.
+/// concrete addresses, so you can see exactly which route the link takes (e.g.
 /// `tailscale0 · CGNAT  100.x ↔ 100.y` means the tailnet, stated as data, not
 /// guessed). A relay/TURN path has no line of sight, so it reads "relay · TURN"
 /// with the encrypted caveat instead of addresses; direct links also carry a
@@ -104,7 +104,7 @@ fn print_warm_line(v: &Value) {
         line.push_str(&format!("   {}", ui::paint(Tone::Warn, &fmt_route(route))));
         line.push_str(&format!("  {}", ui::paint(Tone::Dim, "(encrypted, not direct)")));
     } else {
-        // Interface · class — the heart of "show the path". When the interface
+        // Interface · class, the heart of "show the path". When the interface
         // is a VPN/tailscale tunnel, tint it mint so the tunnel is obvious.
         if let Some(iface) = path["iface"].as_str() {
             let vpn = path["vpn"].as_bool().unwrap_or(false);
@@ -147,7 +147,7 @@ fn print_warm_verdict(peer: &str, v: &Value) {
 }
 
 /// No live link held locally: measure what a fresh connect would cost (the honest
-/// number — that IS what ssh/pty would pay), via the same establish-then-drop
+/// number (that IS what ssh/pty would pay), via the same establish-then-drop
 /// probe `filament doctor` uses.
 async fn print_cold(server: &str, peer: &str, relay: bool) {
     match crate::l2::establish_probe(server, peer, relay).await {

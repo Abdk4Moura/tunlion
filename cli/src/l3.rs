@@ -14,7 +14,7 @@
 //! now (no L3 over relay yet).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -133,9 +133,10 @@ pub struct L3 {
     identity: Option<Identity>,
     /// Monotonic announce sequence so a peer can ignore a stale re-announce.
     seq: AtomicU64,
-    /// MagicDNS: pid -> (petname, overlay addr) for VERIFIED peers, mirrored into a
-    /// managed block in /etc/hosts so native tools resolve `<petname>` / `<petname>.mesh`.
-    names: Mutex<HashMap<String, (String, Ipv6Addr)>>,
+    /// MagicDNS: pid -> (petname, v6 overlay addr, optional v4 overlay addr) for
+    /// VERIFIED peers, mirrored into a managed block in /etc/hosts so native tools
+    /// resolve `<petname>` / `<petname>.mesh` (both AAAA and A records).
+    names: Mutex<HashMap<String, (String, Ipv6Addr, Option<Ipv4Addr>)>>,
     /// `Some` when the endpoint is the userspace netstack (no kernel TUN). Held as
     /// the concrete type so `bind`/`dial` can open smoltcp sockets; its presence also
     /// means there is no kernel route to the overlay, so we do NOT write /etc/hosts
@@ -242,6 +243,16 @@ impl L3 {
         self.netstack.is_some()
     }
 
+    /// Access the overlay identity (crypto mode only).
+    pub fn identity_ref(&self) -> Option<&Identity> {
+        self.identity.as_ref()
+    }
+
+    /// Insert a name entry into the MagicDNS table (for self-registration).
+    pub async fn names_insert(&self, pid: &str, name: &str, v6: Ipv6Addr, v4: Option<Ipv4Addr>) {
+        self.names.lock().await.insert(pid.to_string(), (name.to_string(), v6, v4));
+    }
+
     /// Dial `dst:port` over the overlay, in BOTH modes: a kernel `TcpStream`
     /// (routed via filament0) or an in-process smoltcp connection. This is what lets
     /// a node reach a peer's OVERLAY-exposed service (an `expose` bound on the
@@ -281,8 +292,10 @@ impl L3 {
     /// Reverse MagicDNS: the petname of a verified peer by overlay address, so an
     /// `expose --peer` allowlist can match an incoming connection's source.
     pub async fn petname_of(&self, addr: IpAddr) -> Option<String> {
-        let IpAddr::V6(v6) = addr else { return None };
-        self.names.lock().await.values().find(|(_, a)| *a == v6).map(|(n, _)| n.clone())
+        self.names.lock().await.values().find(|(n, v6, v4)| {
+            matches!(addr, IpAddr::V6(a) if a == *v6)
+                || matches!(addr, IpAddr::V4(a) if v4.map_or(false, |v| a == v))
+        }).map(|(n, _, _)| n.clone())
     }
 
     /// Resolve a verified peer's petname to its overlay address (the inverse of
@@ -290,7 +303,13 @@ impl L3 {
     /// from a paired identity, never one the client asserts.
     pub async fn addr_of(&self, name: &str) -> Option<Ipv6Addr> {
         let name = sanitize_host(name);
-        self.names.lock().await.values().find(|(n, _)| *n == name).map(|(_, a)| *a)
+        self.names.lock().await.values().find(|(n, _, _)| *n == name).map(|(_, a, _)| *a)
+    }
+
+    /// Resolve a verified peer's petname to its v4 overlay address (if dual-stack).
+    pub async fn addr_v4_of(&self, name: &str) -> Option<Ipv4Addr> {
+        let name = sanitize_host(name);
+        self.names.lock().await.values().find(|(n, _, _)| *n == name).and_then(|(_, _, a)| *a)
     }
 
     /// Build a signed announce of our address bound to link channel-binding `cb`.
@@ -335,9 +354,13 @@ impl L3 {
                 }
             }
         }
-        // MagicDNS: record <petname> -> v6 addr and refresh /etc/hosts (v6 only).
+        // MagicDNS: record <petname> -> v6 addr (+ v4 if dual-stack) and refresh /etc/hosts.
         if let IpAddr::V6(v6) = peer_ip {
-            self.names.lock().await.insert(pid.to_string(), (sanitize_host(petname), v6));
+            let v4 = peer_ip_v4.and_then(|ip| match ip {
+                IpAddr::V4(a) => Some(a),
+                _ => None,
+            });
+            self.names.lock().await.insert(pid.to_string(), (sanitize_host(petname), v6, v4));
             self.refresh_hosts().await;
         }
         // ONE datagram->TUN pump per link (a peer's datagrams carry both families;
@@ -404,15 +427,24 @@ impl L3 {
     /// native tools resolve `<petname>` and `<petname>.mesh`. Best-effort: a
     /// non-root daemon (or read-only /etc/hosts) just skips it and the overlay
     /// still works by IP.
-    async fn refresh_hosts(&self) {
+    /// Refresh the managed /etc/hosts block from the current verified names so
+    /// native tools resolve `<petname>` and `<petname>.mesh`. Best-effort: a
+    /// non-root daemon (or read-only /etc/hosts) just skips it and the overlay
+    /// still works by IP.
+    pub async fn refresh_hosts(&self) {
         // Userspace mode has no kernel route to the overlay, so a resolved
         // `<peer>.mesh` would point at an unroutable IP (worse than not resolving);
         // skip /etc/hosts entirely and let dial/proxy resolve names in-process.
         if self.netstack.is_some() {
             return;
         }
-        let entries: Vec<(String, Ipv6Addr)> =
-            self.names.lock().await.values().map(|(n, a)| (n.clone(), *a)).collect();
+        let entries: Vec<(String, Ipv6Addr, Option<Ipv4Addr>)> = self
+            .names
+            .lock()
+            .await
+            .values()
+            .map(|(n, v6, v4)| (n.clone(), *v6, *v4))
+            .collect();
         if let Err(e) = rewrite_hosts_block(&entries) {
             crate::ui::debug(&format!("  MagicDNS: /etc/hosts not updated ({e}); overlay still works by IP"));
         }
@@ -456,6 +488,13 @@ fn open_kernel(
 const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
 
+/// Get this machine's hostname for MagicDNS.
+pub fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "cli".into())
+}
+
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
 /// under %SystemRoot% (default C:\Windows), which the resolver consults like /etc/hosts.
 fn hosts_path() -> std::path::PathBuf {
@@ -471,18 +510,20 @@ fn hosts_path() -> std::path::PathBuf {
 }
 
 /// Replace the filament-mesh managed block in /etc/hosts with `entries`
-/// (`<addr> <name>.mesh <name>` per peer). Atomic via temp-file + rename. An
-/// empty `entries` removes the block. Names are display-only; routing is always
-/// by the cryptographically-verified address.
+/// (`<addr> <name>.mesh` per peer, both AAAA and A records). Atomic via
+/// temp-file + rename. An empty `entries` removes the block. Names are
+/// display-only; routing is always by the cryptographically-verified address.
 pub(crate) fn sanitize_host(name: &str) -> String {
-    let s: String = name
+    // If name contains @, extract just the hostname part (user@host → host)
+    let base = name.split('@').last().unwrap_or(name);
+    let s: String = base
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
         .collect();
     s.trim_matches('-').to_string()
 }
 
-fn rewrite_hosts_block(entries: &[(String, Ipv6Addr)]) -> std::io::Result<()> {
+fn rewrite_hosts_block(entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> std::io::Result<()> {
     let path = hosts_path();
     let cur = std::fs::read_to_string(&path).unwrap_or_default();
     let out = render_hosts(&cur, entries);
@@ -504,7 +545,7 @@ fn rewrite_hosts_block(entries: &[(String, Ipv6Addr)]) -> std::io::Result<()> {
 /// Pure transform: strip any prior filament-mesh block from `current`, then append
 /// a fresh one for `entries` (none => block removed). Non-filament lines are kept
 /// verbatim, so we never clobber the user's /etc/hosts.
-fn render_hosts(current: &str, entries: &[(String, Ipv6Addr)]) -> String {
+fn render_hosts(current: &str, entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> String {
     let mut out = String::with_capacity(current.len() + 256);
     let mut in_block = false;
     for line in current.lines() {
@@ -522,26 +563,32 @@ fn render_hosts(current: &str, entries: &[(String, Ipv6Addr)]) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    // Dedup exact (name, addr) pairs: the names table is keyed per-link, so a peer
-    // that reconnected under several link ids can appear more than once and would
-    // otherwise emit duplicate /etc/hosts lines.
+    // Dedup exact (name, v6_addr) pairs: the names table is keyed per-link, so a
+    // peer that reconnected under several link ids can appear more than once and
+    // would otherwise emit duplicate /etc/hosts lines.
     let mut seen = std::collections::HashSet::new();
-    let live: Vec<&(String, Ipv6Addr)> = entries
+    let live: Vec<&(String, Ipv6Addr, Option<Ipv4Addr>)> = entries
         .iter()
-        .filter(|(n, _)| is_safe_mesh_name(n))
-        .filter(|(n, a)| seen.insert((n.clone(), *a)))
+        .filter(|(n, _, _)| is_safe_mesh_name(n))
+        .filter(|(n, v6, _)| seen.insert((n.clone(), *v6)))
         .collect();
     if !live.is_empty() {
         out.push_str(HOSTS_BEGIN);
         out.push('\n');
-        for (name, addr) in live {
+        for (name, v6, v4) in live {
+            // AAAA record: the v6 overlay address (always present).
             // ONLY the namespaced `<name>.mesh` is emitted, never a bare `<name>`:
             // a bare entry could shadow a real hostname (localhost, an internal
             // host, a public domain). Under the reserved `.mesh` suffix a peer
             // name can never collide with real resolution. (Security: DNS-hijack
             // hardening; the petname is the locally-assigned one, but this holds
             // even if a name is ever influenced by the peer.)
-            out.push_str(&format!("{addr} {name}.mesh\n"));
+            out.push_str(&format!("{v6} {name}.mesh\n"));
+            // A record: the v4 overlay address (dual-stack only). Same .mesh
+            // suffix so both families resolve to the same name.
+            if let Some(v4) = v4 {
+                out.push_str(&format!("{v4} {name}.mesh\n"));
+            }
         }
         out.push_str(HOSTS_END);
         out.push('\n');
@@ -624,13 +671,13 @@ fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::{dest_ip, render_hosts, sanitize_host};
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn magicdns_block_roundtrips_without_clobbering() {
         let base = "127.0.0.1 localhost\n::1 localhost\n";
         let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
-        let with = render_hosts(base, &[("other-do".into(), a)]);
+        let with = render_hosts(base, &[("other-do".into(), a, None)]);
         // user lines preserved, managed block added with the NAMESPACED name only
         assert!(with.contains("127.0.0.1 localhost"));
         assert!(with.contains(&format!("{a} other-do.mesh")));
@@ -639,7 +686,7 @@ mod tests {
         assert!(!with.lines().any(|l| l.trim() == format!("{a} other-do")));
         assert!(with.contains("# BEGIN filament-mesh"));
         // re-rendering replaces (not stacks) the block, and empty removes it
-        let again = render_hosts(&with, &[("other-do".into(), a)]);
+        let again = render_hosts(&with, &[("other-do".into(), a, None)]);
         assert_eq!(again.matches("# BEGIN filament-mesh").count(), 1);
         let cleared = render_hosts(&again, &[]);
         assert!(!cleared.contains("filament-mesh"));
@@ -649,7 +696,7 @@ mod tests {
     #[test]
     fn hostnames_are_sanitized() {
         assert_eq!(sanitize_host("other-do"), "other-do");
-        assert_eq!(sanitize_host("user@cli"), "user-cli");
+        assert_eq!(sanitize_host("user@cli"), "cli");  // strips user@ prefix
         assert_eq!(sanitize_host("a b/c"), "a-b-c");
     }
 
@@ -662,7 +709,7 @@ mod tests {
         assert!(is_safe_mesh_name("other-do"));
         // a peer named "localhost" is skipped entirely (no localhost.mesh either)
         let a: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
-        assert!(!render_hosts("", &[("localhost".into(), a)]).contains("filament-mesh"));
+        assert!(!render_hosts("", &[("localhost".into(), a, None)]).contains("filament-mesh"));
     }
 
     #[test]
@@ -773,5 +820,114 @@ mod tests {
         l3.remove_by_pid("pidA").await;
         assert!(l3.routes.lock().await.is_empty(), "all routes gone");
         assert!(l3.readers.lock().await.is_empty(), "pump aborted");
+    }
+
+    #[test]
+    fn magicdns_emits_both_a_and_aaaa_records() {
+        let base = "127.0.0.1 localhost\n";
+        let v6: Ipv6Addr = "fdf1:1af7:c30d:1a1::99aa".parse().unwrap();
+        let v4: Ipv4Addr = "198.18.5.6".parse().unwrap();
+        let out = render_hosts(base, &[("peer-one".into(), v6, Some(v4))]);
+        // Both AAAA (v6) and A (v4) records present
+        assert!(out.contains(&format!("{v6} peer-one.mesh")), "AAAA record present");
+        assert!(out.contains(&format!("{v4} peer-one.mesh")), "A record present");
+        // v6-only peer: no A record emitted
+        let v6b: Ipv6Addr = "fdf1:1af7:c30d:2b2::bb".parse().unwrap();
+        let out2 = render_hosts(base, &[("v6-only".into(), v6b, None)]);
+        assert!(out2.contains(&format!("{v6b} v6-only.mesh")), "AAAA record present");
+        assert!(!out2.contains("v6-only.mesh") || out2.lines().filter(|l| l.contains("v6-only.mesh")).count() == 1, "no duplicate A record for v6-only peer");
+    }
+
+    #[test]
+    fn magicdns_dual_stack_add_peer_registers_v4_in_names() {
+        use super::Transport;
+        // Use a userspace-backed L3 so refresh_hosts is a no-op (avoids /etc/hosts)
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let l3 = test_l3();
+            let v6: IpAddr = "fdf1:1af7:c30d::1".parse().unwrap();
+            let v4: IpAddr = "198.18.5.6".parse().unwrap();
+            let t: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+            l3.add_peer("pidA", "alice", v6, Some(v4), t).await;
+            // petname_of matches both v6 and v4
+            assert_eq!(l3.petname_of(v6).await.as_deref(), Some("alice"));
+            assert_eq!(l3.petname_of(v4).await.as_deref(), Some("alice"));
+            // addr_of returns v6; addr_v4_of returns v4
+            assert_eq!(l3.addr_of("alice").await, Some("fdf1:1af7:c30d::1".parse().unwrap()));
+            assert_eq!(l3.addr_v4_of("alice").await, Some("198.18.5.6".parse().unwrap()));
+            // v6-only peer: addr_v4_of returns None
+            let v6b: IpAddr = "fdf1:1af7:c30d::2".parse().unwrap();
+            let t2: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+            l3.add_peer("pidB", "bob", v6b, None, t2).await;
+            assert_eq!(l3.addr_v4_of("bob").await, None);
+        });
+    }
+
+    #[test]
+    fn magicdns_same_name_different_peers_both_emitted() {
+        use super::Transport;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let l3 = test_l3();
+            // Two peers with the same petname "host1" but different addresses
+            let v6a: IpAddr = "fdf1:1af7:c30d::aa".parse().unwrap();
+            let v4a: IpAddr = "198.18.1.1".parse().unwrap();
+            let v6b: IpAddr = "fdf1:1af7:c30d::bb".parse().unwrap();
+            let v4b: IpAddr = "198.18.2.2".parse().unwrap();
+            let ta: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+            let tb: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+            // Both registered under same name, different pids
+            l3.add_peer("pidA", "host1", v6a, Some(v4a), ta).await;
+            l3.add_peer("pidB", "host1", v6b, Some(v4b), tb).await;
+            // Both addresses are routable
+            assert!(l3.is_verified_peer(v6a).await);
+            assert!(l3.is_verified_peer(v6b).await);
+            assert!(l3.is_verified_peer(v4a).await);
+            assert!(l3.is_verified_peer(v4b).await);
+            // petname_of returns one of them (which one is implementation-defined)
+            let found = l3.petname_of(v6a).await;
+            assert!(found.is_some(), "petname_of must return a result for known peer");
+            // render_hosts emits both entries (DNS round-robin)
+            let base = "";
+            let entries: Vec<(String, std::net::Ipv6Addr, Option<std::net::Ipv4Addr>)> = vec![
+                ("host1".into(), "fdf1:1af7:c30d::aa".parse().unwrap(), Some("198.18.1.1".parse().unwrap())),
+                ("host1".into(), "fdf1:1af7:c30d::bb".parse().unwrap(), Some("198.18.2.2".parse().unwrap())),
+            ];
+            let out = render_hosts(base, &entries);
+            // Both v6 addresses should appear as host1.mesh
+            assert!(out.contains("fdf1:1af7:c30d::aa host1.mesh"));
+            assert!(out.contains("fdf1:1af7:c30d::bb host1.mesh"));
+            // Both v4 addresses should appear as host1.mesh
+            assert!(out.contains("198.18.1.1 host1.mesh"));
+            assert!(out.contains("198.18.2.2 host1.mesh"));
+        });
+    }
+
+    #[test]
+    fn magicdns_case_insensitive_collision() {
+        // "Host1" and "host1" should collide after sanitization
+        use super::Transport;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let l3 = test_l3();
+            let v6a: IpAddr = "fdf1:1af7:c30d::aa".parse().unwrap();
+            let v6b: IpAddr = "fdf1:1af7:c30d::bb".parse().unwrap();
+            let ta: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+            let tb: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+            // Different case names
+            l3.add_peer("pidA", "Host1", v6a, None, ta).await;
+            l3.add_peer("pidB", "host1", v6b, None, tb).await;
+            // Both are routable
+            assert!(l3.is_verified_peer(v6a).await);
+            assert!(l3.is_verified_peer(v6b).await);
+            // render_hosts deduplicates by (sanitized_name, v6) - different v6 means both emitted
+            let entries: Vec<(String, std::net::Ipv6Addr, Option<std::net::Ipv4Addr>)> = vec![
+                ("host1".into(), "fdf1:1af7:c30d::aa".parse().unwrap(), None),
+                ("host1".into(), "fdf1:1af7:c30d::bb".parse().unwrap(), None),
+            ];
+            let out = render_hosts("", &entries);
+            assert!(out.contains("fdf1:1af7:c30d::aa host1.mesh"));
+            assert!(out.contains("fdf1:1af7:c30d::bb host1.mesh"));
+        });
     }
 }

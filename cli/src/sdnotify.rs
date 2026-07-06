@@ -2,7 +2,7 @@
 //!
 //! Why this exists: the `up` daemon already self-heals a SEVERED signaling link
 //! (the in-core reconnect loop). What it could NOT recover from is the event loop
-//! itself WEDGING — alive but stuck — because the same stall that freezes the loop
+//! itself WEDGING: alive but stuck, because the same stall that freezes the loop
 //! also freezes the reconnect code, so the daemon silently drops off presence and
 //! only a manual restart brings it back. systemd's watchdog closes that gap: the
 //! loop pings `WATCHDOG=1` every tick; if those stop for `WatchdogSec`, systemd
@@ -86,7 +86,7 @@ mod tests {
 
         ready();
         watchdog();
-        status("up — serving");
+        status("up, serving");
 
         let mut got = Vec::new();
         let mut buf = [0u8; 256];
@@ -100,7 +100,7 @@ mod tests {
         assert!(got.contains(&"READY=1".to_string()), "got: {got:?}");
         assert!(got.contains(&"WATCHDOG=1".to_string()), "got: {got:?}");
         assert!(
-            got.iter().any(|s| s == "STATUS=up — serving"),
+            got.iter().any(|s| s == "STATUS=up, serving"),
             "got: {got:?}"
         );
     }
