@@ -8003,7 +8003,7 @@ async fn recv_cmd(
         if daemon && last_mount_check.elapsed() >= Duration::from_secs(30) {
             last_mount_check = Instant::now();
             let dead_locals: Vec<String> = daemon_mounts.entries.iter()
-                .filter_map(|(local, entry)| {
+                .filter_map(|(local, _entry)| {
                     let is_alive = mount::is_mount_point(local);
                     let path_exists = Path::new(local).exists();
                     if !path_exists {
