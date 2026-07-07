@@ -8,8 +8,23 @@ fn mounts_path() -> PathBuf {
     crate::settings::config_dir().join(MOUNTS_FILE)
 }
 
+fn generate_mount_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut hasher = DefaultHasher::new();
+    now.hash(&mut hasher);
+    let hash = hasher.finish();
+    // Take first 6 hex chars.
+    format!("{:06x}", hash & 0xffffff)
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct MountEntry {
+    id: String,
     local: String,
     peer: String,
     remote: String,
@@ -215,8 +230,10 @@ pub async fn mount_cmd(
 
         let pid = child.id();
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mount_id = generate_mount_id();
 
         add_mount(MountEntry {
+            id: mount_id.clone(),
             local: local_path.clone(),
             peer: peer_name.to_string(),
             remote: remote.to_string(),
@@ -225,8 +242,8 @@ pub async fn mount_cmd(
             created: now,
         })?;
 
-        crate::ui::say(&format!("mounted {peer}:{remote} at {local_path} (background, pid {pid})"));
-        crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
+        crate::ui::say(&format!("mounted {peer}:{remote} at {local_path} (id: {mount_id})"));
+        crate::ui::say(&format!("  check with: filament mount --check {mount_id}"));
         crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
 
         // Spawn monitor thread (not tokio, because we use std::process::Command).
@@ -303,36 +320,38 @@ pub fn list_cmd() -> Result<()> {
             let color = if is_ok { "\x1b[32m" } else { "\x1b[31m" };
             let reset = "\x1b[0m";
             println!(
-                "{color}{}{reset}  {}:{} -> {} (pid {}, {})",
-                status_str, entry.peer, entry.remote, entry.local, entry.pid, entry.created
+                "{color}{}{reset}  {color}{}{reset}  {}:{} -> {}",
+                status_str, entry.id, entry.peer, entry.remote, entry.local
             );
         } else {
             println!(
-                "{} {}:{} -> {} pid={} created={}",
-                status_str, entry.peer, entry.remote, entry.local, entry.pid, entry.created
+                "{} {} {}:{} -> {}",
+                status_str, entry.id, entry.peer, entry.remote, entry.local
             );
         }
     }
 
     if is_tty {
         println!("\n{healthy} healthy, {unhealthy} unhealthy, {} total", mounts.len());
+        println!("unmount with: filament unmount <id>");
     }
 
     Ok(())
 }
 
-pub fn check_cmd(path: &str) -> Result<()> {
+pub fn check_cmd(target: &str) -> Result<()> {
     let mounts = load_mounts();
-    let entry = mounts.iter().find(|m| m.local == path);
+    // Try to find by ID first, then by path.
+    let entry = mounts.iter().find(|m| m.id == target || m.local == target);
 
     match entry {
         None => {
             // Not tracked, but check if it's a live mount anyway.
-            if is_mount_point(path) {
-                crate::ui::say(&format!("{path} is a mount point but not tracked by filament"));
+            if is_mount_point(target) {
+                crate::ui::say(&format!("{target} is a mount point but not tracked by filament"));
                 Ok(())
             } else {
-                bail!("{path} is not a filament mount");
+                bail!("{target} is not a filament mount (use `filament mount --list` to see active mounts)");
             }
         }
         Some(entry) => {
@@ -345,13 +364,12 @@ pub fn check_cmd(path: &str) -> Result<()> {
                     _ => ("\x1b[31m", "UNHEALTHY"),
                 };
                 let reset = "\x1b[0m";
-                println!("{color}[{label}]{reset} {}", entry.local);
+                println!("{color}[{label}]{reset} {} ({})", entry.id, entry.local);
                 println!("  peer:   {}:{}", entry.peer, entry.remote);
-                println!("  pid:    {}", entry.pid);
                 println!("  status: {status}");
                 println!("  since:  {}", entry.created);
             } else {
-                println!("{} {}:{} pid={} created={}", status, entry.peer, entry.remote, entry.pid, entry.created);
+                println!("{} {} {}:{} created={}", status, entry.id, entry.peer, entry.remote, entry.created);
             }
 
             if status != MountStatus::Healthy {
@@ -374,37 +392,65 @@ fn is_mount_point(path: &str) -> bool {
     false
 }
 
-pub fn unmount_cmd(path: &str) -> Result<()> {
-    if !Path::new(path).exists() {
-        // Check if it's tracked but dead.
-        let mounts = load_mounts();
-        if mounts.iter().any(|m| m.local == path) {
-            let _ = remove_mount(path);
-            crate::ui::say(&format!("removed stale tracking for {path}"));
-            return Ok(());
-        }
-        bail!("mount point does not exist: {path}");
-    }
+pub fn unmount_cmd(target: &str) -> Result<()> {
+    let mounts = load_mounts();
 
-    let status = std::process::Command::new("fusermount")
-        .arg("-u")
-        .arg(path)
-        .status();
+    // Try to find by ID first, then by path.
+    let entry = mounts.iter().find(|m| m.id == target || m.local == target);
 
-    match status {
-        Ok(s) if s.success() => {
-            let _ = remove_mount(path);
-            crate::ui::say(&format!("unmounted {path}"));
-            Ok(())
+    match entry {
+        Some(entry) => {
+            let path = &entry.local;
+            // Try fusermount first.
+            let status = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(path)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    let _ = remove_mount(path);
+                    crate::ui::say(&format!("unmounted {path} (id: {})", entry.id));
+                    Ok(())
+                }
+                _ => {
+                    let status = std::process::Command::new("umount").arg(path).status()?;
+                    if status.success() {
+                        let _ = remove_mount(path);
+                        crate::ui::say(&format!("unmounted {path} (id: {})", entry.id));
+                        Ok(())
+                    } else {
+                        // Still remove tracking even if unmount fails.
+                        let _ = remove_mount(path);
+                        bail!("failed to unmount {path}, but tracking removed");
+                    }
+                }
+            }
         }
-        _ => {
-            let status = std::process::Command::new("umount").arg(path).status()?;
-            if status.success() {
-                let _ = remove_mount(path);
-                crate::ui::say(&format!("unmounted {path}"));
-                Ok(())
+        None => {
+            // Not tracked - try as a direct path.
+            if Path::new(target).exists() {
+                let status = std::process::Command::new("fusermount")
+                    .arg("-u")
+                    .arg(target)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
+                        crate::ui::say(&format!("unmounted {target}"));
+                        Ok(())
+                    }
+                    _ => {
+                        let status = std::process::Command::new("umount").arg(target).status()?;
+                        if status.success() {
+                            crate::ui::say(&format!("unmounted {target}"));
+                            Ok(())
+                        } else {
+                            bail!("failed to unmount {target}");
+                        }
+                    }
+                }
             } else {
-                bail!("failed to unmount {path}");
+                bail!("no mount found for '{target}' (use `filament mount --list` to see active mounts)");
             }
         }
     }
