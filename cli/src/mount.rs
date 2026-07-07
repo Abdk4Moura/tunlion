@@ -194,14 +194,22 @@ pub async fn mount_cmd(
     foreground: bool,
     auto_restore: bool,
 ) -> Result<()> {
+    // Pass remote path as-is to sshfs - don't expand ~ locally.
+    // sshfs will expand ~ on the remote side using the remote user's home.
+    let remote_path = remote.to_string();
+    
     let local_path = match local {
         Some(p) => p,
         None => {
-            let basename = Path::new(remote)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| peer.to_string());
-            basename
+            // For ~ paths, use the basename after ~/
+            if remote_path.starts_with("~/") {
+                remote_path[2..].to_string()
+            } else {
+                Path::new(&remote_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| peer.to_string())
+            }
         }
     };
 
@@ -213,8 +221,8 @@ pub async fn mount_cmd(
     // Try daemon first (daemon handles sshfs spawn + monitoring centrally).
     #[cfg(unix)]
     if !foreground && crate::ctl::daemon_present().await {
-        if let Some(_reply) = crate::ctl::try_mount(peer, remote, &local_path, read_only, auto_restore).await {
-            crate::ui::say(&format!("mounted {peer}:{remote} at {local_path} (daemon-managed)"));
+        if let Some(_reply) = crate::ctl::try_mount(peer, &remote_path, &local_path, read_only, auto_restore).await {
+            crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
             crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
             crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
             return Ok(());
@@ -257,7 +265,7 @@ pub async fn mount_cmd(
 
         if use_l3 {
             if let Some(dest) = crate::l2::l3_dest(info) {
-                cmd.arg(format!("{dest}:{remote}"));
+                cmd.arg(format!("{dest}:{remote_path}"));
                 return cmd;
             }
         }
@@ -272,7 +280,7 @@ pub async fn mount_cmd(
         proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
         cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
         let dest_token = format!("{}@{}", info.login, info.host);
-        cmd.arg(format!("{dest_token}:{remote}"));
+        cmd.arg(format!("{dest_token}:{remote_path}"));
         cmd
     };
 
@@ -292,7 +300,7 @@ pub async fn mount_cmd(
         let status = cmd.status();
         match status {
             Ok(s) if s.success() => {
-                crate::ui::say(&format!("mounted {peer}:{remote} at {local_path}"));
+                crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path}"));
                 crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
                 Ok(())
             }
@@ -332,21 +340,21 @@ pub async fn mount_cmd(
             parent_id,
             local: local_path.clone(),
             peer: peer_name.to_string(),
-            remote: remote.to_string(),
+            remote: remote_path.clone(),
             pid,
             read_only,
             auto_restore,
             created: now,
         })?;
 
-        crate::ui::say(&format!("mounted {peer}:{remote} at {local_path} (id: {mount_id})"));
+        crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (id: {mount_id})"));
         crate::ui::say(&format!("  check with: filament mount --check {mount_id}"));
         crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
 
         // Spawn monitor thread (not tokio, because we use std::process::Command).
         let monitor_local = local_path.clone();
         let monitor_peer = peer_name.to_string();
-        let monitor_remote = remote.to_string();
+        let monitor_remote = remote_path.clone();
         let monitor_server = server.to_string();
         std::thread::spawn(move || {
             monitor_mount(monitor_local, monitor_peer, monitor_remote, monitor_server, relay);
