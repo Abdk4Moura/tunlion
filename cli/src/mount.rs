@@ -9,17 +9,23 @@ fn mounts_path() -> PathBuf {
 }
 
 fn generate_mount_id() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let mut hasher = DefaultHasher::new();
-    now.hash(&mut hasher);
-    let hash = hasher.finish();
-    // Take first 6 hex chars.
-    format!("{:06x}", hash & 0xffffff)
+    use std::io::Read;
+    let mut buf = [0u8; 4];
+    // Use /dev/urandom for true randomness.
+    let _ = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf));
+    let val = u32::from_ne_bytes(buf);
+    format!("{:06x}", val & 0xffffff)
+}
+
+fn unique_mount_id() -> String {
+    let mounts = load_mounts();
+    loop {
+        let id = generate_mount_id();
+        if !mounts.iter().any(|m| m.id == id) {
+            return id;
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -230,7 +236,7 @@ pub async fn mount_cmd(
 
         let pid = child.id();
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let mount_id = generate_mount_id();
+        let mount_id = unique_mount_id();
 
         add_mount(MountEntry {
             id: mount_id.clone(),
