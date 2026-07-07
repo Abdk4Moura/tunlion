@@ -316,7 +316,7 @@ pub async fn mount_cmd(
         }
     } else {
         // Background mode: spawn sshfs, record PID, start monitor.
-        let mut child = cmd
+        let child = cmd
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
@@ -356,7 +356,7 @@ pub async fn mount_cmd(
     }
 }
 
-fn monitor_mount(local: String, peer: String, remote: String, server: String, relay: bool) {
+fn monitor_mount(local: String, peer: String, remote: String, _server: String, _relay: bool) {
     let check_interval = std::time::Duration::from_secs(30);
     let mut consecutive_failures = 0u32;
 
@@ -760,119 +760,11 @@ pub fn print_mount_help() {
     println!("  filament mount --apply work");
 }
 
-pub async fn interactive_mount(server: &str, relay: bool) -> Result<()> {
-    use std::io::Write;
-
-    // Show current mounts if any
-    let mounts = load_mounts();
-    if !mounts.is_empty() {
-        println!("\x1b[1mActive mounts:\x1b[0m");
-        for entry in &mounts {
-            let status = check_mount_health(entry);
-            let color = if status == MountStatus::Healthy { "\x1b[32m" } else { "\x1b[31m" };
-            let reset = "\x1b[0m";
-            println!("  {color}{}{reset}  {}:{} -> {}", entry.id, entry.peer, entry.remote, entry.local);
-        }
-        println!();
-    }
-
-    // Show saved profiles if any
-    let profiles = list_profiles().unwrap_or_default();
-    if !profiles.is_empty() {
-        println!("\x1b[1mSaved profiles:\x1b[0m");
-        for name in &profiles {
-            if let Ok(profile) = load_profile(name) {
-                println!("  {}: {} mount(s)", name, profile.mounts.len());
-            }
-        }
-        println!();
-    }
-
-    // Get available devices
-    let devices = crate::devices_load();
-    let device_names: Vec<String> = devices.iter()
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    if device_names.is_empty() {
-        println!("\x1b[33mNo paired devices found.\x1b[0m");
-        println!("Pair a device first: filament pair");
-        return Ok(());
-    }
-
-    // Show available devices
-    println!("\x1b[1mAvailable devices:\x1b[0m");
-    for name in &device_names {
-        println!("  - {name}");
-    }
-    println!();
-
-    // Prompt for peer
-    print!("Mount from device (name): ");
-    std::io::stdout().flush()?;
-    let mut peer = String::new();
-    std::io::stdin().read_line(&mut peer)?;
-    let peer = peer.trim().to_string();
-
-    if !device_names.contains(&peer) {
-        bail!("unknown device '{peer}'. Available: {}", device_names.join(", "));
-    }
-
-    // Prompt for remote path
-    print!("Remote path (e.g. /data): ");
-    std::io::stdout().flush()?;
-    let mut remote = String::new();
-    std::io::stdin().read_line(&mut remote)?;
-    let remote = remote.trim().to_string();
-
-    if remote.is_empty() {
-        bail!("remote path is required");
-    }
-
-    // Prompt for local path
-    let default_local = Path::new(&remote)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| peer.clone());
-    print!("Local mount point [{default_local}]: ");
-    std::io::stdout().flush()?;
-    let mut local = String::new();
-    std::io::stdin().read_line(&mut local)?;
-    let local = if local.trim().is_empty() { default_local } else { local.trim().to_string() };
-
-    // Prompt for options
-    print!("Read-only? [y/N]: ");
-    std::io::stdout().flush()?;
-    let mut ro_input = String::new();
-    std::io::stdin().read_line(&mut ro_input)?;
-    let read_only = ro_input.trim().eq_ignore_ascii_case("y");
-
-    print!("Auto-restore on daemon start? [y/N]: ");
-    std::io::stdout().flush()?;
-    let mut ar_input = String::new();
-    std::io::stdin().read_line(&mut ar_input)?;
-    let auto_restore = ar_input.trim().eq_ignore_ascii_case("y");
-
-    println!();
-    println!("\x1b[1mMounting {peer}:{remote} -> {local}\x1b[0m");
-
-    mount_cmd(server, &peer, &remote, Some(local), read_only, None, relay, false, auto_restore).await
-}
-
 // ---- Fancy interactive UI with arrow selection and type-to-filter ----
-
-struct MountItem {
-    label: String,
-    peer: String,
-    remote: String,
-    local: String,
-    read_only: bool,
-    auto_restore: bool,
-}
 
 fn render_mount_ui(
     header: &str,
-    items: &[MountItem],
+    items: &[(String, String)],  // (display_name, item_type)
     sel: usize,
     filter: &str,
     filter_active: bool,
@@ -883,25 +775,26 @@ fn render_mount_ui(
     let color = crate::ui::caps().color;
 
     if redraw {
-        let _ = write!(out, "\x1b[{}A", items.len() + 4);
+        // Move up to redraw
+        let lines = items.len() + 3;  // header + filter + items + blank line
+        let _ = write!(out, "\x1b[{}A", lines);
     }
 
     // Header
-    let _ = write!(out, "\r\x1b[2K\r\n");
-    let _ = write!(out, "\r\x1b[2K\x1b[1;36m{header}\x1b[0m\r\n");
+    let _ = write!(out, "\r\x1b[2K{header}\r\n");
 
     // Filter line
     if filter_active {
         let _ = write!(out, "\r\x1b[2K  \x1b[33m>\x1b[0m {filter}\x1b[37m_\x1b[0m\r\n");
     } else {
-        let _ = write!(out, "\r\x1b[2K  \x1b[2mtype to filter, arrow keys to select\x1b[0m\r\n");
+        let _ = write!(out, "\r\x1b[2K\r\n");
     }
 
     // Items
     if items.is_empty() {
         let _ = write!(out, "\r\x1b[2K  \x1b[2m(no matches)\x1b[0m\r\n");
     } else {
-        for (i, item) in items.iter().enumerate() {
+        for (i, (name, _item_type)) in items.iter().enumerate() {
             let (mark, c, r) = if i == sel {
                 if color {
                     ("\u{276f}", "\x1b[1;36m", "\x1b[0m")
@@ -911,26 +804,25 @@ fn render_mount_ui(
             } else {
                 (" ", "", "")
             };
-            let _ = write!(out, "\r\x1b[2K  {c}{mark} {}{}\r\n", item.label, r);
+            let _ = write!(out, "\r\x1b[2K  {c}{mark} {}{r}\r\n", name);
         }
     }
 
-    // Help line
+    // Blank line
     let _ = write!(out, "\r\x1b[2K\r\n");
-    let _ = write!(out, "\r\x1b[2K  \x1b[2m\x1b[K\r\n");
-    let _ = write!(out, "\r\x1b[2K  \x1b[2m\x1b[K\r\n");
 
     let _ = out.flush();
 }
 
-fn filter_items<'a>(items: &'a [MountItem], filter: &str) -> Vec<(usize, &'a MountItem)> {
+fn filter_items(items: &[(String, String)], filter: &str) -> Vec<(usize, String, String)> {
     if filter.is_empty() {
-        return items.iter().enumerate().collect();
+        return items.iter().enumerate().map(|(i, (n, t))| (i, n.clone(), t.clone())).collect();
     }
     let lower = filter.to_lowercase();
     items.iter()
         .enumerate()
-        .filter(|(_, item)| item.label.to_lowercase().contains(&lower))
+        .filter(|(_, (name, _))| name.to_lowercase().contains(&lower))
+        .map(|(i, (n, t))| (i, n.clone(), t.clone()))
         .collect()
 }
 
@@ -941,34 +833,18 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
     let _guard = crate::codeentry::RawGuard::enable()?;
 
     // Collect all items: devices + profiles + current mounts
-    let mut items: Vec<MountItem> = Vec::new();
+    let mut items: Vec<(String, String)> = Vec::new();  // (display_name, type)
 
     // Add available devices
     let devices = crate::devices_load();
     for (name, _) in &devices {
-        items.push(MountItem {
-            label: format!("\x1b[33m{}\x1b[0m  \x1b[2m(device)\x1b[0m", name),
-            peer: name.clone(),
-            remote: String::new(),
-            local: String::new(),
-            read_only: false,
-            auto_restore: false,
-        });
+        items.push((name.clone(), "device".to_string()));
     }
 
     // Add saved profiles
     if let Ok(profiles) = list_profiles() {
         for name in &profiles {
-            if let Ok(profile) = load_profile(name) {
-                items.push(MountItem {
-                    label: format!("\x1b[35m{}\x1b[0m  \x1b[2m(profile, {} mount(s))\x1b[0m", name, profile.mounts.len()),
-                    peer: name.clone(),
-                    remote: String::new(),
-                    local: String::new(),
-                    read_only: false,
-                    auto_restore: false,
-                });
-            }
+            items.push((name.clone(), "profile".to_string()));
         }
     }
 
@@ -976,17 +852,11 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
     let mounts = load_mounts();
     for entry in &mounts {
         let status = check_mount_health(entry);
-        let status_color = if status == MountStatus::Healthy { "\x1b[32m" } else { "\x1b[31m" };
-        items.push(MountItem {
-            label: format!("{}:{} -> {}  {}{}{}\x1b[0m",
-                entry.peer, entry.remote, entry.local,
-                status_color, entry.id, ""),
-            peer: entry.peer.clone(),
-            remote: entry.remote.clone(),
-            local: entry.local.clone(),
-            read_only: entry.read_only,
-            auto_restore: entry.auto_restore,
-        });
+        let status_str = if status == MountStatus::Healthy { "ok" } else { "err" };
+        items.push((
+            format!("{}:{} -> {} [{}]", entry.peer, entry.remote, entry.local, status_str),
+            "mount".to_string(),
+        ));
     }
 
     if items.is_empty() {
@@ -996,6 +866,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
         return Ok(());
     }
 
+    let header = "  \x1b[2mMount from device, profile, or manage mount (up/down, enter, esc)\x1b[0m";
     let mut sel = 0usize;
     let mut filter = String::new();
     let mut filter_active = false;
@@ -1003,7 +874,6 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
 
     loop {
         let filtered = filter_items(&items, &filter);
-        let header = "\x1b[1;36mSelect a device, profile, or mount:\x1b[0m";
 
         // Clamp selection
         if !filtered.is_empty() && sel >= filtered.len() {
@@ -1011,17 +881,8 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
         }
 
         // Render
-        let display_items: Vec<MountItem> = filtered.iter().map(|(_, item)| {
-            MountItem {
-                label: item.label.clone(),
-                peer: item.peer.clone(),
-                remote: item.remote.clone(),
-                local: item.local.clone(),
-                read_only: item.read_only,
-                auto_restore: item.auto_restore,
-            }
-        }).collect();
-        render_mount_ui(header, &display_items, sel, &filter, filter_active, redraw);
+        let display: Vec<(String, String)> = filtered.iter().map(|(_, n, t)| (n.clone(), t.clone())).collect();
+        render_mount_ui(header, &display, sel, &filter, filter_active, redraw);
         redraw = true;
 
         // Read event
@@ -1032,13 +893,11 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
         }
 
         match k.code {
-            // Ctrl-C: cancel
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 drop(_guard);
                 println!("\r\x1b[2K\x1b[2mCancelled.\x1b[0m");
                 return Ok(());
             }
-            // Escape: if filter active, clear filter; else cancel
             KeyCode::Esc => {
                 if filter_active {
                     filter.clear();
@@ -1050,21 +909,18 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     return Ok(());
                 }
             }
-            // Enter: select
             KeyCode::Enter => {
                 if filtered.is_empty() {
                     continue;
                 }
-                let item = filtered[sel].1;
+                let (_, name, item_type) = &filtered[sel];
+                let name = name.clone();
+                let item_type = item_type.clone();
                 drop(_guard);
 
-                // Check if it's a device (needs remote path)
-                let is_device = items.iter().any(|i| i.peer == item.peer && i.remote.is_empty() && i.label.contains("device"));
-
-                if is_device {
-                    // Device selected - prompt for remote path
-                    println!("\r\x1b[2K");
-                    print!("  Remote path on \x1b[1m{}\x1b[0m: ", item.peer);
+                if item_type == "device" {
+                    println!();
+                    print!("  Remote path on \x1b[1m{name}\x1b[0m: ");
                     std::io::stdout().flush()?;
                     let mut remote = String::new();
                     std::io::stdin().read_line(&mut remote)?;
@@ -1073,11 +929,10 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                         bail!("remote path is required");
                     }
 
-                    // Prompt for local path
                     let default_local = Path::new(&remote)
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| item.peer.clone());
+                        .unwrap_or_else(|| name.clone());
                     print!("  Local mount point [\x1b[2m{default_local}\x1b[0m]: ");
                     std::io::stdout().flush()?;
                     let mut local = String::new();
@@ -1085,23 +940,24 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     let local = if local.trim().is_empty() { default_local } else { local.trim().to_string() };
 
                     println!();
-                    return mount_cmd(server, &item.peer, &remote, Some(local), false, None, relay, false, false).await;
-                } else if item.label.contains("profile") {
-                    // Profile selected - apply it
-                    println!("\r\x1b[2K");
-                    println!("  \x1b[1mApplying profile: {}\x1b[0m", item.peer);
-                    return apply_profile_cmd(&item.peer, server, relay).await;
+                    return mount_cmd(server, &name, &remote, Some(local), false, None, relay, false, false).await;
+                } else if item_type == "profile" {
+                    println!();
+                    println!("  \x1b[1mApplying profile: {name}\x1b[0m");
+                    return apply_profile_cmd(&name, server, relay).await;
                 } else {
-                    // Active mount selected - show details
-                    println!("\r\x1b[2K");
-                    println!("  \x1b[1mMount: {}:{} -> {}\x1b[0m", item.peer, item.remote, item.local);
-                    println!("  \x1b[2mCommands:\x1b[0m");
-                    println!("    filament mount --check {}", item.local);
-                    println!("    filament unmount {}", item.local);
+                    // Active mount - show info
+                    println!();
+                    // Find the mount entry
+                    if let Some(entry) = mounts.iter().find(|m| name.starts_with(&m.peer)) {
+                        println!("  Mount: {}:{} -> {}", entry.peer, entry.remote, entry.local);
+                        println!("  \x1b[2mCommands:\x1b[0m");
+                        println!("    filament mount --check {}", entry.local);
+                        println!("    filament unmount {}", entry.local);
+                    }
                     return Ok(());
                 }
             }
-            // Arrow up / k: move up
             KeyCode::Up | KeyCode::Char('k') if !filter_active => {
                 if sel > 0 {
                     sel -= 1;
@@ -1109,15 +965,12 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     sel = filtered.len() - 1;
                 }
             }
-            // Arrow down / j: move down
             KeyCode::Down | KeyCode::Char('j') if !filter_active => {
                 sel = (sel + 1) % filtered.len().max(1);
             }
-            // / or Ctrl-F: activate filter
-            KeyCode::Char('/') | KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) || k.code == KeyCode::Char('/') => {
+            KeyCode::Char('/') if !filter_active => {
                 filter_active = true;
             }
-            // Backspace: remove filter char
             KeyCode::Backspace if filter_active => {
                 filter.pop();
                 if filter.is_empty() {
@@ -1125,7 +978,6 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                 }
                 sel = 0;
             }
-            // Char: add to filter
             KeyCode::Char(c) if filter_active && !k.modifiers.contains(KeyModifiers::CONTROL) => {
                 filter.push(c);
                 sel = 0;
