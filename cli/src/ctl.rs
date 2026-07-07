@@ -46,10 +46,11 @@ pub fn reuse_disabled() -> bool {
 }
 
 #[cfg(unix)]
-pub use imp::{
-    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_open, try_open_at,
-    try_ping, try_pty, try_reconfigure, try_reload, try_reload_expose, try_resize, Req, ReqKind,
-};
+    pub use imp::{
+        daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_list_mounts,
+        try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
+        try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
+    };
 
 #[cfg(not(unix))]
 pub use stub::Req;
@@ -297,6 +298,76 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask the daemon to mount a remote directory via sshfs. The daemon spawns
+    /// sshfs, tracks the mount, and monitors its health centrally. Returns the
+    /// daemon's reply (`{"ok":true}`) or `None` if no daemon answered, so the
+    /// caller can fall back to a direct sshfs spawn.
+    pub async fn try_mount(peer: &str, remote: &str, local: &str, read_only: bool, auto_restore: bool) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "mount", "peer": peer, "remote": remote, "local": local, "read_only": read_only, "auto_restore": auto_restore });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Ask the daemon to unmount a filament mount point. Returns the daemon's
+    /// reply (`{"ok":true}`) or `None` if no daemon answered.
+    pub async fn try_unmount(target: &str) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "unmount", "target": target });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(15), read_line(&mut s, 8192))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Ask the daemon to list all tracked mounts and their health. Returns the
+    /// daemon's reply (`{"ok":true,"mounts":[...]}`) or `None` if no daemon.
+    pub async fn try_list_mounts() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "list-mounts" });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 16384))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Ask the daemon to check health of a specific mount. Returns the daemon's
+    /// reply (`{"ok":true,"status":"healthy"}`) or `None` if no daemon.
+    pub async fn try_mount_health(target: &str) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "mount-health", "target": target });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -341,6 +412,15 @@ mod imp {
         /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
         /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
         Reload,
+        /// Mount a remote directory via sshfs through the daemon. The daemon
+        /// spawns sshfs, tracks the mount, and monitors its health centrally.
+        Mount { peer: String, remote: String, local: String, read_only: bool, auto_restore: bool },
+        /// Unmount a filament mount point by local path.
+        Unmount { target: String },
+        /// List all daemon-managed mounts and their health status.
+        ListMounts,
+        /// Check health of a specific mount by local path or mount ID.
+        MountHealth { target: String },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -462,6 +542,23 @@ mod imp {
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
                     Some("reload") => ReqKind::Reload,
+                    Some("mount") => {
+                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
+                        let Some(remote) = v["remote"].as_str().map(str::to_string) else { return };
+                        let Some(local) = v["local"].as_str().map(str::to_string) else { return };
+                        let read_only = v["read_only"].as_bool().unwrap_or(false);
+                        let auto_restore = v["auto_restore"].as_bool().unwrap_or(false);
+                        ReqKind::Mount { peer, remote, local, read_only, auto_restore }
+                    }
+                    Some("unmount") => {
+                        let Some(target) = v["target"].as_str().map(str::to_string) else { return };
+                        ReqKind::Unmount { target }
+                    }
+                    Some("list-mounts") => ReqKind::ListMounts,
+                    Some("mount-health") => {
+                        let Some(target) = v["target"].as_str().map(str::to_string) else { return };
+                        ReqKind::MountHealth { target }
+                    }
                     _ => return,
                 };
                 let _ = tx.send(Req { kind, sock });

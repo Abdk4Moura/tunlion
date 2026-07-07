@@ -86,20 +86,20 @@ fn default_auto_restore() -> bool {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
-struct MountEntry {
-    id: String,
-    parent_id: Option<String>,
-    local: String,
-    peer: String,
-    remote: String,
-    pid: u32,
-    read_only: bool,
+pub(crate) struct MountEntry {
+    pub(crate) id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) local: String,
+    pub(crate) peer: String,
+    pub(crate) remote: String,
+    pub(crate) pid: u32,
+    pub(crate) read_only: bool,
     #[serde(default = "default_auto_restore")]
-    auto_restore: bool,
-    created: String,
+    pub(crate) auto_restore: bool,
+    pub(crate) created: String,
 }
 
-fn load_mounts() -> Vec<MountEntry> {
+pub(crate) fn load_mounts() -> Vec<MountEntry> {
     let path = mounts_path();
     let Ok(data) = std::fs::read_to_string(&path) else {
         return Vec::new();
@@ -125,7 +125,7 @@ fn add_mount(entry: MountEntry) -> Result<()> {
     save_mounts(&mounts)
 }
 
-fn remove_mount(local: &str) -> Result<()> {
+pub(crate) fn remove_mount(local: &str) -> Result<()> {
     let mut mounts = load_mounts();
     mounts.retain(|m| m.local != local);
     save_mounts(&mounts)
@@ -208,6 +208,18 @@ pub async fn mount_cmd(
     if !Path::new(&local_path).exists() {
         std::fs::create_dir_all(&local_path)?;
         crate::ui::say(&format!("created mount point: {local_path}"));
+    }
+
+    // Try daemon first (daemon handles sshfs spawn + monitoring centrally).
+    #[cfg(unix)]
+    if !foreground && crate::ctl::daemon_present().await {
+        if let Some(_reply) = crate::ctl::try_mount(peer, remote, &local_path, read_only, auto_restore).await {
+            crate::ui::say(&format!("mounted {peer}:{remote} at {local_path} (daemon-managed)"));
+            crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
+            crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+            return Ok(());
+        }
+        // Daemon not available or mount failed, fall through to direct spawn.
     }
 
     if std::process::Command::new("which")
@@ -488,7 +500,7 @@ pub fn check_cmd(target: &str) -> Result<()> {
     }
 }
 
-fn is_mount_point(path: &str) -> bool {
+pub(crate) fn is_mount_point(path: &str) -> bool {
     // Check /proc/mounts for FUSE mounts.
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
         for line in mounts.lines() {
@@ -505,6 +517,24 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
 
     // Try to find by ID first, then by path.
     let entry = mounts.iter().find(|m| m.id == target || m.local == target);
+
+    // If daemon is present, delegate unmount to it (daemon kills sshfs + removes tracking).
+    #[cfg(unix)]
+    {
+        let target_for_daemon = target.to_string();
+        let rt = tokio::runtime::Handle::current();
+        let daemon_result = rt.block_on(async {
+            if crate::ctl::daemon_present().await {
+                crate::ctl::try_unmount(&target_for_daemon).await
+            } else {
+                None
+            }
+        });
+        if let Some(_reply) = daemon_result {
+            crate::ui::say(&format!("unmounted {target} (daemon-managed)"));
+            return Ok(());
+        }
+    }
 
     match entry {
         Some(entry) => {
