@@ -194,8 +194,9 @@ pub async fn mount_cmd(
     foreground: bool,
     auto_restore: bool,
 ) -> Result<()> {
-    // Pass remote path as-is to sshfs - don't expand ~ locally.
-    // sshfs will expand ~ on the remote side using the remote user's home.
+    // For tilde paths, we need to resolve them on the remote side.
+    // sshfs doesn't expand ~ when using ProxyCommand, so we'll use the
+    // ssh:// syntax which handles path expansion properly.
     let remote_path = remote.to_string();
     
     let local_path = match local {
