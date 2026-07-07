@@ -759,16 +759,15 @@ fn render_mount_ui(
     sel: usize,
     filter: &str,
     filter_active: bool,
-    redraw: bool,
-) {
+    prev_lines: usize,
+) -> usize {
     use std::io::Write;
     let mut out = std::io::stderr();
     let color = crate::ui::caps().color;
 
-    if redraw {
-        // Move up to redraw
-        let lines = items.len() + 3;  // header + filter + items + blank line
-        let _ = write!(out, "\x1b[{}A", lines);
+    // Move up to redraw previous content
+    if prev_lines > 0 {
+        let _ = write!(out, "\x1b[{}A", prev_lines);
     }
 
     // Header
@@ -803,6 +802,9 @@ fn render_mount_ui(
     let _ = write!(out, "\r\x1b[2K\r\n");
 
     let _ = out.flush();
+
+    // Return current line count for next redraw
+    items.len() + 3  // header + filter + items + blank
 }
 
 fn filter_items(items: &[(String, String)], filter: &str) -> Vec<(usize, String, String)> {
@@ -839,10 +841,13 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
         }
     }
 
-    // Add active mounts
+    // Add active mounts (filter out dead/missing)
     let mounts = load_mounts();
     for entry in &mounts {
         let status = check_mount_health(entry);
+        if status == MountStatus::Dead || status == MountStatus::Missing {
+            continue;  // Skip dead/missing mounts
+        }
         let status_str = if status == MountStatus::Healthy { "ok" } else { "err" };
         items.push((
             format!("{}:{} -> {} [{}]", entry.peer, entry.remote, entry.local, status_str),
@@ -861,7 +866,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
     let mut sel = 0usize;
     let mut filter = String::new();
     let mut filter_active = false;
-    let mut redraw = true;
+    let mut prev_lines = 0usize;
 
     loop {
         let filtered = filter_items(&items, &filter);
@@ -873,8 +878,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
 
         // Render
         let display: Vec<(String, String)> = filtered.iter().map(|(_, n, t)| (n.clone(), t.clone())).collect();
-        render_mount_ui(header, &display, sel, &filter, filter_active, redraw);
-        redraw = true;
+        prev_lines = render_mount_ui(header, &display, sel, &filter, filter_active, prev_lines);
 
         // Read event
         let ev = event::read()?;
@@ -928,7 +932,18 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     std::io::stdout().flush()?;
                     let mut local = String::new();
                     std::io::stdin().read_line(&mut local)?;
-                    let local = if local.trim().is_empty() { default_local } else { local.trim().to_string() };
+                    let local = if local.trim().is_empty() { 
+                        default_local 
+                    } else { 
+                        let p = local.trim().to_string();
+                        // Convert relative paths to absolute
+                        if p.starts_with('/') {
+                            p
+                        } else {
+                            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+                            cwd.join(p).to_string_lossy().into_owned()
+                        }
+                    };
 
                     println!();
                     return mount_cmd(server, &name, &remote, Some(local), false, None, relay, false, false).await;
