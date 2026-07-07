@@ -5691,6 +5691,14 @@ async fn main() -> Result<()> {
                 mount::list_cmd()
             } else if let Some(path) = check {
                 mount::check_cmd(&path)
+            } else if peer.is_none() && remote.is_none() {
+                // No arguments: interactive mode for TTY, help for machines
+                if std::io::stdin().is_terminal() {
+                    mount::interactive_mount(&server, relay).await
+                } else {
+                    mount::print_mount_help();
+                    Ok(())
+                }
             } else {
                 let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;

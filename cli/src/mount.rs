@@ -732,3 +732,129 @@ pub fn delete_profile_cmd(name: &str) -> Result<()> {
     crate::ui::say(&format!("deleted profile '{name}'"));
     Ok(())
 }
+
+pub fn print_mount_help() {
+    println!("filament mount - mount remote directories over the mesh");
+    println!();
+    println!("USAGE:");
+    println!("  filament mount <peer> <remote-path> [local-path]   Mount a remote directory");
+    println!("  filament mount --list                              List active mounts");
+    println!("  filament mount --check <id|path>                   Check mount health");
+    println!("  filament mount --save <name>                       Save current mounts as profile");
+    println!("  filament mount --apply <name>                      Apply a saved profile");
+    println!("  filament mount --profiles                          List saved profiles");
+    println!();
+    println!("OPTIONS:");
+    println!("  --read-only                  Mount read-only");
+    println!("  --foreground                 Run sshfs in foreground (blocks terminal)");
+    println!("  --save-auto                  Auto-restore this mount on daemon start");
+    println!("  --options <opts>             Extra sshfs options (comma-separated)");
+    println!();
+    println!("EXAMPLES:");
+    println!("  filament mount other-do /data /mnt/data");
+    println!("  filament mount other-do /data /mnt/data --read-only");
+    println!("  filament mount other-do /data --save-auto");
+    println!("  filament mount --list");
+    println!("  filament mount --check abc123");
+    println!("  filament mount --save work");
+    println!("  filament mount --apply work");
+}
+
+pub async fn interactive_mount(server: &str, relay: bool) -> Result<()> {
+    use std::io::Write;
+
+    // Show current mounts if any
+    let mounts = load_mounts();
+    if !mounts.is_empty() {
+        println!("\x1b[1mActive mounts:\x1b[0m");
+        for entry in &mounts {
+            let status = check_mount_health(entry);
+            let color = if status == MountStatus::Healthy { "\x1b[32m" } else { "\x1b[31m" };
+            let reset = "\x1b[0m";
+            println!("  {color}{}{reset}  {}:{} -> {}", entry.id, entry.peer, entry.remote, entry.local);
+        }
+        println!();
+    }
+
+    // Show saved profiles if any
+    let profiles = list_profiles().unwrap_or_default();
+    if !profiles.is_empty() {
+        println!("\x1b[1mSaved profiles:\x1b[0m");
+        for name in &profiles {
+            if let Ok(profile) = load_profile(name) {
+                println!("  {}: {} mount(s)", name, profile.mounts.len());
+            }
+        }
+        println!();
+    }
+
+    // Get available devices
+    let devices = crate::devices_load();
+    let device_names: Vec<String> = devices.iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if device_names.is_empty() {
+        println!("\x1b[33mNo paired devices found.\x1b[0m");
+        println!("Pair a device first: filament pair");
+        return Ok(());
+    }
+
+    // Show available devices
+    println!("\x1b[1mAvailable devices:\x1b[0m");
+    for name in &device_names {
+        println!("  - {name}");
+    }
+    println!();
+
+    // Prompt for peer
+    print!("Mount from device (name): ");
+    std::io::stdout().flush()?;
+    let mut peer = String::new();
+    std::io::stdin().read_line(&mut peer)?;
+    let peer = peer.trim().to_string();
+
+    if !device_names.contains(&peer) {
+        bail!("unknown device '{peer}'. Available: {}", device_names.join(", "));
+    }
+
+    // Prompt for remote path
+    print!("Remote path (e.g. /data): ");
+    std::io::stdout().flush()?;
+    let mut remote = String::new();
+    std::io::stdin().read_line(&mut remote)?;
+    let remote = remote.trim().to_string();
+
+    if remote.is_empty() {
+        bail!("remote path is required");
+    }
+
+    // Prompt for local path
+    let default_local = Path::new(&remote)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| peer.clone());
+    print!("Local mount point [{default_local}]: ");
+    std::io::stdout().flush()?;
+    let mut local = String::new();
+    std::io::stdin().read_line(&mut local)?;
+    let local = if local.trim().is_empty() { default_local } else { local.trim().to_string() };
+
+    // Prompt for options
+    print!("Read-only? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut ro_input = String::new();
+    std::io::stdin().read_line(&mut ro_input)?;
+    let read_only = ro_input.trim().eq_ignore_ascii_case("y");
+
+    print!("Auto-restore on daemon start? [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut ar_input = String::new();
+    std::io::stdin().read_line(&mut ar_input)?;
+    let auto_restore = ar_input.trim().eq_ignore_ascii_case("y");
+
+    println!();
+    println!("\x1b[1mMounting {peer}:{remote} -> {local}\x1b[0m");
+
+    mount_cmd(server, &peer, &remote, Some(local), read_only, None, relay, false, auto_restore).await
+}
