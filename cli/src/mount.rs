@@ -222,7 +222,8 @@ pub async fn mount_cmd(
     // Try daemon first (daemon handles sshfs spawn + monitoring centrally).
     #[cfg(unix)]
     if !foreground && crate::ctl::daemon_present().await {
-        if let Some(_reply) = crate::ctl::try_mount(peer, &remote_path, &local_path, read_only, auto_restore).await {
+        let port: u16 = std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
+        if let Some(_reply) = crate::ctl::try_mount(peer, &remote_path, &local_path, read_only, auto_restore, port).await {
             crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
             crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
             crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));

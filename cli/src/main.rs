@@ -4818,12 +4818,13 @@ async fn handle_mount(
     daemon_mounts: &mut DaemonMounts,
     last_mount_check: &mut Instant,
 ) {
-    let ctl::ReqKind::Mount { peer, remote, local, read_only, auto_restore } = &req.kind else { return };
+    let ctl::ReqKind::Mount { peer, remote, local, read_only, auto_restore, port } = &req.kind else { return };
     let peer = peer.clone();
     let remote = remote.clone();
     let local = local.clone();
     let read_only = *read_only;
     let auto_restore = *auto_restore;
+    let port = *port;
 
     // Ensure mount point exists.
     if !Path::new(&local).exists() {
@@ -4846,7 +4847,7 @@ async fn handle_mount(
     }
 
     // Bootstrap peer connection info.
-    let info = match crate::l2::ensure_peer_bootstrap(server, &peer, relay).await {
+    let info = match crate::l2::ensure_peer_bootstrap_port(server, &peer, relay, port).await {
         Ok(info) => info,
         Err(e) => {
             req.reject(&format!("bootstrap failed: {e}")).await;

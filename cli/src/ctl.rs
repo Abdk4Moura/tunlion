@@ -302,9 +302,9 @@ mod imp {
     /// sshfs, tracks the mount, and monitors its health centrally. Returns the
     /// daemon's reply (`{"ok":true}`) or `None` if no daemon answered, so the
     /// caller can fall back to a direct sshfs spawn.
-    pub async fn try_mount(peer: &str, remote: &str, local: &str, read_only: bool, auto_restore: bool) -> Option<Value> {
+    pub async fn try_mount(peer: &str, remote: &str, local: &str, read_only: bool, auto_restore: bool, port: u16) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "mount", "peer": peer, "remote": remote, "local": local, "read_only": read_only, "auto_restore": auto_restore });
+        let req = json!({ "op": "mount", "peer": peer, "remote": remote, "local": local, "read_only": read_only, "auto_restore": auto_restore, "port": port });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -414,7 +414,7 @@ mod imp {
         Reload,
         /// Mount a remote directory via sshfs through the daemon. The daemon
         /// spawns sshfs, tracks the mount, and monitors its health centrally.
-        Mount { peer: String, remote: String, local: String, read_only: bool, auto_restore: bool },
+        Mount { peer: String, remote: String, local: String, read_only: bool, auto_restore: bool, port: u16 },
         /// Unmount a filament mount point by local path.
         Unmount { target: String },
         /// List all daemon-managed mounts and their health status.
@@ -548,7 +548,8 @@ mod imp {
                         let Some(local) = v["local"].as_str().map(str::to_string) else { return };
                         let read_only = v["read_only"].as_bool().unwrap_or(false);
                         let auto_restore = v["auto_restore"].as_bool().unwrap_or(false);
-                        ReqKind::Mount { peer, remote, local, read_only, auto_restore }
+                        let port = v["port"].as_u64().unwrap_or(22) as u16;
+                        ReqKind::Mount { peer, remote, local, read_only, auto_restore, port }
                     }
                     Some("unmount") => {
                         let Some(target) = v["target"].as_str().map(str::to_string) else { return };
