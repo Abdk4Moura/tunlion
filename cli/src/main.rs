@@ -4808,7 +4808,8 @@ async fn handle_warm_req(
     }
 }
 
-/// Handle a mount request: spawn sshfs and track the mount centrally.
+/// Handle a mount request: spawn sshfs directly and track the child process
+/// centrally so `handle_unmount` can kill it.
 #[cfg(unix)]
 async fn handle_mount(
     req: ctl::Req,
@@ -4844,30 +4845,102 @@ async fn handle_mount(
         return;
     }
 
-    // Use the mount module to spawn sshfs.
-    match mount::mount_cmd(server, &peer, &remote, Some(local.clone()), read_only, None, relay, false, auto_restore).await {
-        Ok(()) => {
-            // Read back the mount entry we just created.
-            let mounts = mount::load_mounts();
-            if let Some(entry) = mounts.iter().find(|m| m.local == local) {
-                let entry = DaemonMountEntry {
-                    local: entry.local.clone(),
-                    peer: entry.peer.clone(),
-                    remote: entry.remote.clone(),
-                    pid: entry.pid,
-                    read_only: entry.read_only,
-                    auto_restore: entry.auto_restore,
-                    created: entry.created.clone(),
-                };
-                daemon_mounts.entries.insert(local.clone(), entry);
-            }
-            *last_mount_check = Instant::now();
-            req.reply(&json!({ "ok": true })).await;
-        }
+    // Bootstrap peer connection info.
+    let info = match crate::l2::ensure_peer_bootstrap(server, &peer, relay).await {
+        Ok(info) => info,
         Err(e) => {
-            req.reject(&format!("mount failed: {e}")).await;
+            req.reject(&format!("bootstrap failed: {e}")).await;
+            return;
         }
+    };
+    let peer_name = peer.strip_suffix(".mesh").unwrap_or(&peer);
+
+    // Build the sshfs command args directly.
+    let mut args: Vec<String> = Vec::new();
+
+    // Common SSH options.
+    args.extend_from_slice(&[
+        "-o".into(), format!("IdentityFile={}", info.key_path.display()),
+        "-o".into(), "IdentitiesOnly=yes".into(),
+        "-o".into(), format!("UserKnownHostsFile={}", info.known_hosts_path.display()),
+        "-o".into(), "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(), "ConnectTimeout=10".into(),
+        "-o".into(), "ServerAliveInterval=15".into(),
+        "-o".into(), "ServerAliveCountMax=4".into(),
+    ]);
+
+    // L3 preferred, L2 fallback.
+    let dest = if let Some(d) = crate::l2::l3_dest(&info) {
+        d
+    } else {
+        let exe = std::env::current_exe().unwrap();
+        let exe = exe.to_string_lossy();
+        let mut proxy = format!("{exe} --server {server}");
+        if relay {
+            proxy.push_str(" --relay");
+        }
+        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        args.push("-o".into());
+        args.push(format!("ProxyCommand={proxy}"));
+        format!("{}@{}", info.login, info.host)
+    };
+
+    args.push(format!("{dest}:{remote}"));
+    args.push(local.clone());
+    if read_only {
+        args.push("-o".into());
+        args.push("ro".into());
     }
+
+    // Spawn sshfs via tokio so we get a Child we can kill later.
+    let child = match tokio::process::Command::new("sshfs")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            req.reject(&format!("failed to spawn sshfs: {e}")).await;
+            return;
+        }
+    };
+
+    let pid = child.id().unwrap_or(0);
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mount_id = mount::unique_mount_id();
+    let parent_id = mount::find_parent_mount(&local);
+
+    // Record in persistent mount tracking.
+    let _ = mount::add_mount(mount::MountEntry {
+        id: mount_id.clone(),
+        parent_id,
+        local: local.clone(),
+        peer: peer_name.to_string(),
+        remote: remote.clone(),
+        pid,
+        read_only,
+        auto_restore,
+        created: now.clone(),
+    });
+
+    // Store in daemon in-memory tracking.
+    let entry = DaemonMountEntry {
+        local: local.clone(),
+        peer: peer_name.to_string(),
+        remote: remote.clone(),
+        pid,
+        read_only,
+        auto_restore,
+        created: now,
+    };
+    daemon_mounts.entries.insert(local.clone(), entry);
+    daemon_mounts.children.insert(local.clone(), child);
+
+    *last_mount_check = Instant::now();
+    crate::ui::say(&format!("mounted {peer_name}:{remote} at {local} (id: {mount_id})"));
+    req.reply(&json!({ "ok": true })).await;
 }
 
 /// Handle an unmount request: kill the sshfs process and remove tracking.
@@ -4882,8 +4955,8 @@ async fn handle_unmount(req: ctl::Req, daemon_mounts: &mut DaemonMounts) {
     }
     daemon_mounts.entries.remove(&target);
 
-    // Also remove from persistent tracking.
-    match mount::unmount_cmd(&target) {
+    // Also remove from persistent tracking (async-safe, no block_on).
+    match mount::unmount_cmd_async(&target).await {
         Ok(()) => req.reply(&json!({ "ok": true })).await,
         Err(e) => req.reject(&format!("unmount failed: {e}")).await,
     }

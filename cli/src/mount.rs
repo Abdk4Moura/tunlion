@@ -61,7 +61,7 @@ fn delete_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn generate_mount_id() -> String {
+pub(crate) fn generate_mount_id() -> String {
     use std::io::Read;
     let mut buf = [0u8; 4];
     // Use /dev/urandom for true randomness.
@@ -71,7 +71,7 @@ fn generate_mount_id() -> String {
     format!("{:06x}", val & 0xffffff)
 }
 
-fn unique_mount_id() -> String {
+pub(crate) fn unique_mount_id() -> String {
     let mounts = load_mounts();
     loop {
         let id = generate_mount_id();
@@ -117,7 +117,7 @@ fn save_mounts(mounts: &[MountEntry]) -> Result<()> {
     Ok(())
 }
 
-fn add_mount(entry: MountEntry) -> Result<()> {
+pub(crate) fn add_mount(entry: MountEntry) -> Result<()> {
     let mut mounts = load_mounts();
     // Remove any stale entry for the same local path.
     mounts.retain(|m| m.local != entry.local);
@@ -131,7 +131,7 @@ pub(crate) fn remove_mount(local: &str) -> Result<()> {
     save_mounts(&mounts)
 }
 
-fn find_parent_mount(local: &str) -> Option<String> {
+pub(crate) fn find_parent_mount(local: &str) -> Option<String> {
     let mounts = load_mounts();
     mounts.iter()
         .filter(|m| local.starts_with(&m.local) && m.local != local && is_mount_alive(m))
@@ -587,6 +587,91 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
                     }
                     _ => {
                         let status = std::process::Command::new("umount").arg(target).status()?;
+                        if status.success() {
+                            crate::ui::say(&format!("unmounted {target}"));
+                            Ok(())
+                        } else {
+                            bail!("failed to unmount {target}");
+                        }
+                    }
+                }
+            } else {
+                bail!("no mount found for '{target}' (use `filament mount --list` to see active mounts)");
+            }
+        }
+    }
+}
+
+pub async fn unmount_cmd_async(target: &str) -> Result<()> {
+    let mounts = load_mounts();
+
+    let entry = mounts.iter().find(|m| m.id == target || m.local == target);
+
+    #[cfg(unix)]
+    {
+        if crate::ctl::daemon_present().await {
+            if let Some(_reply) = crate::ctl::try_unmount(target).await {
+                crate::ui::say(&format!("unmounted {target} (daemon-managed)"));
+                return Ok(());
+            }
+        }
+    }
+
+    match entry {
+        Some(entry) => {
+            let children = find_child_mounts(&entry.id);
+            for child in children {
+                if let Err(e) = Box::pin(unmount_cmd_async(&child.local)).await {
+                    crate::ui::say(&format!("warning: failed to unmount child {}: {}", child.local, e));
+                }
+            }
+
+            let path = &entry.local;
+            let status = tokio::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(path)
+                .status()
+                .await;
+
+            match status {
+                Ok(s) if s.success() => {
+                    let _ = remove_mount(path);
+                    crate::ui::say(&format!("unmounted {path} (id: {})", entry.id));
+                    Ok(())
+                }
+                _ => {
+                    let status = tokio::process::Command::new("umount")
+                        .arg(path)
+                        .status()
+                        .await?;
+                    if status.success() {
+                        let _ = remove_mount(path);
+                        crate::ui::say(&format!("unmounted {path} (id: {})", entry.id));
+                        Ok(())
+                    } else {
+                        let _ = remove_mount(path);
+                        bail!("failed to unmount {path}, but tracking removed");
+                    }
+                }
+            }
+        }
+        None => {
+            if Path::new(target).exists() {
+                let status = tokio::process::Command::new("fusermount")
+                    .arg("-u")
+                    .arg(target)
+                    .status()
+                    .await;
+                match status {
+                    Ok(s) if s.success() => {
+                        crate::ui::say(&format!("unmounted {target}"));
+                        Ok(())
+                    }
+                    _ => {
+                        let status = tokio::process::Command::new("umount")
+                            .arg(target)
+                            .status()
+                            .await?;
                         if status.success() {
                             crate::ui::say(&format!("unmounted {target}"));
                             Ok(())
