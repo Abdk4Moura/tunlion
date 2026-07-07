@@ -4742,6 +4742,21 @@ async fn next_ev(
 /// (lookup) and the spawned bridge tasks (insert/remove). Inert on non-unix.
 type WarmPtys = std::sync::Arc<std::sync::Mutex<HashMap<String, (String, u32)>>>;
 
+struct DaemonMountEntry {
+    local: String,
+    peer: String,
+    remote: String,
+    pid: u32,
+    read_only: bool,
+    auto_restore: bool,
+    created: String,
+}
+
+struct DaemonMounts {
+    entries: HashMap<String, DaemonMountEntry>,
+    children: HashMap<String, tokio::process::Child>,
+}
+
 /// Dispatch one warm-reuse control request to the right handler. Warm reuse is
 /// unix-only (the control socket is a unix-domain socket); on non-unix `ctl::Req`
 /// is uninhabited so this is never reached - it only keeps the event loop portable.
@@ -4784,6 +4799,147 @@ async fn handle_warm_req(
         // Reload is handled inline in the daemon loop (it self-SIGTERMs); answer
         // defensively if it ever reaches here.
         ctl::ReqKind::Reload => req.reply(&json!({ "ok": true, "reloading": false })).await,
+        // Mount/Unmount/ListMounts/MountHealth are handled inline in the daemon
+        // loop (they need access to DaemonMounts); answer defensively if reached.
+        ctl::ReqKind::Mount { .. } => req.reject("mount not handled here").await,
+        ctl::ReqKind::Unmount { .. } => req.reject("unmount not handled here").await,
+        ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
+        ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
+    }
+}
+
+/// Handle a mount request: spawn sshfs and track the mount centrally.
+#[cfg(unix)]
+async fn handle_mount(
+    req: ctl::Req,
+    server: &str,
+    relay: bool,
+    daemon_mounts: &mut DaemonMounts,
+    last_mount_check: &mut Instant,
+) {
+    let ctl::ReqKind::Mount { peer, remote, local, read_only, auto_restore } = &req.kind else { return };
+    let peer = peer.clone();
+    let remote = remote.clone();
+    let local = local.clone();
+    let read_only = *read_only;
+    let auto_restore = *auto_restore;
+
+    // Ensure mount point exists.
+    if !Path::new(&local).exists() {
+        if let Err(e) = std::fs::create_dir_all(&local) {
+            req.reject(&format!("failed to create mount point: {e}")).await;
+            return;
+        }
+        crate::ui::say(&format!("created mount point: {local}"));
+    }
+
+    // Check sshfs is available.
+    if std::process::Command::new("which")
+        .arg("sshfs")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        req.reject("sshfs not found").await;
+        return;
+    }
+
+    // Use the mount module to spawn sshfs.
+    match mount::mount_cmd(server, &peer, &remote, Some(local.clone()), read_only, None, relay, false, auto_restore).await {
+        Ok(()) => {
+            // Read back the mount entry we just created.
+            let mounts = mount::load_mounts();
+            if let Some(entry) = mounts.iter().find(|m| m.local == local) {
+                let entry = DaemonMountEntry {
+                    local: entry.local.clone(),
+                    peer: entry.peer.clone(),
+                    remote: entry.remote.clone(),
+                    pid: entry.pid,
+                    read_only: entry.read_only,
+                    auto_restore: entry.auto_restore,
+                    created: entry.created.clone(),
+                };
+                daemon_mounts.entries.insert(local.clone(), entry);
+            }
+            *last_mount_check = Instant::now();
+            req.reply(&json!({ "ok": true })).await;
+        }
+        Err(e) => {
+            req.reject(&format!("mount failed: {e}")).await;
+        }
+    }
+}
+
+/// Handle an unmount request: kill the sshfs process and remove tracking.
+#[cfg(unix)]
+async fn handle_unmount(req: ctl::Req, daemon_mounts: &mut DaemonMounts) {
+    let ctl::ReqKind::Unmount { target } = &req.kind else { return };
+    let target = target.clone();
+
+    // Kill the child process if tracked by the daemon.
+    if let Some(mut child) = daemon_mounts.children.remove(&target) {
+        let _ = child.kill().await;
+    }
+    daemon_mounts.entries.remove(&target);
+
+    // Also remove from persistent tracking.
+    match mount::unmount_cmd(&target) {
+        Ok(()) => req.reply(&json!({ "ok": true })).await,
+        Err(e) => req.reject(&format!("unmount failed: {e}")).await,
+    }
+}
+
+/// Handle a list-mounts request: return all tracked mounts and their status.
+#[cfg(unix)]
+async fn handle_list_mounts(req: ctl::Req, daemon_mounts: &DaemonMounts) {
+    let mounts: Vec<Value> = daemon_mounts.entries.values().map(|e| {
+        let is_alive = mount::is_mount_point(&e.local);
+        let status = if is_alive { "healthy" } else { "dead" };
+        json!({
+            "local": e.local,
+            "peer": e.peer,
+            "remote": e.remote,
+            "read_only": e.read_only,
+            "auto_restore": e.auto_restore,
+            "created": e.created,
+            "status": status,
+        })
+    }).collect();
+    req.reply(&json!({ "ok": true, "mounts": mounts })).await;
+}
+
+/// Handle a mount-health request: check health of a specific mount.
+#[cfg(unix)]
+async fn handle_mount_health(req: ctl::Req, daemon_mounts: &DaemonMounts) {
+    let ctl::ReqKind::MountHealth { target } = &req.kind else { return };
+    let target = target.clone();
+
+    // Find the entry by local path or ID.
+    let entry = daemon_mounts.entries.get(&target);
+    match entry {
+        Some(e) => {
+            let is_alive = mount::is_mount_point(&e.local);
+            let path_exists = Path::new(&e.local).exists();
+            let status = if !path_exists {
+                "missing"
+            } else if !is_alive {
+                "dead"
+            } else {
+                match std::fs::metadata(&e.local) {
+                    Ok(_) => "healthy",
+                    Err(_) => "stale",
+                }
+            };
+            req.reply(&json!({ "ok": true, "status": status, "local": e.local, "peer": e.peer, "remote": e.remote })).await;
+        }
+        None => {
+            // Not tracked by daemon, but check if it's a live mount anyway.
+            if mount::is_mount_point(&target) {
+                req.reply(&json!({ "ok": true, "status": "untracked", "local": target })).await;
+            } else {
+                req.reject(&format!("no mount found for '{target}'")).await;
+            }
+        }
     }
 }
 
@@ -7372,6 +7528,14 @@ async fn recv_cmd(
         devices.iter().map(|(_, s)| channel_of(s)).collect();
     let mut last_devices_scan = Instant::now();
 
+    // Daemon-managed mount state: the daemon holds the sshfs child processes and
+    // monitors their health centrally instead of spawning per-mount threads.
+    let mut daemon_mounts = DaemonMounts {
+        entries: HashMap::new(),
+        children: HashMap::new(),
+    };
+    let mut last_mount_check = Instant::now();
+
     // P2 (GAP-2): outer reconnect / re-announce loop state for the long-lived
     // acceptor. `reconnect(false)` means a severed signaling TCP leaves the
     // socket dead with NO further events, the acceptor zombies and the sender
@@ -7524,6 +7688,14 @@ async fn recv_cmd(
                             req.reject("L3 overlay not supported on this build").await;
                         } else if matches!(&req.kind, ctl::ReqKind::Bootstrap { .. }) {
                             handle_warm_bootstrap(&conn, &mut pending_bootstrap, req).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::Mount { .. }) {
+                            handle_mount(req, &server, relay, &mut daemon_mounts, &mut last_mount_check).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::Unmount { .. }) {
+                            handle_unmount(req, &mut daemon_mounts).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::ListMounts) {
+                            handle_list_mounts(req, &daemon_mounts).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
+                            handle_mount_health(req, &daemon_mounts).await;
                         } else {
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                         }
@@ -7742,6 +7914,35 @@ async fn recv_cmd(
                 ui::debug(&format!("filament: link to '{pid}' died, dropping so it can re-connect"));
                 conn.drop_link(&pid);
                 l2_muxes.remove(&pid);
+            }
+        }
+
+        // Daemon-managed mount health check: periodically check all tracked
+        // mounts and remove dead/stale entries. Runs every 30s, daemon-only.
+        if daemon && last_mount_check.elapsed() >= Duration::from_secs(30) {
+            last_mount_check = Instant::now();
+            let dead_locals: Vec<String> = daemon_mounts.entries.iter()
+                .filter_map(|(local, entry)| {
+                    let is_alive = mount::is_mount_point(local);
+                    let path_exists = Path::new(local).exists();
+                    if !path_exists {
+                        Some(local.clone())
+                    } else if !is_alive {
+                        Some(local.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for local in dead_locals {
+                if let Some(entry) = daemon_mounts.entries.remove(&local) {
+                    ui::say(&format!("mount {local} is gone, removing from daemon tracking (was {}:{})", entry.peer, entry.remote));
+                    // Kill the child process if still tracked.
+                    if let Some(mut child) = daemon_mounts.children.remove(&local) {
+                        let _ = child.kill().await;
+                    }
+                    let _ = mount::remove_mount(&local);
+                }
             }
         }
 
