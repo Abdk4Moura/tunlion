@@ -5694,7 +5694,7 @@ async fn main() -> Result<()> {
             } else if peer.is_none() && remote.is_none() {
                 // No arguments: interactive mode for TTY, help for machines
                 if std::io::stdin().is_terminal() {
-                    mount::interactive_mount(&server, relay).await
+                    mount::interactive_mount_fancy(&server, relay).await
                 } else {
                     mount::print_mount_help();
                     Ok(())

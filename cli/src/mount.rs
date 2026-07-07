@@ -858,3 +858,279 @@ pub async fn interactive_mount(server: &str, relay: bool) -> Result<()> {
 
     mount_cmd(server, &peer, &remote, Some(local), read_only, None, relay, false, auto_restore).await
 }
+
+// ---- Fancy interactive UI with arrow selection and type-to-filter ----
+
+struct MountItem {
+    label: String,
+    peer: String,
+    remote: String,
+    local: String,
+    read_only: bool,
+    auto_restore: bool,
+}
+
+fn render_mount_ui(
+    header: &str,
+    items: &[MountItem],
+    sel: usize,
+    filter: &str,
+    filter_active: bool,
+    redraw: bool,
+) {
+    use std::io::Write;
+    let mut out = std::io::stderr();
+    let color = crate::ui::caps().color;
+
+    if redraw {
+        let _ = write!(out, "\x1b[{}A", items.len() + 4);
+    }
+
+    // Header
+    let _ = write!(out, "\r\x1b[2K\r\n");
+    let _ = write!(out, "\r\x1b[2K\x1b[1;36m{header}\x1b[0m\r\n");
+
+    // Filter line
+    if filter_active {
+        let _ = write!(out, "\r\x1b[2K  \x1b[33m>\x1b[0m {filter}\x1b[37m_\x1b[0m\r\n");
+    } else {
+        let _ = write!(out, "\r\x1b[2K  \x1b[2mtype to filter, arrow keys to select\x1b[0m\r\n");
+    }
+
+    // Items
+    if items.is_empty() {
+        let _ = write!(out, "\r\x1b[2K  \x1b[2m(no matches)\x1b[0m\r\n");
+    } else {
+        for (i, item) in items.iter().enumerate() {
+            let (mark, c, r) = if i == sel {
+                if color {
+                    ("\u{276f}", "\x1b[1;36m", "\x1b[0m")
+                } else {
+                    (">", "", "")
+                }
+            } else {
+                (" ", "", "")
+            };
+            let _ = write!(out, "\r\x1b[2K  {c}{mark} {}{}\r\n", item.label, r);
+        }
+    }
+
+    // Help line
+    let _ = write!(out, "\r\x1b[2K\r\n");
+    let _ = write!(out, "\r\x1b[2K  \x1b[2m\x1b[K\r\n");
+    let _ = write!(out, "\r\x1b[2K  \x1b[2m\x1b[K\r\n");
+
+    let _ = out.flush();
+}
+
+fn filter_items<'a>(items: &'a [MountItem], filter: &str) -> Vec<(usize, &'a MountItem)> {
+    if filter.is_empty() {
+        return items.iter().enumerate().collect();
+    }
+    let lower = filter.to_lowercase();
+    items.iter()
+        .enumerate()
+        .filter(|(_, item)| item.label.to_lowercase().contains(&lower))
+        .collect()
+}
+
+pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::io::Write;
+
+    let _guard = crate::codeentry::RawGuard::enable()?;
+
+    // Collect all items: devices + profiles + current mounts
+    let mut items: Vec<MountItem> = Vec::new();
+
+    // Add available devices
+    let devices = crate::devices_load();
+    for (name, _) in &devices {
+        items.push(MountItem {
+            label: format!("\x1b[33m{}\x1b[0m  \x1b[2m(device)\x1b[0m", name),
+            peer: name.clone(),
+            remote: String::new(),
+            local: String::new(),
+            read_only: false,
+            auto_restore: false,
+        });
+    }
+
+    // Add saved profiles
+    if let Ok(profiles) = list_profiles() {
+        for name in &profiles {
+            if let Ok(profile) = load_profile(name) {
+                items.push(MountItem {
+                    label: format!("\x1b[35m{}\x1b[0m  \x1b[2m(profile, {} mount(s))\x1b[0m", name, profile.mounts.len()),
+                    peer: name.clone(),
+                    remote: String::new(),
+                    local: String::new(),
+                    read_only: false,
+                    auto_restore: false,
+                });
+            }
+        }
+    }
+
+    // Add active mounts
+    let mounts = load_mounts();
+    for entry in &mounts {
+        let status = check_mount_health(entry);
+        let status_color = if status == MountStatus::Healthy { "\x1b[32m" } else { "\x1b[31m" };
+        items.push(MountItem {
+            label: format!("{}:{} -> {}  {}{}{}\x1b[0m",
+                entry.peer, entry.remote, entry.local,
+                status_color, entry.id, ""),
+            peer: entry.peer.clone(),
+            remote: entry.remote.clone(),
+            local: entry.local.clone(),
+            read_only: entry.read_only,
+            auto_restore: entry.auto_restore,
+        });
+    }
+
+    if items.is_empty() {
+        drop(_guard);
+        println!("\x1b[33mNo devices paired and no mounts configured.\x1b[0m");
+        println!("Pair a device first: filament pair");
+        return Ok(());
+    }
+
+    let mut sel = 0usize;
+    let mut filter = String::new();
+    let mut filter_active = false;
+    let mut redraw = true;
+
+    loop {
+        let filtered = filter_items(&items, &filter);
+        let header = "\x1b[1;36mSelect a device, profile, or mount:\x1b[0m";
+
+        // Clamp selection
+        if !filtered.is_empty() && sel >= filtered.len() {
+            sel = filtered.len() - 1;
+        }
+
+        // Render
+        let display_items: Vec<MountItem> = filtered.iter().map(|(_, item)| {
+            MountItem {
+                label: item.label.clone(),
+                peer: item.peer.clone(),
+                remote: item.remote.clone(),
+                local: item.local.clone(),
+                read_only: item.read_only,
+                auto_restore: item.auto_restore,
+            }
+        }).collect();
+        render_mount_ui(header, &display_items, sel, &filter, filter_active, redraw);
+        redraw = true;
+
+        // Read event
+        let ev = event::read()?;
+        let Event::Key(k) = ev else { continue };
+        if k.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        match k.code {
+            // Ctrl-C: cancel
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                drop(_guard);
+                println!("\r\x1b[2K\x1b[2mCancelled.\x1b[0m");
+                return Ok(());
+            }
+            // Escape: if filter active, clear filter; else cancel
+            KeyCode::Esc => {
+                if filter_active {
+                    filter.clear();
+                    filter_active = false;
+                    sel = 0;
+                } else {
+                    drop(_guard);
+                    println!("\r\x1b[2K\x1b[2mCancelled.\x1b[0m");
+                    return Ok(());
+                }
+            }
+            // Enter: select
+            KeyCode::Enter => {
+                if filtered.is_empty() {
+                    continue;
+                }
+                let item = filtered[sel].1;
+                drop(_guard);
+
+                // Check if it's a device (needs remote path)
+                let is_device = items.iter().any(|i| i.peer == item.peer && i.remote.is_empty() && i.label.contains("device"));
+
+                if is_device {
+                    // Device selected - prompt for remote path
+                    println!("\r\x1b[2K");
+                    print!("  Remote path on \x1b[1m{}\x1b[0m: ", item.peer);
+                    std::io::stdout().flush()?;
+                    let mut remote = String::new();
+                    std::io::stdin().read_line(&mut remote)?;
+                    let remote = remote.trim().to_string();
+                    if remote.is_empty() {
+                        bail!("remote path is required");
+                    }
+
+                    // Prompt for local path
+                    let default_local = Path::new(&remote)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| item.peer.clone());
+                    print!("  Local mount point [\x1b[2m{default_local}\x1b[0m]: ");
+                    std::io::stdout().flush()?;
+                    let mut local = String::new();
+                    std::io::stdin().read_line(&mut local)?;
+                    let local = if local.trim().is_empty() { default_local } else { local.trim().to_string() };
+
+                    println!();
+                    return mount_cmd(server, &item.peer, &remote, Some(local), false, None, relay, false, false).await;
+                } else if item.label.contains("profile") {
+                    // Profile selected - apply it
+                    println!("\r\x1b[2K");
+                    println!("  \x1b[1mApplying profile: {}\x1b[0m", item.peer);
+                    return apply_profile_cmd(&item.peer, server, relay).await;
+                } else {
+                    // Active mount selected - show details
+                    println!("\r\x1b[2K");
+                    println!("  \x1b[1mMount: {}:{} -> {}\x1b[0m", item.peer, item.remote, item.local);
+                    println!("  \x1b[2mCommands:\x1b[0m");
+                    println!("    filament mount --check {}", item.local);
+                    println!("    filament unmount {}", item.local);
+                    return Ok(());
+                }
+            }
+            // Arrow up / k: move up
+            KeyCode::Up | KeyCode::Char('k') if !filter_active => {
+                if sel > 0 {
+                    sel -= 1;
+                } else if !filtered.is_empty() {
+                    sel = filtered.len() - 1;
+                }
+            }
+            // Arrow down / j: move down
+            KeyCode::Down | KeyCode::Char('j') if !filter_active => {
+                sel = (sel + 1) % filtered.len().max(1);
+            }
+            // / or Ctrl-F: activate filter
+            KeyCode::Char('/') | KeyCode::Char('f') if k.modifiers.contains(KeyModifiers::CONTROL) || k.code == KeyCode::Char('/') => {
+                filter_active = true;
+            }
+            // Backspace: remove filter char
+            KeyCode::Backspace if filter_active => {
+                filter.pop();
+                if filter.is_empty() {
+                    filter_active = false;
+                }
+                sel = 0;
+            }
+            // Char: add to filter
+            KeyCode::Char(c) if filter_active && !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                filter.push(c);
+                sel = 0;
+            }
+            _ => {}
+        }
+    }
+}
