@@ -3134,6 +3134,14 @@ pub(crate) async fn ensure_peer_bootstrap(server: &str, peer: &str, relay: bool)
     let rport: u16 =
         std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
 
+    ensure_peer_bootstrap_port(server, peer, relay, rport).await
+}
+
+/// Ensure our managed key is installed on the peer with a specific port.
+pub(crate) async fn ensure_peer_bootstrap_port(server: &str, peer: &str, relay: bool, rport: u16) -> Result<PeerSshInfo> {
+    let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
+    let host = format!("filament-{peer}");
+
     let cached = if crate::sshkeys::host_pinned(&host) {
         crate::sshkeys::bootstrap_cache_get(peer)
     } else {
