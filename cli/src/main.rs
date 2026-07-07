@@ -4871,9 +4871,8 @@ async fn handle_mount(
     ]);
 
     // L3 preferred, L2 fallback.
-    let dest = if let Some(d) = crate::l2::l3_dest(&info) {
-        d
-    } else {
+    // For sshfs, always use L2 with ProxyCommand since L3 may be unstable.
+    let dest = {
         let exe = std::env::current_exe().unwrap();
         let exe = exe.to_string_lossy();
         let mut proxy = format!("{exe} --server {server}");
