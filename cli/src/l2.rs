@@ -3211,15 +3211,19 @@ pub(crate) fn ssh_transport_args(info: &PeerSshInfo, server: &str, peer: &str, r
 /// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
     let peer = info.host.strip_prefix("filament-").unwrap_or(&info.host);
-    if let Some((mesh_host, addr)) = l3_mesh_addr(peer, info.rport) {
-        if probe_sshd(addr, std::time::Duration::from_millis(600)) {
-            Some(format!("{}@{mesh_host}", info.login))
-        } else {
-            None
+    let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
+    
+    // Retry with increasing timeouts (like run_ssh does with revive+poll).
+    // A single 600ms probe is too aggressive - overlay may be temporarily slow.
+    for attempt in 0..3 {
+        if probe_sshd(addr, std::time::Duration::from_millis(1000)) {
+            return Some(format!("{}@{mesh_host}", info.login));
         }
-    } else {
-        None
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
+    None
 }
 
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {

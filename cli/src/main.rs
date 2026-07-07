@@ -4871,8 +4871,10 @@ async fn handle_mount(
     ]);
 
     // L3 preferred, L2 fallback.
-    // For sshfs, always use L2 with ProxyCommand since L3 may be unstable.
-    let dest = {
+    let dest = if let Some(d) = crate::l2::l3_dest(&info) {
+        d  // L3 direct: user@peer.mesh, no ProxyCommand
+    } else {
+        // L2 fallback: user@filament-peer with ProxyCommand
         let exe = std::env::current_exe().unwrap();
         let exe = exe.to_string_lossy();
         let mut proxy = format!("{exe} --server {server}");
@@ -8702,21 +8704,18 @@ async fn recv_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
-                _ if !conn.links.contains_key(&pid) => {}
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.
+                // Check BEFORE the catch-all guard so announces that race ahead of
+                // link creation are cached in l3_seen for replay on ChannelReady.
                 #[cfg(l3)]
-                Some("l3-announce") => {
-                    // The peer signed a claim to an overlay address. Verify it
-                    // against THIS link's channel binding (rejects a forged addr, a
-                    // replayed announce, or a peer that doesn't hold the key), then
-                    // route to the VERIFIED address. Cache it either way so a hello
-                    // that raced ahead of the transport is replayed on ChannelReady.
-                    if let Some(l3) = l3.as_ref() {
-                        match overlay::Announce::from_json(&v) {
-                            Ok(ann) => {
-                                l3_seen.insert(pid.clone(), ann.clone());
+                Some("l3-announce") if l3.is_some() => {
+                    match overlay::Announce::from_json(&v) {
+                        Ok(ann) => {
+                            l3_seen.insert(pid.clone(), ann.clone());
+                            // Try to process immediately if transport is available.
+                            if let Some(l3) = l3.as_ref() {
                                 match conn.transport_of(&pid).and_then(|t| t.channel_binding().map(|cb| (t, cb))) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
@@ -8724,7 +8723,6 @@ async fn recv_cmd(
                                             let v4 = ann.addr_v4();
                                             l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                                            // Store overlay addresses for `filament addr <device>`
                                             devices_touch(&who, Some(ip), Some(v4));
                                         }
                                         Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
@@ -8733,10 +8731,11 @@ async fn recv_cmd(
                                     None => {}
                                 }
                             }
-                            Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
                         }
+                        Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
                     }
                 }
+                _ if !conn.links.contains_key(&pid) => {}
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
                 // (a warm `open`) is connected end to end. Route it to the mux so
                 // verify_first_frame passes even for a client-speaks-first service
