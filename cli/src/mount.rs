@@ -75,7 +75,7 @@ fn remove_mount(local: &str) -> Result<()> {
 fn find_parent_mount(local: &str) -> Option<String> {
     let mounts = load_mounts();
     mounts.iter()
-        .filter(|m| local.starts_with(&m.local) && m.local != local)
+        .filter(|m| local.starts_with(&m.local) && m.local != local && is_mount_alive(m))
         .max_by_key(|m| m.local.len())
         .map(|m| m.id.clone())
 }
@@ -427,7 +427,9 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
             // Recursively unmount children first.
             let children = find_child_mounts(&entry.id);
             for child in children {
-                let _ = unmount_cmd(&child.local);
+                if let Err(e) = unmount_cmd(&child.local) {
+                    crate::ui::say(&format!("warning: failed to unmount child {}: {}", child.local, e));
+                }
             }
 
             let path = &entry.local;
