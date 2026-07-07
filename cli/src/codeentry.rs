@@ -185,12 +185,12 @@ pub enum Outcome {
 /// RAII guard: enables raw mode on construction and ALWAYS restores the terminal
 /// on drop (success, cancel, error, OR panic). This is the one thing we must
 /// never get wrong, a leaked raw mode wedges the user's shell.
-struct RawGuard {
+pub struct RawGuard {
     active: bool,
 }
 
 impl RawGuard {
-    fn enable() -> std::io::Result<RawGuard> {
+    pub fn enable() -> std::io::Result<RawGuard> {
         crossterm::terminal::enable_raw_mode()?;
         Ok(RawGuard { active: true })
     }
