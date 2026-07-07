@@ -8,6 +8,59 @@ fn mounts_path() -> PathBuf {
     crate::settings::config_dir().join(MOUNTS_FILE)
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct MountProfile {
+    name: String,
+    mounts: Vec<ProfileMount>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ProfileMount {
+    peer: String,
+    remote: String,
+    local: String,
+    read_only: bool,
+    auto_restore: bool,
+}
+
+fn profiles_dir() -> PathBuf {
+    crate::settings::config_dir().join("mount-profiles")
+}
+
+fn load_profile(name: &str) -> Result<MountProfile> {
+    let path = profiles_dir().join(format!("{name}.json"));
+    let data = std::fs::read_to_string(&path)?;
+    Ok(serde_json::from_str(&data)?)
+}
+
+fn save_profile(profile: &MountProfile) -> Result<()> {
+    std::fs::create_dir_all(profiles_dir())?;
+    let path = profiles_dir().join(format!("{}.json", profile.name));
+    let data = serde_json::to_string_pretty(profile)?;
+    std::fs::write(&path, data)?;
+    Ok(())
+}
+
+fn list_profiles() -> Result<Vec<String>> {
+    let dir = profiles_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+        .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .collect())
+}
+
+fn delete_profile(name: &str) -> Result<()> {
+    let path = profiles_dir().join(format!("{name}.json"));
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
 fn generate_mount_id() -> String {
     use std::io::Read;
     let mut buf = [0u8; 4];
@@ -517,4 +570,50 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
             }
         }
     }
+}
+
+pub fn save_profile_cmd(name: &str) -> Result<()> {
+    let mounts = load_mounts();
+    let profile = MountProfile {
+        name: name.to_string(),
+        mounts: mounts.iter().map(|m| ProfileMount {
+            peer: m.peer.clone(),
+            remote: m.remote.clone(),
+            local: m.local.clone(),
+            read_only: m.read_only,
+            auto_restore: m.auto_restore,
+        }).collect(),
+    };
+    save_profile(&profile)?;
+    crate::ui::say(&format!("saved profile '{}' with {} mount(s)", name, profile.mounts.len()));
+    Ok(())
+}
+
+pub async fn apply_profile_cmd(name: &str, server: &str, relay: bool) -> Result<()> {
+    let profile = load_profile(name)?;
+    crate::ui::say(&format!("applying profile '{}' ({} mount(s))", name, profile.mounts.len()));
+    for pm in &profile.mounts {
+        mount_cmd(server, &pm.peer, &pm.remote, Some(pm.local.clone()),
+                 pm.read_only, None, relay, false, pm.auto_restore).await?;
+    }
+    Ok(())
+}
+
+pub fn profiles_cmd() -> Result<()> {
+    let profiles = list_profiles()?;
+    if profiles.is_empty() {
+        crate::ui::say("no saved profiles");
+        return Ok(());
+    }
+    for name in &profiles {
+        let profile = load_profile(name)?;
+        println!("{}: {} mount(s)", name, profile.mounts.len());
+    }
+    Ok(())
+}
+
+pub fn delete_profile_cmd(name: &str) -> Result<()> {
+    delete_profile(name)?;
+    crate::ui::say(&format!("deleted profile '{name}'"));
+    Ok(())
 }

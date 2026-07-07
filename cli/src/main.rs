@@ -798,6 +798,18 @@ enum Cmd {
         /// Check if a mount is healthy
         #[arg(long, value_name = "PATH")]
         check: Option<String>,
+        /// Save current mounts as a named profile
+        #[arg(long, value_name = "NAME")]
+        save_profile: Option<String>,
+        /// Apply a saved mount profile
+        #[arg(long, value_name = "NAME")]
+        apply_profile: Option<String>,
+        /// List saved mount profiles
+        #[arg(long)]
+        profiles: bool,
+        /// Delete a saved mount profile
+        #[arg(long, value_name = "NAME")]
+        delete_profile: Option<String>,
     },
     /// Unmount a filament mount point.
     Unmount {
@@ -5437,8 +5449,16 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { peer, remote, local, read_only, options, foreground, save_auto, list, check } => {
-            if list {
+        Cmd::Mount { peer, remote, local, read_only, options, foreground, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile } => {
+            if let Some(name) = save_profile {
+                mount::save_profile_cmd(&name)
+            } else if let Some(name) = apply_profile {
+                mount::apply_profile_cmd(&name, &server, relay).await
+            } else if profiles {
+                mount::profiles_cmd()
+            } else if let Some(name) = delete_profile {
+                mount::delete_profile_cmd(&name)
+            } else if list {
                 mount::list_cmd()
             } else if let Some(path) = check {
                 mount::check_cmd(&path)
