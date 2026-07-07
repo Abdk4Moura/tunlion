@@ -799,10 +799,10 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         check: Option<String>,
         /// Save current mounts as a named profile
-        #[arg(long, value_name = "NAME")]
+        #[arg(long = "save-profile", alias = "save", value_name = "NAME")]
         save_profile: Option<String>,
         /// Apply a saved mount profile
-        #[arg(long, value_name = "NAME")]
+        #[arg(long = "apply-profile", alias = "apply", value_name = "NAME")]
         apply_profile: Option<String>,
         /// List saved mount profiles
         #[arg(long)]
