@@ -28,6 +28,10 @@ fn unique_mount_id() -> String {
     }
 }
 
+fn default_auto_restore() -> bool {
+    false
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct MountEntry {
     id: String,
@@ -37,6 +41,8 @@ struct MountEntry {
     remote: String,
     pid: u32,
     read_only: bool,
+    #[serde(default = "default_auto_restore")]
+    auto_restore: bool,
     created: String,
 }
 
@@ -133,6 +139,7 @@ pub async fn mount_cmd(
     extra_opts: Option<String>,
     relay: bool,
     foreground: bool,
+    auto_restore: bool,
 ) -> Result<()> {
     let local_path = match local {
         Some(p) => p,
@@ -263,6 +270,7 @@ pub async fn mount_cmd(
             remote: remote.to_string(),
             pid,
             read_only,
+            auto_restore,
             created: now,
         })?;
 
@@ -360,6 +368,29 @@ pub fn list_cmd() -> Result<()> {
         println!("unmount with: filament unmount <id>");
     }
 
+    Ok(())
+}
+
+pub async fn restore_mounts(server: &str, relay: bool) -> Result<()> {
+    let mounts = load_mounts();
+    let mut restored = 0;
+    for entry in mounts {
+        if !entry.auto_restore {
+            continue;
+        }
+        if is_mount_alive(&entry) {
+            continue;
+        }
+        crate::ui::say(&format!("restoring mount {}:{} at {}", entry.peer, entry.remote, entry.local));
+        if let Err(e) = mount_cmd(server, &entry.peer, &entry.remote, Some(entry.local.clone()), entry.read_only, None, relay, false, entry.auto_restore).await {
+            crate::ui::say(&format!("warning: failed to restore {}: {}", entry.local, e));
+        } else {
+            restored += 1;
+        }
+    }
+    if restored > 0 {
+        crate::ui::say(&format!("restored {} mount(s)", restored));
+    }
     Ok(())
 }
 

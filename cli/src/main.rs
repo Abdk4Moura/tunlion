@@ -789,6 +789,9 @@ enum Cmd {
         /// Run sshfs in the foreground (blocks terminal)
         #[arg(long)]
         foreground: bool,
+        /// Auto-restore this mount on daemon start (off by default)
+        #[arg(long)]
+        save_auto: bool,
         /// List all filament mounts and their status
         #[arg(long)]
         list: bool,
@@ -5434,7 +5437,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { peer, remote, local, read_only, options, foreground, list, check } => {
+        Cmd::Mount { peer, remote, local, read_only, options, foreground, save_auto, list, check } => {
             if list {
                 mount::list_cmd()
             } else if let Some(path) = check {
@@ -5442,7 +5445,8 @@ async fn main() -> Result<()> {
             } else {
                 let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
-                mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground).await
+                let auto_restore = save_auto;
+                mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground, auto_restore).await
             }
         }
         Cmd::Unmount { path } => mount::unmount_cmd(&path),
@@ -7389,6 +7393,11 @@ async fn recv_cmd(
     if daemon {
         sdnotify::ready();
         sdnotify::status("up - serving");
+    }
+
+    // Restore mounts that were marked with auto_restore.
+    if let Err(e) = mount::restore_mounts(server, relay).await {
+        crate::ui::say(&format!("warning: failed to restore mounts: {e}"));
     }
 
     loop {
