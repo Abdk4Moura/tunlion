@@ -518,24 +518,6 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
     // Try to find by ID first, then by path.
     let entry = mounts.iter().find(|m| m.id == target || m.local == target);
 
-    // If daemon is present, delegate unmount to it (daemon kills sshfs + removes tracking).
-    #[cfg(unix)]
-    {
-        let target_for_daemon = target.to_string();
-        let rt = tokio::runtime::Handle::current();
-        let daemon_result = rt.block_on(async {
-            if crate::ctl::daemon_present().await {
-                crate::ctl::try_unmount(&target_for_daemon).await
-            } else {
-                None
-            }
-        });
-        if let Some(_reply) = daemon_result {
-            crate::ui::say(&format!("unmounted {target} (daemon-managed)"));
-            return Ok(());
-        }
-    }
-
     match entry {
         Some(entry) => {
             // Recursively unmount children first.
