@@ -31,6 +31,7 @@ fn unique_mount_id() -> String {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct MountEntry {
     id: String,
+    parent_id: Option<String>,
     local: String,
     peer: String,
     remote: String,
@@ -69,6 +70,20 @@ fn remove_mount(local: &str) -> Result<()> {
     let mut mounts = load_mounts();
     mounts.retain(|m| m.local != local);
     save_mounts(&mounts)
+}
+
+fn find_parent_mount(local: &str) -> Option<String> {
+    let mounts = load_mounts();
+    mounts.iter()
+        .filter(|m| local.starts_with(&m.local) && m.local != local)
+        .max_by_key(|m| m.local.len())
+        .map(|m| m.id.clone())
+}
+
+fn find_child_mounts(parent_id: &str) -> Vec<MountEntry> {
+    load_mounts().into_iter()
+        .filter(|m| m.parent_id.as_deref() == Some(parent_id))
+        .collect()
 }
 
 fn is_mount_alive(entry: &MountEntry) -> bool {
@@ -238,8 +253,11 @@ pub async fn mount_cmd(
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let mount_id = unique_mount_id();
 
+        let parent_id = find_parent_mount(&local_path);
+
         add_mount(MountEntry {
             id: mount_id.clone(),
+            parent_id,
             local: local_path.clone(),
             peer: peer_name.to_string(),
             remote: remote.to_string(),
@@ -406,6 +424,12 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
 
     match entry {
         Some(entry) => {
+            // Recursively unmount children first.
+            let children = find_child_mounts(&entry.id);
+            for child in children {
+                let _ = unmount_cmd(&child.local);
+            }
+
             let path = &entry.local;
             // Try fusermount first.
             let status = std::process::Command::new("fusermount")
