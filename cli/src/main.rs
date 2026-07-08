@@ -87,7 +87,7 @@ fn quiet_exit_window() -> Duration {
         .unwrap_or(Duration::from_secs(10))
 }
 /// C3/C4: connection (re)establishment attempts before failing honestly.
-const MAX_ATTEMPTS: u32 = 3;
+const MAX_ATTEMPTS: u32 = 5;
 
 /// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
 /// gates (runner/sim/*) to drive deterministic failure modes. They are compiled
@@ -3758,6 +3758,12 @@ impl Conn {
             _ => Presence::Reconnecting,
         };
         let was_active = self.is_active(pid);
+        // Add exponential backoff between retries to avoid burning through attempts instantly.
+        let backoff = std::cmp::min(
+            Duration::from_secs(2u64.pow(attempts - 1)),
+            Duration::from_secs(10),
+        );
+        tokio::time::sleep(backoff).await;
         self.establish(info).await?;
         if let Some(nl) = self.links.get_mut(pid) {
             nl.attempts = attempts;

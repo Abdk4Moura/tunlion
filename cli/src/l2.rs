@@ -356,12 +356,12 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // closes, but socket_to_dc (reader) stays parked on an IDLE client socket and
     // never notices - so awaiting only the reader (the old behavior) DEADLOCKED the
     // warm bridge, and thus the client's warm pty, until the user happened to type.
-    // A 2s liveness poll is the backstop for a transport that black-holes without
+    // A 5s liveness poll is the backstop for a transport that black-holes without
     // ever closing the pipe. Whichever fires, we drop the socket so the client sees
     // EOF and (for the pty) falls through to a cold reattach.
     // read_result: Some = reader finished (Ok=FIN sent, Err(join)=teardown aborted
     // us); None = we tore down because the peer/link ended.
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.tick().await; // consume the immediate tick
     let read_result;
     loop {
