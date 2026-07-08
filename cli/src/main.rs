@@ -44,6 +44,7 @@ mod tun;
 #[cfg(l3)]
 mod l3;
 mod shutdown;
+mod sshd;
 mod sshkeys;
 mod ui;
 
@@ -7471,6 +7472,14 @@ async fn recv_cmd(
                                 m.names_insert("__self__", &l3::sanitize_host(&my_name), v6, v4).await;
                                 if !m.is_userspace() {
                                     m.refresh_hosts().await;
+                                }
+                                // Configure sshd to listen on overlay addresses if enabled.
+                                if settings::get_bool("sshd-overlay", None) {
+                                    let v6_str = id.addr().to_string();
+                                    let v4_str = id.addr_v4().to_string();
+                                    if let Err(e) = sshd::configure_sshd_overlay(&v6_str, &v4_str) {
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!("  sshd-overlay: {e}")));
+                                    }
                                 }
                             }
                             Some(m)

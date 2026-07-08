@@ -154,6 +154,17 @@ pub fn registry() -> &'static [Setting] {
             help: "Drop the ssh/web-shell PTY to this non-root account (runuser)",
         },
         Setting {
+            key: "sshd-overlay",
+            aliases: &[],
+            store: "sshd-overlay",
+            kind: Kind::Bool,
+            default: "off",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "Add L3 overlay addresses to sshd ListenAddress for L3 mounts",
+        },
+        Setting {
             key: "tun-addr",
             aliases: &["overlay"],
             store: "tun-addr",
