@@ -16,7 +16,7 @@ use crate::net::{Ev, Transport};
 
 const KIND_CONTROL: u8 = 0;
 const KIND_DATA: u8 = 1;
-const MAX_PAYLOAD: usize = 1024 * 1024; // 1 MiB
+const MAX_PAYLOAD: usize = 1024 * 1024; // 1 MiB - optimal for TCP localhost
 
 /// TCP localhost transport implementing the `Transport` trait.
 pub struct LocalTransport {
