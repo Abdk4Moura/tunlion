@@ -997,10 +997,12 @@ fn spawn_reader(
                     if body.len() >= 4 {
                         last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         let sid = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                        // Zero-copy: convert Vec directly to Bytes, then split off the 4-byte sid prefix.
+                        let bytes = bytes::Bytes::from(body);
                         let _ = tx.send(crate::net::Ev::Chunk(
                             peer_id.clone(),
                             sid,
-                            bytes::Bytes::copy_from_slice(&body[4..]),
+                            bytes.slice(4..),
                         ));
                     }
                 }
