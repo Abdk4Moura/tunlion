@@ -46,6 +46,7 @@ mod l3;
 mod shutdown;
 mod sshd;
 mod sshkeys;
+mod local;
 mod ui;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -2132,6 +2133,8 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         iface_snapshot: Vec::new(),
     },
     direct_ok: direct::direct_enabled(),
+    local_port: None,
+    local_listener: None,
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -2915,6 +2918,9 @@ struct Conn {
     /// `direct_ok_for`; `start_direct_inner` gates on this instead of the bare env
     /// check. One-shot send/recv/pair keep the bare `direct_enabled()` default.
     direct_ok: bool,
+    /// Local transport for same-machine peers.
+    local_port: Option<u16>,
+    local_listener: Option<Arc<tokio::net::TcpListener>>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -3067,6 +3073,8 @@ impl Conn {
                 iface_snapshot: Vec::new(),
             },
             direct_ok,
+            local_port: None,
+            local_listener: None,
         }
     }
 
@@ -3350,6 +3358,17 @@ impl Conn {
         self.start_direct_inner(pid, name, secret, true).await
     }
 
+    /// Ensure we have a TCP listener for local connections.
+    async fn ensure_local_listener(&mut self) -> u16 {
+        if let Some(p) = self.local_port {
+            return p;
+        }
+        let (listener, port) = crate::local::listen_local().await.unwrap();
+        self.local_listener = Some(Arc::new(listener));
+        self.local_port = Some(port);
+        port
+    }
+
     async fn start_direct_inner(&mut self, pid: &str, name: &str, secret: &str, probe: bool) {
         // Gate on the per-session flag, not the bare env check: the L2/ssh
         // acceptor (`up --shell`) sets `direct_ok` true even with the env unset,
@@ -3381,11 +3400,21 @@ impl Conn {
         if self.direct_pending.contains_key(pid) || (!probe && self.links.contains_key(pid)) {
             return; // already trying, or already linked (WebRTC or direct)
         }
-        let (ep, port) = match direct::bind_endpoint() {
-            Ok(v) => v,
-            Err(e) => {
-                ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e})"));
-                return;
+
+        // Check if target is same-machine peer (local transport).
+        let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str());
+        let is_local = is_self_uid(&self.my_uid, peer_uid);
+
+        let (ep, port) = if is_local {
+            // For local peers, we don't need a QUIC endpoint.
+            (None, 0u16)
+        } else {
+            match direct::bind_endpoint() {
+                Ok(v) => (Some(v.0), v.1),
+                Err(e) => {
+                    ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e})"));
+                    return;
+                }
             }
         };
         // #1 (parallelism): gather the host/public candidates (incl. the
@@ -3400,15 +3429,27 @@ impl Conn {
         // (not handed to quinn), its NAT mapping is the one we'll punch + run
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
-        let srflx_fut = async {
-            if holepunch::holepunch_enabled() {
-                self.gather_srflx().await
-            } else {
-                None
+
+        let (cands, srflx) = if is_local {
+            // For local peers, ensure we have a listener and return TCP candidate.
+            if self.local_port.is_none() {
+                let (listener, port) = crate::local::listen_local().await.unwrap();
+                self.local_listener = Some(Arc::new(listener));
+                self.local_port = Some(port);
             }
+            let cands = vec![format!("{{\"type\":\"tcp-localhost\",\"port\":{}}}", self.local_port.unwrap())];
+            (cands, None)
+        } else {
+            let srflx_fut = async {
+                if holepunch::holepunch_enabled() {
+                    self.gather_srflx().await
+                } else {
+                    None
+                }
+            };
+            tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut)
         };
-        let (cands, srflx) =
-            tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut);
+
         let (punch_sock, my_srflx) = match srflx {
             Some((sock, srflx)) => (Some(sock), Some(srflx)),
             None => (None, None),
@@ -3475,7 +3516,7 @@ impl Conn {
                 secret: (name.to_string(), secret.to_string()),
                 deadline,
                 racing: false,
-                endpoint: Some(ep),
+                endpoint: ep,
                 punch_sock,
                 my_srflx,
                 probe,
@@ -3539,6 +3580,26 @@ impl Conn {
             }
         };
         tokio::spawn(async move {
+            // Check for TCP localhost candidate (same-machine peer).
+            for cand in &peer_cands {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
+                    if v["type"] == "tcp-localhost" {
+                        if let Some(port) = v["port"].as_u64() {
+                            let addr = format!("127.0.0.1:{port}");
+                            ui::trace(&format!("filament: trying TCP localhost to {addr}"));
+                            match crate::local::LocalTransport::connect(&addr).await {
+                                Ok(t) => {
+                                    let _ = tx.send(mk(pid_s, Arc::new(t), "local-tcp"));
+                                    return;
+                                }
+                                Err(e) => {
+                                    ui::trace(&format!("filament: TCP localhost failed: {e}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // rung-1: direct-dial QUIC over host candidates. answerer=true: this
             // is on_transport_offer (the side whose daemon received the offer), so
             // it allocates from the high L2 sid half (the connector side uses the
@@ -6972,13 +7033,14 @@ async fn stream_one(
     // return early (link-not-found) and the test would falsely pass.
     let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
     let mut injected = false;
-    let mut f = std::fs::File::open(&path)?;
-    f.seek(SeekFrom::Start(offset))?;
+    let mut f = tokio::fs::File::open(&path).await?;
+    use tokio::io::{AsyncSeekExt, AsyncReadExt};
+    f.seek(SeekFrom::Start(offset)).await?;
     let mut sent = offset;
     let mut buf = vec![0u8; chunk];
     let mut bar = ui::Progress::new(&name, size);
     loop {
-        let n = f.read(&mut buf)?;
+        let n = f.read(&mut buf).await?;
         if n == 0 {
             break;
         }
@@ -9608,10 +9670,15 @@ async fn recv_cmd(
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.on_frame(sid, data).await;
                     }
-                } else if let Some(inc) = by_sid.get_mut(&(pid, sid)) {
+                } else if let Some(inc) = by_sid.get_mut(&(pid.clone(), sid)) {
                     inc.file.write_all(&data).await?;
                     inc.received += data.len() as u64;
                     inc.bar.tick(inc.received);
+                } else {
+                    // Chunk arrived for unknown (pid, sid) - log instead of silently dropping.
+                    // This happens during transport supersede or stall repair when old chunks
+                    // arrive after the by_sid entry was removed.
+                    ui::debug(&format!("  dropping chunk for unknown sid {sid} from {pid} ({} bytes)", data.len()));
                 }
             }
             Ev::StdinLine(line) => {
