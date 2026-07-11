@@ -56,11 +56,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
 /// C7: content identity for resume, sha256 over the first 256 KiB.
@@ -2135,6 +2137,8 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     direct_ok: direct::direct_enabled(),
     local_port: None,
     local_listener: None,
+    direct_endpoint: None,
+    worker_port_tx: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -2748,6 +2752,10 @@ struct Link {
     /// Route label for a direct link (no WebRTC `route()` to query): `direct-quic`
     /// for rung-1, `holepunched` for rung-2. Ignored for WebRTC links.
     direct_route: &'static str,
+    /// Parallel QUIC transports for multi-stream file transfer
+    /// (`FILAMENT_DIRECT_STREAMS` > 1). Empty when striping is disabled
+    /// or when the link uses a non-QUIC transport.
+    workers: Vec<Arc<dyn Transport>>,
 }
 
 impl Link {
@@ -2921,6 +2929,17 @@ struct Conn {
     /// Local transport for same-machine peers.
     local_port: Option<u16>,
     local_listener: Option<Arc<tokio::net::TcpListener>>,
+    /// Shared direct-QUIC endpoint, cloned from the originating Endpoint so that
+    /// worker connections for multi-stream transfers can be dialled (sender side)
+    /// or accepted (receiver side) without racing the winner's keepalive closure.
+    /// Set once in `start_direct_inner`; `None` when direct is not in use, or
+    /// when multi-streaming is disabled (`direct_streams() == 1`).
+    direct_endpoint: Option<quinn::Endpoint>,
+    /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
+    /// The dialer-side `spawn_direct_workers` stores a sender here; the
+    /// `worker-ports` control message handler delivers the acceptor's port list
+    /// through it. Removed by the receiver on delivery (one-shot).
+    worker_port_tx: HashMap<String, oneshot::Sender<Vec<u16>>>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -3075,6 +3094,8 @@ impl Conn {
             direct_ok,
             local_port: None,
             local_listener: None,
+            direct_endpoint: None,
+            worker_port_tx: HashMap::new(),
         }
     }
 
@@ -3312,6 +3333,7 @@ impl Conn {
                 name,
                 uid: peer_uid,
                 transport: None,
+                workers: vec![],
                 generation,
                 attempts: 0,
                 trusted: false,
@@ -3397,8 +3419,17 @@ impl Conn {
         }
         // A probe expects a relay link to be present (it's the one we'd upgrade
         // AWAY from); only the cold path bails when a link already exists.
-        if self.direct_pending.contains_key(pid) || (!probe && self.links.contains_key(pid)) {
-            return; // already trying, or already linked (WebRTC or direct)
+        let link_dead = self.links.get(pid)
+            .map(|l| l.transport.is_none() && l.workers.is_empty())
+            .unwrap_or(false);
+        if link_dead {
+            self.drop_link(pid);
+        }
+        let link_alive = self.links.get(pid)
+            .map(|l| l.transport.is_some() || !l.workers.is_empty())
+            .unwrap_or(false);
+        if self.direct_pending.contains_key(pid) || (!probe && link_alive) {
+            return; // already trying, or already linked via a live transport
         }
 
         // Check if target is same-machine peer (local transport).
@@ -3410,7 +3441,14 @@ impl Conn {
             (None, 0u16)
         } else {
             match direct::bind_endpoint() {
-                Ok(v) => (Some(v.0), v.1),
+                Ok(v) => {
+                    // Clone for multi-stream worker connections before the
+                    // original is consumed by the race in on_transport_offer.
+                    if net::direct_streams() > 1 {
+                        self.direct_endpoint = Some(v.0.clone());
+                    }
+                    (Some(v.0), v.1)
+                }
                 Err(e) => {
                     ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e})"));
                     return;
@@ -3690,6 +3728,7 @@ impl Conn {
                 name,
                 uid,
                 transport: Some(t),
+                workers: vec![],
                 generation,
                 attempts: 0,
                 trusted: true,
@@ -3702,6 +3741,128 @@ impl Conn {
                 direct_route: route,
             },
         );
+    }
+
+    /// Spawn K-1 parallel QUIC worker transports in a background task after
+    /// the primary direct connection wins.  The non-answerer side dials; the
+    /// answerer side accepts.  Each worker gets its OWN quinn::Endpoint (own
+    /// UDP socket, own driver task) so packet I/O parallelises across cores.
+    /// Workers arrive asynchronously via `Ev::DirectWorkersReady` and are
+    /// populated on the Link.  File send (`stream_one`) gracefully degrades
+    /// to fewer streams if workers are not yet ready.
+    fn spawn_direct_workers(
+        &mut self,
+        pid: &str,
+        primary: &Arc<dyn Transport>,
+        tkey: [u8; 32],
+    ) {
+        let k = net::direct_streams();
+        if k <= 1 {
+            return;
+        }
+        let Some(peer_addr) = primary.remote_addr() else { return };
+        // BUGFIX: `primary.sid_answerer()` is TRUE on BOTH ends of a symmetric
+        // simultaneous-open (both peers establish via on_transport_offer, which
+        // hardcodes answerer=true), so it cannot split the worker roles — both
+        // sides would `accept_workers` and nobody dials. Use the deterministic
+        // polite-role tie-break: it compares (uid, then session-id) so exactly
+        // one side is "polite" and the other is not, giving opposite roles.
+        // Polite side accepts; the other dials.
+        let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
+        let answerer = net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid);
+        eprintln!("[T] spawn_direct_workers: pid={pid} my_uid={} peer_uid={peer_uid:?} my_id={} answerer={answerer} k={k}", self.my_uid, self.my_id);
+        let count = k - 1;
+
+        let pid = pid.to_string();
+        let my_uid = self.my_uid.clone();
+        let worker_port_key = peer_uid.map(|s| s.to_string()).unwrap_or_else(|| pid.clone());
+        let tx = self.tx.clone();
+        let primary = primary.clone();
+
+        // Dialer branch: create a oneshot channel so the control handler can
+        // deliver the acceptor's worker port list.
+            let worker_port_rx = if answerer {
+            None
+        } else {
+            let (tx, rx) = oneshot::channel();
+            eprintln!("[T] DIALER storing worker_port_tx key={worker_port_key} (peer_uid={pu:?}, pid={ppid})", pu=peer_uid, ppid=&pid);
+            self.worker_port_tx.insert(worker_port_key.clone(), tx);
+            Some(rx)
+        };
+
+        tokio::spawn(async move {
+            let workers = if answerer {
+                eprintln!("[T] worker ACCEPTOR branch: binding {count} endpoints");
+                // Acceptor: bind N fresh endpoints (each on its own UDP socket),
+                // send their ports to the dialer via the primary transport, then
+                // accept one connection per endpoint.
+                let mut endpoints = Vec::with_capacity(count);
+                let mut ports = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match direct::bind_endpoint() {
+                        Ok((ep, port)) => {
+                            eprintln!("[T]   bound endpoint port={port}");
+                            endpoints.push(ep);
+                            ports.push(port);
+                        }
+                        Err(e) => {
+                            crate::ui::debug(&format!("worker bind endpoint: {e}"));
+                            eprintln!("[T]   bind error: {e}");
+                            break;
+                        }
+                    }
+                }
+                if !ports.is_empty() {
+                    eprintln!("[T] sending worker-ports: {ports:?}");
+                    let _ = primary
+                        .send_control(&json!({
+                            "type": "worker-ports",
+                            "for": &my_uid,
+                            "ports": ports,
+                        }))
+                        .await;
+                }
+                let w = direct::accept_workers(
+                    endpoints,
+                    tkey,
+                    pid.clone(),
+                    tx.clone(),
+                    count,
+                )
+                .await;
+                eprintln!("[T] acceptor returned {} workers", w.len());
+                w
+            } else if let Some(rx) = worker_port_rx {
+                eprintln!("[T] worker DIALER branch: awaiting worker-ports");
+                // Dialer: await the worker-ports message, then bind one fresh
+                // endpoint per port and dial each.
+                match rx.await {
+                    Ok(ports) => {
+                        eprintln!("[T] DIALER got ports: {ports:?}, dialing {count} workers");
+                        let w = direct::dial_workers(
+                            ports,
+                            peer_addr.ip(),
+                            tkey,
+                            pid.clone(),
+                            tx.clone(),
+                            count,
+                        )
+                        .await;
+                        eprintln!("[T] dialer returned {} workers", w.len());
+                        w
+                    }
+                    Err(_) => {
+                        crate::ui::debug("worker-ports never arrived, using single-stream");
+                        eprintln!("[T] worker-ports never arrived");
+                        vec![]
+                    }
+                }
+            } else {
+                eprintln!("[T] worker NEITHER branch (no rx)");
+                vec![]
+            };
+            let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+        });
     }
 
     /// Per-tick: a direct attempt whose budget expired without an authenticated
@@ -3862,12 +4023,28 @@ impl Conn {
         // stall threshold. This makes "judge a still-establishing link by the 6 s
         // flowing threshold" - the high-RTT relay repair loop - unrepresentable.
         // See docs/transfer-state-machine.md.
-        let transport = self.links.get(pid).and_then(|l| l.transport.as_ref());
+        // Aggregate across primary + worker transports: during multi-stream
+        // transfers data rides the workers, so the primary can appear idle.
+        // Liveness is measured by the MOST recently active transport.
+        let link = self.links.get(pid);
+        let transport = link.and_then(|l| l.transport.as_ref());
+        let workers: Vec<Arc<dyn Transport>> = link.map(|l| l.workers.clone()).unwrap_or_default();
+        let transport_up = transport.is_some() || !workers.is_empty();
+        let flowed = transport.map(|t| t.has_flowed()).unwrap_or(false)
+            || workers.iter().any(|w| w.has_flowed());
+        let idle_ms = transport.map(|t| t.idle_ms()).into_iter()
+            .chain(workers.iter().map(|w| w.idle_ms()))
+            .min()
+            .unwrap_or(u64::MAX);
+        eprintln!("[STALL] pid={pid} in_flight={in_flight} transport_up={transport_up} flowed={flowed} idle_ms={idle_ms} workers={} cluster={:?}",
+            workers.len(),
+            transport.map(|t| t.idle_ms()).into_iter().chain(workers.iter().map(|w| w.idle_ms())).collect::<Vec<_>>()
+        );
         let obs = resilience::LiveObs {
             in_flight,
-            transport_up: transport.is_some(),
-            flowed: transport.map(|t| t.has_flowed()).unwrap_or(false),
-            idle_ms: transport.map(|t| t.idle_ms()).unwrap_or(u64::MAX),
+            transport_up,
+            flowed,
+            idle_ms,
             grace_ms: net::establish_grace_ms(),
             stall_ms: net::stall_ms(),
         };
@@ -4362,7 +4539,7 @@ impl Conn {
         let beat_ok = matches!(
             tokio::time::timeout(
                 Duration::from_millis(500),
-                standby.send_frame(VERIFY_PROBE_SID, b"upgrade-verify"),
+                standby.send_frame(VERIFY_PROBE_SID, 0, b"upgrade-verify"),
             )
             .await,
             Ok(Ok(()))
@@ -4466,6 +4643,7 @@ impl Conn {
                 name,
                 uid,
                 transport: Some(t),
+                workers: vec![],
                 generation,
                 attempts: 0,
                 trusted: true,
@@ -6352,7 +6530,7 @@ async fn send_cmd(
         if let Some(active) = conn.active.clone() {
             let in_flight = {
                 let out = outgoing.lock().await;
-                out.iter().any(|o| o.accepted_once && !o.done)
+                out.iter().any(|o| o.accepted_once && !o.sent)
             };
             if let Some(idle) = conn.detect_stall(&active, in_flight) {
                 if conn.link_alive(&active).await {
@@ -6536,8 +6714,19 @@ async fn send_cmd(
             // handler the WebRTC path uses (announce + offers) by re-emitting
             // ChannelReady, the transfer logic rides the trait unchanged.
             Ev::DirectReady(pid, t, route) => {
+                let tkey = conn.direct_pending.get(&pid)
+                    .map(|p| direct::transport_key(&p.secret.1));
                 conn.adopt_direct(&pid, t.clone(), route);
+                if let Some(k) = tkey {
+                    conn.spawn_direct_workers(&pid, &t, k);
+                }
                 let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::DirectWorkersReady(pid, workers) => {
+                if let Some(link) = conn.link_mut(&pid) {
+                    link.workers = workers;
+                    crate::ui::debug(&format!("worker transports ready: {pid} {} workers", link.workers.len()));
+                }
             }
             // P5 (GAP-6): a relay->direct upgrade probe's direct standby connected
             // ALONGSIDE the live relay link. Do NOT adopt it (that would clobber the
@@ -6638,6 +6827,22 @@ async fn send_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("worker-ports") => {
+                    let pid = v["for"].as_str().unwrap_or_default();
+                    eprintln!("[T:SERVE] worker-ports handler: looking up key={pid}");
+                    if let Some(tx) = conn.worker_port_tx.remove(pid) {
+                        eprintln!("[T:SERVE] worker-ports handler: FOUND key={pid}");
+                        let ports: Vec<u16> = v["ports"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|p| p.as_u64().map(|x| x as u16))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = tx.send(ports);
+                    }
+                }
                 _ if !conn.is_active(&pid) => {}
                 Some("brb") => {
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
@@ -6728,6 +6933,12 @@ async fn send_cmd(
                 }
                 Some("file-accept") => {
                     let Some(t) = conn.transport() else { continue };
+                    // Build transport list: primary + any parallel QUIC workers.
+                    let workers = conn.link(&pid)
+                        .map(|l| l.workers.clone())
+                        .unwrap_or_default();
+                    let mut transports = vec![t];
+                    transports.extend(workers);
                     let offset = v["offset"].as_u64().unwrap_or(0);
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     {
@@ -6737,13 +6948,19 @@ async fn send_cmd(
                         }
                     }
                     let out = outgoing.clone();
-                    let chunk = conn.chunk_size.min(t.max_payload());
+                    // Use the transport's OWN max payload, not conn.chunk_size:
+                    // chunk_size is pinned to the 60 KiB WebRTC DataChannel limit
+                    // (MAX_DC_PAYLOAD), which needlessly throttled the direct-QUIC
+                    // path to tiny chunks. On QUIC max_payload() is far larger, so
+                    // far fewer chunks pass through the receiver's single event-loop
+                    // consumer (record_range + seek + write) per byte.
+                    let chunk = transports[0].max_payload();
                     let tx2 = tx.clone();
                     // #28 test hook: the active peer's sid, so the streamer can
                     // synthesize a peer-left for it mid-flight (see stream_one).
                     let active_sid = conn.active.clone();
                     tokio::spawn(async move {
-                        match stream_one(out, t, id.clone(), offset, chunk, active_sid, tx2.clone()).await {
+                        match stream_one(out, transports, id.clone(), offset, chunk, active_sid, tx2.clone()).await {
                             Ok(()) => {
                                 let _ = tx2.send(Ev::TransferDone(id));
                             }
@@ -6803,7 +7020,10 @@ async fn send_cmd(
                         // resume:true on the SAME transport. The receiver's
                         // file-accept carries its `.part` offset, so streaming
                         // continues from where it stalled (no restart-from-zero).
-                        if let Some(t) = conn.transport_of(&pid) {
+                        // If the link has no live transport, Resume is futile.
+                        if conn.transport_of(&pid).is_none() {
+                            ui::debug(&format!("  resume skipped: no live transport for {pid}, awaiting next repair cycle"));
+                        } else if let Some(t) = conn.transport_of(&pid) {
                             let out = outgoing.lock().await;
                             for o in out.iter().filter(|o| o.accepted_once && !o.done) {
                                 let offer = protocol::offer_msg(
@@ -7009,7 +7229,7 @@ async fn send_cmd(
 
 async fn stream_one(
     outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
-    t: Arc<dyn Transport>,
+    transports: Vec<Arc<dyn Transport>>,
     id: String,
     offset: u64,
     chunk: usize,
@@ -7031,33 +7251,73 @@ async fn stream_one(
     // deferred-drop path must keep the link and let the transfer finish on it.
     // Injecting the active sid is critical: a wrong id makes on_peer_left
     // return early (link-not-found) and the test would falsely pass.
-    let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
-    let mut injected = false;
-    let mut f = tokio::fs::File::open(&path).await?;
     use tokio::io::{AsyncSeekExt, AsyncReadExt};
-    f.seek(SeekFrom::Start(offset)).await?;
-    let mut sent = offset;
-    let mut buf = vec![0u8; chunk];
-    let mut bar = ui::Progress::new(&name, size);
-    loop {
-        let n = f.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
+    let num = transports.len().max(1);
+    // Split the remaining bytes [offset, size) into `num` contiguous ranges and
+    // stream each over its OWN transport in a CONCURRENT task. The previous
+    // round-robin ran on one task and awaited each send_frame, so it stalled on
+    // whichever connection's flow-control window filled first and never used the
+    // links in parallel. One task per connection lets every link drain at once,
+    // which is the actual multi-stream win. The receiver reassembles by absolute
+    // offset (positional writes), so range order does not matter.
+    let bar = std::sync::Arc::new(tokio::sync::Mutex::new(ui::Progress::new(&name, size)));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(offset));
+    let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let remaining = size.saturating_sub(offset);
+    let per = remaining / num as u64;
+    let mut handles = Vec::with_capacity(num);
+    for i in 0..num {
+        let start = offset + i as u64 * per;
+        let end = if i == num - 1 { size } else { start + per };
+        if start >= end {
+            continue;
         }
-        t.send_frame(sid, &buf[..n]).await?;
-        sent += n as u64;
-        bar.tick(sent);
-        if let (false, Some(at), Some(asid)) = (injected, inject_at, active_sid.as_ref()) {
-            if sent >= at {
-                injected = true;
-                eprintln!("[test] injecting synthetic peer-left for active sid at {sent} bytes");
-                let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
+        let t = transports[i].clone();
+        let path = path.clone();
+        let bar = bar.clone();
+        let progress = progress.clone();
+        let injected = injected.clone();
+        let tx = tx.clone();
+        let active_sid = active_sid.clone();
+        handles.push(tokio::spawn(async move {
+            let mut f = tokio::fs::File::open(&path).await?;
+            f.seek(SeekFrom::Start(start)).await?;
+            let mut pos = start;
+            let mut buf = vec![0u8; chunk];
+            while pos < end {
+                let want = std::cmp::min(chunk as u64, end - pos) as usize;
+                let n = f.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    break;
+                }
+                t.send_frame(sid, pos, &buf[..n]).await?;
+                pos += n as u64;
+                let total =
+                    progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed) + n as u64;
+                bar.lock().await.tick(total);
+                if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
+                    if total >= at
+                        && !injected.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        eprintln!("[test] injecting synthetic peer-left for active sid at {total} bytes");
+                        let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
+                    }
+                }
             }
-        }
+            t.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        }));
     }
-    t.send_control(&protocol::end_msg(&id, sid)).await?;
-    t.flush().await?;
-    bar.done(sent - offset);
+    for h in handles {
+        h.await.map_err(|e| anyhow!("stream task join: {e}"))??;
+    }
+    // End frame on primary transport; flush all transports.
+    transports[0].send_control(&protocol::end_msg(&id, sid)).await?;
+    for t in &transports {
+        t.flush().await?;
+    }
+    bar.lock().await.done(size.saturating_sub(offset));
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
         // P4: the bytes + file-end left this side, but the transfer is NOT
@@ -7083,8 +7343,17 @@ struct IncomingFile {
     id: String,
     name: String,
     size: u64,
-    received: u64,
-    file: tokio::io::BufWriter<tokio::fs::File>,
+    /// Atomic counter so background writer tasks can publish received bytes
+    /// without locking. The event loop polls this for progress updates.
+    received: Arc<AtomicU64>,
+    /// Disjoint sorted byte intervals [start, end) received so far, for
+    /// out-of-order reassembly from multi-stream transports. Shared via
+    /// Mutex so concurrent spawn_blocking writer tasks can update safely.
+    ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    /// Raw file handle shared across concurrent spawn_blocking writer tasks.
+    /// Positional writes use std::os::unix::fs::FileExt::write_at which is
+    /// atomic per call — no seek needed, safe for concurrent access.
+    file: Arc<std::fs::File>,
     part_path: PathBuf,
     /// P4 (GAP-5): the whole-file sha256 the SENDER offered (`full`). On
     /// completion we hash the received `.part` and compare, only a match
@@ -7092,7 +7361,45 @@ struct IncomingFile {
     /// un-hashable source); we fall back to the legacy size-only acceptance and
     /// do NOT ack (nothing to verify), which the sender's bounded fallback covers.
     full: Option<String>,
+    /// Number of inflight spawn_blocking write tasks. The event loop uses
+    /// this to decide when a file is ready for finalization:
+    ///   inflight == 0 && end_seen → finalize
+    inflight: Arc<AtomicI64>,
+    /// Set by the file-end handler when the sender reports end-of-file, even
+    /// if inflight writes are still pending. The last finishing writer checks
+    /// this flag and emits Ev::MaybeComplete if both conditions are met.
+    end_seen: Arc<AtomicBool>,
+    /// The sid to use in the delivery-ack message. Set from the file-end
+    /// control frame; read by the MaybeComplete handler for the ack.
+    ack_sid: u32,
+    /// Tracks the last received value used for progress display (to avoid
+    /// re-ticking the same value). Not atomic — only accessed from the event loop.
+    last_tick: u64,
     bar: ui::Progress,
+}
+
+/// Record a received byte interval [pos, pos+len) in the disjoint sorted range
+/// list, merging overlapping/adjacent intervals. Returns the total unique bytes
+/// covered by all ranges — the authoritative `received` for multi-stream OOO
+/// reassembly. Single-stream (no ranges) callers can skip this entirely.
+fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
+    let end = pos + len as u64;
+    // Skip past ranges that end before this one starts.
+    let mut i = 0;
+    while i < ranges.len() && ranges[i].1 < pos {
+        i += 1;
+    }
+    // Merge all overlapping / adjacent ranges.
+    let mut new_s = pos;
+    let mut new_e = end;
+    while i < ranges.len() && ranges[i].0 <= end {
+        let (s, e) = ranges.remove(i);
+        new_s = new_s.min(s);
+        new_e = new_e.max(e);
+    }
+    ranges.insert(i, (new_s, new_e));
+    // Sum all ranges: total unique bytes received.
+    ranges.iter().map(|(s, e)| e - s).sum()
 }
 
 /// Build the live shell policy from the persistent settings (global `shell` +
@@ -8157,7 +8464,7 @@ async fn recv_cmd(
                     let mut transfers = serde_json::Map::new();
                     for ((p0, _), inc) in &by_sid {
                         if p0 == pid {
-                            transfers.insert(inc.id.clone(), json!(inc.received));
+                            transfers.insert(inc.id.clone(), json!(inc.received.load(Ordering::Relaxed)));
                         }
                     }
                     // BOUNDED: this runs inline in the event loop for EVERY link.
@@ -8615,8 +8922,19 @@ async fn recv_cmd(
             // rung-1: authenticated direct-QUIC won the race, adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
             Ev::DirectReady(pid, t, route) => {
+                let tkey = conn.direct_pending.get(&pid)
+                    .map(|p| direct::transport_key(&p.secret.1));
                 conn.adopt_direct(&pid, t.clone(), route);
+                if let Some(k) = tkey {
+                    conn.spawn_direct_workers(&pid, &t, k);
+                }
                 let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::DirectWorkersReady(pid, workers) => {
+                if let Some(link) = conn.link_mut(&pid) {
+                    link.workers = workers;
+                    crate::ui::debug(&format!("worker transports ready: {pid} {} workers", link.workers.len()));
+                }
             }
             // P5 (GAP-6): relay->direct upgrade standby connected (receiver side).
             // Stash + VERIFY rather than adopt, see the send-loop twin.
@@ -8811,6 +9129,22 @@ async fn recv_cmd(
                             }
                         }
                         Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
+                    }
+                }
+                Some("worker-ports") => {
+                    let pid = v["for"].as_str().unwrap_or_default();
+                    eprintln!("[T:CLI] worker-ports handler: looking up key={pid}");
+                    if let Some(tx) = conn.worker_port_tx.remove(pid) {
+                        eprintln!("[T:CLI] worker-ports handler: FOUND key={pid}");
+                        let ports: Vec<u16> = v["ports"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|p| p.as_u64().map(|x| x as u16))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = tx.send(ports);
                     }
                 }
                 _ if !conn.links.contains_key(&pid) => {}
@@ -9474,8 +9808,9 @@ async fn recv_cmd(
                             // partials to disk and drop them so the resume below
                             // re-opens the .part from its saved offset.
                             for k in dup_keys {
-                                if let Some(mut inc) = by_sid.remove(&k) {
-                                    let _ = inc.file.flush().await;
+                                if let Some(inc) = by_sid.remove(&k) {
+                                    let f = inc.file.clone();
+                                    let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
                                 }
                             }
                         }
@@ -9499,13 +9834,18 @@ async fn recv_cmd(
                                 id: id.clone(),
                                 name,
                                 size,
-                                received: 0,
-                                file: tokio::io::BufWriter::with_capacity(1 << 20, out),
+                                received: Arc::new(AtomicU64::new(0)),
+                                ranges: Arc::new(std::sync::Mutex::new(vec![])),
+                                file: Arc::new(out.into_std().await),
                                 part_path: PathBuf::new(),
                                 // Pipe mode streams to a fd we can't re-read, so we
                                 // can't recompute the digest, no verify, no ack
                                 // (the sender's bounded fallback covers it).
                                 full: None,
+                                inflight: Arc::new(AtomicI64::new(0)),
+                                end_seen: Arc::new(AtomicBool::new(false)),
+                                ack_sid: 0,
+                                last_tick: 0,
                                 bar: ui::Progress::new("(stdout)", size),
                             });
                             t.send_control(&protocol::accept_msg(&id, 0)).await?;
@@ -9518,20 +9858,32 @@ async fn recv_cmd(
                     let file = if offset > 0 {
                         // DEBUG, resilience internal (receiver resuming from offset).
                         ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
-                        tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
+                        // Open with write mode (not append) so we can seek to any
+                        // position for multi-stream out-of-order writes.
+                        tokio::fs::OpenOptions::new().write(true).open(&part_path).await?
                     } else {
                         PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)?;
                         tokio::fs::File::create(&part_path).await?
                     };
                     let bar = ui::Progress::new(&name, size);
+                    let file = Arc::new(file.into_std().await);
+                    let received = Arc::new(AtomicU64::new(offset));
+                    let ranges = Arc::new(std::sync::Mutex::new(
+                        if offset > 0 { vec![(0, offset)] } else { vec![] }
+                    ));
                     by_sid.insert((pid.clone(), sid), IncomingFile {
                         id: id.clone(),
                         name,
                         size,
-                        received: offset,
-                        file: tokio::io::BufWriter::with_capacity(1 << 20, file),
+                        received,
+                        ranges,
+                        file,
                         part_path,
                         full: effective_full,
+                        inflight: Arc::new(AtomicI64::new(0)),
+                        end_seen: Arc::new(AtomicBool::new(false)),
+                        ack_sid: 0,
+                        last_tick: 0,
                         bar,
                     });
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
@@ -9540,129 +9892,190 @@ async fn recv_cmd(
                     // Test hook (gate 18 standalone repro): drop the file-end
                     // control frame so a fully-received stream is stranded in
                     // by_sid, mirrors a sender whose PC tears down before the
-                    // best-effort file-end is delivered. The G-k completion
-                    // sweep must then finalize it on size and quiet-exit.
+                    // best-effort file-end is delivered.
                     if test_hooks::drop_file_end() {
                         continue;
                     }
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    if let Some(mut inc) = by_sid.remove(&(pid.clone(), sid)) {
-                        inc.file.flush().await?;
-                        if to_stdout {
-                            completed += 1;
-                            continue;
+                    // If background writes are still in-flight, defer to
+                    // Ev::MaybeComplete from the last finishing writer.
+                    let process_now = {
+                        match by_sid.get_mut(&(pid.clone(), sid)) {
+                            None => false, // unknown stream
+                            Some(inc) => {
+                                inc.ack_sid = sid;
+                                if inc.inflight.load(Ordering::Relaxed) > 0 {
+                                    inc.end_seen.store(true, Ordering::Relaxed);
+                                    false // deferred to MaybeComplete
+                                } else {
+                                    true // inflight == 0, process now
+                                }
+                            }
                         }
-                        // P4 (GAP-5): WHOLE-FILE INTEGRITY. The sender offered the
-                        // file's full sha256 (`inc.full`). Before declaring "done",
-                        // recompute it over the received `.part` and COMPARE. A
-                        // truncated or corrupt receive (the 7 KB stub class) must
-                        // NOT be accepted, instead keep the partial and re-request
-                        // until the bytes are whole and the hash matches, or fail
-                        // CLEARLY after a bound. Only on a MATCH do we finalize +
-                        // send the delivery-ack. An old peer that offered no digest
-                        // (`inc.full == None`) degrades to the legacy size check,
-                        // no verify, no ack (the sender's bounded fallback covers
-                        // it), so this never hangs against an ack-less peer.
-                        let id = inc.id.clone();
-                        if inc.full.is_some() {
-                            let verdict = verify_incoming(&mut inc).await;
-                            match verdict {
-                                protocol::VerifyResult::Match => {
-                                    // INTACT, finalize, then tell the sender it
-                                    // landed whole (the deterministic delivery-ack).
+                    };
+                    if !process_now { continue; }
+                    // No inflight writes — process inline (fast path).
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    let mut inc = match by_sid.remove(&(pid.clone(), sid)) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let f = inc.file.clone();
+                    let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
+                    if to_stdout {
+                        completed += 1;
+                        continue;
+                    }
+                    let id = inc.id.clone();
+                    if inc.full.is_some() {
+                        let verdict = verify_incoming(&inc).await;
+                        match verdict {
+                            protocol::VerifyResult::Match => {
+                                verify_fails.remove(&id);
+                                let rename_to = if completed == 0 { output.clone() } else { None };
+                                let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                                let nm = inc.name.clone();
+                                if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                                    completed += 1;
+                                    if test_hooks::suppress_delivery_ack() {
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
+                                    } else if let Some(t) = conn.transport_of(&pid) {
+                                        let _ = t.send_control(&protocol::delivery_ack_msg(&id, sid)).await;
+                                        let _ = t.flush().await;
+                                        ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched), acked")));
+                                    }
+                                }
+                            }
+                            protocol::VerifyResult::Mismatch { restart_from_zero } => {
+                                let fails = verify_fails.entry(id.clone()).or_insert(0);
+                                *fails += 1;
+                                if *fails > MAX_VERIFY_FAILS {
+                                    ui::critical(&ui::paint(ui::Tone::Err, &format!(
+                                        "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
+                                        inc.name
+                                    )));
                                     verify_fails.remove(&id);
-                                    let rename_to = if completed == 0 { output.clone() } else { None };
-                                    let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                                    let nm = inc.name.clone();
-                                    if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
-                                        completed += 1;
-                                        // P4 silent-data-loss gate: optionally WITHHOLD the
-                                        // ack (file is intact on disk) to simulate an ack
-                                        // lost on a healthy link, the sender must then end
-                                        // UNCONFIRMED, never a false success. No-op on
-                                        // default/release builds (hook compiled out).
-                                        if test_hooks::suppress_delivery_ack() {
-                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
-                                        } else if let Some(t) = conn.transport_of(&pid) {
-                                            let _ = t.send_control(&protocol::delivery_ack_msg(&id, sid)).await;
-                                            ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched), acked", )));
-                                        }
+                                    continue;
+                                }
+                                let mut req_offset = inc.received.load(Ordering::Relaxed);
+                                if restart_from_zero {
+                                    let _ = tokio::fs::File::create(&inc.part_path).await;
+                                    inc.received.store(0, Ordering::Relaxed);
+                                    inc.ranges.lock().unwrap().clear();
+                                    req_offset = 0;
+                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!(
+                                        "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
+                                        inc.name, *fails
+                                    )));
+                                } else {
+                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!(
+                                        "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
+                                        inc.name, human(req_offset), human(inc.size), *fails
+                                    )));
+                                }
+                                let f = inc.file.clone();
+                                let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
+                                if req_offset == 0 {
+                                    if let Ok(f) = tokio::fs::OpenOptions::new().write(true).open(&inc.part_path).await {
+                                        inc.file = Arc::new(f.into_std().await);
                                     }
                                 }
-                                protocol::VerifyResult::Mismatch { restart_from_zero } => {
-                                    // TRUNCATED or CORRUPT, do NOT accept. Bound the
-                                    // re-request so a genuinely-unrecoverable payload
-                                    // fails clearly instead of looping forever.
-                                    let fails = verify_fails.entry(id.clone()).or_insert(0);
-                                    *fails += 1;
-                                    if *fails > MAX_VERIFY_FAILS {
-                                        // Give up CLEANLY: keep the partial, surface
-                                        // the cause, do not finalize, do not ack. No
-                                        // silent bad file; re-running can still retry.
-                                        // CRITICAL, a clean terminal refusal (corrupt file
-                                        // rejected); the user must see it even under -q.
-                                        ui::critical(&ui::paint(ui::Tone::Err, &format!(
-                                            "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
-                                            inc.name
-                                        )));
-                                        verify_fails.remove(&id);
-                                        // Leave the .part on disk; the stream is dropped
-                                        // (by_sid already removed). The sender's transfer
-                                        // stays un-acked; its bounded ack-wait then reports
-                                        // honestly rather than declaring success.
-                                        continue;
-                                    }
-                                    // Re-request: a truncated tail resumes from the
-                                    // current `.part` offset; a corrupt body (full
-                                    // size, wrong hash) restarts from 0 (the .part is
-                                    // poisoned, truncate it and re-fetch whole).
-                                    let mut req_offset = inc.received;
-                                    if restart_from_zero {
-                                        let _ = tokio::fs::File::create(&inc.part_path).await; // truncate to 0
-                                        inc.received = 0;
-                                        req_offset = 0;
-                                        // DEBUG, resilience internal (P4 whole-file re-fetch).
-                                        ui::debug(&ui::paint(ui::Tone::Warn, &format!(
-                                            "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
-                                            inc.name, *fails
-                                        )));
-                                    } else {
-                                        // DEBUG, resilience internal (P4 truncation re-request).
-                                        ui::debug(&ui::paint(ui::Tone::Warn, &format!(
-                                            "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
-                                            inc.name, human(inc.received), human(inc.size), *fails
-                                        )));
-                                    }
-                                    // Park the stream back in by_sid so resumed chunks
-                                    // land in the same writer, and ask the sender to
-                                    // (re)stream from req_offset.
-                                    let _ = inc.file.flush().await;
-                                    if req_offset == 0 {
-                                        // Reopen the freshly-truncated file for append.
-                                        if let Ok(f) = tokio::fs::OpenOptions::new().append(true).open(&inc.part_path).await {
-                                            inc.file = tokio::io::BufWriter::with_capacity(1 << 20, f);
-                                        }
-                                    }
-                                    by_sid.insert((pid.clone(), sid), inc);
-                                    if let Some(t) = conn.transport_of(&pid) {
-                                        let _ = t.send_control(&protocol::accept_msg(&id, req_offset)).await;
-                                    }
+                                inc.end_seen.store(false, Ordering::Relaxed);
+                                by_sid.insert((pid.clone(), sid), inc);
+                                if let Some(t) = conn.transport_of(&pid) {
+                                    let _ = t.send_control(&protocol::accept_msg(&id, req_offset)).await;
                                 }
                             }
-                        } else {
-                            // No digest offered (old peer / pipe source): legacy
-                            // size-only acceptance, no ack.
-                            let rename_to = if completed == 0 { output.clone() } else { None };
-                            let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                            if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
-                                completed += 1;
-                            }
+                        }
+                    } else {
+                        let rename_to = if completed == 0 { output.clone() } else { None };
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                            completed += 1;
                         }
                     }
                 }
                 _ => {}
             },
-            Ev::Chunk(pid, sid, data) => {
+            Ev::MaybeComplete(pid, sid) => {
+                // A background writer task finished and was the last inflight,
+                // and end_seen was already set. Finalize (verify + delv ack).
+                let ack_sid = {
+                    by_sid.get(&(pid.clone(), sid)).map(|inc| inc.ack_sid).unwrap_or(0)
+                };
+                if let Some(mut inc) = by_sid.remove(&(pid.clone(), sid)) {
+                    if to_stdout {
+                        completed += 1;
+                        continue;
+                    }
+                    let id = inc.id.clone();
+                    if inc.full.is_some() {
+                        let verdict = verify_incoming(&inc).await;
+                        match verdict {
+                            protocol::VerifyResult::Match => {
+                                verify_fails.remove(&id);
+                                let rename_to = if completed == 0 { output.clone() } else { None };
+                                let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                                let nm = inc.name.clone();
+                                if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                                    completed += 1;
+                                    if test_hooks::suppress_delivery_ack() {
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!("    [test] {nm} verified but SUPPRESSING delivery-ack")));
+                                    } else if let Some(t) = conn.transport_of(&pid) {
+                                        let _ = t.send_control(&protocol::delivery_ack_msg(&id, ack_sid)).await;
+                                        ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched), acked")));
+                                    }
+                                }
+                            }
+                            protocol::VerifyResult::Mismatch { restart_from_zero } => {
+                                let fails = verify_fails.entry(id.clone()).or_insert(0);
+                                *fails += 1;
+                                if *fails > MAX_VERIFY_FAILS {
+                                    ui::critical(&ui::paint(ui::Tone::Err, &format!(
+                                        "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
+                                        inc.name
+                                    )));
+                                    verify_fails.remove(&id);
+                                    continue;
+                                }
+                                let mut req_offset = inc.received.load(Ordering::Relaxed);
+                                if restart_from_zero {
+                                    let _ = tokio::fs::File::create(&inc.part_path).await;
+                                    if let Ok(f) = tokio::fs::OpenOptions::new().write(true).open(&inc.part_path).await {
+                                        inc.file = Arc::new(f.into_std().await);
+                                    }
+                                    inc.received.store(0, Ordering::Relaxed);
+                                    inc.ranges.lock().unwrap().clear();
+                                    req_offset = 0;
+                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!(
+                                        "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
+                                        inc.name, *fails
+                                    )));
+                                } else {
+                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!(
+                                        "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
+                                        inc.name, human(req_offset), human(inc.size), *fails
+                                    )));
+                                }
+                                let f = inc.file.clone();
+                                let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
+                                inc.end_seen.store(false, Ordering::Relaxed);
+                                by_sid.insert((pid.clone(), sid), inc);
+                                if let Some(t) = conn.transport_of(&pid) {
+                                    let _ = t.send_control(&protocol::accept_msg(&id, req_offset)).await;
+                                }
+                            }
+                        }
+                    } else {
+                        let rename_to = if completed == 0 { output.clone() } else { None };
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                            completed += 1;
+                        }
+                    }
+                }
+            }
+            Ev::Chunk(pid, sid, offset, data) => {
                 // L2 streams live in the HIGH half of the sid space, route them
                 // to the tunnel mux, never the file-transfer table (the pure
                 // high-bit prefix check keeps file send/recv byte-identical).
@@ -9671,9 +10084,39 @@ async fn recv_cmd(
                         mux.on_frame(sid, data).await;
                     }
                 } else if let Some(inc) = by_sid.get_mut(&(pid.clone(), sid)) {
-                    inc.file.write_all(&data).await?;
-                    inc.received += data.len() as u64;
-                    inc.bar.tick(inc.received);
+                    // Determine the write position: absolute offset from
+                    // the sender (QUIC multi-stream) or current file end
+                    // (DataChannel, via the received counter).
+                    let pos = offset.unwrap_or_else(|| inc.received.load(Ordering::Relaxed));
+                    inc.inflight.fetch_add(1, Ordering::Relaxed);
+                    let file = Arc::clone(&inc.file);
+                    let ranges = offset.map(|_| Arc::clone(&inc.ranges));
+                    let received = Arc::clone(&inc.received);
+                    let inflight = Arc::clone(&inc.inflight);
+                    let end_seen = Arc::clone(&inc.end_seen);
+                    let tx = tx.clone();
+                    let pid = pid.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = file.write_at(&data, pos);
+                        if let Some(ranges) = ranges {
+                            let total = {
+                                let mut r = ranges.lock().unwrap();
+                                record_range(&mut *r, pos, data.len())
+                            };
+                            received.store(total, Ordering::Relaxed);
+                        } else {
+                            received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
+                        let prev = inflight.fetch_sub(1, Ordering::Relaxed);
+                        if prev == 1 && end_seen.load(Ordering::Relaxed) {
+                            let _ = tx.send(Ev::MaybeComplete(pid, sid));
+                        }
+                    });
+                    let r = inc.received.load(Ordering::Relaxed);
+                    if r != inc.last_tick {
+                        inc.bar.tick(r);
+                        inc.last_tick = r;
+                    }
                 } else {
                     // Chunk arrived for unknown (pid, sid) - log instead of silently dropping.
                     // This happens during transport supersede or stall repair when old chunks
@@ -9793,9 +10236,10 @@ async fn recv_cmd(
                 let stale: Vec<(String, u32)> =
                     by_sid.keys().filter(|(p, _)| *p == pid).cloned().collect();
                 for key in stale {
-                    if let Some(mut inc) = by_sid.remove(&key) {
-                        let _ = inc.file.flush().await;
-                        ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received)));
+                    if let Some(inc) = by_sid.remove(&key) {
+                        let f = inc.file.clone();
+                        let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
+                        ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received.load(Ordering::Relaxed))));
                     }
                 }
                 match conn.correct_stall(&pid).await {
@@ -9923,23 +10367,28 @@ async fn recv_cmd(
 /// hash is computed, deterministically inducing the corrupt-receive case so the
 /// gate can prove reject + recover. `FILAMENT_TEST_CORRUPT_ONCE=1` makes it fire
 /// exactly once (the re-fetch then succeeds), proving auto-recovery.
-async fn verify_incoming(inc: &mut IncomingFile) -> protocol::VerifyResult {
+/// Recompute the whole-file sha256 and compare against the sender's offered
+/// digest. Flushes (syncs) first. This is the receiver-side core of P4 integrity.
+async fn verify_incoming(inc: &IncomingFile) -> protocol::VerifyResult {
     let want = match &inc.full { Some(w) => w.clone(), None => return protocol::VerifyResult::Match };
-    let _ = inc.file.flush().await;
+    // Sync file to disk before hashing.
+    let f = inc.file.clone();
+    let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
+
+    let recvd = inc.received.load(Ordering::Relaxed);
 
     // Test-only corruption injection (deterministic; gate proof). Compiled out
     // entirely on default/release builds, the `corrupt_recv_target` twin returns
-    // None there, so this whole block strips to nothing. The "fired once" latch is
-    // an AtomicBool inside test_hooks (no unsafe env mutation).
+    // None there, so this whole block strips to nothing.
     if let Some(target) = test_hooks::corrupt_recv_target() {
         #[cfg(feature = "test-hooks")]
         {
             let once = test_hooks::corrupt_recv_once();
             let already = test_hooks::corrupt_already_fired();
-            if target == inc.id && inc.received == inc.size && !(once && already) {
+            if target == inc.id && recvd == inc.size && !(once && already) {
                 if let Ok(mut bytes) = std::fs::read(&inc.part_path) {
                     if let Some(b) = bytes.last_mut() {
-                        *b ^= 0xFF; // flip the final byte, same size, wrong hash
+                        *b ^= 0xFF;
                         let _ = std::fs::write(&inc.part_path, &bytes);
                         eprintln!("[test] CORRUPT-RECV: flipped the last byte of {} (id {})", inc.name, inc.id);
                         if once { test_hooks::corrupt_mark_fired(); }
@@ -9947,44 +10396,40 @@ async fn verify_incoming(inc: &mut IncomingFile) -> protocol::VerifyResult {
                 }
             }
         }
-        // Silence the unused binding on default builds (this arm never runs there).
         let _ = &target;
     }
 
-    // A short file can't possibly match, it's truncated; classify without hashing.
-    if inc.received < inc.size {
-        return protocol::decide_verify(inc.received, inc.size, None);
+    if recvd < inc.size {
+        return protocol::decide_verify(recvd, inc.size, None);
     }
     let path = inc.part_path.clone();
     let got = tokio::task::spawn_blocking(move || full_hash(&path)).await.ok().flatten();
-    // The decision (match / truncated / corrupt-restart) is pure (protocol.rs).
-    protocol::decide_verify(inc.received, inc.size, Some(got.as_deref() == Some(want.as_str())))
+    protocol::decide_verify(recvd, inc.size, Some(got.as_deref() == Some(want.as_str())))
 }
 
-/// Finalize a fully-received incoming file: flush, rename `.part` → final,
+/// Finalize a fully-received incoming file: sync, rename `.part` → final,
 /// clean up the meta sidecar, and (in daemon mode) append to the upload log.
-/// Returns true if the file was placed (so the caller bumps `completed`).
-/// Shared by the file-end control-frame path and the G-k completion sweep,
-/// the two must not drift. `daemon`/`from_name` drive only the daemon log.
+/// Returns true if the file was placed. Takes `IncomingFile` by value and drops it.
 async fn finalize_incoming(
-    mut inc: IncomingFile,
+    inc: IncomingFile,
     dir: &Path,
     rename_to: Option<&str>,
     daemon: bool,
     from_name: &str,
 ) -> Result<bool> {
-    inc.file.flush().await?;
+    // Sync then drop file handle before rename (file is closed for the rename on Linux).
+    let f = inc.file.clone();
+    let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
     drop(inc.file);
     let final_path = unique_path(dir, rename_to.unwrap_or(&inc.name));
     if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
-        // C23: a duplicate stream's partial may already be finalized, discard
-        // quietly instead of dying.
         ui::say(&ui::paint(ui::Tone::Dim, &format!("  (stream for {} already finalized, duplicate discarded: {e})", inc.name)));
         return Ok(false);
     }
     let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
-    let ok = inc.received == inc.size;
-    inc.bar.done(inc.received);
+    let recvd = inc.received.load(Ordering::Relaxed);
+    let ok = recvd == inc.size;
+    inc.bar.done(recvd);
     let shown = final_path.display().to_string();
     ui::say(&format!(
         "    {} {}{}",
@@ -9992,10 +10437,6 @@ async fn finalize_incoming(
         ui::link(&format!("file://{shown}"), &shown),
         if ok { String::new() } else { ui::paint(ui::Tone::Err, "  SIZE MISMATCH") },
     ));
-    // Opt-in auto-extract (settings `auto-extract`, default off, per-peer aware):
-    // unpack received tar/tar.gz into the drop dir so a directory send lands as a
-    // directory. Only recognized archive extensions trigger it; the unpack is
-    // hardened against traversal/symlink/bomb escapes (see settings::extract_archive).
     if ok {
         let lname = final_path
             .file_name()
@@ -10022,7 +10463,7 @@ async fn finalize_incoming(
     if daemon {
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(up_log()) {
-            let _ = writeln!(f, "{}  {}  {}  from {}", chrono_now(), inc.name, human(inc.received), from_name);
+            let _ = writeln!(f, "{}  {}  {}  from {}", chrono_now(), inc.name, human(recvd), from_name);
         }
     }
     Ok(true)
@@ -10053,15 +10494,14 @@ async fn sweep_completed_streams(
 ) -> Result<()> {
     let done_sids: Vec<(String, u32)> = by_sid
         .iter()
-        .filter(|((pid, _), inc)| inc.received == inc.size && !conn.links.contains_key(pid))
+        .filter(|((pid, _), inc)| inc.received.load(Ordering::Relaxed) == inc.size && !conn.links.contains_key(pid))
         .map(|(k, _)| k.clone())
         .collect();
     for key in done_sids {
         if let Some(mut inc) = by_sid.remove(&key) {
             if to_stdout {
-                // Parity with the file-end handler: flush before counting it,
-                // since dropping a tokio BufWriter does not async-flush.
-                let _ = inc.file.flush().await;
+                let f = inc.file.clone();
+                let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
                 *completed += 1;
                 continue;
             }
@@ -10075,13 +10515,14 @@ async fn sweep_completed_streams(
     Ok(())
 }
 
-/// Park in-flight receives: flush buffers so the .part files are complete up
+/// Park in-flight receives: sync so the .part files are complete up
 /// to the last byte received, then drop the per-link routing. Resume picks
 /// them up from disk.
 async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     for (_sid, mut inc) in by_sid.drain() {
-        let _ = inc.file.flush().await;
-        ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received)));
+        let f = inc.file.clone();
+        let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
+        ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received.load(Ordering::Relaxed))));
     }
 }
 

@@ -33,3 +33,5 @@ jobs:
           python-version: "3.12"
       - name: Model-check establishment protocol (N=2, N=3; GoodNet + Degraded)
         run: python3 proofs/establishment_model.py
+      - name: Model-check transport lifecycle (corpse / ack-loss / role; GoodNet + Degraded)
+        run: python3 proofs/transport_lifecycle_model.py
