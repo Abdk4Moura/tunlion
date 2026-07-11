@@ -92,6 +92,34 @@ pub fn establish_grace_ms() -> u64 {
         .max(stall_ms())
 }
 
+/// Multi-streaming concurrency for the direct-QUIC transport: how many parallel
+/// worker connections to dial (or accept) for a single file transfer.  The
+/// sender stripes each file into K equal-size ranges and fans them out over K
+/// authenticated QUIC connections, each writing to its own file region on disk
+/// at the receiver.  Defaults to `min(max(1, available_parallelism - 1), 4)` —
+/// i.e. one less than the CPU count, at least 1, capped at 4 (diminishing
+/// returns beyond 4 for a single flow over the same bottleneck).  Overridable
+/// via `FILAMENT_DIRECT_STREAMS`; setting it to 1 gives today's single-stream
+/// behaviour.
+pub const DIRECT_STREAMS_DEFAULT: usize = 0; // 0 = auto-calc at runtime
+
+/// Read the configured number of direct-QUIC worker streams
+/// (`FILAMENT_DIRECT_STREAMS`).
+pub fn direct_streams() -> usize {
+    let from_env = std::env::var("FILAMENT_DIRECT_STREAMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1);
+    if let Some(n) = from_env {
+        return n;
+    }
+    // Auto-calc: min(max(1, cpu_count - 1), 4)
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    (cpus.saturating_sub(1)).max(1).min(4)
+}
+
 /// P2 (GAP-2): how long a long-lived acceptor's signaling link may go SILENT
 /// (no inbound socket.io event AND no successful `sync` ack) before the outer
 /// reconnect loop declares it dead and re-dials. The session ticks a `sync`
@@ -261,8 +289,15 @@ pub enum Ev {
     /// data. Distinct event so the normal `adopt_direct` path is never reached for
     /// a probe.
     DirectUpgradeReady(String, Arc<dyn Transport>, &'static str),
+    /// Async completion: K-1 worker transports connected and ready for
+    /// multi-stream striping. Carries (peer sid, workers).
+    DirectWorkersReady(String, Vec<Arc<dyn Transport>>),
     Control(String, Value),
-    Chunk(String, u32, Bytes),
+    /// `Chunk(peer_id, stream_sid, abs_offset, payload)`.
+    /// `abs_offset` is `None` for transports without offset info (DataChannel).
+    /// `Some(pos)` for direct-QUIC which embeds the absolute byte offset in
+    /// every data frame, enabling out-of-order multi-stream writes.
+    Chunk(String, u32, Option<u64>, Bytes),
     PcState(String, String),
     /// A local outgoing stream finished (sent by the streaming task so the
     /// main loop re-evaluates its all-done exit condition).
@@ -271,6 +306,10 @@ pub enum Ev {
     /// A local outgoing stream failed; the transfer stays pending so it can
     /// be re-offered (resume) on the next channel (C10: no process::exit).
     TransferFailed { id: String, err: String },
+    /// The last inflight background writer task for a received stream finished
+    /// (all bytes written to disk) and end_seen was already set. The event
+    /// loop should finalize: verify SHA256, rename .part, send delivery-ack.
+    MaybeComplete(String, u32),
     /// C3: the establishment watchdog fired for (peer sid, attempt generation).
     Stuck(String, u32),
     /// P0 (GAP-1): the bytes-moved watchdog declared an in-flight transfer
@@ -314,8 +353,10 @@ impl std::fmt::Debug for dyn Transport {
 #[async_trait]
 pub trait Transport: Send + Sync {
     async fn send_control(&self, msg: &Value) -> Result<()>;
-    /// Frame and send one chunk: [u32 BE sid][payload]. Applies backpressure.
-    async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()>;
+    /// Frame and send one chunk: [u32 BE sid][u64 BE abs_offset][payload].
+    /// Applies backpressure.  `offset` is the byte position in the file (0 for
+    /// non-file streams such as L2 pty/ssh transport).
+    async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()>;
     /// Resolve once all queued bytes are flushed to the wire.
     async fn flush(&self) -> Result<()>;
     /// FINAL-teardown drain: block until the peer has acknowledged *all* written
@@ -470,7 +511,7 @@ impl Transport for DataChannelTransport {
         Ok(())
     }
 
-    async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+    async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
         framed.extend_from_slice(payload);
@@ -1681,9 +1722,12 @@ async fn wire_channel(
                                     first_data
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                                    // DataChannel frames carry no offset; receiver
+                                    // appends sequentially (abs_offset = None).
                                     let _ = tx.send(Ev::Chunk(
                                         peer_id.clone(),
                                         sid,
+                                        None,
                                         Bytes::copy_from_slice(&buf[4..n]),
                                     ));
                                 }

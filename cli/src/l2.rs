@@ -288,10 +288,10 @@ async fn socket_to_dc<R: AsyncRead + Unpin>(
     loop {
         let n = rd.read(&mut buf).await?;
         if n == 0 {
-            transport.send_frame(sid, &[]).await?; // local FIN -> empty frame
+            transport.send_frame(sid, 0, &[]).await?; // local FIN -> empty frame
             return Ok(());
         }
-        transport.send_frame(sid, &buf[..n]).await?;
+        transport.send_frame(sid, 0, &buf[..n]).await?;
     }
 }
 
@@ -647,7 +647,7 @@ pub async fn spawn_pty_session(
                         push_ring(&mut ring, &bytes, SESSION_BUFFER_CAP);
                         if let Some(b) = &bind {
                             for chunk in bytes.chunks(b.transport.max_payload().max(1)) {
-                                if b.transport.send_frame(b.sid, chunk).await.is_err() {
+                                if b.transport.send_frame(b.sid, 0, chunk).await.is_err() {
                                     // The link died under us; treat as a detach so
                                     // output keeps buffering for a reattach.
                                     detached_since = Some(Instant::now());
@@ -667,7 +667,7 @@ pub async fn spawn_pty_session(
                         let mp = transport.max_payload().max(1);
                         let mut ok = true;
                         for chunk in snapshot.chunks(mp) {
-                            if transport.send_frame(sid, chunk).await.is_err() {
+                            if transport.send_frame(sid, 0, chunk).await.is_err() {
                                 ok = false;
                                 break;
                             }
@@ -675,7 +675,7 @@ pub async fn spawn_pty_session(
                         // Heal a mouse-reporting mode a cut-off TUI left stuck on
                         // the client (see PTY_REATTACH_RESET): sent after the
                         // replay so it is the last word on terminal state.
-                        if ok && transport.send_frame(sid, PTY_REATTACH_RESET).await.is_err() {
+                        if ok && transport.send_frame(sid, 0, PTY_REATTACH_RESET).await.is_err() {
                             ok = false;
                         }
                         if ok {
@@ -1497,7 +1497,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                 }
                 _ => {}
             },
-            Ev::Chunk(_pid, sid, data) if is_l2_sid(sid) => {
+            Ev::Chunk(_pid, sid, _offset, data) if is_l2_sid(sid) => {
                 mux.on_frame(sid, data).await;
             }
             Ev::PcState(_, s) if s == "failed" || s == "closed" || s == "disconnected" => {
@@ -1780,11 +1780,11 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
         loop {
             match stdin.read(&mut buf).await {
                 Ok(0) | Err(_) => {
-                    let _ = t_in.send_frame(sid, &[]).await; // local EOF -> FIN
+                    let _ = t_in.send_frame(sid, 0, &[]).await; // local EOF -> FIN
                     break;
                 }
                 Ok(n) => {
-                    if t_in.send_frame(sid, &buf[..n]).await.is_err() {
+                    if t_in.send_frame(sid, 0, &buf[..n]).await.is_err() {
                         break;
                     }
                 }
@@ -1884,7 +1884,7 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
 async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> std::result::Result<(), ()> {
     let cap = t.max_payload().max(1);
     for chunk in data.chunks(cap) {
-        if t.send_frame(sid, chunk).await.is_err() {
+        if t.send_frame(sid, 0, chunk).await.is_err() {
             return Err(());
         }
     }
@@ -2013,7 +2013,7 @@ async fn pty_attach_once(
             chunk = stdin_rx.recv(), if !stdin_done => match chunk {
                 // Empty Vec = fd0 EOF: send the FIN once, then stop reading stdin but
                 // keep draining remote output until the shell actually closes.
-                Some(c) if c.is_empty() => { let _ = t_in.send_frame(sid, &[]).await; stdin_done = true; }
+                Some(c) if c.is_empty() => { let _ = t_in.send_frame(sid, 0, &[]).await; stdin_done = true; }
                 Some(c) => {
                     if send_frames_chunked(&t_in, sid, &c).await.is_err() {
                         // Link died mid-send: stash the input for the next attach and
@@ -3340,7 +3340,7 @@ mod h1_tests {
             self.controls.lock().unwrap().push(msg.clone());
             Ok(())
         }
-        async fn send_frame(&self, _sid: u32, _payload: &[u8]) -> Result<()> {
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
             Ok(())
         }
         async fn flush(&self) -> Result<()> {
@@ -3488,7 +3488,7 @@ mod h1_tests {
             self.controls.lock().unwrap().push(msg.clone());
             Ok(())
         }
-        async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+        async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
             self.frames.lock().unwrap().push((sid, payload.to_vec()));
             Ok(())
         }
@@ -3518,7 +3518,7 @@ mod h1_tests {
         async fn send_control(&self, _msg: &Value) -> Result<()> {
             Ok(())
         }
-        async fn send_frame(&self, _sid: u32, _payload: &[u8]) -> Result<()> {
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
             Ok(())
         }
         async fn flush(&self) -> Result<()> {

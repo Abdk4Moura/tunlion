@@ -65,7 +65,7 @@ impl Transport for LocalTransport {
         Ok(())
     }
 
-    async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+    async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
         if self.dead.load(Ordering::Relaxed) {
             bail!("transport is dead");
         }
