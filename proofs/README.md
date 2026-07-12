@@ -30,6 +30,33 @@ Degraded N=2  -> PROVEN (K=1,2,3)         Degraded N=3  -> PROVEN (K=1: 4544, K=
 0 invariant violations, 0 deadlocks, 0 unreachable-terminal states, 0 post-fault
 states that can't self-heal — in all runs.
 
+## Companion: the transport-lifecycle proof
+
+`establishment_model.py` proves the **signaling** protocol (offer → answer → ICE
+→ CONNECTED). Its sibling, `transport_lifecycle_model.py`, proves the **data
+plane** that begins once a pair is CONNECTED: carrying a file over a transport,
+confirming whole-file delivery, tearing the transport down, and reusing it for a
+second transfer. Run it:
+
+```
+python3 transport_lifecycle_model.py
+```
+
+Every bug in the multi-stream throughput push (a dead-link **corpse** that blocks
+its own re-dial; a **lost delivery-ack** from a premature QUIC close; a
+**both-answerer role** that dials nothing) lived in the gap *between* the
+establishment model and the liveness classifier — each assumed the other owned a
+transport-less-but-established link. This model closes that gap. It encodes the
+three fixes as independent booleans and checks all 2³ combinations, proving:
+
+- **GoodNet** (perfect DO↔DO link): correct **⟺ `role ∧ (teardown ∨ guard)`** —
+  verified on all 8 combos. Each conjunct is necessary; together sufficient.
+- **Degraded** (real mid-transfer drops): the liveness-aware re-dial (`guard`)
+  becomes *independently* necessary; all fixes on → self-heals in bounded steps.
+
+The design write-up is [`docs/transport-lifecycle-state-machine.md`](../docs/transport-lifecycle-state-machine.md).
+Both proofs are required CI gates (`.github/workflows/proof.yml`).
+
 ## The properties
 
 - **I1 glare-freedom** (safety, structural): of any pair the lexically-lesser

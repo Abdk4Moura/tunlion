@@ -676,8 +676,11 @@ pub async fn serve_tun_connect(peer: SocketAddr, secret: &[u8; 32]) -> Result<qu
 /// THIS connection closes (a detached waiter), then let it drop.
 fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     let c = conn.clone();
+    let ep_addr = ep.local_addr().ok();
+    let conn_id = conn.stable_id();
     tokio::spawn(async move {
         c.closed().await;
+        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
         drop(ep);
     });
 }
@@ -1388,6 +1391,8 @@ pub async fn race_connect_labeled(
             drop(endpoint);
         });
     }
+    let conn_id = conn.stable_id();
+    eprintln!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}");
     Some(make_transport(peer_id, conn, send, recv, tx, answerer, Some(ep_for_transport)))
 }
 
