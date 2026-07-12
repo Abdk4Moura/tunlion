@@ -728,7 +728,8 @@ pub struct DirectTransport {
 
 impl Drop for DirectTransport {
     fn drop(&mut self) {
-        eprintln!("[DROP] DirectTransport stable_id={} answerer={} close_reason={:?}",
+        let ep_info = self.ep.as_ref().map(|e| format!("ep={:?}", e.local_addr())).unwrap_or_else(|| "ep=None".to_string());
+        eprintln!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} close_reason={:?}",
             self.conn.stable_id(), self.answerer, self.conn.close_reason());
     }
 }
@@ -1381,8 +1382,9 @@ pub async fn race_connect_labeled(
     {
         let conn2 = conn.clone();
         tokio::spawn(async move {
-            // Hold the endpoint until the connection ends.
             conn2.closed().await;
+            eprintln!("[KEEP-EP-DROP] endpoint for primary conn_stable={} ep={:?}",
+                conn2.stable_id(), endpoint.local_addr());
             drop(endpoint);
         });
     }
