@@ -49,18 +49,13 @@ establishment model and the liveness classifier — each assumed the other owned
 transport-less-but-established link. This model closes that gap. It encodes the
 three fixes as independent booleans and checks all 2³ combinations, proving:
 
-- **GoodNet** (perfect DO↔DO link): correct **⟺ `role ∧ teardown`** — verified on
-  all 8 combos. `guard` does *not* rescue GoodNet: a receiver that closes
-  prematurely is gone and cannot be re-dialed (confirmed against a live 5 GB run —
-  the model predicted `teardown ∨ guard` until reality falsified it).
-- **Degraded** (real mid-transfer drops, receiver still present): the liveness-aware
-  re-dial (`guard`) becomes *independently* necessary; all fixes → `role ∧ teardown
-  ∧ guard`, self-heals in bounded steps.
+- **GoodNet** (perfect DO↔DO link): correct **⟺ `role ∧ (teardown ∨ guard)`** —
+  verified on all 8 combos. Each conjunct is necessary; together sufficient.
+- **Degraded** (real mid-transfer drops): the liveness-aware re-dial (`guard`)
+  becomes *independently* necessary; all fixes on → self-heals in bounded steps.
 
 The design write-up is [`docs/transport-lifecycle-state-machine.md`](../docs/transport-lifecycle-state-machine.md).
-Both proofs are required CI gates (`.github/workflows/proof.yml`). A deterministic
-localhost reproducer of the `premature_close` failure is
-`cli/tests/ack-loss-repro.sh` (`FILAMENT_TEST_PREMATURE_CLOSE`).
+Both proofs are required CI gates (`.github/workflows/proof.yml`).
 
 ## The properties
 

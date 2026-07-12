@@ -751,7 +751,7 @@ mod tests {
         async fn send_control(&self, _m: &serde_json::Value) -> super::Result<()> {
             Ok(())
         }
-        async fn send_frame(&self, _sid: u32, _p: &[u8]) -> super::Result<()> {
+        async fn send_frame(&self, _sid: u32, _offset: u64, _p: &[u8]) -> super::Result<()> {
             Ok(())
         }
         async fn flush(&self) -> super::Result<()> {
