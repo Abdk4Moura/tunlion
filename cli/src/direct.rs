@@ -26,7 +26,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use quinn::{Endpoint, RecvStream, SendStream};
+use quinn::{Endpoint, ReadError, RecvStream, SendStream};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::SignatureScheme;
@@ -34,6 +34,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::net::Transport;
@@ -141,10 +142,12 @@ pub const DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5)
 /// ALPN, distinguishes our QUIC app; both ends must agree.
 const ALPN: &[u8] = b"filament-direct/1";
 
-/// Max app payload per send_frame. QUIC streams are byte-streams with no
-/// datagram cap, but we keep a chunk size comparable to the DataChannel so the
-/// transfer pacing/backpressure logic behaves the same.
-pub const MAX_DIRECT_PAYLOAD: usize = 256 * 1024;
+/// Max app payload per send_frame on the direct-QUIC path. QUIC streams are
+/// byte-streams with no datagram cap, so larger frames just mean fewer
+/// send_frame calls and, more importantly, far fewer chunks through the
+/// receiver's single event-loop consumer (record_range + seek + write) per
+/// byte. 1 MiB keeps that per-chunk overhead ~17x lower than the old 60 KiB.
+pub const MAX_DIRECT_PAYLOAD: usize = 1024 * 1024;
 
 // =========================================================== crypto helpers ==
 
@@ -456,6 +459,12 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(21)) {
         tc.max_idle_timeout(Some(idle));
     }
+    // 2 Gbps × 1 ms RTT = ~250 KB BDP. Raise all windows well above that so
+    // the pipe stays full and the congestion controller can probe beyond the
+    // initial slow-start cwnd. 16 MB each is generous both ways.
+    tc.stream_receive_window(quinn::VarInt::from_u32(16_777_216));
+    tc.receive_window(quinn::VarInt::from_u32(33_554_432));
+    tc.send_window(16_777_216_u64);
     // L3 data plane: enable QUIC unreliable DATAGRAMs (the serve_tun path rides
     // these, not the reliable streams L2 uses, to avoid TCP-over-TCP meltdown).
     // A 1 MiB receive ring absorbs bursts; advertising it lets the peer send to us.
@@ -503,11 +512,35 @@ pub(crate) fn client_config() -> Result<quinn::ClientConfig> {
 
 /// Bind a quinn endpoint on an EPHEMERAL UDP port that BOTH accepts and dials
 /// (simultaneous-open over one socket). Returns the endpoint and its port.
+/// Uses socket2 for large SO_RCVBUF/SO_SNDBUF to reduce UDP packet loss at
+/// high throughput (the default ~208KB kernel buffer overflows at ~1.2 Gbps).
 pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
-    let mut ep = Endpoint::server(server_config()?, "0.0.0.0:0".parse().unwrap())
-        .context("bind quinn endpoint")?;
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+        .context("socket2 UDP socket")?;
+    let buf_size: usize = 8 * 1024 * 1024; // 8 MiB
+    sock.set_recv_buffer_size(buf_size)
+        .or_else(|_| sock.set_recv_buffer_size(4 * 1024 * 1024))
+        .or_else(|_| sock.set_recv_buffer_size(1024 * 1024))
+        .context("set SO_RCVBUF")?;
+    sock.set_send_buffer_size(buf_size)
+        .or_else(|_| sock.set_send_buffer_size(4 * 1024 * 1024))
+        .or_else(|_| sock.set_send_buffer_size(1024 * 1024))
+        .context("set SO_SNDBUF")?;
+    sock.bind(&"0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap().into())
+        .context("bind socket")?;
+    let port = sock.local_addr().context("sock local addr")?.as_socket().unwrap().port();
+    let socket: std::net::UdpSocket = sock.into();
+    socket.set_nonblocking(true).context("set nonblocking")?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| anyhow::anyhow!("no async runtime found"))?;
+    let mut ep = Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(server_config()?),
+        runtime.wrap_udp_socket(socket)?,
+        runtime,
+    )?;
     ep.set_default_client_config(client_config()?);
-    let port = ep.local_addr().context("endpoint local addr")?.port();
     Ok((ep, port))
 }
 
@@ -666,6 +699,11 @@ pub struct DirectTransport {
     /// The deterministic `polite` role for this link (opposite on the two ends);
     /// selects this end's L2 sid half so the two ends never collide.
     answerer: bool,
+    /// The endpoint that created this transport. WORKER transports own their
+    /// own endpoint (one per worker). The PRIMARY transport does NOT own the
+    /// endpoint (it is shared). When the worker transport is dropped (via
+    /// drop_link), the endpoint drops, closing all its connections.
+    ep: Option<quinn::Endpoint>,
     /// Running count of file-data bytes this transport has written. Only read by
     /// the data-path-freeze PROOF hook (`freeze_after_bytes`); compiled out
     /// entirely unless `--features test-hooks` is set.
@@ -686,6 +724,13 @@ pub struct DirectTransport {
     /// detect->verify->UPGRADE path. Compiled out unless `--features test-hooks`.
     #[cfg(feature = "test-hooks")]
     born_ms: u64,
+}
+
+impl Drop for DirectTransport {
+    fn drop(&mut self) {
+        eprintln!("[DROP] DirectTransport stable_id={} answerer={} close_reason={:?}",
+            self.conn.stable_id(), self.answerer, self.conn.close_reason());
+    }
 }
 
 const KIND_CONTROL: u8 = 0;
@@ -730,7 +775,7 @@ impl Transport for DirectTransport {
         self.write_framed(KIND_CONTROL, text.as_bytes()).await
     }
 
-    async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+    async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
         // P5 (GAP-6): the relay->direct UPGRADE lift. A transport born AFTER the
         // unblock moment is the prober's DIRECT standby, let it carry data so the
         // verify-before-upgrade can confirm + cut over. In FLAKY mode the lift is
@@ -745,8 +790,9 @@ impl Transport for DirectTransport {
         if unblocked && !self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
             // Healthy upgrade standby: stream normally (no freeze ever).
             if !direct_flaky_upgrade() {
-                let mut framed = Vec::with_capacity(4 + payload.len());
+                let mut framed = Vec::with_capacity(4 + 8 + payload.len());
                 framed.extend_from_slice(&sid.to_be_bytes());
+                framed.extend_from_slice(&offset.to_be_bytes());
                 framed.extend_from_slice(payload);
                 self.write_framed(KIND_DATA, &framed).await?;
                 self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -767,8 +813,9 @@ impl Transport for DirectTransport {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
-            let mut framed = Vec::with_capacity(4 + payload.len());
+            let mut framed = Vec::with_capacity(4 + 8 + payload.len());
             framed.extend_from_slice(&sid.to_be_bytes());
+            framed.extend_from_slice(&offset.to_be_bytes());
             framed.extend_from_slice(payload);
             self.write_framed(KIND_DATA, &framed).await?;
             self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -828,8 +875,9 @@ impl Transport for DirectTransport {
                 }
             }
         }
-        let mut framed = Vec::with_capacity(4 + payload.len());
+        let mut framed = Vec::with_capacity(4 + 8 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
+        framed.extend_from_slice(&offset.to_be_bytes());
         framed.extend_from_slice(payload);
         self.write_framed(KIND_DATA, &framed).await?;
         self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -887,6 +935,15 @@ impl Transport for DirectTransport {
     // flow's own congestion control stays in charge.
     fn supports_datagrams(&self) -> bool {
         true
+    }
+    fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn force_close(&self) {
+        self.conn.close(0u32.into(), b"dropped");
     }
 
     fn send_datagram(&self, packet: &[u8]) -> Result<()> {
@@ -966,11 +1023,19 @@ fn spawn_reader(
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
+    answerer: bool,
 ) {
     tokio::spawn(async move {
         loop {
             let mut hdr = [0u8; 5];
-            if recv.read_exact(&mut hdr).await.is_err() {
+            if let Err(e) = recv.read_exact(&mut hdr).await {
+                // FinishedEarly is the peer cleanly ending their send half
+                // (e.g. after the final file chunk). Our WRITE half is still
+                // open for delivery-ack — DO NOT mark the transport as dead.
+                if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
+                    break;
+                }
+                eprintln!("[DEAD] spawn_reader: peer={} answerer={answerer} read hdr error: {e:?}", peer_id);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
@@ -979,11 +1044,18 @@ fn spawn_reader(
             // Guard against an absurd length (a corrupt/hostile peer); cap well
             // above MAX_DIRECT_PAYLOAD + the 4-byte sid.
             if len > MAX_DIRECT_PAYLOAD + 64 {
+                eprintln!("[DEAD] spawn_reader: peer={} absurd len={}", peer_id, len);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
             let mut body = vec![0u8; len];
-            if recv.read_exact(&mut body).await.is_err() {
+            if let Err(e) = recv.read_exact(&mut body).await {
+                // FinishedEarly after a header means clean end-of-stream after
+                // the sender's final frame — not a protocol error.
+                if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
+                    break;
+                }
+                eprintln!("[DEAD] spawn_reader: peer={} read body error kind={} err={e:?}", peer_id, kind);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
@@ -994,15 +1066,21 @@ fn spawn_reader(
                     }
                 }
                 KIND_DATA => {
-                    if body.len() >= 4 {
+                    // Frame: [4B sid][8B abs_offset][payload]
+                    if body.len() >= 12 {
                         last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         let sid = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-                        // Zero-copy: convert Vec directly to Bytes, then split off the 4-byte sid prefix.
+                        let offset = u64::from_be_bytes([
+                            body[4], body[5], body[6], body[7],
+                            body[8], body[9], body[10], body[11],
+                        ]);
+                        // Zero-copy: convert Vec directly to Bytes, then split off the 12-byte prefix.
                         let bytes = bytes::Bytes::from(body);
                         let _ = tx.send(crate::net::Ev::Chunk(
                             peer_id.clone(),
                             sid,
-                            bytes.slice(4..),
+                            Some(offset),
+                            bytes.slice(12..),
                         ));
                     }
                 }
@@ -1021,16 +1099,18 @@ fn make_transport(
     recv: RecvStream,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     answerer: bool,
+    ep: Option<quinn::Endpoint>,
 ) -> Arc<dyn Transport> {
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_reader(peer_id, recv, tx, last_activity.clone(), dead.clone());
+    spawn_reader(peer_id, recv, tx, last_activity.clone(), dead.clone(), answerer);
     Arc::new(DirectTransport {
         conn,
         send: Arc::new(Mutex::new(send)),
         last_activity,
         dead,
         answerer,
+        ep,
         #[cfg(feature = "test-hooks")]
         sent_data: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "test-hooks")]
@@ -1038,6 +1118,132 @@ fn make_transport(
         #[cfg(feature = "test-hooks")]
         born_ms: now_ms(),
     })
+}
+
+// ========================================================== multi-stream workers ==
+
+/// Dial one direct-QUIC worker connection per port in `ports`.  Each connection
+/// gets its OWN endpoint (own UDP socket, own QUIC driver task), letting packet
+/// I/O parallelise across cores.  Returns however many completed within the
+/// 5-second budget (may be fewer; the caller gracefully degrades).
+/// Called by the non-answerer side after receiving the `worker-ports` message.
+pub async fn dial_workers(
+    ports: Vec<u16>,
+    peer_ip: IpAddr,
+    tkey: [u8; 32],
+    peer_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    count: usize,
+) -> Vec<Arc<dyn Transport>> {
+    const WORKER_BUDGET: Duration = Duration::from_secs(5);
+    if count == 0 || ports.is_empty() {
+        return vec![];
+    }
+    let mut workers = Vec::with_capacity(count.min(ports.len()));
+    let deadline = tokio::time::sleep(WORKER_BUDGET);
+    tokio::pin!(deadline);
+
+    use futures_util::stream::StreamExt;
+    let mut futs: futures_util::stream::FuturesUnordered<_> = ports
+        .into_iter()
+        .map(|port| {
+            let tkey = tkey;
+            Box::pin(async move {
+                let (ep, _) = bind_endpoint()?;
+                let peer = SocketAddr::new(peer_ip, port);
+                let connecting =
+                    ep.connect(peer, "filament-direct").context("worker connect")?;
+                let conn = connecting.await.context("worker dial handshake")?;
+                let (s, r) = authenticate(&conn, &tkey, true).await?;
+                // Pass the endpoint to make_transport so its lifetime is
+                // bound to the DirectTransport (no detached keepalive task).
+                Ok::<_, anyhow::Error>((conn, s, r, ep))
+            })
+        })
+        .collect();
+
+    loop {
+        tokio::select! {
+            result = futs.next() => {
+                match result {
+                    Some(Ok((conn, send, recv, ep))) => {
+                        workers.push(make_transport(
+                            peer_id.clone(), conn, send, recv, tx.clone(), false, Some(ep),
+                        ));
+                        if workers.len() >= count { break; }
+                    }
+                    Some(Err(e)) => {
+                        crate::ui::debug(&format!("worker dial: {e}"));
+                    }
+                    None => break,
+                }
+            }
+            _ = &mut deadline => break,
+        }
+    }
+    workers
+}
+
+/// Accept `count` additional direct-QUIC worker connections, one per endpoint,
+/// and authenticate each as an acceptor.  Returns however many arrived within
+/// the 5-second budget.  Each endpoint in `endpoints` has its own UDP socket,
+/// letting the QUIC driver tasks parallelise across cores.
+/// Called by the answerer side after the primary transport wins its race.
+pub async fn accept_workers(
+    endpoints: Vec<Endpoint>,
+    tkey: [u8; 32],
+    peer_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    count: usize,
+) -> Vec<Arc<dyn Transport>> {
+    const WORKER_BUDGET: Duration = Duration::from_secs(5);
+    if count == 0 || endpoints.is_empty() {
+        return vec![];
+    }
+    let mut workers = Vec::with_capacity(count.min(endpoints.len()));
+    let deadline = tokio::time::sleep(WORKER_BUDGET);
+    tokio::pin!(deadline);
+
+    use futures_util::stream::StreamExt;
+    let mut futs: futures_util::stream::FuturesUnordered<_> = endpoints
+        .into_iter()
+        .map(|ep| {
+            let tkey = tkey;
+            Box::pin(async move {
+                match ep.accept().await {
+                    Some(incoming) => {
+                        let conn = incoming.await.context("worker accept handshake")?;
+                        let (s, r) = authenticate(&conn, &tkey, false).await?;
+                        // Pass the endpoint to make_transport so its lifetime
+                        // is bound to the DirectTransport.
+                        Ok::<_, anyhow::Error>((conn, s, r, ep))
+                    }
+                    None => bail!("worker endpoint closed before connection arrived"),
+                }
+            })
+        })
+        .collect();
+
+    loop {
+        tokio::select! {
+            result = futs.next() => {
+                match result {
+                    Some(Ok((conn, send, recv, ep))) => {
+                        workers.push(make_transport(
+                            peer_id.clone(), conn, send, recv, tx.clone(), true, Some(ep),
+                        ));
+                        if workers.len() >= count { break; }
+                    }
+                    Some(Err(e)) => {
+                        crate::ui::debug(&format!("worker accept: {e}"));
+                    }
+                    None => break,
+                }
+            }
+            _ = &mut deadline => break,
+        }
+    }
+    workers
 }
 
 // ============================================================== orchestrator ==
@@ -1169,7 +1375,9 @@ pub async fn race_connect_labeled(
     ));
     // Keep the endpoint alive for the connection's lifetime by leaking it into
     // the transport's closure scope: hold it in a task that lives as long as the
-    // connection. Simplest: stash it in a detached keepalive future.
+    // connection.
+    let ep_for_transport = endpoint.clone(); // clone: one for the keepalive task,
+                                             // one for the DirectTransport
     {
         let conn2 = conn.clone();
         tokio::spawn(async move {
@@ -1178,7 +1386,7 @@ pub async fn race_connect_labeled(
             drop(endpoint);
         });
     }
-    Some(make_transport(peer_id, conn, send, recv, tx, answerer))
+    Some(make_transport(peer_id, conn, send, recv, tx, answerer, Some(ep_for_transport)))
 }
 
 #[cfg(test)]
