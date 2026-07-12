@@ -157,6 +157,34 @@ mod test_hooks {
         std::env::var("FILAMENT_TEST_SUPPRESS_ACK").is_ok()
     }
 
+    /// BUG-ACKLOSS reproducer (test-only): `FILAMENT_TEST_PREMATURE_CLOSE=1` tears
+    /// the link DOWN at the exact moment the delivery-ack is due, so the ack never
+    /// reaches the sender and the sender's transport observes ApplicationClosed(0,"").
+    /// QUIC has no flush-on-close (RFC 9000 s10.2), so this is precisely the
+    /// self-inflicted teardown race the multi-stream push otherwise hit only ~1-in-5
+    /// on 10GB cross-machine transfers -- made DETERMINISTIC on a 1MB localhost
+    /// transfer. The sender then sits in AWAIT_ACK on a dead link (the corpse
+    /// cascade). Models `premature_close` in proofs/transport_lifecycle_model.py.
+    /// No-op on default/release (compiled out). `=1` fires on EVERY completion;
+    /// `=once` fires exactly once then falls through to a normal ack -- so an `up`
+    /// daemon receiver (which stays alive) can be re-dialed and RECOVER (deliver on
+    /// the second attempt) instead of looping drop -> re-dial -> drop. The latch is
+    /// a process-global AtomicBool, mirroring corrupt_once.
+    pub fn premature_close_after_ack() -> bool {
+        matches!(std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").as_deref(), Ok("1") | Ok("once"))
+    }
+    static PREMATURE_FIRED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    pub fn premature_close_once() -> bool {
+        std::env::var("FILAMENT_TEST_PREMATURE_CLOSE").as_deref() == Ok("once")
+    }
+    pub fn premature_already_fired() -> bool {
+        PREMATURE_FIRED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn premature_mark_fired() {
+        PREMATURE_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// truncation/ack gate corruption injector. `FILAMENT_TEST_CORRUPT_RECV=<id>`
     /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
     /// fires exactly once (proving auto-recovery). The "already fired" latch is a
@@ -195,6 +223,10 @@ mod test_hooks {
     #[inline] pub fn drop_file_end() -> bool { false }
     #[inline] pub fn drop_peer_left() -> bool { false }
     #[inline] pub fn suppress_delivery_ack() -> bool { false }
+    #[inline] pub fn premature_close_after_ack() -> bool { false }
+    #[inline] pub fn premature_close_once() -> bool { false }
+    #[inline] pub fn premature_already_fired() -> bool { false }
+    #[inline] pub fn premature_mark_fired() {}
     #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
 }
 

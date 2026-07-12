@@ -24,7 +24,16 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="$CLI_DIR/target/release/filament"
+# Correctness gates build DEBUG by default (~20s incremental) instead of the LTO
+# release build (~4min) -- these gates verify BEHAVIOUR via the FILAMENT_TEST_*
+# hooks, not throughput, so they don't need release codegen. Set
+# FILAMENT_GATE_RELEASE=1 only when a gate is measuring MB/s.
+if [ -n "${FILAMENT_GATE_RELEASE:-}" ]; then
+  GATE_PROFILE_DIR=release; GATE_BUILD_FLAG=--release
+else
+  GATE_PROFILE_DIR=debug; GATE_BUILD_FLAG=
+fi
+BIN="$CLI_DIR/target/$GATE_PROFILE_DIR/filament"
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
@@ -80,7 +89,7 @@ fi
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; exit 2; }
 # These gates drive env-gated test hooks (FILAMENT_TEST_*), which now ship ONLY
 # in a `--features test-hooks` build (stripped from default/release).
-( cd "$CLI_DIR" && cargo build --release --features test-hooks -q ) || { echo "build failed"; exit 2; }
+( cd "$CLI_DIR" && cargo build $GATE_BUILD_FLAG --features test-hooks -q ) || { echo "build failed"; exit 2; }
 
 # The browser gates load frontend/dist via the LOCAL backend, so the bundle
 # must be SAME-ORIGIN. `npm run build` bakes frontend/.env.production
