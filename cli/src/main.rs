@@ -7009,7 +7009,7 @@ async fn send_cmd(
 
 async fn stream_one(
     outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
-    t: Arc<dyn Transport>,
+    transports: Vec<Arc<dyn Transport>>,
     id: String,
     offset: u64,
     chunk: usize,
@@ -7031,33 +7031,73 @@ async fn stream_one(
     // deferred-drop path must keep the link and let the transfer finish on it.
     // Injecting the active sid is critical: a wrong id makes on_peer_left
     // return early (link-not-found) and the test would falsely pass.
-    let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
-    let mut injected = false;
-    let mut f = tokio::fs::File::open(&path).await?;
     use tokio::io::{AsyncSeekExt, AsyncReadExt};
-    f.seek(SeekFrom::Start(offset)).await?;
-    let mut sent = offset;
-    let mut buf = vec![0u8; chunk];
-    let mut bar = ui::Progress::new(&name, size);
-    loop {
-        let n = f.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
+    let num = transports.len().max(1);
+    // Split the remaining bytes [offset, size) into `num` contiguous ranges and
+    // stream each over its OWN transport in a CONCURRENT task. The previous
+    // round-robin ran on one task and awaited each send_frame, so it stalled on
+    // whichever connection's flow-control window filled first and never used the
+    // links in parallel. One task per connection lets every link drain at once,
+    // which is the actual multi-stream win. The receiver reassembles by absolute
+    // offset (positional writes), so range order does not matter.
+    let bar = std::sync::Arc::new(tokio::sync::Mutex::new(ui::Progress::new(&name, size)));
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(offset));
+    let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let remaining = size.saturating_sub(offset);
+    let per = remaining / num as u64;
+    let mut handles = Vec::with_capacity(num);
+    for i in 0..num {
+        let start = offset + i as u64 * per;
+        let end = if i == num - 1 { size } else { start + per };
+        if start >= end {
+            continue;
         }
-        t.send_frame(sid, &buf[..n]).await?;
-        sent += n as u64;
-        bar.tick(sent);
-        if let (false, Some(at), Some(asid)) = (injected, inject_at, active_sid.as_ref()) {
-            if sent >= at {
-                injected = true;
-                eprintln!("[test] injecting synthetic peer-left for active sid at {sent} bytes");
-                let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
+        let t = transports[i].clone();
+        let path = path.clone();
+        let bar = bar.clone();
+        let progress = progress.clone();
+        let injected = injected.clone();
+        let tx = tx.clone();
+        let active_sid = active_sid.clone();
+        handles.push(tokio::spawn(async move {
+            let mut f = tokio::fs::File::open(&path).await?;
+            f.seek(SeekFrom::Start(start)).await?;
+            let mut pos = start;
+            let mut buf = vec![0u8; chunk];
+            while pos < end {
+                let want = std::cmp::min(chunk as u64, end - pos) as usize;
+                let n = f.read(&mut buf[..want]).await?;
+                if n == 0 {
+                    break;
+                }
+                t.send_frame(sid, pos, &buf[..n]).await?;
+                pos += n as u64;
+                let total =
+                    progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed) + n as u64;
+                bar.lock().await.tick(total);
+                if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
+                    if total >= at
+                        && !injected.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        eprintln!("[test] injecting synthetic peer-left for active sid at {total} bytes");
+                        let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
+                    }
+                }
             }
-        }
+            t.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        }));
     }
-    t.send_control(&protocol::end_msg(&id, sid)).await?;
-    t.flush().await?;
-    bar.done(sent - offset);
+    for h in handles {
+        h.await.map_err(|e| anyhow!("stream task join: {e}"))??;
+    }
+    // End frame on primary transport; flush all transports.
+    transports[0].send_control(&protocol::end_msg(&id, sid)).await?;
+    for t in &transports {
+        t.flush().await?;
+    }
+    bar.lock().await.done(size.saturating_sub(offset));
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
         // P4: the bytes + file-end left this side, but the transfer is NOT
@@ -7076,6 +7116,8 @@ async fn stream_one(
     }
     Ok(())
 }
+
+// ------------------------------------------------------------------- recv --
 
 // ------------------------------------------------------------------- recv --
 
@@ -9662,7 +9704,15 @@ async fn recv_cmd(
                 }
                 _ => {}
             },
+<<<<<<< current
+<<<<<<< current
+            Ev::Chunk(pid, sid, _offset, data) => {
+=======
             Ev::Chunk(pid, sid, data) => {
+>>>>>>> base
+=======
+            Ev::Chunk(pid, sid, data) => {
+>>>>>>> base
                 // L2 streams live in the HIGH half of the sid space, route them
                 // to the tunnel mux, never the file-transfer table (the pure
                 // high-bit prefix check keeps file send/recv byte-identical).

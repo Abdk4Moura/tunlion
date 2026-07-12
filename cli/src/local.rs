@@ -65,7 +65,7 @@ impl Transport for LocalTransport {
         Ok(())
     }
 
-    async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+    async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
         if self.dead.load(Ordering::Relaxed) {
             bail!("transport is dead");
         }
@@ -105,6 +105,12 @@ impl Transport for LocalTransport {
 
     fn local_ip(&self) -> Option<std::net::IpAddr> {
         None
+    }
+    fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
