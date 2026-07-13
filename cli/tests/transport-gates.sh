@@ -90,10 +90,10 @@ DG="$WORK/g1drop"; mkdir -p "$DG"
 # -v on both ends: the "DIRECT-CONNECT ok (route: ...)" marker is a DEBUG
 # (direct-connect diagnostic) line; the user-facing route label is "route:" on
 # its own. The transfer itself is verbosity-independent.
-FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 timeout 60 "$BIN" -v up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
+FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" -v up --dir "$DG" --server "$SERVER" >"$WORK/g1-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G1=0
-FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 timeout 60 "$BIN" -v send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
+FILAMENT_CONFIG_DIR="$DA" timeout 60 "$BIN" -v send "$BIG" --to boxB --server "$SERVER" >"$WORK/g1-send.log" 2>&1 || G1=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT="$DG/big.bin"
 if [ $G1 -eq 0 ] \
@@ -135,11 +135,11 @@ print("tampered boxA secret")
 PY
 DG2="$WORK/g2drop"; mkdir -p "$DG2"
 # B (wrong secret) receives; no -y, stdin from /dev/null => untrusted offer declined.
-FILAMENT_CONFIG_DIR="$DBX" FILAMENT_DIRECT=1 FILAMENT_REJOIN_SECS=4 timeout 45 \
+FILAMENT_CONFIG_DIR="$DBX" FILAMENT_REJOIN_SECS=4 timeout 45 \
   "$BIN" up --dir "$DG2" --server "$SERVER" </dev/null >"$WORK/g2-recv.log" 2>&1 &
 RP=$!; pids+=($RP); sleep 3
 # A (correct secret) tries to send.
-FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 timeout 25 \
+FILAMENT_CONFIG_DIR="$DA" timeout 25 \
   "$BIN" send "$SMALL" --to boxB --server "$SERVER" </dev/null >"$WORK/g2-send.log" 2>&1
 sleep 2; kill $RP 2>/dev/null; wait $RP 2>/dev/null
 # zero bytes: no completed file in the drop dir
@@ -162,11 +162,11 @@ fi
 # ===========================================================================
 say "GATE 3: fallback — direct blocked (flag ON) -> WebRTC still transfers"
 DG3="$WORK/g3drop"; mkdir -p "$DG3"
-FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_TEST_BLOCK=1 timeout 90 \
+FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT_TEST_BLOCK=1 timeout 90 \
   "$BIN" up --dir "$DG3" --server "$SERVER" >"$WORK/g3-up.log" 2>&1 &
 UP=$!; pids+=($UP); sleep 3
 G3=0
-FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_TEST_BLOCK=1 timeout 75 \
+FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT_TEST_BLOCK=1 timeout 75 \
   "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g3-send.log" 2>&1 || G3=1
 sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
 GOT3="$DG3/big.bin"

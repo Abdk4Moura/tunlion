@@ -238,7 +238,7 @@ if build_pair port-restricted port-restricted; then
     bad "topology NOT cone (A=$mapA B=$mapB) — cannot honestly assert punch"
   fi
   if pair_devices; then ok "paired (A knows boxB, B knows boxA)"; else bad "pairing failed"; fi
-  res=$(run_known_transfer "FILAMENT_DIRECT=1 FILAMENT_HOLEPUNCH=1" "cone")
+  res=$(run_known_transfer "FILAMENT_HOLEPUNCH=1" "cone")
   IFS='|' read -r route hashok <<<"$res"
   echo "  result: route=$route hashok=$hashok"
   [ -n "$(grep -h "HOLEPUNCH ok" "$WORK"/send-cone.log "$WORK"/recv-cone.log 2>/dev/null)" ] \
@@ -266,7 +266,7 @@ if build_pair symmetric symmetric; then
     bad "topology NOT symmetric (A=$mapA B=$mapB) — cannot honestly assert step-down"
   fi
   if pair_devices; then ok "paired (A knows boxB, B knows boxA)"; else bad "pairing failed"; fi
-  res=$(run_known_transfer "FILAMENT_DIRECT=1 FILAMENT_HOLEPUNCH=1" "sym")
+  res=$(run_known_transfer "FILAMENT_HOLEPUNCH=1" "sym")
   IFS='|' read -r route hashok <<<"$res"
   echo "  result: route=$route hashok=$hashok"
   [ -n "$(grep -h "HOLEPUNCH-FAIL" "$WORK"/send-sym.log "$WORK"/recv-sym.log 2>/dev/null)" ] \
