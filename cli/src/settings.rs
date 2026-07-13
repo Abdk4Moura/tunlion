@@ -970,7 +970,7 @@ fn build_affordance_with_current(s: &Setting, cur_val: &str) -> crate::interact:
         None
     };
 
-    crate::interact::Affordance { command, needs, example, options }
+    crate::interact::Affordance { command, needs, example, options, options_label: "interfaces".into() }
 }
 
 // Remove old functions

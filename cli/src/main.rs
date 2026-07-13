@@ -285,6 +285,23 @@ impl UiCapability {
         };
         UiCapability { interactive, json: cli.json, yes: cli.yes, color }
     }
+
+    pub fn confirm(&self, action: &str) -> Result<()> {
+        if self.yes { return Ok(()); }
+        if self.interactive {
+            use std::io::Write;
+            eprint!("{action} [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok();
+            if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                anyhow::bail!("cancelled");
+            }
+        } else {
+            anyhow::bail!("refusing {action} without --yes (non-interactive)");
+        }
+        Ok(())
+    }
 }
 
 /// THE interactivity GATE, scripts/automation are safe BY DEFAULT. Three layers:
@@ -701,9 +718,13 @@ enum Cmd {
     Completions {
         shell: clap_complete::Shell,
     },
-    /// Print the man page (roff) to stdout
+    /// Print the manual (roff to stdout). `filament man routing` shows the
+    /// connection & interface selection model.
     #[command(hide = true)]
-    Man,
+    Man {
+        /// Manual page: routing, settings, or omit for the full man page
+        page: Option<String>,
+    },
     /// Tunnel: wire stdio to one TCP stream on a known peer's localhost (the
     /// ssh ProxyCommand primitive). Off by default; FILAMENT_L2=1 enables the
     /// acceptor side in `up`/`recv`.
@@ -5871,7 +5892,7 @@ async fn main() -> Result<()> {
             up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_user).await
         }
         Cmd::Status { json } => status_cmd(json),
-        Cmd::Down => down_cmd(),
+        Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, relay).await,
         Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
         Cmd::Devices { action, json } => {
@@ -5948,7 +5969,13 @@ async fn main() -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "filament", &mut std::io::stdout());
             Ok(())
         }
-        Cmd::Man => {
+        Cmd::Man { page } => {
+            if let Some(p) = page {
+                if p == "routing" {
+                    println!("{}", include_str!("../../docs/filament-routing.md"));
+                    return Ok(());
+                }
+            }
             use clap::CommandFactory;
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(())
@@ -5958,7 +5985,7 @@ async fn main() -> Result<()> {
         Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
-        Cmd::Unexpose { port } => expose::unexpose_cmd(port).await,
+        Cmd::Unexpose { port } => { ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await },
         Cmd::Proxy { port, bind } => l2::proxy_cmd(&server, &bind, port, relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
@@ -5978,6 +6005,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Revoke { device, capability } => {
+            ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false)?;
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
@@ -6015,7 +6043,7 @@ async fn main() -> Result<()> {
                 mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground, auto_restore).await
             }
         }
-        Cmd::Unmount { path } => mount::unmount_cmd(&path),
+        Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -6680,10 +6708,23 @@ async fn send_cmd(
                 }
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
-                        if saw_known_peer.contains(n) { continue; }
-                        saw_known_peer.insert(n.clone());
-                        ui::say(&format!("known device '{n}' is online, connecting"));
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        // Liveness-aware: skip only if a healthy link already exists.
+                        // If the link is dead or absent, re-establish (reconnect-after-loss).
+                        let link_alive = conn.link(&pid)
+                            .and_then(|l| l.transport.as_ref())
+                            .map(|t| !t.is_dead())
+                            .unwrap_or(false);
+                        if link_alive {
+                            if !saw_known_peer.contains(n) {
+                                saw_known_peer.insert(n.clone());
+                            }
+                            continue;
+                        }
+                        if !saw_known_peer.contains(n) {
+                            ui::say(&format!("known device '{n}' is online, connecting"));
+                        }
+                        saw_known_peer.insert(n.clone());
                         // rung-1: both ends are CLIs (known device), try direct
                         // QUIC FIRST. start_direct records the pending so the
                         // maybe_adopt->establish below skips the WebRTC offer
@@ -8861,7 +8902,12 @@ async fn recv_cmd(
                     // reconnect removes the link first, so it still announces.
                     let fresh = !conn.links.contains_key(&pid)
                         && !conn.direct_pending.contains_key(&pid);
-                    if fresh {
+                    // Also re-announce if the existing link's transport is dead
+                    let link_dead = conn.links.get(&pid)
+                        .and_then(|l| l.transport.as_ref())
+                        .map(|t| t.is_dead())
+                        .unwrap_or(false);
+                    if fresh || link_dead {
                         ui::say(&format!("known device '{n}' appeared, connecting"));
                         devices_touch(n, None, None);  // track last_seen; addresses filled on ChannelReady
                     } else {
@@ -11183,5 +11229,28 @@ mod tests {
         assert!(!saw.contains("popos"), "different device must not be skipped");
         saw.insert("popos".to_string());
         assert!(saw.contains("popos"));
+    }
+
+    #[test]
+    fn confirm_yes_passes() {
+        let caps = UiCapability { interactive: false, json: false, yes: true, color: false };
+        assert!(caps.confirm("delete it").is_ok());
+    }
+
+    #[test]
+    fn confirm_non_interactive_without_yes_fails() {
+        let caps = UiCapability { interactive: false, json: false, yes: false, color: false };
+        assert!(caps.confirm("delete it").is_err());
+    }
+
+    #[test]
+    fn known_peer_liveness_allows_reconnect() {
+        let mut saw: HashSet<String> = HashSet::new();
+        let n = "peer";
+        assert!(!saw.contains(n));
+        saw.insert(n.to_string());
+        // Link dies: clear to allow reconnect
+        saw.remove(n);
+        assert!(!saw.contains(n), "dead link must be reconnectable");
     }
 }

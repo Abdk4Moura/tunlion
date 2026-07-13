@@ -58,6 +58,7 @@ pub struct Affordance {
     pub needs: String,
     pub example: String,
     pub options: Option<Vec<OptionEntry>>,
+    pub options_label: String, // "interfaces" | "peers"
 }
 
 pub struct OptionEntry {
@@ -74,7 +75,7 @@ pub fn render_steer(aff: &Affordance) -> ! {
     if let Some(ref opts) = aff.options {
         if !opts.is_empty() {
             let names: Vec<&str> = opts.iter().map(|o| o.label.as_str()).collect();
-            eprintln!("interfaces on this machine: {}", names.join(", "));
+            eprintln!("{} on this machine: {}", aff.options_label, names.join(", "));
             let mut groups: Vec<&str> = Vec::new();
             for o in opts { if !groups.contains(&o.group.as_str()) { groups.push(&o.group); } }
             groups.sort();
