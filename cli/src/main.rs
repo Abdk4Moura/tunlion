@@ -56,13 +56,27 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
+
+/// Positional write at an absolute offset, used by concurrent spawn_blocking
+/// writer tasks for out-of-order multi-stream reassembly (no seek, atomic per
+/// call). Cross-platform: `FileExt::write_at` on Unix, `seek_write` on Windows —
+/// both write at `offset` without moving the shared handle's cursor.
+#[cfg(unix)]
+fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+#[cfg(windows)]
+fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buf, offset)
+}
 
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
 /// C7: content identity for resume, sha256 over the first 256 KiB.
@@ -7416,8 +7430,9 @@ struct IncomingFile {
     /// Mutex so concurrent spawn_blocking writer tasks can update safely.
     ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
     /// Raw file handle shared across concurrent spawn_blocking writer tasks.
-    /// Positional writes use std::os::unix::fs::FileExt::write_at which is
-    /// atomic per call — no seek needed, safe for concurrent access.
+    /// Positional writes go through `pwrite_at` (write_at on Unix, seek_write on
+    /// Windows) which is atomic per call — no seek needed, safe for concurrent
+    /// access.
     file: Arc<std::fs::File>,
     part_path: PathBuf,
     /// P4 (GAP-5): the whole-file sha256 the SENDER offered (`full`). On
@@ -10162,7 +10177,7 @@ async fn recv_cmd(
                     let tx = tx.clone();
                     let pid = pid.clone();
                     tokio::task::spawn_blocking(move || {
-                        let _ = file.write_at(&data, pos);
+                        let _ = pwrite_at(&file, &data, pos);
                         if let Some(ranges) = ranges {
                             let total = {
                                 let mut r = ranges.lock().unwrap();

@@ -356,12 +356,13 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // closes, but socket_to_dc (reader) stays parked on an IDLE client socket and
     // never notices - so awaiting only the reader (the old behavior) DEADLOCKED the
     // warm bridge, and thus the client's warm pty, until the user happened to type.
-    // A 5s liveness poll is the backstop for a transport that black-holes without
+    // A 2s liveness poll is the backstop for a transport that black-holes without
     // ever closing the pipe. Whichever fires, we drop the socket so the client sees
-    // EOF and (for the pty) falls through to a cold reattach.
+    // EOF and (for the pty) falls through to a cold reattach. (Kept short so a dead
+    // peer tears the warm pty down in ~2s rather than leaving it hung.)
     // read_result: Some = reader finished (Ok=FIN sent, Err(join)=teardown aborted
     // us); None = we tore down because the peer/link ended.
-    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
     ticker.tick().await; // consume the immediate tick
     let read_result;
     loop {
@@ -3216,7 +3217,17 @@ pub(crate) fn ssh_transport_args(info: &PeerSshInfo, server: &str, peer: &str, r
     args
 }
 
+/// Build the L3 direct destination for sshfs/rsync (login@peer.mesh). The mesh
+/// overlay (TUN) and its `.mesh` MagicDNS entries are Linux-only, so on other
+/// platforms there is no L3 path: return `None` and let the caller fall back to
+/// the L2 tunnel (same semantics as "peer isn't on the mesh").
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
+    None
+}
+
 /// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
+#[cfg(target_os = "linux")]
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
     let peer = info.host.strip_prefix("filament-").unwrap_or(&info.host);
     let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
