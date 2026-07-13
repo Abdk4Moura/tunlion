@@ -401,25 +401,34 @@ pub fn resolve(s: &Setting, peer: Option<&str>) -> (String, Origin) {
     (effective_default(s), Origin::Default)
 }
 
-/// Decode the shared "interfaces" store (JSON membership) into the view
-/// appropriate for the requested key (avoid or only).
-fn decode_membership(s: &Setting, raw: String) -> String {
-    if s.store != "interfaces" {
-        return raw;
+/// Decode the shared "interfaces" store or "prefer" store (JSON) into the
+/// view appropriate for the requested key.
+fn decode_store_value(s: &Setting, raw: String) -> String {
+    if s.store == "interfaces" {
+        if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+            let mode = obj["m"].as_str().unwrap_or("");
+            let items = obj["i"].as_str().unwrap_or("");
+            let want_mode = match s.key {
+                "avoid" | "exclude" => "avoid",
+                "only" | "include" => "only",
+                _ => "avoid",
+            };
+            if mode == want_mode { return items.to_string(); }
+        }
+        return String::new();
     }
-    if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
-        let mode = obj["m"].as_str().unwrap_or("");
-        let items = obj["i"].as_str().unwrap_or("");
-        let want_mode = match s.key {
-            "avoid" | "exclude" => "avoid",
-            "only" | "include" => "only",
-            _ => "avoid",
-        };
-        if mode == want_mode {
-            return items.to_string();
+    if s.store == "prefer" {
+        if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+            if let Some(order) = obj["o"].as_str() {
+                return order.to_string();
+            }
         }
     }
-    String::new()
+    raw
+}
+
+fn decode_membership(s: &Setting, raw: String) -> String {
+    decode_store_value(s, raw)
 }
 
 // -- typed convenience for behavioral consumers (up/recv/relay wiring) ------
@@ -431,6 +440,21 @@ pub fn get_bool(key: &str, peer: Option<&str>) -> bool {
 }
 
 /// Effective string for a key, or None when it resolves to the empty default.
+/// Read the prefer strength (soft|hard) from the raw store, or "soft" if unset.
+pub fn prefer_strength(peer: Option<&str>) -> &'static str {
+    let raw = if let Some(p) = peer {
+        peer_get(p, "prefer").unwrap_or_default()
+    } else {
+        global_get("prefer").unwrap_or_default()
+    };
+    if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+        if obj["s"].as_str() == Some("hard") {
+            return "hard";
+        }
+    }
+    "soft"
+}
+
 /// Read the RAW store value (no decode) for the interfaces membership config.
 /// Returns the JSON string or empty so the filter can parse mode+items directly.
 pub fn raw_membership(peer: Option<&str>) -> String {
@@ -710,6 +734,7 @@ pub async fn run_set(
     peers: &[String],
     dry_run: bool,
     reset: bool,
+    hard: bool,
     yes: bool,
     json_out: bool,
 ) -> Result<()> {
@@ -750,6 +775,9 @@ pub async fn run_set(
                     _ => "avoid",
                 };
                 json!({"m": mode, "i": raw}).to_string()
+            } else if s.store == "prefer" {
+                let strength = if hard { "hard" } else { "soft" };
+                json!({"o": raw, "s": strength}).to_string()
             } else {
                 raw
             };

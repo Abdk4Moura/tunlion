@@ -5770,13 +5770,14 @@ async fn main() -> Result<()> {
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
             recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None).await
         }
-        Cmd::Set { key, value, peer, dry_run, reset, .. } => settings::run_set(
+        Cmd::Set { key, value, peer, dry_run, reset, hard, .. } => settings::run_set(
             key.as_deref(),
             value.as_deref(),
             &peer,
             dry_run,
             reset,
-            ui_caps.yes || cli.yes,
+            hard,
+            ui_caps.yes,
             ui_caps.json || cli.json,
         ).await,
         Cmd::Get { key, peer, show_origin, default, json } => {
