@@ -123,15 +123,8 @@ impl Identity {
                 let rng = ring::rand::SystemRandom::new();
                 let doc = Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| anyhow!("overlay key generation failed"))?;
-                if let Some(d) = path.parent() {
-                    std::fs::create_dir_all(d)?;
-                }
-                std::fs::write(&path, doc.as_ref()).context("write overlay key")?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
+                crate::platform::SecretFile::write(&path, doc.as_ref())
+                    .context("write overlay key")?;
                 doc.as_ref().to_vec()
             }
         };

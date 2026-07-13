@@ -31,6 +31,17 @@ jobs:
         working-directory: cli
         run: cargo test --release
 
+  test-windows:
+    name: cargo test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test
+        working-directory: cli
+        shell: bash
+        run: cargo test --release
+
   cross-build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

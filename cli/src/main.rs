@@ -1035,10 +1035,7 @@ fn install_id() -> String {
         }
     }
     let id: String = fresh_secret()[..8].to_string();
-    if let Some(d) = p.parent() {
-        let _ = std::fs::create_dir_all(d);
-    }
-    let _ = std::fs::write(&p, &id);
+    let _ = crate::platform::SecretFile::write_str(&p, &id);
     id
 }
 
@@ -1332,12 +1329,7 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
         Some(existing) => existing["secret"] = json!(secret),
         None => arr.push(json!({"name": &final_name, "secret": secret})),
     }
-    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
 }
 
@@ -1375,12 +1367,7 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
     arr.retain(|d| d["name"].as_str() != Some(&final_name));
     arr.push(json!({"name": &final_name, "secret": secret, "v": 2, "caps": caps,
                     "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
-    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
 }
 
@@ -1401,7 +1388,7 @@ fn devices_touch(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net
             break;
         }
     }
-    let _ = std::fs::write(&p, serde_json::to_string_pretty(&arr).unwrap_or_default());
+    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
 }
 
 /// Read the `lastSeen` timestamp and overlay addresses for a known device.
@@ -1582,16 +1569,10 @@ fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
             "no known device named '{name}', run `filament devices` to see who you've paired"
         ));
     }
-    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
 }
 
-/// C27: a declined remember offer must not leave one-sided dead weight.
 fn devices_remove(name: &str) -> Result<()> {
     let p = devices_path();
     if let Some(dir) = p.parent() {
@@ -1606,12 +1587,7 @@ fn devices_remove(name: &str) -> Result<()> {
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
     arr.retain(|d| d["name"].as_str() != Some(name));
-    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
 }
 
@@ -5953,12 +5929,7 @@ async fn main() -> Result<()> {
                             d["name"] = json!(new);
                         }
                     }
-                    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-                    }
+                    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
                     println!("renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)");
                 }
             }
