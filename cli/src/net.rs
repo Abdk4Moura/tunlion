@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::FutureExt;
+use quinn::{Connection, RecvStream, SendStream};
 use rust_socketio::asynchronous::{Client, ClientBuilder};
 use rust_socketio::{Event as SioEvent, Payload, TransportType};
 use serde_json::{json, Value};
@@ -101,7 +102,10 @@ pub fn establish_grace_ms() -> u64 {
 /// returns beyond 4 for a single flow over the same bottleneck).  Overridable
 /// via `FILAMENT_DIRECT_STREAMS`; setting it to 1 gives today's single-stream
 /// behaviour.
-pub const DIRECT_STREAMS_DEFAULT: usize = 0; // 0 = auto-calc at runtime
+/// Default K=1 (single-stream) — K>1 is disabled by default until the
+/// cross-machine primary-death bug is fixed. Set FILAMENT_DIRECT_STREAMS=n
+/// to override. Once fixed, this reverts to 0 (auto-calc = min(cpus-1,4)).
+pub const DIRECT_STREAMS_DEFAULT: usize = 1; // 1 = single-stream (safe default)
 
 /// Read the configured number of direct-QUIC worker streams
 /// (`FILAMENT_DIRECT_STREAMS`).
@@ -113,11 +117,9 @@ pub fn direct_streams() -> usize {
     if let Some(n) = from_env {
         return n;
     }
-    // Auto-calc: min(max(1, cpu_count - 1), 4)
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(2);
-    (cpus.saturating_sub(1)).max(1).min(4)
+    // Default: K=1 single-stream (safe default until the cross-machine
+    // primary-death bug is fixed. Set FILAMENT_DIRECT_STREAMS=n to override.
+    DIRECT_STREAMS_DEFAULT
 }
 
 /// P2 (GAP-2): how long a long-lived acceptor's signaling link may go SILENT
@@ -418,6 +420,13 @@ pub trait Transport: Send + Sync {
     /// so the peer can clean up its link. Called before drop_link purges the
     /// corpse, preventing the keepalive from leaking a zombie connection.
     fn force_close(&self) {}
+    /// If the transport rides an existing QUIC connection, open a new
+    /// bidirectional stream on it (mesh reuse) and return the streams plus
+    /// a clone of the underlying connection handle. Returns None when the
+    /// transport doesn't support stream-opening or the connection is dead.
+    async fn open_stream(&self) -> Option<(SendStream, RecvStream, quinn::Connection)> {
+        None
+    }
     /// Send one IP packet as an unreliable datagram (non-blocking). Default errors
     /// for transports without datagram support.
     fn send_datagram(&self, _packet: &[u8]) -> Result<()> {
@@ -1436,7 +1445,7 @@ impl Peer {
     /// side often sees its peer as prflx even on the same LAN, and what the
     /// badge promises is "bytes never leave your network", which is an
     /// address property.
-    pub async fn route(&self) -> Option<&'static str> {
+    pub async fn route(&self) -> Option<String> {
         let pair = self
             .pc
             .sctp()
@@ -1447,18 +1456,23 @@ impl Peer {
         if pair.local.typ == RTCIceCandidateType::Relay
             || pair.remote.typ == RTCIceCandidateType::Relay
         {
-            return Some("relayed");
+            return Some("relay".into());
         }
-        // Same address on both ends = same machine (loopback via any of its
-        // IPs, public included), bytes never leave the host.
-        // "local" when bytes can't leave the machine/network: identical
-        // addresses, the remote address being one of THIS host's own
-        // addresses (multi-homed same-host pairs select different interfaces
-        // nondeterministically), or both ends private.
         let same_host =
             pair.local.address == pair.remote.address || is_own_addr(&pair.remote.address);
+        if same_host {
+            return Some("direct over lo".into());
+        }
+        // Resolve the LOCAL address to a real interface name
+        let iface = resolve_iface_name(&pair.local.address);
+        if is_tailscale_addr(&pair.local.address) || is_tailscale_addr(&pair.remote.address) {
+            return Some(format!("direct over {iface}"));
+        }
         let both_private = is_private_addr(&pair.local.address) && is_private_addr(&pair.remote.address);
-        Some(if same_host || both_private { "local" } else { "direct" })
+        if both_private {
+            return Some(format!("direct over {iface}"));
+        }
+        Some(format!("direct over {iface}"))
     }
 
     /// The selected ICE pair's concrete endpoints, for `filament ping`/`doctor`
@@ -1659,6 +1673,29 @@ pub fn is_private_addr(addr: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// True when the address is in the Tailscale overlay range (100.64.0.0/10,
+/// shared CGNAT space). Used to give the route a useful label.
+pub fn is_tailscale_addr(addr: &str) -> bool {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a local IP address to an interface name by enumerating interfaces.
+fn resolve_iface_name(addr: &str) -> String {
+    if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+        for iface in crate::interact::enumerate_interfaces() {
+            if iface.ips.iter().any(|i| *i == ip) {
+                return iface.name;
+            }
+        }
+    }
+    "?".to_string()
 }
 
 async fn wire_channel(

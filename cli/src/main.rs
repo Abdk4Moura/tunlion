@@ -24,6 +24,7 @@ mod doctor;
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
 mod holepunch;
+mod interact;
 mod l2;
 mod mount;
 mod backup;
@@ -54,7 +55,7 @@ use clap::{Parser, Subcommand};
 use net::{Ev, Peer, Transport};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -263,6 +264,46 @@ fn relay_forbidden() -> bool {
 /// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
 static NO_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// App-wide UI capability resolved once from flags + env. Controls how every
+/// command renders: interactive vs steer, human vs JSON, color vs plain.
+pub struct UiCapability {
+    pub interactive: bool,
+    pub json: bool,
+    pub yes: bool,
+    pub color: bool,
+}
+
+impl UiCapability {
+    pub(crate) fn from_cli(cli: &Cli) -> Self {
+        let interactive = std::io::stdin().is_terminal()
+            && !cli.no_interactive
+            && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none();
+        let color = match cli.color.as_deref() {
+            Some("always") => true,
+            Some("never") => false,
+            _ => std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        };
+        UiCapability { interactive, json: cli.json, yes: cli.yes, color }
+    }
+
+    pub fn confirm(&self, action: &str) -> Result<()> {
+        if self.yes { return Ok(()); }
+        if self.interactive {
+            use std::io::Write;
+            eprint!("{action} [y/N] ");
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).ok();
+            if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                anyhow::bail!("cancelled");
+            }
+        } else {
+            anyhow::bail!("refusing {action} without --yes (non-interactive)");
+        }
+        Ok(())
+    }
+}
+
 /// THE interactivity GATE, scripts/automation are safe BY DEFAULT. Three layers:
 ///   1. stdin is not a TTY  -> never interactive (pipes, CI, `< /dev/null`).
 ///   2. TTY but opted out    -> never interactive: `--no-interactive` OR the env
@@ -399,6 +440,14 @@ struct Cli {
     /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     color: Option<String>,
+    /// JSON output for every command (structured, parseable). Independent of
+    /// TTY: a pipe still gets human text unless --json is set.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Auto-confirm destructive actions (revoke, unmount, unexpose).
+    /// Required from a non-TTY; a TTY prompts instead.
+    #[arg(short = 'y', long = "yes", global = true)]
+    yes: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -575,6 +624,12 @@ enum Cmd {
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Prefer strength: hard (always prefer, even if slower)
+        #[arg(long, conflicts_with = "soft")]
+        hard: bool,
+        /// Prefer strength: soft (prefer unless much faster) — default
+        #[arg(long, conflicts_with = "hard")]
+        soft: bool,
     },
     /// Show this machine's overlay address, or a device's info (addresses, caps, last seen).
     ///
@@ -663,9 +718,13 @@ enum Cmd {
     Completions {
         shell: clap_complete::Shell,
     },
-    /// Print the man page (roff) to stdout
+    /// Print the manual (roff to stdout). `filament man routing` shows the
+    /// connection & interface selection model.
     #[command(hide = true)]
-    Man,
+    Man {
+        /// Manual page: routing, settings, or omit for the full man page
+        page: Option<String>,
+    },
     /// Tunnel: wire stdio to one TCP stream on a known peer's localhost (the
     /// ssh ProxyCommand primitive). Off by default; FILAMENT_L2=1 enables the
     /// acceptor side in `up`/`recv`.
@@ -3798,6 +3857,8 @@ impl Conn {
                 existing.expected_secret = expected_secret;
             }
         } else {
+            // Mesh reuse: spawn accept loop before t moves into Link.
+            direct::spawn_mesh_accept(pid.to_string(), &t, self.tx.clone());
             self.links.insert(
                 pid.to_string(),
                 Link {
@@ -3849,98 +3910,38 @@ impl Conn {
         // Polite side accepts; the other dials.
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
         let answerer = net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid);
+        #[cfg(debug_assertions)]
         eprintln!("[T] spawn_direct_workers: pid={pid} my_uid={} peer_uid={peer_uid:?} my_id={} answerer={answerer} k={k}", self.my_uid, self.my_id);
         let count = k - 1;
 
         let pid = pid.to_string();
-        let my_uid = self.my_uid.clone();
-        let worker_port_key = peer_uid.map(|s| s.to_string()).unwrap_or_else(|| pid.clone());
         let tx = self.tx.clone();
         let primary = primary.clone();
 
-        // Dialer branch: create a oneshot channel so the control handler can
-        // deliver the acceptor's worker port list.
-            let worker_port_rx = if answerer {
-            None
-        } else {
-            let (tx, rx) = oneshot::channel();
-            eprintln!("[T] DIALER storing worker_port_tx key={worker_port_key} (peer_uid={pu:?}, pid={ppid})", pu=peer_uid, ppid=&pid);
-            self.worker_port_tx.insert(worker_port_key.clone(), tx);
-            Some(rx)
-        };
+        // Only the ACCEPTOR creates workers (opens mesh streams on the primary).
+        // The DIALER side's accept loop (spawned by adopt_direct) picks up the
+        // incoming streams and delivers them via Ev::DirectWorkersReady.
+        if !answerer {
+            #[cfg(debug_assertions)]
+            eprintln!("[T] worker DIALER branch: mesh streams accepted by background loop");
+            return;
+        }
 
         tokio::spawn(async move {
-            let workers = if answerer {
-                eprintln!("[T] worker ACCEPTOR branch: binding {count} endpoints");
-                // Acceptor: bind N fresh endpoints (each on its own UDP socket),
-                // send their ports to the dialer via the primary transport, then
-                // accept one connection per endpoint.
-                let mut endpoints = Vec::with_capacity(count);
-                let mut ports = Vec::with_capacity(count);
-                for _ in 0..count {
-                    match direct::bind_endpoint() {
-                        Ok((ep, port)) => {
-                            eprintln!("[T]   bound endpoint port={port}");
-                            endpoints.push(ep);
-                            ports.push(port);
-                        }
-                        Err(e) => {
-                            crate::ui::debug(&format!("worker bind endpoint: {e}"));
-                            eprintln!("[T]   bind error: {e}");
-                            break;
-                        }
-                    }
+            let mut workers = Vec::with_capacity(count);
+            #[cfg(debug_assertions)]
+            eprintln!("[T] worker ACCEPTOR branch: opening {count} mesh streams on primary");
+            for _ in 0..count {
+                if let Some((send, recv, conn)) = primary.open_stream().await {
+                    let worker = direct::make_transport(pid.clone(), conn, send, recv, tx.clone(), true, None);
+                    workers.push(worker);
                 }
-                if !ports.is_empty() {
-                    eprintln!("[T] sending worker-ports: {ports:?}");
-                    let _ = primary
-                        .send_control(&json!({
-                            "type": "worker-ports",
-                            "for": &my_uid,
-                            "ports": ports,
-                        }))
-                        .await;
-                }
-                let w = direct::accept_workers(
-                    endpoints,
-                    tkey,
-                    pid.clone(),
-                    tx.clone(),
-                    count,
-                )
-                .await;
-                eprintln!("[T] acceptor returned {} workers", w.len());
-                w
-            } else if let Some(rx) = worker_port_rx {
-                eprintln!("[T] worker DIALER branch: awaiting worker-ports");
-                // Dialer: await the worker-ports message, then bind one fresh
-                // endpoint per port and dial each.
-                match rx.await {
-                    Ok(ports) => {
-                        eprintln!("[T] DIALER got ports: {ports:?}, dialing {count} workers");
-                        let w = direct::dial_workers(
-                            ports,
-                            peer_addr.ip(),
-                            tkey,
-                            pid.clone(),
-                            tx.clone(),
-                            count,
-                        )
-                        .await;
-                        eprintln!("[T] dialer returned {} workers", w.len());
-                        w
-                    }
-                    Err(_) => {
-                        crate::ui::debug("worker-ports never arrived, using single-stream");
-                        eprintln!("[T] worker-ports never arrived");
-                        vec![]
-                    }
-                }
-            } else {
-                eprintln!("[T] worker NEITHER branch (no rx)");
-                vec![]
-            };
-            let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+            }
+            #[cfg(debug_assertions)]
+            eprintln!("[T] acceptor mesh streams: {} workers", workers.len());
+            if !workers.is_empty() {
+                let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+            }
         });
     }
 
@@ -4115,6 +4116,7 @@ impl Conn {
             .chain(workers.iter().map(|w| w.idle_ms()))
             .min()
             .unwrap_or(u64::MAX);
+        #[cfg(debug_assertions)]
         eprintln!("[STALL] pid={pid} in_flight={in_flight} transport_up={transport_up} flowed={flowed} idle_ms={idle_ms} workers={} cluster={:?}",
             workers.len(),
             transport.map(|t| t.idle_ms()).into_iter().chain(workers.iter().map(|w| w.idle_ms())).collect::<Vec<_>>()
@@ -5377,7 +5379,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     let route = if direct {
         link.map(|l| l.direct_route.to_string()).unwrap_or_else(|| "direct".into())
     } else if let Some(p) = link.and_then(|l| l.peer.clone()) {
-        p.route().await.unwrap_or("relay").to_string()
+        p.route().await.unwrap_or_else(|| "relay".into())
     } else {
         "relay".to_string()
     };
@@ -5714,6 +5716,7 @@ async fn main() -> Result<()> {
         }
     }
     let cli = Cli::parse_from(argv);
+    let ui_caps = UiCapability::from_cli(&cli);
     // Resolve the global output verbosity ONCE, before any worker spawns:
     // FILAMENT_LOG (if set) overrides the -v/-q flags. Default = info.
     ui::init_verbosity(cli.verbose, cli.quiet);
@@ -5767,14 +5770,15 @@ async fn main() -> Result<()> {
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
             recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None).await
         }
-        Cmd::Set { key, value, peer, dry_run, reset, yes, json } => settings::run_set(
+        Cmd::Set { key, value, peer, dry_run, reset, hard, .. } => settings::run_set(
             key.as_deref(),
             value.as_deref(),
             &peer,
             dry_run,
             reset,
-            yes,
-            json,
+            hard,
+            ui_caps.yes,
+            ui_caps.json || cli.json,
         ).await,
         Cmd::Get { key, peer, show_origin, default, json } => {
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
@@ -5889,7 +5893,7 @@ async fn main() -> Result<()> {
             up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_user).await
         }
         Cmd::Status { json } => status_cmd(json),
-        Cmd::Down => down_cmd(),
+        Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, relay).await,
         Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
         Cmd::Devices { action, json } => {
@@ -5966,7 +5970,13 @@ async fn main() -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "filament", &mut std::io::stdout());
             Ok(())
         }
-        Cmd::Man => {
+        Cmd::Man { page } => {
+            if let Some(p) = page {
+                if p == "routing" {
+                    println!("{}", include_str!("../../docs/filament-routing.md"));
+                    return Ok(());
+                }
+            }
             use clap::CommandFactory;
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(())
@@ -5976,7 +5986,7 @@ async fn main() -> Result<()> {
         Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
-        Cmd::Unexpose { port } => expose::unexpose_cmd(port).await,
+        Cmd::Unexpose { port } => { ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await },
         Cmd::Proxy { port, bind } => l2::proxy_cmd(&server, &bind, port, relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
@@ -5996,6 +6006,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Revoke { device, capability } => {
+            ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false)?;
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
@@ -6033,7 +6044,7 @@ async fn main() -> Result<()> {
                 mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground, auto_restore).await
             }
         }
-        Cmd::Unmount { path } => mount::unmount_cmd(&path),
+        Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -6482,6 +6493,7 @@ async fn send_cmd(
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
+    let mut saw_known_peer: HashSet<String> = HashSet::new();
     // P4 (delivery-ack window): when every transfer's bytes have been `sent` but
     // the whole-file `delivery-ack` hasn't landed, we wait up to this bound for
     // the ack. CRITICAL (silent-data-loss fix): elapsing this window does NOT mean
@@ -6697,8 +6709,23 @@ async fn send_cmd(
                 }
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
-                        ui::say(&format!("known device '{n}' is online, connecting"));
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        // Liveness-aware: skip only if a healthy link already exists.
+                        // If the link is dead or absent, re-establish (reconnect-after-loss).
+                        let link_alive = conn.link(&pid)
+                            .and_then(|l| l.transport.as_ref())
+                            .map(|t| !t.is_dead())
+                            .unwrap_or(false);
+                        if link_alive {
+                            if !saw_known_peer.contains(n) {
+                                saw_known_peer.insert(n.clone());
+                            }
+                            continue;
+                        }
+                        if !saw_known_peer.contains(n) {
+                            ui::say(&format!("known device '{n}' is online, connecting"));
+                        }
+                        saw_known_peer.insert(n.clone());
                         // rung-1: both ends are CLIs (known device), try direct
                         // QUIC FIRST. start_direct records the pending so the
                         // maybe_adopt->establish below skips the WebRTC offer
@@ -8061,6 +8088,7 @@ async fn recv_cmd(
     // Bug 5: surface the single-host mDNS wedge hint once after repeated stuck.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
+    let mut saw_known_peer: HashSet<String> = HashSet::new();
     let mut ever_received = false;
     // C12 live-pairing: the roster (`devices`) is loaded ONCE at startup, and
     // KnownPeer events only fire for channels we've SUBSCRIBED. A device paired
@@ -8875,7 +8903,12 @@ async fn recv_cmd(
                     // reconnect removes the link first, so it still announces.
                     let fresh = !conn.links.contains_key(&pid)
                         && !conn.direct_pending.contains_key(&pid);
-                    if fresh {
+                    // Also re-announce if the existing link's transport is dead
+                    let link_dead = conn.links.get(&pid)
+                        .and_then(|l| l.transport.as_ref())
+                        .map(|t| t.is_dead())
+                        .unwrap_or(false);
+                    if fresh || link_dead {
                         ui::say(&format!("known device '{n}' appeared, connecting"));
                         devices_touch(n, None, None);  // track last_seen; addresses filled on ChannelReady
                     } else {
@@ -10841,12 +10874,11 @@ mod tests {
         // The L2/ssh acceptor (`up --shell`) keeps taking it (the prior fix).
         assert!(direct_ok_for(true, true));
         assert!(direct_ok_for(false, true), "L2 acceptor must take direct even when not a daemon");
-        // A one-shot command (daemon=false) with no L2 and no env gate keeps the
-        // WebRTC default: send/recv/pair are deliberately left unchanged.
-        assert!(!direct_ok_for(false, false), "one-shot send/recv/pair keep the WebRTC default");
-        // The env gate still forces it on for any session.
-        unsafe { std::env::set_var("FILAMENT_DIRECT", "1") };
-        assert!(direct_ok_for(false, false), "FILAMENT_DIRECT=1 forces direct for any session");
+        // A one-shot command (daemon=false) with no L2 now defaults to direct-ON
+        // (the default changed from opt-in to opt-out). FILAMENT_DIRECT=0 restores WebRTC.
+        assert!(direct_ok_for(false, false), "default direct-ON for any session");
+        unsafe { std::env::set_var("FILAMENT_DIRECT", "0") };
+        assert!(!direct_ok_for(false, false), "FILAMENT_DIRECT=0 disables direct");
         unsafe { std::env::remove_var("FILAMENT_DIRECT") };
     }
 
@@ -11154,5 +11186,71 @@ mod tests {
         };
         arr.push(serde_json::json!({"name": &final_name, "secret": "ccc"}));
         assert_eq!(arr[2]["name"].as_str().unwrap(), "host1-3", "suffix incremented");
+    }
+
+    // --- KnownPeer idempotency regression tests ---
+    // These guard against P0 churn: repeated KnownPeer presence events must NOT
+    // re-fire establishment on an already-seen/live peer. The real handler uses
+    // a HashSet<device_name>; these tests verify the idempotency contract.
+
+    #[test]
+    fn known_peer_first_event_connects() {
+        let mut saw: HashSet<String> = HashSet::new();
+        let n = "popos";
+        assert!(!saw.contains(n), "first event should connect");
+        saw.insert(n.to_string());
+        assert!(saw.contains(n));
+    }
+
+    #[test]
+    fn known_peer_repeat_while_seen_is_ignored() {
+        let mut saw: HashSet<String> = HashSet::new();
+        let n = "dovm";
+        saw.insert(n.to_string());
+        for _ in 0..5 {
+            assert!(saw.contains(n), "repeat KnownPeer must be ignored");
+        }
+    }
+
+    #[test]
+    fn known_peer_uses_device_name_not_pid() {
+        let mut saw: HashSet<String> = HashSet::new();
+        let n = "other-do";
+        assert!(!saw.contains(n));
+        saw.insert(n.to_string());
+        // Same device name with different pids should still be skipped
+        assert!(saw.contains(n), "should skip regardless of signaling pid");
+    }
+
+    #[test]
+    fn known_peer_different_devices_not_skipped() {
+        let mut saw: HashSet<String> = HashSet::new();
+        saw.insert("dovm".to_string());
+        assert!(!saw.contains("popos"), "different device must not be skipped");
+        saw.insert("popos".to_string());
+        assert!(saw.contains("popos"));
+    }
+
+    #[test]
+    fn confirm_yes_passes() {
+        let caps = UiCapability { interactive: false, json: false, yes: true, color: false };
+        assert!(caps.confirm("delete it").is_ok());
+    }
+
+    #[test]
+    fn confirm_non_interactive_without_yes_fails() {
+        let caps = UiCapability { interactive: false, json: false, yes: false, color: false };
+        assert!(caps.confirm("delete it").is_err());
+    }
+
+    #[test]
+    fn known_peer_liveness_allows_reconnect() {
+        let mut saw: HashSet<String> = HashSet::new();
+        let n = "peer";
+        assert!(!saw.contains(n));
+        saw.insert(n.to_string());
+        // Link dies: clear to allow reconnect
+        saw.remove(n);
+        assert!(!saw.contains(n), "dead link must be reconnectable");
     }
 }

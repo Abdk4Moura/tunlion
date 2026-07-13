@@ -772,6 +772,9 @@ mod tests {
         async fn recv_datagram(&self) -> super::Result<bytes::Bytes> {
             std::future::pending().await
         }
+        fn is_dead(&self) -> bool {
+            false
+        }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }

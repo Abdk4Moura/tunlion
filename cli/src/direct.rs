@@ -48,8 +48,9 @@ use crate::net::Transport;
 /// rock-solid. A plain `up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
 /// byte-for-byte unchanged, the file-transfer hard rule.
 pub fn direct_enabled() -> bool {
-    let on = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
-    on("FILAMENT_DIRECT") || on("FILAMENT_L2")
+    // Default ON. Opt out with FILAMENT_DIRECT=0.
+    std::env::var("FILAMENT_DIRECT").map(|v| v != "0").unwrap_or(true)
+        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false)
 }
 
 /// Test-only: force the direct race to fail (simulate a blocked direct path)
@@ -203,6 +204,165 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ====================================================== candidate gathering ==
+
+// ============================================================= CIDR filter ==
+
+/// A single CIDR rule: network IP + prefix length.
+struct CidrRule {
+    ip: IpAddr,
+    prefix_len: u8,
+}
+
+fn parse_cidr(s: &str) -> Option<CidrRule> {
+    let s = s.trim();
+    let (ip_str, len_str) = s.split_once('/')?;
+    let ip: IpAddr = ip_str.parse().ok()?;
+    let prefix_len: u8 = len_str.parse().ok()?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix_len > max {
+        return None;
+    }
+    Some(CidrRule { ip, prefix_len })
+}
+
+fn ip_matches_cidr(ip: &IpAddr, rule: &CidrRule) -> bool {
+    match (ip, &rule.ip) {
+        (IpAddr::V4(a), IpAddr::V4(net)) => {
+            let mask = u32::MAX.checked_shl(32 - rule.prefix_len as u32).unwrap_or(0);
+            u32::from(*a) & mask == u32::from(*net) & mask
+        }
+        (IpAddr::V6(a), IpAddr::V6(net)) => {
+            let mask = u128::MAX.checked_shl(128 - rule.prefix_len as u32).unwrap_or(0);
+            u128::from(*a) & mask == u128::from(*net) & mask
+        }
+        _ => false,
+    }
+}
+
+/// Expand a friendly group name into CIDR rules. Groups:
+///   tailscale → 100.64.0.0/10  (Tailscale / CGNAT overlay)
+///   docker    → 172.17.0.0/16  (docker0 bridge default)
+fn expand_group(item: &str) -> Vec<CidrRule> {
+    match item.to_ascii_lowercase().as_str() {
+        "tailscale" => parse_cidr("100.64.0.0/10").into_iter().collect(),
+        "docker" => parse_cidr("172.17.0.0/16").into_iter().collect(),
+        _ => vec![],
+    }
+}
+
+/// Parse one avoid/prefer CSV entry, normalizing both CIDRs and groups.
+fn parse_rule_item(item: &str) -> Vec<CidrRule> {
+    let item = item.trim();
+    if item.is_empty() {
+        return vec![];
+    }
+    // Try as CIDR first
+    if let Some(r) = parse_cidr(item) {
+        return vec![r];
+    }
+    // Try as friendly group
+    let groups = expand_group(item);
+    if !groups.is_empty() {
+        return groups;
+    }
+    // Not a CIDR or group — could be an interface name (not supported yet).
+    // Silently ignore; avoid being noisy.
+    vec![]
+}
+
+fn parse_rule_list(csv: &str) -> Vec<CidrRule> {
+    csv.split(',')
+        .flat_map(parse_rule_item)
+        .collect()
+}
+
+/// Read one iface setting, per-peer aware. For the membership store
+/// ("interfaces"), returns the raw JSON. For prefer, reads from config.
+fn read_iface_setting(key: &str, peer: Option<&str>) -> String {
+    if key == "interfaces" {
+        return crate::settings::raw_membership(peer);
+    }
+    crate::settings::get_str(key, peer).unwrap_or_default()
+}
+
+/// Filter local IPs for candidate gathering using membership (avoid/only store)
+/// and arrangement (prefer ordering). Membership decides which IPs are ELIGIBLE;
+/// prefer only orders the survivors.
+fn filter_local_ips(ips: Vec<IpAddr>, peer: Option<&str>) -> Vec<IpAddr> {
+    // --- membership: eligible set from the shared interfaces store ---
+    let membership_raw = read_iface_setting("interfaces", peer);
+    let (membership_mode, membership_items) = parse_membership(&membership_raw);
+    let avoid_rules = if membership_mode == "avoid" {
+        parse_rule_list(&membership_items)
+    } else {
+        vec![]
+    };
+    let only_rules = if membership_mode == "only" {
+        parse_rule_list(&membership_items)
+    } else {
+        vec![]
+    };
+
+    // --- arrangement: prefer ordering (soft by default) ---
+    let prefer = read_iface_setting("prefer", peer);
+    let prefer_rules = parse_rule_list(&prefer);
+
+    // If no rules at all, pass through unchanged
+    if membership_mode.is_empty() && prefer.is_empty() {
+        return ips;
+    }
+
+    let mut kept: Vec<(IpAddr, u8)> = ips
+        .into_iter()
+        .filter(|ip| {
+            if ip.is_loopback() {
+                return true; // never filter loopback
+            }
+            // Avoid mode: drop matching IPs (deny list)
+            for r in &avoid_rules {
+                if ip_matches_cidr(ip, r) {
+                    return false;
+                }
+            }
+            // Only mode: keep only matching IPs (allow list)
+            if !only_rules.is_empty() {
+                return only_rules.iter().any(|r| ip_matches_cidr(ip, r));
+            }
+            true
+        })
+        .map(|ip| {
+            // Prefer: weight 0 for preferred, 1 for fallback
+            let weight: u8 = if prefer_rules.iter().any(|r| ip_matches_cidr(&ip, r)) {
+                0
+            } else {
+                1
+            };
+            (ip, weight)
+        })
+        .collect();
+
+    if kept.is_empty() {
+        crate::ui::debug("membership filter removed ALL host candidates");
+        return vec![];
+    }
+
+    kept.sort_by_key(|(_, w)| *w);
+    kept.into_iter().map(|(ip, _)| ip).collect()
+}
+
+/// Parse the shared interfaces store value (JSON membership) into (mode, items).
+/// Returns ("", "") when the store is empty or unparseable.
+fn parse_membership(raw: &str) -> (String, String) {
+    if raw.is_empty() {
+        return (String::new(), String::new());
+    }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        let mode = v["m"].as_str().unwrap_or("").to_string();
+        let items = v["i"].as_str().unwrap_or("").to_string();
+        return (mode, items);
+    }
+    (String::new(), String::new())
+}
 
 /// Every local non-loopback interface IP (v4+v6). Std-only: enumerate by
 /// "connecting" UDP sockets to public anchors and reading the chosen local
@@ -364,12 +524,18 @@ fn loopback_only() -> bool {
 }
 
 /// Gather all advertisable candidates for our bound endpoint port.
+/// `peer` is optional — when provided, per-peer avoid/prefer overrides are read.
 pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
+    let peer: Option<&str> = None; // per-peer filter not yet wired from callers
     if loopback_only() {
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
         return vec![cand_str(lo, port)];
     }
-    let mut cands: Vec<String> = local_ips().into_iter().map(|ip| cand_str(ip, port)).collect();
+    let ips = filter_local_ips(local_ips(), peer);
+    let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
+    if cands.is_empty() && !local_ips().is_empty() {
+        crate::ui::debug("iface filter removed ALL host candidates; connectivity may fail");
+    }
     if !suppress_public() {
         if let Some(pip) = public_ip(server).await {
             let s = cand_str(pip, port);
@@ -465,6 +631,9 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     tc.stream_receive_window(quinn::VarInt::from_u32(16_777_216));
     tc.receive_window(quinn::VarInt::from_u32(33_554_432));
     tc.send_window(16_777_216_u64);
+    // BBR congestion control: tolerates non-congestion loss (packet reordering,
+    // TURN relay jitter, cross-region spikes) without collapsing cwnd like Cubic.
+    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
     // L3 data plane: enable QUIC unreliable DATAGRAMs (the serve_tun path rides
     // these, not the reliable streams L2 uses, to avoid TCP-over-TCP meltdown).
     // A 1 MiB receive ring absorbs bursts; advertising it lets the peer send to us.
@@ -680,6 +849,8 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     let conn_id = conn.stable_id();
     tokio::spawn(async move {
         c.closed().await;
+        #[cfg(debug_assertions)]
+        #[cfg(debug_assertions)]
         eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
         drop(ep);
     });
@@ -732,6 +903,8 @@ pub struct DirectTransport {
 impl Drop for DirectTransport {
     fn drop(&mut self) {
         let ep_info = self.ep.as_ref().map(|e| format!("ep={:?}", e.local_addr())).unwrap_or_else(|| "ep=None".to_string());
+        #[cfg(debug_assertions)]
+        #[cfg(debug_assertions)]
         eprintln!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} close_reason={:?}",
             self.conn.stable_id(), self.answerer, self.conn.close_reason());
     }
@@ -950,6 +1123,16 @@ impl Transport for DirectTransport {
         self.conn.close(0u32.into(), b"dropped");
     }
 
+    async fn open_stream(&self) -> Option<(quinn::SendStream, quinn::RecvStream, quinn::Connection)> {
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        match self.conn.open_bi().await {
+            Ok(s) => Some((s.0, s.1, self.conn.clone())),
+            Err(_) => None,
+        }
+    }
+
     fn send_datagram(&self, packet: &[u8]) -> Result<()> {
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(anyhow!("direct connection closed"));
@@ -1039,6 +1222,8 @@ fn spawn_reader(
                 if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
                     break;
                 }
+                #[cfg(debug_assertions)]
+                #[cfg(debug_assertions)]
                 eprintln!("[DEAD] spawn_reader: peer={} answerer={answerer} read hdr error: {e:?}", peer_id);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
@@ -1048,6 +1233,8 @@ fn spawn_reader(
             // Guard against an absurd length (a corrupt/hostile peer); cap well
             // above MAX_DIRECT_PAYLOAD + the 4-byte sid.
             if len > MAX_DIRECT_PAYLOAD + 64 {
+                #[cfg(debug_assertions)]
+                #[cfg(debug_assertions)]
                 eprintln!("[DEAD] spawn_reader: peer={} absurd len={}", peer_id, len);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
@@ -1059,6 +1246,8 @@ fn spawn_reader(
                 if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
                     break;
                 }
+                #[cfg(debug_assertions)]
+                #[cfg(debug_assertions)]
                 eprintln!("[DEAD] spawn_reader: peer={} read body error kind={} err={e:?}", peer_id, kind);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
@@ -1096,7 +1285,7 @@ fn spawn_reader(
 
 /// Build a `DirectTransport` from an authenticated connection + its auth stream
 /// (reused as the control/data stream), wiring the reader into `tx`.
-fn make_transport(
+pub fn make_transport(
     peer_id: String,
     conn: quinn::Connection,
     send: SendStream,
@@ -1122,6 +1311,32 @@ fn make_transport(
         #[cfg(feature = "test-hooks")]
         born_ms: now_ms(),
     })
+}
+
+/// Mesh reuse: spawn a background task that accepts new incoming QUIC streams
+/// on an existing connection. Each accepted stream gets wrapped as a transport
+/// and sent as a worker via Ev::DirectWorkersReady — avoiding the 1-RTT
+/// handshake for file transfers that re-use the L3 mesh connection.
+pub fn spawn_mesh_accept(
+    pid: String,
+    t: &std::sync::Arc<dyn crate::net::Transport>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+) {
+    if let Some(dt) = t.as_any().downcast_ref::<DirectTransport>() {
+        let conn = dt.conn.clone();
+        tokio::spawn(async move {
+            loop {
+                match conn.accept_bi().await {
+                    Ok((send, recv)) => {
+                        let conn2 = conn.clone();
+                        let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None);
+                        let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid.clone(), vec![worker]));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
 }
 
 // ========================================================== multi-stream workers ==
@@ -1386,12 +1601,16 @@ pub async fn race_connect_labeled(
         let conn2 = conn.clone();
         tokio::spawn(async move {
             conn2.closed().await;
+            #[cfg(debug_assertions)]
+            #[cfg(debug_assertions)]
             eprintln!("[KEEP-EP-DROP] endpoint for primary conn_stable={} ep={:?}",
                 conn2.stable_id(), endpoint.local_addr());
             drop(endpoint);
         });
     }
     let conn_id = conn.stable_id();
+    #[cfg(debug_assertions)]
+    #[cfg(debug_assertions)]
     eprintln!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}");
     Some(make_transport(peer_id, conn, send, recv, tx, answerer, Some(ep_for_transport)))
 }
