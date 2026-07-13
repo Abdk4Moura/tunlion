@@ -31,3 +31,7 @@ htmlcov
 *.log
 tmp/
 deploy/coturn/*.pem
+
+# Agent scratch (never track)
+.opencode/
+.claude/
