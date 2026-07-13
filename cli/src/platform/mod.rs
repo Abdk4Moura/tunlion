@@ -195,19 +195,13 @@ impl ServiceHost {
         }
     }
 
-    /// Check whether systemd user instance is available.
+    /// Check whether systemd is PID 1. Equivalent to libsystemd's
+    /// sd_booted(3): /run/systemd/system exists iff systemd manages the system.
+    /// Does NOT spawn a subprocess, and does not false-negative when systemd
+    /// is in a "degraded" runtime state.
     #[cfg(target_os = "linux")]
     fn has_systemd() -> bool {
-        // systemctl --user is the user-mode systemd instance;
-        // it fails if systemd isn't pid 1 OR the user session isn't systemd-managed
-        // (container, WSL1, non-systemd distro).
-        std::process::Command::new("systemctl")
-            .args(["--user", "is-system-running"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        std::path::Path::new("/run/systemd/system").is_dir()
     }
 }
 
