@@ -772,6 +772,9 @@ mod tests {
         async fn recv_datagram(&self) -> super::Result<bytes::Bytes> {
             std::future::pending().await
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     // Build an L3 backed by the userspace netstack (no privilege, and refresh_hosts

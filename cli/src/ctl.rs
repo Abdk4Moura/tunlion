@@ -53,7 +53,7 @@ pub fn reuse_disabled() -> bool {
     };
 
 #[cfg(not(unix))]
-pub use stub::Req;
+pub use stub::{try_ping, Req};
 
 // --------------------------------------------------------------- unix impl ----
 #[cfg(unix)]
@@ -637,9 +637,18 @@ mod imp {
 // -------------------------------------------------------- non-unix fallback ----
 #[cfg(not(unix))]
 mod stub {
+    use serde_json::Value;
     /// Warm-link reuse needs a unix-domain socket, which this platform lacks, so
     /// `Req` is uninhabited: the daemon never spawns `serve`, the channel never
     /// receives, and the fast paths (gated on `cfg(unix)`) never call `try_open`.
     /// Keeping the type lets the daemon loop and handler compile unchanged.
     pub enum Req {}
+
+    /// No control socket on this platform, so there is never a warm daemon link
+    /// to ping. Callers (`ping`, `forward`) treat `None` as "no daemon" and fall
+    /// back to a fresh establish. Present so the `via_daemon`-gated call sites —
+    /// dead here, since `via_daemon` is always false on non-unix — still compile.
+    pub async fn try_ping(_peer: &str) -> Option<Value> {
+        None
+    }
 }
