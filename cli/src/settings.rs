@@ -43,6 +43,9 @@ pub enum Kind {
     Str,
     Path,
     Enum(&'static [&'static str]),
+    /// Comma-separated list; each item is validated by the setting's own
+    /// parse fn (e.g. interface name, CIDR, or friendly group).
+    List,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -115,10 +118,43 @@ pub fn registry() -> &'static [Setting] {
             store: "relay",
             kind: Kind::Enum(RELAY_VALS),
             default: "auto",
-            scope: ScopeKind::GlobalOnly,
+            scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: true,
-            help: "Relay policy: auto (direct, fall back to relay), always (force TURN), never (direct-only)",
+            help: "Relay policy: auto (direct, fall back to relay), always (force TURN), never (direct-only). Per-peer: filament set relay never --peer dovm",
+        },
+        Setting {
+            key: "prefer",
+            aliases: &["via"],
+            store: "prefer",
+            kind: Kind::List,
+            default: "",
+            scope: ScopeKind::GlobalOrPeer,
+            env: None,
+            daemon: false,
+            help: "Interfaces to prefer, in order: interface name (wl1, eth0), friendly group (wifi, ethernet), or CIDR (100.64.0.0/10). Non-preferred interfaces are still used as fallback.",
+        },
+        Setting {
+            key: "avoid",
+            aliases: &["exclude"],
+            store: "interfaces",
+            kind: Kind::List,
+            default: "",
+            scope: ScopeKind::GlobalOrPeer,
+            env: None,
+            daemon: false,
+            help: "Deny-list (open set): interfaces or subnets never to use. Complements only/include — setting either replaces the membership config.",
+        },
+        Setting {
+            key: "only",
+            aliases: &["include"],
+            store: "interfaces",
+            kind: Kind::List,
+            default: "",
+            scope: ScopeKind::GlobalOrPeer,
+            env: None,
+            daemon: false,
+            help: "Allow-list (closed set): only these interfaces or subnets are eligible. Complements avoid — setting either replaces the membership config.",
         },
         Setting {
             key: "auto-extract",
@@ -355,14 +391,44 @@ pub fn resolve(s: &Setting, peer: Option<&str>) -> (String, Origin) {
     if let Some(p) = peer {
         if s.scope == ScopeKind::GlobalOrPeer {
             if let Some(v) = peer_get(p, s.store) {
-                return (v, Origin::Peer(p.to_string()));
+                return (decode_membership(s, v), Origin::Peer(p.to_string()));
             }
         }
     }
     if let Some(v) = global_get(s.store) {
-        return (v, Origin::Global);
+        return (decode_membership(s, v), Origin::Global);
     }
     (effective_default(s), Origin::Default)
+}
+
+/// Decode the shared "interfaces" store or "prefer" store (JSON) into the
+/// view appropriate for the requested key.
+fn decode_store_value(s: &Setting, raw: String) -> String {
+    if s.store == "interfaces" {
+        if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+            let mode = obj["m"].as_str().unwrap_or("");
+            let items = obj["i"].as_str().unwrap_or("");
+            let want_mode = match s.key {
+                "avoid" | "exclude" => "avoid",
+                "only" | "include" => "only",
+                _ => "avoid",
+            };
+            if mode == want_mode { return items.to_string(); }
+        }
+        return String::new();
+    }
+    if s.store == "prefer" {
+        if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+            if let Some(order) = obj["o"].as_str() {
+                return order.to_string();
+            }
+        }
+    }
+    raw
+}
+
+fn decode_membership(s: &Setting, raw: String) -> String {
+    decode_store_value(s, raw)
 }
 
 // -- typed convenience for behavioral consumers (up/recv/relay wiring) ------
@@ -371,6 +437,33 @@ pub fn resolve(s: &Setting, peer: Option<&str>) -> (String, Origin) {
 pub fn get_bool(key: &str, peer: Option<&str>) -> bool {
     let Some(s) = find(key) else { return false };
     truthy(&resolve(s, peer).0)
+}
+
+/// Effective string for a key, or None when it resolves to the empty default.
+/// Read the prefer strength (soft|hard) from the raw store, or "soft" if unset.
+pub fn prefer_strength(peer: Option<&str>) -> &'static str {
+    let raw = if let Some(p) = peer {
+        peer_get(p, "prefer").unwrap_or_default()
+    } else {
+        global_get("prefer").unwrap_or_default()
+    };
+    if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+        if obj["s"].as_str() == Some("hard") {
+            return "hard";
+        }
+    }
+    "soft"
+}
+
+/// Read the RAW store value (no decode) for the interfaces membership config.
+/// Returns the JSON string or empty so the filter can parse mode+items directly.
+pub fn raw_membership(peer: Option<&str>) -> String {
+    if let Some(p) = peer {
+        if let Some(v) = peer_get(p, "interfaces") {
+            return v;
+        }
+    }
+    global_get("interfaces").unwrap_or_default()
 }
 
 /// Effective string for a key, or None when it resolves to the empty default.
@@ -450,6 +543,12 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
         Kind::Str => {
             if s.key == "server" && !(raw.starts_with("http://") || raw.starts_with("https://")) {
                 bail!("server must be an http(s) URL, e.g. https://api.example.com");
+            }
+            Ok(raw.to_string())
+        }
+        Kind::List => {
+            if raw.is_empty() {
+                bail!("'{}' needs a comma-separated list (e.g. wl1,eth0)", s.key);
             }
             Ok(raw.to_string())
         }
@@ -635,6 +734,7 @@ pub async fn run_set(
     peers: &[String],
     dry_run: bool,
     reset: bool,
+    hard: bool,
     yes: bool,
     json_out: bool,
 ) -> Result<()> {
@@ -644,8 +744,19 @@ pub async fn run_set(
     match (key, value) {
         (None, _) => readout(json_out),
         (Some(k), None) => {
-            // `set <key>` with no value = read it (ergonomic shortcut to `get`).
-            run_get(k, peers.first().map(|s| s.as_str()), false, None, json_out)
+            // `set <key>` with no value.
+            let s = lookup(k)?;
+            let tty = std::io::stdout().is_terminal();
+            if json_out {
+                let aff = build_affordance(s);
+                crate::interact::render_json_steer(&aff);
+            } else if tty {
+                render_missing_interactive(s);
+            } else {
+                let aff = build_affordance(s);
+                crate::interact::render_steer(&aff);
+            }
+            Ok(())
         }
         (Some(k), Some(v)) => {
             let s = lookup(k)?;
@@ -654,7 +765,22 @@ pub async fn run_set(
             }
             // Validate the value once (fail fast before writing anything), and
             // every target device, so a typo in peer 2 never half-applies peer 1.
-            let new = canonicalize(s, v)?;
+            let raw = canonicalize(s, v)?;
+            // Membership refactor: avoid/only share one store. Encode as JSON
+            // so the file carries the mode alongside the items.
+            let new = if s.store == "interfaces" {
+                let mode = match s.key {
+                    "avoid" => "avoid",
+                    "only" | "include" => "only",
+                    _ => "avoid",
+                };
+                json!({"m": mode, "i": raw}).to_string()
+            } else if s.store == "prefer" {
+                let strength = if hard { "hard" } else { "soft" };
+                json!({"o": raw, "s": strength}).to_string()
+            } else {
+                raw
+            };
             for p in peers {
                 require_peer_known(p)?;
             }
@@ -767,6 +893,150 @@ fn run_reset(dry_run: bool, yes: bool) -> Result<()> {
 
 /// No-args readout. TTY: aligned colored table. Pipe: tab-separated rows.
 /// `--json`: complete structured array (global rows + per-peer overrides).
+/// Build an Affordance when `filament set <key>` is given without a value.
+/// Renders interactively (TTY), as steer (non-TTY), or as JSON (--json).
+fn render_missing_interactive(s: &Setting) {
+    let (cur_val, origin) = resolve(s, None);
+    let subtitle = if cur_val.is_empty() {
+        format!("(currently unset) [{}]", origin.label())
+    } else {
+        format!("currently: {}  [{}]", cur_val, origin.label())
+    };
+    match s.kind {
+        Kind::List => {
+            let is_membership = s.key == "avoid" || s.key == "only" || s.key == "include";
+            let aff = build_affordance_with_current(s, &cur_val);
+            let opts = aff.options.unwrap_or_default();
+
+            if is_membership {
+                // Membership (avoid/only): multi-select checklist
+                match crate::interact::interactive_checklist(&aff.command, &subtitle, &opts) {
+                    Some(chosen) => {
+                        if chosen.is_empty() {
+                            eprintln!("{} cancelled (nothing selected)", s.key);
+                        } else {
+                            let _ = set(s.key, &chosen, None);
+                            let color = ui::stdout_color();
+                            eprintln!("{} {}: {} {} {} (global)", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), chosen);
+                        }
+                    }
+                    None => eprintln!("{} cancelled", s.key),
+                }
+            } else {
+                // Arrangement (prefer): reorderable list
+                match crate::interact::interactive_reorder(&aff.command, &subtitle, &opts, crate::interact::Strength::Soft) {
+                    Some((ordered, strength)) => {
+                        let _ = set(s.key, &ordered, None);
+                        let color = ui::stdout_color();
+                        let s_label = if strength == crate::interact::Strength::Hard { " (hard)" } else { "" };
+                        eprintln!("{} {}: {} {} {}{s_label} (global)", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), ordered);
+                    }
+                    None => eprintln!("{} cancelled", s.key),
+                }
+            }
+        }
+        _ => {
+            // Non-List: show current value + help
+            let color = ui::stdout_color();
+            println!("{} {} = {}  ({})", s.key, ui::paint_when(color, ui::Tone::Dim, &origin.label()), cur_val, s.help);
+            match s.kind {
+                Kind::Bool => println!("  on / off  (example: filament set {} on)", s.key),
+                Kind::Enum(vals) => println!("  values: {}  (example: filament set {} {})", vals.join(" / "), s.key, vals[0]),
+                Kind::Str | Kind::Path => println!("  example: filament set {} <value>", s.key),
+                _ => {}
+            }
+            println!();
+            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: filament set <key> <value> [--peer <peer>]"));
+        }
+    }
+}
+
+fn render_missing_steer(s: &Setting) {
+    let aff = build_affordance(s);
+    crate::interact::render_steer(&aff);
+}
+
+fn render_missing_json(s: &Setting) {
+    let aff = build_affordance(s);
+    crate::interact::render_json_steer(&aff);
+}
+
+fn build_affordance(s: &Setting) -> crate::interact::Affordance {
+    let (cur_val, _) = resolve(s, None);
+    build_affordance_with_current(s, &cur_val)
+}
+
+fn build_affordance_with_current(s: &Setting, cur_val: &str) -> crate::interact::Affordance {
+    let command = format!("set {}", s.key);
+    let (needs, example) = match s.kind {
+        Kind::Bool => ("on / off".into(), format!("filament set {} on", s.key)),
+        Kind::Enum(vals) => (vals.join(" / "), format!("filament set {} {}", s.key, vals[0])),
+        Kind::List => ("interface name, group, or CIDR".into(), format!("filament set {} wl1", s.key)),
+        Kind::Str => ("a value".into(), format!("filament set {} <value>", s.key)),
+        Kind::Path => ("a path".into(), format!("filament set {} ~/Downloads", s.key)),
+    };
+
+    let options = if matches!(s.kind, Kind::List) {
+        let ifaces = crate::interact::enumerate_interfaces();
+        if ifaces.is_empty() {
+            None
+        } else {
+            // Split current value into parts for preselection
+            let current_parts: Vec<&str> = cur_val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            Some(ifaces.iter().map(|i| {
+                let ips: Vec<String> = i.ips.iter().map(|ip| ip.to_string()).collect();
+                let is_checked = current_parts.iter().any(|p| *p == i.name);
+                crate::interact::OptionEntry {
+                    label: i.name.clone(),
+                    detail: ips.join(", "),
+                    group: i.group.clone(),
+                    checked: is_checked,
+                }
+            }).collect())
+        }
+    } else {
+        None
+    };
+
+    crate::interact::Affordance { command, needs, example, options, options_label: "interfaces".into() }
+}
+
+// Remove old functions
+/// When avoid and prefer overlap, the latest set wins. Remove the overlapping
+/// items from the OTHER key so the two lists stay consistent.
+fn fix_overlap(key: &str, value: &str, peer: Option<&str>, color: bool) {
+    let parts: Vec<&str> = value.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return;
+    }
+    let other_key = if key == "avoid" { "prefer" } else if key == "prefer" { "avoid" } else { return };
+    if let Some(other_s) = find(other_key) {
+        let (other_val, _) = resolve(other_s, peer);
+        if !other_val.is_empty() {
+            let mut other_parts: Vec<&str> = other_val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let original_len = other_parts.len();
+            other_parts.retain(|p| !parts.contains(p));
+            if other_parts.len() < original_len {
+                if other_parts.is_empty() {
+                    // All items removed — clear the key entirely
+                    let _ = global_remove(other_key);
+                } else {
+                    let new_val = other_parts.join(",");
+                    let _ = set(other_key, &new_val, peer);
+                }
+                let removed: Vec<&&str> = parts.iter().filter(|p| other_val.split(',').any(|o| o.trim() == **p)).collect();
+                let removed_str: Vec<&str> = removed.iter().map(|r| **r).collect();
+                let msg = format!("removed {} from {}", removed_str.join(","), other_key);
+                if color {
+                    eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, &msg));
+                } else {
+                    eprintln!("  {msg}");
+                }
+            }
+        }
+    }
+}
+
 fn readout(json_out: bool) -> Result<()> {
     let peers = peer_load();
 
@@ -795,19 +1065,22 @@ fn readout(json_out: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Human surface: aligned table with provenance, no borders.
+    let color = ui::stdout_color();
     let tty = std::io::stdout().is_terminal();
+
     if !tty {
-        // Machine surface: one entry per line, no header, no color, no borders.
-        // Always 3 columns so `cut -f2` is stable.
+        // Non-TTY default: plain TSV (not JSON). Scripts parse this.
         for s in registry() {
             let (v, _) = resolve(s, None);
-            println!("{}\t{}\tglobal", s.key, v);
+            let val = if v.is_empty() { "(none)".to_string() } else { v };
+            println!("{}\t{}\tglobal\t{}", s.key, val, short_help(s));
         }
         for (dev, kv) in &peers {
             if let Some(obj) = kv.as_object() {
                 for (store, val) in obj {
-                    if let Some(s) = registry().iter().find(|s| s.store == store) {
-                        println!("{}\t{}\tpeer:{dev}", s.key, val.as_str().unwrap_or_default());
+                    if let Some(s) = registry().iter().find(|r| r.store == store) {
+                        println!("{}\t{}\tpeer:{dev}\t{}", s.key, val.as_str().unwrap_or_default(), short_help(s));
                     }
                 }
             }
@@ -815,46 +1088,97 @@ fn readout(json_out: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Human surface: aligned table with provenance, no borders.
-    let color = ui::stdout_color();
-    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    // TTY: aligned table with WHAT IT DOES column.
+    // Build rows: (key, value, where_label, help, is_default, is_peer_child, peer_name)
+    let mut rows: Vec<(String, String, String, String, bool, bool, String)> = Vec::new();
+    let mut peer_rows: Vec<(String, String, String, String, bool, bool, String)> = Vec::new();
+
     for s in registry() {
         let (v, o) = resolve(s, None);
-        rows.push((s.key.into(), v, "global".into(), o.label()));
-    }
-    for (dev, kv) in &peers {
-        if let Some(obj) = kv.as_object() {
-            for (store, val) in obj {
-                if let Some(s) = registry().iter().find(|s| s.store == store) {
-                    rows.push((s.key.into(), val.as_str().unwrap_or_default().into(), format!("peer:{dev}"), format!("peer:{dev}")));
+        let is_default = v.is_empty();
+        let val = if is_default { "(none)".into() } else { v };
+        let where_ = match o {
+            Origin::Default => "default".into(),
+            Origin::Global => "config".into(),
+            Origin::Env(v) => format!("env:{v}"),
+            Origin::Peer(d) => format!("peer:{d}"),
+        };
+        let help = setting_help_line(s);
+        rows.push((s.key.into(), val, where_, help, is_default, false, String::new()));
+
+        // Collect per-peer overrides for this setting
+        for (dev, kv) in &peers {
+            if let Some(obj) = kv.as_object() {
+                if let Some(pv) = obj.get(s.store) {
+                    let pval = pv.as_str().unwrap_or_default().to_string();
+                    peer_rows.push((
+                        s.key.into(),
+                        pval,
+                        "peer".into(),
+                        String::new(),
+                        false,
+                        true,
+                        dev.clone(),
+                    ));
                 }
             }
         }
     }
-    let w0 = rows.iter().map(|r| r.0.len()).max().unwrap_or(3).max(7);
-    let w1 = rows.iter().map(|r| r.1.len()).max().unwrap_or(5).max(5);
-    let w2 = rows.iter().map(|r| r.2.len()).max().unwrap_or(5).max(5);
+
+    let w0 = rows.iter().map(|r| r.0.len() + if r.5 { 6 } else { 0 }).max().unwrap_or(7).max(7);
+    let w1 = rows.iter().chain(&peer_rows).map(|r| r.1.len()).max().unwrap_or(5).max(5);
+    let w2 = rows.iter().map(|r| r.2.len()).max().unwrap_or(7).max(7);
     let header = format!(
-        "{:w0$}  {:w1$}  {:w2$}  {}",
-        "SETTING", "VALUE", "SCOPE", "ORIGIN",
+        "{:w0$}  {:w1$}  {:w2$}  WHAT IT DOES",
+        "SETTING", "VALUE", "WHERE",
         w0 = w0, w1 = w1, w2 = w2
     );
     println!("{}", ui::paint_when(color, ui::Tone::Dim, &header));
-    for (k, v, sc, or) in &rows {
-        let dim_default = or == "default";
-        let line = format!("{k:w0$}  {v:w1$}  {sc:w2$}  {or}", w0 = w0, w1 = w1, w2 = w2);
-        if dim_default {
+
+    for (k, v, wh, help, is_default, _is_child, _pn) in &rows {
+        let line = format!("{k:w0$}  {v:w1$}  {wh:w2$}  {help}", w0 = w0, w1 = w1, w2 = w2);
+        if *is_default {
             println!("{}", ui::paint_when(color, ui::Tone::Dim, &line));
         } else {
             println!("{line}");
+        }
+        // Print peer overrides grouped under this key
+        let key = k;
+        for (pk, pv, _pwh, _ph, _pd, _pc, pn) in peer_rows.iter().filter(|r| r.0 == *key) {
+            let indent = "   |- ";
+            let label = "peer";
+            let child = format!("{indent}{pn:wpad$}  {pv:w1$}  {label:w2$}",
+                wpad = w0.saturating_sub(6), w1 = w1, w2 = w2);
+            println!("{child}");
         }
     }
     println!();
     println!(
         "{}",
-        ui::paint_when(color, ui::Tone::Dim, "change: filament set <key> <value> [--peer <device>]   reset: filament unset <key>")
+        ui::paint_when(color, ui::Tone::Dim, "edit: filament set <key>   change: filament set <key> <value> [--peer <peer>]   reset: filament unset <key>")
     );
     Ok(())
+}
+
+/// First sentence of help text, truncated to ~50 chars. Enums get their
+/// options appended inline.
+fn short_help(s: &Setting) -> String {
+    let base = s.help.split(". ").next().unwrap_or(s.help);
+    let base = base.trim();
+    let mut out = if base.len() > 55 {
+        format!("{}…", &base[..52])
+    } else {
+        base.to_string()
+    };
+    if let Kind::Enum(vals) = s.kind {
+        out.push_str(&format!(" {}", vals.join("/")));
+    }
+    out
+}
+
+/// Like short_help but also appends enum options when present.
+fn setting_help_line(s: &Setting) -> String {
+    short_help(s)
 }
 
 // --------------------------------------------------------------- extract --
@@ -1048,6 +1372,49 @@ mod tests {
             assert_eq!(n, 1, "only the safe entry is written");
             assert!(into.join("bundle/ok.txt").exists());
             assert!(!config_dir().join("escape.txt").exists(), "traversal blocked");
+        });
+    }
+
+    #[test]
+    fn avoid_resolve_matches_what_was_set() {
+        with_tmp_cfg(|| {
+            let devs = config_dir().join("devices.json");
+            std::fs::write(&devs, r#"[{"name":"laptop","secret":"x"}]"#).unwrap();
+
+            // Low-level set writes raw; the membership JSON wrapping happens in run_set.
+            // Here we write the JSON directly so resolve can decode it.
+            global_put("interfaces", r#"{"m":"avoid","i":"tailscale0,lo"}"#).unwrap();
+            let resolved = resolve(find("avoid").unwrap(), None).0;
+            assert_eq!(resolved, "tailscale0,lo");
+        });
+    }
+
+    #[test]
+    fn fix_overlap_removes_from_other_key() {
+        with_tmp_cfg(|| {
+            let devs = config_dir().join("devices.json");
+            std::fs::write(&devs, r#"[{"name":"laptop","secret":"x"}]"#).unwrap();
+
+            // Set prefer, then fix_overlap for avoid: items in avoid are removed from prefer
+            set("prefer", "wl1,tailscale0", None).unwrap();
+            set("avoid", "wl1", None).unwrap();
+            fix_overlap("avoid", "wl1", None, false);
+            assert_eq!(resolve(find("prefer").unwrap(), None).0, "tailscale0",
+                "wl1 removed from prefer, tailscale0 kept");
+        });
+    }
+
+    #[test]
+    fn fix_overlap_clears_other_when_all_removed() {
+        with_tmp_cfg(|| {
+            let devs = config_dir().join("devices.json");
+            std::fs::write(&devs, r#"[{"name":"laptop","secret":"x"}]"#).unwrap();
+
+            set("avoid", "wl1", None).unwrap();
+            set("prefer", "wl1", None).unwrap();
+            fix_overlap("prefer", "wl1", None, false);
+            assert_eq!(resolve(find("avoid").unwrap(), None).0, "",
+                "avoid cleared when prefer claims the only item");
         });
     }
 }

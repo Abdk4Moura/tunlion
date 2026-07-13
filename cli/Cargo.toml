@@ -55,6 +55,7 @@ filament-pake = { path = "../pake" }
 # the rest of the rustls tree; we hand quinn an explicit ring-based config so
 # no process-default crypto provider is required.
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+quinn-proto = "0.11"
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
 # L3 overlay crypto: a per-device Ed25519 identity whose public key IS the overlay
 # address (self-certifying, Yggdrasil-style). ring is already in the tree via
