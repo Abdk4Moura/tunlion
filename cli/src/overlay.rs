@@ -101,13 +101,7 @@ pub fn addr_v4_from_pubkey(pubkey: &[u8; 32]) -> std::net::Ipv4Addr {
 // ------------------------------------------------------------- identity key --
 
 fn key_path() -> PathBuf {
-    let base = if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        PathBuf::from(d)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/filament")
-    };
-    base.join("overlay.ed25519")
+    crate::platform::Paths::config_path("overlay.ed25519")
 }
 
 /// This device's overlay identity: the Ed25519 keypair + its cached pubkey/addr.
@@ -129,15 +123,8 @@ impl Identity {
                 let rng = ring::rand::SystemRandom::new();
                 let doc = Ed25519KeyPair::generate_pkcs8(&rng)
                     .map_err(|_| anyhow!("overlay key generation failed"))?;
-                if let Some(d) = path.parent() {
-                    std::fs::create_dir_all(d)?;
-                }
-                std::fs::write(&path, doc.as_ref()).context("write overlay key")?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
+                crate::platform::SecretFile::write(&path, doc.as_ref())
+                    .context("write overlay key")?;
                 doc.as_ref().to_vec()
             }
         };

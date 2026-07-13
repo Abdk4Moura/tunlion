@@ -267,11 +267,7 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
 // ------------------------------------------------------------------ store --
 
 pub(crate) fn config_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/filament")
+    crate::platform::Paths::config_dir()
 }
 
 fn global_path() -> PathBuf {
@@ -328,16 +324,7 @@ fn peer_load() -> serde_json::Map<String, Value> {
 }
 
 fn peer_save(m: &serde_json::Map<String, Value>) -> Result<()> {
-    let p = peer_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(&p, serde_json::to_string_pretty(&Value::Object(m.clone()))?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::platform::SecretFile::write_str(&peer_path(), &serde_json::to_string_pretty(&Value::Object(m.clone()))?)?;
     Ok(())
 }
 
