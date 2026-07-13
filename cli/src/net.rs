@@ -671,13 +671,7 @@ fn dns_timeout_ms() -> u64 {
 }
 
 fn dns_cache_path() -> PathBuf {
-    let base = if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        PathBuf::from(d)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/filament")
-    };
-    base.join("signaling-dns.json")
+    crate::platform::Paths::config_path("signaling-dns.json")
 }
 
 /// Pull `host` and `port` out of an `http(s)://` URL for resolution. Returns the
