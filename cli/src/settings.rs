@@ -267,11 +267,7 @@ pub(crate) fn levenshtein(a: &str, b: &str) -> usize {
 // ------------------------------------------------------------------ store --
 
 pub(crate) fn config_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/filament")
+    crate::platform::Paths::config_dir()
 }
 
 fn global_path() -> PathBuf {

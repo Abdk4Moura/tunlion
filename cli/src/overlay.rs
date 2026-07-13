@@ -101,13 +101,7 @@ pub fn addr_v4_from_pubkey(pubkey: &[u8; 32]) -> std::net::Ipv4Addr {
 // ------------------------------------------------------------- identity key --
 
 fn key_path() -> PathBuf {
-    let base = if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        PathBuf::from(d)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/filament")
-    };
-    base.join("overlay.ed25519")
+    crate::platform::Paths::config_path("overlay.ed25519")
 }
 
 /// This device's overlay identity: the Ed25519 keypair + its cached pubkey/addr.

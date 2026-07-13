@@ -30,6 +30,7 @@ mod mount;
 mod backup;
 mod net;
 mod overlay;
+mod platform;
 mod pake_ceremony;
 mod ping;
 mod sdnotify;
@@ -1243,11 +1244,7 @@ fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
 }
 
 fn devices_path() -> PathBuf {
-    if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        return PathBuf::from(d).join("devices.json");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/filament/devices.json")
+    crate::platform::Paths::config_path("devices.json")
 }
 
 pub(crate) fn devices_load() -> Vec<(String, String)> {
@@ -5647,6 +5644,9 @@ async fn main() -> Result<()> {
     // rustls refuses to guess between two providers, so pick ring explicitly
     // BEFORE anything touches TLS.
     rustls::crypto::ring::default_provider().install_default().ok();
+    // Migrate state from legacy cwd-relative .config/filament (the broken
+    // Windows fallback when HOME was unset) to the platform-correct path.
+    platform::Paths::migrate_legacy();
     // Bare-arg comfort dispatch: `filament <path>` sends it with a code;
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();

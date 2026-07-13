@@ -15,15 +15,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// The filament config dir (same root as devices.json), honoring
-/// FILAMENT_CONFIG_DIR for hermetic tests. NOT the user's ~/.ssh.
-fn config_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/filament")
-}
+use crate::settings::config_dir;
 
 /// Directory holding the managed keypair + private known_hosts.
 fn ssh_dir() -> PathBuf {
