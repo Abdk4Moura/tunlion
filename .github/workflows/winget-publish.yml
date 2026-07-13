@@ -1,0 +1,105 @@
+name: winget-publish
+
+# After a CLI release is published, open a winget-pkgs PR automatically — UNLESS
+# the winget manifest schema has moved past what our templates target
+# (packaging/winget/*.tmpl). On a schema bump we STOP and file a review issue
+# instead, because a newer schema can add or require fields our templates don't
+# set. Update the templates to the new schema version and auto-submit resumes,
+# until the next bump.
+#
+# Setup (one-time): add a repo secret WINGET_TOKEN — a classic PAT with
+# `public_repo` scope — so CI can fork microsoft/winget-pkgs, push the branch,
+# and open the PR. The default GITHUB_TOKEN cannot fork an external repo or open
+# a cross-repo PR, so without this secret the submit step fails fast.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  issues: write # to file a "schema bumped, review needed" issue
+
+jobs:
+  winget:
+    # Only CLI releases (tag cli-vX.Y.Z); ignore any other release events.
+    if: startsWith(github.event.release.tag_name, 'cli-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # Belt-and-suspenders: the tag flows into shell + URLs downstream, so
+          # reject anything that isn't a well-formed cli-vX.Y.Z[-pre] tag before
+          # using it. (Releases are owner-created, but validate regardless.)
+          echo "$TAG" | grep -qE '^cli-v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' \
+            || { echo "::error::unexpected tag format: '$TAG'"; exit 1; }
+
+      - name: Compare our pinned schema vs winget's latest
+        id: schema
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # PINNED = the manifest schema version our templates target, read from
+          # the template itself so this never drifts out of sync with the files.
+          pinned=$(grep -oE 'winget-manifest\.installer\.[0-9]+\.[0-9]+\.[0-9]+' \
+            packaging/winget/Abdk4Moura.Filament.installer.yaml.tmpl \
+            | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          # LATEST = newest manifest schema microsoft/winget-cli publishes.
+          latest=$(gh api repos/microsoft/winget-cli/contents/schemas/JSON/manifests \
+            --jq '.[].name' | sed 's/^v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          [ -n "$pinned" ] && [ -n "$latest" ] || { echo "could not resolve schema versions (pinned='$pinned' latest='$latest')"; exit 1; }
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$pinned" = "$latest" ]; then echo "match=yes" >> "$GITHUB_OUTPUT"; else echo "match=no" >> "$GITHUB_OUTPUT"; fi
+          echo "pinned=$pinned  latest=$latest"
+
+      - name: Schema bumped — file a review issue, skip auto-submit
+        if: steps.schema.outputs.match != 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          PINNED: ${{ steps.schema.outputs.pinned }}
+          LATEST: ${{ steps.schema.outputs.latest }}
+        run: |
+          set -euo pipefail
+          # De-dupe: if an open issue already tracks this exact bump, do nothing.
+          existing=$(gh issue list --state open --search "in:title winget schema $LATEST" --json number --jq 'length')
+          if [ "$existing" != "0" ]; then echo "review issue for schema $LATEST already open"; exit 0; fi
+          {
+            echo "Auto winget submission for **$TAG** was paused."
+            echo
+            echo "microsoft/winget-cli manifest schema is now **$LATEST**, but our templates in \`packaging/winget/*.tmpl\` target **$PINNED**."
+            echo
+            echo "**Action:** review the $LATEST schema for added/changed/required fields, update the three \`packaging/winget/*.tmpl\` files (schema URLs + \`ManifestVersion\`), then submit manually:"
+            echo
+            echo '```'
+            echo "packaging/release-followup.sh $TAG --pr"
+            echo '```'
+            echo
+            echo "Once the templates target $LATEST, this workflow auto-submits again until the next schema bump."
+          } > body.md
+          gh issue create --title "winget schema $LATEST released — review before publishing $TAG (templates at $PINNED)" --body-file body.md
+
+      - name: Submit winget-pkgs PR (schema unchanged)
+        if: steps.schema.outputs.match == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::WINGET_TOKEN secret is not set — cannot fork winget-pkgs or open the PR. Add a classic PAT with public_repo scope as WINGET_TOKEN."
+            exit 1
+          fi
+          git config --global user.name  "filament-release-bot"
+          git config --global user.email "release-bot@users.noreply.github.com"
+          # release-followup.sh renders the manifests, refreshes Homebrew, and
+          # (with --pr) forks winget-pkgs + opens the PR.
+          packaging/release-followup.sh "$TAG" --pr
