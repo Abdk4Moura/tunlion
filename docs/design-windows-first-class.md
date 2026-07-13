@@ -5,6 +5,14 @@ every path behind `#[cfg(unix)]` degrades to a stub, a no-op, or a `bail!`. This
 plan takes Windows from "it builds" to "it feels native" — in three phases, with
 correctness and safety first.
 
+> **Scope note — this is really "first-class on every host."** Windows is the
+> worst-off, so it drives the plan, but several host-integration assumptions bite
+> **macOS and non-systemd Linux** too. The clearest example is **service
+> management**: the code assumes systemd (see the dedicated section below), which
+> is already broken on macOS (launchd), on Alpine/Void/Gentoo/Devuan
+> (OpenRC/runit/s6/SysV), and on Windows. Treat the `platform/` abstraction as
+> cross-platform, not Windows-only.
+
 ## What "first-class" means here
 
 Two bars, in order:
@@ -61,6 +69,53 @@ behavior is defined in one place per concern:
 
 This is the enabling refactor for P1/P2; P0 can begin against it incrementally.
 
+## Service management — detect, don't assume systemd
+
+Today the service layer *is* systemd. `filament up --install` (`main.rs:1945`)
+writes `~/.config/systemd/user/filament.service` and runs `systemctl`
+**unconditionally**; `install_system_service` (`main.rs:1759`) is a
+`#[cfg(target_os = "linux")]` systemd unit; `sdnotify.rs` speaks systemd's
+`Type=notify` readiness/watchdog protocol. On macOS, on non-systemd Linux
+(OpenRC/runit/s6/SysV), and on Windows, `--install` therefore writes a **dead
+unit file and runs a failing `systemctl`** — a broken experience, not a
+graceful one.
+
+Key reframe: **the daemon needs none of this.** `filament up` is just a
+long-running process; service integration is *only* for autostart + supervision.
+So the answer is an abstraction with an **honest fallback**, not "port systemd
+everywhere."
+
+### `ServiceHost` — detect the machine's manager and adapt
+
+- **Detect** the manager, in order:
+  - Linux: systemd (`/run/systemd/system`) → OpenRC → runit → s6 → SysV
+  - macOS: launchd
+  - Windows: Service Control Manager (or a Scheduled Task for a per-user,
+    no-admin install)
+  - else: `None`
+- **Backends** generate the right artifact — systemd unit / launchd plist / SCM
+  service / rc script — and map `notify_ready()` / `watchdog()` onto each (a
+  **no-op** where the manager has no such protocol; the daemon still runs fine).
+- **Graceful fallback** when no supported manager is detected: **do not write a
+  dead unit.** Print exact, copy-pasteable instructions for running `filament up`
+  at boot on that system, and/or offer a `--foreground` mode for the user to wire
+  into whatever they use. Honest beats broken.
+
+### Coverage decision (settled)
+
+**Big-3 native backends + honest fallback.** Ship native
+`systemd` (have) + `launchd` (macOS) + `Windows Service`, and **detect**
+everything else (OpenRC/runit/s6/SysV) to emit correct manual instructions rather
+than a broken unit. The long-tail init systems are just template generators that
+can be added later on demand once the trait exists — not a blocker.
+
+### Priority
+
+The **"stop writing dead systemd units off-systemd"** fix is a *correctness bug*,
+not a feature — pull it forward (P0/early-P1): gate `--install` on detection and
+fall back to instructions. That one change un-breaks macOS + non-systemd Linux +
+Windows immediately, before any native launchd/SCM backend lands.
+
 ## Phase 0 — Correct & safe (Windows stops being *wrong*)
 
 The bar-1 items. None are "features"; they're "the current behavior is broken or
@@ -86,8 +141,16 @@ unsafe on Windows."
    mesh is Linux-only. Make the `bail!`s match reality (enable where the backend
    exists; keep an honest message where it truly doesn't).
 
+6. **Stop assuming systemd (bug fix).** Gate `filament up --install`
+   (`main.rs:1945`) on `ServiceHost` detection so it no longer writes a dead
+   systemd unit + runs a failing `systemctl` on macOS / non-systemd Linux /
+   Windows. Where no supported manager is found, print instructions instead. See
+   *Service management* above. (Correctness fix; precedes the native launchd/SCM
+   backends in P2.)
+
 Exit criteria: a fresh Windows install writes protected state to `%APPDATA%`,
-`filament update` self-updates, and CI runs the suite on `windows-latest` green.
+`filament update` self-updates, `filament up --install` never emits a dead unit,
+and CI runs the suite on `windows-latest` green.
 
 ## Phase 1 — Native daily paths (parity on what people run hourly)
 
@@ -110,10 +173,14 @@ Exit criteria: a fresh Windows install writes protected state to `%APPDATA%`,
 
 ## Phase 2 — Native OS integration (Windows-idiomatic, not just ported)
 
-10. **Windows Service (SCM) + autostart.** Implement `ServiceHost` for Windows:
-    register `filament up` as a service (or a Scheduled Task for per-user),
-    map notify-ready/watchdog (`sdnotify.rs:42` is a no-op today) onto SCM status
-    reporting. `filament up --install` becomes native on Windows.
+10. **Native service backends — launchd + Windows Service (SCM).** With the P0
+    detection + fallback already in place (see *Service management*), add the
+    remaining big-3 native backends: **launchd** on macOS (a
+    `~/Library/LaunchAgents/*.plist` + `launchctl`) and **Windows Service / SCM**
+    (or a Scheduled Task for a per-user, no-admin install), mapping
+    notify-ready/watchdog (`sdnotify.rs:42` is a no-op today) onto each. systemd
+    already exists; OpenRC/runit/SysV stay on the detect-and-instruct fallback
+    until there's demand for native generators.
 11. **Firewall automation.** On first `up`, offer to add the inbound UDP rule via
     `netsh advfirewall` (with consent), so QUIC direct connect works without a
     silent Windows Firewall block. Mirror `ensure_net_admin_for_l3`'s advisory
