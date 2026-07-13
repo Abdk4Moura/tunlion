@@ -10874,12 +10874,11 @@ mod tests {
         // The L2/ssh acceptor (`up --shell`) keeps taking it (the prior fix).
         assert!(direct_ok_for(true, true));
         assert!(direct_ok_for(false, true), "L2 acceptor must take direct even when not a daemon");
-        // A one-shot command (daemon=false) with no L2 and no env gate keeps the
-        // WebRTC default: send/recv/pair are deliberately left unchanged.
-        assert!(!direct_ok_for(false, false), "one-shot send/recv/pair keep the WebRTC default");
-        // The env gate still forces it on for any session.
-        unsafe { std::env::set_var("FILAMENT_DIRECT", "1") };
-        assert!(direct_ok_for(false, false), "FILAMENT_DIRECT=1 forces direct for any session");
+        // A one-shot command (daemon=false) with no L2 now defaults to direct-ON
+        // (the default changed from opt-in to opt-out). FILAMENT_DIRECT=0 restores WebRTC.
+        assert!(direct_ok_for(false, false), "default direct-ON for any session");
+        unsafe { std::env::set_var("FILAMENT_DIRECT", "0") };
+        assert!(!direct_ok_for(false, false), "FILAMENT_DIRECT=0 disables direct");
         unsafe { std::env::remove_var("FILAMENT_DIRECT") };
     }
 
