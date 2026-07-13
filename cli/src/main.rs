@@ -1951,7 +1951,8 @@ fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: 
 
 #[cfg(not(target_os = "linux"))]
 fn install_system_service(_shell: bool, _shell_only: &Option<String>, _shell_user: &Option<String>) -> Result<()> {
-    bail!("--install --system (ambient-cap system service) is Linux/systemd only");
+    let hint = platform::ServiceHost::detect().install_instructions();
+    bail!("--install --system (ambient-cap system service) is not supported on this platform. {hint}");
 }
 
 async fn up_cmd(
@@ -1975,6 +1976,21 @@ async fn up_cmd(
         return install_system_service(shell, &shell_only, &shell_user);
     }
     if install {
+        // Gate --install on a detected, supported service manager.
+        // Only systemd has a native backend today; other platforms get
+        // correct manual instructions instead of a dead unit.
+        let host = platform::ServiceHost::detect();
+        if !host.supports_install() {
+            let hint = host.install_instructions();
+            if cfg!(target_os = "macos") {
+                eprintln!("filament: --install is not yet supported on macOS ({hint})");
+            } else if cfg!(target_os = "windows") {
+                eprintln!("filament: --install is not yet supported on Windows ({hint})");
+            } else {
+                eprintln!("filament: --install requires systemd ({hint})");
+            }
+            return Ok(());
+        }
         let exe = std::env::current_exe()?;
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
