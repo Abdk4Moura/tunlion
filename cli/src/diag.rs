@@ -261,13 +261,7 @@ impl Attempt {
 const MAX_JSONL_BYTES: u64 = 512 * 1024;
 
 fn diag_path() -> PathBuf {
-    let base = if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        PathBuf::from(d)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/filament")
-    };
-    base.join("diag.jsonl")
+    crate::platform::Paths::config_path("diag.jsonl")
 }
 
 fn write_jsonl(v: &Value) {

@@ -15,15 +15,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// The filament config dir (same root as devices.json), honoring
-/// FILAMENT_CONFIG_DIR for hermetic tests. NOT the user's ~/.ssh.
-fn config_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config/filament")
-}
+use crate::settings::config_dir;
 
 /// Directory holding the managed keypair + private known_hosts.
 fn ssh_dir() -> PathBuf {
@@ -69,7 +61,7 @@ pub fn ensure_managed_key() -> Result<String> {
         if !st.success() {
             return Err(anyhow!("ssh-keygen failed to create the managed key"));
         }
-        chmod(&key, 0o600);
+        crate::platform::SecretFile::restrict(&key);
         chmod(&pub_path, 0o644);
     }
     let line = std::fs::read_to_string(&pub_path).context("read managed pubkey")?;
@@ -149,8 +141,8 @@ pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
         kept.push('\n');
     }
     kept.push_str(&format!("{BEGIN} {device}\n{pubkey}\n{END} {device}\n"));
-    std::fs::write(&path, kept).context("write authorized_keys")?;
-    chmod(&path, 0o600);
+    crate::platform::SecretFile::write_str(&path, &kept)
+        .context("write authorized_keys")?;
     Ok(())
 }
 
@@ -160,8 +152,8 @@ pub fn remove_authorized_key(device: &str) -> Result<()> {
     let path = authorized_keys_path();
     let Ok(existing) = std::fs::read_to_string(&path) else { return Ok(()) };
     let kept = strip_block(&existing, device);
-    std::fs::write(&path, kept).context("write authorized_keys")?;
-    chmod(&path, 0o600);
+    crate::platform::SecretFile::write_str(&path, &kept)
+        .context("write authorized_keys")?;
     Ok(())
 }
 
@@ -255,8 +247,8 @@ pub fn pin_host_keys(dest_token: &str, hostkeys: &[String]) -> Result<()> {
         }
         out.push_str(&format!("{dest_token} {k}\n"));
     }
-    std::fs::write(&path, out).context("write known_hosts")?;
-    chmod(&path, 0o600);
+    crate::platform::SecretFile::write_str(&path, &out)
+        .context("write known_hosts")?;
     Ok(())
 }
 
@@ -320,13 +312,7 @@ pub fn bootstrap_cache_put(device: &str, user: Option<&str>) {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     v[device] = serde_json::json!({ "user": user.unwrap_or(""), "ts": now_secs() });
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        chmod(dir, 0o700);
-    }
-    if std::fs::write(&path, v.to_string()).is_ok() {
-        chmod(&path, 0o600);
-    }
+    let _ = crate::platform::SecretFile::write_str(&path, &v.to_string());
 }
 
 /// Drop the cached bootstrap for `device` (forces a full bootstrap next time).
@@ -337,7 +323,7 @@ pub fn bootstrap_cache_clear(device: &str) {
     if let Some(obj) = v.as_object_mut() {
         obj.remove(device);
     }
-    let _ = std::fs::write(&path, v.to_string());
+    let _ = crate::platform::SecretFile::write_str(&path, &v.to_string());
 }
 
 #[cfg(test)]

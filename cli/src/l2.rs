@@ -3705,6 +3705,7 @@ mod h1_tests {
     /// Crucially it verifies BEFORE the client is committed, so the fallback is
     /// instant - never the 25s ssh-ConnectTimeout stall an accepted-then-dead
     /// connection would cause.
+    #[cfg(unix)]
     #[tokio::test]
     async fn warm_reuse_zombie_link_self_heals_instead_of_hanging() {
         let t = CapTransport::new();
@@ -3730,6 +3731,7 @@ mod h1_tests {
     /// false-flags a live link: a HEALTHY link that delivers a first frame within
     /// the window returns `Ok` with that frame preserved, and `serve_verified_stream`
     /// replays it to the client byte-for-byte (no peer bytes lost to the probe).
+    #[cfg(unix)]
     #[tokio::test]
     async fn warm_reuse_healthy_link_passes_and_replays_first_frame() {
         let t = CapTransport::new();
@@ -3772,6 +3774,7 @@ mod h1_tests {
     /// drop a healthy link (the bug that sent every warm `forward` to a cold link) -
     /// and replay it as ZERO bytes so the client sees no spurious data before its own
     /// exchange.
+    #[cfg(unix)]
     #[tokio::test]
     async fn warm_reuse_client_first_link_passes_on_open_ack() {
         let t = CapTransport::new();

@@ -30,13 +30,7 @@ use std::path::PathBuf;
 /// else `~/.config/filament`. Mirrors `devices_path()` / `pidfile()`. Portable
 /// (just path math); only used on unix where the socket is actually bound.
 pub fn control_sock_path() -> PathBuf {
-    let base = if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
-        PathBuf::from(d)
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config/filament")
-    };
-    base.join("control.sock")
+    crate::platform::Paths::config_path("control.sock")
 }
 
 /// True if the warm-reuse fast path is disabled by the operator. An escape hatch
