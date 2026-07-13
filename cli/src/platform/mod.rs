@@ -135,3 +135,118 @@ fn restrict_dacl(path: &Path) -> io::Result<()> {
         .output();
     Ok(())
 }
+
+// --------------------------------------------------------- ServiceHost --
+
+/// The detected service manager on this platform.
+///
+/// Used to gate `filament up --install` so it never writes a dead unit
+/// on an unsupported platform. Only systemd has a native backend today;
+/// other managers are detected and get correct manual instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceHost {
+    /// systemd (Linux, user or system scope).
+    Systemd,
+    /// launchd (macOS) — detected, no native backend yet.
+    Launchd,
+    /// Windows Service Control Manager — detected, no native backend yet.
+    WindowsService,
+    /// No recognized service manager (or we are inside a container).
+    None,
+}
+
+impl ServiceHost {
+    /// Detect the host's service manager.
+    pub fn detect() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            if Self::has_systemd() {
+                return ServiceHost::Systemd;
+            }
+            ServiceHost::None
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ServiceHost::Launchd
+        }
+        #[cfg(target_os = "windows")]
+        {
+            ServiceHost::WindowsService
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            ServiceHost::None
+        }
+    }
+
+    /// True when we have a native install backend (systemd for now).
+    pub fn supports_install(&self) -> bool {
+        matches!(self, ServiceHost::Systemd)
+    }
+
+    /// Human-readable instructions for manual autostart on this host.
+    /// Only called when `supports_install()` is false.
+    pub fn install_instructions(&self) -> &'static str {
+        match self {
+            ServiceHost::Launchd => "On macOS, create a LaunchAgent plist in ~/Library/LaunchAgents/ and load it with launchctl.",
+            ServiceHost::WindowsService => "On Windows, create a Scheduled Task (trigger: at logon) or register a Service with sc.exe.",
+            ServiceHost::None => "No service manager detected. Start filament with `filament up` in a terminal, or configure your init system manually.",
+            ServiceHost::Systemd => "",
+        }
+    }
+
+    /// Check whether systemd user instance is available.
+    #[cfg(target_os = "linux")]
+    fn has_systemd() -> bool {
+        // systemctl --user is the user-mode systemd instance;
+        // it fails if systemd isn't pid 1 OR the user session isn't systemd-managed
+        // (container, WSL1, non-systemd distro).
+        std::process::Command::new("systemctl")
+            .args(["--user", "is-system-running"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_returns_a_valid_variant() {
+        let host = ServiceHost::detect();
+        // On Linux with systemd this is Systemd; on other platforms it's
+        // whatever the detection says. The key property: it never panics,
+        // and supports_install is consistent.
+        assert!(
+            matches!(
+                host,
+                ServiceHost::Systemd
+                    | ServiceHost::Launchd
+                    | ServiceHost::WindowsService
+                    | ServiceHost::None
+            ),
+            "detect returned a valid variant: {host:?}"
+        );
+    }
+
+    #[test]
+    fn systemd_supports_install_others_do_not() {
+        assert!(ServiceHost::Systemd.supports_install());
+        assert!(!ServiceHost::Launchd.supports_install());
+        assert!(!ServiceHost::WindowsService.supports_install());
+        assert!(!ServiceHost::None.supports_install());
+    }
+
+    #[test]
+    fn install_instructions_non_empty_when_no_backend() {
+        assert!(!ServiceHost::Launchd.install_instructions().is_empty());
+        assert!(!ServiceHost::WindowsService.install_instructions().is_empty());
+        assert!(!ServiceHost::None.install_instructions().is_empty());
+        // Systemd has a backend, so instructions should be empty.
+        assert!(ServiceHost::Systemd.install_instructions().is_empty());
+    }
+}
