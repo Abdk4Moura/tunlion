@@ -9618,7 +9618,6 @@ async fn recv_cmd(
                         &term,
                         argv,
                         pty_guard,
-                        pty_guard,
                     )
                     .await
                     {
