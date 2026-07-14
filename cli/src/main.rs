@@ -31,6 +31,7 @@ mod backup;
 mod net;
 mod overlay;
 mod platform;
+mod pake;
 mod pake_ceremony;
 mod ping;
 mod sdnotify;
@@ -2378,14 +2379,14 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         let malformed = code.as_deref().filter(|c| {
             // A "valid claim shape" is words + a trailing dash-group; anything that
             // split_code can't peel into (nameplate, non-empty words) is malformed.
-            let normalized = filament_pake::norm_code(c);
-            let (np, pw) = filament_pake::split_code(&normalized);
+            let normalized = crate::pake::norm_code(c);
+            let (np, pw) = crate::pake::split_code(&normalized);
             pw.is_empty() || np.is_empty()
         });
         match (&code, malformed) {
             // No code at all -> CREATE entry.
             (None, _) => {
-                let auto_np = filament_pake::words::mint_nameplate();
+                let auto_np = crate::pake::words::mint_nameplate();
                 match codeentry::run("  pair · choose words  ", codeentry::Mode::Create, "", &auto_np)? {
                     codeentry::Outcome::Submitted(words) => {
                         word = Some(words);
@@ -2402,7 +2403,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // Malformed positional -> banner + prefilled CLAIM entry.
             (Some(raw), Some(_)) => {
                 malformed_entry_banner(raw);
-                let prefill = filament_pake::norm_code(raw);
+                let prefill = crate::pake::norm_code(raw);
                 match codeentry::run("  pair · code  ", codeentry::Mode::Claim, &prefill, "")? {
                     codeentry::Outcome::Submitted(c) => code = Some(c),
                     // Empty submit on a claim-fix means "give up on this code".
@@ -2429,7 +2430,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // `split_code`) only strips a trailing 3-5 digit nameplate, so a
             // two-word phrase like "gigantic element" keeps BOTH words.
             let (words, _np) =
-                filament_pake::split_chosen_code(&filament_pake::norm_code(w));
+                crate::pake::split_chosen_code(&crate::pake::norm_code(w));
             if password_word_tokens(&words) < 2 {
                 bail!(
                     "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
@@ -2472,8 +2473,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     match &code {
         Some(c) => {
             // Claimer: normalize the typed code, split, send ONLY the nameplate.
-            let normalized = filament_pake::norm_code(c);
-            let (np, pw) = filament_pake::split_code(&normalized);
+            let normalized = crate::pake::norm_code(c);
+            let (np, pw) = crate::pake::split_code(&normalized);
             if pw.is_empty() || np.is_empty() {
                 bail!("that code doesn't look right, expected something like brave-otter-ruby-3141");
             }
@@ -2487,12 +2488,12 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // nameplate is ALWAYS machine-minted. Ask the server to allocate ONLY
             // the nameplate. The full code is displayed from our own words when
             // pair-ok arrives (the server never echoes any words).
-            my_words = custom_words.clone().unwrap_or_else(filament_pake::words::mint_words);
+            my_words = custom_words.clone().unwrap_or_else(crate::pake::words::mint_words);
             // Reuse the nameplate the guided entry already previewed (if any), so
             // the created code matches what the user saw; otherwise mint fresh.
             my_nameplate = preview_nameplate
                 .clone()
-                .unwrap_or_else(filament_pake::words::mint_nameplate);
+                .unwrap_or_else(crate::pake::words::mint_nameplate);
             // STEERING: echo the normalized code we're about to create so the
             // creator sees EXACTLY what their peer must type (== what SPAKE2 hashes).
             if custom_words.is_some() {
@@ -2676,9 +2677,9 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     // Re-mint a FRESH nameplate; KEEP the creator's chosen words
                     // (--word), only mint fresh words when we minted them.
                     if custom_words.is_none() {
-                        my_words = filament_pake::words::mint_words();
+                        my_words = crate::pake::words::mint_words();
                     }
-                    my_nameplate = filament_pake::words::mint_nameplate();
+                    my_nameplate = crate::pake::words::mint_nameplate();
                     cer.restart(&my_words, &my_nameplate);
                     sio.emit("pair-create", json!({ "nameplate": my_nameplate, "v": 2 })).await.ok();
                     continue;
@@ -5960,7 +5961,7 @@ async fn main() -> Result<()> {
         Cmd::Man { page } => {
             if let Some(p) = page {
                 if p == "routing" {
-                    println!("{}", include_str!("../../docs/filament-routing.md"));
+                    println!("{}", include_str!("../docs/filament-routing.md"));
                     return Ok(());
                 }
             }
@@ -6315,7 +6316,7 @@ async fn send_cmd(
                 ui::Tone::Dim,
                 "  press enter to send over the local network, or type words to create a shareable code",
             ));
-            let auto_np = filament_pake::words::mint_nameplate();
+            let auto_np = crate::pake::words::mint_nameplate();
             match codeentry::run("  send · code  ", codeentry::Mode::Create, "", &auto_np)? {
                 codeentry::Outcome::Submitted(words) => {
                     use_code = true;
@@ -6419,7 +6420,7 @@ async fn send_cmd(
         send_words = match &word {
             Some(w) => {
                 let (words, _np) =
-                    filament_pake::split_chosen_code(&filament_pake::norm_code(w));
+                    crate::pake::split_chosen_code(&crate::pake::norm_code(w));
                 if password_word_tokens(&words) < 2 {
                     bail!(
                         "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
@@ -6429,9 +6430,9 @@ async fn send_cmd(
                 }
                 words
             }
-            None => filament_pake::words::mint_words(),
+            None => crate::pake::words::mint_words(),
         };
-        send_nameplate = filament_pake::words::mint_nameplate();
+        send_nameplate = crate::pake::words::mint_nameplate();
         sio.emit("pair-create", json!({ "nameplate": send_nameplate, "v": 2 })).await.ok();
     } else {
         ui::say(&format!("waiting for a peer in room {room} (same network auto-discovers; or use --code)"));
@@ -6710,9 +6711,9 @@ async fn send_cmd(
                 // burned code. The ephemeral ceremony restarts with the new pair.
                 if use_code && v["error"].as_str() == Some("taken") {
                     if word.is_none() {
-                        send_words = filament_pake::words::mint_words();
+                        send_words = crate::pake::words::mint_words();
                     }
-                    send_nameplate = filament_pake::words::mint_nameplate();
+                    send_nameplate = crate::pake::words::mint_nameplate();
                     if let Some(cer) = send_cer.as_mut() {
                         cer.restart(&send_words, &send_nameplate);
                     }
@@ -7723,8 +7724,8 @@ async fn recv_cmd(
         Some(c) => {
             // Split the typed code into (nameplate, words); send ONLY the
             // nameplate. The words become the SPAKE2 password held locally.
-            let normalized = filament_pake::norm_code(c);
-            let (np, pw) = filament_pake::split_code(&normalized);
+            let normalized = crate::pake::norm_code(c);
+            let (np, pw) = crate::pake::split_code(&normalized);
             if pw.is_empty() || np.is_empty() {
                 bail!("that code doesn't look right, expected something like brave-otter-371");
             }

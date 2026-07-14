@@ -1082,15 +1082,19 @@ dependencies = [
  "clap_mangen",
  "crossterm",
  "directories",
- "filament-pake",
  "flate2",
  "futures-util",
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "hmac",
  "libc",
  "openssl-sys",
  "portable-pty",
  "qrcode",
  "quinn",
  "quinn-proto",
+ "rand_core 0.6.4",
  "rcgen",
  "reqwest 0.13.4",
  "ring",
@@ -1098,28 +1102,16 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "smoltcp",
  "socket2 0.5.10",
+ "spake2",
  "tar",
  "tokio",
  "webrtc",
  "wintun",
  "zip",
-]
-
-[[package]]
-name = "filament-pake"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.2.17",
- "hex",
- "hkdf",
- "hmac",
- "rand_core 0.6.4",
- "sha2 0.10.9",
- "spake2",
- "wasm-bindgen",
 ]
 
 [[package]]

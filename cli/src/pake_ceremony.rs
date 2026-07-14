@@ -31,7 +31,7 @@
 //! payloads this module produces. That keeps it unit-testable end to end (two
 //! in-process ceremonies, no sockets), see the tests at the bottom.
 
-use filament_pake::{self, PakeState};
+use crate::pake::{self, PakeState};
 use serde_json::{json, Value};
 
 /// The capability set v2 first-pairing / ephemeral transfer-auth agrees on.
@@ -132,8 +132,8 @@ impl Ceremony {
     /// `nameplate` the numeric routing suffix. Both sides MUST pass identical
     /// password AND nameplate (the SPAKE2 identity) or they derive different K.
     pub fn new(password: &str, nameplate: &str, caps: Vec<String>) -> Self {
-        let caps_canon = filament_pake::canonical_caps(&caps);
-        let (state, msg) = filament_pake::start(password.as_bytes(), nameplate.as_bytes());
+        let caps_canon = crate::pake::canonical_caps(&caps);
+        let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
         Ceremony {
             caps,
             caps_canon,
@@ -151,7 +151,7 @@ impl Ceremony {
     /// server `taken` collision. Resets the session and the sent-flag so the new
     /// element goes out. The caller re-emits `pair-create {nameplate}`.
     pub fn restart(&mut self, password: &str, nameplate: &str) {
-        let (state, msg) = filament_pake::start(password.as_bytes(), nameplate.as_bytes());
+        let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
         self.state = Some(state);
         self.msg = msg;
         self.k = None;
@@ -191,7 +191,7 @@ impl Ceremony {
             return None;
         }
         let k = self.k.as_ref()?;
-        let mac = filament_pake::our_confirm(k, my_fp, their_fp, &self.caps_canon);
+        let mac = crate::pake::our_confirm(k, my_fp, their_fp, &self.caps_canon);
         self.sent_confirm = true;
         Some(json!({
             "type": "pake-confirm", "v": 2,
@@ -215,7 +215,7 @@ impl Ceremony {
                 if self.k.is_none() {
                     if let Some(state) = self.state.take() {
                         let peer_el = data["msg"].as_str().and_then(b64_decode).unwrap_or_default();
-                        match filament_pake::finish(state, &peer_el) {
+                        match crate::pake::finish(state, &peer_el) {
                             Some(k) => self.k = Some(k),
                             None => {
                                 return Inbound::Abort(
@@ -241,14 +241,14 @@ impl Ceremony {
                 };
                 // We MAC against OUR fixed caps, so a server that rewrites the
                 // relayed `caps` field cannot make the MAC verify.
-                if filament_pake::verify_peer_confirm(
+                if crate::pake::verify_peer_confirm(
                     &k,
                     my_fp,
                     their_fp,
                     &self.caps_canon,
                     &recv_mac,
                 ) {
-                    self.secret = Some(filament_pake::secret_from_k(&k));
+                    self.secret = Some(crate::pake::secret_from_k(&k));
                     Inbound::Consumed
                 } else {
                     self.aborted = Some("key confirmation failed".to_string());
