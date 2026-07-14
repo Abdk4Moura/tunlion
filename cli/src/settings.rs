@@ -124,6 +124,17 @@ pub fn registry() -> &'static [Setting] {
             help: "Relay policy: auto (direct, fall back to relay), always (force TURN), never (direct-only). Per-peer: filament set relay never --peer dovm",
         },
         Setting {
+            key: "shell-program",
+            aliases: &[],
+            store: "shell-program",
+            kind: Kind::Str,
+            default: "",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_SHELL"),
+            daemon: true,
+            help: "Shell program for PTY sessions (e.g. \"bash -l\", \"pwsh -NoLogo\"). Args allowed. Overrides platform default.",
+        },
+        Setting {
             key: "prefer",
             aliases: &["via"],
             store: "prefer",
