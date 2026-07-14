@@ -1,0 +1,76 @@
+name: publish-registries
+
+# On a published cli-v* release, publish filament-cli to crates.io and npm.
+# Each job is independent and skips cleanly if its token secret is unset, so you
+# can enable them one at a time.
+#
+# Auth:
+#   crates.io — CARGO_REGISTRY_TOKEN secret (Account Settings → API Tokens)
+#   npm       — Trusted Publishing via OIDC (no token). Configure a Trusted
+#               Publisher for `filament-cli` on npmjs.com pointing at this repo
+#               and workflow (Abdk4Moura/filament → publish-registries.yml).
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  crates-io:
+    if: startsWith(github.event.release.tag_name, 'cli-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Rust toolchain (edition 2024)
+        run: rustup update stable && rustup default stable
+      - name: cargo publish filament-cli
+        working-directory: cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."
+            exit 0
+          fi
+          # pake is inlined, so filament-cli has no unpublished path-deps.
+          # --allow-dirty is unnecessary (clean checkout); republishing an existing
+          # version is a no-op error we tolerate so re-runs are safe.
+          cargo publish || {
+            echo "::warning::cargo publish failed (already published this version?)"; exit 0;
+          }
+
+  npm:
+    if: startsWith(github.event.release.tag_name, 'cli-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm Trusted Publishing (no long-lived token)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Use an npm that supports Trusted Publishing (OIDC)
+        run: npm install -g npm@latest
+      - name: npm publish filament-cli (Trusted Publishing)
+        working-directory: packaging/npm
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # Validate the tag before it flows into `npm version`.
+          echo "$TAG" | grep -qE '^cli-v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' \
+            || { echo "::error::unexpected tag format: '$TAG'"; exit 1; }
+          version="${TAG#cli-v}"
+          # Set the package version to the release version (source keeps 0.0.0).
+          npm version "$version" --no-git-tag-version --allow-same-version
+          # Trusted Publishing: npm authenticates via the OIDC id-token — no
+          # NPM_TOKEN. Requires a Trusted Publisher for filament-cli configured on
+          # npmjs.com pointing at this repo + workflow. Provenance is automatic.
+          npm publish --access public || {
+            echo "::warning::npm publish failed — is the Trusted Publisher set on npmjs.com for filament-cli -> Abdk4Moura/filament -> publish-registries.yml?"; exit 0;
+          }

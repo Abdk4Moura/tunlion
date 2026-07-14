@@ -1,0 +1,36 @@
+{
+  "name": "filament-cli",
+  "version": "0.0.0",
+  "description": "Send files and reach your devices, peer to peer — no upload, no account. The CLI for filament.autumated.com.",
+  "bin": {
+    "filament": "bin/filament.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "keywords": [
+    "p2p",
+    "file-transfer",
+    "webrtc",
+    "quic",
+    "airdrop",
+    "file-sharing",
+    "mesh",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abdk4Moura/filament.git"
+  },
+  "homepage": "https://filament.autumated.com",
+  "bugs": "https://github.com/Abdk4Moura/filament/issues",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  }
+}

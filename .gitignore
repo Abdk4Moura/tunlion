@@ -35,3 +35,7 @@ deploy/coturn/*.pem
 # Agent scratch (never track)
 .opencode/
 .claude/
+
+# npm package: binary downloaded by postinstall at install time
+packaging/npm/vendor/
+packaging/npm/node_modules/
