@@ -1,8 +1,10 @@
 name: publish-registries
 
-# On a published cli-v* release, publish filament-cli to crates.io and npm.
-# Each job is independent and skips cleanly if its token secret is unset, so you
-# can enable them one at a time.
+# Publish filament-cli to crates.io and npm after a CLI release is built.
+#
+# Triggered by cli-release.yml COMPLETING (workflow_run) — NOT the `release`
+# event, because a release created by GITHUB_TOKEN does not fire `release`
+# workflows (GitHub recursion guard). workflow_dispatch allows manual backfill.
 #
 # Auth:
 #   crates.io — CARGO_REGISTRY_TOKEN secret (Account Settings → API Tokens)
@@ -11,18 +13,30 @@ name: publish-registries
 #               and workflow (Abdk4Moura/filament → publish-registries.yml).
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["cli-release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. cli-v0.4.2)"
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   crates-io:
-    if: startsWith(github.event.release.tag_name, 'cli-v')
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'cli-v'))
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
       - name: Update Rust toolchain (edition 2024)
         run: rustup update stable && rustup default stable
       - name: cargo publish filament-cli
@@ -36,20 +50,25 @@ jobs:
             exit 0
           fi
           # pake is inlined, so filament-cli has no unpublished path-deps.
-          # --allow-dirty is unnecessary (clean checkout); republishing an existing
-          # version is a no-op error we tolerate so re-runs are safe.
+          # Republishing an existing version is a tolerated no-op so re-runs/backfills are safe.
           cargo publish || {
             echo "::warning::cargo publish failed (already published this version?)"; exit 0;
           }
 
   npm:
-    if: startsWith(github.event.release.tag_name, 'cli-v')
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'cli-v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write # OIDC for npm Trusted Publishing (no long-lived token)
+    env:
+      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -58,8 +77,6 @@ jobs:
         run: npm install -g npm@latest
       - name: npm publish filament-cli (Trusted Publishing)
         working-directory: packaging/npm
-        env:
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           # Validate the tag before it flows into `npm version`.

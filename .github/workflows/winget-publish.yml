@@ -13,8 +13,17 @@ name: winget-publish
 # a cross-repo PR, so without this secret the submit step fails fast.
 
 on:
-  release:
-    types: [published]
+  # Triggered by cli-release.yml COMPLETING — NOT the `release` event, because a
+  # release created by GITHUB_TOKEN does not fire `release` workflows (GitHub
+  # recursion guard). workflow_dispatch allows manual backfill.
+  workflow_run:
+    workflows: ["cli-release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to submit (e.g. cli-v0.4.2)"
+        required: true
 
 permissions:
   contents: read
@@ -22,15 +31,18 @@ permissions:
 
 jobs:
   winget:
-    # Only CLI releases (tag cli-vX.Y.Z); ignore any other release events.
-    if: startsWith(github.event.release.tag_name, 'cli-v')
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'cli-v'))
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
 
       - name: Validate release tag
-        env:
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           # Belt-and-suspenders: the tag flows into shell + URLs downstream, so
@@ -64,7 +76,6 @@ jobs:
         if: steps.schema.outputs.match != 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
           PINNED: ${{ steps.schema.outputs.pinned }}
           LATEST: ${{ steps.schema.outputs.latest }}
         run: |
@@ -91,7 +102,6 @@ jobs:
         if: steps.schema.outputs.match == 'yes'
         env:
           GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
