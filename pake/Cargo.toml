@@ -22,7 +22,9 @@ crate-type = ["cdylib", "rlib"]
 # HMAC) and the browser derive byte-identical K / MAC / secret. This crate owns
 # its own sha2 0.10 / hkdf / hmac so there is no cross-version drift.
 spake2 = "=0.4.0"
-sha2 = "0.10"
+# sha2 0.10 renamed to match the inlined CLI copy; avoids version clash with
+# the CLI's sha2 0.11. The shared source (cli/src/pake/mod.rs) uses this alias.
+sha2_pake = { package = "sha2", version = "0.10" }
 hkdf = "0.12"
 hmac = "0.12"
 hex = "0.4"

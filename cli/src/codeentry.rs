@@ -91,7 +91,7 @@ fn is_nameplate(s: &str) -> bool {
 /// CREATE preview, mint it ONCE per session (like the browser's autoNpRef) and
 /// pass it in, so the preview doesn't reshuffle on every keystroke.
 pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
-    let normalized = filament_pake::norm_code(buf);
+    let normalized = crate::pake::norm_code(buf);
     let trimmed = normalized.trim_matches('-');
 
     if trimmed.is_empty() {
@@ -106,7 +106,7 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
         Mode::Claim => {
             // Claim side: the shared `split_code` peels the TRAILING dash-group as
             // the nameplate; everything before it is the password (words).
-            let (np, pw) = filament_pake::split_code(trimmed);
+            let (np, pw) = crate::pake::split_code(trimmed);
             let has_words = !pw.is_empty();
             let np_ok = is_nameplate(&np);
             if np_ok && has_words {
@@ -146,7 +146,7 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
             // Create side: keep ALL words as the password; the nameplate is always
             // machine-minted. `split_chosen_code` only strips a trailing 3-5 digit
             // group, so "gigantic-element" keeps both words.
-            let (words, _np) = filament_pake::split_chosen_code(trimmed);
+            let (words, _np) = crate::pake::split_chosen_code(trimmed);
             if crate::password_word_tokens(&words) < 2 {
                 return Judgment {
                     level: Level::Incomplete,
@@ -346,13 +346,13 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
                             // CREATE submits the words-only password (no nameplate);
                             // the caller mints the nameplate.
                             Mode::Create => {
-                                let (words, _np) = filament_pake::split_chosen_code(
-                                    &filament_pake::norm_code(&buf),
+                                let (words, _np) = crate::pake::split_chosen_code(
+                                    &crate::pake::norm_code(&buf),
                                 );
                                 words
                             }
                             // CLAIM submits the normalized full code.
-                            Mode::Claim => filament_pake::norm_code(&buf),
+                            Mode::Claim => crate::pake::norm_code(&buf),
                         };
                         return Ok(Outcome::Submitted(result));
                     }
