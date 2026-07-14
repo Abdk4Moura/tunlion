@@ -58,6 +58,88 @@ impl Paths {
             }
         }
     }
+
+    /// Platform-aware home directory for the current user.
+    /// Unix: `$HOME`. Windows: `%USERPROFILE%`. Falls back to `"."` when unset.
+    pub fn home_dir() -> PathBuf {
+        #[cfg(unix)]
+        {
+            if let Ok(h) = std::env::var("HOME") {
+                if !h.is_empty() {
+                    return PathBuf::from(h);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(h) = std::env::var("USERPROFILE") {
+                if !h.is_empty() {
+                    return PathBuf::from(h);
+                }
+            }
+        }
+        PathBuf::from(".")
+    }
+
+    /// Platform-aware shell for PTY sessions. Returns `(argv, can_use_user)`.
+    ///
+    /// Resolution order (first match wins):
+    /// 1. `shell_program` (from `--shell-program` flag)
+    /// 2. `FILAMENT_SHELL` env var
+    /// 3. `filament set shell` config (passed via `shell_config`)
+    /// 4. `$SHELL` on Unix / powershell→cmd on Windows
+    /// 5. Hardcoded fallback (`/bin/bash` → `/bin/sh` / `cmd.exe`)
+    ///
+    /// The value is argv-split so it can carry args: `bash -l`, `pwsh -NoLogo`.
+    /// On Unix, `shell_user` uses `runuser -l`; on Windows it's unsupported.
+    pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
+        let shell = shell_program
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("FILAMENT_SHELL").ok().filter(|s| !s.is_empty()))
+            .or_else(|| shell_config.map(|s| s.to_string()))
+            .unwrap_or_else(|| Self::default_shell());
+
+        let parts: Vec<String> = shell.split_whitespace().map(|s| s.to_string()).collect();
+        #[cfg(unix)]
+        {
+            let argv = match shell_user {
+                Some(user) => vec!["runuser".into(), "-l".into(), user.into()],
+                None => parts,
+            };
+            (argv, true)
+        }
+        #[cfg(windows)]
+        {
+            (parts, false)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            (parts, true)
+        }
+    }
+
+    fn default_shell() -> String {
+        #[cfg(unix)]
+        {
+            std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                if Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+            })
+        }
+        #[cfg(windows)]
+        {
+            if Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe").exists() {
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".into()
+            } else if Path::new("C:\\Windows\\System32\\cmd.exe").exists() {
+                "C:\\Windows\\System32\\cmd.exe".into()
+            } else {
+                "cmd.exe".into()
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            "/bin/sh".into()
+        }
+    }
 }
 
 // ------------------------------------------------------------ SecretFile --

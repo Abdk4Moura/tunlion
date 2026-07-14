@@ -569,9 +569,7 @@ pub async fn spawn_pty_session(
     // truecolor fine, so set this to get full-color output (verified: opencode
     // emits 38;2;R;G;B with this set, 38;5;N without).
     cmd.env("COLORTERM", "truecolor");
-    if let Ok(home) = std::env::var("HOME") {
-        cmd.cwd(home);
-    }
+    cmd.cwd(crate::platform::Paths::home_dir());
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
