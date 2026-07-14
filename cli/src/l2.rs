@@ -1612,14 +1612,17 @@ pub(crate) async fn open_pty_stream(
     cols: u16,
     rows: u16,
     term: &str,
+    cmd: &str,
 ) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
     let sid = mux.alloc_sid();
     let rx = mux.register(sid).await;
-    mux.transport
-        .send_control(&json!({
-            "type": "pty-open", "sid": sid, "session": session, "cols": cols, "rows": rows, "term": term
-        }))
-        .await?;
+    let mut ctl = json!({
+        "type": "pty-open", "sid": sid, "session": session, "cols": cols, "rows": rows, "term": term
+    });
+    if !cmd.is_empty() {
+        ctl["cmd"] = json!(cmd);
+    }
+    mux.transport.send_control(&ctl).await?;
     Ok((sid, rx))
 }
 
@@ -1636,9 +1639,10 @@ pub(crate) async fn open_pty_stream_verified(
     cols: u16,
     rows: u16,
     term: &str,
+    cmd: &str,
     verify: std::time::Duration,
 ) -> Result<(u32, PipeItem, mpsc::Receiver<PipeItem>)> {
-    let (sid, rx) = open_pty_stream(mux, session, cols, rows, term).await?;
+    let (sid, rx) = open_pty_stream(mux, session, cols, rows, term, cmd).await?;
     let (first, rx) = verify_first_frame(mux, sid, rx, verify).await?;
     Ok((sid, first, rx))
 }
@@ -1904,6 +1908,7 @@ async fn pty_attach_once(
     role: &'static str,
     session_id: &str,
     term: &str,
+    cmd: &str,
     interactive: bool,
     resume: bool,
     raw: &mut Option<RawGuard>,
@@ -1934,10 +1939,16 @@ async fn pty_attach_once(
     // verified device); a fresh per-invocation id means two `filament pty` runs
     // never collide. `term` is forwarded so the remote matches THIS terminal.
     mux.transport()
-        .send_control(&json!({
-            "type": "pty-open", "sid": sid, "session": session_id,
-            "cols": cols, "rows": rows, "term": term, "resume": resume,
-        }))
+        .send_control(&{
+            let mut ctl = json!({
+                "type": "pty-open", "sid": sid, "session": session_id,
+                "cols": cols, "rows": rows, "term": term, "resume": resume,
+            });
+            if !cmd.is_empty() {
+                ctl["cmd"] = json!(cmd);
+            }
+            ctl
+        })
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
 
@@ -2097,7 +2108,8 @@ async fn try_warm_pty(
 /// ~90s) no longer loses the session. The session id lives only in THIS process,
 /// so a separate `filament pty` run always gets a fresh shell, never this one.
 /// A non-tty stdio (a pipe) keeps the plain cooked, non-resuming bridge.
-pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
+pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) -> Result<()> {
+    let one_shot = cmd.join(" ");
     use std::io::IsTerminal;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     // Random, per-invocation, in-memory only: distinct runs never collide; only
@@ -2151,7 +2163,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     loop {
         // Resume-only for the FIRST attach right after a warm session ended.
         let resume = warm_ended && !ever_connected;
-        match pty_attach_once(server, peer, relay, role, &session_id, &term, interactive, resume, &mut raw, &mut stdin_rx, &mut pending).await {
+        match pty_attach_once(server, peer, relay, role, &session_id, &term, &one_shot, interactive, resume, &mut raw, &mut stdin_rx, &mut pending).await {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Dropped) => {
                 // Non-tty (scripted) sessions don't resume; a drop is the end.
