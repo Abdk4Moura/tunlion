@@ -6,11 +6,12 @@ name: publish-registries
 # event, because a release created by GITHUB_TOKEN does not fire `release`
 # workflows (GitHub recursion guard). workflow_dispatch allows manual backfill.
 #
-# Auth:
-#   crates.io — CARGO_REGISTRY_TOKEN secret (Account Settings → API Tokens)
-#   npm       — Trusted Publishing via OIDC (no token). Configure a Trusted
-#               Publisher for `filament-cli` on npmjs.com pointing at this repo
-#               and workflow (Abdk4Moura/filament → publish-registries.yml).
+# Auth — both via OIDC Trusted Publishing, no long-lived tokens:
+#   crates.io — configure a Trusted Publisher for the `filament-cli` crate on
+#               crates.io (crate Settings → Trusted Publishing) pointing at
+#               Abdk4Moura/filament → publish-registries.yml.
+#   npm       — configure a Trusted Publisher for `filament-cli` on npmjs.com
+#               (package Settings → Trusted Publisher) → same repo + workflow.
 
 on:
   workflow_run:
@@ -31,6 +32,9 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'cli-v'))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for crates.io Trusted Publishing (no long-lived token)
     env:
       TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
@@ -39,16 +43,15 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
       - name: Update Rust toolchain (edition 2024)
         run: rustup update stable && rustup default stable
+      - name: Authenticate to crates.io (Trusted Publishing / OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: cargo publish filament-cli
         working-directory: cli
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish."
-            exit 0
-          fi
           # pake is inlined, so filament-cli has no unpublished path-deps.
           # Tolerate an already-published version (re-runs/backfills), but fail
           # loudly on any other error so it's visible.
