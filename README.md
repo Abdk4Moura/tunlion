@@ -27,7 +27,7 @@ Or a package manager:
 | **winget** (Windows) | `winget install Abdk4Moura.Filament` |
 | **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/filament` |
 | **Cargo** (Rust) | `cargo install filament-cli` |
-| **npm** (Node) | `npm i -g filament-cli` |
+| **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
 
 Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `filament update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[filament.autumated.com](https://filament.autumated.com)** on both devices.
 

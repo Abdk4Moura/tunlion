@@ -6,12 +6,12 @@ name: publish-registries
 # event, because a release created by GITHUB_TOKEN does not fire `release`
 # workflows (GitHub recursion guard). workflow_dispatch allows manual backfill.
 #
-# Auth — both via OIDC Trusted Publishing, no long-lived tokens:
-#   crates.io — configure a Trusted Publisher for the `filament-cli` crate on
-#               crates.io (crate Settings → Trusted Publishing) pointing at
-#               Abdk4Moura/filament → publish-registries.yml.
-#   npm       — configure a Trusted Publisher for `filament-cli` on npmjs.com
-#               (package Settings → Trusted Publisher) → same repo + workflow.
+# Auth: both via OIDC Trusted Publishing, no long-lived tokens.
+#   crates.io: configure a Trusted Publisher for the `filament-cli` crate on
+#              crates.io (crate Settings, Trusted Publishing) pointing at
+#              Abdk4Moura/filament + publish-registries.yml.
+#   npm:       configure a Trusted Publisher for `@abdk4moura/filament-cli` on
+#              npmjs.com (package Settings, Trusted Publisher), same repo + workflow.
 
 on:
   workflow_run:
@@ -100,4 +100,4 @@ jobs:
           if echo "$out" | grep -qiE "cannot publish over|previously published|403 .*You cannot publish over"; then
             echo "::notice::filament-cli this version already on npm — nothing to do"; exit 0
           fi
-          echo "::error::npm publish failed — is the Trusted Publisher set on npmjs.com (filament-cli -> Abdk4Moura/filament -> publish-registries.yml) and the package seeded?"; exit 1
+          echo "::error::npm publish failed. Is the Trusted Publisher set on npmjs.com (@abdk4moura/filament-cli, Abdk4Moura/filament, publish-registries.yml) and the package seeded?"; exit 1
