@@ -1,10 +1,11 @@
 name: publish-registries
 
-# Publish filament-cli to crates.io and npm after a CLI release is built.
+# Publish filament-cli to crates.io and npm on a CLI release tag.
 #
-# Triggered by cli-release.yml COMPLETING (workflow_run) — NOT the `release`
-# event, because a release created by GITHUB_TOKEN does not fire `release`
-# workflows (GitHub recursion guard). workflow_dispatch allows manual backfill.
+# Triggered by the `cli-v*` tag push directly (NOT workflow_run): OIDC Trusted
+# Publishing rejects the workflow_run event, and both registries publish from
+# source, so they don't need the built release assets. workflow_dispatch allows
+# manual backfill (also OIDC-compatible).
 #
 # Auth: both via OIDC Trusted Publishing, no long-lived tokens.
 #   crates.io: configure a Trusted Publisher for the `filament-cli` crate on
@@ -14,13 +15,17 @@ name: publish-registries
 #              npmjs.com (package Settings, Trusted Publisher), same repo + workflow.
 
 on:
-  workflow_run:
-    workflows: ["cli-release"]
-    types: [completed]
+  # Trigger on the tag push, NOT workflow_run: OIDC Trusted Publishing rejects the
+  # workflow_run event for security. crates.io publishes from source and npm
+  # publishes the package (the binary is fetched at install time), so neither
+  # needs the release assets to exist yet. (winget, which does need the assets and
+  # uses a PAT, stays on workflow_run in winget-publish.yml.)
+  push:
+    tags: ["cli-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. cli-v0.4.2)"
+        description: "Release tag to publish (e.g. cli-v0.5.0)"
         required: true
 
 permissions:
@@ -30,17 +35,17 @@ jobs:
   crates-io:
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'cli-v'))
+      startsWith(github.ref, 'refs/tags/cli-v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write # OIDC for crates.io Trusted Publishing (no long-lived token)
     env:
-      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
       - name: Update Rust toolchain (edition 2024)
         run: rustup update stable && rustup default stable
       - name: Authenticate to crates.io (Trusted Publishing / OIDC)
@@ -65,17 +70,17 @@ jobs:
   npm:
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'cli-v'))
+      startsWith(github.ref, 'refs/tags/cli-v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write # OIDC for npm Trusted Publishing (no long-lived token)
     env:
-      TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
