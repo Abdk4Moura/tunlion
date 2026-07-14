@@ -50,10 +50,14 @@ jobs:
             exit 0
           fi
           # pake is inlined, so filament-cli has no unpublished path-deps.
-          # Republishing an existing version is a tolerated no-op so re-runs/backfills are safe.
-          cargo publish || {
-            echo "::warning::cargo publish failed (already published this version?)"; exit 0;
-          }
+          # Tolerate an already-published version (re-runs/backfills), but fail
+          # loudly on any other error so it's visible.
+          out=$(cargo publish 2>&1) && { echo "$out"; exit 0; }
+          echo "$out"
+          if echo "$out" | grep -qiE "already (uploaded|exists)|crate version .* is already"; then
+            echo "::notice::filament-cli $TAG already on crates.io — nothing to do"; exit 0
+          fi
+          echo "::error::cargo publish failed"; exit 1
 
   npm:
     if: >
@@ -88,6 +92,9 @@ jobs:
           # Trusted Publishing: npm authenticates via the OIDC id-token — no
           # NPM_TOKEN. Requires a Trusted Publisher for filament-cli configured on
           # npmjs.com pointing at this repo + workflow. Provenance is automatic.
-          npm publish --access public || {
-            echo "::warning::npm publish failed — is the Trusted Publisher set on npmjs.com for filament-cli -> Abdk4Moura/filament -> publish-registries.yml?"; exit 0;
-          }
+          out=$(npm publish --access public 2>&1) && { echo "$out"; exit 0; }
+          echo "$out"
+          if echo "$out" | grep -qiE "cannot publish over|previously published|403 .*You cannot publish over"; then
+            echo "::notice::filament-cli this version already on npm — nothing to do"; exit 0
+          fi
+          echo "::error::npm publish failed — is the Trusted Publisher set on npmjs.com (filament-cli -> Abdk4Moura/filament -> publish-registries.yml) and the package seeded?"; exit 1

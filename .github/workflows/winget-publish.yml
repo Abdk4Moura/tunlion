@@ -110,6 +110,10 @@ jobs:
           fi
           git config --global user.name  "filament-release-bot"
           git config --global user.email "release-bot@users.noreply.github.com"
+          # Make plain `git push` (used by release-followup.sh to push the
+          # winget-pkgs fork branch) authenticate with the token — otherwise git
+          # prompts for a username and fails in CI.
+          gh auth setup-git
           # release-followup.sh renders the manifests, refreshes Homebrew, and
           # (with --pr) forks winget-pkgs + opens the PR.
           packaging/release-followup.sh "$TAG" --pr
