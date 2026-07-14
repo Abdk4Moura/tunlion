@@ -205,6 +205,64 @@ impl ServiceHost {
     }
 }
 
+// ------------------------------------------------------- InstallSource --
+
+/// How filament was installed. Used to gate `filament update`:
+/// package-manager installs must be updated via their manager, not
+/// by overwriting the binary directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallSource {
+    Homebrew,
+    Winget,
+    Scoop,
+    Cargo,
+    /// Installed manually (curl | sh, direct download) or untraceable.
+    SelfInstalled,
+}
+
+impl InstallSource {
+    /// Classify the running binary by its canonical path.
+    pub fn detect() -> Self {
+        let path = match std::env::current_exe() {
+            Ok(p) => match p.canonicalize() {
+                Ok(c) => c,
+                Err(_) => p,
+            },
+            Err(_) => return InstallSource::SelfInstalled,
+        };
+        Self::classify(&path)
+    }
+
+    fn classify(path: &Path) -> Self {
+        let s = path.to_string_lossy().to_lowercase();
+        // Cross-platform package manager fingerprints.
+        if s.contains("/cellar/") || s.contains("/homebrew/") || s.contains("/linuxbrew/") {
+            return InstallSource::Homebrew;
+        }
+        if s.contains("\\microsoft\\winget\\") || s.contains("/microsoft/winget/") {
+            return InstallSource::Winget;
+        }
+        if s.contains("\\scoop\\apps\\") || s.contains("/scoop/apps/") {
+            return InstallSource::Scoop;
+        }
+        if s.contains("/.cargo/bin") || s.contains("\\.cargo\\bin") {
+            return InstallSource::Cargo;
+        }
+        InstallSource::SelfInstalled
+    }
+
+    /// Upgrade command the user should run instead of `filament update`.
+    pub fn upgrade_hint(&self) -> &'static str {
+        match self {
+            InstallSource::Homebrew => "brew upgrade filament",
+            InstallSource::Winget => "winget upgrade Abdk4Moura.Filament",
+            InstallSource::Scoop => "scoop update filament",
+            InstallSource::Cargo => "cargo install filament-cli",
+            InstallSource::SelfInstalled => "",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +300,47 @@ mod tests {
         assert!(!ServiceHost::None.install_instructions().is_empty());
         // Systemd has a backend, so instructions should be empty.
         assert!(ServiceHost::Systemd.install_instructions().is_empty());
+    }
+
+    #[test]
+    fn install_source_classify_brew() {
+        let p = Path::new("/opt/homebrew/Cellar/filament/0.4.1/bin/filament");
+        assert_eq!(InstallSource::classify(p), InstallSource::Homebrew);
+        let p2 = Path::new("/home/linuxbrew/.linuxbrew/bin/filament");
+        assert_eq!(InstallSource::classify(p2), InstallSource::Homebrew);
+        let p3 = Path::new("/usr/local/Cellar/filament/0.3.1/bin/filament");
+        assert_eq!(InstallSource::classify(p3), InstallSource::Homebrew);
+    }
+
+    #[test]
+    fn install_source_classify_winget() {
+        let p = Path::new("C:\\Users\\kabir\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Abdk4Moura.Filament_filament\\filament.exe");
+        assert_eq!(InstallSource::classify(p), InstallSource::Winget);
+    }
+
+    #[test]
+    fn install_source_classify_scoop() {
+        let p = Path::new("C:\\Users\\kabir\\scoop\\apps\\filament\\0.4.1\\filament.exe");
+        assert_eq!(InstallSource::classify(p), InstallSource::Scoop);
+    }
+
+    #[test]
+    fn install_source_classify_cargo() {
+        let p = Path::new("/home/kabir/.cargo/bin/filament");
+        assert_eq!(InstallSource::classify(p), InstallSource::Cargo);
+    }
+
+    #[test]
+    fn install_source_classify_self_installed() {
+        let p = Path::new("/home/kabir/.local/bin/filament");
+        assert_eq!(InstallSource::classify(p), InstallSource::SelfInstalled);
+    }
+
+    #[test]
+    fn install_source_upgrade_hints() {
+        assert_eq!(InstallSource::Homebrew.upgrade_hint(), "brew upgrade filament");
+        assert_eq!(InstallSource::Winget.upgrade_hint(), "winget upgrade Abdk4Moura.Filament");
+        assert_eq!(InstallSource::Cargo.upgrade_hint(), "cargo install filament-cli");
+        assert_eq!(InstallSource::SelfInstalled.upgrade_hint(), "");
     }
 }
