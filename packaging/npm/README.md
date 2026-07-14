@@ -1,9 +1,9 @@
-# filament-cli
+# @abdk4moura/filament-cli
 
-Send files and reach your devices, peer to peer — no upload, no account.
+Send files and reach your devices, peer to peer. No upload, no account.
 
 ```sh
-npm i -g filament-cli
+npm i -g @abdk4moura/filament-cli
 filament send video.mp4 --code
 ```
 
