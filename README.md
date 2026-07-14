@@ -1,42 +1,70 @@
 # Filament
 
-**Live: [filament.autumated.com](https://filament.autumated.com)**. Send files directly between any two devices: no upload, no size cap, no account.
+**Live: [filament.autumated.com](https://filament.autumated.com)** — send files and reach your devices, peer to peer. No upload, no size cap, no account.
 
-Files travel **peer to peer** over a WebRTC data channel. The server only helps the two ends find each other (signaling) and never sees a byte of your files.
+Filament started as the file transfer nothing else does: the **receiving end needs nothing installed** — it can be any browser, on any phone or laptop. That still holds. But the same crypto-addressed link that carries a file also lets you **shell into your machines, forward a port, or mount a folder** across the internet. One tool, one identity, your devices meshed.
+
+Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other — it never sees a byte.
 
 ![filament demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
 
-## Works anywhere
+## Install
 
-The receiving end never needs anything installed. That is the core design decision, and it is what nothing else in this space offers:
+Runs on **Linux, macOS, and Windows** (all first-class), or use it with **nothing installed** in a browser.
 
-| From | To | How |
-|---|---|---|
-| Android phone | iPhone | both open the website |
-| Linux server (headless) | your phone | `filament send` on the box, browser on the phone |
-| Windows laptop | Mac terminal | `winget install Abdk4Moura.Filament` and `brew install abdk4moura/tap/filament` |
-| any browser | any browser | same WiFi auto-discovers; across networks, speak a one-time code |
-| terminal | terminal | the classic croc-style flow, plus resume that survives restarts |
-
-```
-# Linux / macOS
+```sh
+# Linux / macOS — curl | sh
 curl -fsSL https://filament.autumated.com/install | sh
 
-# Windows
-winget install Abdk4Moura.Filament
-
-# or just open https://filament.autumated.com on both devices
-
-filament pair --name phone     # remember a device — no file needed
-filament up                    # interactive session: pair / devices / forget in-session
+# Windows — PowerShell one-liner
+irm https://filament.autumated.com/install.ps1 | iex
 ```
+
+Or a package manager:
+
+| Manager | Command |
+|---|---|
+| **winget** (Windows) | `winget install Abdk4Moura.Filament` |
+| **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/filament` |
+| **Cargo** (Rust) | `cargo install filament-cli` |
+| **npm** (Node) | `npm i -g filament-cli` |
+
+Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `filament update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[filament.autumated.com](https://filament.autumated.com)** on both devices.
+
+## Send a file
+
+```sh
+filament send video.mp4 --code       # speak the code aloud
+filament recv clever-lynx-63         # …or open the website on the other device
+
+filament pair --name phone           # remember a device (no file needed)
+filament up                          # receive in the background
+```
+
+- **The other end can be a browser** — your wife's phone with nothing installed opens a URL and taps accept.
+- **Speakable one-time codes** burn on first use — an overheard code is worthless.
+- **Resumable**: transfers survive process restarts and verify by content hash.
+- **Route transparency**: every transfer shows whether bytes went `direct over wl1`, `direct over tailscale0`, or `relay` — you can see what your data did.
+
+## Reach your devices
+
+Once two machines are paired, they share a crypto-addressed overlay — each device's public key *is* its address. On top of that:
+
+```sh
+filament dovm                        # open a shell on a paired device
+filament expose 5432                 # publish a local port on the mesh
+filament forward 5432 dovm:5432      # forward a remote port to localhost
+filament mount dovm:~/data ./data    # mount a remote folder (sshfs over the mesh)
+```
+
+No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.
 
 ## Why Filament over the alternatives
 
-- **vs croc / magic-wormhole**: superb tools, but both ends must install them. Filament's other end can be your wife's phone with literally nothing installed: she opens a URL and taps accept. The CLI also resumes transfers across process restarts (croc parity) and a browser can be either side.
-- **vs Snapdrop / PairDrop**: same-network discovery is just the starting point here. Filament adds speakable one-time codes that burn on first use (an overheard code is worthless), resumable transfers with content-hash verification, and a native CLI for servers and scripts.
-- **vs WeTransfer / Drive / email**: nothing is uploaded, ever. There is no size limit, no account, no link that sits on someone's server. Bytes go device to device, DTLS-encrypted.
-- **Route transparency, unique as far as we know**: every connection shows whether bytes went `local` (never left your network), `direct` (peer to peer across the internet), or `relayed` (through the TURN server). You can see what your data did.
+- **vs croc / magic-wormhole**: superb tools, but both ends must install them. Filament's other end can be a browser with nothing installed. The CLI also resumes across restarts (croc parity), and a browser can be either side.
+- **vs Snapdrop / PairDrop**: same-network discovery is the *starting* point here. Filament adds speakable one-time codes, resumable + content-verified transfers, a native CLI for servers and scripts, and the device mesh (shell/forward/mount).
+- **vs Tailscale / ngrok** (for the mesh): no account, no coordination server holding your keys — identity is client-side crypto, and the data plane is pure P2P. It's lighter-weight and self-hostable end to end.
+- **vs WeTransfer / Drive / email**: nothing is uploaded, ever. No size limit, no account, no link on someone's server. Bytes go device to device, encrypted.
 - **Self-hostable end to end**: Flask signaling + Redis + coturn in one `docker compose up`. Point the apps at your instance with one env var.
 
 ## How it works
@@ -44,28 +72,30 @@ filament up                    # interactive session: pair / devices / forget in
 ```
               one origin
    browser ── REST /api/* ─────────► Flask ── serves React build (dist/)
-      │       Socket.IO /socket.io ► signaling relay
-      └────── WebRTC DataChannel ──► other browser / CLI   (the files go here)
+      │       Socket.IO /socket.io ► signaling relay (a dumb pipe; never sees files)
+      └────── WebRTC DataChannel ──► other browser / CLI      (files go here)
+
+   CLI ─────► direct QUIC ─────────► other CLI                (files + shell + ports)
+              └ crypto-addressed L3 overlay for reach (shell / expose / mount)
 ```
 
-Reliability is documented failure-by-failure: [docs/resilience.md](docs/resilience.md) (the browser's 11 fixes) and [docs/cli-resilience.md](docs/cli-resilience.md) (the CLI's ledger, every entry gated by a test in `cli/tests/gates.sh`).
+The signaling relay only introduces peers; all data is peer-to-peer and end-to-end encrypted. Reliability is documented failure-by-failure: [docs/resilience.md](docs/resilience.md) (the browser's fixes) and [docs/cli-resilience.md](docs/cli-resilience.md) (the CLI's ledger, every entry gated by a test in `cli/tests/gates.sh`). Routing is explained in [docs/filament-routing.md](docs/filament-routing.md).
 
 ## Layout
 
 ```
-backend/        Flask app
-  app.py          routes + SPA serving + Socket.IO mount
-  signaling.py    the signaling relay (dumb pipe; never sees files)
-  config.py       runtime config served at /api/config
+backend/        Flask app (routes + SPA serving + Socket.IO signaling)
 frontend/       React app (Vite); src/lib/ is the networking layer
-cli/            Rust CLI (same wire protocol; browsers are first-class peers)
+cli/            Rust CLI — same wire protocol; direct-QUIC transport + L3 overlay
+pake/           shared SPAKE2 pairing core (native rlib + wasm for the browser)
 deploy/         docker compose: api + redis + coturn + cloudflared
+scripts/        install.sh (curl|sh) + install.ps1 (Windows)
 CONTRACT.md     the shape everything agrees on (REST + events + hook)
 ```
 
-## Run it
+## Run it yourself
 
-**Dev (hot reload, two processes):**
+**Dev (hot reload):**
 ```bash
 cd backend && pip install -r requirements.txt && python app.py    # :5000
 cd frontend && npm install && npm run dev                         # :5173
@@ -77,12 +107,8 @@ cd frontend && npm install && npm run build
 cd ../backend && pip install -r requirements.txt && python app.py
 ```
 
-Open the same room link in two tabs or two devices to pair, then click a peer tile (or drag files onto it) to send.
-
-## Configuration
-
-Everything is driven by `/api/config`, so no rebuild is needed: `FIL_SIGNALING` (socketio default, firebase optional), `FIL_ICE_SERVERS` / `FIL_TURN_HOST` + `FIL_TURN_SECRET` (TURN for hard NATs), `FIL_SECRET`, `FIL_CHUNK_SIZE`, `FIL_REDIS_URL` (horizontal scaling), `PORT`.
+Everything is driven by `/api/config` (no rebuild to reconfigure): `FIL_SIGNALING`, `FIL_ICE_SERVERS` / `FIL_TURN_HOST` + `FIL_TURN_SECRET`, `FIL_SECRET`, `FIL_CHUNK_SIZE`, `FIL_REDIS_URL` (horizontal scaling), `PORT`.
 
 ## A note on the "framework"
 
-An earlier version of this project shipped a hand-rolled, Flutter-flavored reactive UI engine (a `StateNotifier` + lifecycle-driven element system). That experiment now lives on its own as **[statelet](https://github.com/Abdk4Moura/statelet)**. This repo uses real React.
+An earlier version shipped a hand-rolled, Flutter-flavored reactive UI engine. That experiment now lives on its own as **[statelet](https://github.com/Abdk4Moura/statelet)**. This repo uses real React.

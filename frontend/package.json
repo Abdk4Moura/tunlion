@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "postbuild": "cp ../scripts/install.sh dist/install || true",
+    "postbuild": "cp ../scripts/install.sh dist/install || true; cp ../scripts/install.ps1 dist/install.ps1 || true",
     "preview": "vite preview"
   },
   "dependencies": {
