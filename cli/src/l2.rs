@@ -1023,7 +1023,7 @@ async fn bring_up_to_known(
     // do not read as a flap/retry of one connection.
     crate::ui::say(&match role {
         "bootstrap" => format!("filament: authenticating with '{peer_name}'..."),
-        _ => format!("filament: waiting for known device '{peer_name}'..."),
+        _ => format!("\rfilament: waiting for known device '{peer_name}'..."),
     });
 
     // Presence re-subscribe cadence: while we have NOT yet discovered a candidate
@@ -1281,7 +1281,7 @@ async fn bring_up_to_known(
                 // INFO, tunnel established (with its route label). Silent for the
                 // bootstrap pre-flight (internal; the data link reports the route).
                 if role != "bootstrap" {
-                    crate::ui::say(&format!("filament: tunnel up to '{peer_name}' (route: {route})"));
+                    crate::ui::say(&format!("\rfilament: tunnel up to '{peer_name}' (route: {route})"));
                 }
                 // Transport is up: the Establishing race is won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
@@ -2161,8 +2161,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     }
 
     loop {
-        // Resume-only for the FIRST attach right after a warm session ended.
-        let resume = warm_ended && !ever_connected;
+        // Resume-only after any prior connection (warm or cold). If the session
+        // is gone (shell exited cleanly on a prior drop), the acceptor returns
+        // "no such session" and we exit cleanly instead of spawning a fresh shell.
+        let resume = ever_connected || warm_ended;
         match pty_attach_once(server, peer, relay, role, &session_id, &term, &one_shot, interactive, resume, &mut raw, &mut stdin_rx, &mut pending).await {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Dropped) => {
