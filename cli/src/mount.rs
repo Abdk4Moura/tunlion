@@ -183,6 +183,36 @@ impl std::fmt::Display for MountStatus {
     }
 }
 
+/// Removes a mount-point directory we created if the mount never succeeds, so a
+/// failed `filament mount` doesn't litter empty dirs (e.g. the peer has no sshd).
+/// A failed mount leaves the dir empty, so `remove_dir` (empty-only) is safe: a
+/// live/successful mount makes it non-empty and the removal simply no-ops. Only
+/// dirs WE created are tracked, so a pre-existing dir is never touched.
+struct MountPointGuard {
+    path: String,
+    active: bool,
+}
+
+impl MountPointGuard {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+    fn cleanup_now(&mut self) {
+        if self.active {
+            let _ = std::fs::remove_dir(&self.path);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for MountPointGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = std::fs::remove_dir(&self.path);
+        }
+    }
+}
+
 pub async fn mount_cmd(
     server: &str,
     peer: &str,
@@ -214,16 +244,23 @@ pub async fn mount_cmd(
         }
     };
 
-    if !Path::new(&local_path).exists() {
+    // Track the mount point so a failed mount (e.g. the peer has no sshd) doesn't
+    // leave an empty dir behind. Only dirs WE create are tracked; disarmed on any
+    // success path.
+    let mut mp_guard = if !Path::new(&local_path).exists() {
         std::fs::create_dir_all(&local_path)?;
         crate::ui::say(&format!("created mount point: {local_path}"));
-    }
+        Some(MountPointGuard { path: local_path.clone(), active: true })
+    } else {
+        None
+    };
 
     // Try daemon first (daemon handles sshfs spawn + monitoring centrally).
     #[cfg(unix)]
     if !foreground && crate::ctl::daemon_present().await {
         let port: u16 = std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
         if let Some(_reply) = crate::ctl::try_mount(peer, &remote_path, &local_path, read_only, auto_restore, port).await {
+            if let Some(g) = mp_guard.as_mut() { g.disarm(); }
             crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
             crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
             crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
@@ -238,6 +275,7 @@ pub async fn mount_cmd(
         .map(|o| !o.status.success())
         .unwrap_or(true)
     {
+        if let Some(g) = mp_guard.as_mut() { g.cleanup_now(); }
         crate::ui::problem(
             "sshfs not found",
             "sshfs is required for `filament mount` but is not installed.",
@@ -250,7 +288,20 @@ pub async fn mount_cmd(
         std::process::exit(1);
     }
 
-    let info = crate::l2::ensure_peer_bootstrap(server, peer, relay).await?;
+    // `mount` currently rides sshfs, so it needs a real sshd on the peer, unlike
+    // `pty`. If bootstrap fails (typically "no sshd"), say so honestly and point
+    // at the paths that work today. (Guard drops here and removes the empty dir.)
+    let info = match crate::l2::ensure_peer_bootstrap(server, peer, relay).await {
+        Ok(i) => i,
+        Err(e) => {
+            crate::ui::say(&format!(
+                "  note: `filament mount` currently rides sshfs and needs an sshd on '{peer}'. \
+                 A no-sshd mesh-native mount is in progress; for now run an sshd there, set \
+                 FILAMENT_SSH_PORT, or use `filament pty {peer}` for a shell."
+            ));
+            return Err(e);
+        }
+    };
     let peer_name = peer.strip_suffix(".mesh").unwrap_or(peer);
 
     // Build the sshfs command.
@@ -302,6 +353,7 @@ pub async fn mount_cmd(
         let status = cmd.status();
         match status {
             Ok(s) if s.success() => {
+                if let Some(g) = mp_guard.as_mut() { g.disarm(); }
                 crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path}"));
                 crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
                 Ok(())
@@ -349,6 +401,7 @@ pub async fn mount_cmd(
             created: now,
         })?;
 
+        if let Some(g) = mp_guard.as_mut() { g.disarm(); }
         crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (id: {mount_id})"));
         crate::ui::say(&format!("  check with: filament mount --check {mount_id}"));
         crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
