@@ -27,6 +27,7 @@ mod holepunch;
 mod interact;
 mod l2;
 mod mount;
+mod mount_proto;
 mod backup;
 mod net;
 mod overlay;
@@ -6038,7 +6039,48 @@ async fn main() -> Result<()> {
                 let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
                 let auto_restore = save_auto;
-                mount::mount_cmd(&server, &peer, &remote, local, read_only, options, relay, foreground, auto_restore).await
+                let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
+                if let Some(_local) = local {
+                    ui::say(&format!(
+                        "  {} mesh-native mount protocol connected to {peer}:{remote}",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                    ));
+                    ui::say(&format!(
+                        "  {} FUSE adapter not yet available; listing directory instead",
+                        ui::paint(ui::Tone::Warn, "!")
+                    ));
+                }
+                // List the root directory
+                use crate::mount_proto::MountOp;
+                let root_enc = mount_proto::path_encode(std::path::Path::new("."));
+                let resp = client.call(MountOp::Open { path: root_enc, flags: 0 }).await?;
+                match resp.result {
+                    crate::mount_proto::MountResult::Ok(v) => {
+                        let fh = v["fh"].as_u64().unwrap_or(0);
+                        ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), remote));
+                        let entries = client.call(MountOp::ReadDir { fh, offset: 0 }).await?;
+                        match entries.result {
+                            crate::mount_proto::MountResult::Ok(v) => {
+                                if let Some(arr) = v.as_array() {
+                                    for entry in arr {
+                                        let name_enc = entry["name"].as_str().unwrap_or("?");
+                                        let name = mount_proto::path_decode(name_enc)
+                                            .map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "?".into()))
+                                            .unwrap_or_else(|_| "?".into());
+                                        let kind = entry["stat"]["kind"].as_str().unwrap_or("file");
+                                        let size = entry["stat"]["size"].as_u64().unwrap_or(0);
+                                        ui::say(&format!("    {name}  ({kind}, {size}B)"));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::mount_proto::MountResult::Err(e) => {
+                        ui::say(&format!("  {} {}: {}", ui::paint(ui::Tone::Err, ui::glyph_err()), remote, e.msg));
+                    }
+                }
+                Ok(())
             }
         }
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
@@ -9631,6 +9673,30 @@ async fn recv_cmd(
                             mux.drop_pty(sid).await;
                         }
                     }
+                }
+                Some("mount-open") if l2_enabled => {
+                    let Some(t) = conn.transport_of(&pid) else { continue };
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    if !l2::is_l2_sid(sid) { continue; }
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    if !trusted {
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: untrusted peer" })).await;
+                        continue;
+                    }
+                    let root_encoded = v["root"].as_str().unwrap_or(".");
+                    let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let mux = l2_muxes.entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    if mux.at_stream_cap().await {
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
+                        continue;
+                    }
+                    let rx = mux.register_stream(sid).await;
+                    let _ = t.send_control(&json!({ "type": "mount-open-ack", "sid": sid })).await;
+                    let transport = t.clone();
+                    let spawn_sid = sid;
+                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx);
                 }
                 Some("pty-resize") if l2_enabled => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;

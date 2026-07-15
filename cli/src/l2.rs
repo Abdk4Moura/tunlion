@@ -1601,6 +1601,22 @@ pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Se
     serve_stream(mux, sid, sock, rx, true, Some(first)).await;
 }
 
+/// Open a mesh-native mount stream to the peer, sending `mount-open` with the
+/// encoded root path. Returns sid + inbound pipe; the caller drives the
+/// protocol via `MountClient`. No sshd, no sshfs.
+pub(crate) async fn open_mount_stream(
+    mux: &Arc<Mux>,
+    root: &str,
+) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
+    let sid = mux.alloc_sid();
+    let rx = mux.register(sid).await;
+    let encoded = crate::mount_proto::path_encode(std::path::Path::new(root));
+    mux.transport
+        .send_control(&json!({ "type": "mount-open", "sid": sid, "root": encoded }))
+        .await?;
+    Ok((sid, rx))
+}
+
 /// WARM pty (daemon side): open a PTY on the peer over an EXISTING link's `mux`,
 /// sending `pty-open` (vs `open_stream`'s `l2-open`). Returns the sid + inbound
 /// pipe; the caller bridges with `serve_opened_stream` and relays `pty-resize` by
@@ -2325,6 +2341,27 @@ impl Drop for ConnGuard {
             self.total.load(Relaxed)
         ));
     }
+}
+
+/// `filament mount <peer> <remote>`: open a mesh-native mount stream to the
+/// peer and serve the remote filesystem over the mount protocol. No sshd,
+/// no sshfs — the server runs the mount handler on the peer's side of the
+/// authenticated mesh stream, and the client drives it via `MountClient`.
+///
+/// Returns a `MountClient` ready for FUSE or direct operations.
+pub async fn mount_cmd(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    root: &str,
+) -> Result<crate::mount_proto::MountClient> {
+    let (t, rx, guard, _diag) = bring_up_to_known(server, peer, relay, "mount").await?;
+    guard.forget();
+    let mux = Mux::new(t.clone());
+    let _pump = tokio::spawn(pump_initiator(rx, mux.clone()));
+    let (sid, pipe_rx) = open_mount_stream(&mux, root).await?;
+    let client = crate::mount_proto::MountClient::from_mux(t.clone(), sid, pipe_rx);
+    Ok(client)
 }
 
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
