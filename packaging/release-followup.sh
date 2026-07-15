@@ -44,8 +44,30 @@ render "$HERE/brew/filament.rb.tmpl" > "$OUT/filament.rb"
 ROOT="$(cd "$HERE/.." && pwd)"
 mkdir -p "$ROOT/Formula"
 cp "$OUT/filament.rb" "$ROOT/Formula/filament.rb"
-echo "rendered Formula/filament.rb (commit it in the main repo)"
+echo "rendered Formula/filament.rb"
 if gh auth status >/dev/null 2>&1; then
+  # Commit the refreshed in-repo formula back to the default branch so the
+  # secondary tap path (brew tap abdk4moura/filament <this repo>) doesn't lag.
+  # This script runs in CI on a DETACHED, shallow tag checkout, so the local git
+  # state can't push to the branch; use the Contents API. Idempotent: skip when
+  # the branch already has this exact content. [skip ci] keeps the formula-only
+  # commit from spinning up the full test matrix.
+  DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq .default_branch 2>/dev/null || echo main)
+  local_b64=$(base64 "$OUT/filament.rb" | tr -d '\n')
+  remote_b64=$(gh api "repos/$REPO/contents/Formula/filament.rb?ref=$DEFAULT_BRANCH" --jq .content 2>/dev/null | tr -d '\n' || true)
+  cur_sha=$(gh api "repos/$REPO/contents/Formula/filament.rb?ref=$DEFAULT_BRANCH" --jq .sha 2>/dev/null || true)
+  if [ "$local_b64" = "$remote_b64" ]; then
+    echo "in-repo Formula/filament.rb already at $VERSION on $DEFAULT_BRANCH"
+  elif gh api -X PUT "repos/$REPO/contents/Formula/filament.rb" \
+         -f message="chore: sync in-repo Homebrew formula to $VERSION [skip ci]" \
+         -f content="$local_b64" \
+         -f branch="$DEFAULT_BRANCH" \
+         ${cur_sha:+-f sha="$cur_sha"} >/dev/null; then
+    echo "in-repo Formula/filament.rb synced to $VERSION on $DEFAULT_BRANCH"
+  else
+    echo "::warning::could not sync in-repo Formula/filament.rb to $DEFAULT_BRANCH (token may lack contents:write)"
+  fi
+
   TAPDIR=$(mktemp -d)
   if gh repo clone Abdk4Moura/homebrew-tap "$TAPDIR" -- -q 2>/dev/null; then
     mkdir -p "$TAPDIR/Formula"
