@@ -122,6 +122,94 @@ This makes mount self-contained and uniform like pty, and it means one wire
 protocol to test rather than N sshfs integrations. WinFsp remains an option for
 the *client adapter*, not the whole design.
 
+### The mount protocol rules (normative)
+
+A mount is a byte-exact window onto a real filesystem, not a content interpreter.
+Everything below follows from one invariant: `read(open(f))` returns exactly the
+bytes on disk, `stat().size` equals those bytes, offset N is offset N. The server
+serves its real filesystem faithfully and transforms nothing; all platform
+translation lives in the `MountHost` client adapter plus a rich, canonical wire
+model. This is the same byte-transparency that lets pty work: pty does not rewrite
+terminal bytes, and mount does not rewrite file bytes.
+
+**1. Content is raw bytes. Never transform it.**
+
+- No line-ending conversion, no encoding normalization, no "text mode", ever. CRLF
+  is the application's concern (git `core.autocrlf`, the editor's EOL setting), not
+  the filesystem's. FTP "ASCII mode" did this content translation and corrupted
+  files for a generation; SFTP is binary and byte-exact, and so are we.
+- Why it matters beyond CRLF: converting content desyncs `size` from the delivered
+  bytes, breaks random access (`pread`/`seek`/`mmap`), and invalidates every hash
+  (git blob SHA, checksums, signatures). You also cannot reliably tell text from
+  binary, so any heuristic silently corrupts PNGs, UTF-16 text, and anything that
+  happens to contain `0x0D 0x0A`.
+- Transport: Read/Write payloads carry the raw bytes. base64-inside-JSON is
+  acceptable for v1 (it round-trips arbitrary bytes, so it stays byte-exact), but
+  it costs about +33% size plus CPU per block. The throughput target is a JSON
+  control header plus a raw, length-prefixed binary data frame, so payload bytes
+  never pay the base64/JSON tax. Either way the rule is identical: bytes returned
+  equal bytes on disk.
+
+**2. Names are data, not text. Carry raw bytes; escape only at the edge.**
+
+- Linux filenames are arbitrary byte sequences and are NOT guaranteed valid UTF-8.
+  Carry paths on the wire as raw bytes (or base64) with a UTF-8 hint for display.
+  `to_string_lossy()` on the wire is a bug: it replaces invalid bytes with U+FFFD
+  and makes those files impossible to open, rename, or delete.
+- The server is authoritative for its own namespace. The client adapter translates
+  to the local convention (`/` vs `\`, byte-path vs UTF-16) and is the only place
+  that escapes.
+- Un-representable names are escaped reversibly by the adapter, never dropped:
+  Windows forbids `< > : " | ? *`, trailing dot or space, and reserved device
+  names (CON, PRN, AUX, NUL, COM1-9, LPT1-9), so a Linux file `aux.txt` or
+  `foo:bar` needs a reversible escape (percent-encode, or map into a Unicode
+  private-use range) that round-trips. Case sensitivity differs (Linux keeps
+  `README` and `readme`; Windows and macOS collide them): present the server's
+  truth, and on an unrepresentable collision surface a clear error rather than
+  silently merge.
+
+**3. Metadata: a portable subset, best-effort, honest about gaps.**
+
+- Timestamps: nanosecond UTC on the wire; the adapter rounds to local resolution
+  (Windows 100ns, FAT 2s). Always carry mtime; carry atime/btime where available.
+- Permissions: carry a portable subset (at minimum the executable bit and
+  read-only). Map Unix mode bits to and from the Windows read-only attribute plus a
+  best-effort ACL. The exec bit matters for scripts; the rest is best-effort, not a
+  promise.
+- Symlinks: represent them, canonicalizing the target's separators. Windows symlink
+  creation may need developer mode or privilege, so degrade gracefully. FIFOs,
+  sockets, device nodes, and hardlinks: decline honestly rather than fake.
+- xattrs, macOS resource forks, Windows alternate data streams: not carried in v1;
+  report "not carried" rather than fake success.
+
+**4. Operation semantics are defined by the protocol, not implementation-defined.**
+
+- rename is atomic replace-over-existing (POSIX semantics), enforced by the server.
+- unlink of an open file is allowed (Unix semantics); the Windows adapter emulates.
+- `O_EXCL` create, `O_TRUNC`, and fsync mean what POSIX says; the server is the
+  source of truth and the adapter maps them to local calls.
+
+**5. Capability and limits handshake at mount time.**
+
+Before the first op, the two ends exchange what they can represent: case
+sensitivity, max component and path length (Windows MAX_PATH 260 vs Linux 4096),
+symlink support, the illegal-character set, and which metadata fields are carried.
+The client then knows up front what to escape and what to refuse, instead of
+failing mid-transfer. This is the per-capability support matrix applied to the file
+namespace.
+
+**6. Fail loud, never silently corrupt.**
+
+Every un-representable case (a name that cannot be escaped, a symlink the client
+cannot create, a path too long) returns a clear error naming the file and the
+reason. A mount that silently drops or mangles is worse than one that refuses,
+because the user trusts it as a real disk.
+
+Net: byte-transparent content is the easy, correct default (CRLF included). The
+engineering that makes mount actually agnostic is the name and metadata model and
+the escaping rules, which is exactly where sshfs is weak (it assumes Unix-to-Unix)
+and where a mesh-native protocol can be genuinely better.
+
 ## Reachability: two tiers, elevated and not
 
 filament reaches peers two ways. The choice is about privilege, not features.
