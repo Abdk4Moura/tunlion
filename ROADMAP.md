@@ -40,36 +40,6 @@ Exploration.
 - Serve a PAC file so a browser routes only `*.mesh` through the proxy.
 - MagicDNS / hosts-file management polish.
 
-## Parallel track: filament lend-gpu (compute pooling)
-
-Validated product direction (researched 2026-07-12, market-tested): filament as
-"Tailscale-for-compute for trusted groups." One command to pool a trusted peer's
-behind-NAT GPU. MVP = `filament lend-gpu` / `filament borrow <word>`. Reuses the
-mesh, file transfer, and the `runner/` job-runner; the one load-bearing new piece is
-a sandboxed GPU executor. Scope: single-GPU / batch, trusted peers, NOT a
-marketplace and NOT distributed training. Designed but unimplemented. Ready to hand
-to a separate agent in its own worktree, parallel to the cross-platform track. Full
-plan: `docs/runner/HANDOFF-lend-gpu.md`. Orchestration layer it reuses:
-`docs/runner/generic-runner-design.md` (filament-jobs, phased de-T4-ify to spec-v2 to
-queue to backends).
-
-## Exploration (bigger bets, not yet scheduled)
-
-- **Mesh LLM / GPU over the mesh** (related to lend-gpu but live-inference, not batch).
-  filament already provides the hard part: a secure, NAT-traversing, authenticated
-  P2P transport plus device identity, which is exactly the substrate distributed
-  inference needs.
-  - **Level 1 (basically works today):** reach a remote inference endpoint
-    (Ollama, vLLM, llama.cpp) over the mesh. `filament expose 11434` on a GPU box,
-    then reach `gpu.mesh:11434` from anywhere via forward/proxy/dial. Make it
-    first-class with a convenience command and a recipe. On-brand: reach your own
-    GPU/model from anywhere, encrypted, no account, no cloud.
-  - **Level 2 (research-grade):** pool GPUs / split a model across peers
-    (tensor/pipeline parallel), or a scheduler that routes prompts to a peer with a
-    free GPU. Lean on existing distributed-inference stacks (exo, Petals,
-    llama.cpp RPC) running over filament's overlay; the mesh's latency/bandwidth is
-    the real constraint to characterize.
-
 ## Shipped recently
 
 - ShellHost: Windows pty shell fix, customizable shell, one-shot exec (0.5.0).
