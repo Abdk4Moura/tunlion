@@ -1169,6 +1169,16 @@ impl Peer {
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut m)?;
         let mut se = SettingEngine::default();
+        // Test-only: pin ICE candidates to loopback (same machine harness, no
+        // routable interfaces on CI). Mirrors direct.rs's loopback_only().
+        // Also disable mDNS (.local) candidate gathering — macOS ARM64 CI
+        // runners cannot bind multicast sockets for mDNS resolution, and a
+        // stuck mDNS gather blocks ALL ICE candidate gathering.
+        #[cfg(feature = "test-hooks")]
+        if std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
+            se.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
+            se.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+        }
         se.detach_data_channels(); // C1: we run our own read loop (see READ_BUF)
         let api = APIBuilder::new()
             .with_media_engine(m)

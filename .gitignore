@@ -39,3 +39,4 @@ deploy/coturn/*.pem
 # npm package: binary downloaded by postinstall at install time
 packaging/npm/vendor/
 packaging/npm/node_modules/
+target/

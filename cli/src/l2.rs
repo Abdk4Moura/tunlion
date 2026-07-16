@@ -430,6 +430,45 @@ pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 /// reattach never disturbs arrow keys.
 pub const PTY_REATTACH_RESET: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
 
+/// Scan a PTY output chunk for DEC private-mode SET/RST sequences that
+/// affect mouse tracking. Returns (modes_set, modes_reset) from this chunk.
+///
+/// CSI `ESC [ ? <num> h` = DECSET (enable); `l` = DECRST (disable).
+/// Multiple mode numbers separated by `;` are each evaluated.
+fn mouse_mode_changes(data: &[u8]) -> (Vec<u16>, Vec<u16>) {
+    let mut sets: Vec<u16> = Vec::new();
+    let mut resets: Vec<u16> = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != b'\x1b' || i + 3 >= data.len() || data[i + 1] != b'[' || data[i + 2] != b'?' {
+            i += 1;
+            continue;
+        }
+        let start = i + 3;
+        let mut j = start;
+        while j < data.len() && (data[j].is_ascii_digit() || data[j] == b';') {
+            j += 1;
+        }
+        if j > start && j < data.len() && matches!(data[j], b'h' | b'l') {
+            let set = data[j] == b'h';
+            let nums: &str = std::str::from_utf8(&data[start..j]).unwrap_or("");
+            for part in nums.split(';') {
+                if let Ok(n) = part.parse::<u16>() {
+                    if matches!(n, 1000 | 1002 | 1003 | 1006 | 1015) {
+                        if set {
+                            if !sets.contains(&n) { sets.push(n); }
+                        } else {
+                            if !resets.contains(&n) { resets.push(n); }
+                        }
+                    }
+                }
+            }
+        }
+        i = j + 1;
+    }
+    (sets, resets)
+}
+
 /// A detached session (channel dropped, nobody reattached) is reaped after this.
 /// Long enough to ride out a mobile network handoff / tab suspend, short enough
 /// that a closed laptop does not leave a root shell alive for hours.
@@ -635,6 +674,7 @@ pub async fn spawn_pty_session(
         let mut ring: VecDeque<u8> = VecDeque::new();
         let started = Instant::now();
         let mut detached_since: Option<Instant> = None;
+        let mut active_mouse_modes: Vec<u16> = Vec::new();
         // 5s tick to enforce the idle/lifetime caps without busy-waiting.
         let mut reaper = tokio::time::interval(Duration::from_secs(5));
         reaper.tick().await; // consume the immediate first tick
@@ -643,6 +683,11 @@ pub async fn spawn_pty_session(
             tokio::select! {
                 out = orx.recv() => match out {
                     Some(bytes) => {
+                        let (sets, resets) = mouse_mode_changes(&bytes);
+                        for m in sets {
+                            if !active_mouse_modes.contains(&m) { active_mouse_modes.push(m); }
+                        }
+                        active_mouse_modes.retain(|m| !resets.contains(m));
                         push_ring(&mut ring, &bytes, SESSION_BUFFER_CAP);
                         if let Some(b) = &bind {
                             for chunk in bytes.chunks(b.transport.max_payload().max(1)) {
@@ -671,11 +716,22 @@ pub async fn spawn_pty_session(
                                 break;
                             }
                         }
-                        // Heal a mouse-reporting mode a cut-off TUI left stuck on
-                        // the client (see PTY_REATTACH_RESET): sent after the
-                        // replay so it is the last word on terminal state.
-                        if ok && transport.send_frame(sid, 0, PTY_REATTACH_RESET).await.is_err() {
-                            ok = false;
+                        // Heal stuck mouse modes from a cut-off TUI, then
+                        // restore any modes the live PTY app had active so
+                        // the wheel still scrolls after a reconnect.
+                        if ok {
+                            // Always flush stuck modes first (safety net)
+                            if transport.send_frame(sid, 0, PTY_REATTACH_RESET).await.is_err() {
+                                ok = false;
+                            }
+                            // Re-enable modes the PTY app had on before detach
+                            for m in &active_mouse_modes {
+                                let seq = format!("\x1b[?{m}h");
+                                if ok && transport.send_frame(sid, 0, seq.as_bytes()).await.is_err() {
+                                    ok = false;
+                                    break;
+                                }
+                            }
                         }
                         if ok {
                             bind = Some(OutBind { transport, sid });
@@ -1020,11 +1076,16 @@ async fn bring_up_to_known(
 
     // Distinct wording for the shell-auth pre-flight so the two sequential
     // bring-ups of `filament ssh` (the bootstrap link, then the netcat data link)
-    // do not read as a flap/retry of one connection.
-    crate::ui::say(&match role {
-        "bootstrap" => format!("filament: authenticating with '{peer_name}'..."),
-        _ => format!("\rfilament: waiting for known device '{peer_name}'..."),
-    });
+    // do not read as a flap/retry of one connection. "bootstrap" has its own
+    // wording; "reconnect" is silent (post-warm resume check — the link was
+    // already up; re-reporting it after a clean logout is noise).
+    let silent = role.starts_with("reconnect");
+    if !silent {
+        crate::ui::say(&match role {
+            "bootstrap" => format!("filament: authenticating with '{peer_name}'..."),
+            _ => format!("\rfilament: waiting for known device '{peer_name}'..."),
+        });
+    }
 
     // Presence re-subscribe cadence: while we have NOT yet discovered a candidate
     // (empty queue, no live peer), re-emit the ack'd subscribe every ~2s. This
@@ -1279,8 +1340,9 @@ async fn bring_up_to_known(
                 // to verify against. (design-l2-direct-ladder.md §NOTE: pre-trust
                 // OR pair-proof, we confirmed pre-trust holds for the L2 acceptor.)
                 // INFO, tunnel established (with its route label). Silent for the
-                // bootstrap pre-flight (internal; the data link reports the route).
-                if role != "bootstrap" {
+                // bootstrap pre-flight (internal; the data link reports the route)
+                // and for reconnect roles (post-warm resume noise suppression).
+                if !role.starts_with("reconnect") && role != "bootstrap" {
                     crate::ui::say(&format!("\rfilament: tunnel up to '{peer_name}' (route: {route})"));
                 }
                 // Transport is up: the Establishing race is won. Record Ready;
@@ -1323,7 +1385,7 @@ async fn bring_up_to_known(
                 // Hand sio + peer to the caller via a guard: a long-lived tunnel
                 // `forget()`s it (keep alive); the bootstrap `close().await`s it
                 // (tear down before the second link).
-                if role != "bootstrap" {
+                if !role.starts_with("reconnect") && role != "bootstrap" {
                     crate::ui::say(&format!("filament: tunnel up to '{peer_name}'"));
                 }
                 // Transport is up via WebRTC: Establishing race won. Record Ready;
@@ -1837,16 +1899,22 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// mode the local tty line-buffers + echoes and swallows control keys, so a
 /// remote TUI (claude/opencode/vim/htop) can't receive keystrokes or escape
 /// sequences and renders unusable.
-struct RawGuard;
+struct RawGuard {
+    active: bool,
+}
 impl RawGuard {
     fn enable() -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
-        Ok(RawGuard)
+        Ok(RawGuard { active: true })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+            crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
+            eprint!("\r\n");
+        }
     }
 }
 
@@ -2162,6 +2230,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // can't tell). The first cold attach after that is RESUME-ONLY: a warm drop
     // reattaches the SAME live shell/TUI (seamless, no re-login); a clean warm exit
     // finds no session and the acceptor closes it, so we exit cleanly.
+    // TODO: distinguish clean-exit from transport-drop at the warm layer.
+    //   Currently the bridge sees an opaque socket close for both cases.
+    //   A `ctl::session_alive(peer)` probe before the cold loop would skip
+    //   unnecessary transport establishment after a clean logout.
     let mut warm_ended = false;
 
     #[cfg(unix)]
@@ -3347,10 +3419,14 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
     }
     crate::ui::problem(
         &format!("filament ssh: no sshd on '{peer}'"),
-        &format!("'{peer}' is reachable, but nothing is listening on port {rport} for ssh."),
+        &format!(
+            "'{peer}' is reachable, but nothing is listening on localhost:{rport} for ssh. \
+             (sshd may be bound to a non-localhost address like the mesh ULA — \
+             `filament ssh` connects to localhost:{rport} on the peer.)",
+        ),
         &[
-            format!("start an sshd on '{peer}'"),
-            format!("set {} to its port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
+            format!("start an sshd on '{peer}' listening on localhost (or all interfaces)"),
+            format!("set {} to a different port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
             format!(
                 "use {} for a shell that needs no sshd",
                 crate::ui::paint(crate::ui::Tone::Brand, &format!("filament pty {peer}"))

@@ -4,8 +4,12 @@ use std::path::Path;
 const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
 const FILAMENT_MARKER: &str = "# Added by filament for L3 overlay access";
 
-/// Configure sshd to listen on the L3 overlay addresses.
-/// Appends ListenAddress entries for both IPv6 and IPv4 overlay addresses.
+/// Configure sshd to listen on the L3 overlay addresses AND localhost.
+/// Appends ListenAddress entries for both IPv6 and IPv4 overlay addresses,
+/// plus 127.0.0.1 and ::1 so `filament ssh` (which dials localhost via the
+/// L2 tunnel) continues to work. Without the localhost entries, sshd's
+/// default all-interfaces listen is REPLACED by the explicit overlay entries
+/// and localhost becomes unreachable (a regression).
 pub fn configure_sshd_overlay(v6: &str, v4: &str) -> Result<()> {
     let config_path = Path::new(SSHD_CONFIG);
     
@@ -21,9 +25,9 @@ pub fn configure_sshd_overlay(v6: &str, v4: &str) -> Result<()> {
         return Ok(());
     }
     
-    // Build the entries to append
+    // Build the entries to append — overlay addresses AND localhost.
     let entries = format!(
-        "\n{FILAMENT_MARKER}\nListenAddress {v6}\nListenAddress {v4}\n"
+        "\n{FILAMENT_MARKER}\nListenAddress {v6}\nListenAddress {v4}\nListenAddress 127.0.0.1\nListenAddress ::1\n"
     );
     
     // Append to config

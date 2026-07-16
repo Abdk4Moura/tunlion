@@ -2048,6 +2048,7 @@ async fn up_cmd(
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
+        eprintln!("[up] already-up: pidfile={:?} pid={pid} cmdline={:?}", pidfile(), std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default());
         bail!("already up (pid {pid}), `filament status` / `filament down`");
     }
     let dir = drop_dir(dir);
@@ -5355,14 +5356,27 @@ async fn handle_mount_health(req: ctl::Req, daemon_mounts: &DaemonMounts) {
 /// means nothing is there. Reported in the shell-bootstrap ack so the initiator
 /// fails fast with a clear message instead of ssh hanging on a dead port.
 async fn sshd_listening(port: u16) -> bool {
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
-        )
-        .await,
-        Ok(Ok(_))
-    )
+    // Probe localhost first (covers the common case: sshd bound to localhost or
+    // all interfaces). Then also try ::1 for dual-stack daemons that only bind
+    // IPv6 localhost.
+    let addrs: [(&str, std::net::SocketAddr); 2] = [
+        ("127.0.0.1", (std::net::Ipv4Addr::LOCALHOST, port).into()),
+        ("[::1]", (std::net::Ipv6Addr::LOCALHOST, port).into()),
+    ];
+    let rt = tokio::runtime::Handle::current();
+    for (_label, addr) in addrs {
+        let ok = rt
+            .spawn_blocking(move || {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400))
+                    .is_ok()
+            })
+            .await
+            .unwrap_or(false);
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Answer a `filament ping`: report the daemon's warm link to `peer` (route,
