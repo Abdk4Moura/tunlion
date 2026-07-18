@@ -3043,23 +3043,16 @@ async fn run_ssh(
                 crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
             } else if revive {
                 // The route exists but the overlay path looks dead (a lapsed/zombie
-                // transport). Rather than time out toward L2, ACTIVELY REVIVE it: the
-                // ctl warm-open nudges the daemon to verify + drop the zombie, which
-                // its re-dial / self-heal rebuilds under the SAME stable overlay IP.
-                // Poll briefly, then take L3 if it comes back. (If L2 can reach the
-                // peer, L3 can too - they ride the same transport.)
-                crate::ui::say(&format!("filament: L3 overlay to '{peer}' looks down, reviving..."));
-                revive_l3(peer, rport).await;
-                if wait_for_overlay(addr, l3_revive_deadline()).await {
-                    crate::ui::say("filament: L3 overlay back, using it");
-                    let code = spawn_ssh_direct(login, &mesh_host, extra)?;
-                    if code != 255 {
-                        return Ok(code);
-                    }
-                    crate::ui::say("filament: L3 ssh failed after revive, falling back to the tunnel");
-                } else {
-                    crate::ui::say("filament: L3 overlay still down, using the tunnel");
-                }
+                // transport). Kick the revive nudge in the BACKGROUND and fall back to
+                // L2 immediately. The user must never wait the revive ceiling for an
+                // interactive ssh; the next ssh will find L3 up if the revive worked.
+                crate::ui::say(&format!(
+                    "filament: L3 overlay to '{peer}' down, falling back to the tunnel; reviving in background"
+                ));
+                let peer = peer.to_string();
+                tokio::spawn(async move {
+                    revive_l3(&peer, rport).await;
+                });
             }
             // else (revive=false, e.g. the post-255 re-bootstrap retry): don't pay the
             // revive wait twice - go straight to the L2 tunnel below.
@@ -3196,47 +3189,6 @@ async fn revive_l3(peer: &str, rport: u16) {
 
 /// How long to wait for the overlay to come back after a revive nudge (default 15s;
 /// override with FILAMENT_L3_REVIVE_MS). This is a CEILING, not a fixed wait:
-/// `wait_for_overlay` polls every 500ms and returns the instant L3 answers, so a
-/// fast heal connects fast. The ceiling must clear the actual re-establish floor:
-/// the nudge drops the zombie link at once, but the re-dial rides KnownPeer's ~5s
-/// sync + establish (~2-3s), and a full-outage heal (dead-link scan + re-dial) was
-/// measured at ~12s post-blackhole. 15s covers that with margin.
-///
-/// TRADEOFF (honest worst case): this wait runs BEFORE the L2 fallback, not
-/// racing it - so for a peer that is genuinely down on BOTH planes, a single
-/// `filament ssh` now pays the full poll (~15s) before it even attempts L2, on
-/// top of L2's own establish/timeout. That is the deliberate cost of preferring
-/// L3: we would rather wait for the overlay to heal than silently settle onto a
-/// tunnel it will outlive. In practice L2 to a truly offline peer fails fast
-/// (signaling reports it absent), so the added cost is ~the poll, not a doubled
-/// ConnectTimeout. A future refinement could early-abort the poll once the daemon
-/// reports no re-establishment in progress (needs a link-state ctl query we don't
-/// have yet); until then the ceiling bounds it.
-#[cfg(target_os = "linux")]
-fn l3_revive_deadline() -> std::time::Duration {
-    let ms = std::env::var("FILAMENT_L3_REVIVE_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(15000);
-    std::time::Duration::from_millis(ms)
-}
-
-/// Poll the overlay sshd until it answers or the deadline passes. Each probe is a
-/// bounded blocking connect run OFF the async runtime.
-#[cfg(target_os = "linux")]
-async fn wait_for_overlay(addr: std::net::SocketAddr, deadline: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() >= deadline {
-            return false;
-        }
-        if tokio::task::spawn_blocking(move || probe_sshd(addr, std::time::Duration::from_millis(400)))
-            .await
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
-
 /// Info needed to connect to a peer over SSH (or sshfs/rsync). Returned by
 /// `ensure_peer_bootstrap` after key installation + host key pinning.
 pub(crate) struct PeerSshInfo {

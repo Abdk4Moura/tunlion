@@ -233,6 +233,17 @@ pub fn registry() -> &'static [Setting] {
             daemon: true,
             help: "L3 backend: auto (kernel TUN when privileged, else userspace netstack), kernel (require the TUN), userspace (zero-privilege netstack; host firewall NOT enforced, expose honored)",
         },
+        Setting {
+            key: "warm-peers",
+            aliases: &[],
+            store: "warm-peers",
+            kind: Kind::List,
+            default: "",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_WARM_PEERS"),
+            daemon: true,
+            help: "Peers to keep connected (comma-separated names). These stay warm for instant ssh/ping. Recently-used peers are also kept warm automatically (last 5).",
+        },
     ];
     R
 }
@@ -308,7 +319,10 @@ fn global_put(store: &str, value: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{store} {value}"));
-    std::fs::write(&p, lines.join("\n") + "\n")?;
+    // Atomic write: temp file + rename (same as devices.json fix)
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, lines.join("\n") + "\n")?;
+    std::fs::rename(&tmp, &p)?;
     Ok(())
 }
 

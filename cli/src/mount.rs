@@ -37,7 +37,10 @@ fn save_profile(profile: &MountProfile) -> Result<()> {
     std::fs::create_dir_all(profiles_dir())?;
     let path = profiles_dir().join(format!("{}.json", profile.name));
     let data = serde_json::to_string_pretty(profile)?;
-    std::fs::write(&path, data)?;
+    // Atomic write: temp file + rename (prevents truncation on ENOSPC/crash)
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

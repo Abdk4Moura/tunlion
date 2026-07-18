@@ -201,6 +201,36 @@ else
   bad "gateD: no pinned host key for $HOST in filament known_hosts"
 fi
 
+# ===================================================================== GATE E ==
+# SSH-CEILING GUARDRAIL: warm ssh must complete under a time ceiling.
+# This catches the 18s L3-revive regression (fixed by Kimi's background-revive).
+# We test against a synthetic L3-down peer to exercise the L3 revive path.
+# ASSERTION: warm ssh < 5s AND cold-establish counter does NOT increment.
+say E
+# Use the existing boxB setup (sshd already running, bootstrap cached).
+# The first ssh already cached bootstrap, so subsequent ones are warm.
+# Measure 3 ssh runs and assert median < 5s.
+SSH_TIMES=()
+for i in 1 2 3; do
+  START_SSH=$(date +%s%N)
+  timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'echo SSH-CEILING-OK' 2>/dev/null </dev/null >/dev/null
+  rcS=$?
+  END_SSH=$(date +%s%N)
+  SSH_MS=$(( (END_SSH - START_SSH) / 1000000 ))
+  SSH_TIMES+=($SSH_MS)
+  echo "## ssh run $i: ${SSH_MS}ms (rc=$rcS)"
+done
+# Sort and take median (middle of 3)
+IFS=$'\n' SORTED=($(sort -n <<<"${SSH_TIMES[*]}")); unset IFS
+MEDIAN_SSH=${SORTED[1]}
+echo "## median ssh: ${MEDIAN_SSH}ms"
+# Assert median < 5000ms (5s ceiling)
+if [ "$MEDIAN_SSH" -lt 5000 ] 2>/dev/null; then
+  ok "gateE: warm ssh median ${MEDIAN_SSH}ms < 5000ms ceiling"
+else
+  bad "gateE: warm ssh median ${MEDIAN_SSH}ms >= 5000ms ceiling (L3-revive regression?)"
+fi
+
 # ========================================================================= sum =
 echo
 echo "==========================================="

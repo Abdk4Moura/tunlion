@@ -190,17 +190,33 @@ impl SecretFile {
         Ok(())
     }
 
+    /// Atomic write: write to temp file, fsync, then rename over original.
+    /// This prevents data loss on ENOSPC/crash - either old file or new file,
+    /// never a truncated/empty file.
     fn write_raw(path: &Path, data: &[u8]) -> io::Result<()> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let temp = dir.join(format!("{}.tmp.{}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
+        // Write to temp file
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&temp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
         }
-        let mut f = opts.open(path)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+        // Atomic rename over original
+        std::fs::rename(&temp, path)?;
+        // Best-effort: fsync parent dir for crash durability
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }
