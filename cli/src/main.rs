@@ -2249,7 +2249,6 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     local_listener: None,
     direct_endpoint: None,
     warm_hold: WarmHold::default(),
-    cold_establishes: std::sync::atomic::AtomicU64::new(0),
     worker_port_tx: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
@@ -2988,10 +2987,6 @@ const WARM_DORMANT_THRESHOLD: u32 = 5;
 struct WarmHold {
     /// Explicitly configured peers (from `warm-peers` setting)
     configured: std::collections::HashSet<String>,
-    /// Peers with active relationships (forward/expose/proxy/pty/bridge)
-    /// that should be auto-warmed while the relationship is active.
-    /// UNBOUNDED - not capped like recent LRU.
-    active: std::collections::HashSet<String>,
     /// Peers warmed by L3 overlay being up (all paired peers when L3 enabled).
     /// UNBOUNDED - not capped like recent LRU.
     l3: std::collections::HashSet<String>,
@@ -3068,12 +3063,9 @@ impl WarmHold {
         }
     }
 
-    /// Check if a peer should be connected (configured OR active OR l3 OR recently used, not dormant)
+    /// Check if a peer should be connected (configured OR l3 OR recently used, not dormant)
     fn should_connect(&self, peer: &str) -> bool {
         if self.configured.contains(peer) {
-            return true;
-        }
-        if self.active.contains(peer) {
             return true;
         }
         if self.l3.contains(peer) {
@@ -3092,12 +3084,6 @@ impl WarmHold {
     /// Get all peers that should be connected
     fn peers_to_connect(&self) -> Vec<String> {
         let mut peers: Vec<String> = self.configured.iter().cloned().collect();
-        // Add active peers (unbounded)
-        for p in &self.active {
-            if !peers.contains(p) {
-                peers.push(p.clone());
-            }
-        }
         // Add L3 peers (unbounded)
         for p in &self.l3 {
             if !peers.contains(p) {
@@ -3142,14 +3128,6 @@ mod warm_hold_tests {
     fn should_connect_configured() {
         let mut wh = WarmHold::default();
         wh.configured.insert("dovm".into());
-        assert!(wh.should_connect("dovm"));
-        assert!(!wh.should_connect("popos"));
-    }
-
-    #[test]
-    fn should_connect_active() {
-        let mut wh = WarmHold::default();
-        wh.active.insert("dovm".into());
         assert!(wh.should_connect("dovm"));
         assert!(!wh.should_connect("popos"));
     }
@@ -3230,15 +3208,6 @@ mod warm_hold_tests {
     }
 
     #[test]
-    fn active_add_remove() {
-        let mut wh = WarmHold::default();
-        wh.active.insert("dovm".into());
-        assert!(wh.should_connect("dovm"));
-        wh.active.remove("dovm");
-        assert!(!wh.should_connect("dovm"));
-    }
-
-    #[test]
     fn l3_disabled_clears_set() {
         let mut wh = WarmHold::default();
         wh.l3.insert("dovm".into());
@@ -3304,33 +3273,21 @@ mod warm_hold_tests {
         assert!(!wh.is_dormant("dovm"));
     }
 
-    /// CI GUARDRAIL: cold-establish counter sanity check.
-    /// Ensures the counter exists and is usable for CI assertions.
-    #[test]
-    fn cold_establish_counter_exists() {
-        let counter = std::sync::atomic::AtomicU64::new(0);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
-    }
-
     /// CI GUARDRAIL: warm peers should be instantly connectable.
     /// This is a LOGICAL test (no network) - verifies the warm-hold state
     /// machine would allow instant connection for a warm peer.
     #[test]
     fn warm_peer_allows_instant_connection() {
         let mut wh = WarmHold::default();
-        // Simulate a warm peer (configured + active)
+        // Simulate a warm peer (configured + l3)
         wh.configured.insert("dovm".into());
-        wh.active.insert("dovm".into());
         wh.l3.insert("dovm".into());
         wh.note_use("dovm");
         // All paths should return true
         assert!(wh.should_connect("dovm"));
         assert!(!wh.is_dormant("dovm"));
-        // Peer is in all warm sets
+        // Peer is in warm sets
         assert!(wh.configured.contains("dovm"));
-        assert!(wh.active.contains("dovm"));
         assert!(wh.l3.contains("dovm"));
     }
 }
@@ -3414,9 +3371,6 @@ struct Conn {
     /// configured peers so `filament ping`/`ssh` is instant. Tracked per-peer
     /// with LRU eviction and exponential backoff on failures.
     warm_hold: WarmHold,
-    /// Cold-establish counter: increments every time a connection is cold-established
-    /// (via establish()). Exposed for CI guardrail to verify warm path reuses held links.
-    cold_establishes: std::sync::atomic::AtomicU64,
     /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
     /// The dialer-side `spawn_direct_workers` stores a sender here; the
     /// `worker-ports` control message handler delivers the acceptor's port list
@@ -3578,7 +3532,6 @@ impl Conn {
             local_listener: None,
             direct_endpoint: None,
             warm_hold: WarmHold::default(),
-            cold_establishes: std::sync::atomic::AtomicU64::new(0),
             worker_port_tx: HashMap::new(),
         }
     }
@@ -3763,21 +3716,6 @@ impl Conn {
         self.warm_hold.note_use(peer);
     }
 
-    /// Auto-warm a peer with an active relationship (forward/expose/proxy/pty/bridge).
-    /// The peer stays warm as long as the relationship is active.
-    fn note_active_relationship(&mut self, peer: &str) {
-        self.warm_hold.note_use(peer);
-        // Also mark as actively warm (not just recently-used)
-        self.warm_hold.active.insert(peer.to_string());
-        ui::debug(&format!("warm-hold: auto-warming peer '{peer}' (active relationship)"));
-    }
-
-    /// Remove auto-warm for a peer when its relationship ends.
-    fn clear_active_relationship(&mut self, peer: &str) {
-        self.warm_hold.active.remove(peer);
-        ui::debug(&format!("warm-hold: removing auto-warm for '{peer}' (relationship ended)"));
-    }
-
     /// Load configured warm-peers from settings. Called at daemon startup and
     /// at the top of each warm_hold_tick to stay in sync with runtime changes.
     fn load_warm_peers_config(&mut self) {
@@ -3865,8 +3803,6 @@ impl Conn {
     }
 
     async fn establish(&mut self, info: Value) -> Result<()> {
-        // Track cold-establishes for CI guardrail (warm path should bypass this)
-        self.cold_establishes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.establish_as(info, None).await
     }
 
@@ -8858,11 +8794,9 @@ async fn recv_cmd(
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
                         } else {
-                            // Auto-warm: track peer for active PTY relationships only.
-                            // Open (forward/netcat) is short-lived, not worth warming permanently.
-                            // Pty sessions are long-lived interactive shells worth keeping warm.
+                            // Auto-warm: feed LRU for pty sessions (bounded, no leak).
                             if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
-                                conn.note_active_relationship(peer);
+                                conn.note_warm_use(peer);
                             }
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                         }
