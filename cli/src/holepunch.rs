@@ -131,7 +131,10 @@ pub fn stun_srflx_any(sock: &UdpSocket, servers: &[SocketAddr]) -> Result<Socket
         // Fan out to every server, then take whichever answers first.
         for s in servers {
             if let Err(e) = sock.send_to(&req, s) {
-                last_err = anyhow!("stun: send_to {s}: {e}");
+                #[allow(unused_assignments)]
+                {
+                    last_err = anyhow!("stun: send_to {s}: {e}");
+                }
             }
         }
         let mut buf = [0u8; 512];

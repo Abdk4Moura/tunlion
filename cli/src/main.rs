@@ -59,12 +59,12 @@ use net::{Ev, Peer, Transport};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Read, Seek, SeekFrom};
+use std::io::{IsTerminal, Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
+
 use tokio::sync::{mpsc, oneshot};
 
 /// Positional write at an absolute offset, used by concurrent spawn_blocking
@@ -2114,7 +2114,7 @@ fn tour_cmd() -> Result<()> {
     ui::say(&format!("  {n} known device{}", if n == 1 { "" } else { "s" }));
     ui::say("");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  do this:"));
-    let mut act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));
+    let act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));
     act("filament send <file>", "send files (to a browser or a paired device)");
     if n == 0 {
         act("filament pair", "remember a device (unlocks ssh + expose)");
@@ -3841,7 +3841,7 @@ impl Conn {
                     || v["id"].as_str().map(|id| id.eq_ignore_ascii_case(&peer)).unwrap_or(false)
             }) {
                 let info = info.clone();
-                let peer_id = info["id"].as_str().unwrap_or_default().to_string();
+                let _peer_id = info["id"].as_str().unwrap_or_default().to_string();
                 // Try to establish connection
                 match self.establish(info).await {
                     Ok(()) => {
@@ -4332,7 +4332,7 @@ impl Conn {
         // full-insert replacing the old Link (which would drop the primary
         // transport Arc → quinn ApplicationClosed → primary death at K>1).
         // Workers stay intact; only the primary transport is swapped.
-        let existing_generation = self.links.get(pid).map(|l| l.generation).unwrap_or(0);
+        let _existing_generation = self.links.get(pid).map(|l| l.generation).unwrap_or(0);
         if let Some(existing) = self.links.get_mut(pid) {
             if existing.transport.as_ref().map(|t2| t2.is_dead()).unwrap_or(true) { existing.transport = Some(t); }
             existing.direct = true;
@@ -4384,13 +4384,13 @@ impl Conn {
         &mut self,
         pid: &str,
         primary: &Arc<dyn Transport>,
-        tkey: [u8; 32],
+        _tkey: [u8; 32],
     ) {
         let k = net::direct_streams();
         if k <= 1 {
             return;
         }
-        let Some(peer_addr) = primary.remote_addr() else { return };
+        let Some(_peer_addr) = primary.remote_addr() else { return };
         // BUGFIX: `primary.sid_answerer()` is TRUE on BOTH ends of a symmetric
         // simultaneous-open (both peers establish via on_transport_offer, which
         // hardcodes answerer=true), so it cannot split the worker roles — both
@@ -6516,7 +6516,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { peer, remote, local, read_only, options, foreground, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile } => {
+        Cmd::Mount { peer, remote, local, read_only: _, options: _, foreground: _, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile } => {
             if let Some(name) = save_profile {
                 mount::save_profile_cmd(&name)
             } else if let Some(name) = apply_profile {
@@ -6540,7 +6540,7 @@ async fn main() -> Result<()> {
             } else {
                 let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
-                let auto_restore = save_auto;
+                let _auto_restore = save_auto;
                 let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
                 if let Some(_local) = local {
                     ui::say(&format!(
@@ -8671,7 +8671,7 @@ async fn recv_cmd(
     // Bug 5: surface the single-host mDNS wedge hint once after repeated stuck.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
-    let mut saw_known_peer: HashSet<String> = HashSet::new();
+    let _saw_known_peer: HashSet<String> = HashSet::new();
     let mut ever_received = false;
     // C12 live-pairing: the roster (`devices`) is loaded ONCE at startup, and
     // KnownPeer events only fire for channels we've SUBSCRIBED. A device paired
@@ -11265,7 +11265,7 @@ async fn sweep_completed_streams(
         .map(|(k, _)| k.clone())
         .collect();
     for key in done_sids {
-        if let Some(mut inc) = by_sid.remove(&key) {
+        if let Some(inc) = by_sid.remove(&key) {
             if to_stdout {
                 let f = inc.file.clone();
                 let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
@@ -11286,7 +11286,7 @@ async fn sweep_completed_streams(
 /// to the last byte received, then drop the per-link routing. Resume picks
 /// them up from disk.
 async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
-    for (_sid, mut inc) in by_sid.drain() {
+    for (_sid, inc) in by_sid.drain() {
         let f = inc.file.clone();
         let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
         ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received.load(Ordering::Relaxed))));
