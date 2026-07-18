@@ -204,31 +204,55 @@ fi
 # ===================================================================== GATE E ==
 # SSH-CEILING GUARDRAIL: warm ssh must complete under a time ceiling.
 # This catches the 18s L3-revive regression (fixed by Kimi's background-revive).
-# We test against a synthetic L3-down peer to exercise the L3 revive path.
-# ASSERTION: warm ssh < 5s AND cold-establish counter does NOT increment.
+# We test against a SYNTHETIC L3-DOWN peer to exercise the L3 revive path.
+# ASSERTION: warm ssh < 5s AND L3 path is exercised.
 say E
+
+# SYNTHETIC L3-DOWN REPRO: register boxB.mesh in /etc/hosts with a fake overlay
+# address so l3_mesh_addr() returns Some (the L3 path is triggered), but keep the
+# overlay DOWN so the revive path is exercised (same condition as popos/agboola).
+FAKE_L3_ADDR="fdf1:1af7:c30d:dead:beef::1"
+echo "$FAKE_L3_ADDR boxB.mesh" >> /etc/hosts
+cleanup_hosts() { sed -i "/$FAKE_L3_ADDR boxB\.mesh/d" /etc/hosts 2>/dev/null; }
+trap cleanup_hosts EXIT
+
 # Use the existing boxB setup (sshd already running, bootstrap cached).
 # The first ssh already cached bootstrap, so subsequent ones are warm.
 # Measure 3 ssh runs and assert median < 5s.
 SSH_TIMES=()
+L3_PATH_HIT=0
 for i in 1 2 3; do
   START_SSH=$(date +%s%N)
-  timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'echo SSH-CEILING-OK' 2>/dev/null </dev/null >/dev/null
+  SSH_STDERR=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'echo SSH-CEILING-OK' 2>&1 </dev/null)
   rcS=$?
   END_SSH=$(date +%s%N)
   SSH_MS=$(( (END_SSH - START_SSH) / 1000000 ))
   SSH_TIMES+=($SSH_MS)
   echo "## ssh run $i: ${SSH_MS}ms (rc=$rcS)"
+  # Check if L3 path was exercised
+  if echo "$SSH_STDERR" | grep -q "L3 overlay to 'boxB' down"; then
+    L3_PATH_HIT=1
+    echo "## L3 REVIVE PATH EXERCISED ✓"
+  fi
 done
+
 # Sort and take median (middle of 3)
 IFS=$'\n' SORTED=($(sort -n <<<"${SSH_TIMES[*]}")); unset IFS
 MEDIAN_SSH=${SORTED[1]}
 echo "## median ssh: ${MEDIAN_SSH}ms"
-# Assert median < 5000ms (5s ceiling)
+
+# ASSERT 1: median < 5000ms (5s ceiling)
 if [ "$MEDIAN_SSH" -lt 5000 ] 2>/dev/null; then
-  ok "gateE: warm ssh median ${MEDIAN_SSH}ms < 5000ms ceiling"
+  ok "gateE-1: warm ssh median ${MEDIAN_SSH}ms < 5000ms ceiling"
 else
-  bad "gateE: warm ssh median ${MEDIAN_SSH}ms >= 5000ms ceiling (L3-revive regression?)"
+  bad "gateE-1: warm ssh median ${MEDIAN_SSH}ms >= 5000ms ceiling (L3-revive regression?)"
+fi
+
+# ASSERT 2: L3 path was exercised (the revive path was triggered)
+if [ "$L3_PATH_HIT" -eq 1 ]; then
+  ok "gateE-2: L3 revive path exercised (synthetic L3-DOWN repro works)"
+else
+  bad "gateE-2: L3 revive path NOT exercised (gate is false-safe!)"
 fi
 
 # ========================================================================= sum =
