@@ -421,6 +421,11 @@ export class PeerLink {
     this.relayOnly = !!relayOnly
     this.pc = new RTCPeerConnection({
       iceServers,
+      // Pre-gather a candidate so the srflx/relay path is ready the moment the
+      // offer is built, instead of gathering from cold afterward — shaves a beat
+      // off first connect on a high-RTT link. (Trickle already sends each
+      // candidate as it arrives; this just starts the gather earlier.)
+      iceCandidatePoolSize: 1,
       ...(this.relayOnly ? { iceTransportPolicy: 'relay' } : {}),
     })
     // Link-diagnostics (telemetry capture): a per-link getStats sampler that

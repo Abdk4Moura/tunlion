@@ -43,7 +43,15 @@ class SocketIOSignaling extends Emitter {
     this.room = null
     this.name = null
     // API_BASE === '' → same-origin; otherwise connect to the backend origin.
-    this.socket = io(API_BASE || undefined, { autoConnect: true })
+    // WebSocket FIRST: socket.io's default is HTTP long-poll → upgrade, which
+    // costs an extra handshake + upgrade round-trip on every connect (painful at
+    // high RTT, e.g. a phone in Lagos to a US/EU origin). Trying `websocket`
+    // first connects straight over WS; `polling` stays as the fallback so a
+    // network that blocks WS still works (just slower there).
+    this.socket = io(API_BASE || undefined, {
+      autoConnect: true,
+      transports: ['websocket', 'polling'],
+    })
     for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-ok', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
