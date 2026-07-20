@@ -1,0 +1,615 @@
+// Linux FUSE client adapter for the mesh-native mount protocol.
+//
+// This is the `MountHost` piece from docs/design-cross-platform-capabilities.md:
+// the mesh serves a uniform SFTP-like file protocol (see mount_proto.rs), and
+// this adapter presents that protocol as a real local filesystem via FUSE. The
+// server needs no FUSE; only the client mount does. macOS reuses this same crate
+// (macFUSE) and Windows gets a WinFsp/ProjFS adapter in a later round.
+//
+// Design notes:
+//   * The wire protocol is PATH-based; FUSE is INODE-based. `InodeMap` is the
+//     client-side bridge: a stable u64 inode per path (root = 1), allocated on
+//     first lookup/readdir and reused so the kernel's inode cache stays coherent.
+//   * Server file handles pass straight through as FUSE file handles.
+//   * fuser 0.17's `Filesystem` methods take `&self`, but `MountClient::call_sync`
+//     needs `&mut` (it owns the framing buffer + id counter), so the client lives
+//     behind a `Mutex`. fuser runs a single event-loop thread by default, so this
+//     never contends.
+//   * `call_sync` blocks the calling thread on a tokio mpsc, so the whole FUSE
+//     session runs inside `spawn_blocking` while the mux pump tasks keep draining
+//     the transport on the tokio runtime.
+
+#![cfg(target_os = "linux")]
+
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use fuser::{
+    Config, FileAttr, FileType, Filesystem, Generation, MountOption, OpenFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    TimeOrNow,
+};
+use fuser::{Errno, FileHandle, FopenFlags, INodeNo};
+use serde_json::Value;
+
+use crate::mount_proto::{FileKind, FileStat, MountClient, MountOp, MountResult};
+
+const EIO: i32 = 5;
+const TTL: Duration = Duration::from_secs(1);
+
+/// Maps stable FUSE inode numbers to protocol paths (relative to the mount root)
+/// and back. Root is inode 1, path ".". New inodes are handed out monotonically
+/// and cached both ways so repeated lookups of the same path are stable.
+struct InodeMap {
+    fwd: HashMap<u64, PathBuf>,
+    rev: HashMap<PathBuf, u64>,
+    next: u64,
+}
+
+impl InodeMap {
+    fn new() -> Self {
+        let mut fwd = HashMap::new();
+        let mut rev = HashMap::new();
+        fwd.insert(1, PathBuf::from("."));
+        rev.insert(PathBuf::from("."), 1);
+        InodeMap { fwd, rev, next: 2 }
+    }
+
+    fn path(&self, ino: u64) -> Option<PathBuf> {
+        self.fwd.get(&ino).cloned()
+    }
+
+    fn intern(&mut self, path: PathBuf) -> u64 {
+        if let Some(&i) = self.rev.get(&path) {
+            return i;
+        }
+        let i = self.next;
+        self.next += 1;
+        self.fwd.insert(i, path.clone());
+        self.rev.insert(path, i);
+        i
+    }
+
+    fn forget(&mut self, path: &Path) {
+        if let Some(i) = self.rev.remove(path) {
+            self.fwd.remove(&i);
+        }
+    }
+}
+
+/// A cached directory listing, captured on the first `readdir` for an open dir
+/// handle and served across the paginated readdir calls the kernel makes.
+struct CachedDir {
+    // (child inode, kind, name) triples, in listing order.
+    entries: Vec<(u64, FileType, OsString)>,
+}
+
+pub struct FilamentFs {
+    client: Mutex<MountClient>,
+    inodes: Mutex<InodeMap>,
+    // Keyed by the server file handle returned from opendir.
+    dirs: Mutex<HashMap<u64, CachedDir>>,
+}
+
+impl FilamentFs {
+    pub fn new(client: MountClient) -> Self {
+        FilamentFs {
+            client: Mutex::new(client),
+            inodes: Mutex::new(InodeMap::new()),
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Issue one protocol op and unwrap the result to either the ok `Value` or a
+    /// POSIX errno the FUSE reply can carry. A dead channel maps to EIO.
+    fn call(&self, op: MountOp) -> Result<Value, i32> {
+        let mut c = self.client.lock().unwrap();
+        match c.call_sync(op) {
+            Ok(resp) => match resp.result {
+                MountResult::Ok(v) => Ok(v),
+                MountResult::Err(e) => Err(e.code),
+            },
+            Err(_) => Err(EIO),
+        }
+    }
+
+    fn path_of(&self, ino: u64) -> Result<PathBuf, i32> {
+        self.inodes
+            .lock()
+            .unwrap()
+            .path(ino)
+            .ok_or(libc::ENOENT)
+    }
+}
+
+/// Join a child name onto a parent path, keeping the root as "." rather than
+/// "./name" so the encoded wire path and the inode-map key stay canonical.
+fn child_path(parent: &Path, name: &OsStr) -> PathBuf {
+    if parent == Path::new(".") {
+        PathBuf::from(name)
+    } else {
+        parent.join(name)
+    }
+}
+
+fn encode(path: &Path) -> String {
+    crate::mount_proto::path_encode(path)
+}
+
+fn kind_to_fuse(stat: &FileStat) -> FileType {
+    match stat.kind {
+        Some(FileKind::Dir) => FileType::Directory,
+        Some(FileKind::Symlink) => FileType::Symlink,
+        _ => {
+            // No explicit kind: fall back to the mode type bits.
+            match stat.mode & 0o170000 {
+                0o040000 => FileType::Directory,
+                0o120000 => FileType::Symlink,
+                0o010000 => FileType::NamedPipe,
+                0o140000 => FileType::Socket,
+                0o020000 => FileType::CharDevice,
+                0o060000 => FileType::BlockDevice,
+                _ => FileType::RegularFile,
+            }
+        }
+    }
+}
+
+/// Build a fuser `FileAttr` from the protocol `FileStat`, stamping the given
+/// stable inode. Times we cannot represent collapse to mtime (v1 carries mtime
+/// only, per the spec's best-effort metadata rule).
+fn to_attr(ino: u64, stat: &FileStat) -> FileAttr {
+    let mtime = UNIX_EPOCH + Duration::from_secs(stat.mtime);
+    FileAttr {
+        ino: INodeNo(ino),
+        size: stat.size,
+        blocks: stat.blocks,
+        atime: mtime,
+        mtime,
+        ctime: mtime,
+        crtime: mtime,
+        kind: kind_to_fuse(stat),
+        perm: (stat.mode & 0o7777) as u16,
+        nlink: stat.nlink.max(1),
+        uid: stat.uid,
+        gid: stat.gid,
+        rdev: 0,
+        blksize: stat.blksize,
+        flags: 0,
+    }
+}
+
+fn parse_stat(v: &Value) -> Result<FileStat, i32> {
+    serde_json::from_value(v.clone()).map_err(|_| EIO)
+}
+
+impl Filesystem for FilamentFs {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent_path = match self.path_of(parent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let path = child_path(&parent_path, name);
+        match self.call(MountOp::GetAttr { path: encode(&path) }) {
+            Ok(v) => match parse_stat(&v) {
+                Ok(stat) => {
+                    let ino = self.inodes.lock().unwrap().intern(path);
+                    reply.entry(&TTL, &to_attr(ino, &stat), Generation(0));
+                }
+                Err(e) => reply.error(Errno::from_i32(e)),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let path = match self.path_of(ino.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        match self.call(MountOp::GetAttr { path: encode(&path) }) {
+            Ok(v) => match parse_stat(&v) {
+                Ok(stat) => reply.attr(&TTL, &to_attr(ino.0, &stat)),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let path = match self.path_of(ino.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        // v1 honours the one setattr that changes bytes: truncate. mode/uid/gid/
+        // timestamps are acked best-effort (the spec's honest-metadata rule); we
+        // re-stat and return the server's truth rather than fake the requested
+        // values.
+        if let Some(sz) = size {
+            if let Err(e) = self.call(MountOp::Truncate { path: encode(&path), size: sz }) {
+                return reply.error(Errno::from_i32(e));
+            }
+        }
+        match self.call(MountOp::GetAttr { path: encode(&path) }) {
+            Ok(v) => match parse_stat(&v) {
+                Ok(stat) => reply.attr(&TTL, &to_attr(ino.0, &stat)),
+                Err(e) => reply.error(Errno::from_i32(e)),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let path = match self.path_of(ino.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        match self.call(MountOp::ReadLink { path: encode(&path) }) {
+            // The server returns the target as an encoded raw-byte path; the link
+            // body handed to the kernel is exactly those bytes.
+            Ok(Value::String(enc)) => match crate::mount_proto::path_decode(&enc) {
+                Ok(target) => reply.data(target.as_os_str().as_bytes()),
+                Err(_) => reply.error(Errno::from_i32(EIO)),
+            },
+            Ok(_) => reply.error(Errno::from_i32(EIO)),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let path = match self.path_of(ino.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        match self.call(MountOp::Open { path: encode(&path), flags: flags.0 }) {
+            Ok(v) => {
+                let fh = v["fh"].as_u64().unwrap_or(0);
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+            }
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn read(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyData,
+    ) {
+        match self.call(MountOp::Read { fh: fh.0, offset, size }) {
+            Ok(v) => {
+                let enc = v["data"].as_str().unwrap_or("");
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(enc) {
+                    Ok(bytes) => reply.data(&bytes),
+                    Err(_) => reply.error(Errno::from_i32(EIO)),
+                }
+            }
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        use base64::Engine;
+        let enc = base64::engine::general_purpose::STANDARD.encode(data);
+        match self.call(MountOp::Write { fh: fh.0, offset, data: enc }) {
+            Ok(v) => reply.written(v["size"].as_u64().unwrap_or(0) as u32),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        // No client-side write buffering: writes are already synchronous round
+        // trips to the server, so there is nothing to flush here.
+        reply.ok();
+    }
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        match self.call(MountOp::FSync { fh: fh.0, datasync }) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        let _ = self.call(MountOp::Release { fh: fh.0 });
+        reply.ok();
+    }
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let path = match self.path_of(ino.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        // The server serves ReadDir off an open handle, so a dir opens like a file.
+        match self.call(MountOp::Open { path: encode(&path), flags: flags.0 }) {
+            Ok(v) => {
+                let fh = v["fh"].as_u64().unwrap_or(0);
+                reply.opened(FileHandle(fh), FopenFlags::empty());
+            }
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        // Populate the cache once (offset 0), then paginate from it. The server
+        // returns the whole listing in one ReadDir, so caching keeps readdir
+        // stable across the kernel's paginated calls.
+        if offset == 0 {
+            let dir_path = match self.path_of(ino.0) {
+                Ok(p) => p,
+                Err(e) => return reply.error(Errno::from_i32(e)),
+            };
+            let listing = match self.call(MountOp::ReadDir { fh: fh.0, offset: 0 }) {
+                Ok(v) => v,
+                Err(e) => return reply.error(Errno::from_i32(e)),
+            };
+            let parent_ino = {
+                let inodes = self.inodes.lock().unwrap();
+                dir_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .and_then(|p| inodes.rev.get(p).copied())
+                    .unwrap_or(1)
+            };
+            let mut entries: Vec<(u64, FileType, OsString)> = Vec::new();
+            entries.push((ino.0, FileType::Directory, OsString::from(".")));
+            entries.push((parent_ino, FileType::Directory, OsString::from("..")));
+            if let Some(arr) = listing.as_array() {
+                let mut inodes = self.inodes.lock().unwrap();
+                for e in arr {
+                    let name_enc = e["name"].as_str().unwrap_or("");
+                    // Names are raw bytes on the wire; decode to an OsString and
+                    // never lossy-convert (spec rule 2). Skip anything undecodable.
+                    let name_os = match crate::mount_proto::path_decode(name_enc) {
+                        Ok(p) => match p.file_name() {
+                            Some(n) => n.to_os_string(),
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    };
+                    let stat: FileStat = match serde_json::from_value(e["stat"].clone()) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let child = child_path(&dir_path, &name_os);
+                    let child_ino = inodes.intern(child);
+                    entries.push((child_ino, kind_to_fuse(&stat), name_os));
+                }
+            }
+            self.dirs.lock().unwrap().insert(fh.0, CachedDir { entries });
+        }
+
+        let dirs = self.dirs.lock().unwrap();
+        if let Some(cached) = dirs.get(&fh.0) {
+            for (idx, (child_ino, kind, name)) in
+                cached.entries.iter().enumerate().skip(offset as usize)
+            {
+                // The offset we hand back is the index of the NEXT entry, so a
+                // resumed readdir continues correctly.
+                let next = (idx + 1) as u64;
+                if reply.add(INodeNo(*child_ino), next, *kind, name) {
+                    break; // kernel buffer full; the rest comes on the next call
+                }
+            }
+        }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.dirs.lock().unwrap().remove(&fh.0);
+        let _ = self.call(MountOp::Release { fh: fh.0 });
+        reply.ok();
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let parent_path = match self.path_of(parent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let path = child_path(&parent_path, name);
+        let fh = match self.call(MountOp::Create { path: encode(&path), mode, flags }) {
+            Ok(v) => v["fh"].as_u64().unwrap_or(0),
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        match self.call(MountOp::GetAttr { path: encode(&path) }) {
+            Ok(v) => match parse_stat(&v) {
+                Ok(stat) => {
+                    let ino = self.inodes.lock().unwrap().intern(path);
+                    reply.created(
+                        &TTL,
+                        &to_attr(ino, &stat),
+                        Generation(0),
+                        FileHandle(fh),
+                        FopenFlags::empty(),
+                    );
+                }
+                Err(e) => reply.error(Errno::from_i32(e)),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let parent_path = match self.path_of(parent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let path = child_path(&parent_path, name);
+        if let Err(e) = self.call(MountOp::MkDir { path: encode(&path), mode }) {
+            return reply.error(Errno::from_i32(e));
+        }
+        match self.call(MountOp::GetAttr { path: encode(&path) }) {
+            Ok(v) => match parse_stat(&v) {
+                Ok(stat) => {
+                    let ino = self.inodes.lock().unwrap().intern(path);
+                    reply.entry(&TTL, &to_attr(ino, &stat), Generation(0));
+                }
+                Err(e) => reply.error(Errno::from_i32(e)),
+            },
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.path_of(parent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let path = child_path(&parent_path, name);
+        match self.call(MountOp::Unlink { path: encode(&path) }) {
+            Ok(_) => {
+                self.inodes.lock().unwrap().forget(&path);
+                reply.ok();
+            }
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.path_of(parent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let path = child_path(&parent_path, name);
+        match self.call(MountOp::RmDir { path: encode(&path) }) {
+            Ok(_) => {
+                self.inodes.lock().unwrap().forget(&path);
+                reply.ok();
+            }
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        _flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let from_parent = match self.path_of(parent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let to_parent = match self.path_of(newparent.0) {
+            Ok(p) => p,
+            Err(e) => return reply.error(Errno::from_i32(e)),
+        };
+        let from = child_path(&from_parent, name);
+        let to = child_path(&to_parent, newname);
+        match self.call(MountOp::Rename { from: encode(&from), to: encode(&to) }) {
+            Ok(_) => {
+                // Drop the stale inode bindings; the kernel re-looks-up as needed.
+                let mut inodes = self.inodes.lock().unwrap();
+                inodes.forget(&from);
+                inodes.forget(&to);
+                reply.ok();
+            }
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+}
+
+/// Mount the protocol served by `client` at `mountpoint` via FUSE. Blocks the
+/// calling thread running the FUSE session loop until the filesystem is
+/// unmounted (by `fusermount -u`, `umount`, or the kernel on teardown). Because
+/// `MountClient::call_sync` blocks on the tokio mpsc, callers must run this on a
+/// dedicated blocking thread (`spawn_blocking`) so the mux pump keeps draining.
+pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
+    let fs = FilamentFs::new(client);
+    let mut cfg = Config::default();
+    // FSName labels the mount in /proc/mounts. We deliberately omit AutoUnmount
+    // (it needs allow_other and a fuse.conf tweak); teardown is driven explicitly
+    // by the caller via fusermount -u / ctrl-c.
+    cfg.mount_options = vec![MountOption::FSName("filament".into())];
+    fuser::mount2(fs, mountpoint, &cfg)?;
+    Ok(())
+}

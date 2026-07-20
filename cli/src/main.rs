@@ -28,6 +28,8 @@ mod interact;
 mod l2;
 mod mount;
 mod mount_proto;
+#[cfg(target_os = "linux")]
+mod mount_fuse;
 mod backup;
 mod net;
 mod overlay;
@@ -6478,15 +6480,23 @@ async fn main() -> Result<()> {
                 let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
                 let _auto_restore = save_auto;
                 let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
-                if let Some(_local) = local {
-                    ui::say(&format!(
-                        "  {} mesh-native mount protocol connected to {peer}:{remote}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                    ));
-                    ui::say(&format!(
-                        "  {} FUSE adapter not yet available; listing directory instead",
-                        ui::paint(ui::Tone::Warn, "!")
-                    ));
+                if let Some(local) = local {
+                    #[cfg(target_os = "linux")]
+                    {
+                        return mount_fuse_cmd(client, &peer, &remote, &local).await;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = &local;
+                        ui::say(&format!(
+                            "  {} mesh-native mount protocol connected to {peer}:{remote}",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                        ));
+                        ui::say(&format!(
+                            "  {} local FUSE/WinFsp adapter not available on this OS yet; listing directory instead",
+                            ui::paint(ui::Tone::Warn, "!")
+                        ));
+                    }
                 }
                 // List the root directory
                 use crate::mount_proto::MountOp;
@@ -6526,6 +6536,122 @@ async fn main() -> Result<()> {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
     }
+}
+
+// ------------------------------------------------------------------ mount --
+// Mount a peer directory locally over the mesh-native mount protocol, presented
+// through FUSE. Linux only for now (macOS/Windows adapters are a later round).
+
+/// Present the connected `client` as a local FUSE mount at `local`.
+///
+/// Before touching the filesystem we run a connection-honesty probe: one
+/// GetAttr on the mount root under a timeout. An untrusted or refused peer
+/// (the acceptor replies l2-close, which EOFs the stream) surfaces here as one
+/// clean pre-mount error, instead of a cryptic failure on the first `ls` after
+/// the kernel has already accepted the mount. On any failure we leave no stale
+/// mountpoint behind (the #22 contract).
+#[cfg(target_os = "linux")]
+async fn mount_fuse_cmd(
+    mut client: crate::mount_proto::MountClient,
+    peer: &str,
+    remote: &str,
+    local: &str,
+) -> Result<()> {
+    use crate::mount_proto::{MountOp, MountResult};
+
+    // 1. Probe the link before we mount anything.
+    let root_enc = mount_proto::path_encode(std::path::Path::new("."));
+    let probe = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.call(MountOp::GetAttr { path: root_enc }),
+    )
+    .await;
+    match probe {
+        Ok(Ok(resp)) => match resp.result {
+            MountResult::Ok(_) => {}
+            MountResult::Err(e) => bail!(
+                "mount refused by {peer}: {} (remote path {remote})",
+                e.msg
+            ),
+        },
+        Ok(Err(e)) => bail!(
+            "mount to {peer} failed before it started: {e} \
+             (peer may be untrusted or the link dropped; nothing was mounted)"
+        ),
+        Err(_) => bail!(
+            "mount to {peer} timed out waiting for the remote filesystem \
+             (no response in 10s; nothing was mounted)"
+        ),
+    }
+
+    // 2. Create the mountpoint. Track whether WE created it so a failed mount
+    //    cleans up after itself and never leaves a stale empty dir.
+    let mnt = std::path::PathBuf::from(local);
+    let created_dir = !mnt.exists();
+    if created_dir {
+        std::fs::create_dir_all(&mnt)
+            .with_context(|| format!("failed to create mount point {local}"))?;
+    }
+
+    ui::say(&format!(
+        "  {} mesh-native mount: {peer}:{remote} -> {local} (FUSE, no sshd/sshfs)",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+    ));
+    ui::say(&format!(
+        "  {} mounted. unmount with `filament unmount {local}` or ctrl-c",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+    ));
+
+    // 3. Run the blocking FUSE session on a dedicated thread so the tokio mux
+    //    pump keeps draining the transport. ctrl-c triggers an unmount, which
+    //    makes the blocking session loop return.
+    let mnt_run = mnt.clone();
+    let session = tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run));
+
+    let result: Result<()> = tokio::select! {
+        joined = session => {
+            match joined {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::anyhow!("mount session panicked: {e}")),
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            ui::say("\n  unmounting...");
+            let _ = unmount_fuse(local);
+            Ok(())
+        }
+    };
+
+    // 4. On any error, remove the mountpoint we created (leave a pre-existing
+    //    dir alone). A clean unmount leaves the empty dir in place, matching the
+    //    legacy behaviour.
+    if result.is_err() && created_dir {
+        let _ = unmount_fuse(local);
+        let _ = std::fs::remove_dir(&mnt);
+    }
+    result
+}
+
+/// Unmount a FUSE mountpoint. Tries fusermount3 then fusermount (older systems),
+/// falling back to a lazy unmount so a busy mount still detaches.
+#[cfg(target_os = "linux")]
+fn unmount_fuse(local: &str) -> std::io::Result<()> {
+    for bin in ["fusermount3", "fusermount"] {
+        if std::process::Command::new(bin)
+            .args(["-u", local])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    // Last resort: lazy unmount so a busy handle does not wedge teardown.
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-uz", local])
+        .status();
+    Ok(())
 }
 
 // ----------------------------------------------------------------- update --

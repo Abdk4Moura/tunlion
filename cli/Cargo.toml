@@ -90,6 +90,12 @@ crossterm = "0.29"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux mount client adapter: present the mesh-native mount protocol as a real
+# local filesystem via FUSE. Server side needs no FUSE; only the client mount
+# does. macOS uses the same crate (macFUSE) in a later round.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.17"
+
 # Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
 # loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
 # release packaging; adapter creation needs Administrator.

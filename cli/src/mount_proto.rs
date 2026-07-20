@@ -227,6 +227,10 @@ const EROFS: i32 = 30;
 const O_RDONLY: i32 = 0;
 const O_WRONLY: i32 = 1;
 const O_RDWR: i32 = 2;
+// Access-mode mask. The read/write intent lives in the low two bits, NOT in a
+// set bit: O_RDONLY is 0, so `flags & O_RDONLY` is always 0 and can never be
+// tested for. Mask with O_ACCMODE and compare the result to the three modes.
+const O_ACCMODE: i32 = 3;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -380,10 +384,11 @@ fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64,
 
 fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut HashMap<u64, (std::fs::File, PathBuf)>, next_fh: &mut u64) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
+    // create implies write; also open for read unless the caller asked write-only.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .read((flags & O_RDONLY as i32) == 0)
+        .read((flags & O_ACCMODE) != O_WRONLY)
         .open(&resolved)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     #[cfg(unix)]
@@ -405,6 +410,10 @@ fn do_read(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset:
     let mut buf = vec![0u8; size as usize];
     let n = file.read(&mut buf).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
     buf.truncate(n);
+    // v1: payload rides as base64-in-JSON. Byte-exact (round-trips arbitrary
+    // bytes) but +33% size and a copy per block. Throughput follow-up per the
+    // spec rule 1: a JSON control header plus a raw length-prefixed data frame,
+    // so payload bytes skip the base64/JSON tax. Not final.
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok(serde_json::json!({ "data": encoded }))
@@ -517,8 +526,9 @@ fn file_stat(path: &std::path::Path, meta: &std::fs::Metadata) -> FileStat {
 
 fn open_file(path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
     use std::fs::OpenOptions;
-    let rd = (flags & O_RDONLY as i32) != 0 || (flags & O_RDWR as i32) != 0;
-    let wr = (flags & O_WRONLY as i32) != 0 || (flags & O_RDWR as i32) != 0;
+    let accmode = flags & O_ACCMODE;
+    let rd = accmode == O_RDONLY || accmode == O_RDWR;
+    let wr = accmode == O_WRONLY || accmode == O_RDWR;
     OpenOptions::new()
         .read(rd)
         .write(wr)
@@ -560,4 +570,57 @@ fn cfg_unix_uid() -> u32 {
 fn cfg_unix_gid() -> u32 {
     #[cfg(unix)] { unsafe { libc::getgid() } }
     #[cfg(not(unix))] { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn path_roundtrip_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        // A filename with a lone 0xFF byte is valid on Linux but invalid UTF-8.
+        let raw = std::ffi::OsStr::from_bytes(b"caf\xffe.bin");
+        let p = std::path::Path::new(raw);
+        let enc = path_encode(p);
+        let dec = path_decode(&enc).expect("decode");
+        assert_eq!(dec.as_os_str().as_bytes(), b"caf\xffe.bin");
+    }
+
+    #[test]
+    fn accmode_masks_low_two_bits() {
+        // O_RDONLY is 0, so a naive `flags & O_RDONLY` is always 0. The mask is
+        // the only correct test. O_CREAT (0x40) etc. must not disturb the mode.
+        let rdonly = O_RDONLY | 0o100 /* O_CREAT */;
+        let wronly = O_WRONLY | 0o2000 /* O_APPEND */;
+        let rdwr = O_RDWR;
+        assert_eq!(rdonly & O_ACCMODE, O_RDONLY);
+        assert_eq!(wronly & O_ACCMODE, O_WRONLY);
+        assert_eq!(rdwr & O_ACCMODE, O_RDWR);
+    }
+
+    #[test]
+    fn open_file_read_only_flag_opens_for_read() {
+        // Regression for the accmode bug: a plain read-only open (flags == 0)
+        // must build an OpenOptions that can actually read.
+        let dir = std::env::temp_dir().join(format!("fil-mount-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hello.txt");
+        std::fs::write(&f, b"hi").unwrap();
+        let mut file = open_file(&f, O_RDONLY).expect("open ro");
+        use std::io::Read;
+        let mut s = String::new();
+        file.read_to_string(&mut s).expect("read");
+        assert_eq!(s, "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_blocks_path_traversal() {
+        let root = std::path::PathBuf::from("/srv/share");
+        let enc = path_encode(std::path::Path::new("../../etc/passwd"));
+        let err = resolve(&root, &enc).unwrap_err();
+        assert_eq!(err.code, EACCES);
+    }
 }
