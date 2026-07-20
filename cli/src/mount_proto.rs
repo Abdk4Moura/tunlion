@@ -32,6 +32,10 @@ pub type PipeItem = Option<Bytes>;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MountRequest {
     pub id: u64,
+    /// True when this request carries a binary data suffix after the JSON line.
+    /// Makes framing unambiguous for pipelined and future transport paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bin: Option<bool>,
     #[serde(flatten)]
     pub op: MountOp,
 }
@@ -58,6 +62,9 @@ pub enum MountOp {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MountResponse {
     pub id: u64,
+    /// True when this response carries a binary data suffix after the JSON line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bin: Option<bool>,
     #[serde(flatten)]
     pub result: MountResult,
 }
@@ -117,6 +124,11 @@ pub struct DirEntry {
 /// `mount-open-ack`; the client negotiates via `mount-cap-ack`. Both sides can
 /// speak v1 (base64 data) or v2 (binary data frames), selected at mount-open time.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Default max read/write payload size advertised by the server. Kept well
+/// below net::MAX_DC_PAYLOAD (60 KiB) so a single mount frame fits through
+/// WebRTC/relay DataChannels, not just direct-quic.
+pub const DEFAULT_MOUNT_MAX_SIZE: u32 = 32 * 1024;
 
 /// Server capabilities advertised in `mount-open-ack`, per spec rule 5: the two
 /// ends exchange what they can represent before the first file op, so the client
@@ -181,8 +193,8 @@ pub fn mount_caps_for_root(root: &std::path::Path) -> MountCaps {
         metadata_fields: vec![
             "mtime".into(), "mode".into(), "uid".into(), "gid".into(),
         ],
-        max_read_size: 64 * 1024,
-        max_write_size: 64 * 1024,
+        max_read_size: DEFAULT_MOUNT_MAX_SIZE,
+        max_write_size: DEFAULT_MOUNT_MAX_SIZE,
     }
 }
 
@@ -306,6 +318,10 @@ pub struct MountClient {
     /// True when the server advertised protocol_version >= 2 in mount-open-ack.
     /// Read/Write payloads use binary frames instead of base64.
     pub binary_frames: bool,
+    /// Maximum payload size for a single Read op, advertised by the server.
+    pub max_read_size: u32,
+    /// Maximum payload size for a single Write op, advertised by the server.
+    pub max_write_size: u32,
 }
 
 impl MountClient {
@@ -338,17 +354,23 @@ impl MountClient {
                 }
             }
         });
-        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false }
+        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false, max_read_size: DEFAULT_MOUNT_MAX_SIZE, max_write_size: DEFAULT_MOUNT_MAX_SIZE }
     }
 
     /// Create a MountClient with binary frame support enabled (protocol v2+).
+    /// `max_read_size` and `max_write_size` come from the server's MountCaps.
     pub fn from_mux_v2(
         transport: Arc<dyn Transport>,
         sid: u32,
-        mut rx: mpsc::Receiver<PipeItem>,
+        rx: mpsc::Receiver<PipeItem>,
+        max_read_size: u32,
+        max_write_size: u32,
     ) -> Self {
         let mut c = Self::from_mux(transport, sid, rx);
         c.binary_frames = true;
+        // A zero cap means "unspecified"; fall back to the safe default.
+        c.max_read_size = if max_read_size > 0 { max_read_size } else { DEFAULT_MOUNT_MAX_SIZE };
+        c.max_write_size = if max_write_size > 0 { max_write_size } else { DEFAULT_MOUNT_MAX_SIZE };
         c
     }
 
@@ -356,7 +378,7 @@ impl MountClient {
     pub async fn call(&mut self, op: MountOp) -> Result<MountResponse> {
         let id = self.next_id;
         self.next_id += 1;
-        let req = MountRequest { id, op };
+        let req = MountRequest { id, bin: None, op };
         let mut payload = serde_json::to_vec(&req)?;
         payload.push(b'\n');
         self.tx.send(payload).ok();
@@ -419,7 +441,8 @@ impl MountClient {
     ) -> Result<(MountResponse, Option<Bytes>)> {
         let id = self.next_id;
         self.next_id += 1;
-        let req = MountRequest { id, op };
+        let has_data = data.is_some();
+        let req = MountRequest { id, bin: if has_data { Some(true) } else { None }, op };
         let mut payload = serde_json::to_vec(&req)?;
         payload.push(b'\n');
         if self.binary_frames {
@@ -568,7 +591,7 @@ pub fn spawn_mount_server(
                 let req: MountRequest = match serde_json::from_slice(hdr) {
                     Ok(r) => r,
                     Err(e) => {
-                        let resp = MountResponse { id: 0, result: MountResult::Err(MountError { code: EINVAL, msg: format!("parse: {e}") }) };
+                        let resp = MountResponse { id: 0, bin: None, result: MountResult::Err(MountError { code: EINVAL, msg: format!("parse: {e}") }) };
                         let mut p = serde_json::to_vec(&resp).unwrap_or_default();
                         p.push(b'\n');
                         let _ = transport.send_frame(sid, 0, &p).await;
@@ -641,8 +664,15 @@ async fn handle_mount_request(
 
     let (res, data) = result;
     match res {
-        Ok(v) => (MountResponse { id: req.id, result: MountResult::Ok(v) }, data),
-        Err(e) => (MountResponse { id: req.id, result: MountResult::Err(e) }, None),
+        Ok(v) => (
+            MountResponse {
+                id: req.id,
+                bin: if data.is_some() { Some(true) } else { None },
+                result: MountResult::Ok(v),
+            },
+            data,
+        ),
+        Err(e) => (MountResponse { id: req.id, bin: None, result: MountResult::Err(e) }, None),
     }
 }
 
@@ -1077,5 +1107,54 @@ mod tests {
         });
         let caps = parse_mount_caps(json).unwrap();
         assert_eq!(caps.protocol_version, 2);
+    }
+
+    #[test]
+    fn mount_caps_default_max_sizes_are_zero() {
+        let caps = MountCaps::default();
+        assert_eq!(caps.max_read_size, 0);
+        assert_eq!(caps.max_write_size, 0);
+    }
+
+    #[test]
+    fn mount_caps_for_root_advertises_safe_max_size() {
+        let caps = mount_caps_for_root(&std::path::PathBuf::from("/tmp"));
+        assert!(caps.max_read_size > 0);
+        assert!(caps.max_write_size > 0);
+        assert!(caps.max_read_size <= 60 * 1024);
+        assert!(caps.max_write_size <= 60 * 1024);
+    }
+
+    #[test]
+    fn binary_frame_header_includes_bin_discriminator() {
+        let req = MountRequest {
+            id: 1,
+            bin: Some(true),
+            op: MountOp::Write { fh: 7, offset: 0, size: 5 },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"bin\":true"));
+    }
+
+    #[test]
+    fn binary_frame_header_omits_bin_when_no_data() {
+        let req = MountRequest {
+            id: 1,
+            bin: None,
+            op: MountOp::Read { fh: 7, offset: 0, size: 5 },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("bin"));
+    }
+
+    #[test]
+    fn response_header_includes_bin_discriminator() {
+        let resp = MountResponse {
+            id: 1,
+            bin: Some(true),
+            result: MountResult::Ok(serde_json::json!({ "n": 5 })),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"bin\":true"));
     }
 }

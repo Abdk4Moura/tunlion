@@ -93,6 +93,8 @@ pub struct FilamentFs {
     inodes: Mutex<InodeMap>,
     // Keyed by the server file handle returned from opendir.
     dirs: Mutex<HashMap<u64, CachedDir>>,
+    max_read_size: u32,
+    max_write_size: u32,
 }
 
 impl FilamentFs {
@@ -100,10 +102,14 @@ impl FilamentFs {
         // The mount protocol is v2+. A v1 client reaching here is a programming
         // error; fail fast rather than silently return empty data.
         assert!(client.binary_frames, "FilamentFs requires a v2 MountClient");
+        let max_read_size = client.max_read_size;
+        let max_write_size = client.max_write_size;
         FilamentFs {
             client: Mutex::new(client),
             inodes: Mutex::new(InodeMap::new()),
             dirs: Mutex::new(HashMap::new()),
+            max_read_size,
+            max_write_size,
         }
     }
 
@@ -311,6 +317,7 @@ impl Filesystem for FilamentFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
+        let size = size.min(self.max_read_size);
         match self.call_data(MountOp::Read { fh: fh.0, offset, size }, None) {
             Ok((_v, Some(bytes))) => reply.data(&bytes),
             Ok((_, None)) => reply.data(&[]),
@@ -330,10 +337,24 @@ impl Filesystem for FilamentFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.call_data(MountOp::Write { fh: fh.0, offset, size: data.len() as u32 }, Some(data)) {
-            Ok((v, _)) => reply.written(v["size"].as_u64().unwrap_or(0) as u32),
-            Err(e) => reply.error(Errno::from_i32(e)),
+        // The kernel may hand us a buffer larger than the server advertised.
+        // Split it into cap-sized chunks so each frame fits through every
+        // transport path (direct-quic, relay, WebRTC DataChannel).
+        let mut written: u32 = 0;
+        for chunk in data.chunks(self.max_write_size as usize) {
+            match self.call_data(
+                MountOp::Write {
+                    fh: fh.0,
+                    offset: offset + written as u64,
+                    size: chunk.len() as u32,
+                },
+                Some(chunk),
+            ) {
+                Ok((v, _)) => written += v["size"].as_u64().unwrap_or(0) as u32,
+                Err(e) => return reply.error(Errno::from_i32(e)),
+            }
         }
+        reply.written(written);
     }
 
     fn flush(
@@ -606,11 +627,17 @@ impl Filesystem for FilamentFs {
 /// dedicated blocking thread (`spawn_blocking`) so the mux pump keeps draining.
 pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
     let fs = FilamentFs::new(client);
+    let max_read = fs.max_read_size;
     let mut cfg = Config::default();
-    // FSName labels the mount in /proc/mounts. We deliberately omit AutoUnmount
-    // (it needs allow_other and a fuse.conf tweak); teardown is driven explicitly
-    // by the caller via fusermount -u / ctrl-c.
-    cfg.mount_options = vec![MountOption::FSName("filament".into())];
+    // FSName labels the mount in /proc/mounts. max_read matches the server's
+    // advertised cap so the kernel never requests a single read larger than
+    // one transport frame. We deliberately omit AutoUnmount (it needs
+    // allow_other and a fuse.conf tweak); teardown is driven explicitly by the
+    // caller via fusermount -u / ctrl-c.
+    cfg.mount_options = vec![
+        MountOption::FSName("filament".into()),
+        MountOption::CUSTOM(format!("max_read={max_read}")),
+    ];
     fuser::mount2(fs, mountpoint, &cfg)?;
     Ok(())
 }
