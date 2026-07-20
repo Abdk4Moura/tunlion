@@ -97,6 +97,9 @@ pub struct FilamentFs {
 
 impl FilamentFs {
     pub fn new(client: MountClient) -> Self {
+        // The mount protocol is v2+. A v1 client reaching here is a programming
+        // error; fail fast rather than silently return empty data.
+        assert!(client.binary_frames, "FilamentFs requires a v2 MountClient");
         FilamentFs {
             client: Mutex::new(client),
             inodes: Mutex::new(InodeMap::new()),
@@ -107,10 +110,16 @@ impl FilamentFs {
     /// Issue one protocol op and unwrap the result to either the ok `Value` or a
     /// POSIX errno the FUSE reply can carry. A dead channel maps to EIO.
     fn call(&self, op: MountOp) -> Result<Value, i32> {
+        self.call_data(op, None).map(|(v, _)| v)
+    }
+
+    /// Issue one protocol op with an optional binary data payload (for Write)
+    /// and collect any binary payload from the response (for Read).
+    fn call_data(&self, op: MountOp, data: Option<&[u8]>) -> Result<(Value, Option<Vec<u8>>), i32> {
         let mut c = self.client.lock().unwrap();
-        match c.call_sync(op) {
-            Ok(resp) => match resp.result {
-                MountResult::Ok(v) => Ok(v),
+        match c.call_sync_binary(op, data) {
+            Ok((resp, bin)) => match resp.result {
+                MountResult::Ok(v) => Ok((v, bin.map(|b| b.to_vec()))),
                 MountResult::Err(e) => Err(e.code),
             },
             Err(_) => Err(EIO),
@@ -302,15 +311,9 @@ impl Filesystem for FilamentFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.call(MountOp::Read { fh: fh.0, offset, size }) {
-            Ok(v) => {
-                let enc = v["data"].as_str().unwrap_or("");
-                use base64::Engine;
-                match base64::engine::general_purpose::STANDARD.decode(enc) {
-                    Ok(bytes) => reply.data(&bytes),
-                    Err(_) => reply.error(Errno::from_i32(EIO)),
-                }
-            }
+        match self.call_data(MountOp::Read { fh: fh.0, offset, size }, None) {
+            Ok((_v, Some(bytes))) => reply.data(&bytes),
+            Ok((_, None)) => reply.data(&[]),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }
@@ -327,10 +330,8 @@ impl Filesystem for FilamentFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
-        use base64::Engine;
-        let enc = base64::engine::general_purpose::STANDARD.encode(data);
-        match self.call(MountOp::Write { fh: fh.0, offset, data: enc }) {
-            Ok(v) => reply.written(v["size"].as_u64().unwrap_or(0) as u32),
+        match self.call_data(MountOp::Write { fh: fh.0, offset, size: data.len() as u32 }, Some(data)) {
+            Ok((v, _)) => reply.written(v["size"].as_u64().unwrap_or(0) as u32),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
     }

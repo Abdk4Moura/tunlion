@@ -120,6 +120,11 @@ pub struct Mux {
     /// inbound `l2-close` (`on_close`), the session task exit (`drop_pty`), and
     /// link/mux death (`shutdown_all`), closing the resizer-map leak.
     resizers: Mutex<HashMap<u32, mpsc::UnboundedSender<(u16, u16)>>>,
+    /// mount: per-sid oneshot senders for delivering mount-open-ack caps back to
+    /// the caller that issued open_mount_stream. pump_initiator receives the ack
+    /// control message, resolves the sid, and sends the caps; open_mount_stream
+    /// awaits the receiver. Cleaned up on stream teardown.
+    mount_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<serde_json::Value>>>,
 }
 
 impl Mux {
@@ -130,6 +135,7 @@ impl Mux {
             next_sid: AtomicU32::new(0),
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
+            mount_ack_tx: Mutex::new(HashMap::new()),
         })
     }
 
@@ -252,6 +258,9 @@ impl Mux {
     /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
     async fn on_close(&self, sid: u32, _err: Option<&str>) {
+        // Drop any pending mount-open-ack waiter for this sid so the caller
+        // gets a clean error rather than hanging on a oneshot that will never fire.
+        self.mount_ack_tx.lock().await.remove(&sid);
         self.drop_stream(sid).await;
     }
 
@@ -259,6 +268,7 @@ impl Mux {
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
+        self.mount_ack_tx.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -1556,6 +1566,15 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                         mux.on_open_ack(sid as u32).await;
                     }
                 }
+                Some("mount-open-ack") => {
+                    if let Some(sid) = v["sid"].as_u64() {
+                        let mut ack_map = mux.mount_ack_tx.lock().await;
+                        if let Some(tx) = ack_map.remove(&(sid as u32)) {
+                            let caps = v.get("caps").cloned().unwrap_or(serde_json::Value::Null);
+                            let _ = tx.send(caps);
+                        }
+                    }
+                }
                 _ => {}
             },
             Ev::Chunk(_pid, sid, _offset, data) if is_l2_sid(sid) => {
@@ -1664,19 +1683,36 @@ pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Se
 }
 
 /// Open a mesh-native mount stream to the peer, sending `mount-open` with the
-/// encoded root path. Returns sid + inbound pipe; the caller drives the
-/// protocol via `MountClient`. No sshd, no sshfs.
+/// encoded root path. Waits for the `mount-open-ack` control message carrying
+/// server capabilities, then sends `mount-cap-ack` to confirm the negotiated
+/// protocol. Returns sid + inbound pipe + the server's MountCaps.
+/// No sshd, no sshfs.
 pub(crate) async fn open_mount_stream(
     mux: &Arc<Mux>,
     root: &str,
-) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
+) -> Result<(u32, mpsc::Receiver<PipeItem>, crate::mount_proto::MountCaps)> {
     let sid = mux.alloc_sid();
     let rx = mux.register(sid).await;
+    let (tx, caps_rx) = tokio::sync::oneshot::channel();
+    mux.mount_ack_tx.lock().await.insert(sid, tx);
     let encoded = crate::mount_proto::path_encode(std::path::Path::new(root));
     mux.transport
         .send_control(&json!({ "type": "mount-open", "sid": sid, "root": encoded }))
         .await?;
-    Ok((sid, rx))
+    let caps_value = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        caps_rx,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
+    .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
+    let caps = crate::mount_proto::parse_mount_caps(caps_value)?;
+    // Send mount-cap-ack: the client confirms it accepts the server's caps.
+    let _ = mux.transport.send_control(&json!({
+        "type": "mount-cap-ack", "sid": sid,
+        "binary_frames": caps.protocol_version >= 2
+    })).await;
+    Ok((sid, rx, caps))
 }
 
 /// WARM pty (daemon side): open a PTY on the peer over an EXISTING link's `mux`,
@@ -2431,8 +2467,8 @@ pub async fn mount_cmd(
     guard.forget();
     let mux = Mux::new(t.clone());
     let _pump = tokio::spawn(pump_initiator(rx, mux.clone()));
-    let (sid, pipe_rx) = open_mount_stream(&mux, root).await?;
-    let client = crate::mount_proto::MountClient::from_mux(t.clone(), sid, pipe_rx);
+    let (sid, pipe_rx, _caps) = open_mount_stream(&mux, root).await?;
+    let client = crate::mount_proto::MountClient::from_mux_v2(t.clone(), sid, pipe_rx);
     Ok(client)
 }
 

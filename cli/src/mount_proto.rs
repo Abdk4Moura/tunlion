@@ -43,7 +43,7 @@ pub enum MountOp {
     ReadLink { path: String },
     Open { path: String, flags: i32 },
     Read { fh: u64, offset: u64, size: u32 },
-    Write { fh: u64, offset: u64, data: String },
+    Write { fh: u64, offset: u64, size: u32 },  // data is binary suffix of the frame
     ReadDir { fh: u64, offset: i64 },
     Release { fh: u64 },
     Create { path: String, mode: u32, flags: i32 },
@@ -113,6 +113,188 @@ pub struct DirEntry {
     pub stat: FileStat,
 }
 
+/// Protocol version this implementation speaks. The server advertises it in
+/// `mount-open-ack`; the client negotiates via `mount-cap-ack`. Both sides can
+/// speak v1 (base64 data) or v2 (binary data frames), selected at mount-open time.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Server capabilities advertised in `mount-open-ack`, per spec rule 5: the two
+/// ends exchange what they can represent before the first file op, so the client
+/// knows up front what to escape and what to refuse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MountCaps {
+    pub protocol_version: u32,
+    pub case_sensitive: bool,
+    pub max_path_len: u32,
+    pub max_component_len: u32,
+    #[serde(default)]
+    pub forbidden_bytes: Vec<u8>,
+    #[serde(default)]
+    pub forbidden_names: Vec<String>,
+    pub supports_symlinks: bool,
+    pub supports_hardlinks: bool,
+    pub supports_fifo: bool,
+    #[serde(default)]
+    pub metadata_fields: Vec<String>,
+    #[serde(default)]
+    pub max_read_size: u32,
+    #[serde(default)]
+    pub max_write_size: u32,
+}
+
+impl Default for MountCaps {
+    /// Sensible defaults for a v1-only, unix-like server that does not advertise
+    /// any specific capabilities. v2+ servers MUST provide real values from the
+    /// OS at mount-open time.
+    fn default() -> Self {
+        MountCaps {
+            protocol_version: 1,
+            case_sensitive: true,
+            max_path_len: 4096,
+            max_component_len: 255,
+            forbidden_bytes: vec![0x00],
+            forbidden_names: Vec::new(),
+            supports_symlinks: false,
+            supports_hardlinks: false,
+            supports_fifo: false,
+            metadata_fields: vec!["mtime".into(), "mode".into(), "uid".into(), "gid".into()],
+            max_read_size: 0,
+            max_write_size: 0,
+        }
+    }
+}
+
+/// Build the server's real mount capabilities from the OS and filesystem at
+/// `root`. Called by the acceptor at mount-open time so every link gets honest
+/// caps rather than compile-time defaults.
+pub fn mount_caps_for_root(root: &std::path::Path) -> MountCaps {
+    MountCaps {
+        protocol_version: PROTOCOL_VERSION,
+        case_sensitive: cfg!(unix) && !cfg!(target_os = "macos"),
+        max_path_len: max_path_len_for(root),
+        max_component_len: 255,
+        forbidden_bytes: forbidden_bytes_for_os(),
+        forbidden_names: forbidden_names_for_os(),
+        supports_symlinks: cfg!(unix),
+        supports_hardlinks: cfg!(unix),
+        supports_fifo: cfg!(unix),
+        metadata_fields: vec![
+            "mtime".into(), "mode".into(), "uid".into(), "gid".into(),
+        ],
+        max_read_size: 64 * 1024,
+        max_write_size: 64 * 1024,
+    }
+}
+
+/// Parse server capabilities from a mount-open-ack value and enforce a minimum
+/// supported protocol version. Fails loud on missing, unparseable, or
+/// too-old caps so the client never silently falls back to a broken path.
+pub fn parse_mount_caps(value: serde_json::Value) -> Result<MountCaps> {
+    if value.is_null() {
+        anyhow::bail!("peer did not advertise mount capabilities; upgrade filament");
+    }
+    let caps: MountCaps = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("peer mount capabilities unreadable ({e}); upgrade filament"))?;
+    if caps.protocol_version < 2 {
+        anyhow::bail!(
+            "peer mount protocol version {} unsupported (need v2); upgrade filament",
+            caps.protocol_version
+        );
+    }
+    Ok(caps)
+}
+
+#[cfg(unix)]
+fn max_path_len_for(_root: &std::path::Path) -> u32 {
+    // PATH_MAX is 4096 on Linux, 1024 on macOS. statvfs has f_namemax.
+    unsafe {
+        let mut buf: libc::statvfs = std::mem::zeroed();
+        let p = std::ffi::CString::new(".").unwrap_or_default();
+        if libc::statvfs(p.as_ptr(), &mut buf) == 0 && buf.f_namemax > 0 {
+            buf.f_namemax.min(4096) as u32
+        } else {
+            4096
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn max_path_len_for(_root: &std::path::Path) -> u32 { 260 }
+
+#[cfg(unix)]
+fn forbidden_bytes_for_os() -> Vec<u8> { vec![0x00, 0x2f] }  // NUL + /
+
+#[cfg(not(unix))]
+fn forbidden_bytes_for_os() -> Vec<u8> {
+    // Windows: NUL + control chars + < > : " | ? *
+    let mut v: Vec<u8> = (0..=31).collect();
+    v.extend_from_slice(&[0x3c, 0x3e, 0x3a, 0x22, 0x7c, 0x3f, 0x2a]);
+    v
+}
+
+fn forbidden_names_for_os() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let reserved = ["CON","PRN","AUX","NUL","COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9","LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"];
+        reserved.iter().map(|s| s.to_string()).collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+// ----------------------------------------------------- binary frame helpers --
+// v2+ frames: JSON line + '\n' + optional 4-byte LE u32 length prefix + raw bytes.
+// Non-data ops omit the binary suffix. This preserves v1 JSON-only framing for ops
+// like GetAttr/ReadDir while letting Read/Write carry raw payloads.
+
+/// Encode a frame: header bytes (JSON line + '\n'), optionally followed by a
+/// 4-byte LE u32 length prefix and raw data. Returns the complete frame payload.
+pub fn encode_frame(header: &[u8], data: Option<&[u8]>) -> Vec<u8> {
+    if let Some(d) = data {
+        let mut out = Vec::with_capacity(header.len() + 4 + d.len());
+        out.extend_from_slice(header);
+        let len = d.len() as u32;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(d);
+        out
+    } else {
+        header.to_vec()
+    }
+}
+
+/// Decode a frame, returning the JSON header, optional binary payload, and the
+/// number of bytes consumed from the input. Returns `None` when a complete frame
+/// is not yet available (e.g. partial binary suffix).
+pub fn decode_frame_with_len(frame: &[u8]) -> Option<(&[u8], Option<&[u8]>, usize)> {
+    let nl = frame.iter().position(|&b| b == b'\n')?;
+    let header_end = nl;
+    if frame.len() >= nl + 1 + 4 {
+        let len = u32::from_le_bytes([frame[nl + 1], frame[nl + 2], frame[nl + 3], frame[nl + 4]]) as usize;
+        let frame_end = nl + 1 + 4 + len;
+        if frame.len() >= frame_end {
+            let data = &frame[nl + 1 + 4..frame_end];
+            return Some((&frame[..header_end], Some(data), frame_end));
+        }
+        // Partial binary suffix: wait for more data.
+        return None;
+    }
+    // No binary suffix; frame ends at the newline.
+    Some((&frame[..header_end], None, nl + 1))
+}
+
+/// Decode a frame: returns the JSON-line header (up to the first '\n') and an
+/// optional binary payload (4-byte LE length prefix + data following it).
+/// Returns `None` for the payload if the frame ends at the JSON line terminator.
+/// Prefer `decode_frame_with_len` for bounded buffer parsing.
+pub fn decode_frame(frame: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match decode_frame_with_len(frame) {
+        Some((hdr, data, _)) => (hdr, data),
+        None => (&[], None),
+    }
+}
+
 // ----------------------------------------------------------- protocol transport --
 
 /// A client-end handle for talking to the mount server over the mux stream.
@@ -121,6 +303,9 @@ pub struct MountClient {
     rx: mpsc::UnboundedReceiver<Bytes>,
     buf: Vec<u8>,
     next_id: u64,
+    /// True when the server advertised protocol_version >= 2 in mount-open-ack.
+    /// Read/Write payloads use binary frames instead of base64.
+    pub binary_frames: bool,
 }
 
 impl MountClient {
@@ -153,7 +338,18 @@ impl MountClient {
                 }
             }
         });
-        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1 }
+        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false }
+    }
+
+    /// Create a MountClient with binary frame support enabled (protocol v2+).
+    pub fn from_mux_v2(
+        transport: Arc<dyn Transport>,
+        sid: u32,
+        mut rx: mpsc::Receiver<PipeItem>,
+    ) -> Self {
+        let mut c = Self::from_mux(transport, sid, rx);
+        c.binary_frames = true;
+        c
     }
 
     /// Send a request and await its response (async).
@@ -165,20 +361,32 @@ impl MountClient {
         payload.push(b'\n');
         self.tx.send(payload).ok();
         loop {
-            if let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-                let line = self.buf.drain(..nl).collect::<Vec<_>>();
-                if !self.buf.is_empty() && self.buf[0] == b'\n' {
-                    self.buf.remove(0);
+            if self.binary_frames {
+                let parsed = if let Some((hdr, _bin, consumed)) = decode_frame_with_len(&self.buf) {
+                    let resp: MountResponse = serde_json::from_slice(hdr)?;
+                    Some((resp, consumed))
+                } else {
+                    None
+                };
+                if let Some((resp, consumed)) = parsed {
+                    let frame_bytes: Vec<u8> = self.buf.drain(..consumed).collect();
+                    if resp.id == id { return Ok(resp); }
+                    self.buf.splice(0..0, frame_bytes);
+                    continue;
                 }
-                let resp: MountResponse = serde_json::from_slice(&line)?;
-                if resp.id == id {
-                    return Ok(resp);
+            } else {
+                if let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+                    let line = self.buf.drain(..nl).collect::<Vec<_>>();
+                    if !self.buf.is_empty() && self.buf[0] == b'\n' {
+                        self.buf.remove(0);
+                    }
+                    let resp: MountResponse = serde_json::from_slice(&line)?;
+                    if resp.id == id {
+                        return Ok(resp);
+                    }
+                    self.buf.splice(0..0, line);
+                    continue;
                 }
-                // Not our response (pipelined responses can arrive out of order).
-                // This function blocks until matching id; store others? No, they're
-                // not ours since we do one-at-a-time calls. Re-enqueue and continue.
-                self.buf.splice(0..0, line);
-                continue;
             }
             match self.rx.recv().await {
                 Some(bytes) => self.buf.extend_from_slice(&bytes),
@@ -190,20 +398,61 @@ impl MountClient {
     /// Synchronous call using `blocking_recv`, for FUSE callbacks that run
     /// outside a tokio runtime context. Same protocol but blocks the thread.
     pub fn call_sync(&mut self, op: MountOp) -> Result<MountResponse> {
+        self.call_sync_inner(op, None).map(|(r, _)| r)
+    }
+
+    /// Like `call_sync` but attaches a binary data payload to the request frame
+    /// (v2 Read/Write) and collects any binary payload from the response.
+    /// `data` is only meaningful for Write ops; for Read/other ops pass `None`.
+    pub fn call_sync_binary(
+        &mut self,
+        op: MountOp,
+        data: Option<&[u8]>,
+    ) -> Result<(MountResponse, Option<Bytes>)> {
+        self.call_sync_inner(op, data)
+    }
+
+    fn call_sync_inner(
+        &mut self,
+        op: MountOp,
+        data: Option<&[u8]>,
+    ) -> Result<(MountResponse, Option<Bytes>)> {
         let id = self.next_id;
         self.next_id += 1;
         let req = MountRequest { id, op };
         let mut payload = serde_json::to_vec(&req)?;
         payload.push(b'\n');
+        if self.binary_frames {
+            if let Some(d) = data {
+                payload.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                payload.extend_from_slice(d);
+            }
+        }
         self.tx.send(payload).ok();
         loop {
-            if let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-                let line = self.buf.drain(..nl).collect::<Vec<_>>();
-                if !self.buf.is_empty() && self.buf[0] == b'\n' { self.buf.remove(0); }
-                let resp: MountResponse = serde_json::from_slice(&line)?;
-                if resp.id == id { return Ok(resp); }
-                self.buf.splice(0..0, line);
-                continue;
+            if self.binary_frames {
+                let parsed = if let Some((hdr, bin, consumed)) = decode_frame_with_len(&self.buf) {
+                    let resp: MountResponse = serde_json::from_slice(hdr)?;
+                    let bin_data = bin.map(|b| Bytes::copy_from_slice(b));
+                    Some((resp, bin_data, consumed))
+                } else {
+                    None
+                };
+                if let Some((resp, bin_data, consumed)) = parsed {
+                    let frame_bytes: Vec<u8> = self.buf.drain(..consumed).collect();
+                    if resp.id == id { return Ok((resp, bin_data)); }
+                    self.buf.splice(0..0, frame_bytes);
+                    continue;
+                }
+            } else {
+                if let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.buf.drain(..nl).collect();
+                    if !self.buf.is_empty() && self.buf[0] == b'\n' { self.buf.remove(0); }
+                    let resp: MountResponse = serde_json::from_slice(&line)?;
+                    if resp.id == id { return Ok((resp, None)); }
+                    self.buf.splice(0..0, line);
+                    continue;
+                }
             }
             match self.rx.blocking_recv() {
                 Some(bytes) => self.buf.extend_from_slice(&bytes),
@@ -271,27 +520,52 @@ pub fn path_decode(encoded: &str) -> Result<PathBuf, MountError> {
 }
 
 /// Serve the mount protocol on a stream. Spawned by the acceptor daemon
-/// when a `mount-open` control message arrives. Reads JSON requests from
-/// `rx` (mux inbound pipe) and writes responses via `transport.send_frame`.
+/// when a `mount-open` control message arrives. Reads requests from `rx`
+/// (mux inbound pipe) and writes responses via `transport.send_frame`.
+///
+/// `proto_version` is the negotiated protocol version (advertised in
+/// mount-open-ack). v2+ uses binary data frames for Read/Write; v1 uses
+/// base64-inside-JSON (legacy, no server speaks this by default).
 pub fn spawn_mount_server(
     root: PathBuf,
     transport: Arc<dyn Transport>,
     sid: u32,
     mut rx: mpsc::Receiver<PipeItem>,
+    proto_version: u32,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut open_files: HashMap<u64, (std::fs::File, PathBuf)> = HashMap::new();
         let mut next_fh: u64 = 1;
         let mut buf = Vec::new();
+        let v2 = proto_version >= 2;
 
         loop {
-            // Extract complete lines from buf and handle them
+            // In v2, each frame is: JSON line + '\n' + optional (4-byte LE len + data).
+            // The JSON line's `\n` delimiter marks the header boundary; if `buf` has
+            // enough bytes after it for a length prefix, the frame includes the binary
+            // suffix. Drain the complete frame atomically so a raw `\n` byte inside
+            // payload data never triggers a false header boundary.
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..nl).collect();
-                if !buf.is_empty() && buf[0] == b'\n' {
-                    buf.remove(0);
-                }
-                let req: MountRequest = match serde_json::from_slice(&line) {
+                let frame_end = if v2 && buf.len() >= nl + 1 + 4 {
+                    let len = u32::from_le_bytes([buf[nl + 1], buf[nl + 2], buf[nl + 3], buf[nl + 4]]) as usize;
+                    if buf.len() >= nl + 1 + 4 + len {
+                        nl + 1 + 4 + len
+                    } else {
+                        // Partial frame: wait for more data.
+                        break;
+                    }
+                } else {
+                    nl + 1
+                };
+                let frame: Vec<u8> = buf.drain(..frame_end).collect();
+                let (hdr, bin) = if v2 {
+                    let (h, b) = decode_frame(&frame);
+                    (h, b.map(|d| d.to_vec()))
+                } else {
+                    let end = frame.iter().position(|&b| b == b'\n').unwrap_or(frame.len());
+                    (&frame[..end], None)
+                };
+                let req: MountRequest = match serde_json::from_slice(hdr) {
                     Ok(r) => r,
                     Err(e) => {
                         let resp = MountResponse { id: 0, result: MountResult::Err(MountError { code: EINVAL, msg: format!("parse: {e}") }) };
@@ -301,10 +575,16 @@ pub fn spawn_mount_server(
                         continue;
                     }
                 };
-                let resp = handle_mount_request(&root, &mut open_files, &mut next_fh, &req).await;
-                let mut p = serde_json::to_vec(&resp).unwrap_or_default();
-                p.push(b'\n');
-                if transport.send_frame(sid, 0, &p).await.is_err() { return; }
+                let (resp_body, resp_data) =
+                    handle_mount_request(&root, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2).await;
+                let mut resp_json = serde_json::to_vec(&resp_body).unwrap_or_default();
+                resp_json.push(b'\n');
+                let payload = if v2 {
+                    encode_frame(&resp_json, resp_data.as_deref())
+                } else {
+                    resp_json
+                };
+                if transport.send_frame(sid, 0, &payload).await.is_err() { return; }
             }
 
             // Read next frame
@@ -318,32 +598,51 @@ pub fn spawn_mount_server(
     })
 }
 
+/// Handle one mount request. Returns the JSON response body and (for Read ops
+/// under v2+) a binary data payload the server will attach as a frame suffix.
+/// `write_data` is the binary payload decoded from a v2 Write request frame;
+/// `v2` controls whether Read data is returned through the binary suffix.
 async fn handle_mount_request(
     root: &PathBuf,
     open_files: &mut HashMap<u64, (std::fs::File, PathBuf)>,
     next_fh: &mut u64,
     req: &MountRequest,
-) -> MountResponse {
+    write_data: Option<&[u8]>,
+    v2: bool,
+) -> (MountResponse, Option<Vec<u8>>) {
     let result = match &req.op {
-        MountOp::GetAttr { path } => do_getattr(root, path),
-        MountOp::Open { path, flags } => do_open(root, path, *flags, open_files, next_fh),
-        MountOp::Read { fh, offset, size } => do_read(open_files, *fh, *offset, *size),
-        MountOp::Write { fh, offset, data } => do_write(open_files, *fh, *offset, data),
-        MountOp::ReadDir { fh, offset } => do_readdir(root, open_files, *fh, *offset),
-        MountOp::Release { fh } => { open_files.remove(fh); Ok(Value::Null) }
-        MountOp::Create { path, mode, flags } => do_create(root, path, *mode, *flags, open_files, next_fh),
-        MountOp::Unlink { path } => do_unlink(root, path),
-        MountOp::MkDir { path, mode } => do_mkdir(root, path, *mode),
-        MountOp::RmDir { path } => do_rmdir(root, path),
-        MountOp::Rename { from, to } => do_rename(root, from, to),
-        MountOp::Truncate { path, size } => do_truncate(root, path, *size),
-        MountOp::FSync { fh, .. } => do_fsync(open_files, *fh),
-        MountOp::ReadLink { path } => do_readlink(root, path),
+        MountOp::GetAttr { path } => (do_getattr(root, path), None),
+        MountOp::Open { path, flags } => (do_open(root, path, *flags, open_files, next_fh), None),
+        MountOp::Read { fh, offset, size } => {
+            match do_read(open_files, *fh, *offset, *size) {
+                Ok((v, bytes)) => (Ok(v), if v2 { Some(bytes) } else { None }),
+                Err(e) => (Err(e), None),
+            }
+        }
+        MountOp::Write { fh, offset, size: _ } => {
+            let r = if let Some(data) = write_data {
+                do_write(open_files, *fh, *offset, data)
+            } else {
+                Err(MountError { code: EINVAL, msg: "Write missing data payload".into() })
+            };
+            (r, None)
+        }
+        MountOp::ReadDir { fh, offset } => (do_readdir(root, open_files, *fh, *offset), None),
+        MountOp::Release { fh } => { open_files.remove(fh); (Ok(Value::Null), None) }
+        MountOp::Create { path, mode, flags } => (do_create(root, path, *mode, *flags, open_files, next_fh), None),
+        MountOp::Unlink { path } => (do_unlink(root, path), None),
+        MountOp::MkDir { path, mode } => (do_mkdir(root, path, *mode), None),
+        MountOp::RmDir { path } => (do_rmdir(root, path), None),
+        MountOp::Rename { from, to } => (do_rename(root, from, to), None),
+        MountOp::Truncate { path, size } => (do_truncate(root, path, *size), None),
+        MountOp::FSync { fh, .. } => (do_fsync(open_files, *fh), None),
+        MountOp::ReadLink { path } => (do_readlink(root, path), None),
     };
 
-    match result {
-        Ok(v) => MountResponse { id: req.id, result: MountResult::Ok(v) },
-        Err(e) => MountResponse { id: req.id, result: MountResult::Err(e) },
+    let (res, data) = result;
+    match res {
+        Ok(v) => (MountResponse { id: req.id, result: MountResult::Ok(v) }, data),
+        Err(e) => (MountResponse { id: req.id, result: MountResult::Err(e) }, None),
     }
 }
 
@@ -402,7 +701,7 @@ fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut
     Ok(serde_json::json!({ "fh": fh }))
 }
 
-fn do_read(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset: u64, size: u32) -> Result<Value, MountError> {
+fn do_read(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset: u64, size: u32) -> Result<(Value, Vec<u8>), MountError> {
     use std::io::{Read, Seek, SeekFrom};
     let (file, _) = open_files.get(&fh).ok_or_else(|| MountError { code: EBADF, msg: "bad fh".into() })?;
     let mut file = file.try_clone().map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
@@ -410,23 +709,15 @@ fn do_read(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset:
     let mut buf = vec![0u8; size as usize];
     let n = file.read(&mut buf).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
     buf.truncate(n);
-    // v1: payload rides as base64-in-JSON. Byte-exact (round-trips arbitrary
-    // bytes) but +33% size and a copy per block. Throughput follow-up per the
-    // spec rule 1: a JSON control header plus a raw length-prefixed data frame,
-    // so payload bytes skip the base64/JSON tax. Not final.
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
-    Ok(serde_json::json!({ "data": encoded }))
+    Ok((serde_json::json!({ "n": n }), buf))
 }
 
-fn do_write(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset: u64, data: &str) -> Result<Value, MountError> {
+fn do_write(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset: u64, data: &[u8]) -> Result<Value, MountError> {
     use std::io::{Seek, SeekFrom, Write};
-    use base64::Engine;
     let (file, _) = open_files.get(&fh).ok_or_else(|| MountError { code: EBADF, msg: "bad fh".into() })?;
     let mut file = file.try_clone().map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
-    let buf = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
     file.seek(SeekFrom::Start(offset)).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
-    let n = file.write(&buf).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
+    let n = file.write(data).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
     Ok(serde_json::json!({ "size": n }))
 }
 
@@ -622,5 +913,169 @@ mod tests {
         let enc = path_encode(std::path::Path::new("../../etc/passwd"));
         let err = resolve(&root, &enc).unwrap_err();
         assert_eq!(err.code, EACCES);
+    }
+
+    // -------------------------------------------------- binary frame round-trip
+
+    #[test]
+    fn binary_frame_roundtrip_no_data() {
+        let header = b"{\"id\":1}\n";
+        let frame = encode_frame(header, None);
+        let (hdr, data) = decode_frame(&frame);
+        assert_eq!(hdr, b"{\"id\":1}"); // decode_frame strips newline
+        assert!(data.is_none());
+    }
+
+    #[test]
+    fn binary_frame_roundtrip_with_data() {
+        let header = b"{\"id\":1}\n";
+        let payload = b"hello binary world";
+        let frame = encode_frame(header, Some(payload));
+        let (hdr, data) = decode_frame(&frame);
+        assert_eq!(hdr, b"{\"id\":1}");
+        assert_eq!(data.unwrap(), payload);
+    }
+
+    #[test]
+    fn binary_frame_roundtrip_empty_data() {
+        let header = b"{\"id\":1}\n";
+        let frame = encode_frame(header, Some(b""));
+        let (hdr, data) = decode_frame(&frame);
+        assert_eq!(hdr, b"{\"id\":1}");
+        assert_eq!(data.unwrap(), b"");
+    }
+
+    #[test]
+    fn binary_frame_roundtrip_4kb() {
+        let header = b"{\"id\":1}\n";
+        let payload = vec![0xAAu8; 4096];
+        let frame = encode_frame(header, Some(&payload));
+        let (hdr, data) = decode_frame(&frame);
+        assert_eq!(hdr, b"{\"id\":1}");
+        assert_eq!(data.unwrap(), &payload[..]);
+        assert_eq!(data.unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn binary_frame_roundtrip_1mb() {
+        let header = b"{\"id\":1}\n";
+        let payload = vec![0xBBu8; 1_048_576];
+        let frame = encode_frame(header, Some(&payload));
+        let (hdr, data) = decode_frame(&frame);
+        assert_eq!(hdr, b"{\"id\":1}");
+        assert_eq!(data.unwrap(), &payload[..]);
+        assert_eq!(data.unwrap().len(), 1_048_576);
+    }
+
+    #[test]
+    fn decode_frame_without_binary_suffix_returns_none() {
+        let frame = b"{\"id\":1}\n";
+        let (hdr, data) = decode_frame(frame);
+        assert_eq!(hdr, b"{\"id\":1}");
+        assert!(data.is_none());
+    }
+
+    #[test]
+    fn decode_frame_with_truncated_length_returns_none() {
+        let mut frame = b"{\"id\":1}\n".to_vec();
+        frame.extend_from_slice(&4096u32.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 2]);
+        let (hdr, data) = decode_frame(&frame);
+        assert!(data.is_none());
+    }
+
+    #[test]
+    fn encode_frame_preserves_binary_byte_exactness() {
+        let header = b"{\"r\":1}\n";
+        let all_bytes: Vec<u8> = (0..=255).collect();
+        let frame = encode_frame(header, Some(&all_bytes));
+        let (_, data) = decode_frame(&frame);
+        assert_eq!(data.unwrap(), &all_bytes[..]);
+    }
+
+    // ------------------------------------------------- MountCaps + version
+
+    #[test]
+    fn mount_caps_serialize_roundtrip() {
+        let caps = MountCaps {
+            protocol_version: 2,
+            case_sensitive: true,
+            max_path_len: 4096,
+            max_component_len: 255,
+            forbidden_bytes: vec![0x00, 0x2f],
+            forbidden_names: vec!["CON".into(), "PRN".into()],
+            supports_symlinks: true,
+            supports_hardlinks: false,
+            supports_fifo: false,
+            metadata_fields: vec!["mtime".into(), "mode".into()],
+            max_read_size: 65536,
+            max_write_size: 65536,
+        };
+        let json = serde_json::to_value(&caps).unwrap();
+        let back: MountCaps = serde_json::from_value(json).unwrap();
+        assert_eq!(back.protocol_version, 2);
+        assert!(back.case_sensitive);
+        assert_eq!(back.forbidden_bytes, vec![0x00, 0x2f]);
+    }
+
+    #[test]
+    fn mount_caps_default_is_v1() {
+        let caps = MountCaps::default();
+        assert_eq!(caps.protocol_version, 1);
+        assert!(!caps.supports_symlinks);
+    }
+
+    #[test]
+    fn protocol_version_is_two() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
+    fn mount_caps_for_root_has_version() {
+        let caps = mount_caps_for_root(&std::path::PathBuf::from("/tmp"));
+        assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn parse_mount_caps_rejects_null() {
+        let err = parse_mount_caps(serde_json::Value::Null).unwrap_err().to_string();
+        assert!(err.contains("did not advertise"));
+    }
+
+    #[test]
+    fn parse_mount_caps_rejects_v1() {
+        let json = serde_json::json!({
+            "protocol_version": 1,
+            "case_sensitive": true,
+            "max_path_len": 4096,
+            "max_component_len": 255,
+            "supports_symlinks": true,
+            "supports_hardlinks": false,
+            "supports_fifo": false
+        });
+        let err = parse_mount_caps(json).unwrap_err().to_string();
+        assert!(err.contains("version 1 unsupported"));
+    }
+
+    #[test]
+    fn parse_mount_caps_rejects_unparseable() {
+        let json = serde_json::json!({ "protocol_version": "not-a-number", "case_sensitive": true });
+        let err = parse_mount_caps(json).unwrap_err().to_string();
+        assert!(err.contains("unreadable"));
+    }
+
+    #[test]
+    fn parse_mount_caps_accepts_v2() {
+        let json = serde_json::json!({
+            "protocol_version": 2,
+            "case_sensitive": true,
+            "max_path_len": 4096,
+            "max_component_len": 255,
+            "supports_symlinks": true,
+            "supports_hardlinks": false,
+            "supports_fifo": false
+        });
+        let caps = parse_mount_caps(json).unwrap();
+        assert_eq!(caps.protocol_version, 2);
     }
 }

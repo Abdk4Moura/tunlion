@@ -10285,6 +10285,7 @@ async fn recv_cmd(
                     }
                     let root_encoded = v["root"].as_str().unwrap_or(".");
                     let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let caps = mount_proto::mount_caps_for_root(&root_path);
                     let mux = l2_muxes.entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();
@@ -10293,10 +10294,11 @@ async fn recv_cmd(
                         continue;
                     }
                     let rx = mux.register_stream(sid).await;
-                    let _ = t.send_control(&json!({ "type": "mount-open-ack", "sid": sid })).await;
+                    let _ = t.send_control(&json!({ "type": "mount-open-ack", "sid": sid, "caps": caps })).await;
                     let transport = t.clone();
                     let spawn_sid = sid;
-                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx);
+                    let proto_version = caps.protocol_version;
+                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version);
                 }
                 Some("pty-resize") if l2_enabled => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
@@ -10330,6 +10332,10 @@ async fn recv_cmd(
                         }
                     }
                 }
+                // Client confirmed the protocol version advertised in mount-open-ack.
+                // The server is already running in that version; this control is
+                // received and consumed here to prevent it from hitting the catch-all.
+                Some("mount-cap-ack") if l2_enabled => {}
                 Some("brb") => {
                     // C21: the peer announces a benign absence (mobile file
                     // picker suspends the tab). Hold the line that long.
