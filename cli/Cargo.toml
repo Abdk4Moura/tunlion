@@ -103,6 +103,6 @@ fuser = "0.17"
 wintun = "0.5"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = true
