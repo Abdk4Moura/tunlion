@@ -79,11 +79,12 @@ jobs:
     needs: build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    # macOS ARM64: local-process P2P transport stalls (transport_up=false). Both
-    # direct-QUIC and WebRTC fail to establish on the stock GitHub runner. Tried:
-    # firewall disable, codesign, WebRTC-only, threading mode, mDNS disable.
-    # Tracked in #26 — allow failure so ubuntu+windows CI remains green.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    # #26 (resolved): macOS ARM64 required check. The root cause was webrtc-rs
+    # gathering ZERO loopback host candidates on ARM64 macOS. With the
+    # loopback-only filter enabled, only unusable srflx candidates remained and
+    # ICE never nominated a pair. The fix: disable the IP filter on macOS so the
+    # runner's bridge IP (192.168.64.x) provides a host candidate.
+    continue-on-error: false
     strategy:
       fail-fast: false
       matrix:
@@ -135,14 +136,26 @@ jobs:
 
       - name: Run capability harness
         working-directory: cli
-        run: cargo test --features test-hooks --release --test capability_harness -- --nocapture --test-threads=1
+        run: |
+          cargo test --features test-hooks --release --test capability_harness \
+            -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
         env:
           RUST_BACKTRACE: 1
+          RUST_LOG: trace
           FILAMENT_WORKTREE: ${{ github.workspace }}
           RUST_MIN_STACK: 8388608
           FILAMENT_LOG: trace
-          FILAMENT_DIRECT_FLAG: ${{ runner.os == 'macOS' && '0' || '1' }}
+          FILAMENT_DIRECT_PER_OS: ${{ runner.os == 'macOS' && '0' || '1' }}
+          FILAMENT_DIRECT_LOOPBACK_ONLY: ${{ runner.os == 'macOS' && '0' || '1' }}   # macOS ARM64 webrtc-rs gathers no loopback host candidates; allow all interfaces so the runner's bridge IP provides a candidate
         timeout-minutes: 15
+
+      - name: Upload harness log (macOS)
+        if: runner.os == 'macOS' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-macos-log
+          path: /tmp/harness-macos.log
+          if-no-files-found: warn
 
   # Security gate: confirm capability_harness is ABSENT in release builds.
   # The test-hooks feature enables signaling-bypass paths; a release binary

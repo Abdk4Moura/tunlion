@@ -198,7 +198,11 @@ fn spawn_daemon_inner(
     let mut child = Command::new(bin)
         .env("FILAMENT_CONFIG_DIR", config_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+        .env(
+        "FILAMENT_DIRECT_LOOPBACK_ONLY",
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+            .unwrap_or_else(|_| "1".into()),
+    )
         .env("FILAMENT_NAME", name)
         .arg("up")
         .arg("--userspace")
@@ -295,7 +299,11 @@ fn pair_and_transfer_smoke() {
     // Also watch for the minted code prefix.
     let mut send_proc = Command::new(&bin)
         .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+        .env(
+        "FILAMENT_DIRECT_LOOPBACK_ONLY",
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+            .unwrap_or_else(|_| "1".into()),
+    )
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .arg("send")
@@ -332,7 +340,11 @@ fn pair_and_transfer_smoke() {
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
     let mut recv_proc = Command::new(&bin)
         .env("FILAMENT_DIRECT", &direct_flag)
-        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", "1")
+        .env(
+        "FILAMENT_DIRECT_LOOPBACK_ONLY",
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+            .unwrap_or_else(|_| "1".into()),
+    )
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
         .arg("recv")

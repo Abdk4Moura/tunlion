@@ -1198,6 +1198,17 @@ impl Peer {
             .await?,
         );
 
+        // P2P ICE diagnostic: log gathering state changes to see when/if
+        // complete fires vs stalls (used for CI capability-harness debugging).
+        pc.on_ice_gathering_state_change(Box::new(move |s| {
+            eprintln!("[ice-gathering] state={}", s);
+            Box::pin(async {})
+        }));
+        pc.on_ice_connection_state_change(Box::new(move |s| {
+            eprintln!("[ice-connection] state={}", s);
+            Box::pin(async {})
+        }));
+
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Trickle ICE -> relay each candidate.
@@ -1208,7 +1219,11 @@ impl Peer {
                 let sio = sio.clone();
                 let to = to.clone();
                 Box::pin(async move {
-                    if let Some(c) = c {
+                    if let Some(ref c) = c {
+                        let typ = c.typ.to_string();
+                        let addr = c.address.clone();
+                        let port = c.port;
+                        eprintln!("[ice-candidate] type={} addr={} port={}", typ, addr, port);
                         if let Ok(init) = c.to_json() {
                             let _ = sio
                                 .emit(
@@ -1217,6 +1232,8 @@ impl Peer {
                                 )
                                 .await;
                         }
+                    } else {
+                        eprintln!("[ice-candidate] gathering complete (null candidate)");
                     }
                 })
             }));
@@ -1227,6 +1244,7 @@ impl Peer {
             let closed = closed.clone();
             let pid = peer_id.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
+                eprintln!("[pc-state] {} -> {}", pid, s);
                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = tx.send(Ev::PcState(pid.clone(), s.to_string()));
                 }
