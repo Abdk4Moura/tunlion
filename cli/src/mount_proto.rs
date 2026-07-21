@@ -189,7 +189,7 @@ pub fn mount_caps_for_root(root: &std::path::Path) -> MountCaps {
         forbidden_names: forbidden_names_for_os(),
         supports_symlinks: cfg!(unix),
         supports_hardlinks: cfg!(unix),
-        supports_fifo: cfg!(unix),
+        supports_fifo: cfg!(target_os = "linux"),
         metadata_fields: vec![
             "mtime".into(), "mode".into(), "uid".into(), "gid".into(),
         ],
@@ -318,10 +318,9 @@ pub struct MountClient {
     /// True when the server advertised protocol_version >= 2 in mount-open-ack.
     /// Read/Write payloads use binary frames instead of base64.
     pub binary_frames: bool,
-    /// Maximum payload size for a single Read op, advertised by the server.
-    pub max_read_size: u32,
-    /// Maximum payload size for a single Write op, advertised by the server.
-    pub max_write_size: u32,
+    /// Server capabilities advertised at mount-open time. Used by the FUSE
+    /// adapters to honor transport limits and OS-specific restrictions.
+    pub caps: MountCaps,
 }
 
 impl MountClient {
@@ -354,23 +353,24 @@ impl MountClient {
                 }
             }
         });
-        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false, max_read_size: DEFAULT_MOUNT_MAX_SIZE, max_write_size: DEFAULT_MOUNT_MAX_SIZE }
+        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false, caps: MountCaps::default() }
     }
 
     /// Create a MountClient with binary frame support enabled (protocol v2+).
-    /// `max_read_size` and `max_write_size` come from the server's MountCaps.
+    /// `caps` are the server's advertised MountCaps.
     pub fn from_mux_v2(
         transport: Arc<dyn Transport>,
         sid: u32,
         rx: mpsc::Receiver<PipeItem>,
-        max_read_size: u32,
-        max_write_size: u32,
+        caps: MountCaps,
     ) -> Self {
         let mut c = Self::from_mux(transport, sid, rx);
         c.binary_frames = true;
-        // A zero cap means "unspecified"; fall back to the safe default.
-        c.max_read_size = if max_read_size > 0 { max_read_size } else { DEFAULT_MOUNT_MAX_SIZE };
-        c.max_write_size = if max_write_size > 0 { max_write_size } else { DEFAULT_MOUNT_MAX_SIZE };
+        // A zero max-size cap means "unspecified"; fall back to the safe default.
+        let mut caps = caps;
+        if caps.max_read_size == 0 { caps.max_read_size = DEFAULT_MOUNT_MAX_SIZE; }
+        if caps.max_write_size == 0 { caps.max_write_size = DEFAULT_MOUNT_MAX_SIZE; }
+        c.caps = caps;
         c
     }
 

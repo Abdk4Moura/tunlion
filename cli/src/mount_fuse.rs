@@ -1,4 +1,5 @@
-// Linux FUSE client adapter for the mesh-native mount protocol.
+// Unix FUSE client adapter for the mesh-native mount protocol (Linux FUSE and
+// macOS macFUSE).
 //
 // This is the `MountHost` piece from docs/design-cross-platform-capabilities.md:
 // the mesh serves a uniform SFTP-like file protocol (see mount_proto.rs), and
@@ -44,19 +45,38 @@ const TTL: Duration = Duration::from_secs(1);
 /// Maps stable FUSE inode numbers to protocol paths (relative to the mount root)
 /// and back. Root is inode 1, path ".". New inodes are handed out monotonically
 /// and cached both ways so repeated lookups of the same path are stable.
+///
+/// When `case_sensitive` is false (e.g. macOS mounting a case-preserving but
+/// case-insensitive filesystem) the reverse lookup key is lowercased so that
+/// "File" and "file" resolve to the same inode. This is an ASCII-centric
+/// approximation; full Unicode case folding is left to a future normalization
+/// pass.
 struct InodeMap {
     fwd: HashMap<u64, PathBuf>,
-    rev: HashMap<PathBuf, u64>,
+    rev: HashMap<String, u64>,
     next: u64,
+    case_sensitive: bool,
 }
 
 impl InodeMap {
-    fn new() -> Self {
+    fn new(case_sensitive: bool) -> Self {
         let mut fwd = HashMap::new();
         let mut rev = HashMap::new();
         fwd.insert(1, PathBuf::from("."));
-        rev.insert(PathBuf::from("."), 1);
-        InodeMap { fwd, rev, next: 2 }
+        rev.insert(Self::normalize(Path::new(".")), 1);
+        InodeMap { fwd, rev, next: 2, case_sensitive }
+    }
+
+    fn normalize(path: &Path) -> String {
+        path.to_string_lossy().to_lowercase()
+    }
+
+    fn key(&self, path: &Path) -> String {
+        if self.case_sensitive {
+            path.to_string_lossy().into_owned()
+        } else {
+            Self::normalize(path)
+        }
     }
 
     fn path(&self, ino: u64) -> Option<PathBuf> {
@@ -64,18 +84,20 @@ impl InodeMap {
     }
 
     fn intern(&mut self, path: PathBuf) -> u64 {
-        if let Some(&i) = self.rev.get(&path) {
+        let key = self.key(&path);
+        if let Some(&i) = self.rev.get(&key) {
             return i;
         }
         let i = self.next;
         self.next += 1;
-        self.fwd.insert(i, path.clone());
-        self.rev.insert(path, i);
+        self.fwd.insert(i, path);
+        self.rev.insert(key, i);
         i
     }
 
     fn forget(&mut self, path: &Path) {
-        if let Some(i) = self.rev.remove(path) {
+        let key = self.key(path);
+        if let Some(i) = self.rev.remove(&key) {
             self.fwd.remove(&i);
         }
     }
@@ -93,8 +115,6 @@ pub struct FilamentFs {
     inodes: Mutex<InodeMap>,
     // Keyed by the server file handle returned from opendir.
     dirs: Mutex<HashMap<u64, CachedDir>>,
-    max_read_size: u32,
-    max_write_size: u32,
 }
 
 impl FilamentFs {
@@ -102,14 +122,11 @@ impl FilamentFs {
         // The mount protocol is v2+. A v1 client reaching here is a programming
         // error; fail fast rather than silently return empty data.
         assert!(client.binary_frames, "FilamentFs requires a v2 MountClient");
-        let max_read_size = client.max_read_size;
-        let max_write_size = client.max_write_size;
+        let case_sensitive = client.caps.case_sensitive;
         FilamentFs {
             client: Mutex::new(client),
-            inodes: Mutex::new(InodeMap::new()),
+            inodes: Mutex::new(InodeMap::new(case_sensitive)),
             dirs: Mutex::new(HashMap::new()),
-            max_read_size,
-            max_write_size,
         }
     }
 
@@ -139,6 +156,10 @@ impl FilamentFs {
             .path(ino)
             .ok_or(libc::ENOENT)
     }
+
+    fn supports_fifo(&self) -> bool {
+        self.client.lock().unwrap().caps.supports_fifo
+    }
 }
 
 /// Join a child name onto a parent path, keeping the root as "." rather than
@@ -155,7 +176,7 @@ fn encode(path: &Path) -> String {
     crate::mount_proto::path_encode(path)
 }
 
-fn kind_to_fuse(stat: &FileStat) -> FileType {
+fn kind_to_fuse(stat: &FileStat, supports_fifo: bool) -> FileType {
     match stat.kind {
         Some(FileKind::Dir) => FileType::Directory,
         Some(FileKind::Symlink) => FileType::Symlink,
@@ -164,7 +185,9 @@ fn kind_to_fuse(stat: &FileStat) -> FileType {
             match stat.mode & 0o170000 {
                 0o040000 => FileType::Directory,
                 0o120000 => FileType::Symlink,
-                0o010000 => FileType::NamedPipe,
+                0o010000 => {
+                    if supports_fifo { FileType::NamedPipe } else { FileType::RegularFile }
+                }
                 0o140000 => FileType::Socket,
                 0o020000 => FileType::CharDevice,
                 0o060000 => FileType::BlockDevice,
@@ -177,7 +200,7 @@ fn kind_to_fuse(stat: &FileStat) -> FileType {
 /// Build a fuser `FileAttr` from the protocol `FileStat`, stamping the given
 /// stable inode. Times we cannot represent collapse to mtime (v1 carries mtime
 /// only, per the spec's best-effort metadata rule).
-fn to_attr(ino: u64, stat: &FileStat) -> FileAttr {
+fn to_attr(ino: u64, stat: &FileStat, supports_fifo: bool) -> FileAttr {
     let mtime = UNIX_EPOCH + Duration::from_secs(stat.mtime);
     FileAttr {
         ino: INodeNo(ino),
@@ -187,7 +210,7 @@ fn to_attr(ino: u64, stat: &FileStat) -> FileAttr {
         mtime,
         ctime: mtime,
         crtime: mtime,
-        kind: kind_to_fuse(stat),
+        kind: kind_to_fuse(stat, supports_fifo),
         perm: (stat.mode & 0o7777) as u16,
         nlink: stat.nlink.max(1),
         uid: stat.uid,
@@ -213,7 +236,7 @@ impl Filesystem for FilamentFs {
             Ok(v) => match parse_stat(&v) {
                 Ok(stat) => {
                     let ino = self.inodes.lock().unwrap().intern(path);
-                    reply.entry(&TTL, &to_attr(ino, &stat), Generation(0));
+                    reply.entry(&TTL, &to_attr(ino, &stat, self.supports_fifo()), Generation(0));
                 }
                 Err(e) => reply.error(Errno::from_i32(e)),
             },
@@ -228,7 +251,7 @@ impl Filesystem for FilamentFs {
         };
         match self.call(MountOp::GetAttr { path: encode(&path) }) {
             Ok(v) => match parse_stat(&v) {
-                Ok(stat) => reply.attr(&TTL, &to_attr(ino.0, &stat)),
+                Ok(stat) => reply.attr(&TTL, &to_attr(ino.0, &stat, self.supports_fifo())),
                 Err(e) => reply.error(Errno::from_i32(e)),
             },
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -268,7 +291,7 @@ impl Filesystem for FilamentFs {
         }
         match self.call(MountOp::GetAttr { path: encode(&path) }) {
             Ok(v) => match parse_stat(&v) {
-                Ok(stat) => reply.attr(&TTL, &to_attr(ino.0, &stat)),
+                Ok(stat) => reply.attr(&TTL, &to_attr(ino.0, &stat, self.supports_fifo())),
                 Err(e) => reply.error(Errno::from_i32(e)),
             },
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -317,7 +340,8 @@ impl Filesystem for FilamentFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let size = size.min(self.max_read_size);
+        let max_read = self.client.lock().unwrap().caps.max_read_size;
+        let size = size.min(max_read);
         match self.call_data(MountOp::Read { fh: fh.0, offset, size }, None) {
             Ok((_v, Some(bytes))) => reply.data(&bytes),
             Ok((_, None)) => reply.data(&[]),
@@ -340,8 +364,9 @@ impl Filesystem for FilamentFs {
         // The kernel may hand us a buffer larger than the server advertised.
         // Split it into cap-sized chunks so each frame fits through every
         // transport path (direct-quic, relay, WebRTC DataChannel).
+        let max_write = self.client.lock().unwrap().caps.max_write_size;
         let mut written: u32 = 0;
-        for chunk in data.chunks(self.max_write_size as usize) {
+        for chunk in data.chunks(max_write as usize) {
             match self.call_data(
                 MountOp::Write {
                     fh: fh.0,
@@ -431,7 +456,10 @@ impl Filesystem for FilamentFs {
                 dir_path
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
-                    .and_then(|p| inodes.rev.get(p).copied())
+                    .and_then(|p| {
+                        let key = inodes.key(p);
+                        inodes.rev.get(&key).copied()
+                    })
                     .unwrap_or(1)
             };
             let mut entries: Vec<(u64, FileType, OsString)> = Vec::new();
@@ -456,7 +484,7 @@ impl Filesystem for FilamentFs {
                     };
                     let child = child_path(&dir_path, &name_os);
                     let child_ino = inodes.intern(child);
-                    entries.push((child_ino, kind_to_fuse(&stat), name_os));
+                    entries.push((child_ino, kind_to_fuse(&stat, self.supports_fifo()), name_os));
                 }
             }
             self.dirs.lock().unwrap().insert(fh.0, CachedDir { entries });
@@ -516,7 +544,7 @@ impl Filesystem for FilamentFs {
                     let ino = self.inodes.lock().unwrap().intern(path);
                     reply.created(
                         &TTL,
-                        &to_attr(ino, &stat),
+                        &to_attr(ino, &stat, self.supports_fifo()),
                         Generation(0),
                         FileHandle(fh),
                         FopenFlags::empty(),
@@ -549,7 +577,7 @@ impl Filesystem for FilamentFs {
             Ok(v) => match parse_stat(&v) {
                 Ok(stat) => {
                     let ino = self.inodes.lock().unwrap().intern(path);
-                    reply.entry(&TTL, &to_attr(ino, &stat), Generation(0));
+                    reply.entry(&TTL, &to_attr(ino, &stat, self.supports_fifo()), Generation(0));
                 }
                 Err(e) => reply.error(Errno::from_i32(e)),
             },
@@ -625,9 +653,50 @@ impl Filesystem for FilamentFs {
 /// unmounted (by `fusermount -u`, `umount`, or the kernel on teardown). Because
 /// `MountClient::call_sync` blocks on the tokio mpsc, callers must run this on a
 /// dedicated blocking thread (`spawn_blocking`) so the mux pump keeps draining.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inodemap_case_sensitive_distinct_keys() {
+        let mut map = InodeMap::new(true);
+        let a = map.intern(PathBuf::from("File.txt"));
+        let b = map.intern(PathBuf::from("file.txt"));
+        assert_ne!(a, b, "case-sensitive map treats File and file as distinct");
+    }
+
+    #[test]
+    fn inodemap_case_insensitive_merges_keys() {
+        let mut map = InodeMap::new(false);
+        let a = map.intern(PathBuf::from("File.txt"));
+        let b = map.intern(PathBuf::from("file.txt"));
+        assert_eq!(a, b, "case-insensitive map merges File and file");
+    }
+
+    #[test]
+    fn inodemap_case_insensitive_forget_by_other_case() {
+        let mut map = InodeMap::new(false);
+        let _ = map.intern(PathBuf::from("Foo"));
+        map.forget(Path::new("foo"));
+        assert!(map.path(2).is_none());
+    }
+
+    #[test]
+    fn kind_to_fuse_fifo_when_supported() {
+        let stat = FileStat { ino: 1, kind: None, mode: 0o010644, size: 0, blocks: 0, mtime: 0, nlink: 1, uid: 0, gid: 0, blksize: 512 };
+        assert_eq!(kind_to_fuse(&stat, true), FileType::NamedPipe);
+    }
+
+    #[test]
+    fn kind_to_fuse_fifo_mapped_to_regular_when_not_supported() {
+        let stat = FileStat { ino: 1, kind: None, mode: 0o010644, size: 0, blocks: 0, mtime: 0, nlink: 1, uid: 0, gid: 0, blksize: 512 };
+        assert_eq!(kind_to_fuse(&stat, false), FileType::RegularFile);
+    }
+}
+
 pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
+    let max_read = client.caps.max_read_size;
     let fs = FilamentFs::new(client);
-    let max_read = fs.max_read_size;
     let mut cfg = Config::default();
     // FSName labels the mount in /proc/mounts. max_read matches the server's
     // advertised cap so the kernel never requests a single read larger than

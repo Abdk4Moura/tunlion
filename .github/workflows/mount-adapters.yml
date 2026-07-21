@@ -1,0 +1,33 @@
+# Cross-platform mount adapter validation (additive, opt-in).
+#
+# Linux FUSE is the default-on, fully-proven path and is already exercised by
+# `test.yml` and mount-gates.sh. The Windows and macOS adapters were attempted
+# in this PR but could not be brought to a compile-validated state on GitHub
+# hosted runners, so they have been moved to dedicated follow-up work. This
+# workflow is retained as a placeholder and future home for adapter validation.
+
+name: Mount Adapters
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: mount-adapters-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  placeholder:
+    name: Adapter validation placeholder
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Note current scope
+        shell: bash
+        run: |
+          echo "Only the Linux FUSE adapter is included in this PR."
+          echo "Windows (WinFsp) and macOS (macFUSE) adapters will be pursued in"
+          echo "dedicated follow-up PRs where the required SDKs can be validated."

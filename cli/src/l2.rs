@@ -2468,10 +2468,7 @@ pub async fn mount_cmd(
     let mux = Mux::new(t.clone());
     let _pump = tokio::spawn(pump_initiator(rx, mux.clone()));
     let (sid, pipe_rx, caps) = open_mount_stream(&mux, root).await?;
-    let client = crate::mount_proto::MountClient::from_mux_v2(
-        t.clone(), sid, pipe_rx,
-        caps.max_read_size, caps.max_write_size
-    );
+    let client = crate::mount_proto::MountClient::from_mux_v2(t.clone(), sid, pipe_rx, caps);
     Ok(client)
 }
 

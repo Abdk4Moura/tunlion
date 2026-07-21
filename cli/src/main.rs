@@ -6493,7 +6493,7 @@ async fn main() -> Result<()> {
                             ui::paint(ui::Tone::Ok, ui::glyph_ok())
                         ));
                         ui::say(&format!(
-                            "  {} local FUSE/WinFsp adapter not available on this OS yet; listing directory instead",
+                            "  {} local FUSE adapter not available on this OS; listing directory instead",
                             ui::paint(ui::Tone::Warn, "!")
                         ));
                     }
@@ -6606,6 +6606,7 @@ async fn mount_fuse_cmd(
     //    pump keeps draining the transport. ctrl-c triggers an unmount, which
     //    makes the blocking session loop return.
     let mnt_run = mnt.clone();
+    #[cfg(target_os = "linux")]
     let session = tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run));
 
     let result: Result<()> = tokio::select! {
@@ -6633,10 +6634,11 @@ async fn mount_fuse_cmd(
     result
 }
 
-/// Unmount a FUSE mountpoint. Tries fusermount3 then fusermount (older systems),
+/// Unmount a FUSE/macFUSE mountpoint. Tries fusermount3 then fusermount on Linux,
 /// falling back to a lazy unmount so a busy mount still detaches.
 #[cfg(target_os = "linux")]
 fn unmount_fuse(local: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
     for bin in ["fusermount3", "fusermount"] {
         if std::process::Command::new(bin)
             .args(["-u", local])
@@ -6647,10 +6649,27 @@ fn unmount_fuse(local: &str) -> std::io::Result<()> {
             return Ok(());
         }
     }
-    // Last resort: lazy unmount so a busy handle does not wedge teardown.
-    let _ = std::process::Command::new("fusermount3")
-        .args(["-uz", local])
-        .status();
+    // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-uz", local])
+            .status();
+    }
+    // macOS: use system umount.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("umount")
+            .args([local])
+            .status();
+    }
+    Ok(())
+}
+
+/// Windows: WinFsp handles unmount through its own control path; this is a no-op
+/// placeholder so the Linux/macOS cleanup flow compiles on Windows.
+#[cfg(all(target_os = "windows", feature = "mount-windows"))]
+fn unmount_fuse(_local: &str) -> std::io::Result<()> {
     Ok(())
 }
 

@@ -25,6 +25,10 @@ static = ["dep:openssl-sys"]
 # from the binary — no `FILAMENT_TEST_*` env reads, no corruption/freeze/drop
 # injection logic. Build the gates' binary with `--features test-hooks`.
 test-hooks = []
+# Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
+# not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
+# These are OFF by default so stock CI runners (which lack the SDKs) stay green.
+
 
 [dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
@@ -91,11 +95,17 @@ crossterm = "0.29"
 libc = "0.2"
 
 # Linux mount client adapter: present the mesh-native mount protocol as a real
-# local filesystem via FUSE. Server side needs no FUSE; only the client mount
-# does. macOS uses the same crate (macFUSE) in a later round.
+# local filesystem via FUSE. Server side needs no FUSE; only the client mount does.
+# This stays default-on: it builds on stock Linux runners and is fully exercised
+# by mount-gates.sh.
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"
 
+
+
+# Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
+# loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
+# release packaging; adapter creation needs Administrator.
 # Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
 # loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
 # release packaging; adapter creation needs Administrator.
