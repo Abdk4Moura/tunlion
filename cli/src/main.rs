@@ -8378,7 +8378,11 @@ async fn recv_cmd(
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
             // C29: an interactive up can START empty and pair in-session.
-            if devices.is_empty() && !std::io::stdin().is_terminal() {
+            // When shell (--shell / --shell-only) is enabled, the daemon
+            // explicitly accepts devices paired later, so do NOT bail just
+            // because the device list is empty at startup — the live-pairing
+            // scan (below) will pick them up from devices.json.
+            if devices.is_empty() && !std::io::stdin().is_terminal() && !shell_policy.enables_l2() {
                 bail!("no known devices, run `filament pair` once, or `filament up` in a terminal to pair interactively");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();

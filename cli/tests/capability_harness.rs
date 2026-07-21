@@ -411,3 +411,137 @@ fn two_nodes_pair_each_other() {
 
     eprintln!("two_nodes_pair_each_other: filament binary and backend OK");
 }
+
+#[test]
+fn shell_daemon_live_pairing_no_restart() {
+    // Proves the fix for main.rs:8381 — a `--shell` daemon started with
+    // no known devices in a non-interactive context must NOT bail, AND the
+    // live-pairing scan at line ~9065 must actually discover a device
+    // paired AFTER daemon startup so it is reachable WITHOUT a restart.
+    //
+    // The earlier test only proved the bail was gone (daemon alive), but
+    // that is necessary-not-sufficient: if the 9065 scan were broken,
+    // the daemon would stay up but never find the new peer, making the
+    // fix worthless. This test proves BOTH.
+
+    #[cfg(windows)]
+    {
+        eprintln!("shell_daemon_live_pairing_no_restart: skipped on Windows (pty not yet verified)");
+        return;
+    }
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    // Start BOTH daemons with --shell, NO prior pairing.
+    // spawn_daemon_inner uses --shell, so the guard at 8381 must let them live.
+    h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
+    h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+    std::thread::sleep(Duration::from_secs(4));
+
+    // Assertion 1: both daemons survived the empty-devices startup.
+    assert!(
+        h.daemon_a.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "shell daemon A exited on empty devices (bail bug)"
+    );
+    assert!(
+        h.daemon_b.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "shell daemon B exited on empty devices (bail bug)"
+    );
+
+    // NOW pair A and B while the daemons are already running. This writes
+    // devices.json AFTER the daemon started — the live-pairing scan must
+    // pick it up without a restart.
+    let pair_word = format!("livescan-p{:x}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-a")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_lower = pair_word.to_lowercase();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[livescan-pair-create] {line}");
+            if line.to_lowercase().contains(&pair_word_lower) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("live-pairing create did not mint a code within 60s");
+    eprintln!("live-pairing code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-b")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("pair-claim stdout: {}", String::from_utf8_lossy(&claim_out.stdout));
+    eprintln!("pair-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("pair-create exit: {}", create_out.status);
+
+    // Assertion 2: WITHOUT restarting daemons, the live-pairing scan
+    // (devices_load every 2s) must discover the newly paired device.
+    // 15s = ~7 scan cycles — generous margin for connection establishment.
+    eprintln!("waiting for live-pairing scan to discover the new device...");
+    std::thread::sleep(Duration::from_secs(15));
+
+    let nonce = format!("LIVE-PTY-OK-{}", std::process::id());
+    let mut pty_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pty", "test-b", "--", "echo", &nonce])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pty");
+
+    let pty_out = pty_proc.wait_with_output().expect("pty result");
+    let pty_stdout = String::from_utf8_lossy(&pty_out.stdout);
+    let pty_stderr = String::from_utf8_lossy(&pty_out.stderr);
+    eprintln!("live-pty stdout: {pty_stdout}");
+    eprintln!("live-pty stderr: {pty_stderr}");
+
+    assert!(
+        pty_stdout.contains(&nonce) || pty_stderr.contains(&nonce),
+        "live-pairing pty failed — daemon did not discover the newly paired device\n\
+         nonce: {nonce}\nstdout: {pty_stdout}\nstderr: {pty_stderr}"
+    );
+}
