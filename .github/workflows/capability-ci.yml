@@ -136,9 +136,15 @@ jobs:
 
       - name: Run capability harness
         working-directory: cli
+        shell: bash
         run: |
-          cargo test --features test-hooks --release --test capability_harness \
-            -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cargo test --features test-hooks --release --test capability_harness \
+              -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
+          else
+            cargo test --features test-hooks --release --test capability_harness \
+              -- --nocapture --test-threads=1
+          fi
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: trace
