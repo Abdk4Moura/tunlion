@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
+
 /// Platform-specific paths for the filament CLI.
 ///
 /// Uses the `directories` crate for proper OS placement:
@@ -238,69 +240,351 @@ fn restrict_dacl(path: &Path) -> io::Result<()> {
 
 /// The detected service manager on this platform.
 ///
-/// Used to gate `filament up --install` so it never writes a dead unit
-/// on an unsupported platform. Only systemd has a native backend today;
-/// other managers are detected and get correct manual instructions.
+/// Supports two install tiers:
+/// - **system**: privileged, kernel TUN, autostart at boot (requires admin).
+/// - **user**: unprivileged, userspace-only, autostart at logon.
+///
+/// `filament up --install` tries system first (elevation popup), falls back to
+/// user on decline. `--uninstall` removes whatever was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceHost {
-    /// systemd (Linux, user or system scope).
     Systemd,
-    /// launchd (macOS) — detected, no native backend yet.
     Launchd,
-    /// Windows Service Control Manager — detected, no native backend yet.
     WindowsService,
-    /// No recognized service manager (or we are inside a container).
     None,
 }
 
+/// Outcome of an install attempt.
+pub enum InstallResult {
+    /// Privileged system-level service installed.
+    System,
+    /// User-level autostart installed (admin declined or unavailable).
+    User,
+}
+
 impl ServiceHost {
-    /// Detect the host's service manager.
     pub fn detect() -> Self {
         #[cfg(target_os = "linux")]
         {
-            if Self::has_systemd() {
-                return ServiceHost::Systemd;
-            }
+            if Self::has_systemd() { return ServiceHost::Systemd; }
             ServiceHost::None
         }
         #[cfg(target_os = "macos")]
-        {
-            ServiceHost::Launchd
-        }
+        { ServiceHost::Launchd }
         #[cfg(target_os = "windows")]
-        {
-            ServiceHost::WindowsService
-        }
+        { ServiceHost::WindowsService }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            ServiceHost::None
-        }
+        { ServiceHost::None }
     }
 
-    /// True when we have a native install backend (systemd for now).
     pub fn supports_install(&self) -> bool {
-        matches!(self, ServiceHost::Systemd)
+        !matches!(self, ServiceHost::None)
     }
 
-    /// Human-readable instructions for manual autostart on this host.
-    /// Only called when `supports_install()` is false.
     pub fn install_instructions(&self) -> &'static str {
         match self {
+            ServiceHost::Systemd => "",
             ServiceHost::Launchd => "On macOS, create a LaunchAgent plist in ~/Library/LaunchAgents/ and load it with launchctl.",
             ServiceHost::WindowsService => "On Windows, create a Scheduled Task (trigger: at logon) or register a Service with sc.exe.",
             ServiceHost::None => "No service manager detected. Start filament with `filament up` in a terminal, or configure your init system manually.",
-            ServiceHost::Systemd => "",
         }
     }
 
-    /// Check whether systemd is PID 1. Equivalent to libsystemd's
-    /// sd_booted(3): /run/systemd/system exists iff systemd manages the system.
-    /// Does NOT spawn a subprocess, and does not false-negative when systemd
-    /// is in a "degraded" runtime state.
+    /// Attempt privileged install (system-level). Returns Ok if the privileged
+    /// path completed, Err if elevation was declined or unavailable (caller
+    /// should fall back to install_user).
+    pub fn install_system(&self, exe: &Path, shell_args: &str) -> Result<InstallResult> {
+        // If already elevated (root on unix, admin on Windows), do the actual
+        // system install directly. Otherwise, try to elevate.
+        if self.is_elevated() {
+            self.do_install_system(exe, shell_args)?;
+            return Ok(InstallResult::System);
+        }
+        let elevated = self.try_elevate(exe, shell_args)?;
+        if elevated {
+            return Ok(InstallResult::System);
+        }
+        Err(anyhow::anyhow!("elevation declined"))
+    }
+
+    fn is_elevated(&self) -> bool {
+        #[cfg(unix)]
+        {
+            unsafe { libc::geteuid() == 0 }
+        }
+        #[cfg(windows)]
+        {
+            true // try_elevate already ran via ShellExecute; this host is the elevated instance
+        }
+        #[cfg(not(any(unix, windows)))]
+        { false }
+    }
+
+    fn do_install_system(&self, exe: &Path, shell_args: &str) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            ServiceHost::Systemd => {
+                let unit = std::path::Path::new("/etc/systemd/system/filament.service");
+                std::fs::write(unit, format!(
+                    "[Unit]\nDescription=Filament drop target\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=multi-user.target\n",
+                    exe.display(), shell_args
+                ))?;
+                let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
+                let _ = std::process::Command::new("systemctl").args(["enable", "--now", "filament"]).status();
+            }
+            #[cfg(target_os = "windows")]
+            ServiceHost::WindowsService => {
+                // Quote the exe inside binPath so a spaced install path (e.g.
+                // C:\Program Files\...) is parsed as one program, not split.
+                let status = std::process::Command::new("sc")
+                    .args(["create", "filament", "binPath=", &format!("\"{}\" up{}", exe.display(), shell_args),
+                           "start=", "auto", "obj=", "LocalSystem"])
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("sc create failed");
+                }
+                let _ = std::process::Command::new("sc").args(["start", "filament"]).status();
+            }
+            #[cfg(target_os = "macos")]
+            ServiceHost::Launchd => {
+                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.filament.plist");
+                std::fs::write(plist, format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>autumated.filament</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>up</string>{}</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>"#,
+                    exe.display(), shell_args
+                ))?;
+                let _ = std::process::Command::new("launchctl").args(["bootstrap", "system"]).arg(plist).status();
+            }
+            _ => anyhow::bail!("system install not supported"),
+        }
+        Ok(())
+    }
+
+    /// Install user-level autostart (no elevation needed).
+    pub fn install_user(&self, exe: &Path, shell_args: &str) -> Result<()> {
+        match self {
+            #[cfg(target_os = "linux")]
+            ServiceHost::Systemd => {
+                install_systemd_user(exe, shell_args)
+            }
+            #[cfg(target_os = "windows")]
+            ServiceHost::WindowsService => {
+                install_scheduled_task(exe, shell_args)
+            }
+            #[cfg(target_os = "macos")]
+            ServiceHost::Launchd => {
+                install_launch_agent(exe, shell_args)
+            }
+            _ => Err(anyhow::anyhow!("no service manager detected")),
+        }
+    }
+
+    /// Uninstall any previously-registered service or autostart.
+    pub fn uninstall(&self) {
+        match self {
+            #[cfg(target_os = "linux")]
+            ServiceHost::Systemd => {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "disable", "--now", "filament"])
+                    .status();
+                let _ = std::process::Command::new("systemctl")
+                    .args(["disable", "--now", "filament"])
+                    .status();
+            }
+            #[cfg(target_os = "windows")]
+            ServiceHost::WindowsService => {
+                let _ = std::process::Command::new("sc")
+                    .args(["delete", "filament"])
+                    .status();
+                let _ = std::process::Command::new("schtasks")
+                    .args(["/delete", "/tn", "Filament", "/f"])
+                    .status();
+            }
+            #[cfg(target_os = "macos")]
+            ServiceHost::Launchd => {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["bootout", "gui/501/autumated.filament"])
+                    .status();
+            }
+            _ => {}
+        }
+    }
+
+    /// Try to elevate and re-run ourselves with admin privileges. Returns
+    /// true if the elevation dialog was accepted, false if declined.
+    fn try_elevate(&self, exe: &Path, shell_args: &str) -> Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let ok = std::process::Command::new("pkexec")
+                .arg(exe)
+                .args(["--install-system", shell_args])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            return Ok(ok);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::ffi::OsStrExt;
+
+            unsafe extern "system" {
+                fn ShellExecuteW(
+                    hwnd: isize,
+                    lpOperation: *const u16,
+                    lpFile: *const u16,
+                    lpParameters: *const u16,
+                    lpDirectory: *const u16,
+                    nShowCmd: i32,
+                ) -> isize;
+                fn GetLastError() -> u32;
+            }
+
+            const SW_HIDE: i32 = 0;
+
+            let exe_win: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+            let args = format!("--install-system {shell_args}");
+            let args_win: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let verb: Vec<u16> = "runas\0".encode_utf16().collect();
+
+            let ret = unsafe {
+                ShellExecuteW(
+                    0, // hwnd
+                    verb.as_ptr(),
+                    exe_win.as_ptr(),
+                    args_win.as_ptr(),
+                    std::ptr::null(),
+                    SW_HIDE,
+                )
+            };
+
+            // ShellExecuteW returns HINSTANCE > 32 on success.
+            if ret as usize > 32 {
+                return Ok(true);
+            }
+            let code = unsafe { GetLastError() };
+            if code == 1223 {
+                // ERROR_CANCELLED — user declined UAC
+                return Ok(false);
+            }
+            anyhow::bail!("ShellExecuteW failed: {}", code);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Escape the exe path and shell_args for the AppleScript do-shell-script
+            // double-quote context. The shell_args are our own --shell / --shell-only
+            // flags so they are constrained, but we escape defensively anyway.
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(
+                "do shell script \"'{}' --install-system {}\" with administrator privileges",
+                esc(&exe.display().to_string()),
+                esc(shell_args)
+            );
+            let ok = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            return Ok(ok);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        { Ok(false) }
+    }
+
     #[cfg(target_os = "linux")]
     fn has_systemd() -> bool {
-        std::path::Path::new("/run/systemd/system").is_dir()
+        Path::new("/run/systemd/system").is_dir()
     }
+}
+
+// ------------------------------------------------- platform installers --
+
+#[cfg(target_os = "linux")]
+fn install_systemd_user(exe: &Path, shell_args: &str) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+    std::fs::create_dir_all(&unit_dir)?;
+    let unit = unit_dir.join("filament.service");
+    std::fs::write(&unit, format!(
+        "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
+        exe.display(), shell_args
+    ))?;
+    let ok = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()
+        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "filament"]).status())
+        .map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        anyhow::bail!("systemctl --user enable --now filament failed; run it manually or check journalctl --user -u filament");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_scheduled_task(exe: &Path, shell_args: &str) -> Result<()> {
+    let task_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger/></Triggers>
+  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType></Principal></Principals>
+  <Actions><Exec><Command>{}</Command><Arguments>up{}</Arguments></Exec></Actions>
+</Task>"#,
+        exe.display(), shell_args
+    );
+    let tmp = std::env::temp_dir().join("filament-task.xml");
+    std::fs::write(&tmp, &task_xml)?;
+    let out = std::process::Command::new("schtasks")
+        .args(["/create", "/tn", "Filament", "/xml", &tmp.to_string_lossy(), "/f"])
+        .output()?;
+    let _ = std::fs::remove_file(&tmp);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("schtasks failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = PathBuf::from(&home).join("Library/LaunchAgents");
+    std::fs::create_dir_all(&dir)?;
+    let plist = dir.join("autumated.filament.plist");
+    std::fs::write(&plist, format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>autumated.filament</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>up</string>{}</array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>"#,
+        exe.display(), shell_args
+    ))?;
+    let _ = std::process::Command::new("launchctl").args(["bootstrap", "gui/501", &plist.to_string_lossy()]).status();
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub fn add_firewall_rule(exe: &Path) {
+    let _ = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "add", "rule",
+            "name=Filament QUIC", "dir=in", "action=allow",
+            "protocol=udp",
+            "program=", &exe.display().to_string(),
+            "enable=yes"])
+        .output();
 }
 
 // ------------------------------------------------------- InstallSource --
@@ -464,10 +748,10 @@ mod tests {
     }
 
     #[test]
-    fn systemd_supports_install_others_do_not() {
+    fn all_detected_hosts_support_install() {
         assert!(ServiceHost::Systemd.supports_install());
-        assert!(!ServiceHost::Launchd.supports_install());
-        assert!(!ServiceHost::WindowsService.supports_install());
+        assert!(ServiceHost::Launchd.supports_install());
+        assert!(ServiceHost::WindowsService.supports_install());
         assert!(!ServiceHost::None.supports_install());
     }
 
