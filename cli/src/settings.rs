@@ -266,6 +266,17 @@ pub fn registry() -> &'static [Setting] {
             daemon: true,
             help: "Auto-warm at most this many online peers (most recently used win). Others stay discoverable via signaling and connect on demand.",
         },
+        Setting {
+            key: "auto-proxy",
+            aliases: &[],
+            store: "auto-proxy",
+            kind: Kind::Bool,
+            default: "on",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_AUTO_PROXY"),
+            daemon: true,
+            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `filament set auto-proxy off`.",
+        },
     ];
     R
 }

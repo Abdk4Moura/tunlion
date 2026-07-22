@@ -1152,10 +1152,10 @@ async fn bring_up_to_known(
                 // dial. Bind once, advertise to whichever candidate is current
                 // (mirrors `start_direct`); the peer's own offer drives the
                 // race (handled in Ev::Signal below). Gated on
-                // `direct_enabled()`: when FILAMENT_DIRECT=0 (e.g. macOS
-                // hyperkit CI), the L2 establish skips direct-quic and uses
-                // WebRTC with srflx/relay candidates, exercising the relay
-                // fallback that real users get.
+                // `direct_enabled()` — when `FILAMENT_DIRECT=0` (e.g. macOS
+                // hyperkit CI), the L2 establish skips direct-quic entirely and
+                // uses WebRTC (srflx / relay candidates), exercising the relay
+                // fallback path.
                 if !direct_racing && crate::direct::direct_enabled() {
                     if endpoint.is_none() {
                         match crate::direct::bind_endpoint() {

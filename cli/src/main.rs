@@ -592,6 +592,11 @@ enum Cmd {
         /// Internal: re-invoked after elevation to do the system-level install.
         #[arg(long, hide = true)]
         install_system: bool,
+        /// When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port
+        /// 1080 so native tools (curl, ssh) can reach <peer>.mesh. Opt out
+        /// with --no-proxy-fallback or `filament set auto-proxy off`.
+        #[arg(long)]
+        no_proxy_fallback: bool,
     },
     /// Show whether the daemon runs and what it received recently
     Status {
@@ -1980,6 +1985,7 @@ async fn up_cmd(
     shell_program: Option<String>,
     shell_user: Option<String>,
     install_system_flag: bool,
+    no_proxy_fallback: bool,
 ) -> Result<()> {
     // Internal: re-invoked after elevation. Do the system-level install directly
     // and return. The privileged backend registers the service/daemon/task and exits.
@@ -2109,7 +2115,7 @@ async fn up_cmd(
         let server = server.to_string();
         tokio::spawn(async move { direct::warm_public_ip(&server).await; });
     }
-    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user, no_proxy_fallback).await;
     let _ = std::fs::remove_file(pidfile());
     res
 }
@@ -6299,7 +6305,7 @@ async fn main() -> Result<()> {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
         }
         Cmd::Set { key, value, peer, dry_run, reset, hard, .. } => settings::run_set(
             key.as_deref(),
@@ -6405,7 +6411,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, install_system } => {
+        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, install_system, no_proxy_fallback } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -6423,7 +6429,7 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, install_system).await
+            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, install_system, no_proxy_fallback).await
         }
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
@@ -6606,11 +6612,11 @@ async fn main() -> Result<()> {
                 let _auto_restore = save_auto;
                 let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
                 if let Some(local) = local {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
                     {
                         return mount_fuse_cmd(client, &peer, &remote, &local).await;
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"))))]
                     {
                         let _ = &local;
                         ui::say(&format!(
@@ -6675,7 +6681,7 @@ async fn main() -> Result<()> {
 /// clean pre-mount error, instead of a cryptic failure on the first `ls` after
 /// the kernel has already accepted the mount. On any failure we leave no stale
 /// mountpoint behind (the #22 contract).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 async fn mount_fuse_cmd(
     mut client: crate::mount_proto::MountClient,
     peer: &str,
@@ -6760,30 +6766,38 @@ async fn mount_fuse_cmd(
 }
 
 /// Unmount a FUSE/macFUSE mountpoint. Tries fusermount3 then fusermount on Linux,
-/// falling back to a lazy unmount so a busy mount still detaches.
-#[cfg(target_os = "linux")]
+/// falling back to a lazy unmount so a busy mount still detaches. On macOS,
+/// uses umount or diskutil unmount.
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 fn unmount_fuse(local: &str) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
-    for bin in ["fusermount3", "fusermount"] {
-        if std::process::Command::new(bin)
-            .args(["-u", local])
+    {
+        for bin in ["fusermount3", "fusermount"] {
+            if std::process::Command::new(bin)
+                .args(["-u", local])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+        // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-uz", local])
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Try diskutil first (more reliable for macFUSE), fall back to umount.
+        if std::process::Command::new("diskutil")
+            .args(["unmount", "force", local])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
             return Ok(());
         }
-    }
-    // Linux last resort: lazy unmount so a busy handle does not wedge teardown.
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-uz", local])
-            .status();
-    }
-    // macOS: use system umount.
-    #[cfg(target_os = "macos")]
-    {
         let _ = std::process::Command::new("umount")
             .args([local])
             .status();
@@ -8379,6 +8393,7 @@ async fn recv_cmd(
     // M-1: optional non-root account the web-shell/ssh PTY is dropped to. `None`
     // means the PTY runs as the up-process user (documented root risk).
     mut shell_user: Option<String>,
+    no_proxy_fallback: bool,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
     // INTERACTIVE GATE (CLI `recv` only, never the daemon/`up`). With no code,
@@ -8717,6 +8732,30 @@ async fn recv_cmd(
                                 ui::say(&ui::paint(ui::Tone::Warn,
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
                                 ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
+                                // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
+                                // Opt-out via --no-proxy-fallback or `filament set auto-proxy off`.
+                                let auto_proxy = settings::get_bool("auto-proxy", None)
+                                    && !no_proxy_fallback;
+                                if auto_proxy {
+                                    let server = server.to_string();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay).await {
+                                            // Port already in use is expected (user started proxy manually);
+                                            // only log unexpected errors.
+                                            let msg = e.to_string();
+                                            if !msg.contains("already in use") {
+                                                ui::debug(&format!("auto-proxy: {e}"));
+                                            }
+                                        }
+                                    });
+                                    ui::say(&format!(
+                                        "  {} started SOCKS5 proxy on 127.0.0.1:1080 (set your tools' proxy to this)",
+                                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                    ));
+                                    ui::say(&format!(
+                                        "    e.g.  curl --socks5-hostname 127.0.0.1:1080 http://<peer>.mesh:8080/"
+                                    ));
+                                }
                             } else {
                             // Kernel mode is dual-stack: show the v4 address too
                                 // (userspace has no v4 endpoint yet, so it is omitted
