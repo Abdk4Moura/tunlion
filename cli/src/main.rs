@@ -6025,8 +6025,8 @@ async fn handle_warm_pty(
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
 ) {
-    let ctl::ReqKind::Pty { peer, session, cols, rows, term } = &req.kind else { return };
-    let (peer, session, cols, rows, term) = (peer.clone(), session.clone(), *cols, *rows, term.clone());
+    let ctl::ReqKind::Pty { peer, session, cols, rows, term, cmd } = &req.kind else { return };
+    let (peer, session, cols, rows, term, cmd) = (peer.clone(), session.clone(), *cols, *rows, term.clone(), cmd.clone());
     let Some((pid, t)) = warm_link_for(conn, &peer) else {
         log_warm_miss(conn, &peer);
         req.reject("no warm link to that peer").await;
@@ -6043,7 +6043,7 @@ async fn handle_warm_pty(
     // pty rather than getting a dead terminal. Spawned so the verify wait never
     // blocks the event loop (F8).
     tokio::spawn(async move {
-        match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, "", verify).await {
+        match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
             Ok((sid, first, rx_pipe)) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));

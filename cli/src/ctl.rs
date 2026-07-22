@@ -150,12 +150,16 @@ mod imp {
     /// On success returns the socket bridging this process's stdio to the warm
     /// PTY stream; `None` (no daemon / no warm link) means fall back to a fresh
     /// establish. `session` keys the peer's persistent PTY for reattach.
-    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str) -> Option<UnixStream> {
+    /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
+    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<UnixStream> {
         if reuse_disabled() {
             return None;
         }
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
+        let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
+        if !cmd.is_empty() {
+            req["cmd"] = json!(cmd);
+        }
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -374,7 +378,8 @@ mod imp {
         Dial { peer: String, port: u16 },
         /// Open a PTY shell on `peer` (the warm pty fast path). `session` keys the
         /// peer's persistent PTY so a later reconnect reattaches the same shell.
-        Pty { peer: String, session: String, cols: u16, rows: u16, term: String },
+        /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
+        Pty { peer: String, session: String, cols: u16, rows: u16, term: String, cmd: String },
         /// Relay a window-size change to an already-open warm PTY (by `session`).
         Resize { session: String, cols: u16, rows: u16 },
         /// Run the ssh `shell-bootstrap` over the daemon's warm link instead of a
@@ -512,7 +517,8 @@ mod imp {
                         let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                         let rows = v["rows"].as_u64().unwrap_or(24) as u16;
                         let term = v["term"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).unwrap_or("xterm-256color").to_string();
-                        ReqKind::Pty { peer, session, cols, rows, term }
+                        let cmd = v["cmd"].as_str().unwrap_or("").to_string();
+                        ReqKind::Pty { peer, session, cols, rows, term, cmd }
                     }
                     Some("resize") => {
                         let Some(session) = v["session"].as_str().map(str::to_string) else { return };

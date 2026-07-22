@@ -1837,6 +1837,48 @@ async fn pump_warm_pty_stdio(
     Ok(())
 }
 
+/// Pump a one-shot warm pty: stream output to stdout until the command exits.
+/// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
+/// cold path parity (supports `echo hi | filament pty peer -- cat`).
+#[cfg(unix)]
+async fn pump_warm_pty_one_shot(
+    sock: tokio::net::UnixStream,
+    stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: &mut Option<Vec<u8>>,
+) -> Result<()> {
+    let (mut rd, mut wr) = tokio::io::split(sock);
+    if let Some(buf) = pending.take() {
+        if wr.write_all(&buf).await.is_err() {
+            *pending = Some(buf);
+            return Ok(());
+        }
+        let _ = wr.flush().await;
+    }
+    let mut stdout = tokio::io::stdout();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        tokio::select! {
+            r = rd.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break, // command exited / link closed
+                Ok(n) => {
+                    stdout.write_all(&buf[..n]).await?;
+                    stdout.flush().await?;
+                }
+            },
+            chunk = stdin_rx.recv() => match chunk {
+                Some(c) if c.is_empty() => { let _ = wr.shutdown().await; } // fd0 EOF
+                Some(c) => {
+                    if wr.write_all(&c).await.is_err() { *pending = Some(c); break; }
+                    let _ = wr.flush().await;
+                }
+                None => { let _ = wr.shutdown().await; }
+            },
+        }
+    }
+    let _ = stdout.flush().await;
+    Ok(())
+}
+
 /// `filament dial <peer> <port>`: wire this process's stdio to a service the peer
 /// EXPOSED on its overlay address, over L3 (the overlay-port counterpart of
 /// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
@@ -2231,36 +2273,47 @@ async fn try_warm_pty(
     peer: &str,
     session: &str,
     term: &str,
+    cmd: &str,
+    interactive: bool,
     raw: &mut Option<RawGuard>,
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
 ) -> Option<Result<()>> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let sock = crate::ctl::try_pty(peer, session, cols, rows, term).await?; // None = no warm link
-    crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for pty (no establish)"));
-    if raw.is_none() {
-        match RawGuard::enable() {
-            Ok(g) => *raw = Some(g),
-            Err(e) => return Some(Err(e)),
-        }
-    }
-    // Forward SIGWINCH as a `resize` control op (a fresh short connection each time).
-    let session_owned = session.to_string();
-    let winch = tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sig = match signal(SignalKind::window_change()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        while sig.recv().await.is_some() {
-            if let Ok((c, r)) = crossterm::terminal::size() {
-                crate::ctl::try_resize(&session_owned, c, r).await;
+    let sock = crate::ctl::try_pty(peer, session, cols, rows, term, cmd).await?; // None = no warm link
+    if interactive {
+        crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for pty (no establish)"));
+        if raw.is_none() {
+            match RawGuard::enable() {
+                Ok(g) => *raw = Some(g),
+                Err(e) => return Some(Err(e)),
             }
         }
-    });
-    let r = pump_warm_pty_stdio(sock, stdin_rx, pending).await;
-    winch.abort();
-    Some(r)
+        // Forward SIGWINCH as a `resize` control op (a fresh short connection each time).
+        let session_owned = session.to_string();
+        let winch = tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sig = match signal(SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            while sig.recv().await.is_some() {
+                if let Ok((c, r)) = crossterm::terminal::size() {
+                    crate::ctl::try_resize(&session_owned, c, r).await;
+                }
+            }
+        });
+        let r = pump_warm_pty_stdio(sock, stdin_rx, pending).await;
+        winch.abort();
+        Some(r)
+    } else {
+        // One-shot (scripted): no raw mode, no SIGWINCH, just stream output.
+        crate::ui::trace(&format!("filament: reusing warm link to '{peer}' for one-shot pty"));
+        // NOTE: neither the cold path nor this warm path propagates the remote
+        // command's exit status - both return Ok(()) regardless. This is a known
+        // limitation / future enhancement.
+        Some(pump_warm_pty_one_shot(sock, stdin_rx, pending).await)
+    }
 }
 
 /// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
@@ -2317,8 +2370,8 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     let mut warm_ended = false;
 
     #[cfg(unix)]
-    if interactive && !relay {
-        match try_warm_pty(peer, &session_id, &term, &mut raw, &mut stdin_rx, &mut pending).await {
+    if !relay && (interactive || !one_shot.is_empty()) {
+        match try_warm_pty(peer, &session_id, &term, &one_shot, interactive, &mut raw, &mut stdin_rx, &mut pending).await {
             Some(Err(e)) => return Err(e),
             Some(Ok(())) => {
                 warm_ended = true;

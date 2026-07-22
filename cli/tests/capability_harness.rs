@@ -1006,3 +1006,149 @@ fn warm_all_makes_first_contact_warm() {
     eprintln!("warm_all: all assertions passed ✓");
 }
 
+#[test]
+fn warm_one_shot_pty_reuse() {
+    // Proves fix/warm-one-shot-pty: a scripted `pty <peer> -- cmd` reuses the
+    // daemon's warm-held link instead of cold-establishing.
+    //
+    // Design: pre-warm the daemon's link to the peer by setting `warm-peers`
+    // BEFORE the pty runs. Daemon A's warm_hold_tick establishes ONE link to
+    // test-b — single, no glare. Then the pty finds the link already held and
+    // takes the warm fast path, producing the trace marker.
+    //
+    // Linux-only: macOS hyperkit bridge transport can't reliably complete a
+    // QUIC establish. Verified on ubuntu with trace-confirmed warm reuse.
+
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        eprintln!("warm_one_shot_pty_reuse: skipped on {os} (warm-reuse pty not yet verified)",
+            os = if cfg!(windows) { "Windows" } else { "macOS" });
+        return;
+    }
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    h.pair_daemons();
+    eprintln!("warm_one_shot_pty_reuse: daemons started");
+
+    let pair_word = format!("warm-reuse-p{:x}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-a")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_lower = pair_word.to_lowercase();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[warm-pair-create] {line}");
+            if line.to_lowercase().contains(&pair_word_lower) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("warm pair create did not mint a code within 60s");
+    eprintln!("warm pair code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-b")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("warm-claim stdout: {}", String::from_utf8_lossy(&claim_out.stdout));
+    eprintln!("warm-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("warm-pair-create exit: {}", create_out.status);
+
+    // Enable daemon A to proactively warm-hold test-b: write warm-peers
+    // config so the daemon's warm_hold_tick establishes ONE link.
+    let set = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "set", "warm-peers", "test-b"])
+        .output()
+        .expect("set warm-peers");
+    assert!(set.status.success(), "set warm-peers failed: {:?}", String::from_utf8_lossy(&set.stderr));
+
+    // Restart daemons to pick up the warm-peers config.
+    if let Some(ref mut c) = h.daemon_a {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(ref mut c) = h.daemon_b {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    h.daemon_a = None;
+    h.daemon_b = None;
+    std::thread::sleep(Duration::from_secs(3));
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_b = Some(child_b);
+    h.daemon_a_log = log_a;
+    h.daemon_b_log = log_b;
+    std::thread::sleep(Duration::from_secs(20));
+
+    // Warm-hold tick (10s interval) runs during the 20s settle — daemon A
+    // establishes a warm link to test-b. Now pty should hit the warm path.
+    let nonce = format!("WARM-OK-{}", std::process::id());
+    let out = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pty", "test-b", "--", "echo", &nonce])
+        .output()
+        .expect("pty");
+    let out_stdout = String::from_utf8_lossy(&out.stdout);
+    let out_stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("warm pty stdout: {out_stdout}");
+    eprintln!("warm pty stderr: {out_stderr}");
+
+    assert!(
+        out_stderr.contains("reusing warm link") && out_stderr.contains("one-shot pty"),
+        "pty did NOT use warm link - expected trace 'reusing warm link ... for one-shot pty'\n\
+         stdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+
+    assert!(
+        out_stdout.contains(&nonce),
+        "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+}
+
