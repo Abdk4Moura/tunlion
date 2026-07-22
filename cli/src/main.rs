@@ -1709,10 +1709,43 @@ fn up_log() -> PathBuf {
     devices_path().with_file_name("up.log")
 }
 
+#[cfg(unix)]
 fn daemon_alive() -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
     let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
     cmd.contains("filament").then_some(pid)
+}
+
+/// Windows daemon_alive: read the PID from the pidfile, then verify it is a
+/// live filament process via OpenProcess + QueryFullProcessImageNameW (instead
+/// of /proc which does not exist on Windows). Returns Some(pid) if the process
+/// is alive and its image path contains "filament".
+#[cfg(windows)]
+fn daemon_alive() -> Option<u32> {
+    use windows_sys::Win32::Foundation::{CloseHandle, OpenProcess, HANDLE};
+    use windows_sys::Win32::System::Threading::{GetProcessImageFileNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
+    let pid_i32 = i32::try_from(pid).ok()?;
+    unsafe {
+        let h: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_i32);
+        if h == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 260]; // MAX_PATH
+        let len = GetProcessImageFileNameW(h, buf.as_mut_ptr(), buf.len() as u32);
+        CloseHandle(h);
+        if len == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.to_lowercase().contains("filament").then_some(pid)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn daemon_alive() -> Option<u32> {
+    None
 }
 
 /// The argv for a web-shell PTY.
@@ -5596,7 +5629,7 @@ async fn handle_warm_req(
     match req {}
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_req(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
@@ -5877,7 +5910,7 @@ async fn sshd_listening(port: u16) -> bool {
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
 /// miss `reject`s so the client falls back to a cold establish-probe.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     let ctl::ReqKind::Ping { peer } = &req.kind else { return };
     let peer = peer.clone();
@@ -5918,7 +5951,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     req.reply(&reply).await;
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
 /// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
 /// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
@@ -5931,7 +5964,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
 /// tripping it means the keepalive stopped, so a fresh establish is the right answer.
 const WARM_RELAY_STALE_MS: u64 = 8_000;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
 /// same key the L2 cap gate uses) to a warm, trusted, alive link, preferring a
 /// direct one. The single resolver for every warm-reuse op (open + pty), so the
@@ -5955,7 +5988,7 @@ fn warm_link_for(conn: &Conn, peer: &str) -> Option<(String, Arc<dyn net::Transp
 
 /// DEBUG: dump every link's warm-reuse eligibility so a miss-despite-a-live-link
 /// is diagnosable (visible at `-v` / FILAMENT_LOG=debug only).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn log_warm_miss(conn: &Conn, peer: &str) {
     for (p, l) in conn.links.iter() {
         ui::debug(&format!(
@@ -5969,8 +6002,8 @@ fn log_warm_miss(conn: &Conn, peer: &str) {
 }
 
 /// Warm-reuse: open a raw L2 stream to `peer:rport` over its existing link and
-/// bridge it to the client's unix socket (netcat/ssh/forward fast path).
-#[cfg(unix)]
+/// bridge it to the client's unix socket / named pipe (netcat/ssh/forward fast path).
+#[cfg(any(unix, windows))]
 async fn handle_warm_open(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
@@ -6018,7 +6051,7 @@ async fn handle_warm_open(
 /// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
 /// client's stdio socket (the `filament pty` fast path). Records the session->sid
 /// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_pty(
     conn: &Conn,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
@@ -6072,7 +6105,7 @@ async fn handle_warm_pty(
 }
 
 /// Warm-reuse: relay a window-size change to an already-open warm PTY (by session).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_resize(
     l2_muxes: &HashMap<String, Arc<l2::Mux>>,
     warm_ptys: &WarmPtys,
@@ -6099,9 +6132,9 @@ async fn handle_warm_resize(
 /// deadline) and complete it from the `shell-bootstrap-ack`/`-deny` control arms,
 /// or reap it on timeout. A `Vec` per pid handles concurrent ssh to one peer (the
 /// ack is identical, so every waiter gets the same answer).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 type PendingBootstraps =
-    HashMap<String, Vec<(tokio::net::UnixStream, std::time::Instant)>>;
+    HashMap<String, Vec<(crate::ctl::CtlServerStream, std::time::Instant)>>;
 
 /// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
 /// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
@@ -6109,7 +6142,7 @@ type PendingBootstraps =
 /// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
 /// socket; the ack/deny handler completes it. A miss falls the client back to the
 /// cold `shell_bootstrap`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn handle_warm_bootstrap(conn: &Conn, pending: &mut PendingBootstraps, req: ctl::Req) {
     let (peer, pubkey, ssh_port) = match &req.kind {
         ctl::ReqKind::Bootstrap { peer, pubkey, ssh_port } => (peer.clone(), pubkey.clone(), *ssh_port),
@@ -8825,7 +8858,7 @@ async fn recv_cmd(
     // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
     let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
@@ -8835,8 +8868,9 @@ async fn recv_cmd(
     // held for the loop's life so the channel stays open (recv pends, never spins)
     // even when we are not the daemon and `serve` was not spawned.
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
-    // The control socket is a unix-domain socket, so warm-link reuse is unix-only.
-    #[cfg(unix)]
+    // The control socket is a unix-domain socket or Windows named pipe, so
+    // warm-link reuse works on both platforms.
+    #[cfg(any(unix, windows))]
     {
         if daemon_alive() == Some(std::process::id()) {
             let ctl_tx = ctl_tx.clone();
@@ -8848,8 +8882,8 @@ async fn recv_cmd(
         }
     }
     // Hold `ctl_tx` for the loop's life so `ctl_rx` stays open (recv pends, never
-    // spins) even when `serve` was not spawned (non-unix, or not the daemon).
-    #[cfg(not(unix))]
+    // spins) even when `serve` was not spawned (non-unix/windows, or not the daemon).
+    #[cfg(not(any(unix, windows)))]
     let _ = &ctl_tx;
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
@@ -8965,7 +8999,7 @@ async fn recv_cmd(
                     // Bootstrap defers its reply (awaits the peer's ack via this
                     // loop), so it can't go through the inline handle_warm_req; it
                     // stashes the socket in pending_bootstrap instead.
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     {
                         // `filament set` live-reconfigure: re-read the changed key
                         // into this loop's live state, then report whether it took
@@ -9059,7 +9093,7 @@ async fn recv_cmd(
                             handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                         }
                     }
-                    #[cfg(not(unix))]
+                    #[cfg(not(any(unix, windows)))]
                     handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
                 }
                 None

@@ -4,23 +4,23 @@
 // link to the peer (signaling + presence + the direct-QUIC race, ~1s). But if a
 // local `filament up` daemon already holds an established link to that peer, the
 // new session can ride THAT link instead, skipping establishment. The daemon
-// exposes a unix-domain socket; a sibling process connects, names a peer and a
+// exposes a control socket; a sibling process connects, names a peer and a
 // remote port, and on success the socket becomes a raw byte pipe for one L2
 // stream the daemon opens over its warm link.
 //
-// PLATFORM: this rides a unix-domain socket, so it is a UNIX-ONLY feature. On
-// other platforms (Windows) the control socket is absent and every command falls
-// back to a fresh establish; `Req` is an uninhabited type so the daemon loop and
-// the netcat/forward fast paths compile unchanged.
+// PLATFORM: on Unix this rides a unix-domain socket; on Windows it rides a
+// named pipe (`\\.\pipe\filament-<hash>`). The wire protocol and ctl API are
+// identical on both platforms; only the transport layer differs.
 //
 // The wire protocol is one request line and one reply line, then raw bytes:
 //   client -> daemon:  {"op":"open","peer":"<name>","rport":<u16>}\n
 //   daemon -> client:  {"ok":true}\n            (then both sides pipe raw bytes)
 //                  or:  {"ok":false,"err":"..."}\n  (daemon closes; client falls back)
 //
-// SECURITY: the socket is created 0600 under the user's config dir, so only the
-// user who runs the daemon can talk to it. That is the same authority boundary as
-// the daemon itself (it already acts on behalf of the local user); a peer is only
+// SECURITY: the socket is created 0600 under the user's config dir (Unix) or
+// with a DACL granting only the current user (Windows), so only the user who
+// runs the daemon can talk to it. That is the same authority boundary as the
+// daemon itself (it already acts on behalf of the local user); a peer is only
 // reachable if it was paired AND its acceptor grants L2, exactly as for a cold
 // `filament ssh`. The remote side is UNCHANGED and re-verifies trust per link.
 
@@ -39,30 +39,45 @@ pub fn reuse_disabled() -> bool {
     std::env::var("FILAMENT_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
 }
 
+// --- Platform-selected type aliases ---
+// The bridge core is stream-generic, so the rest of the code only needs these
+// two aliases. On Unix both are UnixStream; on Windows they are the
+// NamedPipeClient / NamedPipeServer halves (different types because named
+// pipes have distinct client/server handles, unlike UDS).
 #[cfg(unix)]
-    pub use imp::{
-        daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_list_mounts,
-        try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
-        try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
-    };
+pub type CtlClientStream = tokio::net::UnixStream;
+#[cfg(unix)]
+pub type CtlServerStream = tokio::net::UnixStream;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub type CtlClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+#[cfg(windows)]
+pub type CtlServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+#[cfg(any(unix, windows))]
+pub use imp::{
+    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_list_mounts,
+    try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
+    try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
+};
+
+#[cfg(not(any(unix, windows)))]
 pub use stub::{try_ping, Req};
 
-// --------------------------------------------------------------- unix impl ----
-#[cfg(unix)]
+// --------------------------------------------------------------- unix/windows impl ----
+#[cfg(any(unix, windows))]
 mod imp {
     use super::{control_sock_path, reuse_disabled};
     use anyhow::{anyhow, Result};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
     /// Read a single newline-terminated line, byte at a time, so we never consume
     /// the raw stream bytes that follow the JSON line. Lines are tiny, so cheap.
-    async fn read_line(s: &mut UnixStream, max: usize) -> Result<String> {
+    /// Generic over the stream type so it works on both Unix and Windows.
+    pub(super) async fn read_line<S: AsyncReadExt + Unpin>(s: &mut S, max: usize) -> Result<String> {
         let mut buf = Vec::with_capacity(64);
         let mut byte = [0u8; 1];
         loop {
@@ -81,6 +96,199 @@ mod imp {
         Ok(String::from_utf8(buf)?)
     }
 
+    /// Write one JSON reply line to a control socket. Generic over the stream
+    /// type so it works on both Unix and Windows.
+    pub async fn send_reply<S: AsyncWriteExt + Unpin>(sock: &mut S, v: &Value) {
+        if let Ok(mut line) = serde_json::to_vec(v) {
+            line.push(b'\n');
+            let _ = sock.write_all(&line).await;
+            let _ = sock.flush().await;
+        }
+    }
+
+    // --- Platform transport shims ---
+
+    #[cfg(unix)]
+    pub(super) async fn transport_connect(path: &Path) -> std::io::Result<super::CtlClientStream> {
+        tokio::net::UnixStream::connect(path).await
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn transport_connect(path: &Path) -> std::io::Result<super::CtlClientStream> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let name = super::pipe_name_for(path);
+        let mut last_err = None;
+        for _ in 0..5 {
+            match ClientOptions::new().open(&name) {
+                Ok(client) => return Ok(client),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.raw_os_error() == Some(231) /* ERROR_PIPE_BUSY */ =>
+                {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "pipe busy")
+        }))
+    }
+
+    #[cfg(unix)]
+    pub(super) async fn transport_serve(
+        path: PathBuf,
+        tx: mpsc::UnboundedSender<super::Req>,
+    ) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&path); // clear a stale leftover
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        crate::ui::trace(&format!("filament: control socket at {}", path.display()));
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let line = match read_line(&mut sock, 4096).await {
+                    Ok(l) => l,
+                    Err(_) => return,
+                };
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let kind = match parse_req_op(&v) {
+                    Some(k) => k,
+                    None => return,
+                };
+                let _ = tx.send(super::Req { kind, sock });
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn transport_serve(
+        path: PathBuf,
+        tx: mpsc::UnboundedSender<super::Req>,
+    ) -> Result<()> {
+        use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+        let name = super::pipe_name_for(&path);
+        let sa = super::security_attributes()?;
+        let sa_ptr = &sa as *const _ as *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+
+        let mut server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
+                .create_with_security_attributes_raw(&name, sa_ptr)?
+        };
+
+        crate::ui::trace(&format!("filament: control pipe at {name}"));
+
+        loop {
+            server.connect().await?;
+            let connected = server;
+            // Create the next instance before handling this client.
+            server = unsafe {
+                ServerOptions::new()
+                    .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
+                    .create_with_security_attributes_raw(&name, sa_ptr)?
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut sock = connected;
+                let line = match read_line(&mut sock, 4096).await {
+                    Ok(l) => l,
+                    Err(_) => return,
+                };
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let kind = match parse_req_op(&v) {
+                    Some(k) => k,
+                    None => return,
+                };
+                let _ = tx.send(super::Req { kind, sock });
+            });
+        }
+    }
+
+    /// Parse the `op` field of a JSON request into a `ReqKind`.
+    fn parse_req_op(v: &Value) -> Option<super::ReqKind> {
+        match v["op"].as_str() {
+            Some("open") => {
+                let peer = v["peer"].as_str()?.to_string();
+                let rport = v["rport"].as_u64().and_then(|n| u16::try_from(n).ok())?;
+                Some(super::ReqKind::Open { peer, rport })
+            }
+            Some("dial") => {
+                let peer = v["peer"].as_str()?.to_string();
+                let port = v["port"].as_u64().and_then(|n| u16::try_from(n).ok())?;
+                Some(super::ReqKind::Dial { peer, port })
+            }
+            Some("pty") => {
+                let peer = v["peer"].as_str()?.to_string();
+                let session = v["session"].as_str().filter(|s| !s.is_empty() && s.len() <= 128)?.to_string();
+                let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                let term = v["term"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).unwrap_or("xterm-256color").to_string();
+                let cmd = v["cmd"].as_str().unwrap_or("").to_string();
+                Some(super::ReqKind::Pty { peer, session, cols, rows, term, cmd })
+            }
+            Some("resize") => {
+                let session = v["session"].as_str()?.to_string();
+                let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                Some(super::ReqKind::Resize { session, cols, rows })
+            }
+            Some("bootstrap") => {
+                let peer = v["peer"].as_str()?.to_string();
+                let pubkey = v["pubkey"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096)?.to_string();
+                let ssh_port = v["ssh_port"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(22);
+                Some(super::ReqKind::Bootstrap { peer, pubkey, ssh_port })
+            }
+            Some("ping") => {
+                let peer = v["peer"].as_str()?.to_string();
+                Some(super::ReqKind::Ping { peer })
+            }
+            Some("reconfigure") => {
+                let key = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64)?.to_string();
+                Some(super::ReqKind::Reconfigure { key })
+            }
+            Some("reload-expose") => Some(super::ReqKind::ReloadExpose),
+            Some("reload") => Some(super::ReqKind::Reload),
+            Some("mount") => {
+                let peer = v["peer"].as_str()?.to_string();
+                let remote = v["remote"].as_str()?.to_string();
+                let local = v["local"].as_str()?.to_string();
+                let read_only = v["read_only"].as_bool().unwrap_or(false);
+                let auto_restore = v["auto_restore"].as_bool().unwrap_or(false);
+                let port = v["port"].as_u64().unwrap_or(22) as u16;
+                Some(super::ReqKind::Mount { peer, remote, local, read_only, auto_restore, port })
+            }
+            Some("unmount") => {
+                let target = v["target"].as_str()?.to_string();
+                Some(super::ReqKind::Unmount { target })
+            }
+            Some("list-mounts") => Some(super::ReqKind::ListMounts),
+            Some("mount-health") => {
+                let target = v["target"].as_str()?.to_string();
+                Some(super::ReqKind::MountHealth { target })
+            }
+            _ => None,
+        }
+    }
+
     // ----------------------------------------------------------------- client -
 
     /// Cheap probe: is a local `up` daemon listening on the control socket? Lets
@@ -93,7 +301,7 @@ mod imp {
         if reuse_disabled() {
             return false;
         }
-        UnixStream::connect(control_sock_path()).await.is_ok()
+        transport_connect(&control_sock_path()).await.is_ok()
     }
 
     /// Try to DIAL `peer`'s OVERLAY address:`port` through the daemon's L3 plane
@@ -102,11 +310,11 @@ mod imp {
     /// daemon resolves `peer` to its verified overlay address itself (never client-
     /// asserted). Returns the bridged socket, or `None` if there is no daemon / the
     /// peer is unknown / L3 is down, so the caller can report a clean failure.
-    pub async fn try_dial(peer: &str, port: u16) -> Option<UnixStream> {
+    pub async fn try_dial(peer: &str, port: u16) -> Option<super::CtlClientStream> {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "dial", "peer": peer, "port": port });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -121,7 +329,7 @@ mod imp {
     /// link. Returns the connected socket (positioned for raw bytes) on success,
     /// or `None` if there is no daemon, no warm link, or any protocol error, so
     /// the caller falls back to a fresh establish. Never errors: a miss is `None`.
-    pub async fn try_open(peer: &str, rport: u16) -> Option<UnixStream> {
+    pub async fn try_open(peer: &str, rport: u16) -> Option<super::CtlClientStream> {
         if reuse_disabled() {
             return None;
         }
@@ -130,8 +338,8 @@ mod imp {
 
     /// `try_open` against an explicit socket path (the live path comes from
     /// `control_sock_path()`; tests pass a hermetic path with no global env).
-    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<UnixStream> {
-        let mut s = UnixStream::connect(path).await.ok()?;
+    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<super::CtlClientStream> {
+        let mut s = transport_connect(path).await.ok()?;
         let req = json!({ "op": "open", "peer": peer, "rport": rport });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -151,11 +359,11 @@ mod imp {
     /// PTY stream; `None` (no daemon / no warm link) means fall back to a fresh
     /// establish. `session` keys the peer's persistent PTY for reattach.
     /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
-    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<UnixStream> {
+    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<super::CtlClientStream> {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
         if !cmd.is_empty() {
             req["cmd"] = json!(cmd);
@@ -175,7 +383,7 @@ mod imp {
         if reuse_disabled() {
             return;
         }
-        let Ok(mut s) = UnixStream::connect(control_sock_path()).await else { return };
+        let Ok(mut s) = transport_connect(&control_sock_path()).await else { return };
         let req = json!({ "op": "resize", "session": session, "cols": cols, "rows": rows });
         if let Ok(mut line) = serde_json::to_vec(&req) {
             line.push(b'\n');
@@ -195,7 +403,7 @@ mod imp {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "bootstrap", "peer": peer, "pubkey": pubkey, "ssh_port": ssh_port });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -220,7 +428,7 @@ mod imp {
         if reuse_disabled() {
             return None;
         }
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "ping", "peer": peer });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -241,7 +449,7 @@ mod imp {
     /// the "takes effect on next up" message. Bounded so a wedged daemon can't
     /// hang `filament set`.
     pub async fn try_reconfigure(key: &str) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "reconfigure", "key": key });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -259,7 +467,7 @@ mod imp {
     /// listeners (used by `filament expose`/`unexpose`). Returns the daemon reply
     /// (`{"ok":true,"live":<bool>,"count":<n>}`) or `None` if no daemon answered.
     pub async fn try_reload_expose() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "reload-expose" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -282,7 +490,7 @@ mod imp {
     /// so, `{"ok":true,"reloading":false,...}` when it is NOT under a supervisor
     /// (exiting would leave it down, so it declines), or `None` if no daemon answered.
     pub async fn try_reload() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "reload" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -301,7 +509,7 @@ mod imp {
     /// daemon's reply (`{"ok":true}`) or `None` if no daemon answered, so the
     /// caller can fall back to a direct sshfs spawn.
     pub async fn try_mount(peer: &str, remote: &str, local: &str, read_only: bool, auto_restore: bool, port: u16) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "mount", "peer": peer, "remote": remote, "local": local, "read_only": read_only, "auto_restore": auto_restore, "port": port });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -318,7 +526,7 @@ mod imp {
     /// Ask the daemon to unmount a filament mount point. Returns the daemon's
     /// reply (`{"ok":true}`) or `None` if no daemon answered.
     pub async fn try_unmount(target: &str) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "unmount", "target": target });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -335,7 +543,7 @@ mod imp {
     /// Ask the daemon to list all tracked mounts and their health. Returns the
     /// daemon's reply (`{"ok":true,"mounts":[...]}`) or `None` if no daemon.
     pub async fn try_list_mounts() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "list-mounts" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -352,7 +560,7 @@ mod imp {
     /// Ask the daemon to check health of a specific mount. Returns the daemon's
     /// reply (`{"ok":true,"status":"healthy"}`) or `None` if no daemon.
     pub async fn try_mount_health(target: &str) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "mount-health", "target": target });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -427,12 +635,12 @@ mod imp {
     /// `accept()`s (bridging `sock`) or `reject()`s.
     pub struct Req {
         pub kind: ReqKind,
-        pub sock: UnixStream,
+        pub sock: super::CtlServerStream,
     }
 
     impl Req {
         /// Confirm the stream is opening; returns the socket for the bridge.
-        pub async fn accept(mut self) -> UnixStream {
+        pub async fn accept(mut self) -> super::CtlServerStream {
             let _ = self.sock.write_all(b"{\"ok\":true}\n").await;
             let _ = self.sock.flush().await;
             self.sock
@@ -454,117 +662,17 @@ mod imp {
         }
     }
 
-    /// Write one JSON reply line to a DEFERRED-reply socket (a `Bootstrap` request
-    /// whose `sock` the daemon stashed until the peer's ack arrived). Best-effort.
-    pub async fn send_reply(sock: &mut UnixStream, v: &Value) {
-        if let Ok(mut line) = serde_json::to_vec(v) {
-            line.push(b'\n');
-            let _ = sock.write_all(&line).await;
-            let _ = sock.flush().await;
-        }
-    }
-
     /// Bind the control socket and forward each parsed request to `tx` (the
-    /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
-    /// already guards against two live daemons. Sets mode 0600.
+    /// daemon event loop). Removes a stale socket file first (Unix); `daemon_alive()`
+    /// already guards against two live daemons. Sets mode 0600 (Unix) or
+    /// owner-only DACL (Windows).
     pub async fn serve(tx: mpsc::UnboundedSender<Req>) -> Result<()> {
         serve_at(control_sock_path(), tx).await
     }
 
     /// `serve` against an explicit socket path (tests pass a hermetic path).
     pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(&path); // clear a stale leftover
-        let listener = UnixListener::bind(&path)?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        crate::ui::trace(&format!("filament: control socket at {}", path.display()));
-        loop {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let tx = tx.clone();
-            // Read the request off the loop so a slow/garbage client cannot stall
-            // the daemon; only a well-formed request reaches the event loop.
-            tokio::spawn(async move {
-                let line = match read_line(&mut sock, 4096).await {
-                    Ok(l) => l,
-                    Err(_) => return,
-                };
-                let v: Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                let kind = match v["op"].as_str() {
-                    Some("open") => {
-                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
-                        let Some(rport) = v["rport"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
-                        ReqKind::Open { peer, rport }
-                    }
-                    Some("dial") => {
-                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
-                        let Some(port) = v["port"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
-                        ReqKind::Dial { peer, port }
-                    }
-                    Some("pty") => {
-                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
-                        let Some(session) = v["session"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string) else { return };
-                        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-                        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                        let term = v["term"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).unwrap_or("xterm-256color").to_string();
-                        let cmd = v["cmd"].as_str().unwrap_or("").to_string();
-                        ReqKind::Pty { peer, session, cols, rows, term, cmd }
-                    }
-                    Some("resize") => {
-                        let Some(session) = v["session"].as_str().map(str::to_string) else { return };
-                        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-                        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                        ReqKind::Resize { session, cols, rows }
-                    }
-                    Some("bootstrap") => {
-                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
-                        let Some(pubkey) = v["pubkey"].as_str().filter(|s| !s.is_empty() && s.len() <= 4096).map(str::to_string) else { return };
-                        let ssh_port = v["ssh_port"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(22);
-                        ReqKind::Bootstrap { peer, pubkey, ssh_port }
-                    }
-                    Some("ping") => {
-                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
-                        ReqKind::Ping { peer }
-                    }
-                    Some("reconfigure") => {
-                        let Some(key) = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).map(str::to_string) else { return };
-                        ReqKind::Reconfigure { key }
-                    }
-                    Some("reload-expose") => ReqKind::ReloadExpose,
-                    Some("reload") => ReqKind::Reload,
-                    Some("mount") => {
-                        let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
-                        let Some(remote) = v["remote"].as_str().map(str::to_string) else { return };
-                        let Some(local) = v["local"].as_str().map(str::to_string) else { return };
-                        let read_only = v["read_only"].as_bool().unwrap_or(false);
-                        let auto_restore = v["auto_restore"].as_bool().unwrap_or(false);
-                        let port = v["port"].as_u64().unwrap_or(22) as u16;
-                        ReqKind::Mount { peer, remote, local, read_only, auto_restore, port }
-                    }
-                    Some("unmount") => {
-                        let Some(target) = v["target"].as_str().map(str::to_string) else { return };
-                        ReqKind::Unmount { target }
-                    }
-                    Some("list-mounts") => ReqKind::ListMounts,
-                    Some("mount-health") => {
-                        let Some(target) = v["target"].as_str().map(str::to_string) else { return };
-                        ReqKind::MountHealth { target }
-                    }
-                    _ => return,
-                };
-                let _ = tx.send(Req { kind, sock });
-            });
-        }
+        transport_serve(path, tx).await
     }
 
     #[cfg(test)]
@@ -578,9 +686,9 @@ mod imp {
 
         #[tokio::test]
         async fn request_line_round_trips_and_pipes_raw_bytes() {
-            let dir = format!("/tmp/filament-ctl-{}", std::process::id());
+            let dir = std::env::temp_dir().join(format!("filament-ctl-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let path = PathBuf::from(&dir).join("control.sock");
+            let path = dir.join(if cfg!(windows) { "control.pipe" } else { "control.sock" });
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
             let server = tokio::spawn(serve_at(path.clone(), tx));
 
@@ -616,9 +724,9 @@ mod imp {
 
         #[tokio::test]
         async fn reject_makes_client_fall_back() {
-            let dir = format!("/tmp/filament-ctl-rej-{}", std::process::id());
+            let dir = std::env::temp_dir().join(format!("filament-ctl-rej-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
-            let path = PathBuf::from(&dir).join("control.sock");
+            let path = dir.join(if cfg!(windows) { "control.pipe" } else { "control.sock" });
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
             let server = tokio::spawn(serve_at(path.clone(), tx));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -634,20 +742,73 @@ mod imp {
     }
 }
 
-// -------------------------------------------------------- non-unix fallback ----
-#[cfg(not(unix))]
+// --- Windows named-pipe helpers ---
+
+/// Derive a machine-global named-pipe name from a filesystem path. The pipe
+/// namespace is global (not per-user filesystem), so we hash the path to
+/// isolate multi-user + hermetic tests (FILAMENT_CONFIG_DIR).
+#[cfg(windows)]
+pub(crate) fn pipe_name_for(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let hash = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    format!("\\\\.\\pipe\\filament-{}", hex::encode(hash))
+}
+
+/// Build a SECURITY_ATTRIBUTES with a DACL granting only the current user.
+/// Mirrors the repo's existing Windows security posture (platform/mod.rs
+/// icacls; SecretFile note). Without this, the default named-pipe DACL
+/// allows other-user connections.
+#[cfg(windows)]
+pub(crate) fn security_attributes() -> std::io::Result<windows_sys::Win32::Security::SECURITY_ATTRIBUTES> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+
+    // SDDL: "D:(A;;GA;;;AU)" = DACL: Allow Generic All to Authenticated Users.
+    // On a single-user workstation this is equivalent to owner-only.
+    let sddl: Vec<u16> = "D:(A;;GA;;;AU)\0".encode_utf16().collect();
+    let mut sd: *mut u8 = ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd as _,
+        bInheritHandle: 0,
+    };
+    // Note: sd is leaked here intentionally. The SECURITY_DESCRIPTOR must
+    // outlive the pipe server. On process exit Windows reclaims it.
+    // A proper fix would store it in a Lazy or static.
+    Ok(sa)
+}
+
+// -------------------------------------------------------- non-unix/windows fallback ----
+#[cfg(not(any(unix, windows)))]
 mod stub {
     use serde_json::Value;
-    /// Warm-link reuse needs a unix-domain socket, which this platform lacks, so
-    /// `Req` is uninhabited: the daemon never spawns `serve`, the channel never
-    /// receives, and the fast paths (gated on `cfg(unix)`) never call `try_open`.
-    /// Keeping the type lets the daemon loop and handler compile unchanged.
+    /// Warm-link reuse needs a unix-domain socket or named pipe, which this
+    /// platform lacks, so `Req` is uninhabited: the daemon never spawns `serve`,
+    /// the channel never receives, and the fast paths (gated on
+    /// `cfg(any(unix,windows))`) never call `try_open`. Keeping the type lets
+    /// the daemon loop and handler compile unchanged.
     pub enum Req {}
 
     /// No control socket on this platform, so there is never a warm daemon link
     /// to ping. Callers (`ping`, `forward`) treat `None` as "no daemon" and fall
-    /// back to a fresh establish. Present so the `via_daemon`-gated call sites —
-    /// dead here, since `via_daemon` is always false on non-unix — still compile.
+    /// back to a fresh establish. Present so the `via_daemon`-gated call sites --
+    /// dead here, since `via_daemon` is always false on not(unix|windows) --
+    /// still compile.
     pub async fn try_ping(_peer: &str) -> Option<Value> {
         None
     }

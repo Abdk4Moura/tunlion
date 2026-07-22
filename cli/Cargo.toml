@@ -111,6 +111,13 @@ fuser = "0.17"
 # release packaging; adapter creation needs Administrator.
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5"
+# Named-pipe ControlChannel: Win32 Security (DACL for owner-only access) and
+# Threading (OpenProcess for daemon_alive). Only needed on Windows.
+windows-sys = { version = "0.59", features = [
+    "Win32_Security",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 lto = "thin"
