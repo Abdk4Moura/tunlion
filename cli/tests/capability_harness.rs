@@ -596,7 +596,6 @@ fn pty_one_shot_exec_smoke() {
             break;
         }
 
-        #[cfg(target_os = "macos")]
         if attempt < 4 {
             eprintln!("pty attempt {attempt} failed, retrying after settle...");
             std::thread::sleep(Duration::from_secs(5));
@@ -774,14 +773,13 @@ fn shell_daemon_live_pairing_no_restart() {
         let ok = pty_stdout.contains(&nonce) || pty_stderr.contains(&nonce);
         eprintln!("live-pty attempt {attempt}: ok={ok} stdout: {pty_stdout}");
         if !ok {
-            eprintln!("live-pty attempt {attempt} stderr: {pty_stderr}");
+        eprintln!("live-pty attempt {attempt} stderr: {pty_stderr}");
         }
 
         if ok {
             break;
         }
 
-        #[cfg(target_os = "macos")]
         if attempt < 4 {
             eprintln!("live-pty attempt {attempt} failed, retrying after settle...");
             std::thread::sleep(Duration::from_secs(5));
@@ -790,7 +788,7 @@ fn shell_daemon_live_pairing_no_restart() {
 
         assert!(
             ok,
-            "live-pairing pty failed — daemon did not discover the newly paired device after {attempt} attempt(s)\n\
+            "live-pairing pty failed after {attempt} attempt(s) — daemon did not discover the newly paired device\n\
              nonce: {nonce}\nstdout: {pty_stdout}\nstderr: {pty_stderr}"
         );
         break;
