@@ -13,6 +13,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const CODE_WORD: &str = "gigantic-element-tango";
@@ -52,6 +53,8 @@ struct Harness {
     backend_port: u16,
     daemon_a: Option<Child>,
     daemon_b: Option<Child>,
+    daemon_a_log: Arc<Mutex<Vec<String>>>,
+    daemon_b_log: Arc<Mutex<Vec<String>>>,
     work_dir: PathBuf,
     a_dir: PathBuf,
     b_dir: PathBuf,
@@ -150,6 +153,8 @@ impl Harness {
             backend_port: port,
             daemon_a: None,
             daemon_b: None,
+            daemon_a_log: Arc::new(Mutex::new(Vec::new())),
+            daemon_b_log: Arc::new(Mutex::new(Vec::new())),
             work_dir: work,
             a_dir,
             b_dir,
@@ -166,7 +171,7 @@ impl Harness {
         BIN.get_or_init(binary)
     }
 
-    fn spawn_daemon(&mut self, name: &str, config_dir: &Path) -> Child {
+    fn spawn_daemon(&mut self, name: &str, config_dir: &Path) -> (Child, Arc<Mutex<Vec<String>>>) {
         let bin = self.filament_bin().to_path_buf();
         let server = self.server_url();
         spawn_daemon_inner(&bin, &server, name, config_dir)
@@ -179,8 +184,12 @@ impl Harness {
         let bin = self.filament_bin().to_path_buf();
         let server = self.server_url();
 
-        self.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir));
-        self.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir));
+        let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &self.a_dir);
+        let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &self.b_dir);
+        self.daemon_a = Some(child_a);
+        self.daemon_b = Some(child_b);
+        self.daemon_a_log = log_a;
+        self.daemon_b_log = log_b;
         std::thread::sleep(Duration::from_secs(8));
     }
 
@@ -191,11 +200,14 @@ fn spawn_daemon_inner(
     server: &str,
     name: &str,
     config_dir: &Path,
-) -> Child {
+) -> (Child, Arc<Mutex<Vec<String>>>) {
     std::fs::create_dir_all(config_dir).expect("create config dir");
+    let stderr_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = stderr_log.clone();
     let mut child = Command::new(bin)
         .env("FILAMENT_CONFIG_DIR", config_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_LOG", "debug")
         .env(
         "FILAMENT_DIRECT_LOOPBACK_ONLY",
         std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
@@ -220,7 +232,12 @@ fn spawn_daemon_inner(
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
-                if let Ok(l) = line { eprintln!("[{label1} stderr] {l}"); }
+                if let Ok(l) = line {
+                    eprintln!("[{label1} stderr] {l}");
+                    if let Ok(mut log) = log_clone.lock() {
+                        log.push(l);
+                    }
+                }
             }
         });
     }
@@ -231,7 +248,24 @@ fn spawn_daemon_inner(
             }
         });
     }
-    child
+    (child, stderr_log)
+}
+
+/// Poll stderr log for a line containing `needle`, up to `timeout`.
+/// Returns true if found, false on timeout.
+fn wait_for_line(log: &Arc<Mutex<Vec<String>>>, needle: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(lines) = log.lock() {
+            if lines.iter().any(|l| l.contains(needle)) {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn reqwest_blocking_head(url: &str) -> bool {
@@ -516,8 +550,12 @@ fn pty_one_shot_exec_smoke() {
         h.daemon_a = None;
         h.daemon_b = None;
         std::thread::sleep(Duration::from_secs(3));
-        h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
-        h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+        let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+        let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+        h.daemon_a = Some(child_a);
+        h.daemon_b = Some(child_b);
+        h.daemon_a_log = log_a;
+        h.daemon_b_log = log_b;
         std::thread::sleep(Duration::from_secs(12));
     }
     #[cfg(not(target_os = "macos"))]
@@ -581,8 +619,12 @@ fn shell_daemon_live_pairing_no_restart() {
 
     // Start BOTH daemons with --shell, NO prior pairing.
     // spawn_daemon_inner uses --shell, so the guard at 8381 must let them live.
-    h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
-    h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_b = Some(child_b);
+    h.daemon_a_log = log_a;
+    h.daemon_b_log = log_b;
     std::thread::sleep(Duration::from_secs(4));
 
     // Assertion 1: both daemons survived the empty-devices startup.
@@ -674,8 +716,12 @@ fn shell_daemon_live_pairing_no_restart() {
         h.daemon_a = None;
         h.daemon_b = None;
         std::thread::sleep(Duration::from_secs(3));
-        h.daemon_a = Some(spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir));
-        h.daemon_b = Some(spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir));
+        let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+        let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+        h.daemon_a = Some(child_a);
+        h.daemon_b = Some(child_b);
+        h.daemon_a_log = log_a;
+        h.daemon_b_log = log_b;
         std::thread::sleep(Duration::from_secs(12));
     }
     #[cfg(not(target_os = "macos"))]
@@ -707,5 +753,251 @@ fn shell_daemon_live_pairing_no_restart() {
         "live-pairing pty failed — daemon did not discover the newly paired device\n\
          nonce: {nonce}\nstdout: {pty_stdout}\nstderr: {pty_stderr}"
     );
+}
+
+// ------------------------------------------------- warm-all integration test ---
+
+/// Proves: "no cold establish when a peer is online and the daemon is up".
+/// Uses `filament ping --json` which returns `"warm": true` from the daemon's
+/// own warm-link resolver — a trace-grade proof independent of timing.
+#[test]
+fn warm_all_makes_first_contact_warm() {
+    #[cfg(windows)]
+    {
+        eprintln!("warm_all_makes_first_contact_warm: skipped on Windows");
+        return;
+    }
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    // Phase 1: Pair the daemons (same flow as pty_one_shot_exec_smoke).
+    h.pair_daemons();
+    eprintln!("warm_all: daemons started");
+
+    let pair_word = format!("warmtest-mesh-p{:x}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-a")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_lower = pair_word.to_lowercase();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[pair-create] {line}");
+            if line.to_lowercase().contains(&pair_word_lower) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("pair create did not mint a code within 60s");
+    eprintln!("pair code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-b")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("pair-claim stdout: {}", String::from_utf8_lossy(&claim_out.stdout));
+    eprintln!("pair-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("pair-create exit: {}", create_out.status);
+
+    // Phase 2: Restart daemons so they come up with each other as known devices.
+    // Stock config: no tun-addr, no warm-peers, no FILAMENT_AUTO_WARM override.
+    eprintln!("warm_all: restarting daemons with stock config");
+    if let Some(ref mut c) = h.daemon_a { let _ = c.kill(); let _ = c.wait(); }
+    if let Some(ref mut c) = h.daemon_b { let _ = c.kill(); let _ = c.wait(); }
+    h.daemon_a = None;
+    h.daemon_b = None;
+    std::thread::sleep(Duration::from_secs(3));
+
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_b = Some(child_b);
+    h.daemon_a_log = log_a;
+    h.daemon_b_log = log_b;
+
+    // Assertion 1: WARM-HOLD ADOPTED THE PEER (trace)
+    eprintln!("warm_all: waiting for auto-warming line...");
+    let adopted = wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: auto-warming peer 'test-b'",
+        Duration::from_secs(60),
+    );
+    assert!(
+        adopted,
+        "warm-hold did not auto-warm peer 'test-b' within 60s — \
+         the auto-warm setting may not be defaulting to ON"
+    );
+
+    // Assertion 2: THE LINK IS HELD (trace)
+    eprintln!("warm_all: waiting for link to be established...");
+    let link_held = wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: established connection to 'test-b'",
+        Duration::from_secs(60),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "known device 'test-b' appeared, connecting",
+        Duration::from_secs(0), // already should have seen it
+    );
+    assert!(
+        link_held,
+        "warm-hold did not establish a link to 'test-b' within 60s"
+    );
+
+    // Assertion 3: FIRST CONTACT TAKES THE WARM PATH
+    eprintln!("warm_all: running filament ping --json...");
+    let mut ping_proc = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "--json", "ping", "test-b"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ping");
+    let ping_out = ping_proc.wait_with_output().expect("ping result");
+    let ping_stdout = String::from_utf8_lossy(&ping_out.stdout);
+    let ping_stderr = String::from_utf8_lossy(&ping_out.stderr);
+    eprintln!("warm_all ping stdout: {ping_stdout}");
+    eprintln!("warm_all ping stderr: {ping_stderr}");
+
+    // Parse JSON and assert warm: true
+    let ping_json: serde_json::Value = serde_json::from_str(&ping_stdout)
+        .expect("ping --json output is not valid JSON");
+    assert_eq!(ping_json["warm"], true, "first ping should be warm, got: {ping_json}");
+
+    // Assertion 4: NO COLD BANNER
+    assert!(
+        !ping_stderr.contains("still reaching"),
+        "ping output contains cold-establish banner 'still reaching'"
+    );
+
+    // Assertion 5: WARM HOLDS ACROSS IDLE (repeat after 20s)
+    eprintln!("warm_all: waiting 20s then re-pinging...");
+    std::thread::sleep(Duration::from_secs(20));
+    let mut ping_proc2 = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "--json", "ping", "test-b"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ping 2");
+    let ping_out2 = ping_proc2.wait_with_output().expect("ping 2 result");
+    let ping_stdout2 = String::from_utf8_lossy(&ping_out2.stdout);
+    eprintln!("warm_all ping2 stdout: {ping_stdout2}");
+    let ping_json2: serde_json::Value = serde_json::from_str(&ping_stdout2)
+        .expect("ping 2 --json output is not valid JSON");
+    assert_eq!(ping_json2["warm"], true, "second ping should still be warm, got: {ping_json2}");
+
+    // Phase 3: NEGATIVE CONTROL — auto-warm OFF
+    eprintln!("warm_all: testing negative control (auto-warm off)");
+    if let Some(ref mut c) = h.daemon_a { let _ = c.kill(); let _ = c.wait(); }
+    h.daemon_a = None;
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Spawn auto-warm-OFF daemon via custom Command (spawn_daemon_inner doesn't
+    // support FILAMENT_AUTO_WARM override).
+    let mut daemon_a_off = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_LOG", "debug")
+        .env("FILAMENT_AUTO_WARM", "0")
+        .env(
+            "FILAMENT_DIRECT_LOOPBACK_ONLY",
+            std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
+                .unwrap_or_else(|_| "1".into()),
+        )
+        .env("FILAMENT_NAME", "test-a")
+        .arg("up")
+        .arg("--userspace")
+        .arg("--shell")
+        .arg("--server")
+        .arg(&server)
+        .arg("--relay")
+        .arg("--dir")
+        .arg(h.a_dir.join("drops").to_str().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon a (auto-warm off)");
+    let log_a_off: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_a_off_clone = log_a_off.clone();
+    if let Some(stderr) = daemon_a_off.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                if let Ok(l) = line {
+                    eprintln!("[daemon-a-off stderr] {l}");
+                    if let Ok(mut log) = log_a_off_clone.lock() {
+                        log.push(l);
+                    }
+                }
+            }
+        });
+    }
+    if let Some(stdout) = daemon_a_off.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if let Ok(l) = line { eprintln!("[daemon-a-off] {l}"); }
+            }
+        });
+    }
+    h.daemon_a = Some(daemon_a_off);
+
+    // Wait for 3 ticks (30s) — no auto-warming line should appear
+    std::thread::sleep(Duration::from_secs(35));
+    let auto_warm_line = wait_for_line(
+        &log_a_off,
+        "warm-hold: auto-warming",
+        Duration::from_secs(0),
+    );
+    assert!(
+        !auto_warm_line,
+        "auto-warm OFF: daemon should NOT emit 'auto-warming' line"
+    );
+
+    eprintln!("warm_all: all assertions passed ✓");
 }
 

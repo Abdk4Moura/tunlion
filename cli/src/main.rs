@@ -2984,14 +2984,31 @@ struct RejoinState {
 const WARM_RECENT_CAP: usize = 5;
 const WARM_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const WARM_DORMANT_THRESHOLD: u32 = 5;
+/// A dormant peer is retried this often (instead of never). Presence re-announce
+/// still resumes it immediately; this is the floor for a peer whose announces we
+/// keep missing.
+const WARM_DORMANT_RETRY: Duration = Duration::from_secs(300);
+
+/// Auto-warm size guard: warm at most this many roster peers (see `warm-max`).
+/// Must stay under MAX_LINKS (16) so warm-all can never starve on-demand,
+/// inbound, or upgrade-probe links of link-table slots.
+fn warm_max() -> usize {
+    settings::get_str("warm-max", None)
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(12)
+        .min(MAX_LINKS - 2)
+}
 
 #[derive(Default)]
 struct WarmHold {
     /// Explicitly configured peers (from `warm-peers` setting)
     configured: std::collections::HashSet<String>,
-    /// Peers warmed by L3 overlay being up (all paired peers when L3 enabled).
-    /// UNBOUNDED - not capped like recent LRU.
-    l3: std::collections::HashSet<String>,
+    /// AUTO-WARM tier: ALL online paired peers (from the live roster), synced each
+    /// warm_hold_tick. ON by default (`auto-warm` setting); also forced on while the
+    /// L3 overlay is up (L3 needs live links to route). Bounded by `warm-max`
+    /// (Change 4), not by the recent LRU cap.
+    auto: std::collections::HashSet<String>,
     /// Recently-used peers in LRU order (most recent at back, capped at 5)
     recent: std::collections::VecDeque<String>,
     /// Per-peer last-use timestamp
@@ -3065,12 +3082,12 @@ impl WarmHold {
         }
     }
 
-    /// Check if a peer should be connected (configured OR l3 OR recently used, not dormant)
+    /// Check if a peer should be connected (configured OR auto OR recently used, not dormant)
     fn should_connect(&self, peer: &str) -> bool {
         if self.configured.contains(peer) {
             return true;
         }
-        if self.l3.contains(peer) {
+        if self.auto.contains(peer) {
             return true;
         }
         if self.recent.contains(&peer.to_string()) {
@@ -3086,8 +3103,8 @@ impl WarmHold {
     /// Get all peers that should be connected
     fn peers_to_connect(&self) -> Vec<String> {
         let mut peers: Vec<String> = self.configured.iter().cloned().collect();
-        // Add L3 peers (unbounded)
-        for p in &self.l3 {
+        // Add auto-warm peers (all online paired peers)
+        for p in &self.auto {
             if !peers.contains(p) {
                 peers.push(p.clone());
             }
@@ -3110,6 +3127,23 @@ impl WarmHold {
     /// Check if a peer is dormant (too many failures)
     fn is_dormant(&self, peer: &str) -> bool {
         self.backoff.get(peer).map(|b| b.dormant).unwrap_or(false)
+    }
+
+    /// Is this peer due for a (re)connect attempt this tick? Dormant peers get one
+    /// probe per WARM_DORMANT_RETRY; non-dormant peers honor their exponential
+    /// backoff window (duration since last_attempt).
+    fn due(&self, peer: &str) -> bool {
+        match self.backoff.get(peer) {
+            None => true,
+            Some(b) => {
+                let since = b.last_attempt.map(|t| t.elapsed());
+                if b.dormant {
+                    since.map_or(true, |d| d >= WARM_DORMANT_RETRY)
+                } else {
+                    since.map_or(true, |d| d >= b.duration)
+                }
+            }
+        }
     }
 
     /// Resume a dormant peer (e.g., when it reappears in signaling presence)
@@ -3137,7 +3171,7 @@ mod warm_hold_tests {
     #[test]
     fn should_connect_l3() {
         let mut wh = WarmHold::default();
-        wh.l3.insert("dovm".into());
+        wh.auto.insert("dovm".into());
         assert!(wh.should_connect("dovm"));
         assert!(!wh.should_connect("popos"));
     }
@@ -3196,11 +3230,11 @@ mod warm_hold_tests {
     }
 
     #[test]
-    fn l3_set_is_unbounded() {
+    fn auto_set_is_unbounded() {
         let mut wh = WarmHold::default();
-        // Add 10 peers to L3 set
+        // Add 10 peers to auto set
         for i in 0..10 {
-            wh.l3.insert(format!("peer{i}"));
+            wh.auto.insert(format!("peer{i}"));
         }
         // All 10 should be in peers_to_connect
         let peers = wh.peers_to_connect();
@@ -3210,13 +3244,13 @@ mod warm_hold_tests {
     }
 
     #[test]
-    fn l3_disabled_clears_set() {
+    fn auto_disabled_clears_set() {
         let mut wh = WarmHold::default();
-        wh.l3.insert("dovm".into());
-        wh.l3.insert("popos".into());
+        wh.auto.insert("dovm".into());
+        wh.auto.insert("popos".into());
         assert!(wh.should_connect("dovm"));
-        // Simulate L3 disabled
-        wh.l3.clear();
+        // Simulate auto-warm disabled
+        wh.auto.clear();
         assert!(!wh.should_connect("dovm"));
         assert!(!wh.should_connect("popos"));
     }
@@ -3281,16 +3315,41 @@ mod warm_hold_tests {
     #[test]
     fn warm_peer_allows_instant_connection() {
         let mut wh = WarmHold::default();
-        // Simulate a warm peer (configured + l3)
+        // Simulate a warm peer (configured + auto)
         wh.configured.insert("dovm".into());
-        wh.l3.insert("dovm".into());
+        wh.auto.insert("dovm".into());
         wh.note_use("dovm");
         // All paths should return true
         assert!(wh.should_connect("dovm"));
         assert!(!wh.is_dormant("dovm"));
         // Peer is in warm sets
         assert!(wh.configured.contains("dovm"));
-        assert!(wh.l3.contains("dovm"));
+        assert!(wh.auto.contains("dovm"));
+    }
+
+    #[test]
+    fn due_respects_backoff_window() {
+        let mut wh = WarmHold::default();
+        // No backoff entry -> always due
+        assert!(wh.due("unknown"));
+        // After one failure, not due until backoff window passes
+        wh.note_failure("dovm");
+        assert!(!wh.due("dovm")); // 1s window, just failed
+    }
+
+    #[test]
+    fn dormant_peer_retries_after_interval() {
+        let mut wh = WarmHold::default();
+        // Make peer dormant
+        for _ in 0..WARM_DORMANT_THRESHOLD {
+            wh.note_failure("dovm");
+        }
+        assert!(wh.is_dormant("dovm"));
+        // Not due immediately
+        assert!(!wh.due("dovm"));
+        // After WARM_DORMANT_RETRY, would be due (can't easily test Instant::elapsed
+        // without injecting time, so just verify the dormant flag is set)
+        assert!(wh.backoff["dovm"].dormant);
     }
 }
 
@@ -3735,30 +3794,39 @@ impl Conn {
     /// Check for warm peers that need connections and establish them.
     /// Called periodically from the daemon event loop. Returns the list of
     /// peers we attempted to connect to.
-    async fn warm_hold_tick(&mut self, l3_enabled: bool) -> Vec<String> {
+    ///
+    /// `auto_warm`: sync the auto tier (ALL online paired peers) from the roster.
+    /// Default ON (`auto-warm` setting); forced on while L3 is up. When off, the
+    /// auto tier is cleared and only configured + recent peers stay warm.
+    async fn warm_hold_tick(&mut self, auto_warm: bool) -> Vec<String> {
         // Reload configured peers from settings to stay in sync
         self.load_warm_peers_config();
-        // L3 auto-warm: when L3 is enabled, auto-warm ALL online paired peers
-        // via the unbounded l3 set (NOT recent LRU which is capped at 5)
-        if l3_enabled {
-            let current_l3: std::collections::HashSet<String> = self.roster.values()
+        if auto_warm {
+            let mut online: Vec<(String, Option<Instant>)> = self.roster.values()
                 .filter_map(|v| v["name"].as_str())
-                .map(|s| s.to_string())
+                .map(|s| (s.to_string(), self.warm_hold.last_use.get(s).copied()))
                 .collect();
-            // Add new peers to L3 set
-            for name in &current_l3 {
-                if !self.warm_hold.l3.contains(name) {
-                    self.warm_hold.l3.insert(name.clone());
-                    ui::debug(&format!("warm-hold: L3 auto-warming peer '{name}'"));
+            // Change 4 size guard: over warm-max, keep the most recently USED peers
+            // warm (never-used peers rank last; name tie-break keeps it deterministic).
+            let cap = warm_max();
+            if online.len() > cap {
+                online.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                online.truncate(cap);
+            }
+            let current: std::collections::HashSet<String> =
+                online.into_iter().map(|(n, _)| n).collect();
+            for name in &current {
+                if !self.warm_hold.auto.contains(name) {
+                    self.warm_hold.auto.insert(name.clone());
+                    ui::debug(&format!("warm-hold: auto-warming peer '{name}'"));
                 }
             }
-            // Remove peers no longer in roster
-            self.warm_hold.l3.retain(|name| current_l3.contains(name));
+            // Drop peers that went offline (or fell over the warm-max recency cut)
+            self.warm_hold.auto.retain(|name| current.contains(name));
         } else {
-            // L3 disabled: clear all L3-warmed peers
-            if !self.warm_hold.l3.is_empty() {
-                ui::debug("warm-hold: L3 disabled, clearing L3 warm set");
-                self.warm_hold.l3.clear();
+            if !self.warm_hold.auto.is_empty() {
+                ui::debug("warm-hold: auto-warm off, clearing auto tier");
+                self.warm_hold.auto.clear();
             }
         }
         let mut connected = Vec::new();
@@ -3771,8 +3839,9 @@ impl Conn {
             }) {
                 continue;
             }
-            // Skip if dormant (too many failures)
-            if self.warm_hold.is_dormant(&peer) {
+            // Honor per-peer backoff; a dormant peer still gets one probe per
+            // WARM_DORMANT_RETRY so an online-but-unlucky peer cannot stay cold forever.
+            if !self.warm_hold.due(&peer) {
                 continue;
             }
             // Find peer info from roster
@@ -5854,9 +5923,11 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
 /// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
 /// link would open a stream into a black hole and hang. So past this idle window
 /// we refuse to warm-reuse a non-direct link and fall back to a fresh establish
-/// (correct, just not free). Direct links are exempt: the 7s keepalive keeps them
+/// (correct, just not free). Direct links are exempt: the 5s keepalive keeps them
 /// genuinely alive across idle gaps, and their `idle_ms()` is unreliable here
 /// anyway (quinn keepalive frames don't stamp last_activity).
+/// The net.rs 5s relay keepalive keeps idle_ms under this gate on healthy links;
+/// tripping it means the keepalive stopped, so a fresh establish is the right answer.
 const WARM_RELAY_STALE_MS: u64 = 8_000;
 
 #[cfg(unix)]
@@ -9222,8 +9293,10 @@ async fn recv_cmd(
         // so `filament ping`/`ssh` is instant. Runs every 10s, daemon-only.
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
-            let l3_enabled = l3.is_some();
-            let _ = conn.warm_hold_tick(l3_enabled).await;
+            // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
+            // the overlay routes over these links, opting out must not break L3.
+            let auto_warm = l3.is_some() || settings::get_bool("auto-warm", None);
+            let _ = conn.warm_hold_tick(auto_warm).await;
         }
 
         // C12 live-pairing: pick up devices paired AFTER we started (a separate
@@ -9609,11 +9682,24 @@ async fn recv_cmd(
                 }
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    // WARM-HOLD: when a known peer appears, RESUME it if
-                    // dormant/configured (clear backoff so tick reconnects).
+                    // WARM-HOLD: a known peer just came online. Under auto-warm, adopt it
+                    // into the auto tier NOW (don't wait up to 10s for the tick) and clear
+                    // any dormancy/backoff so the reconnect loop owns it from t=0. The
+                    // start_direct/maybe_adopt below already dial immediately; this makes
+                    // warm-hold RETRY if that first dial fails or the link later drops.
                     // Do NOT add to recent-LRU (that's for ACTUAL use only).
+                    let auto_warm = l3.is_some() || settings::get_bool("auto-warm", None);
+                    if auto_warm {
+                        conn.warm_hold.auto.insert(n.clone());
+                    }
                     if conn.warm_hold.should_connect(n) {
                         conn.warm_hold.resume(n);
+                        // Pull the next warm tick forward: the event loop wakes at least every
+                        // 2s (next_ev timeout, :8957-8960), so a failed eager dial is retried
+                        // within ~2s instead of ~10s.
+                        last_warm_hold_tick = Instant::now()
+                            .checked_sub(Duration::from_secs(10))
+                            .unwrap_or_else(Instant::now);
                     }
                     // Only announce a FRESH connect. The server re-pushes the
                     // known-peer roster on every (re)subscribe and C30 sync tick, so

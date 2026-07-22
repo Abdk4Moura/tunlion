@@ -1819,7 +1819,7 @@ async fn wire_channel(
                 // Relay/DataChannel links have NO QUIC keepalive, so an idle one
                 // on a container/DERP path is silently evicted in ~10s, after which
                 // warm-reuse refuses it (the 8s staleness gate) and falls back to a
-                // slow cold establish. Send a tiny keepalive every 7s (under that
+                // slow cold establish. Send a tiny keepalive every 5s (under that
                 // window) so the path stays alive AND idle_ms stays low, keeping the
                 // link instantly warm-reusable across idle gaps. The peer ignores an
                 // unknown control type, and receiving it stamps ITS activity too, so
@@ -1831,7 +1831,7 @@ async fn wire_channel(
                     tokio::spawn(async move {
                         let frame = Bytes::from(json!({ "type": "ping", "reason": "keepalive" }).to_string());
                         loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             if dead_k.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }

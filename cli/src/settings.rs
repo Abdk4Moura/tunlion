@@ -244,6 +244,28 @@ pub fn registry() -> &'static [Setting] {
             daemon: true,
             help: "Peers to keep connected (comma-separated names). These stay warm for instant ssh/ping. Recently-used peers are also kept warm automatically (last 5).",
         },
+        Setting {
+            key: "auto-warm",
+            aliases: &["warm-all"],
+            store: "auto-warm",
+            kind: Kind::Bool,
+            default: "on",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_AUTO_WARM"),
+            daemon: true,
+            help: "Keep a live link to every online paired peer so ssh/pty/ping are instant (Tailscale-style). Turn off to connect on demand only. Capped by warm-max.",
+        },
+        Setting {
+            key: "warm-max",
+            aliases: &[],
+            store: "warm-max",
+            kind: Kind::Str,
+            default: "12",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_WARM_MAX"),
+            daemon: true,
+            help: "Auto-warm at most this many online peers (most recently used win). Others stay discoverable via signaling and connect on demand.",
+        },
     ];
     R
 }
