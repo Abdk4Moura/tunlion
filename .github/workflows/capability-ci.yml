@@ -62,9 +62,8 @@ jobs:
             cli/target/release/deps/
             cli/target/release/build/
             cli/target/release/libfilament_cli*
-          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-${{ github.run_id }}
+          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-
             ${{ runner.os }}-target-
 
       - name: Upload binary artifact
@@ -119,9 +118,8 @@ jobs:
             cli/target/release/deps/
             cli/target/release/build/
             cli/target/release/libfilament_cli*
-          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-${{ github.run_id }}
+          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}-
             ${{ runner.os }}-target-
 
       - name: Download binary artifact
@@ -172,6 +170,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
       - name: Assert test-hooks NOT in release build
         working-directory: cli
         run: |
