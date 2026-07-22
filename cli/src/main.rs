@@ -6254,7 +6254,9 @@ async fn main() -> Result<()> {
                     println!("  overlay:  {v6}{v4_str}");
                     println!("  mesh:     {name}.mesh");
                 }
-                println!("  caps:     {}", caps.join(", "));
+                // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
+                // (what THIS machine authorized the peer to do), NOT what the peer offers.
+                println!("  granted:  {}", caps.join(", "));
                 println!("  last see: {last_seen_str}");
             } else {
                 // Show this machine's address.
@@ -6362,8 +6364,11 @@ async fn main() -> Result<()> {
                         for (n, s) in all {
                             // Show the granted capability set so `grant shell` is
                             // visible here (v1 records read as [transfer]).
+                            // "granted" (not "caps") makes clear this is the LOCAL
+                            // GRANT RECORD (what THIS machine authorized), NOT what
+                            // the peer offers.
                             let caps = device_caps(&n).unwrap_or_else(|| vec!["transfer".to_string()]);
-                            println!("{n}  (channel {})  [{}]", &channel_of(&s)[..12], caps.join(", "));
+                            println!("{n}  (channel {})  granted: [{}]", &channel_of(&s)[..12], caps.join(", "));
                         }
                     }
                 }
