@@ -441,6 +441,75 @@ impl Progress {
     }
 }
 
+// ------------------------------------------------------------- table / align --
+
+/// A simple column-aligned table for status displays. Respects TTY/color gating.
+///
+/// Usage:
+/// ```
+/// let mut table = ui::Table::new(&["NAME", "ADDRESS", "LAST SEEN"]);
+/// table.row(&[&name, &addr, &last_seen]);
+/// table.print();
+/// ```
+pub struct Table {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    widths: Vec<usize>,
+}
+
+impl Table {
+    /// Create a new table with column headers.
+    pub fn new(headers: &[&str]) -> Self {
+        let widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+        Table {
+            headers: headers.iter().map(|s| s.to_string()).collect(),
+            rows: Vec::new(),
+            widths,
+        }
+    }
+
+    /// Add a row to the table. Column widths auto-expand as needed.
+    pub fn row(&mut self, cells: &[&str]) {
+        let row: Vec<String> = cells.iter().map(|s| s.to_string()).collect();
+        for (i, cell) in row.iter().enumerate() {
+            if i < self.widths.len() {
+                self.widths[i] = self.widths[i].max(cell.len());
+            }
+        }
+        self.rows.push(row);
+    }
+
+    /// Format a single row with padded columns.
+    fn format_row(&self, cells: &[String], is_header: bool) -> String {
+        let mut parts = Vec::new();
+        for (i, cell) in cells.iter().enumerate() {
+            let width = self.widths.get(i).copied().unwrap_or(cell.len());
+            let padded = format!("{:<width$}", cell, width = width);
+            if is_header && caps().tty {
+                parts.push(paint(Tone::Dim, &padded));
+            } else {
+                parts.push(padded);
+            }
+        }
+        parts.join("  ")
+    }
+
+    /// Print the table to stdout.
+    pub fn print(&self) {
+        // Header
+        println!("{}", self.format_row(&self.headers, true));
+        // Rows
+        for row in &self.rows {
+            println!("{}", self.format_row(row, false));
+        }
+    }
+
+    /// Check if the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 // --------------------------------------------------------------------- QR --
 
 /// Render a QR code in half-height blocks (2 modules per char row). Empty

@@ -6328,7 +6328,7 @@ async fn main() -> Result<()> {
                 // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
                 // (what THIS machine authorized the peer to do), NOT what the peer offers.
                 println!("  granted:  {}", caps.join(", "));
-                println!("  last see: {last_seen_str}");
+                println!("  last seen: {last_seen_str}");
             } else {
                 // Show this machine's address.
                 let id = overlay::Identity::load_or_create()?;
@@ -6420,10 +6420,16 @@ async fn main() -> Result<()> {
                         let arr: Vec<Value> = all
                             .iter()
                             .map(|(n, s)| {
+                                let (last_seen, v6, v4) = devices_info(n).unwrap_or((0, None, None));
+                                let addr = v6.clone().or_else(|| v4.clone()).unwrap_or_default();
+                                let mesh = format!("{n}.mesh");
                                 json!({
                                     "name": n,
                                     "channel": channel_of(s),
                                     "caps": device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]),
+                                    "lastSeen": last_seen,
+                                    "address": addr,
+                                    "mesh": mesh,
                                 })
                             })
                             .collect();
@@ -6431,15 +6437,25 @@ async fn main() -> Result<()> {
                     } else {
                         if all.is_empty() {
                             println!("no known devices yet, run `filament pair` to add one");
-                        }
-                        for (n, s) in all {
-                            // Show the granted capability set so `grant shell` is
-                            // visible here (v1 records read as [transfer]).
-                            // "granted" (not "caps") makes clear this is the LOCAL
-                            // GRANT RECORD (what THIS machine authorized), NOT what
-                            // the peer offers.
-                            let caps = device_caps(&n).unwrap_or_else(|| vec!["transfer".to_string()]);
-                            println!("{n}  (channel {})  granted: [{}]", &channel_of(&s)[..12], caps.join(", "));
+                        } else {
+                            let mut table = ui::Table::new(&["NAME", "ADDRESS", "GRANTED", "LAST SEEN"]);
+                            for (n, _) in &all {
+                                let (last_seen, v6, v4) = devices_info(n).unwrap_or((0, None, None));
+                                let addr = v6.as_deref().or(v4.as_deref()).unwrap_or("-");
+                                let caps = device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]);
+                                let last_seen_str = if last_seen == 0 {
+                                    "never".to_string()
+                                } else {
+                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                                    let ago = now.saturating_sub(last_seen);
+                                    if ago < 60 { "just now".to_string() }
+                                    else if ago < 3600 { format!("{}m ago", ago / 60) }
+                                    else if ago < 86400 { format!("{}h ago", ago / 3600) }
+                                    else { format!("{}d ago", ago / 86400) }
+                                };
+                                table.row(&[n, addr, &caps.join(", "), &last_seen_str]);
+                            }
+                            table.print();
                         }
                     }
                 }
