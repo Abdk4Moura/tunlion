@@ -393,6 +393,17 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     }
 }
 
+/// Test-only wrapper around `dc_to_socket`. Exposes it for unit tests.
+#[cfg(test)]
+pub(crate) async fn dc_to_socket_for_test<W: AsyncWrite + Unpin>(
+    rx: mpsc::Receiver<PipeItem>,
+    wr: W,
+    first: Option<PipeItem>,
+    eof_signal: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<()> {
+    dc_to_socket(rx, wr, first, eof_signal).await
+}
+
 /// Test-only wrapper around `serve_stream`. Exposes it for integration tests
 /// that exercise the half-close / OOB eof path without a real daemon.
 #[cfg(test)]
