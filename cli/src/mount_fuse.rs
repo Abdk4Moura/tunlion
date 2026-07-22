@@ -20,7 +20,7 @@
 //     session runs inside `spawn_blocking` while the mux pump tasks keep draining
 //     the transport on the tokio runtime.
 
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -707,6 +707,16 @@ pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
         MountOption::FSName("filament".into()),
         MountOption::CUSTOM(format!("max_read={max_read}")),
     ];
+    // macOS-specific mount options for macFUSE.
+    #[cfg(target_os = "macos")]
+    {
+        cfg.mount_options.extend([
+            MountOption::CUSTOM("volname=Filament".into()),
+            MountOption::CUSTOM("local".into()),
+            MountOption::CUSTOM("noappledouble".into()),
+            MountOption::CUSTOM("daemon_timeout=60".into()),
+        ]);
+    }
     fuser::mount2(fs, mountpoint, &cfg)?;
     Ok(())
 }

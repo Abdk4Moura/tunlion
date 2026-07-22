@@ -28,6 +28,7 @@ test-hooks = []
 # Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.
+mount-macos = ["dep:fuser"]
 
 
 [dependencies]
@@ -100,6 +101,12 @@ libc = "0.2"
 # by mount-gates.sh.
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"
+
+# macOS mount client adapter: reuses the Linux FUSE adapter (fuser drives macFUSE).
+# OFF by default: requires macFUSE SDK at build time and the macFUSE kext at runtime.
+# CI cannot provision macFUSE on hosted macOS (needs interactive approval + reboot).
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", optional = true }
 
 
 
