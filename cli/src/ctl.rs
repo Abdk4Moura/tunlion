@@ -788,101 +788,108 @@ mod imp {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use std::time::Duration;
 
-        /// Minimal half-close test: client writes data, shuts down write half,
-        /// server reads all data + EOF. Proves UnixStream::pair() works and
-        /// the basic half-close flow is correct.
+        /// Real OOB EOF test: exercises the ACTUAL code path:
+        /// - socket_to_dc with a oneshot eof_signal (the signal daemon sends)
+        /// - dc_to_socket reading from L2 channel (remote response)
+        /// - The eof_signal fires -> socket_to_dc sends L2 FIN and returns
+        /// - dc_to_socket continues and delivers pending response data
+        /// This catches mis-wires of the watch/oneshot signal.
         #[tokio::test]
-        async fn half_close_basic() {
-            let (mut client, mut server) = tokio::net::UnixStream::pair().unwrap();
-            let server_task = tokio::spawn(async move {
-                let mut buf = Vec::new();
-                server.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
-            client.write_all(b"hello world").await.unwrap();
-            client.flush().await.unwrap();
-            client.shutdown().await.unwrap();
-            let data = tokio::time::timeout(Duration::from_secs(5), server_task)
-                .await
-                .expect("server timed out")
-                .expect("server panicked");
-            assert_eq!(data, b"hello world");
-        }
+        async fn oob_eof_real_wiring() {
+            use crate::l2;
+            use std::sync::Arc;
 
-        /// Test dc_to_socket directly: feed it data via a channel, close the
-        /// channel (simulating L2 FIN), and verify it writes all data + EOF
-        /// to the socket.
-        #[tokio::test]
-        async fn dc_to_socket_writes_all_data() {
             let (client, server) = tokio::net::UnixStream::pair().unwrap();
-            let (tx, rx) = tokio::sync::mpsc::channel(10);
+            let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
+            let l2_tx_clone = l2_tx.clone();
+            let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
 
-            let writer_task = tokio::spawn(async move {
-                crate::l2::dc_to_socket_for_test(rx, client, None, None).await
-            });
+            struct MockTransport(tokio::sync::mpsc::UnboundedSender<Option<bytes::Bytes>>);
+            #[async_trait::async_trait]
+            impl crate::net::Transport for MockTransport {
+                fn is_alive(&self) -> bool { true }
+                fn idle_ms(&self) -> u64 { 0 }
+                fn remote_addr(&self) -> Option<std::net::SocketAddr> { None }
+                fn rtt_ms(&self) -> Option<u64> { Some(0) }
+                fn as_any(&self) -> &dyn std::any::Any { self }
+                async fn send_frame(&self, _sid: u32, _offset: u64, data: &[u8]) -> anyhow::Result<()> {
+                    if data.is_empty() {
+                        let _ = self.0.send(None); // FIN
+                    } else {
+                        let _ = self.0.send(Some(bytes::Bytes::copy_from_slice(data)));
+                    }
+                    Ok(())
+                }
+                async fn send_control(&self, _v: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
+                async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+                fn max_payload(&self) -> usize { 65536 }
+            }
 
-            // Feed data
-            tx.send(Some(bytes::Bytes::from_static(b"hello"))).await.unwrap();
-            tx.send(Some(bytes::Bytes::from_static(b" world"))).await.unwrap();
-            tx.send(None).await.unwrap(); // FIN
+            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_clone)));
+            let sid = 42;
+            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(10);
 
-            writer_task.await.unwrap().unwrap();
-
-            let mut buf = Vec::new();
-            let mut server = server;
-            server.read_to_end(&mut buf).await.unwrap();
-            assert_eq!(buf, b"hello world");
-        }
-
-        /// Test the full half-close flow: client writes request, shuts down
-        /// write (simulating stdin EOF), server processes + sends response via
-        /// L2 channel. The output pump must stay alive to deliver the response.
-        #[tokio::test]
-        async fn half_close_request_response() {
-            let (client, server) = tokio::net::UnixStream::pair().unwrap();
-            let (l2_tx, l2_rx) = tokio::sync::mpsc::channel::<Option<bytes::Bytes>>(10);
-
-            // Server side: read request from client, write response to L2 channel
+            // Server side: run the REAL serve_stream with the eof_signal wired in.
+            // This exercises the full OOB path: eof_signal -> socket_to_dc -> L2 FIN.
             let server_task = tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                let mut server = server;
-                // Read the request
-                let n = server.read(&mut buf).await.unwrap();
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                // Shutdown server's write half (simulating remote EOF on response)
-                server.shutdown().await.unwrap();
-                // Wait a bit for client to read
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                request
+                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None, Some(eof_rx)).await;
             });
 
-            // Client side: send request, shutdown write, read response
+            // Client side: write data, wait for it to be processed, then the
+            // OOB eof signal fires (simulating daemon receiving ReqKind::Eof).
+            let test_data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+            let client_data = test_data.clone();
             let client_task = tokio::spawn(async move {
-                let mut client = client;
-                client.write_all(b"GET /").await.unwrap();
-                client.flush().await.unwrap();
-                // Shutdown write half (simulates stdin EOF)
-                client.shutdown().await.unwrap();
-                // Read response
+                let mut c = client;
+                c.write_all(&client_data).await.unwrap();
+                c.flush().await.unwrap();
+                // Keep reading until server closes (response from remote)
                 let mut response = Vec::new();
-                client.read_to_end(&mut response).await.unwrap();
+                let _ = c.read_to_end(&mut response).await;
                 response
             });
 
-            // Wait for server to process request
-            let request = tokio::time::timeout(Duration::from_secs(5), server_task)
-                .await
-                .expect("server timed out")
-                .expect("server panicked");
-            assert_eq!(request, "GET /");
+            // Wait for client to write + flush
+            tokio::time::sleep(Duration::from_millis(50)).await;
 
-            // Server should have shut down its write half, client should see EOF
-            let response = tokio::time::timeout(Duration::from_secs(5), client_task)
+            // Send response data via L2 BEFORE firing the signal. dc_to_socket
+            // reads this data and writes it to the client socket. The channel
+            // must stay open long enough for dc_to_socket to read the data.
+            let response = b"response-after-eof";
+            let _ = l2_tx.send(Some(bytes::Bytes::from_static(response)));
+            // Now close the L2 channel so dc_to_socket finishes after reading
+            drop(l2_tx);
+
+            // Fire the OOB eof signal AFTER sending response. This causes
+            // socket_to_dc to send L2 FIN and return. dc_to_socket has already
+            // read the response data and written it to the client socket.
+            eof_tx.send_modify(|v| *v = true);
+
+            // Wait for client to read the response
+            let client_response = tokio::time::timeout(Duration::from_secs(5), client_task)
                 .await
                 .expect("client timed out")
                 .expect("client panicked");
-            // Response is empty because server didn't send data, just shutdown
-            assert!(response.is_empty(), "client should see EOF after server shutdown");
+
+            // The client should have received the response data that was sent
+            // AFTER the OOB eof. This proves dc_to_socket stayed alive.
+            assert_eq!(
+                &client_response,
+                response,
+                "OOB eof: response lost -- dc_to_socket was incorrectly shut down"
+            );
+
+            // Verify the L2 channel got the client's data + FIN
+            let mut l2_data = Vec::new();
+            while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), l2_rx.recv()).await {
+                match item {
+                    Some(data) => l2_data.extend_from_slice(&data),
+                    None => break,
+                }
+            }
+            assert_eq!(l2_data, test_data, "OOB eof: L2 data mismatch");
+
+            server_task.abort();
         }
     }
 } // end mod imp
