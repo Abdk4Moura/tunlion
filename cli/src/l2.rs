@@ -1151,8 +1151,12 @@ async fn bring_up_to_known(
                 // Item 3: also start a DIRECT-QUIC attempt racing the WebRTC
                 // dial. Bind once, advertise to whichever candidate is current
                 // (mirrors `start_direct`); the peer's own offer drives the
-                // race (handled in Ev::Signal below).
-                if !direct_racing {
+                // race (handled in Ev::Signal below). Gated on
+                // `direct_enabled()`: when FILAMENT_DIRECT=0 (e.g. macOS
+                // hyperkit CI), the L2 establish skips direct-quic and uses
+                // WebRTC with srflx/relay candidates, exercising the relay
+                // fallback that real users get.
+                if !direct_racing && crate::direct::direct_enabled() {
                     if endpoint.is_none() {
                         match crate::direct::bind_endpoint() {
                             Ok((ep, port)) => {
@@ -3352,7 +3356,7 @@ pub(crate) struct PeerSshInfo {
 /// Returns `PeerSshInfo` with everything needed to spawn sshfs/rsync/ssh.
 pub(crate) async fn ensure_peer_bootstrap(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("filament-{peer}");
+    let _host = format!("filament-{peer}");
     let rport: u16 =
         std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
 
