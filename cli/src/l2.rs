@@ -1872,7 +1872,34 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
             return pump_stdio_over(sock).await;
         }
     }
-    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, "init").await?;
+    // Bound the connect so an unreachable peer fails with a clear message
+    // instead of hanging forever. Override with FILAMENT_CONNECT_SECS.
+    let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(45);
+    let (t, rx, guard, mut diag) = match tokio::time::timeout(
+        std::time::Duration::from_secs(connect_secs),
+        bring_up_to_known(server, peer, relay, "init"),
+    )
+    .await
+    {
+        Ok(inner) => inner?,
+        Err(_) => {
+            crate::ui::problem(
+                &format!("filament netcat: can't reach '{peer}'"),
+                &format!(
+                    "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
+                ),
+                &[
+                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
+                    format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
+                ],
+            );
+            std::process::exit(1);
+        }
+    };
     guard.forget(); // long-lived tunnel, keep the link alive for the process
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
@@ -2035,7 +2062,24 @@ async fn pty_attach_once(
     stdin_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     pending: &mut Option<Vec<u8>>,
 ) -> Result<PtyOutcome> {
-    let (t, rx, guard, mut diag) = bring_up_to_known(server, peer, relay, role).await?;
+    // Bound the connect so an unreachable peer fails with a clear message
+    // instead of hanging forever. Override with FILAMENT_CONNECT_SECS.
+    let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(45);
+    let (t, rx, guard, mut diag) = match tokio::time::timeout(
+        std::time::Duration::from_secs(connect_secs),
+        bring_up_to_known(server, peer, relay, role),
+    )
+    .await
+    {
+        Ok(inner) => inner?,
+        Err(_) => {
+            bail!("connect timeout: couldn't reach '{peer}' in {connect_secs}s");
+        }
+    };
     guard.forget();
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
@@ -2308,7 +2352,22 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // warm session just ended, a failed reattach should RETRY (the mesh
                 // may be mid-repair) until the reaper window, not bail.
                 if !ever_connected && !warm_ended {
-                    return Err(e);
+                    let connect_secs: u64 = std::env::var("FILAMENT_CONNECT_SECS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .filter(|n| *n > 0)
+                        .unwrap_or(45);
+                    crate::ui::problem(
+                        &format!("filament pty: can't reach '{peer}'"),
+                        &format!(
+                            "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
+                        ),
+                        &[
+                            format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
+                            format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
+                        ],
+                    );
+                    std::process::exit(1);
                 }
                 // A reconnect attempt failed. Keep trying until the acceptor would
                 // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);
