@@ -859,36 +859,26 @@ fn warm_all_makes_first_contact_warm() {
     h.daemon_a_log = log_a;
     h.daemon_b_log = log_b;
 
-    // Assertion 1: WARM-HOLD ADOPTED THE PEER (trace)
-    eprintln!("warm_all: waiting for auto-warming line...");
-    let adopted = wait_for_line(
-        &h.daemon_a_log,
-        "warm-hold: auto-warming peer 'test-b'",
-        Duration::from_secs(60),
-    );
-    assert!(
-        adopted,
-        "warm-hold did not auto-warm peer 'test-b' within 60s — \
-         the auto-warm setting may not be defaulting to ON"
-    );
-
-    // Assertion 2: THE LINK IS HELD (trace)
-    eprintln!("warm_all: waiting for link to be established...");
+    // Assertion 1: WARM-HOLD ESTABLISHED THE LINK PROACTIVELY
+    // The "established connection" trace reliably fires when the daemon's
+    // warm-hold tick has connected to the peer — no user-initiated connect,
+    // no ping to trigger it. The "auto-warming" trace is a conditional debug
+    // line (only fires when the peer is added to the auto set during the
+    // tick, which can be skipped if roster sync populates it earlier), so
+    // we assert on the "established" reliability marker instead.
+    eprintln!("warm_all: waiting for warm-hold to establish the link...");
     let link_held = wait_for_line(
         &h.daemon_a_log,
         "warm-hold: established connection to 'test-b'",
         Duration::from_secs(60),
-    ) || wait_for_line(
-        &h.daemon_a_log,
-        "known device 'test-b' appeared, connecting",
-        Duration::from_secs(0), // already should have seen it
     );
     assert!(
         link_held,
-        "warm-hold did not establish a link to 'test-b' within 60s"
+        "warm-hold did not establish a link to 'test-b' within 60s — \
+         the auto-warm setting may not be defaulting to ON"
     );
 
-    // Assertion 3: FIRST CONTACT TAKES THE WARM PATH
+    // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
     eprintln!("warm_all: running filament ping --json...");
     let mut ping_proc = Command::new(&bin)
         .env("FILAMENT_DIRECT", &direct_flag)
@@ -911,7 +901,7 @@ fn warm_all_makes_first_contact_warm() {
         .expect("ping --json output is not valid JSON");
     assert_eq!(ping_json["warm"], true, "first ping should be warm, got: {ping_json}");
 
-    // Assertion 4: NO COLD BANNER
+    // Assertion 3: NO COLD BANNER
     assert!(
         !ping_stderr.contains("still reaching"),
         "ping output contains cold-establish banner 'still reaching'"
