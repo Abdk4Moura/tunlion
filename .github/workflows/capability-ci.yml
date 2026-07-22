@@ -8,6 +8,16 @@
 # "Green" = this CI is green on ALL three OSes, read from `gh pr checks`,
 # NOT a local `cargo test` on Linux. This CI exists because local-Linux-green
 # has repeatedly masked Windows-red.
+#
+# Build + smoke run in ONE job per OS. They used to be split (a `build` job that
+# uploaded a binary artifact, and a `smoke` job that re-downloaded it), but
+# `cargo test` re-unifies features across the harness dev-dependencies, so the
+# smoke job rebuilt most of the graph anyway (~2.5 min) and the cross-job target
+# cache restore invalidated fingerprints on top. The split paid for a whole
+# extra runner plus an artifact round-trip and saved nothing. Building then
+# testing in the SAME target dir keeps fingerprints valid, so the test step only
+# compiles the harness delta. sccache (GHA backend, shared across workflows)
+# still de-dupes the heavy shared-flag dependency compiles with test.yml.
 
 name: Capability CI
 
@@ -34,73 +44,10 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Build filament (test-hooks)
-        working-directory: cli
-        run: cargo build --features test-hooks --release
-        env:
-          RUST_MIN_STACK: 8388608
-          CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
-          CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
-          CC: ${{ runner.os != 'Windows' && 'sccache cc' || '' }}
-          CXX: ${{ runner.os != 'Windows' && 'sccache c++' || '' }}
-
-      - name: Codesign binary (macOS)
-        if: runner.os == 'macOS'
-        run: codesign --force --sign - cli/target/release/filament
-
-      - name: Cache target dir (deps + fingerprints)
-        uses: actions/cache@v4
-        with:
-          path: |
-            cli/target/release/.fingerprint/
-            cli/target/release/deps/
-            cli/target/release/build/
-            cli/target/release/libfilament_cli*
-          key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: filament-${{ runner.os }}
-          path: cli/target/release/filament${{ runner.os == 'Windows' && '.exe' || '' }}
-          if-no-files-found: error
-
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
   capability-smoke:
     name: smoke (${{ matrix.os }})
-    needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     # #26 (resolved): macOS ARM64 required check. The root cause was webrtc-rs
     # gathering ZERO loopback host candidates on ARM64 macOS. With the
     # loopback-only filter enabled, only unusable srflx candidates remained and
@@ -125,7 +72,7 @@ jobs:
       - name: Install Python deps
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 
-      - name: Restore cargo registry cache
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
@@ -136,7 +83,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Restore target dir cache
+      - name: Cache target dir (deps + fingerprints)
         uses: actions/cache@v4
         with:
           path: |
@@ -148,15 +95,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-
 
-      - name: Download binary artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: filament-${{ runner.os }}
-          path: cli/target/release/
+      - name: Build filament (test-hooks)
+        working-directory: cli
+        run: cargo build --features test-hooks --release
+        env:
+          RUST_MIN_STACK: 8388608
+          CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
+          CMAKE_CXX_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
+          CC: ${{ runner.os != 'Windows' && 'sccache cc' || '' }}
+          CXX: ${{ runner.os != 'Windows' && 'sccache c++' || '' }}
 
-      - name: Make binary executable (non-Windows)
-        if: runner.os != 'Windows'
-        run: chmod +x cli/target/release/filament
+      - name: Codesign binary (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - cli/target/release/filament
 
       - name: Run capability harness
         working-directory: cli
