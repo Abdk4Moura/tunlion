@@ -2742,7 +2742,10 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
 /// filament (warm via a local daemon, else a self-healing cold link); any other
 /// host is dialed directly, so the proxy is a drop-in that only diverts `.mesh`.
 /// Pure userspace: no CAP_NET_ADMIN, no sudo, works in containers.
-pub async fn proxy_cmd(server: &str, bind: &str, port: u16, relay: bool) -> Result<()> {
+///
+/// When `--http-port` is set, also runs an HTTP CONNECT proxy + PAC file endpoint
+/// on that port for browser/OS proxy config (Tailscale parity).
+pub async fn proxy_cmd(server: &str, bind: &str, port: u16, http_port: u16, relay: bool) -> Result<()> {
     let listener = match TcpListener::bind((bind, port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -2769,6 +2772,46 @@ pub async fn proxy_cmd(server: &str, bind: &str, port: u16, relay: bool) -> Resu
     // when the warm daemon path misses), mirroring `forward`'s cold manager.
     let cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // HTTP CONNECT proxy + PAC file endpoint (optional).
+    if http_port > 0 {
+        let http_listener = match TcpListener::bind((bind, http_port)).await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                bail!("filament: {bind}:{http_port} is already in use; pick another with --http-port");
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!("filament: failed to bind {bind}:{http_port}")));
+            }
+        };
+        crate::ui::say(&format!("filament: HTTP CONNECT proxy on {bind}:{http_port}"));
+        crate::ui::say(&format!(
+            "  PAC file: http://127.0.0.1:{http_port}/proxy.pac"
+        ));
+        crate::ui::say(&format!(
+            "  e.g.  curl -x http://127.0.0.1:{http_port} https://<peer>.mesh"
+        ));
+        let cold_http = cold.clone();
+        let server_http = server.to_string();
+        tokio::spawn(async move {
+            loop {
+                let sock = match http_listener.accept().await {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        crate::ui::status(&format!("filament: HTTP accept paused ({e}), retrying..."));
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                };
+                let _ = sock.set_nodelay(true);
+                let (server, cold) = (server_http.clone(), cold_http.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = handle_http(sock, &server, port, relay, cold).await {
+                        crate::ui::debug(&format!("filament: HTTP proxy connection ended: {e}"));
+                    }
+                });
+            }
+        });
+    }
     loop {
         let sock = match listener.accept().await {
             Ok((s, _)) => s,
@@ -2905,6 +2948,130 @@ async fn handle_socks(
                 }
             }
         }
+    }
+}
+
+/// Handle one HTTP CONNECT client or PAC file request. Reads the HTTP request,
+/// routes CONNECT through the mesh, or serves the PAC file for browser config.
+async fn handle_http(
+    mut sock: TcpStream,
+    server: &str,
+    socks_port: u16,
+    relay: bool,
+    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+) -> Result<()> {
+    // Read the HTTP request line + headers until empty line.
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1];
+    loop {
+        sock.read_exact(&mut tmp).await?;
+        buf.push(tmp[0]);
+        // Check for \r\n\r\n (end of headers).
+        if buf.len() >= 4 && &buf[buf.len()-4..] == b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 8192 {
+            bail!("HTTP request too large");
+        }
+    }
+    let request = String::from_utf8_lossy(&buf);
+    let first_line = request.lines().next().unwrap_or("");
+
+    // Parse: METHOD PATH HTTP/1.x
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        // HTTP CONNECT proxy: CONNECT host:port HTTP/1.1
+        let host_port = path;
+        let (host, dport) = if let Some(colon) = host_port.rfind(':') {
+            let h = &host_port[..colon];
+            let p: u16 = host_port[colon+1..].parse().unwrap_or(0);
+            (h.to_string(), p)
+        } else {
+            (host_port.to_string(), 80)
+        };
+
+        match host.strip_suffix(".mesh") {
+            Some(peer) => {
+                let peer = peer.to_string();
+                // Warm path: ride the local daemon's live mesh link.
+                #[cfg(unix)]
+                if crate::ctl::daemon_present().await {
+                    if let Some(usock) = crate::ctl::try_open(&peer, dport).await {
+                        let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        return bridge_streams(sock, usock).await.map_err(Into::into);
+                    }
+                    if let Some(usock) = crate::ctl::try_dial(&peer, dport).await {
+                        let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        return bridge_streams(sock, usock).await.map_err(Into::into);
+                    }
+                }
+                // Cold fallback.
+                let rx = {
+                    let mut map = cold.lock().await;
+                    if let Some(rx) = map.get(&peer) {
+                        rx.clone()
+                    } else {
+                        let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
+                        let (s, pr) = (server.to_string(), peer.clone());
+                        tokio::spawn(async move { manage_cold_link(s, pr, relay, tx).await });
+                        map.insert(peer.clone(), rx.clone());
+                        rx
+                    }
+                };
+                let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                serve_cold_connection(rx, sock, dport, peer).await;
+                Ok(())
+            }
+            None => {
+                // Not a mesh name: dial directly.
+                match TcpStream::connect((host.as_str(), dport)).await {
+                    Ok(mut up) => {
+                        let _ = up.set_nodelay(true);
+                        let _ = sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+                        let _ = tokio::io::copy_bidirectional(&mut sock, &mut up).await;
+                        Ok(())
+                    }
+                    Err(_) => {
+                        let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                        Ok(())
+                    }
+                }
+            }
+        }
+    } else if path == "/proxy.pac" || path == "/wpad.dat" {
+        // Serve PAC file for browser/OS proxy config.
+        let pac = format!(
+            r#"function FindProxyForURL(url, host) {{
+    if (dnsDomainIs(host, ".mesh") || shExpMatch(host, "*.mesh")) {{
+        return "SOCKS5 127.0.0.1:{socks_port}; DIRECT";
+    }}
+    return "DIRECT";
+}}
+"#
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/x-ns-proxy-autoconfig\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            pac.len(),
+            pac
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        Ok(())
+    } else {
+        // Unknown HTTP request: return 404.
+        let response = "HTTP/1.1 404 Not Found\r\n\
+                         Content-Length: 0\r\n\
+                         Connection: close\r\n\
+                         \r\n";
+        let _ = sock.write_all(response.as_bytes()).await;
+        Ok(())
     }
 }
 

@@ -820,6 +820,10 @@ enum Cmd {
         /// Address to bind (default: loopback only).
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// HTTP CONNECT proxy port (0 = disabled). Serves HTTP CONNECT tunnel
+        /// and PAC file at http://127.0.0.1:PORT/proxy.pac for browser config.
+        #[arg(long, default_value_t = 0)]
+        http_port: u16,
     },
     /// SSH into a known device over filament.
     ///
@@ -6546,7 +6550,7 @@ async fn main() -> Result<()> {
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
         Cmd::Unexpose { port } => { ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await },
-        Cmd::Proxy { port, bind } => l2::proxy_cmd(&server, &bind, port, relay).await,
+        Cmd::Proxy { port, bind, http_port } => l2::proxy_cmd(&server, &bind, port, http_port, relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
         Cmd::Doctor { device, watch, repeat, json } => {
