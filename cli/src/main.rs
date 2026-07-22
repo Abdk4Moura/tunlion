@@ -5625,8 +5625,8 @@ async fn handle_warm_req(
     _warm_ptys: &WarmPtys,
     _tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
-    _eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
-    _eof_senders: &mut HashMap<u32, tokio::sync::watch::Sender<bool>>,
+    _eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::oneshot::Sender<()>)>,
+    _eof_senders: &mut HashMap<u32, tokio::sync::oneshot::Sender<()>>,
 ) {
     match req {}
 }
@@ -5638,8 +5638,8 @@ async fn handle_warm_req(
     warm_ptys: &WarmPtys,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
-    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
-    eof_senders: &mut HashMap<u32, tokio::sync::watch::Sender<bool>>,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::oneshot::Sender<()>)>,
+    eof_senders: &mut HashMap<u32, tokio::sync::oneshot::Sender<()>>,
 ) {
     match &req.kind {
         ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req, eof_senders_tx).await,
@@ -5653,7 +5653,7 @@ async fn handle_warm_req(
         // to stop writing and close the socket write half (daemon sees EOF).
         ctl::ReqKind::Eof { sid } => {
             if let Some(tx) = eof_senders.remove(sid) {
-                let _ = tx.send(true);
+                let _ = tx.send(());
                 req.reply(&json!({ "ok": true })).await;
             } else {
                 req.reject("unknown stream id").await;
@@ -6023,7 +6023,7 @@ async fn handle_warm_open(
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
-    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::oneshot::Sender<()>)>,
 ) {
     let ctl::ReqKind::Open { peer, rport } = &req.kind else { return };
     let (peer, rport) = (peer.clone(), *rport);
@@ -6081,7 +6081,7 @@ async fn handle_warm_pty(
     warm_ptys: &WarmPtys,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
-    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::oneshot::Sender<()>)>,
 ) {
     let ctl::ReqKind::Pty { peer, session, cols, rows, term, cmd } = &req.kind else { return };
     let (peer, session, cols, rows, term, cmd) = (peer.clone(), session.clone(), *cols, *rows, term.clone(), cmd.clone());
@@ -8895,9 +8895,9 @@ async fn recv_cmd(
     // eof_senders_tx; the event loop collects them.
     #[cfg(any(unix, windows))]
     let (eof_senders_tx, mut eof_senders_rx) =
-        mpsc::unbounded_channel::<(u32, tokio::sync::watch::Sender<bool>)>();
+        mpsc::unbounded_channel::<(u32, tokio::sync::oneshot::Sender<()>)>();
     #[cfg(any(unix, windows))]
-    let mut eof_senders: HashMap<u32, tokio::sync::watch::Sender<bool>> = HashMap::new();
+    let mut eof_senders: HashMap<u32, tokio::sync::oneshot::Sender<()>> = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
     // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
@@ -9012,10 +9012,10 @@ async fn recv_cmd(
     }
 
     loop {
-        // Collect shutdown senders from spawned warm-stream tasks (non-blocking).
+        // Collect eof senders from spawned warm-stream tasks (non-blocking).
         #[cfg(any(unix, windows))]
-        while let Ok((sid, shutdown_tx)) = eof_senders_rx.try_recv() {
-            eof_senders.insert(sid, shutdown_tx);
+        while let Ok((sid, eof_tx)) = eof_senders_rx.try_recv() {
+            eof_senders.insert(sid, eof_tx);
         }
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us

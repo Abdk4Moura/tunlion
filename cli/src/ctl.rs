@@ -781,6 +781,258 @@ mod imp {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+
+    #[cfg(test)]
+    mod eof_tests {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+
+        /// Minimal test: verify that tokio::io::duplex propagates EOF when one
+        /// handle is dropped. If this fails, the duplex-based tests below can't work.
+        #[tokio::test]
+        async fn duplex_eof_propagates() {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let server_task = tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let n = server.read(&mut buf).await.unwrap();
+                assert_eq!(n, 5, "should read 5 bytes");
+                let n = server.read(&mut buf).await.unwrap();
+                assert_eq!(n, 0, "should see EOF after client drops");
+            });
+            client.write_all(b"hello").await.unwrap();
+            drop(client);
+            server_task.await.unwrap();
+        }
+
+        /// Test: one-way binary transfer. Writes data to a duplex socket,
+        /// drops the client, and verifies all data was received.
+        #[tokio::test]
+        async fn oob_eof_one_way_binary() {
+            use crate::l2;
+            use std::sync::Arc;
+
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
+            let l2_tx_for_server = l2_tx.clone();
+
+            struct MockTransport(tokio::sync::mpsc::UnboundedSender<Option<bytes::Bytes>>);
+            #[async_trait::async_trait]
+            impl crate::net::Transport for MockTransport {
+                fn is_alive(&self) -> bool { true }
+                fn idle_ms(&self) -> u64 { 0 }
+                fn remote_addr(&self) -> Option<std::net::SocketAddr> { None }
+                fn rtt_ms(&self) -> Option<u64> { Some(0) }
+                fn as_any(&self) -> &dyn std::any::Any { self }
+                async fn send_frame(&self, _sid: u32, _offset: u64, data: &[u8]) -> anyhow::Result<()> {
+                    if data.is_empty() {
+                        let _ = self.0.send(None);
+                    } else {
+                        let _ = self.0.send(Some(bytes::Bytes::copy_from_slice(data)));
+                    }
+                    Ok(())
+                }
+                async fn send_control(&self, _v: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
+                async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+                fn max_payload(&self) -> usize { 65536 }
+            }
+
+            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_for_server)));
+            let sid = 42;
+            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(1);
+
+            let server_task = tokio::spawn(async move {
+                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None).await;
+            });
+
+            let test_data: Vec<u8> = (0..1024 * 100).map(|i| (i % 256) as u8).collect();
+            let client_data = test_data.clone();
+            let client_task = tokio::spawn(async move {
+                let mut c = client;
+                c.write_all(&client_data).await.unwrap();
+                drop(c);
+            });
+
+            client_task.await.unwrap();
+
+            let mut received = Vec::new();
+            while let Some(item) = tokio::time::timeout(Duration::from_secs(5), l2_rx.recv()).await.unwrap() {
+                match item {
+                    Some(data) => received.extend_from_slice(&data),
+                    None => break,
+                }
+            }
+
+            assert_eq!(received, test_data, "one-way binary: data mismatch");
+            server_task.abort();
+        }
+
+        /// Test: request-response. Sends a request, drops client (triggering
+        /// half-close), then verifies the full response arrives.
+        #[tokio::test]
+        async fn oob_eof_request_response() {
+            use crate::l2;
+            use std::sync::Arc;
+
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
+            let l2_tx_for_server = l2_tx.clone();
+
+            struct MockTransport(tokio::sync::mpsc::UnboundedSender<Option<bytes::Bytes>>);
+            #[async_trait::async_trait]
+            impl crate::net::Transport for MockTransport {
+                fn is_alive(&self) -> bool { true }
+                fn idle_ms(&self) -> u64 { 0 }
+                fn remote_addr(&self) -> Option<std::net::SocketAddr> { None }
+                fn rtt_ms(&self) -> Option<u64> { Some(0) }
+                fn as_any(&self) -> &dyn std::any::Any { self }
+                async fn send_frame(&self, _sid: u32, _offset: u64, data: &[u8]) -> anyhow::Result<()> {
+                    if data.is_empty() {
+                        let _ = self.0.send(None);
+                    } else {
+                        let _ = self.0.send(Some(bytes::Bytes::copy_from_slice(data)));
+                    }
+                    Ok(())
+                }
+                async fn send_control(&self, _v: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
+                async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+                fn max_payload(&self) -> usize { 65536 }
+            }
+
+            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_for_server)));
+            let sid = 43;
+            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(1);
+
+            let server_task = tokio::spawn(async move {
+                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None).await;
+            });
+
+            let client_task = tokio::spawn(async move {
+                let mut c = client;
+                c.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+                drop(c);
+            });
+
+            client_task.await.unwrap();
+
+            // Simulate remote sending response
+            let response = b"HTTP/1.0 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
+            let _ = l2_tx.send(Some(bytes::Bytes::from_static(response)));
+            let _ = l2_tx.send(None);
+
+            let mut received = Vec::new();
+            while let Some(item) = tokio::time::timeout(Duration::from_secs(5), l2_rx.recv()).await.unwrap() {
+                match item {
+                    Some(data) => received.extend_from_slice(&data),
+                    None => break,
+                }
+            }
+
+            assert_eq!(&received, response, "request-response: response lost after client EOF");
+            server_task.abort();
+        }
+    }
+}
+                    Ok(())
+                }
+                async fn send_control(&self, _v: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
+                async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+                fn max_payload(&self) -> usize { 65536 }
+            }
+
+            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_for_server)));
+            let sid = 42;
+            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(1);
+
+            let server_task = tokio::spawn(async move {
+                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None).await;
+            });
+
+            let test_data: Vec<u8> = (0..1024 * 100).map(|i| (i % 256) as u8).collect();
+            let client_data = test_data.clone();
+            let client_task = tokio::spawn(async move {
+                let mut c = client;
+                c.write_all(&client_data).await.unwrap();
+                drop(c);
+            });
+
+            client_task.await.unwrap();
+
+            let mut received = Vec::new();
+            while let Some(item) = tokio::time::timeout(Duration::from_secs(5), l2_rx.recv()).await.unwrap() {
+                match item {
+                    Some(data) => received.extend_from_slice(&data),
+                    None => break,
+                }
+            }
+
+            assert_eq!(received, test_data, "one-way binary: data mismatch");
+            server_task.abort();
+        }
+
+        /// Test: request-response over warm path with OOB eof.
+        #[tokio::test]
+        async fn oob_eof_request_response() {
+            use crate::l2;
+            use std::sync::Arc;
+
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
+            let l2_tx_for_server = l2_tx.clone();
+
+            struct MockTransport(tokio::sync::mpsc::UnboundedSender<Option<bytes::Bytes>>);
+            #[async_trait::async_trait]
+            impl crate::net::Transport for MockTransport {
+                fn is_alive(&self) -> bool { true }
+                fn idle_ms(&self) -> u64 { 0 }
+                fn remote_addr(&self) -> Option<std::net::SocketAddr> { None }
+                fn rtt_ms(&self) -> Option<u64> { Some(0) }
+                fn as_any(&self) -> &dyn std::any::Any { self }
+                async fn send_frame(&self, _sid: u32, _offset: u64, data: &[u8]) -> anyhow::Result<()> {
+                    if data.is_empty() {
+                        let _ = self.0.send(None);
+                    } else {
+                        let _ = self.0.send(Some(bytes::Bytes::copy_from_slice(data)));
+                    }
+                    Ok(())
+                }
+                async fn send_control(&self, _v: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
+                async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+                fn max_payload(&self) -> usize { 65536 }
+            }
+
+            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_for_server)));
+            let sid = 43;
+            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(1);
+
+            let server_task = tokio::spawn(async move {
+                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None).await;
+            });
+
+            let client_task = tokio::spawn(async move {
+                let mut c = client;
+                c.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+                drop(c);
+            });
+
+            client_task.await.unwrap();
+
+            let response = b"HTTP/1.0 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
+            let _ = l2_tx.send(Some(bytes::Bytes::from_static(response)));
+            let _ = l2_tx.send(None);
+
+            let mut received = Vec::new();
+            while let Some(item) = tokio::time::timeout(Duration::from_secs(5), l2_rx.recv()).await.unwrap() {
+                match item {
+                    Some(data) => received.extend_from_slice(&data),
+                    None => break,
+                }
+            }
+
+            assert_eq!(&received, response, "request-response: response lost after client EOF");
+            server_task.abort();
+        }
+    }
 }
 
 // --- Windows named-pipe helpers ---
