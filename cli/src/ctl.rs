@@ -56,7 +56,8 @@ pub type CtlServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
 
 #[cfg(any(unix, windows))]
 pub use imp::{
-    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_list_mounts,
+    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_eof,
+    try_list_mounts,
     try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
     try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
@@ -285,6 +286,10 @@ mod imp {
                 let target = v["target"].as_str()?.to_string();
                 Some(super::ReqKind::MountHealth { target })
             }
+            Some("eof") => {
+                let sid = v["sid"].as_u64().and_then(|n| u32::try_from(n).ok())?;
+                Some(super::ReqKind::Eof { sid })
+            }
             _ => None,
         }
     }
@@ -326,10 +331,10 @@ mod imp {
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
-    /// link. Returns the connected socket (positioned for raw bytes) on success,
-    /// or `None` if there is no daemon, no warm link, or any protocol error, so
-    /// the caller falls back to a fresh establish. Never errors: a miss is `None`.
-    pub async fn try_open(peer: &str, rport: u16) -> Option<super::CtlClientStream> {
+    /// link. Returns the connected socket (positioned for raw bytes) + stream ID
+    /// on success, or `None` if there is no daemon, no warm link, or any protocol
+    /// error, so the caller falls back to a fresh establish.
+    pub async fn try_open(peer: &str, rport: u16) -> Option<(super::CtlClientStream, u32)> {
         if reuse_disabled() {
             return None;
         }
@@ -338,7 +343,9 @@ mod imp {
 
     /// `try_open` against an explicit socket path (the live path comes from
     /// `control_sock_path()`; tests pass a hermetic path with no global env).
-    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<super::CtlClientStream> {
+    /// Returns (socket, stream_id) so the caller can send an out-of-band EOF
+    /// for the specific stream when stdin closes.
+    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<(super::CtlClientStream, u32)> {
         let mut s = transport_connect(path).await.ok()?;
         let req = json!({ "op": "open", "peer": peer, "rport": rport });
         let mut line = serde_json::to_vec(&req).ok()?;
@@ -348,7 +355,8 @@ mod imp {
         let reply = read_line(&mut s, 4096).await.ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         if v["ok"].as_bool() == Some(true) {
-            Some(s)
+            let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+            Some((s, sid))
         } else {
             None
         }
@@ -574,6 +582,32 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Send an out-of-band EOF signal for stream `sid`. Opens a SEPARATE ctl
+    /// connection (not the data pipe) to keep the data pipe byte-transparent.
+    /// The daemon shuts down the L2 stream's write half so the remote sees EOF
+    /// while the client continues reading the response. Windows-only in
+    /// practice (Unix uses native half-close), but safe on both platforms.
+    pub async fn try_eof(sid: u32) -> bool {
+        let mut s = match transport_connect(&control_sock_path()).await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let req = json!({ "op": "eof", "sid": sid });
+        let mut line = serde_json::to_vec(&req).ok().unwrap_or_default();
+        line.push(b'\n');
+        if s.write_all(&line).await.is_err() {
+            return false;
+        }
+        if s.flush().await.is_err() {
+            return false;
+        }
+        // The daemon replies inline; best-effort read.
+        let reply = read_line(&mut s, 4096).await.ok();
+        reply.and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|v| v["ok"].as_bool())
+            .unwrap_or(false)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -628,6 +662,13 @@ mod imp {
         ListMounts,
         /// Check health of a specific mount by local path or mount ID.
         MountHealth { target: String },
+        /// Out-of-band EOF signal: the client's stdin has closed. The daemon
+        /// shuts down the write half of the L2 stream for `sid` (remote sees EOF)
+        /// while keeping the read side open so the client can still receive the
+        /// response. Sent over a SEPARATE ctl connection (not the data pipe) to
+        /// keep the data pipe 100% byte-transparent. Windows-only semantics
+        /// (Unix uses native half-close via socket shutdown).
+        Eof { sid: u32 },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -706,7 +747,7 @@ mod imp {
             }
             let mut daemon_side = req.accept().await;
 
-            let mut client_side = client.await.unwrap().expect("client got ok");
+            let mut client_side = client.await.unwrap().expect("client got ok").0;
             client_side.write_all(b"ping").await.unwrap();
             client_side.flush().await.unwrap();
             let mut got = [0u8; 4];

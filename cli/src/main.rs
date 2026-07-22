@@ -5616,15 +5616,17 @@ struct DaemonMounts {
 }
 
 /// Dispatch one warm-reuse control request to the right handler. Warm reuse is
-/// unix-only (the control socket is a unix-domain socket); on non-unix `ctl::Req`
-/// is uninhabited so this is never reached - it only keeps the event loop portable.
-#[cfg(not(unix))]
+/// unix/windows (the control socket is a unix-domain socket or named pipe);
+/// on other platforms `ctl::Req` is uninhabited so this is never reached.
+#[cfg(not(any(unix, windows)))]
 async fn handle_warm_req(
     _conn: &Conn,
     _l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     _warm_ptys: &WarmPtys,
     _tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    _eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
+    _eof_senders: &mut HashMap<u32, tokio::sync::watch::Sender<bool>>,
 ) {
     match req {}
 }
@@ -5636,15 +5638,27 @@ async fn handle_warm_req(
     warm_ptys: &WarmPtys,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
+    eof_senders: &mut HashMap<u32, tokio::sync::watch::Sender<bool>>,
 ) {
     match &req.kind {
-        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req).await,
+        ctl::ReqKind::Open { .. } => handle_warm_open(conn, l2_muxes, tx, req, eof_senders_tx).await,
         // Dial is handled inline in the daemon loop (it needs the L3 manager);
         // answer defensively if it ever reaches here.
         ctl::ReqKind::Dial { .. } => req.reject("dial not handled here").await,
-        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req).await,
+        ctl::ReqKind::Pty { .. } => handle_warm_pty(conn, l2_muxes, warm_ptys, tx, req, eof_senders_tx).await,
         ctl::ReqKind::Resize { .. } => handle_warm_resize(l2_muxes, warm_ptys, req).await,
         ctl::ReqKind::Ping { .. } => handle_warm_ping(conn, req).await,
+        // Out-of-band EOF: the client's stdin has closed. Signal the write pump
+        // to stop writing and close the socket write half (daemon sees EOF).
+        ctl::ReqKind::Eof { sid } => {
+            if let Some(tx) = eof_senders.remove(sid) {
+                let _ = tx.send(true);
+                req.reply(&json!({ "ok": true })).await;
+            } else {
+                req.reject("unknown stream id").await;
+            }
+        }
         // Bootstrap is dispatched before this (it defers its reply), so it never
         // reaches here; reject defensively so a future caller falls back to cold.
         ctl::ReqKind::Bootstrap { .. } => req.reject("bootstrap not handled here").await,
@@ -6009,6 +6023,7 @@ async fn handle_warm_open(
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
 ) {
     let ctl::ReqKind::Open { peer, rport } = &req.kind else { return };
     let (peer, rport) = (peer.clone(), *rport);
@@ -6032,10 +6047,18 @@ async fn handle_warm_open(
     // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
     // never blocks the event loop (F8).
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         match l2::open_stream_verified(&mux, rport, l2::warm_verify_window()).await {
             Ok((sid, first, rx)) => {
-                let sock = req.accept().await;
-                l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                // Include the stream ID in the reply so the client can send an
+                // out-of-band EOF signal for this specific stream.
+                let mut sock = req.sock;
+                let _ = sock.write_all(format!("{{\"ok\":true,\"sid\":{sid}}}\n").as_bytes()).await;
+                let _ = sock.flush().await;
+                let shutdown_tx = l2::serve_verified_stream(mux, sid, sock, first, rx).await;
+                // Store the shutdown sender so the event loop can signal it on
+                // an out-of-band EOF for this stream.
+                let _ = eof_senders_tx.send((sid, shutdown_tx));
             }
             Err(e) => {
                 ui::debug(&format!(
@@ -6058,6 +6081,7 @@ async fn handle_warm_pty(
     warm_ptys: &WarmPtys,
     tx: &mpsc::UnboundedSender<Ev>,
     req: ctl::Req,
+    eof_senders_tx: mpsc::UnboundedSender<(u32, tokio::sync::watch::Sender<bool>)>,
 ) {
     let ctl::ReqKind::Pty { peer, session, cols, rows, term, cmd } = &req.kind else { return };
     let (peer, session, cols, rows, term, cmd) = (peer.clone(), session.clone(), *cols, *rows, term.clone(), cmd.clone());
@@ -6077,13 +6101,17 @@ async fn handle_warm_pty(
     // pty rather than getting a dead terminal. Spawned so the verify wait never
     // blocks the event loop (F8).
     tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
             Ok((sid, first, rx_pipe)) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));
                 }
-                let sock = req.accept().await;
-                l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                let mut sock = req.sock;
+                let _ = sock.write_all(format!("{{\"ok\":true,\"sid\":{sid}}}\n").as_bytes()).await;
+                let _ = sock.flush().await;
+                let shutdown_tx = l2::serve_verified_stream(mux, sid, sock, first, rx_pipe).await;
+                let _ = eof_senders_tx.send((sid, shutdown_tx));
                 // Bridge ended (shell exit / client gone / link drop): drop our
                 // entry, but only if it is still ours (a reconnect may have
                 // replaced it).
@@ -8860,6 +8888,16 @@ async fn recv_cmd(
     // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
     #[cfg(any(unix, windows))]
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
+    // Out-of-band EOF senders: stream ID -> shutdown channel sender. When a
+    // client sends an Eof ctl op, the daemon looks up the sender by stream ID
+    // and signals the write pump to stop writing and close the socket (daemon
+    // sees EOF on the data pipe). Spawned tasks send their shutdown_tx through
+    // eof_senders_tx; the event loop collects them.
+    #[cfg(any(unix, windows))]
+    let (eof_senders_tx, mut eof_senders_rx) =
+        mpsc::unbounded_channel::<(u32, tokio::sync::watch::Sender<bool>)>();
+    #[cfg(any(unix, windows))]
+    let mut eof_senders: HashMap<u32, tokio::sync::watch::Sender<bool>> = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
     // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
@@ -8974,6 +9012,11 @@ async fn recv_cmd(
     }
 
     loop {
+        // Collect shutdown senders from spawned warm-stream tasks (non-blocking).
+        #[cfg(any(unix, windows))]
+        while let Ok((sid, shutdown_tx)) = eof_senders_rx.try_recv() {
+            eof_senders.insert(sid, shutdown_tx);
+        }
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
         // - the backstop for the stall that also freezes the reconnect code.
@@ -9090,11 +9133,11 @@ async fn recv_cmd(
                             if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
                                 conn.note_warm_use(peer);
                             }
-                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
+                            handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req, eof_senders_tx.clone(), &mut eof_senders).await;
                         }
                     }
                     #[cfg(not(any(unix, windows)))]
-                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req).await;
+                    handle_warm_req(&conn, &mut l2_muxes, &warm_ptys, &tx, req, eof_senders_tx.clone(), &mut eof_senders).await;
                 }
                 None
             }
