@@ -24,6 +24,9 @@ class Filament < Formula
   def install
     bin.install "filament"
     generate_completions_from_executable(bin/"filament", "completions")
+    # man page (roff generated on demand, piped output)
+    (buildpath/"filament.1").write Utils.safe_popen_read(bin/"filament", "man")
+    man1.install "filament.1"
   end
 
   test do

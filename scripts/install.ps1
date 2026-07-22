@@ -107,6 +107,8 @@ if (($userPath -split ';') -notcontains $InstallDir) {
     Say "added $InstallDir to your PATH — open a new terminal for it to take effect"
 }
 
+# Note: Windows has no man page — use `filament --help` or `filament man` for docs.
+
 Say ''
 Say 'try it:   filament send <file> --code'
 Say '          (the other end can be a terminal — or any browser at https://filament.autumated.com)'

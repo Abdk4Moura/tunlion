@@ -86,6 +86,16 @@ tar -xzf "$TMP/$ASSET" -C "$TMP"
 install -m 755 "$TMP/filament" "$INSTALL_DIR/filament"
 say "installed $INSTALL_DIR/filament ($("$INSTALL_DIR/filament" --version 2>/dev/null || echo "$TAG"))"
 
+# man page (best effort, never fatal)
+if command -v man >/dev/null 2>&1; then
+  MANDIR="${XDG_DATA_HOME:-$HOME/.local/share}/man/man1"
+  mkdir -p "$MANDIR" 2>/dev/null && \
+    "$INSTALL_DIR/filament" man > "$MANDIR/filament.1" 2>/dev/null && \
+    say "installed man page to $MANDIR/filament.1 (try \`man filament\`)" || true
+  # Refresh man index (best effort)
+  mandb -q 2>/dev/null || makewhatis 2>/dev/null || true
+fi
+
 # shell completions (best effort, never fatal)
 if [ -n "${BASH_VERSION:-}" ] || [ -f "$HOME/.bashrc" ]; then
   mkdir -p "$HOME/.local/share/bash-completion/completions" 2>/dev/null && \
