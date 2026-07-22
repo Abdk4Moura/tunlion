@@ -729,11 +729,12 @@ enum Cmd {
     Completions {
         shell: clap_complete::Shell,
     },
-    /// Print the manual (roff to stdout). `filament man routing` shows the
+    /// Print the manual. On a TTY, shows readable help; piped, emits roff
+    /// (for `filament man > filament.1`). `filament man routing` shows the
     /// connection & interface selection model.
     #[command(hide = true)]
     Man {
-        /// Manual page: routing, settings, or omit for the full man page
+        /// Manual page: routing, or omit for the full man page
         page: Option<String>,
     },
     /// Tunnel: wire stdio to one TCP stream on a known peer's localhost (the
@@ -6413,9 +6414,25 @@ async fn main() -> Result<()> {
                     println!("{}", include_str!("../docs/filament-routing.md"));
                     return Ok(());
                 }
+                // Unknown page: print clear message instead of falling through to roff
+                if std::io::stdout().is_terminal() {
+                    eprintln!("no manual page '{p}'; available: routing");
+                    eprintln!("try `filament man` for the full help, or `filament man routing` for the connection model.");
+                } else {
+                    // Piped: still emit roff for backward compatibility
+                    use clap::CommandFactory;
+                    clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+                }
+                return Ok(());
             }
-            use clap::CommandFactory;
-            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            // Bare `filament man`: readable on TTY, roff when piped
+            if std::io::stdout().is_terminal() {
+                use clap::CommandFactory;
+                Cli::command().print_long_help()?;
+            } else {
+                use clap::CommandFactory;
+                clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            }
             Ok(())
         }
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
