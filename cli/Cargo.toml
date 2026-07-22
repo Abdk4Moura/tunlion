@@ -28,7 +28,7 @@ test-hooks = []
 # Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.
-mount-macos = ["dep:fuser"]
+mount-windows = ["dep:winfsp", "dep:winfsp-sys"]
 
 
 [dependencies]
@@ -102,12 +102,6 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"
 
-# macOS mount client adapter: reuses the Linux FUSE adapter (fuser drives macFUSE).
-# OFF by default: requires macFUSE SDK at build time and the macFUSE kext at runtime.
-# CI cannot provision macFUSE on hosted macOS (needs interactive approval + reboot).
-[target.'cfg(target_os = "macos")'.dependencies]
-fuser = { version = "0.17", optional = true }
-
 
 
 # Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
@@ -118,6 +112,11 @@ fuser = { version = "0.17", optional = true }
 # release packaging; adapter creation needs Administrator.
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5"
+# Pinned to 0.12: 0.13 is a significant API refactor (FileSystemHost::new
+# takes 2 args, DirInfo is now generic DirInfo<N>, VolumeParams is a builder).
+# Upgrade tracked as follow-up item.
+winfsp = { version = "=0.12.0", features = ["full", "windows-61"], optional = true }
+winfsp-sys = { version = "=0.3.0", optional = true }
 
 [profile.release]
 lto = "thin"

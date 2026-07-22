@@ -1,0 +1,49 @@
+# Mount adapter CI gates (cross-platform)
+#
+# Builds the per-OS mount adapters with their optional features enabled.
+# These are NOT in the required-check set (the map document's design:
+# macOS macFUSE cannot be provisioned on hosted runners; Windows WinFsp
+# CAN be via choco with no reboot). Run on push to branches matching
+# mount-* or feat/mount-* plus workflow_dispatch.
+
+name: Mount CI
+
+on:
+  push:
+    branches:
+      - mount-*
+      - 'feat/mount-*'
+  pull_request:
+    paths:
+      - 'cli/src/mount_*.rs'
+      - 'cli/src/mount_proto.rs'
+      - '.github/workflows/mount-ci.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: mount-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mount-windows:
+    name: mount (windows, WinFsp)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install WinFsp SDK
+        run: choco install winfsp --no-progress -y
+        shell: powershell
+
+      - name: Build with mount-windows feature
+        working-directory: cli
+        run: cargo build --features mount-windows
+        env:
+          RUST_MIN_STACK: 8388608
+
+      - name: Run NameEscaper unit tests
+        working-directory: cli
+        run: cargo test --features mount-windows -- mount_winfsp::escape_tests
+        env:
+          RUST_MIN_STACK: 8388608
