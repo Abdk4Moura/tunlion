@@ -2009,7 +2009,19 @@ async fn up_cmd(
     };
     // --shell-user is Unix-only (uses runuser). Warn early on Windows.
     if shell_user.is_some() && cfg!(windows) {
-        ui::say(&format!("  {} --shell-user is not supported on Windows (PTY runs as current user)", ui::paint(ui::Tone::Warn, "WARNING:")));
+        ui::say(&format!(
+            "  {} --shell-user is not supported on Windows.\n\
+             \n\
+             Windows requires CreateProcessAsUser or CreateProcessWithLogonW to run\n\
+             a process as another user. CreateProcessAsUser needs SE_INCREASE_QUOTA_NAME\n\
+             and SE_ASSIGNPRIMARYTOKEN_NAME privileges (typically requires admin).\n\
+             CreateProcessWithLogonW needs the target user's credentials (username +\n\
+             password), which is a security risk if stored or passed via CLI.\n\
+             \n\
+             The PTY will run as the current user. To run as a different user,\n\
+             start filament from that user's session, or use 'runas /user:<name> filament'.",
+            ui::paint(ui::Tone::Warn, "WARNING:")
+        ));
     }
     if install && system {
         return install_system_service(shell, &shell_only, &shell_user);

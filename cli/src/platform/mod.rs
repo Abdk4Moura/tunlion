@@ -93,7 +93,10 @@ impl Paths {
     /// 5. Hardcoded fallback (`/bin/bash` → `/bin/sh` / `cmd.exe`)
     ///
     /// The value is argv-split so it can carry args: `bash -l`, `pwsh -NoLogo`.
-    /// On Unix, `shell_user` uses `runuser -l`; on Windows it's unsupported.
+    /// On Unix, `shell_user` uses `runuser -l`; on Windows it's unsupported
+    /// because running a process as another user requires either elevated
+    /// privileges (CreateProcessAsUser) or the target user's credentials
+    /// (CreateProcessWithLogonW), both of which have security implications.
     pub fn shell_argv(shell_program: Option<&str>, shell_config: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
         let shell = shell_program
             .map(|s| s.to_string())
