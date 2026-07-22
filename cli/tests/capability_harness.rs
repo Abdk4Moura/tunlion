@@ -457,9 +457,10 @@ fn pty_one_shot_exec_smoke() {
     // before the PTY command. The 3s kill gap + 12s settle was proven
     // effective in earlier CI runs (commit 1213120).
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
-        eprintln!("pty_one_shot_exec_smoke: skipped on Windows (pty not yet verified)");
+        eprintln!("pty_one_shot_exec_smoke: skipped on {os} (cold establish not yet verified on this platform)",
+            os = if cfg!(windows) { "Windows" } else { "macOS" });
         return;
     }
 
@@ -602,9 +603,10 @@ fn shell_daemon_live_pairing_no_restart() {
     // the daemon would stay up but never find the new peer, making the
     // fix worthless. This test proves BOTH.
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
-        eprintln!("shell_daemon_live_pairing_no_restart: skipped on Windows (pty not yet verified)");
+        eprintln!("shell_daemon_live_pairing_no_restart: skipped on {os} (cold establish not yet verified on this platform)",
+            os = if cfg!(windows) { "Windows" } else { "macOS" });
         return;
     }
 
