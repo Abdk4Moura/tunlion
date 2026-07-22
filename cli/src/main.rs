@@ -405,7 +405,7 @@ EXAMPLES:
   More commands (run `filament <cmd> --help`):
     ssh · forward         remote shell / port-forward to a device
     set tun-addr auto     join the encrypted L3 overlay mesh (`filament addr`)
-    ping · doctor         diagnose a link; introduce · grant · serve-tun · netcat · pty";
+    ping · doctor         diagnose a link; introduce · grant · serve-tun · netcat";
 
 #[derive(Parser)]
 #[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers, no upload, no account", after_help = EXAMPLES)]
@@ -760,7 +760,6 @@ enum Cmd {
     /// Open a PTY shell on a known device and bridge it to this terminal (the CLI
     /// sibling of the browser web-shell). The peer must run `up --shell` (or grant
     /// shell). Off by default; FILAMENT_L2=1 / --shell enables the acceptor.
-    #[command(hide = true)]
     Pty {
         /// Known device (petname) to open a shell on
         peer: String,
