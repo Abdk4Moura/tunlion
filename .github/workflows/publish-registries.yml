@@ -58,9 +58,12 @@ jobs:
         run: |
           set -euo pipefail
           # pake is inlined, so filament-cli has no unpublished path-deps.
+          # --allow-dirty: the pinned-to-latest stable toolchain regenerates
+          # Cargo.lock on checkout (format/re-resolve), which trips cargo
+          # publish's clean-tree check even though the committed lock is valid.
           # Tolerate an already-published version (re-runs/backfills), but fail
           # loudly on any other error so it's visible.
-          out=$(cargo publish 2>&1) && { echo "$out"; exit 0; }
+          out=$(cargo publish --allow-dirty 2>&1) && { echo "$out"; exit 0; }
           echo "$out"
           if echo "$out" | grep -qiE "already (uploaded|exists)|crate version .* is already"; then
             echo "::notice::filament-cli $TAG already on crates.io — nothing to do"; exit 0
