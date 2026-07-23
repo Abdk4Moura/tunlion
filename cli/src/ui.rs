@@ -36,8 +36,9 @@ static VERBOSITY: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 /// Resolve and install the global verbosity ONCE, at startup. Precedence:
 ///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
-///   2. otherwise the clap flags: `-q/--quiet` → critical; repeated `-v` raises
-///      info → debug → trace (count saturates at trace).
+///   2. otherwise the clap flags: `-q/--quiet` -> critical; repeated `-v` raises
+///      info -> debug -> trace (count saturates at trace).
+///   3. persistent `verbosity` setting (e.g. `filament set verbosity debug`).
 /// Call this from `main` right after parsing, before any worker spawns.
 pub fn init_verbosity(verbose: u8, quiet: bool) {
     let level = if let Ok(s) = std::env::var("FILAMENT_LOG") {
@@ -47,6 +48,15 @@ pub fn init_verbosity(verbose: u8, quiet: bool) {
             "debug" | "v" => Level::Debug,
             "trace" | "vv" => Level::Trace,
             _ => resolve_from_flags(verbose, quiet),
+        }
+    } else if !quiet && verbose == 0 {
+        // No CLI override; check persistent setting.
+        match crate::settings::get_str("verbosity", None).as_deref() {
+            Some("critical" | "crit" | "quiet" | "q") => Level::Critical,
+            Some("info") => Level::Info,
+            Some("debug" | "v") => Level::Debug,
+            Some("trace" | "vv") => Level::Trace,
+            _ => Level::Info, // default
         }
     } else {
         resolve_from_flags(verbose, quiet)

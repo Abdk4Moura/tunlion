@@ -1201,11 +1201,11 @@ impl Peer {
         // P2P ICE diagnostic: log gathering state changes to see when/if
         // complete fires vs stalls (used for CI capability-harness debugging).
         pc.on_ice_gathering_state_change(Box::new(move |s| {
-            eprintln!("[ice-gathering] state={}", s);
+            crate::ui::trace(&format!("[ice-gathering] state={}", s));
             Box::pin(async {})
         }));
         pc.on_ice_connection_state_change(Box::new(move |s| {
-            eprintln!("[ice-connection] state={}", s);
+            crate::ui::trace(&format!("[ice-connection] state={}", s));
             Box::pin(async {})
         }));
 
@@ -1223,7 +1223,7 @@ impl Peer {
                         let typ = c.typ.to_string();
                         let addr = c.address.clone();
                         let port = c.port;
-                        eprintln!("[ice-candidate] type={} addr={} port={}", typ, addr, port);
+                        crate::ui::trace(&format!("[ice-candidate] type={} addr={} port={}", typ, addr, port));
                         if let Ok(init) = c.to_json() {
                             let _ = sio
                                 .emit(
@@ -1233,7 +1233,7 @@ impl Peer {
                                 .await;
                         }
                     } else {
-                        eprintln!("[ice-candidate] gathering complete (null candidate)");
+                        crate::ui::trace(&format!("[ice-candidate] gathering complete (null candidate)"));
                     }
                 })
             }));
@@ -1244,7 +1244,7 @@ impl Peer {
             let closed = closed.clone();
             let pid = peer_id.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
-                eprintln!("[pc-state] {} -> {}", pid, s);
+                crate::ui::trace(&format!("[pc-state] {} -> {}", pid, s));
                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = tx.send(Ev::PcState(pid.clone(), s.to_string()));
                 }

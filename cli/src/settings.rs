@@ -277,6 +277,17 @@ pub fn registry() -> &'static [Setting] {
             daemon: true,
             help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `filament set auto-proxy off`.",
         },
+        Setting {
+            key: "verbosity",
+            aliases: &[],
+            store: "verbosity",
+            kind: Kind::Str,
+            default: "info",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_LOG"),
+            daemon: false,
+            help: "Default verbosity level: quiet (errors only), info (progress + results), debug (-v equivalent, route/tunnel), trace (-vv equivalent, ICE/per-frame). CLI flags override.",
+        },
     ];
     R
 }

@@ -1357,7 +1357,7 @@ async fn bring_up_to_known(
                 // bootstrap pre-flight (internal; the data link reports the route)
                 // and for reconnect roles (post-warm resume noise suppression).
                 if !role.starts_with("reconnect") && role != "bootstrap" {
-                    crate::ui::say(&format!("\rfilament: tunnel up to '{peer_name}' (route: {route})"));
+                    crate::ui::debug(&format!("\rfilament: tunnel up to '{peer_name}' (route: {route})"));
                 }
                 // Transport is up: the Establishing race is won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
