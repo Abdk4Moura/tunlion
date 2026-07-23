@@ -8193,17 +8193,47 @@ async fn stream_one(
             let mut f = tokio::fs::File::open(&path).await?;
             f.seek(SeekFrom::Start(start)).await?;
             let mut pos = start;
-            let mut buf = vec![0u8; chunk];
+            let mut buf_a = vec![0u8; chunk];
+            let mut buf_b = vec![0u8; chunk];
+            let mut using_buf_a = true;
+
+            // Prime the first read into buf_a.
+            let first_want = std::cmp::min(chunk as u64, end - pos) as usize;
+            if first_want == 0 {
+                return Ok(());
+            }
+            let mut cur_n = f.read(&mut buf_a[..first_want]).await?;
+            if cur_n == 0 {
+                return Ok(());
+            }
+
             while pos < end {
-                let want = std::cmp::min(chunk as u64, end - pos) as usize;
-                let n = f.read(&mut buf[..want]).await?;
-                if n == 0 {
-                    break;
-                }
-                t.send_frame(sid, pos, &buf[..n]).await?;
-                pos += n as u64;
+                // Fire the NEXT read (into the alternate buffer) BEFORE sending.
+                let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;
+                let next_read = if next_want > 0 {
+                    let mut f2 = tokio::fs::File::open(&path).await?;
+                    f2.seek(SeekFrom::Start(pos + cur_n as u64)).await?;
+                    let alt_buf = if using_buf_a {
+                        std::mem::replace(&mut buf_b, vec![0u8; chunk])
+                    } else {
+                        std::mem::replace(&mut buf_a, vec![0u8; chunk])
+                    };
+                    Some(tokio::spawn(async move {
+                        let mut buf = alt_buf;
+                        let n = f2.read(&mut buf[..next_want]).await?;
+                        Ok::<(Vec<u8>, usize), anyhow::Error>((buf, n))
+                    }))
+                } else {
+                    None
+                };
+
+                // Send the current buffer.
+                let cur_buf = if using_buf_a { &buf_a[..cur_n] } else { &buf_b[..cur_n] };
+                t.send_frame(sid, pos, cur_buf).await?;
+                pos += cur_n as u64;
+
                 let total =
-                    progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed) + n as u64;
+                    progress.fetch_add(cur_n as u64, std::sync::atomic::Ordering::Relaxed) + cur_n as u64;
                 bar.lock().await.tick(total);
                 if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
                     if total >= at
@@ -8212,6 +8242,21 @@ async fn stream_one(
                         eprintln!("[test] injecting synthetic peer-left for active sid at {total} bytes");
                         let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
                     }
+                }
+
+                // Collect the next read (it was running while we sent).
+                match next_read {
+                    Some(handle) => match handle.await {
+                        Ok(Ok((buf, n))) => {
+                            if using_buf_a { buf_b = buf; } else { buf_a = buf; }
+                            using_buf_a = !using_buf_a;
+                            cur_n = n;
+                            if cur_n == 0 { break; }
+                        }
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(e) => return Err(anyhow!("read-ahead task panicked: {e}")),
+                    },
+                    None => break,
                 }
             }
             t.flush().await?;
