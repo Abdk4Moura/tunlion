@@ -563,8 +563,21 @@ fn pty_one_shot_exec_smoke() {
     {
         // Live-pairing: daemon discovers the newly paired device via the
         // 2s devices_load scan. No restart needed (proven by #41).
+        // Poll deterministically for the discovery message instead of a fixed sleep.
         eprintln!("pty_one_shot_exec_smoke: waiting for live-pairing discovery...");
-        std::thread::sleep(Duration::from_secs(15));
+        let discovered = wait_for_line(
+            &h.daemon_a_log,
+            "known device 'test-b' appeared",
+            Duration::from_secs(30),
+        ) || wait_for_line(
+            &h.daemon_b_log,
+            "known device 'test-a' appeared",
+            Duration::from_secs(0),
+        );
+        assert!(
+            discovered,
+            "live-pairing discovery did not occur within 30s"
+        );
     }
 
     let nonce = format!("PTY-OK-{}", std::process::id());
@@ -868,17 +881,37 @@ fn warm_all_makes_first_contact_warm() {
     // line (only fires when the peer is added to the auto set during the
     // tick, which can be skipped if roster sync populates it earlier), so
     // we assert on the "established" reliability marker instead.
+    // Also check for "skip" (link already alive within grace) which means
+    // the warm path is usable.
     eprintln!("warm_all: waiting for warm-hold to establish the link...");
     let link_held = wait_for_line(
         &h.daemon_a_log,
         "warm-hold: established connection to 'test-b'",
         Duration::from_secs(60),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: skip 'test-b'",
+        Duration::from_secs(0),
     );
     assert!(
         link_held,
         "warm-hold did not establish a link to 'test-b' within 60s — \
          the auto-warm setting may not be defaulting to ON"
     );
+
+    // Wait for BOTH sides to have discovered each other before running ping.
+    // daemon-a may have the warm link, but daemon-b needs to have discovered
+    // test-a via its own scan before the ping can succeed over the warm path.
+    wait_for_line(
+        &h.daemon_b_log,
+        "known device 'test-a' appeared",
+        Duration::from_secs(15),
+    );
+
+    // Allow the warm link to be verified (pair-proof) before running ping.
+    // The warm-hold "established" message fires when the L2 stream opens,
+    // but the ping warm path requires verification.
+    std::thread::sleep(Duration::from_secs(10));
 
     // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
     eprintln!("warm_all: running filament ping --json...");
@@ -1114,7 +1147,24 @@ fn warm_one_shot_pty_reuse() {
     h.daemon_b = Some(child_b);
     h.daemon_a_log = log_a;
     h.daemon_b_log = log_b;
-    std::thread::sleep(Duration::from_secs(20));
+
+    // Wait for warm link to be established (deterministic poll).
+    let warm_ready = wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: established connection to 'test-b'",
+        Duration::from_secs(40),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: skip 'test-b'",
+        Duration::from_secs(0),
+    );
+    assert!(
+        warm_ready,
+        "warm link to 'test-b' was not established within 40s"
+    );
+
+    // Allow verification to complete before running pty.
+    std::thread::sleep(Duration::from_secs(5));
 
     // Warm-hold tick (10s interval) runs during the 20s settle — daemon A
     // establishes a warm link to test-b. Now pty should hit the warm path.
@@ -1138,6 +1188,182 @@ fn warm_one_shot_pty_reuse() {
          stdout: {out_stdout}\nstderr: {out_stderr}"
     );
 
+    assert!(
+        out_stdout.contains(&nonce),
+        "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+}
+
+#[test]
+fn warm_one_shot_pty_instant_eof() {
+    // Proves fix/warm-oneshot-pty-reuse: one-shot `pty <peer> -- printf ...`
+    // with INSTANT stdin-EOF (</dev/null) returns rc=0 with full output.
+    //
+    // Before the fix, the serve_stream reader-finished branch aborted the
+    // writer, tearing down the pty before output arrived (hang / rc=124).
+    // After the fix, the writer waits for the daemon to close the socket
+    // (command exit), so output is delivered and the client returns cleanly.
+
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        eprintln!("warm_one_shot_pty_instant_eof: skipped on {os}",
+            os = if cfg!(windows) { "Windows" } else { "macOS" });
+        return;
+    }
+
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    h.pair_daemons();
+    eprintln!("warm_one_shot_pty_instant_eof: daemons started");
+
+    // Pair a, claim b
+    let pair_word = format!("warm-eof-p{:x}", std::process::id());
+    let mut create = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-a")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pair", "--word", &pair_word])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair create");
+
+    let stderr = create.stderr.take().unwrap();
+    let pair_word_lower = pair_word.to_lowercase();
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[warm-eof-pair-create] {line}");
+            if line.to_lowercase().contains(&pair_word_lower) {
+                if let Some(code) = line
+                    .split_whitespace()
+                    .find(|w| {
+                        w.to_lowercase().contains(&pair_word_lower)
+                            && w.split('-').count() >= 4
+                    })
+                {
+                    let _ = code_tx.send(code.to_string());
+                }
+            }
+        }
+    });
+
+    let pair_code = code_rx.recv_timeout(Duration::from_secs(60))
+        .expect("warm-eof pair create did not mint a code within 60s");
+    eprintln!("warm-eof pair code: {pair_code}");
+
+    let mut claim = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_NAME", "test-b")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["--server", &server, "pair", &pair_code])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("pair claim");
+    let claim_out = claim.wait_with_output().expect("pair claim result");
+    eprintln!("warm-eof-claim stderr: {}", String::from_utf8_lossy(&claim_out.stderr));
+
+    let create_out = create.wait_with_output().expect("pair create result");
+    eprintln!("warm-eof-pair-create exit: {}", create_out.status);
+
+    // Enable warm-hold and restart daemons.
+    let set = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "set", "warm-peers", "test-b"])
+        .output()
+        .expect("set warm-peers");
+    assert!(set.status.success(), "set warm-peers failed: {:?}", String::from_utf8_lossy(&set.stderr));
+
+    if let Some(ref mut c) = h.daemon_a {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(ref mut c) = h.daemon_b {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    h.daemon_a = None;
+    h.daemon_b = None;
+    std::thread::sleep(Duration::from_secs(3));
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    let (child_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_b = Some(child_b);
+    h.daemon_a_log = log_a;
+    h.daemon_b_log = log_b;
+
+    // Wait for warm link to daemon-b to be established (deterministic, not a
+    // fixed sleep). The warm-hold loop prints "established connection" when a
+    // new link comes up, or "skip ... (link alive, within grace)" when the
+    // link is already up. Either means the warm path is usable.
+    let warm_ready = wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: established connection to 'test-b'",
+        Duration::from_secs(40),
+    ) || wait_for_line(
+        &h.daemon_a_log,
+        "warm-hold: skip 'test-b'",
+        Duration::from_secs(0),
+    );
+    assert!(
+        warm_ready,
+        "warm link to 'test-b' was not established within 40s after daemon restart"
+    );
+
+    // Allow the warm link to be verified (pair-proof) before running pty.
+    // The warm-hold "established" message fires when the L2 stream opens,
+    // but the pty warm path requires verification. The 30s grace window
+    // in warm_hold_tick prevents churn, but we still need a brief settle.
+    std::thread::sleep(Duration::from_secs(5));
+
+    // Run one-shot pty with INSTANT stdin-EOF (</dev/null).
+    // This is the exact scenario #67 fixed: the client closes stdin immediately,
+    // serve_stream must NOT tear down the pty before output arrives.
+    let nonce = format!("WARM-EOF-OK-{}", std::process::id());
+    let out = Command::new(&bin)
+        .env("FILAMENT_DIRECT", &direct_flag)
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "pty", "test-b", "--", "printf", &nonce])
+        .stdin(Stdio::null())  // instant stdin-EOF
+        .output()
+        .expect("pty instant-eof");
+    let out_stdout = String::from_utf8_lossy(&out.stdout);
+    let out_stderr = String::from_utf8_lossy(&out.stderr);
+    eprintln!("warm pty instant-eof stdout: {out_stdout}");
+    eprintln!("warm pty instant-eof stderr: {out_stderr}");
+
+    // Must return rc=0 (not hang/timeout).
+    assert!(
+        out.status.success(),
+        "warm one-shot pty with instant stdin-EOF failed: rc={:?}\n\
+         stdout: {out_stdout}\nstderr: {out_stderr}",
+        out.status.code()
+    );
+
+    // Must use warm path (not cold establish).
+    assert!(
+        out_stderr.contains("reusing warm link") && out_stderr.contains("one-shot pty"),
+        "pty did NOT use warm link - expected 'reusing warm link ... for one-shot pty'\n\
+         stdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+
+    // Must deliver full output.
     assert!(
         out_stdout.contains(&nonce),
         "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"

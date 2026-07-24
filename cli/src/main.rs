@@ -2894,6 +2894,10 @@ struct Link {
     /// (`FILAMENT_DIRECT_STREAMS` > 1). Empty when striping is disabled
     /// or when the link uses a non-QUIC transport.
     workers: Vec<Arc<dyn Transport>>,
+    /// When this link was established (for the warm-hold pair-proof grace).
+    /// `warm_hold_tick` skips re-establish for a live link within this window,
+    /// preventing churn while pair-proof verification completes.
+    established_at: Option<Instant>,
 }
 
 impl Link {
@@ -3857,12 +3861,31 @@ impl Conn {
         let mut connected = Vec::new();
         let peers = self.warm_hold.peers_to_connect();
         for peer in peers {
-            // Skip if already connected
-            if self.links.iter().any(|(_, l)| {
-                l.verified_name.as_deref().map(|n| n.eq_ignore_ascii_case(&peer)).unwrap_or(false)
-                    && l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
-            }) {
+            // Skip re-establish if a link to this pid exists AND is alive AND
+            // (verified OR within the pair-proof grace window).  Dead links and
+            // alive-but-unverified-past-grace (stuck) links still re-establish.
+            // The grace prevents churn during the normal pair-proof verification
+            // window while ensuring stuck links are eventually replaced.
+            const WARM_PAIR_PROOF_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+            let skip = self.links.iter().any(|(_, l)| {
+                // Match by name (peers_to_connect returns names, not IDs)
+                l.name.eq_ignore_ascii_case(&peer)
+                    // Link is alive: transport alive, OR WebRTC peer exists, OR direct link exists
+                    && (l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
+                        || l.peer.is_some()
+                        || l.direct)
+                    && (
+                        l.verified_name.is_some()                    // verified: warm-usable, skip
+                        || l.established_at                          // within grace: pair-proof expected
+                            .map(|t| t.elapsed() < WARM_PAIR_PROOF_GRACE)
+                            .unwrap_or(false)
+                    )
+            });
+            if skip {
+                ui::debug(&format!("warm-hold: skip '{peer}' (link alive, within grace)"));
                 continue;
+            } else {
+                ui::debug(&format!("warm-hold: will establish '{peer}' (no alive link found)"));
             }
             // Honor per-peer backoff; a dormant peer still gets one probe per
             // WARM_DORMANT_RETRY so an online-but-unlucky peer cannot stay cold forever.
@@ -3982,6 +4005,7 @@ impl Conn {
                 presence: Presence::Connecting,
                 direct: false,
                 direct_route: "direct-quic", // unused for WebRTC links (peer.is_some())
+                established_at: Some(Instant::now()),
             },
         );
         Ok(())
@@ -4400,6 +4424,7 @@ impl Conn {
                 presence: Presence::Ready,
                 direct: true,
                 direct_route: route,
+                established_at: Some(Instant::now()),
             },
         );
         }
@@ -5255,6 +5280,7 @@ impl Conn {
                 presence: Presence::Ready,
                 direct: true,
                 direct_route: route,
+                established_at: Some(Instant::now()),
             },
         );
     }
