@@ -928,7 +928,12 @@ impl DirectTransport {
         let mut hdr = [0u8; 5];
         hdr[0] = kind;
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        // --- TRACE ---
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
         let mut s = self.send.lock().await;
+        let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
         // QUIC streams apply flow control internally; write_all parks on the
         // peer's receive window, that IS the backpressure (no manual high-water
         // loop needed). A frozen receiver stalls here, so last_activity stops
@@ -937,9 +942,15 @@ impl DirectTransport {
             self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("direct write hdr: {e}"));
         }
+        let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
         if let Err(e) = s.write_all(payload).await {
             self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("direct write body: {e}"));
+        }
+        let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if trace && lock_us + hdr_us + body_us > 1000 {
+            eprintln!("[TRACE direct write_framed] lock={}us hdr={}us body={}us payload_len={} kind={}", lock_us, hdr_us, body_us, payload.len(), kind);
         }
         Ok(())
     }
@@ -1052,11 +1063,54 @@ impl Transport for DirectTransport {
                 }
             }
         }
-        let mut framed = Vec::with_capacity(4 + 8 + payload.len());
-        framed.extend_from_slice(&sid.to_be_bytes());
-        framed.extend_from_slice(&offset.to_be_bytes());
-        framed.extend_from_slice(payload);
-        self.write_framed(KIND_DATA, &framed).await?;
+        // --- PROD PATH: scatter-gather without intermediate Vec copy ---
+        // Previously this was behind a test-hook guard (dead code in prod), causing
+        // an extra 1 MiB alloc+memcpy per chunk. Now we write directly.
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut s = self.send.lock().await;
+        let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow!("direct connection closed"));
+        }
+        let mut hdr = [0u8; 5];
+        hdr[0] = KIND_DATA;
+        let payload_len = (4 + 8 + payload.len()) as u32;
+        hdr[1..5].copy_from_slice(&payload_len.to_be_bytes());
+        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&hdr).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write hdr: {e}"));
+        }
+        let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_sid_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&sid.to_be_bytes()).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write sid: {e}"));
+        }
+        let sid_us = t_sid_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_off_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&offset.to_be_bytes()).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write offset: {e}"));
+        }
+        let off_us = t_off_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(payload).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write body: {e}"));
+        }
+        let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        drop(s);
+        let total_us = t_total_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if trace {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 10 == 0 || total_us > 5000 {
+                eprintln!("[TRACE direct send_frame] sid={} offset={} len={} lock={}us hdr={}us sid={}us off={}us body={}us total={}us", sid, offset, payload.len(), lock_us, hdr_us, sid_us, off_us, body_us, total_us);
+            }
+        }
         self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
@@ -1213,7 +1267,11 @@ fn spawn_reader(
     answerer: bool,
 ) {
     tokio::spawn(async move {
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut chunk_counter: u64 = 0;
         loop {
+            let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
             let mut hdr = [0u8; 5];
             if let Err(e) = recv.read_exact(&mut hdr).await {
                 // FinishedEarly is the peer cleanly ending their send half
@@ -1239,6 +1297,8 @@ fn spawn_reader(
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
+            let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
             let mut body = vec![0u8; len];
             if let Err(e) = recv.read_exact(&mut body).await {
                 // FinishedEarly after a header means clean end-of-stream after
@@ -1252,6 +1312,7 @@ fn spawn_reader(
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
+            let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
             match kind {
                 KIND_CONTROL => {
                     if let Ok(v) = serde_json::from_slice::<Value>(&body) {
@@ -1267,6 +1328,16 @@ fn spawn_reader(
                             body[4], body[5], body[6], body[7],
                             body[8], body[9], body[10], body[11],
                         ]);
+                        // --- TRACE ---
+                        if trace {
+                            chunk_counter += 1;
+                            let now = std::time::Instant::now();
+                            let since_last = last_chunk_time.map(|t| now.duration_since(t).as_micros()).unwrap_or(0);
+                            last_chunk_time = Some(now);
+                            if chunk_counter % 10 == 0 || since_last > 5000 {
+                                eprintln!("[TRACE direct recv] chunk={} hdr_read={}us body_read={}us since_last_chunk={}us len={} sid={} offset={}", chunk_counter, hdr_us, body_us, since_last, len, sid, offset);
+                            }
+                        }
                         // Zero-copy: convert Vec directly to Bytes, then split off the 12-byte prefix.
                         let bytes = bytes::Bytes::from(body);
                         let _ = tx.send(crate::net::Ev::Chunk(

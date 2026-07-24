@@ -8190,19 +8190,24 @@ async fn stream_one(
         let tx = tx.clone();
         let active_sid = active_sid.clone();
         handles.push(tokio::spawn(async move {
+            let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
             let mut f = tokio::fs::File::open(&path).await?;
             f.seek(SeekFrom::Start(start)).await?;
             let mut pos = start;
+            // Double-buffer with tracing + batching
             let mut buf_a = vec![0u8; chunk];
             let mut buf_b = vec![0u8; chunk];
             let mut using_buf_a = true;
+            let mut chunk_idx: u64 = 0;
 
             // Prime the first read into buf_a.
             let first_want = std::cmp::min(chunk as u64, end - pos) as usize;
             if first_want == 0 {
                 return Ok(());
             }
+            let t_first_read = if trace { Some(std::time::Instant::now()) } else { None };
             let mut cur_n = f.read(&mut buf_a[..first_want]).await?;
+            let _first_read_us = t_first_read.map(|t| t.elapsed().as_micros()).unwrap_or(0);
             if cur_n == 0 {
                 return Ok(());
             }
@@ -8229,12 +8234,24 @@ async fn stream_one(
 
                 // Send the current buffer.
                 let cur_buf = if using_buf_a { &buf_a[..cur_n] } else { &buf_b[..cur_n] };
+                let t_send_start = if trace { Some(std::time::Instant::now()) } else { None };
                 t.send_frame(sid, pos, cur_buf).await?;
+                let send_us = t_send_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                 pos += cur_n as u64;
 
                 let total =
                     progress.fetch_add(cur_n as u64, std::sync::atomic::Ordering::Relaxed) + cur_n as u64;
-                bar.lock().await.tick(total);
+                // Batch progress ticks
+                chunk_idx += 1;
+                let should_tick = chunk_idx % 8 == 0 || pos >= end;
+                let t_tick_start = if trace && should_tick { Some(std::time::Instant::now()) } else { None };
+                if should_tick {
+                    bar.lock().await.tick(total);
+                }
+                let tick_us = t_tick_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                if trace && (chunk_idx % 10 == 0 || send_us + tick_us > 5000) {
+                    eprintln!("[TRACE stream_one] chunk={} offset={} len={} send_frame={}us tick={}us", chunk_idx, pos - cur_n as u64, cur_n, send_us, tick_us);
+                }
                 if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
                     if total >= at
                         && !injected.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -8334,27 +8351,55 @@ struct IncomingFile {
 }
 
 /// Record a received byte interval [pos, pos+len) in the disjoint sorted range
-/// list, merging overlapping/adjacent intervals. Returns the total unique bytes
-/// covered by all ranges — the authoritative `received` for multi-stream OOO
-/// reassembly. Single-stream (no ranges) callers can skip this entirely.
-fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
+/// list, merging overlapping/adjacent intervals. Returns (delta_new_bytes, total_unique).
+/// Delta is the number of previously-unseen bytes added by this chunk.
+/// Total is the authoritative received count for multi-stream OOO reassembly.
+/// Optimized: binary search + incremental total via removed_total tracking.
+fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64) {
     let end = pos + len as u64;
-    // Skip past ranges that end before this one starts.
-    let mut i = 0;
-    while i < ranges.len() && ranges[i].1 < pos {
-        i += 1;
+    if ranges.is_empty() {
+        ranges.push((pos, end));
+        let total = len as u64;
+        return (total, total);
     }
-    // Merge all overlapping / adjacent ranges.
+    // Binary search for first range with end >= pos
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ranges[mid].1 < pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut idx = lo;
     let mut new_s = pos;
     let mut new_e = end;
-    while i < ranges.len() && ranges[i].0 <= end {
-        let (s, e) = ranges.remove(i);
+    let mut removed_total: u64 = 0;
+    // Merge all overlapping / adjacent ranges (adjacent if start <= new_e)
+    while idx < ranges.len() && ranges[idx].0 <= new_e {
+        let (s, e) = ranges[idx];
+        removed_total += e - s;
         new_s = new_s.min(s);
         new_e = new_e.max(e);
+        ranges.remove(idx);
     }
-    ranges.insert(i, (new_s, new_e));
-    // Sum all ranges: total unique bytes received.
-    ranges.iter().map(|(s, e)| e - s).sum()
+    let new_len = new_e - new_s;
+    ranges.insert(idx, (new_s, new_e));
+    let delta = new_len.saturating_sub(removed_total);
+    // Compute total: we could maintain it incrementally in caller, but for
+    // simplicity compute via sum of ranges (N = number of disjoint intervals,
+    // which is <= K, not number of chunks, so O(K) not O(N_chunks)).
+    // For true O(1), caller should track total via fetch_add(delta).
+    let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+    (delta, total)
+}
+
+/// Legacy wrapper returning total only (for call sites that need total)
+fn record_range_total(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
+    let (_delta, total) = record_range(ranges, pos, len);
+    total
 }
 
 /// Build the live shell policy from the persistent settings (global `shell` +
@@ -11168,10 +11213,19 @@ async fn recv_cmd(
                         mux.on_frame(sid, data).await;
                     }
                 } else if let Some(inc) = by_sid.get_mut(&(pid.clone(), sid)) {
+                    // --- TRACE recv path ---
+                    let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                    let t_recv_start = if trace { Some(std::time::Instant::now()) } else { None };
                     // Determine the write position: absolute offset from
                     // the sender (QUIC multi-stream) or current file end
                     // (DataChannel, via the received counter).
-                    let pos = offset.unwrap_or_else(|| inc.received.load(Ordering::Relaxed));
+                    // FIX: Use fetch_add for DataChannel to avoid race where two chunks
+                    // get same pos if they arrive before first pwrite completes.
+                    let pos = if let Some(off) = offset {
+                        off
+                    } else {
+                        inc.received.fetch_add(data.len() as u64, Ordering::Relaxed)
+                    };
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
                     let ranges = offset.map(|_| Arc::clone(&inc.ranges));
@@ -11179,23 +11233,41 @@ async fn recv_cmd(
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
                     let tx = tx.clone();
-                    let pid = pid.clone();
+                    let pid_c = pid.clone();
+                    let data_len = data.len();
+                    let trace_inner = trace;
                     tokio::task::spawn_blocking(move || {
+                        let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
                         let _ = pwrite_at(&file, &data, pos);
+                        let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                        let t_range = if trace_inner { Some(std::time::Instant::now()) } else { None };
                         if let Some(ranges) = ranges {
-                            let total = {
+                            let (_delta, total) = {
                                 let mut r = ranges.lock().unwrap();
                                 record_range(&mut *r, pos, data.len())
                             };
+                            // For correctness, store total (authoritative). Could also fetch_add(delta) if we tracked.
                             received.store(total, Ordering::Relaxed);
                         } else {
-                            received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                            // For DataChannel, pos was already reserved via fetch_add above,
+                            // so we don't need to update received here (already accounted).
+                            // But to keep total accurate in case of out-of-order (shouldn't happen for DC),
+                            // we ensure received at least covers pos+len.
+                            // No extra fetch_add needed since we already did it.
+                        }
+                        let range_us = t_range.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                        if trace_inner && (pwrite_us > 1000 || range_us > 1000) {
+                            eprintln!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us record_range={}us", pos, data_len, pwrite_us, range_us);
                         }
                         let prev = inflight.fetch_sub(1, Ordering::Relaxed);
                         if prev == 1 && end_seen.load(Ordering::Relaxed) {
-                            let _ = tx.send(Ev::MaybeComplete(pid, sid));
+                            let _ = tx.send(Ev::MaybeComplete(pid_c, sid));
                         }
                     });
+                    let recv_us = t_recv_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                    if trace && recv_us > 500 {
+                        eprintln!("[TRACE recv Ev::Chunk] sid={} offset={:?} len={} dispatch={}us", sid, offset, data_len, recv_us);
+                    }
                     let r = inc.received.load(Ordering::Relaxed);
                     if r != inc.last_tick {
                         inc.bar.tick(r);

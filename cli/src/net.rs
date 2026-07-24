@@ -537,13 +537,18 @@ impl Transport for DataChannelTransport {
     }
 
     async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let t_frame = if trace { Some(std::time::Instant::now()) } else { None };
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
         framed.extend_from_slice(payload);
+        let frame_us = t_frame.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         // Event-driven backpressure (C8a): park on the buffered-amount-low
         // notification instead of sleep-polling. Re-check after registering
         // to close the notify race. The read loop notifies on death, so a
         // sender parked on a dying channel wakes up and errors out.
+        let t_bp = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut waited = false;
         loop {
             if self.is_dead() {
                 return Err(anyhow!("channel closed"));
@@ -551,15 +556,26 @@ impl Transport for DataChannelTransport {
             if self.raw.buffered_amount() <= HIGH_WATER {
                 break;
             }
+            waited = true;
             let notified = self.drained.notified();
             if self.raw.buffered_amount() <= HIGH_WATER {
                 break;
             }
             notified.await;
         }
+        let bp_us = t_bp.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_write = if trace { Some(std::time::Instant::now()) } else { None };
         self.raw
             .write_data_channel(&Bytes::from(framed), false)
             .await?;
+        let write_us = t_write.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if trace {
+            static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 20 == 0 || bp_us > 1000 || write_us > 5000 {
+                eprintln!("[TRACE dc send_frame] sid={} len={} frame={}us bp_wait={}us waited={} buf_amt={} write={}us", sid, payload.len(), frame_us, bp_us, waited, self.raw.buffered_amount(), write_us);
+            }
+        }
         // Stamp at the unambiguous "bytes moved" point: the write returned Ok.
         // A frozen receiver (gate 11) stalls send_frame in the backpressure park
         // above, so this never fires and the link goes idle, exactly the signal
