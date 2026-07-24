@@ -2262,8 +2262,9 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
-    direct_pending: HashMap::new(),
-    resil: ResilienceState {
+        direct_pending: HashMap::new(),
+        buffered_offers: HashMap::new(),
+        resil: ResilienceState {
         stall_repairs: HashMap::new(),
         relay_committed: std::collections::HashSet::new(),
         warm_standby: net::warm_standby_override().unwrap_or(false),
@@ -3432,6 +3433,11 @@ struct Conn {
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
     direct_pending: HashMap<String, DirectPending>,
+    /// Bug 2: transport-offers that arrived before the receiver's DirectPending
+    /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
+    /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
+    /// the pending. pid → (candidates, srflx).
+    buffered_offers: HashMap<String, (Vec<String>, Option<String>)>,
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
@@ -3609,6 +3615,7 @@ impl Conn {
             deferred_left: HashMap::new(),
             recv_done: false,
             direct_pending: HashMap::new(),
+            buffered_offers: HashMap::new(),
             resil: ResilienceState {
                 stall_repairs: HashMap::new(),
                 relay_committed: std::collections::HashSet::new(),
@@ -3784,6 +3791,7 @@ impl Conn {
         // stale entry blocking adoption. Invariant: deferred_left only ever
         // holds sids that are still live links.
         self.deferred_left.remove(pid);
+        self.buffered_offers.remove(pid);
         if let Some(old) = self.links.remove(pid) {
             // Never await close in the event loop (F8): mark + spawn. A direct
             // link has no WebRTC peer; dropping the Link drops its QUIC transport
@@ -4223,6 +4231,12 @@ impl Conn {
                 probe,
             },
         );
+        // Bug 2: replay any transport-offers that were buffered while we had
+        // no DirectPending (the sender re-dialed after a mid-transfer death).
+        if let Some((cands, srflx)) = self.buffered_offers.remove(pid) {
+            ui::debug(&format!("replaying buffered transport-offer from {pid}"));
+            self.on_transport_offer(pid, cands, srflx);
+        }
     }
 
     /// rung-2: bind a raw punch socket and discover its srflx via STUN against
@@ -4441,55 +4455,64 @@ impl Conn {
         &mut self,
         pid: &str,
         primary: &Arc<dyn Transport>,
-        _tkey: [u8; 32],
+        tkey: [u8; 32],
     ) {
         let k = net::direct_streams();
         if k <= 1 {
             return;
         }
-        let Some(_peer_addr) = primary.remote_addr() else { return };
-        // BUGFIX: `primary.sid_answerer()` is TRUE on BOTH ends of a symmetric
-        // simultaneous-open (both peers establish via on_transport_offer, which
-        // hardcodes answerer=true), so it cannot split the worker roles — both
-        // sides would `accept_workers` and nobody dials. Use the deterministic
-        // polite-role tie-break: it compares (uid, then session-id) so exactly
-        // one side is "polite" and the other is not, giving opposite roles.
-        // Polite side accepts; the other dials.
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
         let answerer = net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid);
-        #[cfg(debug_assertions)]
-        eprintln!("[T] spawn_direct_workers: pid={pid} my_uid={} peer_uid={peer_uid:?} my_id={} answerer={answerer} k={k}", self.my_uid, self.my_id);
         let count = k - 1;
-
         let pid = pid.to_string();
         let tx = self.tx.clone();
         let primary = primary.clone();
 
-        // Only the ACCEPTOR creates workers (opens mesh streams on the primary).
-        // The DIALER side's accept loop (spawned by adopt_direct) picks up the
-        // incoming streams and delivers them via Ev::DirectWorkersReady.
-        if !answerer {
-            #[cfg(debug_assertions)]
-            eprintln!("[T] worker DIALER branch: mesh streams accepted by background loop");
-            return;
-        }
-
-        tokio::spawn(async move {
-            let mut workers = Vec::with_capacity(count);
-            #[cfg(debug_assertions)]
-            eprintln!("[T] worker ACCEPTOR branch: opening {count} mesh streams on primary");
+        if answerer {
+            // ACCEPTOR: create independent QUIC endpoints (one per worker),
+            // send their ports to the dialer, then accept incoming connections.
+            let mut endpoints = Vec::with_capacity(count);
+            let mut ports = Vec::with_capacity(count);
             for _ in 0..count {
-                if let Some((send, recv, conn)) = primary.open_stream().await {
-                    let worker = direct::make_transport(pid.clone(), conn, send, recv, tx.clone(), true, None);
-                    workers.push(worker);
+                if let Ok((ep, port)) = direct::bind_endpoint() {
+                    endpoints.push(ep);
+                    ports.push(port);
                 }
             }
-            #[cfg(debug_assertions)]
-            eprintln!("[T] acceptor mesh streams: {} workers", workers.len());
-            if !workers.is_empty() {
-                let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+            if endpoints.is_empty() {
+                return;
             }
-        });
+            let offer = json!({ "type": "worker-ports", "v": 1, "ports": ports, "for": &pid });
+            let p = primary.clone();
+            tokio::spawn(async move {
+                let _ = p.send_control(&offer).await;
+            });
+            tokio::spawn(async move {
+                let workers = direct::accept_workers(endpoints, tkey, pid.clone(), tx.clone(), count).await;
+                if !workers.is_empty() {
+                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+                }
+            });
+        } else {
+            // DIALER: wait for the acceptor's worker ports, then connect to each.
+            let peer_ip = match primary.remote_addr().map(|a| a.ip()) {
+                Some(ip) => ip,
+                None => return,
+            };
+            let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+            self.worker_port_tx.insert(pid.clone(), port_tx);
+            tokio::spawn(async move {
+                let ports = match tokio::time::timeout(std::time::Duration::from_secs(5), port_rx).await
+                {
+                    Ok(Ok(p)) => p,
+                    _ => return,
+                };
+                let workers = direct::dial_workers(ports, peer_ip, tkey, pid.clone(), tx.clone(), count).await;
+                if !workers.is_empty() {
+                    let _ = tx.send(net::Ev::DirectWorkersReady(pid, workers));
+                }
+            });
+        }
     }
 
     /// Per-tick: a direct attempt whose budget expired without an authenticated
@@ -4677,12 +4700,21 @@ impl Conn {
             stall_ms: net::stall_ms(),
         };
         match resilience::classify(&obs) {
-            // Flowing, or still establishing within grace: bytes are (or may yet
-            // be) moving. note_progress clears any open episode, so the brief
-            // windows during a repair (new transport not yet flowing) do NOT reset
-            // the attempt counter and re-arm rung (a).
-            resilience::Liveness::Flowing | resilience::Liveness::Establishing => {
+            resilience::Liveness::Flowing => {
                 self.note_progress(pid);
+                None
+            }
+            resilience::Liveness::Establishing => {
+                // During an active repair cycle (new transport not yet
+                // established), the episode must survive so the next stall
+                // picks up at the correct rung instead of restarting from
+                // Resume (which fails because the link was dropped).
+                let in_repair = self.resil.stall_repairs.get(pid)
+                    .map(|s| s.pending)
+                    .unwrap_or(false);
+                if !in_repair {
+                    self.note_progress(pid);
+                }
                 None
             }
             // Nothing in flight: drop stray bookkeeping.
@@ -4777,8 +4809,18 @@ impl Conn {
         if self.resil.warm_cutover.contains(pid) {
             return Rung::Repaired;
         }
+        // Check transport dead BEFORE the mutable borrow so the borrow-split
+        // is unambiguous. When the transport is structurally dead (I/O error,
+        // not a vanished peer), rung (a) Resume (re-offer on the same transport)
+        // is guaranteed wasted — send_frame checks the dead flag and errors
+        // immediately. Skip ahead to rung (c) Repair (re-dial direct QUIC) on
+        // the first ladder tick, collapsing a wasted stall cycle.
+        let dead_on_entry = self.transport_of(pid).map(|t| t.is_dead()).unwrap_or(false);
         let st = self.resil.stall_repairs.entry(pid.to_string()).or_default();
         st.pending = true;
+        if dead_on_entry && st.attempts == 0 {
+            st.attempts = 1;
+        }
         let attempt = st.attempts;
         st.attempts += 1;
 
@@ -7453,11 +7495,17 @@ async fn send_cmd(
                 out.iter().any(|o| o.accepted_once && !o.sent)
             };
             if let Some(idle) = conn.detect_stall(&active, in_flight) {
-                if conn.link_alive(&active).await {
+                let transport_dead = conn.transport_of(&active).map(|t| t.is_dead()).unwrap_or(false);
+                // A dead transport can't pass link_alive (write_framed sees
+                // dead=true and returns Err), but a structurally dead transport
+                // (I/O error, not a vanished peer) IS repairable via the
+                // ladder's re-dial rung. Only suppress the stall when the
+                // transport is NOT dead AND the control path is silent — which
+                // means the peer itself is gone (the C3/C4 establishment path
+                // owns that case).
+                if transport_dead || conn.link_alive(&active).await {
                     let _ = tx.send(Ev::TransferStalled(active, idle));
                 } else {
-                    // Control path also dead → not a data-only stall; let the
-                    // establishment watchdog (C3/C4) own it. Clear the episode.
                     conn.note_progress(&active);
                 }
             }
@@ -7590,7 +7638,25 @@ async fn send_cmd(
                     if data["probe"].as_bool() == Some(true) {
                         conn.answer_upgrade_probe(&from).await;
                     }
-                    conn.on_transport_offer(&from, cands, srflx);
+                    // Bug 2: same buffer-and-replay as the recv-side handler.
+                    // The receiver's re-dial transport-offer may arrive before
+                    // our DirectPending exists (our start_direct hasn't returned
+                    // yet, or PeerLeft dropped the link before the repair).
+                    if conn.direct_pending.contains_key(&from) {
+                        conn.on_transport_offer(&from, cands, srflx);
+                    } else {
+                        let known = crate::devices_load()
+                            .into_iter()
+                            .find(|(n, _)| conn.links.get(&from).map(|l| l.name == *n).unwrap_or(false));
+                        if let Some((name, secret)) = known {
+                            conn.start_direct(&from, &name, &secret).await;
+                        }
+                        if conn.direct_pending.contains_key(&from) {
+                            conn.on_transport_offer(&from, cands, srflx);
+                        } else {
+                            conn.buffered_offers.insert(from.clone(), (cands, srflx));
+                        }
+                    }
                     continue;
                 }
                 // L1-a: PAKE messages ride the opaque `signal` relay. Route them
@@ -7607,26 +7673,19 @@ async fn send_cmd(
                         let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
-                                if cer.secret().is_some() && !pake_done {
-                                    // Authenticated. DISCARD the secret (auth only).
-                                    pake_done = true;
-                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, sending"));
-                                    // --remember on the code path: hand over a FRESH
-                                    // long-lived pair secret only NOW, after the link
-                                    // is mutually authenticated (not the pre-PAKE
-                                    // channel). A SEPARATE explicit trust grant, not
-                                    // the ephemeral transfer secret (which is discarded).
-                                    if let (Some(name), Some(t)) = (&remember, conn.transport_of(&from)) {
-                                        let sec = fresh_secret();
-                                        let _ = t.send_control(&json!({ "type": "pair-keep", "secret": sec })).await;
-                                        devices_store(name, &sec)?;
-                                        ui::say(&format!("remembered this device as '{name}' (they must also pass --remember)"));
-                                    }
-                                    // Re-drive the canonical offer path for this peer by
-                                    // re-emitting ChannelReady (now that pake_done gates
-                                    // it open), reuses the proven offer/resume logic.
-                                    if let Some(t) = conn.transport_of(&from) {
-                                        let _ = tx.send(Ev::ChannelReady(from.clone(), t));
+                                if let Some(sec) = cer.secret() {
+                                    if !pake_done {
+                                        pake_done = true;
+                                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, sending"));
+                                        // Option A: drop WebRTC link and race direct-quic FIRST.
+                                        // If direct wins: transfer rides QUIC (130+ MB/s).
+                                        // If direct fails: expired_direct → establish → WebRTC fallback
+                                        //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
+                                        conn.drop_link(&from);
+                                        conn.start_direct(&from, &from, &sec).await;
+                                        if conn.active.is_none() {
+                                            conn.active = Some(from.clone());
+                                        }
                                     }
                                 }
                             }
@@ -8216,21 +8275,68 @@ async fn stream_one(
         let tx = tx.clone();
         let active_sid = active_sid.clone();
         handles.push(tokio::spawn(async move {
+            let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
             let mut f = tokio::fs::File::open(&path).await?;
             f.seek(SeekFrom::Start(start)).await?;
             let mut pos = start;
-            let mut buf = vec![0u8; chunk];
+            // Double-buffer with tracing + batching
+            let mut buf_a = vec![0u8; chunk];
+            let mut buf_b = vec![0u8; chunk];
+            let mut using_buf_a = true;
+            let mut chunk_idx: u64 = 0;
+
+            // Prime the first read into buf_a.
+            let first_want = std::cmp::min(chunk as u64, end - pos) as usize;
+            if first_want == 0 {
+                return Ok(());
+            }
+            let t_first_read = if trace { Some(std::time::Instant::now()) } else { None };
+            let mut cur_n = f.read(&mut buf_a[..first_want]).await?;
+            let _first_read_us = t_first_read.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            if cur_n == 0 {
+                return Ok(());
+            }
+
             while pos < end {
-                let want = std::cmp::min(chunk as u64, end - pos) as usize;
-                let n = f.read(&mut buf[..want]).await?;
-                if n == 0 {
-                    break;
-                }
-                t.send_frame(sid, pos, &buf[..n]).await?;
-                pos += n as u64;
+                // Fire the NEXT read (into the alternate buffer) BEFORE sending.
+                let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;
+                let next_read = if next_want > 0 {
+                    let mut f2 = tokio::fs::File::open(&path).await?;
+                    f2.seek(SeekFrom::Start(pos + cur_n as u64)).await?;
+                    let alt_buf = if using_buf_a {
+                        std::mem::replace(&mut buf_b, vec![0u8; chunk])
+                    } else {
+                        std::mem::replace(&mut buf_a, vec![0u8; chunk])
+                    };
+                    Some(tokio::spawn(async move {
+                        let mut buf = alt_buf;
+                        let n = f2.read(&mut buf[..next_want]).await?;
+                        Ok::<(Vec<u8>, usize), anyhow::Error>((buf, n))
+                    }))
+                } else {
+                    None
+                };
+
+                // Send the current buffer.
+                let cur_buf = if using_buf_a { &buf_a[..cur_n] } else { &buf_b[..cur_n] };
+                let t_send_start = if trace { Some(std::time::Instant::now()) } else { None };
+                t.send_frame(sid, pos, cur_buf).await?;
+                let send_us = t_send_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                pos += cur_n as u64;
+
                 let total =
-                    progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed) + n as u64;
-                bar.lock().await.tick(total);
+                    progress.fetch_add(cur_n as u64, std::sync::atomic::Ordering::Relaxed) + cur_n as u64;
+                // Batch progress ticks
+                chunk_idx += 1;
+                let should_tick = chunk_idx % 8 == 0 || pos >= end;
+                let t_tick_start = if trace && should_tick { Some(std::time::Instant::now()) } else { None };
+                if should_tick {
+                    bar.lock().await.tick(total);
+                }
+                let tick_us = t_tick_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                if trace && (chunk_idx % 10 == 0 || send_us + tick_us > 5000) {
+                    eprintln!("[TRACE stream_one] chunk={} offset={} len={} send_frame={}us tick={}us", chunk_idx, pos - cur_n as u64, cur_n, send_us, tick_us);
+                }
                 if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
                     if total >= at
                         && !injected.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -8238,6 +8344,21 @@ async fn stream_one(
                         eprintln!("[test] injecting synthetic peer-left for active sid at {total} bytes");
                         let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
                     }
+                }
+
+                // Collect the next read (it was running while we sent).
+                match next_read {
+                    Some(handle) => match handle.await {
+                        Ok(Ok((buf, n))) => {
+                            if using_buf_a { buf_b = buf; } else { buf_a = buf; }
+                            using_buf_a = !using_buf_a;
+                            cur_n = n;
+                            if cur_n == 0 { break; }
+                        }
+                        Ok(Err(e)) => return Err(e.into()),
+                        Err(e) => return Err(anyhow!("read-ahead task panicked: {e}")),
+                    },
+                    None => break,
                 }
             }
             t.flush().await?;
@@ -8315,27 +8436,55 @@ struct IncomingFile {
 }
 
 /// Record a received byte interval [pos, pos+len) in the disjoint sorted range
-/// list, merging overlapping/adjacent intervals. Returns the total unique bytes
-/// covered by all ranges — the authoritative `received` for multi-stream OOO
-/// reassembly. Single-stream (no ranges) callers can skip this entirely.
-fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
+/// list, merging overlapping/adjacent intervals. Returns (delta_new_bytes, total_unique).
+/// Delta is the number of previously-unseen bytes added by this chunk.
+/// Total is the authoritative received count for multi-stream OOO reassembly.
+/// Optimized: binary search + incremental total via removed_total tracking.
+fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64) {
     let end = pos + len as u64;
-    // Skip past ranges that end before this one starts.
-    let mut i = 0;
-    while i < ranges.len() && ranges[i].1 < pos {
-        i += 1;
+    if ranges.is_empty() {
+        ranges.push((pos, end));
+        let total = len as u64;
+        return (total, total);
     }
-    // Merge all overlapping / adjacent ranges.
+    // Binary search for first range with end >= pos
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if ranges[mid].1 < pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let mut idx = lo;
     let mut new_s = pos;
     let mut new_e = end;
-    while i < ranges.len() && ranges[i].0 <= end {
-        let (s, e) = ranges.remove(i);
+    let mut removed_total: u64 = 0;
+    // Merge all overlapping / adjacent ranges (adjacent if start <= new_e)
+    while idx < ranges.len() && ranges[idx].0 <= new_e {
+        let (s, e) = ranges[idx];
+        removed_total += e - s;
         new_s = new_s.min(s);
         new_e = new_e.max(e);
+        ranges.remove(idx);
     }
-    ranges.insert(i, (new_s, new_e));
-    // Sum all ranges: total unique bytes received.
-    ranges.iter().map(|(s, e)| e - s).sum()
+    let new_len = new_e - new_s;
+    ranges.insert(idx, (new_s, new_e));
+    let delta = new_len.saturating_sub(removed_total);
+    // Compute total: we could maintain it incrementally in caller, but for
+    // simplicity compute via sum of ranges (N = number of disjoint intervals,
+    // which is <= K, not number of chunks, so O(K) not O(N_chunks)).
+    // For true O(1), caller should track total via fetch_add(delta).
+    let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
+    (delta, total)
+}
+
+/// Legacy wrapper returning total only (for call sites that need total)
+fn record_range_total(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
+    let (_delta, total) = record_range(ranges, pos, len);
+    total
 }
 
 /// Build the live shell policy from the persistent settings (global `shell` +
@@ -8511,6 +8660,7 @@ async fn recv_cmd(
     // BUFFER the most recent pre-auth offer per candidate peer and REPLAY it the
     // instant that peer authenticates. Bounded by RECV_MAX_CANDIDATES (same keys).
     let mut recv_pending_offers: HashMap<String, Value> = HashMap::new();
+    let mut recv_pending_direct: HashMap<String, (Vec<String>, Option<String>)> = HashMap::new();
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
         std::env::var("FILAMENT_PAIR_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
@@ -9517,7 +9667,8 @@ async fn recv_cmd(
             for pid in all_pids {
                 let in_flight = by_sid.keys().any(|(p, _)| *p == pid);
                 if let Some(idle) = conn.detect_stall(&pid, in_flight) {
-                    if conn.link_alive(&pid).await {
+                    let transport_dead = conn.transport_of(&pid).map(|t| t.is_dead()).unwrap_or(false);
+                    if transport_dead || conn.link_alive(&pid).await {
                         let _ = tx.send(Ev::TransferStalled(pid, idle));
                     } else {
                         conn.note_progress(&pid);
@@ -9850,19 +10001,44 @@ async fn recv_cmd(
                         .as_array()
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    // rung-2: optional server-reflexive candidate for hole-punch.
                     let srflx = data["srflx"].as_str().map(String::from);
-                    // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
-                    // probe from the other end. If we're serving this peer on relay
-                    // and have no probe of our own yet, ARM one so the symmetric
-                    // direct dial can complete (a later re-send of the offer, the
-                    // peer re-emits 6x, is consumed by our now-armed pending). The
-                    // winner posts DirectUpgradeReady (verify-before-upgrade), never
-                    // clobbering the serving relay link.
+                    // If we're on the code path and this peer hasn't authenticated yet,
+                    // buffer the transport-offer until PAKE completes. Otherwise
+                    // on_transport_offer would find no DirectPending (no secret) and
+                    // silently drop the offer, causing the QUIC race to fail.
+                    if recv_code_path && !recv_pake_done {
+                        recv_pending_direct.insert(from.clone(), (cands, srflx));
+                        ui::debug(&format!("buffering pre-auth transport-offer from {from}"));
+                        continue;
+                    }
                     if data["probe"].as_bool() == Some(true) {
                         conn.answer_upgrade_probe(&from).await;
                     }
-                    conn.on_transport_offer(&from, cands, srflx);
+                    // Bug 2: the sender re-dialed after mid-transfer death.
+                    // If we don't have a DirectPending, buffer the offer and
+                    // replay it once start_direct creates one (same pattern as
+                    // Bug 1's pre-PAKE buffer). Without this, on_transport_offer
+                    // finds no pending and silently drops the offer.
+                    if conn.direct_pending.contains_key(&from) {
+                        conn.on_transport_offer(&from, cands, srflx);
+                    } else {
+                        // Also try to re-arm direct proactively: if we still
+                        // know this peer's (name,secret), create the pending
+                        // now so the buffered offer is replayed immediately.
+                        let known = crate::devices_load()
+                            .into_iter()
+                            .find(|(n, _)| conn.links.get(&from).map(|l| l.name == *n).unwrap_or(false));
+                        if let Some((name, secret)) = known {
+                            conn.start_direct(&from, &name, &secret).await;
+                        }
+                        if conn.direct_pending.contains_key(&from) {
+                            // Re-arm succeeded — process the offer now.
+                            conn.on_transport_offer(&from, cands, srflx);
+                        } else {
+                            conn.buffered_offers.insert(from.clone(), (cands, srflx));
+                            ui::debug(&format!("buffering re-dial transport-offer from {from} (no pending yet)"));
+                        }
+                    }
                     continue;
                 }
                 // L1-a: PAKE messages ride the opaque `signal` relay. Route them
@@ -9902,37 +10078,55 @@ async fn recv_cmd(
                         None => None,
                     };
                     let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                    // Extract secret first to avoid borrow checker issues with clear() and start_direct
+                    let mut secret_opt: Option<String> = None;
+                    let mut is_abort = false;
+                    let mut abort_why = String::new();
                     if let Some(cer) = recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
-                                if cer.secret().is_some() {
-                                    // This peer authenticated. Record it as THE
-                                    // sender, DISCARD the secret (auth only), and
-                                    // forget the other candidates.
-                                    recv_pake_peer = Some(from.clone());
-                                    recv_pake_done = true;
-                                    recv_cers.clear();
-                                    recv_deadlines.clear();
-                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
-                                    // Replay any offer this peer sent while we were
-                                    // still authenticating (the offer that raced the
-                                    // confirm), and drop the others' buffered offers.
-                                    let buffered = recv_pending_offers.remove(&from);
-                                    recv_pending_offers.clear();
-                                    if let Some(offer) = buffered {
-                                        let _ = tx.send(Ev::Control(from.clone(), offer));
-                                    }
-                                }
+                                secret_opt = cer.secret().cloned();
                             }
                             PakeInbound::Abort(why) => {
-                                // Drop THIS candidate only; the receive lives on.
-                                recv_cers.remove(&from);
-                                recv_deadlines.remove(&from);
-                                recv_pending_offers.remove(&from);
-                                ui::debug(&format!("recv: candidate {from} refused ({why}), dropped"));
+                                is_abort = true;
+                                abort_why = why;
                             }
                             PakeInbound::Ignored => {}
                         }
+                    }
+                    if let Some(sec) = secret_opt {
+                        // This peer authenticated. Record it as THE sender
+                        recv_pake_peer = Some(from.clone());
+                        recv_pake_done = true;
+                        recv_cers.clear();
+                        recv_deadlines.clear();
+                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
+                        // Option A: drop WebRTC link, start direct-QUIC race.
+                        conn.drop_link(&from);
+                        conn.start_direct(&from, &from, &sec).await;
+                        if conn.active.is_none() {
+                            conn.active = Some(from.clone());
+                        }
+                        // Replay any buffered transport-offer that arrived before PAKE
+                        // (now that start_direct created a DirectPending with the secret)
+                        if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
+                            conn.on_transport_offer(&from, cands, srflx);
+                        }
+                        recv_pending_direct.clear();
+                        // Replay any buffered file offers from this peer
+                        let buffered = recv_pending_offers.remove(&from);
+                        recv_pending_offers.clear();
+                        if let Some(offer) = buffered {
+                            let _ = tx.send(Ev::Control(from.clone(), offer));
+                        }
+                        continue;
+                    }
+                    if is_abort {
+                        recv_cers.remove(&from);
+                        recv_deadlines.remove(&from);
+                        recv_pending_offers.remove(&from);
+                        recv_pending_direct.remove(&from);
+                        ui::debug(&format!("recv: candidate {from} refused ({abort_why}), dropped"));
                     }
                     continue;
                 }
@@ -11149,34 +11343,50 @@ async fn recv_cmd(
                         mux.on_frame(sid, data).await;
                     }
                 } else if let Some(inc) = by_sid.get_mut(&(pid.clone(), sid)) {
+                    // --- TRACE recv path ---
+                    let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                    let t_recv_start = if trace { Some(std::time::Instant::now()) } else { None };
                     // Determine the write position: absolute offset from
                     // the sender (QUIC multi-stream) or current file end
                     // (DataChannel, via the received counter).
-                    let pos = offset.unwrap_or_else(|| inc.received.load(Ordering::Relaxed));
+                    // FIX: Use fetch_add for DataChannel to avoid race where two chunks
+                    // get same pos if they arrive before first pwrite completes.
+                    // For QUIC, record_range immediately in event loop (not inside spawn)
+                    // so received is accurate for upgrade seam (WebRTC->QUIC).
+                    let pos: u64;
+                    if let Some(off) = offset {
+                        pos = off;
+                        // For QUIC, update ranges + received immediately
+                        let mut r = inc.ranges.lock().unwrap();
+                        let (_delta, total) = record_range(&mut *r, pos, data.len());
+                        inc.received.store(total, Ordering::Relaxed);
+                    } else {
+                        pos = inc.received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    };
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
-                    let ranges = offset.map(|_| Arc::clone(&inc.ranges));
-                    let received = Arc::clone(&inc.received);
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
                     let tx = tx.clone();
-                    let pid = pid.clone();
+                    let pid_c = pid.clone();
+                    let data_len = data.len();
+                    let trace_inner = trace;
                     tokio::task::spawn_blocking(move || {
+                        let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
                         let _ = pwrite_at(&file, &data, pos);
-                        if let Some(ranges) = ranges {
-                            let total = {
-                                let mut r = ranges.lock().unwrap();
-                                record_range(&mut *r, pos, data.len())
-                            };
-                            received.store(total, Ordering::Relaxed);
-                        } else {
-                            received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                        if trace_inner && pwrite_us > 1000 {
+                            eprintln!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us", pos, data_len, pwrite_us);
                         }
                         let prev = inflight.fetch_sub(1, Ordering::Relaxed);
                         if prev == 1 && end_seen.load(Ordering::Relaxed) {
-                            let _ = tx.send(Ev::MaybeComplete(pid, sid));
+                            let _ = tx.send(Ev::MaybeComplete(pid_c, sid));
                         }
                     });
+                    let recv_us = t_recv_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+                    if trace && recv_us > 500 {
+                        eprintln!("[TRACE recv Ev::Chunk] sid={} offset={:?} len={} dispatch={}us", sid, offset, data_len, recv_us);
+                    }
                     let r = inc.received.load(Ordering::Relaxed);
                     if r != inc.last_tick {
                         inc.bar.tick(r);

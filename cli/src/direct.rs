@@ -60,6 +60,22 @@ fn test_block() -> bool {
     std::env::var("FILAMENT_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Bug 2 PROOF hook (test-only): `FILAMENT_DIRECT_TEST_DIE_AT=<bytes>` forces
+/// the FIRST established direct transport's QUIC connection to DIE (structurally
+/// error, dead=true) after N cumulative bytes of file data have been written
+/// across all send_frame calls. One-shot via process-global latch: only the
+/// first transport dies; the re-dial (the ladder's rung-c repair) streams
+/// normally and recovers.
+static DIED_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TOTAL_DIRECT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn die_after_bytes() -> Option<u64> {
+    std::env::var("FILAMENT_DIRECT_TEST_DIE_AT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
 /// P0 stall-detector PROOF hook (test-only): `FILAMENT_TEST_FREEZE_AFTER_BYTES=N`
 /// makes the FIRST direct transport's data path go silently dark after it has
 /// written ~N bytes of *file data*, `send_frame` parks forever while the QUIC
@@ -631,9 +647,16 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     tc.stream_receive_window(quinn::VarInt::from_u32(16_777_216));
     tc.receive_window(quinn::VarInt::from_u32(33_554_432));
     tc.send_window(16_777_216_u64);
-    // BBR congestion control: tolerates non-congestion loss (packet reordering,
-    // TURN relay jitter, cross-region spikes) without collapsing cwnd like Cubic.
-    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
+    // Congestion control: BBR by default (tolerates non-congestion loss).
+    // CUBIC can be selected via FILAMENT_CUBIC=1 — it responds more
+    // aggressively to policer loss (rate-limit drops), which can hold closer
+    // to the link ceiling on policed paths (e.g. DO 2 Gbps VM cap).
+    if std::env::var("FILAMENT_CUBIC").map(|v| v == "1").unwrap_or(false) {
+        use quinn_proto::congestion::CubicConfig;
+        tc.congestion_controller_factory(Arc::new(CubicConfig::default()));
+    } else {
+        tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
+    }
     // L3 data plane: enable QUIC unreliable DATAGRAMs (the serve_tun path rides
     // these, not the reliable streams L2 uses, to avoid TCP-over-TCP meltdown).
     // A 1 MiB receive ring absorbs bursts; advertising it lets the peer send to us.
@@ -928,7 +951,12 @@ impl DirectTransport {
         let mut hdr = [0u8; 5];
         hdr[0] = kind;
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        // --- TRACE ---
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
         let mut s = self.send.lock().await;
+        let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
         // QUIC streams apply flow control internally; write_all parks on the
         // peer's receive window, that IS the backpressure (no manual high-water
         // loop needed). A frozen receiver stalls here, so last_activity stops
@@ -937,9 +965,15 @@ impl DirectTransport {
             self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("direct write hdr: {e}"));
         }
+        let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
         if let Err(e) = s.write_all(payload).await {
             self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(anyhow!("direct write body: {e}"));
+        }
+        let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if trace && lock_us + hdr_us + body_us > 1000 {
+            eprintln!("[TRACE direct write_framed] lock={}us hdr={}us body={}us payload_len={} kind={}", lock_us, hdr_us, body_us, payload.len(), kind);
         }
         Ok(())
     }
@@ -1052,12 +1086,67 @@ impl Transport for DirectTransport {
                 }
             }
         }
-        let mut framed = Vec::with_capacity(4 + 8 + payload.len());
-        framed.extend_from_slice(&sid.to_be_bytes());
-        framed.extend_from_slice(&offset.to_be_bytes());
-        framed.extend_from_slice(payload);
-        self.write_framed(KIND_DATA, &framed).await?;
+        // --- PROD PATH: scatter-gather without intermediate Vec copy ---
+        // Previously this was behind a test-hook guard (dead code in prod), causing
+        // an extra 1 MiB alloc+memcpy per chunk. Now we write directly.
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut s = self.send.lock().await;
+        let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow!("direct connection closed"));
+        }
+        let mut hdr = [0u8; 5];
+        hdr[0] = KIND_DATA;
+        let payload_len = (4 + 8 + payload.len()) as u32;
+        hdr[1..5].copy_from_slice(&payload_len.to_be_bytes());
+        let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&hdr).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write hdr: {e}"));
+        }
+        let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_sid_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&sid.to_be_bytes()).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write sid: {e}"));
+        }
+        let sid_us = t_sid_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_off_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(&offset.to_be_bytes()).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write offset: {e}"));
+        }
+        let off_us = t_off_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
+        if let Err(e) = s.write_all(payload).await {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(anyhow!("direct write body: {e}"));
+        }
+        let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        drop(s);
+        let total_us = t_total_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if trace {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c % 10 == 0 || total_us > 5000 {
+                eprintln!("[TRACE direct send_frame] sid={} offset={} len={} lock={}us hdr={}us sid={}us off={}us body={}us total={}us", sid, offset, payload.len(), lock_us, hdr_us, sid_us, off_us, body_us, total_us);
+            }
+        }
         self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        // Bug 2 PROOF hook: force structural death mid-transfer after N bytes.
+        // One-shot: only the first transport dies; the re-dial (rung c) streams
+        // normally and recovers. total crosses the threshold AFTER this frame's
+        // bytes have been written, so the receiver has a real partial on disk.
+        if let Some(limit) = die_after_bytes() {
+            let total = TOTAL_DIRECT_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed) + payload.len() as u64;
+            if total >= limit && !DIED_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[test] DIRECT DEATH at {} total bytes (limit={}), transport killed", total, limit);
+                return Err(anyhow!("direct connection killed (test hook DIE_AT) after {} bytes", total));
+            }
+        }
         Ok(())
     }
 
@@ -1213,7 +1302,11 @@ fn spawn_reader(
     answerer: bool,
 ) {
     tokio::spawn(async move {
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
+        let mut chunk_counter: u64 = 0;
         loop {
+            let t_hdr_start = if trace { Some(std::time::Instant::now()) } else { None };
             let mut hdr = [0u8; 5];
             if let Err(e) = recv.read_exact(&mut hdr).await {
                 // FinishedEarly is the peer cleanly ending their send half
@@ -1239,6 +1332,8 @@ fn spawn_reader(
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
+            let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            let t_body_start = if trace { Some(std::time::Instant::now()) } else { None };
             let mut body = vec![0u8; len];
             if let Err(e) = recv.read_exact(&mut body).await {
                 // FinishedEarly after a header means clean end-of-stream after
@@ -1252,6 +1347,7 @@ fn spawn_reader(
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
+            let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
             match kind {
                 KIND_CONTROL => {
                     if let Ok(v) = serde_json::from_slice::<Value>(&body) {
@@ -1267,6 +1363,16 @@ fn spawn_reader(
                             body[4], body[5], body[6], body[7],
                             body[8], body[9], body[10], body[11],
                         ]);
+                        // --- TRACE ---
+                        if trace {
+                            chunk_counter += 1;
+                            let now = std::time::Instant::now();
+                            let since_last = last_chunk_time.map(|t| now.duration_since(t).as_micros()).unwrap_or(0);
+                            last_chunk_time = Some(now);
+                            if chunk_counter % 10 == 0 || since_last > 5000 {
+                                eprintln!("[TRACE direct recv] chunk={} hdr_read={}us body_read={}us since_last_chunk={}us len={} sid={} offset={}", chunk_counter, hdr_us, body_us, since_last, len, sid, offset);
+                            }
+                        }
                         // Zero-copy: convert Vec directly to Bytes, then split off the 12-byte prefix.
                         let bytes = bytes::Bytes::from(body);
                         let _ = tx.send(crate::net::Ev::Chunk(
