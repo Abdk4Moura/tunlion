@@ -633,7 +633,7 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     tc.send_window(16_777_216_u64);
     // BBR congestion control: tolerates non-congestion loss (packet reordering,
     // TURN relay jitter, cross-region spikes) without collapsing cwnd like Cubic.
-    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::BbrConfig::default()));
+    tc.congestion_controller_factory(Arc::new(quinn_proto::congestion::CubicConfig::default()));
     // L3 data plane: enable QUIC unreliable DATAGRAMs (the serve_tun path rides
     // these, not the reliable streams L2 uses, to avoid TCP-over-TCP meltdown).
     // A 1 MiB receive ring absorbs bursts; advertising it lets the peer send to us.
