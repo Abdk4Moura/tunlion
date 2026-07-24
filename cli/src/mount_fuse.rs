@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -111,22 +111,23 @@ struct CachedDir {
 }
 
 pub struct FilamentFs {
-    client: Mutex<MountClient>,
+    client: Arc<Mutex<MountClient>>,
     inodes: Mutex<InodeMap>,
-    // Keyed by the server file handle returned from opendir.
     dirs: Mutex<HashMap<u64, CachedDir>>,
+    prefetch: Arc<Mutex<HashMap<(u64, u64), Vec<u8>>>>,
+    handle: tokio::runtime::Handle,
 }
 
 impl FilamentFs {
-    pub fn new(client: MountClient) -> Self {
-        // The mount protocol is v2+. A v1 client reaching here is a programming
-        // error; fail fast rather than silently return empty data.
+    pub fn new(client: MountClient, handle: tokio::runtime::Handle) -> Self {
         assert!(client.binary_frames, "FilamentFs requires a v2 MountClient");
         let case_sensitive = client.caps.case_sensitive;
         FilamentFs {
-            client: Mutex::new(client),
+            client: Arc::new(Mutex::new(client)),
             inodes: Mutex::new(InodeMap::new(case_sensitive)),
             dirs: Mutex::new(HashMap::new()),
+            prefetch: Arc::new(Mutex::new(HashMap::new())),
+            handle,
         }
     }
 
@@ -159,6 +160,36 @@ impl FilamentFs {
 
     fn supports_fifo(&self) -> bool {
         self.client.lock().unwrap().caps.supports_fifo
+    }
+
+    fn schedule_prefetch(&self, fh: u64, next_offset: u64, chunk_size: u32, windows: u32) {
+        let max_read = self.client.lock().unwrap().caps.max_read_size;
+        let chunk_size = chunk_size.min(max_read);
+        let prefetch = Arc::clone(&self.prefetch);
+        let handle = self.handle.clone();
+        for w in 0..windows {
+            let offset = next_offset + w as u64 * chunk_size as u64;
+            let key = (fh, offset);
+            if prefetch.lock().unwrap().contains_key(&key) {
+                continue;
+            }
+            let client = Arc::clone(&self.client);
+            let prefetch2 = Arc::clone(&prefetch);
+            handle.spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut c = client.lock().unwrap();
+                    match c.call_sync_binary(
+                        MountOp::Read { fh, offset, size: chunk_size },
+                        None,
+                    ) {
+                        Ok((_, Some(data))) if !data.is_empty() => {
+                            prefetch2.lock().unwrap().insert(key, data.to_vec());
+                        }
+                        _ => {}
+                    }
+                }).await;
+            });
+        }
     }
 }
 
@@ -342,8 +373,20 @@ impl Filesystem for FilamentFs {
     ) {
         let max_read = self.client.lock().unwrap().caps.max_read_size;
         let size = size.min(max_read);
+        let key = (fh.0, offset);
+        {
+            let mut prefetch = self.prefetch.lock().unwrap();
+            if let Some(data) = prefetch.remove(&key) {
+                reply.data(&data);
+                self.schedule_prefetch(fh.0, offset + size as u64, size, 2);
+                return;
+            }
+        }
         match self.call_data(MountOp::Read { fh: fh.0, offset, size }, None) {
-            Ok((_v, Some(bytes))) => reply.data(&bytes),
+            Ok((_v, Some(bytes))) => {
+                reply.data(&bytes);
+                self.schedule_prefetch(fh.0, offset + size as u64, size, 3);
+            }
             Ok((_, None)) => reply.data(&[]),
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -694,9 +737,9 @@ mod tests {
     }
 }
 
-pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
+pub fn run_mount(client: MountClient, mountpoint: &Path, handle: tokio::runtime::Handle) -> anyhow::Result<()> {
     let max_read = client.caps.max_read_size;
-    let fs = FilamentFs::new(client);
+    let fs = FilamentFs::new(client, handle);
     let mut cfg = Config::default();
     // FSName labels the mount in /proc/mounts. max_read matches the server's
     // advertised cap so the kernel never requests a single read larger than
