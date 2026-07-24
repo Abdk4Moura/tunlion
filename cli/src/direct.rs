@@ -967,13 +967,23 @@ impl Transport for DirectTransport {
         if unblocked && !self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
             // Healthy upgrade standby: stream normally (no freeze ever).
             if !direct_flaky_upgrade() {
-                let mut framed = Vec::with_capacity(4 + 8 + payload.len());
-                framed.extend_from_slice(&sid.to_be_bytes());
-                framed.extend_from_slice(&offset.to_be_bytes());
-                framed.extend_from_slice(payload);
-                self.write_framed(KIND_DATA, &framed).await?;
-                self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-                return Ok(());
+            // Normal path: scatter-gather write avoids the 1 MiB
+            // allocation + copy per frame (was: Vec::with_capacity + copy
+            // into a framed buffer). Writing header+sid+offset and payload
+            // as two separate write_all calls saves ~500 MB heap traffic
+            // per 500 MB file.
+            let kind = KIND_DATA;
+            let mut hdr = [0u8; 5];
+            hdr[0] = kind;
+            let payload_len = (4 + 8 + payload.len()) as u32;
+            hdr[1..5].copy_from_slice(&payload_len.to_be_bytes());
+            let mut s = self.send.lock().await;
+            s.write_all(&hdr).await?;
+            s.write_all(&sid.to_be_bytes()).await?;
+            s.write_all(&offset.to_be_bytes()).await?;
+            s.write_all(payload).await?;
+            self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
             }
             // Flaky standby: carry a few KB (so it connects and looks alive for a
             // beat), then re-freeze so the verify window can never confirm.
