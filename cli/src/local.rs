@@ -76,7 +76,8 @@ impl Transport for LocalTransport {
         stream.write_all(&hdr).await?;
         stream.write_all(&sid_bytes).await?;
         stream.write_all(payload).await?;
-        stream.flush().await?;
+        // No flush per chunk: let TCP auto-batch and avoid the per-frame
+        // syscall cost (~2000 extra syscalls per 500MB file).
         self.last_activity.store(now_ms(), Ordering::Relaxed);
         Ok(())
     }
