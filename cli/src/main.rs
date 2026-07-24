@@ -7581,26 +7581,19 @@ async fn send_cmd(
                         let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
-                                if cer.secret().is_some() && !pake_done {
-                                    // Authenticated. DISCARD the secret (auth only).
-                                    pake_done = true;
-                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, sending"));
-                                    // --remember on the code path: hand over a FRESH
-                                    // long-lived pair secret only NOW, after the link
-                                    // is mutually authenticated (not the pre-PAKE
-                                    // channel). A SEPARATE explicit trust grant, not
-                                    // the ephemeral transfer secret (which is discarded).
-                                    if let (Some(name), Some(t)) = (&remember, conn.transport_of(&from)) {
-                                        let sec = fresh_secret();
-                                        let _ = t.send_control(&json!({ "type": "pair-keep", "secret": sec })).await;
-                                        devices_store(name, &sec)?;
-                                        ui::say(&format!("remembered this device as '{name}' (they must also pass --remember)"));
-                                    }
-                                    // Re-drive the canonical offer path for this peer by
-                                    // re-emitting ChannelReady (now that pake_done gates
-                                    // it open), reuses the proven offer/resume logic.
-                                    if let Some(t) = conn.transport_of(&from) {
-                                        let _ = tx.send(Ev::ChannelReady(from.clone(), t));
+                                if let Some(sec) = cer.secret() {
+                                    if !pake_done {
+                                        pake_done = true;
+                                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, sending"));
+                                        // Option A: drop WebRTC link and race direct-quic FIRST.
+                                        // If direct wins: transfer rides QUIC (130+ MB/s).
+                                        // If direct fails: expired_direct → establish → WebRTC fallback
+                                        //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
+                                        conn.drop_link(&from);
+                                        conn.start_direct(&from, &from, &sec).await;
+                                        if conn.active.is_none() {
+                                            conn.active = Some(from.clone());
+                                        }
                                     }
                                 }
                             }
@@ -9966,37 +9959,49 @@ async fn recv_cmd(
                         None => None,
                     };
                     let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                    // Extract secret first to avoid borrow checker issues with clear() and start_direct
+                    let mut secret_opt: Option<String> = None;
+                    let mut is_abort = false;
+                    let mut abort_why = String::new();
                     if let Some(cer) = recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
-                                if cer.secret().is_some() {
-                                    // This peer authenticated. Record it as THE
-                                    // sender, DISCARD the secret (auth only), and
-                                    // forget the other candidates.
-                                    recv_pake_peer = Some(from.clone());
-                                    recv_pake_done = true;
-                                    recv_cers.clear();
-                                    recv_deadlines.clear();
-                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
-                                    // Replay any offer this peer sent while we were
-                                    // still authenticating (the offer that raced the
-                                    // confirm), and drop the others' buffered offers.
-                                    let buffered = recv_pending_offers.remove(&from);
-                                    recv_pending_offers.clear();
-                                    if let Some(offer) = buffered {
-                                        let _ = tx.send(Ev::Control(from.clone(), offer));
-                                    }
-                                }
+                                secret_opt = cer.secret().cloned();
                             }
                             PakeInbound::Abort(why) => {
-                                // Drop THIS candidate only; the receive lives on.
-                                recv_cers.remove(&from);
-                                recv_deadlines.remove(&from);
-                                recv_pending_offers.remove(&from);
-                                ui::debug(&format!("recv: candidate {from} refused ({why}), dropped"));
+                                is_abort = true;
+                                abort_why = why;
                             }
                             PakeInbound::Ignored => {}
                         }
+                    }
+                    if let Some(sec) = secret_opt {
+                        // This peer authenticated. Record it as THE sender
+                        recv_pake_peer = Some(from.clone());
+                        recv_pake_done = true;
+                        recv_cers.clear();
+                        recv_deadlines.clear();
+                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
+                        // Option A: drop WebRTC link, start direct-QUIC race.
+                        conn.drop_link(&from);
+                        conn.start_direct(&from, &from, &sec).await;
+                        if conn.active.is_none() {
+                            conn.active = Some(from.clone());
+                        }
+                        // If direct wins → DirectReady → ChannelReady.
+                        // If direct fails → expired_direct → establish → WebRTC fallback.
+                        let buffered = recv_pending_offers.remove(&from);
+                        recv_pending_offers.clear();
+                        if let Some(offer) = buffered {
+                            let _ = tx.send(Ev::Control(from.clone(), offer));
+                        }
+                        continue;
+                    }
+                    if is_abort {
+                        recv_cers.remove(&from);
+                        recv_deadlines.remove(&from);
+                        recv_pending_offers.remove(&from);
+                        ui::debug(&format!("recv: candidate {from} refused ({abort_why}), dropped"));
                     }
                     continue;
                 }
@@ -11221,15 +11226,20 @@ async fn recv_cmd(
                     // (DataChannel, via the received counter).
                     // FIX: Use fetch_add for DataChannel to avoid race where two chunks
                     // get same pos if they arrive before first pwrite completes.
-                    let pos = if let Some(off) = offset {
-                        off
+                    // For QUIC, record_range immediately in event loop (not inside spawn)
+                    // so received is accurate for upgrade seam (WebRTC->QUIC).
+                    let pos: u64;
+                    if let Some(off) = offset {
+                        pos = off;
+                        // For QUIC, update ranges + received immediately
+                        let mut r = inc.ranges.lock().unwrap();
+                        let (_delta, total) = record_range(&mut *r, pos, data.len());
+                        inc.received.store(total, Ordering::Relaxed);
                     } else {
-                        inc.received.fetch_add(data.len() as u64, Ordering::Relaxed)
+                        pos = inc.received.fetch_add(data.len() as u64, Ordering::Relaxed);
                     };
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
-                    let ranges = offset.map(|_| Arc::clone(&inc.ranges));
-                    let received = Arc::clone(&inc.received);
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
                     let tx = tx.clone();
@@ -11240,24 +11250,8 @@ async fn recv_cmd(
                         let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
                         let _ = pwrite_at(&file, &data, pos);
                         let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-                        let t_range = if trace_inner { Some(std::time::Instant::now()) } else { None };
-                        if let Some(ranges) = ranges {
-                            let (_delta, total) = {
-                                let mut r = ranges.lock().unwrap();
-                                record_range(&mut *r, pos, data.len())
-                            };
-                            // For correctness, store total (authoritative). Could also fetch_add(delta) if we tracked.
-                            received.store(total, Ordering::Relaxed);
-                        } else {
-                            // For DataChannel, pos was already reserved via fetch_add above,
-                            // so we don't need to update received here (already accounted).
-                            // But to keep total accurate in case of out-of-order (shouldn't happen for DC),
-                            // we ensure received at least covers pos+len.
-                            // No extra fetch_add needed since we already did it.
-                        }
-                        let range_us = t_range.map(|t| t.elapsed().as_micros()).unwrap_or(0);
-                        if trace_inner && (pwrite_us > 1000 || range_us > 1000) {
-                            eprintln!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us record_range={}us", pos, data_len, pwrite_us, range_us);
+                        if trace_inner && pwrite_us > 1000 {
+                            eprintln!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us", pos, data_len, pwrite_us);
                         }
                         let prev = inflight.fetch_sub(1, Ordering::Relaxed);
                         if prev == 1 && end_seen.load(Ordering::Relaxed) {
