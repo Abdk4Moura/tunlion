@@ -25,6 +25,9 @@ static = ["dep:openssl-sys"]
 # from the binary — no `FILAMENT_TEST_*` env reads, no corruption/freeze/drop
 # injection logic. Build the gates' binary with `--features test-hooks`.
 test-hooks = []
+# Dev-debug logging (TRACE / STALL / worker-ports internals). Stripped from
+# default release builds so no debug strings reach the shipped binary.
+debug-logs = []
 # Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.

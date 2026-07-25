@@ -1,3 +1,9 @@
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "debug-logs")]
+        eprintln!($($arg)*);
+    };
+}
 // Networking plumbing: /api config fetch, Socket.IO signaling, the WebRTC
 // peer, and the Transport abstraction the transfer logic rides on.
 //
@@ -533,7 +539,7 @@ impl Transport for DataChannelTransport {
     }
 
     async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
-        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
         let t_frame = if trace { Some(std::time::Instant::now()) } else { None };
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
@@ -569,7 +575,7 @@ impl Transport for DataChannelTransport {
             static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let c = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if c % 20 == 0 || bp_us > 1000 || write_us > 5000 {
-                eprintln!("[TRACE dc send_frame] sid={} len={} frame={}us bp_wait={}us waited={} buf_amt={} write={}us", sid, payload.len(), frame_us, bp_us, waited, self.raw.buffered_amount(), write_us);
+                dlog!("[TRACE dc send_frame] sid={} len={} frame={}us bp_wait={}us waited={} buf_amt={} write={}us", sid, payload.len(), frame_us, bp_us, waited, self.raw.buffered_amount(), write_us);
             }
         }
         // Stamp at the unambiguous "bytes moved" point: the write returned Ok.
