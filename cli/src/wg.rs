@@ -76,6 +76,10 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
         bail!("wg set private-key failed");
     }
 
+    // Bring the interface up so `wg show listen-port` returns the ephemeral
+    // port the kernel actually assigned (down interfaces always report 0).
+    ip(&["link", "set", "dev", dev, "up"]).with_context(|| format!("bring {dev} up"))?;
+
     let out = Command::new("wg").args(["show", dev, "listen-port"]).output().context("wg show listen-port")?;
     if !out.status.success() {
         bail!("wg show listen-port failed: {}", String::from_utf8_lossy(&out.stderr).trim());

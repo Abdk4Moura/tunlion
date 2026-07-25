@@ -51,6 +51,8 @@ mod tun;
 /// L3 overlay manager (routes IP packets across peer links); Linux-only.
 #[cfg(l3)]
 mod l3;
+#[cfg(l3)]
+mod wg;
 mod shutdown;
 mod sshd;
 mod sshkeys;
@@ -69,6 +71,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 
 /// Positional write at an absolute offset, used by concurrent spawn_blocking
@@ -720,6 +723,9 @@ enum Cmd {
         /// TUN MTU (under the link datagram size; ~1280 is safe)
         #[arg(long, default_value_t = 1280)]
         mtu: u32,
+        /// Kernel-WireGuard data plane (ADR-0001) instead of the QUIC-datagram pump.
+        #[arg(long)]
+        wireguard: bool,
     },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `filament set`; this is kept for scripts that wrote it directly.
@@ -6438,29 +6444,60 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
-        Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu } => {
+        Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu, wireguard } => {
             #[cfg(l3)]
             {
                 let mut h = Sha256::new();
                 h.update(psk.as_bytes());
                 let secret: [u8; 32] = h.finalize().into();
-                let conn = match (listen, connect) {
+                let is_connector = connect.is_some();
+                let (conn, peer_ip) = match (listen, connect) {
                     (Some(b), None) => {
+                        let bind: SocketAddr = b.parse().context("bad --listen address")?;
                         ui::say(&format!("  serve-tun: listening on {b} (dev {dev}, {tun_addr})"));
-                        direct::serve_tun_listen(b.parse().context("bad --listen address")?, &secret).await?
+                        let c = direct::serve_tun_listen(bind, &secret).await?;
+                        let ip = c.remote_address().ip();
+                        (c, ip)
                     }
                     (None, Some(p)) => {
+                        let peer: SocketAddr = p.parse().context("bad --connect address")?;
+                        let ip = peer.ip();
                         ui::say(&format!("  serve-tun: connecting to {p} (dev {dev}, {tun_addr})"));
-                        direct::serve_tun_connect(p.parse().context("bad --connect address")?, &secret).await?
+                        let c = direct::serve_tun_connect(peer, &secret).await?;
+                        (c, ip)
                     }
                     _ => bail!("serve-tun needs exactly one of --listen <bind> or --connect <host:port>"),
                 };
-                ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
+                if wireguard {
+                    let (privk, pubk) = wg::gen_keypair().context("wg gen_keypair")?;
+                    let our_port = wg::create_iface(&dev, &privk).context("wg create_iface")?;
+                    let (peer_pub, peer_port) = wg::exchange(&conn, &pubk, our_port, is_connector).await?;
+                    wg::configure_peer(
+                        &dev,
+                        &peer_pub,
+                        &wg::network_cidr(&tun_addr)?,
+                        &wg::endpoint(peer_ip, peer_port),
+                        &tun_addr,
+                        mtu,
+                    )?;
+                    ui::say(&format!(
+                        "  {} serve-tun link up (wireguard) on {dev}",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                    ));
+                    tokio::select! {
+                        _ = conn.closed() => {},
+                        _ = tokio::signal::ctrl_c() => {},
+                    }
+                    wg::teardown(&dev);
+                    Ok(())
+                } else {
+                    ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
+                }
             }
             #[cfg(not(l3))]
             {
-                let _ = (tun_addr, listen, connect, psk, dev, mtu);
+                let _ = (tun_addr, listen, connect, psk, dev, mtu, wireguard);
                 bail!("serve-tun (L3) is Linux-only")
             }
         }
