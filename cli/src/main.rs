@@ -1742,14 +1742,6 @@ fn shell_argv(shell_program: Option<&str>, shell_user: Option<&str>) -> Vec<Stri
     argv
 }
 
-/// Dev-debug logging: dlog! expands to eprintln! only under debug-logs feature.
-macro_rules! dlog {
-    ($($arg:tt)*) => {
-        #[cfg(feature = "debug-logs")]
-        eprintln!($($arg)*);
-    };
-}
-
 /// #4: bridge ONE link's PTY stream to a persistent session. Inbound data frames
 /// (`rx`, the mux's per-sid pipe) become keystrokes; resize events (`rrx`, the
 /// mux resizer) become window-size changes. When the channel drops, `rx` closes
@@ -2083,7 +2075,7 @@ async fn up_cmd(
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
-        dlog!("[up] already-up: pidfile={:?} pid={pid} cmdline={:?}", pidfile(), std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default());
+        eprintln!("[up] already-up: pidfile={:?} pid={pid} cmdline={:?}", pidfile(), std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default());
         bail!("already up (pid {pid}), `filament status` / `filament down`");
     }
     let dir = drop_dir(dir);
@@ -7831,9 +7823,9 @@ async fn send_cmd(
             Ev::Control(pid, v) => match v["type"].as_str() {
                 Some("worker-ports") => {
                     let pid = v["for"].as_str().unwrap_or_default();
-                    ui::trace(&format!("[T:SERVE] worker-ports handler: looking up key={pid}"));
+                    eprintln!("[T:SERVE] worker-ports handler: looking up key={pid}");
                     if let Some(tx) = conn.worker_port_tx.remove(pid) {
-                        ui::trace(&format!("[T:SERVE] worker-ports handler: FOUND key={pid}"));
+                        eprintln!("[T:SERVE] worker-ports handler: FOUND key={pid}");
                         let ports: Vec<u16> = v["ports"]
                             .as_array()
                             .map(|a| {
@@ -8283,7 +8275,7 @@ async fn stream_one(
         let tx = tx.clone();
         let active_sid = active_sid.clone();
         handles.push(tokio::spawn(async move {
-            let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+            let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
             let mut f = tokio::fs::File::open(&path).await?;
             f.seek(SeekFrom::Start(start)).await?;
             let mut pos = start;
@@ -8343,7 +8335,7 @@ async fn stream_one(
                 }
                 let tick_us = t_tick_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                 if trace && (chunk_idx % 10 == 0 || send_us + tick_us > 5000) {
-                    dlog!("[TRACE stream_one] chunk={} offset={} len={} send_frame={}us tick={}us", chunk_idx, pos - cur_n as u64, cur_n, send_us, tick_us);
+                    eprintln!("[TRACE stream_one] chunk={} offset={} len={} send_frame={}us tick={}us", chunk_idx, pos - cur_n as u64, cur_n, send_us, tick_us);
                 }
                 if let (Some(at), Some(asid)) = (inject_at, active_sid.as_ref()) {
                     if total >= at
@@ -10357,9 +10349,9 @@ async fn recv_cmd(
                 }
                 Some("worker-ports") => {
                     let pid = v["for"].as_str().unwrap_or_default();
-                    ui::trace(&format!("[T:CLI] worker-ports handler: looking up key={pid}"));
+                    eprintln!("[T:CLI] worker-ports handler: looking up key={pid}");
                     if let Some(tx) = conn.worker_port_tx.remove(pid) {
-                        ui::trace(&format!("[T:CLI] worker-ports handler: FOUND key={pid}"));
+                        eprintln!("[T:CLI] worker-ports handler: FOUND key={pid}");
                         let ports: Vec<u16> = v["ports"]
                             .as_array()
                             .map(|a| {
@@ -11352,7 +11344,7 @@ async fn recv_cmd(
                     }
                 } else if let Some(inc) = by_sid.get_mut(&(pid.clone(), sid)) {
                     // --- TRACE recv path ---
-                    let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+                    let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
                     let t_recv_start = if trace { Some(std::time::Instant::now()) } else { None };
                     // Determine the write position: absolute offset from
                     // the sender (QUIC multi-stream) or current file end
@@ -11384,7 +11376,7 @@ async fn recv_cmd(
                         let _ = pwrite_at(&file, &data, pos);
                         let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                         if trace_inner && pwrite_us > 1000 {
-                            dlog!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us", pos, data_len, pwrite_us);
+                            eprintln!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us", pos, data_len, pwrite_us);
                         }
                         let prev = inflight.fetch_sub(1, Ordering::Relaxed);
                         if prev == 1 && end_seen.load(Ordering::Relaxed) {
@@ -11393,7 +11385,7 @@ async fn recv_cmd(
                     });
                     let recv_us = t_recv_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                     if trace && recv_us > 500 {
-                        dlog!("[TRACE recv Ev::Chunk] sid={} offset={:?} len={} dispatch={}us", sid, offset, data_len, recv_us);
+                        eprintln!("[TRACE recv Ev::Chunk] sid={} offset={:?} len={} dispatch={}us", sid, offset, data_len, recv_us);
                     }
                     let r = inc.received.load(Ordering::Relaxed);
                     if r != inc.last_tick {

@@ -1,9 +1,3 @@
-macro_rules! dlog {
-    ($($arg:tt)*) => {
-        #[cfg(feature = "debug-logs")]
-        eprintln!($($arg)*);
-    };
-}
 // Rung-1 DIRECT CLI<->CLI transport over QUIC (quinn).
 //
 // Why this exists: WebRTC/ICE/STUN/TURN is browser machinery, two CLIs are
@@ -958,7 +952,7 @@ impl DirectTransport {
         hdr[0] = kind;
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         // --- TRACE ---
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
         let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
         let mut s = self.send.lock().await;
         let lock_us = t_lock_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
@@ -979,7 +973,7 @@ impl DirectTransport {
         }
         let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if trace && lock_us + hdr_us + body_us > 1000 {
-            dlog!("[TRACE direct write_framed] lock={}us hdr={}us body={}us payload_len={} kind={}", lock_us, hdr_us, body_us, payload.len(), kind);
+            eprintln!("[TRACE direct write_framed] lock={}us hdr={}us body={}us payload_len={} kind={}", lock_us, hdr_us, body_us, payload.len(), kind);
         }
         Ok(())
     }
@@ -1095,7 +1089,7 @@ impl Transport for DirectTransport {
         // --- PROD PATH: scatter-gather without intermediate Vec copy ---
         // Previously this was behind a test-hook guard (dead code in prod), causing
         // an extra 1 MiB alloc+memcpy per chunk. Now we write directly.
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
         let t_total_start = if trace { Some(std::time::Instant::now()) } else { None };
         let t_lock_start = if trace { Some(std::time::Instant::now()) } else { None };
         let mut s = self.send.lock().await;
@@ -1137,7 +1131,7 @@ impl Transport for DirectTransport {
             static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if c % 10 == 0 || total_us > 5000 {
-                dlog!("[TRACE direct send_frame] sid={} offset={} len={} lock={}us hdr={}us sid={}us off={}us body={}us total={}us", sid, offset, payload.len(), lock_us, hdr_us, sid_us, off_us, body_us, total_us);
+                eprintln!("[TRACE direct send_frame] sid={} offset={} len={} lock={}us hdr={}us sid={}us off={}us body={}us total={}us", sid, offset, payload.len(), lock_us, hdr_us, sid_us, off_us, body_us, total_us);
             }
         }
         self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -1308,7 +1302,7 @@ fn spawn_reader(
     answerer: bool,
 ) {
     tokio::spawn(async move {
-        let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
+        let trace = std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
         let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
         let mut chunk_counter: u64 = 0;
         loop {
@@ -1376,7 +1370,7 @@ fn spawn_reader(
                             let since_last = last_chunk_time.map(|t| now.duration_since(t).as_micros()).unwrap_or(0);
                             last_chunk_time = Some(now);
                             if chunk_counter % 10 == 0 || since_last > 5000 {
-                                dlog!("[TRACE direct recv] chunk={} hdr_read={}us body_read={}us since_last_chunk={}us len={} sid={} offset={}", chunk_counter, hdr_us, body_us, since_last, len, sid, offset);
+                                eprintln!("[TRACE direct recv] chunk={} hdr_read={}us body_read={}us since_last_chunk={}us len={} sid={} offset={}", chunk_counter, hdr_us, body_us, since_last, len, sid, offset);
                             }
                         }
                         // Zero-copy: convert Vec directly to Bytes, then split off the 12-byte prefix.
