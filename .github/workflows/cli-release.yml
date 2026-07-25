@@ -66,6 +66,18 @@ jobs:
             export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
           fi
           cargo build --release --target ${{ matrix.target }} ${{ matrix.features }}
+      - name: Guard - no dev-debug profiling in the release binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="cli/target/${{ matrix.target }}/release/filament"
+          # Per-chunk/per-frame profiling logging must stay compile-stripped (behind
+          # the `debug-logs` feature) and MUST NOT ship in a default release build.
+          # If any marker is present, a dev-debug log leaked - fail the release.
+          if strings "$BIN" | grep -nE 'FILAMENT_TRACE_THROUGHPUT|\[TRACE stream_one|\[TRACE recv|\[TRACE direct|\[TRACE dc'; then
+            echo "::error::dev-debug profiling logging leaked into the release binary"; exit 1
+          fi
+          echo "release binary clean of dev-debug profiling logging"
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
