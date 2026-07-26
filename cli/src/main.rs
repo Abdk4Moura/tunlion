@@ -10731,9 +10731,8 @@ async fn recv_cmd(
                                             }
                                             // Promote provisional identity to durable if present and matches overlay key
                                             if let Some(prov_cert) = load_provisional_identity(&who) {
-                                                if prov_cert.device_pub != ann.pubkey {
-                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  connection_key_divergence: provisional device {} has cert device_pub {} != overlay key {} - clearing provisional, no anchor written",
-                                                        who, hex::encode(prov_cert.device_pub), hex::encode(ann.pubkey))));
+                                                if let Err(e) = identity::provisional_promote_ok(&prov_cert, &ann.pubkey) {
+                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  {} for device {} - clearing provisional, no anchor written", e, who)));
                                                     clear_provisional_identity(&who);
                                                     // Do not add peer, no durable write
                                                     continue;

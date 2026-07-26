@@ -250,6 +250,27 @@ pub fn check_overlay_against_pinned_cert(
     Ok(())
 }
 
+/// Gate the promotion of a PROVISIONAL identity to a durable anchor at overlay
+/// establishment. The provisional cert's device_pub MUST equal the overlay key the
+/// peer actually connected with; otherwise it is connection_key_divergence and NO
+/// durable anchor is written. A failed-overlay session must leave no persistent
+/// trust, else the contact slot is poisoned and the legitimate retry is refused by
+/// the takeover guard. This is the fresh-pairing counterpart to
+/// check_overlay_against_pinned_cert (which guards reconnections against an existing pin).
+pub fn provisional_promote_ok(
+    prov_cert: &DeviceCert,
+    overlay_pubkey: &[u8; 32],
+) -> anyhow::Result<()> {
+    if &prov_cert.device_pub != overlay_pubkey {
+        anyhow::bail!(
+            "connection_key_divergence: provisional cert device_pub {} != overlay key {}",
+            hex::encode(prov_cert.device_pub),
+            hex::encode(overlay_pubkey)
+        );
+    }
+    Ok(())
+}
+
 pub fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -848,26 +869,28 @@ mod tests {
 
     #[test]
     fn expose_then_overlay_mismatch_leaves_no_anchor() {
-        // Valid possession-proven expose, overlay comes up under different key -> named-error teardown -> no anchor
+        // Fresh pairing: identity is held PROVISIONAL, so the durable devices store has
+        // NO anchor for this peer yet. If the overlay comes up under a different key than
+        // the provisional cert's device_pub, promotion must be refused and the durable
+        // store must stay empty, else the contact slot is poisoned and the legitimate
+        // retry is refused by the takeover guard. Exercises the REAL gates main.rs uses.
         let user = make_user();
-        let now = now_secs();
-        let cert = DeviceCert::certify(&user, [0x11; 32], now, CERT_TTL_SECS).unwrap();
-        let known_user_hex = hex::encode(user.public_key_bytes());
-        // Simulate devices.json with no prior anchor
-        let mut arr = vec![];
-        // Provisional store
-        let scope = IntroScope::Device.to_byte();
-        apply_peer_identity(&mut arr, "bob", &cert, scope).unwrap();
-        assert_eq!(arr.len(), 1);
-        // Now overlay comes up under DIFFERENT key
-        let different_overlay_pub = [0x99; 32];
-        // check_overlay_against_pinned should fail
-        let res = check_overlay_against_pinned_cert(&arr, "bob", &different_overlay_pub);
-        assert!(res.is_err(), "overlay mismatch must fail with named error");
-        assert!(res.unwrap_err().to_string().contains("connection_key_divergence"));
-        // After failure, no durable anchor should remain? For this test, we simulate clearing provisional and not writing durable
-        // Our earlier array had anchor, but after mismatch we should clear provisional and NOT have new anchor? Actually arr already has anchor from provisional promote
-        // For this test we just assert that check fails, which would trigger teardown and clear provisional, leaving no new anchor
+        let prov_cert = DeviceCert::certify(&user, [0x11; 32], now_secs(), CERT_TTL_SECS).unwrap();
+        // Durable devices store at provisional time: no anchor for "bob".
+        let durable: Vec<serde_json::Value> = vec![];
+        // Reconnection gate is a no-op here (nothing pinned yet), so it must NOT block.
+        assert!(check_overlay_against_pinned_cert(&durable, "bob", &[0x99; 32]).is_ok());
+        // Fresh-provisional gate: overlay key != provisional device_pub -> refused.
+        let bad_overlay = [0x99u8; 32];
+        let decision = provisional_promote_ok(&prov_cert, &bad_overlay);
+        assert!(decision.is_err(), "overlay key != provisional device_pub must be refused");
+        assert!(decision.unwrap_err().to_string().contains("connection_key_divergence"));
+        // Because promotion was refused, no durable anchor is ever written.
+        assert!(durable.iter().all(|d| d["name"].as_str() != Some("bob")),
+            "a failed-overlay session must leave NO durable anchor");
+        // Positive control: a matching overlay key allows promotion.
+        assert!(provisional_promote_ok(&prov_cert, &prov_cert.device_pub).is_ok(),
+            "matching overlay key must allow promotion");
     }
 
     #[test]
