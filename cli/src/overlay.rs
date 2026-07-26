@@ -161,6 +161,29 @@ impl Identity {
         sig64.copy_from_slice(sig.as_ref());
         Announce { pubkey: self.pubkey, addr: self.addr, seq, sig: sig64 }
     }
+
+    /// Return the 32-byte Ed25519 public key (for cert signing / identity binding).
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.pubkey
+    }
+
+    /// Sign arbitrary bytes with this device's Ed25519 private key (for possession binding).
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        let sig = self.keypair.sign(msg);
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        out
+    }
+}
+
+/// Convenience: load the overlay key and return just the 32-byte public key.
+pub fn overlay_pubkey_bytes() -> Result<[u8; 32]> {
+    Ok(Identity::load_or_create()?.public_key_bytes())
+}
+
+/// Convenience: sign arbitrary bytes with this device's overlay private key.
+pub fn overlay_sign_possession(msg: &[u8]) -> Result<[u8; 64]> {
+    Ok(Identity::load_or_create()?.sign(msg))
 }
 
 /// The message an announce signs: DOMAIN || addr(16) || seq_be(8) || cb.

@@ -108,11 +108,13 @@ pub enum Inbound {
 /// so both `pair` and the transfer path drive it identically.
 pub struct Ceremony {
     /// The agreed capability set (relayed in the confirm payload) and its
-    /// canonical form (fed to the MAC). The password (spoken words) and nameplate
-    /// are consumed by the SPAKE2 `state` at construction and never re-read here,
-    /// so they are not retained: the words NEVER leave the process by design.
+    /// canonical form (fed to the MAC).
     caps: Vec<String>,
     caps_canon: String,
+    /// Introduction scope byte (0x00 User, 0x01 Device), MANDATORY, bound into
+    /// the confirmation transcript alongside caps + sorted DTLS fingerprints.
+    /// Derived from the authenticated introduction token; no default.
+    scope: u8,
     /// Live SPAKE2 session (consumed by `finish`). `None` after K is derived.
     state: Option<PakeState>,
     /// Our outbound 33-byte SPAKE2 element.
@@ -132,12 +134,19 @@ impl Ceremony {
     /// Begin a symmetric SPAKE2 ceremony. `password` is the spoken words,
     /// `nameplate` the numeric routing suffix. Both sides MUST pass identical
     /// password AND nameplate (the SPAKE2 identity) or they derive different K.
-    pub fn new(password: &str, nameplate: &str, caps: Vec<String>) -> Self {
+    /// `scope` is the introduction scope byte (0x00 User-scoped "reach me",
+    /// 0x01 Device-scoped), MANDATORY, derived from the authenticated
+    /// introduction token (or the fixed convention for plain pair). Both sides
+    /// must pass the SAME scope byte or confirmation fails (confused-deputy
+    /// prevention). There is no default: every production call site must
+    /// explicitly pass the scope it derived from the token.
+    pub fn new(password: &str, nameplate: &str, caps: Vec<String>, scope: u8) -> Self {
         let caps_canon = crate::pake::canonical_caps(&caps);
         let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
         Ceremony {
             caps,
             caps_canon,
+            scope,
             state: Some(state),
             msg,
             k: None,
@@ -151,10 +160,26 @@ impl Ceremony {
     /// Re-mint with a FRESH nameplate (and optionally fresh words) after a
     /// server `taken` collision. Resets the session and the sent-flag so the new
     /// element goes out. The caller re-emits `pair-create {nameplate}`.
+    /// Scope is preserved (same introduction).
     pub fn restart(&mut self, password: &str, nameplate: &str) {
         let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
         self.state = Some(state);
         self.msg = msg;
+        self.k = None;
+        self.secret = None;
+        self.aborted = None;
+        self.sent_msg = false;
+        self.sent_confirm = false;
+    }
+
+    /// Explicitly re-mint with a new scope (if the introduction token's scope
+    /// changes, which should be rare). Used only in tests for scope-downgrade.
+    #[cfg(test)]
+    pub fn restart_with_scope(&mut self, password: &str, nameplate: &str, scope: u8) {
+        let (state, msg) = crate::pake::start(password.as_bytes(), nameplate.as_bytes());
+        self.state = Some(state);
+        self.msg = msg;
+        self.scope = scope;
         self.k = None;
         self.secret = None;
         self.aborted = None;
@@ -186,24 +211,43 @@ impl Ceremony {
 
     /// The opaque `signal` payload carrying our key-confirmation MAC, IF K is
     /// derived AND it hasn't been sent yet. Needs both DTLS fingerprints (so the
-    /// MAC binds them). `None` until ready / once sent. Marks it sent.
+    /// MAC binds them) AND the introduction scope byte (so a scope downgrade is
+    /// detected). `None` until ready / once sent.
     pub fn take_confirm_payload(&mut self, my_fp: &str, their_fp: &str) -> Option<Value> {
         if self.sent_confirm {
             return None;
         }
         let k = self.k.as_ref()?;
-        let mac = crate::pake::our_confirm(k, my_fp, their_fp, &self.caps_canon);
+        // Scope byte is MANDATORY and is derived from the authenticated
+        // introduction token (or the fixed convention for plain pair).
+        let mac = crate::pake::our_confirm(k, my_fp, their_fp, &self.caps_canon, self.scope);
         self.sent_confirm = true;
         Some(json!({
             "type": "pake-confirm", "v": 2,
             "mac": b64_encode(&mac),
             "caps": self.caps.clone(),
+            "scope": self.scope,
         }))
     }
 
     /// Whether K has been derived (the peer's element was consumed).
     pub fn has_k(&self) -> bool {
         self.k.is_some()
+    }
+
+    /// Borrow K if derived (for sealing identity-expose).
+    pub fn k(&self) -> Option<&Vec<u8>> {
+        self.k.as_ref()
+    }
+
+    /// Scope byte (mandatory, no default).
+    pub fn scope(&self) -> u8 {
+        self.scope
+    }
+
+    /// Canonical caps string (for possession binding).
+    pub fn caps_canon(&self) -> &str {
+        &self.caps_canon
     }
 
     /// Feed an inbound `signal` payload. PAKE messages are consumed; SDP/ICE is
@@ -240,13 +284,15 @@ impl Ceremony {
                         "no DTLS fingerprints to bind confirmation (abort)".to_string(),
                     );
                 };
-                // We MAC against OUR fixed caps, so a server that rewrites the
-                // relayed `caps` field cannot make the MAC verify.
+                // We MAC against OUR fixed caps + scope, so a server that rewrites the
+                // relayed `caps` or `scope` field cannot make the MAC verify. Scope
+                // byte is read from the authenticated token, not a local guess.
                 if crate::pake::verify_peer_confirm(
                     &k,
                     my_fp,
                     their_fp,
                     &self.caps_canon,
+                    self.scope,
                     &recv_mac,
                 ) {
                     self.secret = Some(crate::pake::secret_from_k(&k));
@@ -279,9 +325,15 @@ mod tests {
     }
 
     // Run a full two-party ceremony in process and return both outcomes.
+    // Scope is MANDATORY: for plain pair (device-to-device) both sides use
+    // Device-scoped (0x01), derived from the fixed convention for pair.
+    // Scope byte is read from the authenticated token, not a local guess.
     fn run_pair(pw_a: &str, pw_b: &str, np: &str) -> (Ceremony, Ceremony) {
-        let mut a = Ceremony::new(pw_a, np, pair_v2_caps());
-        let mut b = Ceremony::new(pw_b, np, pair_v2_caps());
+        // Fixed convention for plain pair: Device-scoped (device-to-device).
+        // Both sides derive scope from the authenticated token, so honest ends match.
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new(pw_a, np, pair_v2_caps(), scope);
+        let mut b = Ceremony::new(pw_b, np, pair_v2_caps(), scope);
         let ((a_mine, a_theirs), (b_mine, b_theirs)) = fps_for(true);
 
         // Exchange elements.
@@ -322,8 +374,10 @@ mod tests {
     fn fingerprint_mismatch_aborts() {
         // A server-substituted DTLS cert => the two sides see different peer
         // fingerprints => confirmation MAC fails => abort, no secret.
-        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps());
-        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps());
+        // Scope: fixed convention Device-scoped for plain pair, derived from token.
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
         let a_msg = a.take_msg_payload().unwrap();
         let b_msg = b.take_msg_payload().unwrap();
         b.on_signal(&a_msg, None);
@@ -337,7 +391,8 @@ mod tests {
 
     #[test]
     fn confirm_before_key_exchange_aborts() {
-        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps());
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
         let stray = json!({ "type": "pake-confirm", "v": 2, "mac": b64_encode(&[0u8; 32]), "caps": ["transfer"] });
         let r = a.on_signal(&stray, Some(("SHA-256 AA", "SHA-256 BB")));
         assert!(matches!(r, Inbound::Abort(_)));
@@ -345,10 +400,12 @@ mod tests {
 
     #[test]
     fn non_pake_signal_is_ignored() {
-        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps());
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
         let sdp = json!({ "type": "description", "description": { "type": "offer" } });
         assert!(matches!(a.on_signal(&sdp, None), Inbound::Ignored));
     }
+
 
     #[test]
     fn b64_roundtrips() {
@@ -372,11 +429,12 @@ mod tests {
         let pw_a = "brave-otter";
         let np = "314";
         let caps = pair_v2_caps();
-        let mut a = Ceremony::new(pw_a, np, caps.clone());
-        let mut b = Ceremony::new(pw_a, np, caps.clone());
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new(pw_a, np, caps.clone(), scope);
+        let mut b = Ceremony::new(pw_a, np, caps.clone(), scope);
         // The fake relay C runs its own SPAKE2 with a GUESSED password.
         let relay_pw = "tidy-walrus"; // wrong password
-        let mut relay = Ceremony::new(relay_pw, np, caps);
+        let mut relay = Ceremony::new(relay_pw, np, caps, scope);
 
         // A sends its element; relay receives it for forwarding.
         let a_msg = a.take_msg_payload().unwrap();
@@ -409,8 +467,9 @@ mod tests {
     // The password NEVER appears in any relayed payload (spec gate:relay-blind).
     #[test]
     fn gate2b_password_never_in_relayed_payloads() {
-        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps());
-        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps());
+        let scope = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
+        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps(), scope);
         let a_msg = a.take_msg_payload().unwrap();
         let b_msg = b.take_msg_payload().unwrap();
         // The password "brave-otter" must not appear in either payload.
@@ -427,4 +486,24 @@ mod tests {
             assert!(!s.contains("brave-otter"), "Gate #2b BROKEN: password leaked in confirm payload: {s}");
         }
     }
+
+    #[test]
+    fn scope_downgrade_detected() {
+        let pw = "brave-otter";
+        let np = "314";
+        let caps = pair_v2_caps();
+        let scope_user = crate::identity::IntroScope::User.to_byte();
+        let scope_device = crate::identity::IntroScope::Device.to_byte();
+        let mut a = Ceremony::new(pw, np, caps.clone(), scope_user);
+        let mut b = Ceremony::new(pw, np, caps.clone(), scope_device);
+        let a_msg = a.take_msg_payload().unwrap();
+        let b_msg = b.take_msg_payload().unwrap();
+        b.on_signal(&a_msg, None);
+        a.on_signal(&b_msg, None);
+        let a_conf = a.take_confirm_payload("SHA-256 AA", "SHA-256 BB").unwrap();
+        let r = b.on_signal(&a_conf, Some(("SHA-256 BB", "SHA-256 AA")));
+        assert!(matches!(r, Inbound::Abort(_)), "scope downgrade must be detected");
+        assert!(b.secret().is_none());
+    }
+
 }
