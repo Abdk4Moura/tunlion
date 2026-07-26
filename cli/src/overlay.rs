@@ -161,6 +161,16 @@ impl Identity {
         sig64.copy_from_slice(sig.as_ref());
         Announce { pubkey: self.pubkey, addr: self.addr, seq, sig: sig64 }
     }
+
+    /// Return the 32-byte Ed25519 public key (for cert signing / identity binding).
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.pubkey
+    }
+}
+
+/// Convenience: load the overlay key and return just the 32-byte public key.
+pub fn overlay_pubkey_bytes() -> Result<[u8; 32]> {
+    Ok(Identity::load_or_create()?.public_key_bytes())
 }
 
 /// The message an announce signs: DOMAIN || addr(16) || seq_be(8) || cb.

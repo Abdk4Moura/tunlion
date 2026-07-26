@@ -24,6 +24,7 @@ mod doctor;
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
 mod holepunch;
+mod identity;
 mod interact;
 mod l2;
 mod mount;
