@@ -15,23 +15,42 @@ filament-professional. Product thesis: a no-account pairwise mesh plus a secure
 compute-pooling platform on top; the p2p send is the consumer wedge; enterprise
 features are a demand-pulled compliance envelope built LAST.
 
+## The core / product boundary (READ FIRST)
+
+filament is the CORE/platform: pairing (L1), the transport ladder (L2), the overlay
+(L3 = WireGuard), identity, capabilities, transfer, and `mount`, exposed through a
+stable PRODUCT INTERFACE (the local control socket, `ctl.rs`). PRODUCTS -- the
+compute/GPU product and any others -- are SEPARATE codebases that CONSUME that
+interface. Nothing product-specific (GPU sandbox, job protocol, OpenAI routing)
+lives in filament core. filament's job is to make itself usable for those purposes,
+not to be them.
+
 ## Master build order (and why this sequence)
 
-1. **L1 PAKE v2** (trust root). Everything's identity, certs, and capabilities
-   root in the first-pairing secret; PAKE closes the first-pairing MITM gap.
-   Decisions locked. -> filament-professional.
-2. **Merge WireGuard L3 data plane** (`feat/wireguard-l3`). The fabric foundation,
-   built + measured, ready.
-3. **Identity layer** (user-key over device-certs). Roots in L1.
-4. **Capabilities / grant.** Generalize L2's `filament grant`; typed signed ops.
-5. **Compute product (lend-gpu).** The p2p-send inverted; Rust subcommand + edge
-   routing (OpenAI-compatible) + model distribution (`mount <cid>`). The wedge.
-6. **Enterprise envelope** (org authority: SSO/audit/device-approval). LAST,
+1. **L1 PAKE v2** (trust root). Identity/certs/capabilities root in the
+   first-pairing secret; PAKE closes the first-pairing MITM gap. Decisions locked.
+   IN PROGRESS -> filament-professional.
+2. **L2 per-sid QUIC streams** (HoL-free multiplexing). Each sid its own QUIC
+   stream; kills head-of-line blocking. IN PROGRESS -> mimo-0x0
+   (`design-l2-perstream-quic.md`).
+3. **Merge WireGuard L3 data plane** (`feat/wireguard-l3`). Built + measured, ready.
+4. **Product interface.** Formalize the control socket (`ctl.rs`) into a stable,
+   versioned local API + a thin SDK (pair, peers+events, streams gated by grants,
+   transfer, mount). The seam every product builds on. The highest-leverage
+   "make filament usable" move.
+5. **Identity layer** (user-key over device-certs). Roots in L1.
+6. **Capabilities / grant** (edge-local typed signed ops). Generalize L2's
+   `filament grant`; the exposed authz primitive; meets the interface at `open`.
+7. **[SEPARATE PRODUCT] Compute product (lend-gpu).** CONSUMES the interface; GPU
+   sandbox + consent + edge routing (OpenAI-compatible) + model distribution
+   (`mount <cid>`). The p2p-send inverted. NOT filament core.
+8. **Enterprise envelope** (org authority: SSO/audit/device-approval). LAST,
    demand-pulled, not a wedge.
 
 Fabric is the FOUNDATION we own standalone (Tailscale = compat bridge only). The
-WEDGE is compute (govern USE, not reachability). Pitch: "secure compute pooling
-among trusted devices," never "a no-account Tailscale."
+WEDGE is compute (govern USE, not reachability), built as a separate product ON the
+core. Pitch: "secure compute pooling among trusted devices," never "a no-account
+Tailscale."
 
 ## Status by workstream
 
@@ -57,6 +76,26 @@ among trusted devices," never "a no-account Tailscale."
   nameplate-only split (remove word minting in `backend/signaling.py`), decisions
   2-4, and the §10 gates (esp. negative gates #2 server-can't-derive, #3 burn+no-retry).
 - NEXT: contract to filament-professional.
+
+### L2 per-sid QUIC streams -- IN PROGRESS (mimo-0x0)
+- Spec: `docs/design-l2-perstream-quic.md` (PROPOSED). Each L2 `sid` gets its own
+  QUIC bidi stream (QUIC gives per-stream flow control + no cross-stream HoL), so a
+  stalled stream no longer blocks the others. App-credit (`feat/l2-credit`) was
+  tried and FAILED validation. Breaking wire change: v2 negotiation + v1 fallback.
+- File: `cli/src/direct.rs` (also touched by the WireGuard branch; merge ordering TBD).
+- NEXT: mimo-0x0 returns a plan, then implements; money test = fast stream not
+  blocked by a stalled slow stream over one link.
+
+### Product interface -- CORE, to build
+- The seam: `ctl.rs`, the local 0600 unix control socket (JSON line + reply +
+  raw bytes; ~15 internal ops today: open/dial/pty/mount/...). Used only by the CLI
+  talking to its own daemon; internal and unstable.
+- The work: (1) stabilize + version + document it as a public contract; (2) fill
+  gaps a product needs -- identity/pair, peers + an EVENTS subscription, open a
+  stream to peer:action gated by the grant model, transfer, grants, mount; (3) a
+  thin SDK (Python first for the compute MVP, then Rust/JS).
+- Boundary: filament owns the API + primitives; products own compute-specific logic
+  on the consumer side. Capabilities meet the interface at `open`.
 
 ### Identity + access UX -- DESIGNED + COMMITTED
 - `docs/design-identity-access-ux.md`: onboarding, contact book, introduce,
