@@ -1488,6 +1488,12 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
     None
 }
 
+/// Pure in-memory merge of a peer identity cert into a device array, with takeover guard.
+/// Delegates to identity::apply_peer_identity for single source of truth.
+fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert) -> Result<()> {
+    identity::apply_peer_identity(arr, name, peer_cert).map_err(|e| anyhow::anyhow!("{}", e))
+}
+
 fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert) -> Result<()> {
     let p = devices_path();
     let mut arr: Vec<Value> = std::fs::read_to_string(&p)
@@ -1495,39 +1501,7 @@ fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert) -> Result<
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    let uk_hex = hex::encode(peer_cert.user_pub);
-    let mut updated = false;
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(name) {
-            // If this device already has a trusted userKey, enforce continuity:
-            // new cert must chain to SAME user_pub or be refused. TOFU only when
-            // there is no prior userKey. This prevents an attacker presenting a
-            // self-signed cert under an existing contact's name from overwriting
-            // the trusted user key (identity takeover).
-            if let Some(existing_uk_hex) = d["userKey"].as_str() {
-                if existing_uk_hex != uk_hex {
-                    // Check if existing is valid hex and different
-                    if let Ok(existing_bytes) = hex::decode(existing_uk_hex) {
-                        if existing_bytes.len() == 32 {
-                            let mut existing_arr = [0u8; 32];
-                            existing_arr.copy_from_slice(&existing_bytes);
-                            if peer_cert.user_pub != existing_arr {
-                                bail!(
-                                    "identity takeover refused: device '{}' already trusts user key {}, new cert chains to different user {}",
-                                    name, existing_uk_hex, uk_hex
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            d["userKey"] = json!(uk_hex);
-            d["deviceCert"] = peer_cert.to_json();
-            updated = true;
-            break;
-        }
-    }
-    if !updated { return Ok(()); }
+    apply_peer_identity(&mut arr, name, peer_cert)?;
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
 }

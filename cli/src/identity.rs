@@ -135,6 +135,49 @@ impl IntroScope {
     }
 }
 
+pub fn apply_peer_identity(
+    arr: &mut Vec<serde_json::Value>,
+    name: &str,
+    peer_cert: &DeviceCert,
+) -> anyhow::Result<()> {
+    let uk_hex = hex::encode(peer_cert.user_pub);
+    let mut found = false;
+    for d in arr.iter_mut() {
+        if d["name"].as_str() == Some(name) {
+            found = true;
+            if let Some(existing_uk_hex) = d["userKey"].as_str() {
+                if existing_uk_hex != uk_hex {
+                    if let Ok(existing_bytes) = hex::decode(existing_uk_hex) {
+                        if existing_bytes.len() == 32 {
+                            let mut existing_arr = [0u8; 32];
+                            existing_arr.copy_from_slice(&existing_bytes);
+                            if peer_cert.user_pub != existing_arr {
+                                anyhow::bail!(
+                                    "identity takeover refused: device '{}' already trusts user key {}, new cert chains to different user {}",
+                                    name, existing_uk_hex, uk_hex
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            d["userKey"] = serde_json::json!(uk_hex);
+            d["deviceCert"] = peer_cert.to_json();
+            break;
+        }
+    }
+    if !found {
+        arr.push(serde_json::json!({
+            "name": name,
+            "userKey": uk_hex,
+            "deviceCert": peer_cert.to_json(),
+            "v": 2,
+            "caps": ["transfer"]
+        }));
+    }
+    Ok(())
+}
+
 pub fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -232,25 +275,41 @@ mod tests {
 
     #[test]
     fn cert_not_chain_flow() {
-        // Known contact with userKey U_old. Inbound cert signed by different user U_new must be REFUSED
-        // and must NOT overwrite U_old. This exercises the actual takeover refusal path.
+        // Known contact with userKey U_old. Inbound cert signed by different user U_new
+        // must be REFUSED by the real guard and must NOT overwrite U_old.
+        // This exercises the ACTUAL apply_peer_identity guard, not a simulation.
         let user_old = make_user();
         let user_new = make_user();
         let known_user_pub = user_old.public_key_bytes();
         let new_user_pub = user_new.public_key_bytes();
         assert_ne!(known_user_pub, new_user_pub);
-        // New cert is signed by new_user, not old
+        let known_user_hex = hex::encode(known_user_pub);
+
+        // Seed arr with a known contact bob that trusts U_old
+        let mut arr = vec![serde_json::json!({
+            "name": "bob",
+            "userKey": known_user_hex,
+            "v": 2,
+            "caps": ["transfer"]
+        })];
+
+        // New cert signed by different user U_new
         let cert_new = DeviceCert::certify(&user_new, [0x99; 32], now_secs(), CERT_TTL_SECS).unwrap();
-        // Verify it does NOT chain to known old user
-        assert!(cert_new.verify_chain(&known_user_pub, now_secs()).is_err(),
-            "cert from different user must NOT chain to known userKey");
-        // Verify it DOES chain to its own signer
-        assert!(cert_new.verify_chain(&new_user_pub, now_secs()).is_ok());
-        // If we had stored U_old for this contact, overwriting with U_new would be takeover
-        // The fix is to refuse: new cert's user_pub != known_user_pub => bail
-        // Simulate the check in update_peer_identity
-        let would_overwrite = cert_new.user_pub != known_user_pub;
-        assert!(would_overwrite, "this cert would trigger takeover refusal");
+
+        // Call the REAL guard: it must Err (takeover refused)
+        let res = apply_peer_identity(&mut arr, "bob", &cert_new);
+        assert!(res.is_err(), "takeover must be refused by guard, got Ok");
+
+        // Assert arr's bob.userKey is STILL U_old (not overwritten)
+        let bob = arr.iter().find(|d| d["name"] == "bob").unwrap();
+        assert_eq!(bob["userKey"].as_str().unwrap(), known_user_hex, "userKey must NOT be overwritten on refused takeover");
+
+        // Now test continuity: new device cert from SAME user_old should be accepted
+        let cert_new_device_same_user = DeviceCert::certify(&user_old, [0xaa; 32], now_secs(), CERT_TTL_SECS).unwrap();
+        let res2 = apply_peer_identity(&mut arr, "bob", &cert_new_device_same_user);
+        assert!(res2.is_ok(), "continuity: new device from same user must be accepted");
+        assert_eq!(arr.iter().find(|d| d["name"] == "bob").unwrap()["userKey"].as_str().unwrap(), known_user_hex,
+            "userKey must stay same after continuity re-introduce");
     }
 
     #[test]
