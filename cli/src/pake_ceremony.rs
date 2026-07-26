@@ -235,6 +235,21 @@ impl Ceremony {
         self.k.is_some()
     }
 
+    /// Borrow K if derived (for sealing identity-expose).
+    pub fn k(&self) -> Option<&Vec<u8>> {
+        self.k.as_ref()
+    }
+
+    /// Scope byte (mandatory, no default).
+    pub fn scope(&self) -> u8 {
+        self.scope
+    }
+
+    /// Canonical caps string (for possession binding).
+    pub fn caps_canon(&self) -> &str {
+        &self.caps_canon
+    }
+
     /// Feed an inbound `signal` payload. PAKE messages are consumed; SDP/ICE is
     /// ignored (falls through to the WebRTC path). A `pake-confirm` carries the
     /// fingerprints to verify against (the caller supplies the link's current

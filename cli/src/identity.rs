@@ -135,10 +135,14 @@ impl IntroScope {
     }
 }
 
+/// Scope-aware anchor: under scope=Device (0x01) store PAIR (user_pub, device_pub)
+/// and require EXACT device_pub match; different device under same user = new trust decision.
+/// Under scope=User (0x00) store user_pub only, continuity across devices.
 pub fn apply_peer_identity(
     arr: &mut Vec<serde_json::Value>,
     name: &str,
     peer_cert: &DeviceCert,
+    scope: u8,
 ) -> anyhow::Result<()> {
     let uk_hex = hex::encode(peer_cert.user_pub);
     let mut found = false;
@@ -159,10 +163,29 @@ pub fn apply_peer_identity(
                             }
                         }
                     }
+                } else {
+                    // Same user key, check scope-aware continuity
+                    let existing_scope = d["identityScope"].as_u64().unwrap_or(0) as u8;
+                    // If existing record was Device-scoped (0x01), require exact device_pub match
+                    // A different device under same user is NEW trust decision, not silent continuity
+                    if existing_scope == 0x01 {
+                        if let Some(existing_cert_json) = d.get("deviceCert") {
+                            if let Some(existing_cert) = DeviceCert::from_json(existing_cert_json) {
+                                if existing_cert.device_pub != peer_cert.device_pub {
+                                    anyhow::bail!(
+                                        "device-scope continuity: device '{}' already trusts user {} for device {}, new device {} under same user requires new trust decision",
+                                        name, existing_uk_hex, hex::encode(existing_cert.device_pub), hex::encode(peer_cert.device_pub)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // User-scope (0x00): same user key is enough, different device accepted (continuity)
                 }
             }
             d["userKey"] = serde_json::json!(uk_hex);
             d["deviceCert"] = peer_cert.to_json();
+            d["identityScope"] = serde_json::json!(scope);
             break;
         }
     }
@@ -171,6 +194,7 @@ pub fn apply_peer_identity(
             "name": name,
             "userKey": uk_hex,
             "deviceCert": peer_cert.to_json(),
+            "identityScope": scope,
             "v": 2,
             "caps": ["transfer"]
         }));
@@ -178,9 +202,178 @@ pub fn apply_peer_identity(
     Ok(())
 }
 
+/// Fail-closed check: if peer previously exposed identity (has userKey) and now does NOT expose,
+/// abort rather than proceed as normal peer. Session with no identity must be visibly unauthenticated.
+pub fn check_fail_closed(arr: &[serde_json::Value], name: &str, peer_cert: Option<&DeviceCert>) -> anyhow::Result<()> {
+    if peer_cert.is_some() {
+        return Ok(());
+    }
+    for d in arr {
+        if d["name"].as_str() == Some(name) {
+            if d.get("userKey").is_some() {
+                anyhow::bail!(
+                    "fail-closed: device '{}' previously exposed identity (userKey present) but did not now, aborting as unauthenticated",
+                    name
+                );
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Build the session-bound possession message that device_pub signs.
+/// Freeze-candidate spec (8 LP fields, fixed order, every field LP):
+/// 1 LP(tag) tag = "filament-identity-possession-v1"
+/// 2 LP(binding_type) 1 byte: 0x01 PAKE_CMV | 0x02 INTRODUCE_NONCE
+/// 3 LP(binding_value) 32B: cmv or receiver_nonce
+/// 4 LP(scope_byte) 1 byte User/Device, verifier plugs OWN token scope
+/// 5 LP(caps_digest) SHA-256(canonical caps), verifier plugs OWN caps
+/// 6 LP(cert_hash) SHA-256(canonical signing bytes of cert) - pins device+user+expires
+/// 7 LP(sender_device_pub) 32B = cert.device_pub
+/// 8 LP(receiver_device_pub) 32B: PAKE => zeros (verifier rejects non-zero), introduce => receiver's device_pub from challenge
+/// Never signs raw K. cmv already binds K + sorted fps + caps + scope.
+pub fn possession_msg(
+    binding_type: u8,
+    binding_value: &[u8; 32],
+    scope_byte: u8,
+    caps_digest: &[u8; 32],
+    cert_hash: &[u8; 32],
+    sender_device_pub: &[u8; 32],
+    receiver_device_pub: &[u8; 32],
+) -> Vec<u8> {
+    fn lp(buf: &mut Vec<u8>, field: &[u8]) {
+        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        buf.extend_from_slice(field);
+    }
+    let tag = b"filament-identity-possession-v1";
+    let mut v = Vec::new();
+    lp(&mut v, tag);
+    lp(&mut v, &[binding_type]);
+    lp(&mut v, binding_value);
+    lp(&mut v, &[scope_byte]);
+    lp(&mut v, caps_digest);
+    lp(&mut v, cert_hash);
+    lp(&mut v, sender_device_pub);
+    lp(&mut v, receiver_device_pub);
+    v
+}
+
+/// Legacy helper for PAKE-only tests (domain + confirm_mac + device_pub) - kept for reference, not used in new layout.
+pub fn possession_msg_legacy(confirm_mac: &[u8], device_pub: &[u8; 32]) -> Vec<u8> {
+    fn lp(buf: &mut Vec<u8>, field: &[u8]) {
+        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        buf.extend_from_slice(field);
+    }
+    let mut v = Vec::new();
+    lp(&mut v, b"filament-identity-possession-v1");
+    lp(&mut v, confirm_mac);
+    lp(&mut v, device_pub);
+    v
+}
+
+/// Compute SHA-256 of canonical caps string (for possession binding).
+pub fn caps_digest(caps_canon: &str) -> [u8; 32] {
+    use sha2_pake::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(caps_canon.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Compute SHA-256 of cert's canonical signing bytes (pins device+user+expires).
+pub fn cert_hash(cert: &DeviceCert) -> [u8; 32] {
+    use sha2_pake::{Digest, Sha256};
+    let canon = cert.canonical_for_signing();
+    let mut h = Sha256::new();
+    h.update(&canon);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+/// Verify a possession signature made by device_pub over possession_msg.
+pub fn verify_possession_sig(
+    device_pub: &[u8; 32],
+    msg: &[u8],
+    sig: &[u8; 64],
+) -> Result<()> {
+    let peer_pub = UnparsedPublicKey::new(&ED25519, device_pub);
+    peer_pub
+        .verify(msg, sig)
+        .map_err(|_| anyhow!("possession signature invalid: not signed by claimed device key"))
+}
+
+/// Derive a sealing key for identity-expose from K.
+/// HKDF(K, "filament-identity-expose-v1:seal") -> 32 bytes.
+pub fn sealing_key_from_k(k: &[u8]) -> [u8; 32] {
+    use hkdf::Hkdf;
+    use sha2_pake::Sha256;
+    let hk = Hkdf::<Sha256>::new(None, k);
+    let mut out = [0u8; 32];
+    hk.expand(b"filament-identity-expose-v1:seal", &mut out)
+        .expect("32 bytes valid HKDF length");
+    out
+}
+
+/// Seal plaintext with AEAD (ChaCha20-Poly1305) using key derived from K.
+/// Returns (nonce 12 bytes, ciphertext+tag).
+pub fn seal_plaintext(key: &[u8; 32], plaintext: &[u8]) -> Result<([u8; 12], Vec<u8>)> {
+    use ring::aead::{self, BoundKey, Nonce, SealingKey, UnboundKey, CHACHA20_POLY1305};
+    use ring::rand::SecureRandom;
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0u8; 12];
+    rng.fill(&mut nonce_bytes)
+        .map_err(|_| anyhow!("CSPRNG failed for nonce"))?;
+    let unbound = UnboundKey::new(&CHACHA20_POLY1305, key)
+        .map_err(|_| anyhow!("failed to create sealing key"))?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut sealing_key = SealingKey::new(unbound, OneNonce::new(nonce));
+    let mut in_out = plaintext.to_vec();
+    let tag = sealing_key
+        .seal_in_place_separate_tag(aead::Aad::empty(), &mut in_out)
+        .map_err(|_| anyhow!("seal failed"))?;
+    let mut sealed = Vec::with_capacity(in_out.len() + 16);
+    sealed.extend_from_slice(&in_out);
+    sealed.extend_from_slice(tag.as_ref());
+    Ok((nonce_bytes, sealed))
+}
+
+/// Open sealed ciphertext with AEAD key.
+pub fn open_sealed(key: &[u8; 32], nonce: &[u8; 12], sealed: &[u8]) -> Result<Vec<u8>> {
+    use ring::aead::{self, BoundKey, Nonce, OpeningKey, UnboundKey, CHACHA20_POLY1305};
+    if sealed.len() < 16 {
+        bail!("sealed payload too short");
+    }
+    let unbound = UnboundKey::new(&CHACHA20_POLY1305, key)
+        .map_err(|_| anyhow!("failed to create opening key"))?;
+    let nonce_obj = Nonce::assume_unique_for_key(*nonce);
+    let mut opening_key = OpeningKey::new(unbound, OneNonce::new(nonce_obj));
+    let mut in_out = sealed.to_vec();
+    let plaintext = opening_key
+        .open_in_place(aead::Aad::empty(), &mut in_out)
+        .map_err(|_| anyhow!("open sealed failed: tampered or wrong key"))?;
+    Ok(plaintext.to_vec())
+}
+
+struct OneNonce {
+    nonce: Option<ring::aead::Nonce>,
+}
+impl OneNonce {
+    fn new(nonce: ring::aead::Nonce) -> Self {
+        OneNonce { nonce: Some(nonce) }
+    }
+}
+impl ring::aead::NonceSequence for OneNonce {
+    fn advance(&mut self) -> Result<ring::aead::Nonce, ring::error::Unspecified> {
+        self.nonce.take().ok_or(ring::error::Unspecified)
+    }
 }
 
 #[cfg(test)]
@@ -296,8 +489,8 @@ mod tests {
         // New cert signed by different user U_new
         let cert_new = DeviceCert::certify(&user_new, [0x99; 32], now_secs(), CERT_TTL_SECS).unwrap();
 
-        // Call the REAL guard: it must Err (takeover refused)
-        let res = apply_peer_identity(&mut arr, "bob", &cert_new);
+        // Call the REAL guard: it must Err (takeover refused). Scope-aware: Device-scope
+        let res = apply_peer_identity(&mut arr, "bob", &cert_new, IntroScope::Device.to_byte());
         assert!(res.is_err(), "takeover must be refused by guard, got Ok");
 
         // Assert arr's bob.userKey is STILL U_old (not overwritten)
@@ -305,8 +498,10 @@ mod tests {
         assert_eq!(bob["userKey"].as_str().unwrap(), known_user_hex, "userKey must NOT be overwritten on refused takeover");
 
         // Now test continuity: new device cert from SAME user_old should be accepted
+        // Under Device-scope, different device under same user is NEW trust decision, not silent continuity
+        // So for continuity test, use User-scope (0x00) where same user is enough
         let cert_new_device_same_user = DeviceCert::certify(&user_old, [0xaa; 32], now_secs(), CERT_TTL_SECS).unwrap();
-        let res2 = apply_peer_identity(&mut arr, "bob", &cert_new_device_same_user);
+        let res2 = apply_peer_identity(&mut arr, "bob", &cert_new_device_same_user, IntroScope::User.to_byte());
         assert!(res2.is_ok(), "continuity: new device from same user must be accepted");
         assert_eq!(arr.iter().find(|d| d["name"] == "bob").unwrap()["userKey"].as_str().unwrap(), known_user_hex,
             "userKey must stay same after continuity re-introduce");
@@ -384,5 +579,60 @@ mod tests {
             "User vs Device scope must produce different transcript bytes");
         assert_eq!(canonical.len() + 1, flipped_scope_cert_canonical_user.len(),
             "adding scope byte must change length, proving scope is bound separately");
+    }
+
+    #[test]
+    fn f1_device_scope_different_device_requires_new_decision() {
+        // Device-scope (0x01) must store PAIR (user_pub, device_pub) and require exact device match.
+        // Different device under same user = new trust decision, NOT silent continuity.
+        let user = make_user();
+        let known_user_hex = hex::encode(user.public_key_bytes());
+        let now = now_secs();
+        let cert_laptop = DeviceCert::certify(&user, [0x11; 32], now, CERT_TTL_SECS).unwrap();
+        let cert_phone = DeviceCert::certify(&user, [0x22; 32], now, CERT_TTL_SECS).unwrap();
+        // Seed with laptop, Device-scoped
+        let mut arr = vec![serde_json::json!({
+            "name": "bob",
+            "userKey": known_user_hex,
+            "deviceCert": cert_laptop.to_json(),
+            "identityScope": IntroScope::Device.to_byte(),
+            "v": 2,
+            "caps": ["transfer"]
+        })];
+        // Try to introduce phone (different device) under same user with Device-scope -> must be new decision, not auto-accepted
+        let res = apply_peer_identity(&mut arr, "bob", &cert_phone, IntroScope::Device.to_byte());
+        assert!(res.is_err(), "Device-scope: different device under same user must require new trust decision, not silent continuity");
+        // But same device, same user, Device-scope should be accepted (continuity for same device)
+        let cert_laptop_dup = DeviceCert::certify(&user, [0x11; 32], now, CERT_TTL_SECS).unwrap();
+        let res2 = apply_peer_identity(&mut arr, "bob", &cert_laptop_dup, IntroScope::Device.to_byte());
+        assert!(res2.is_ok(), "Device-scope: same device same user must be accepted");
+    }
+
+    #[test]
+    fn f2_fail_closed_stripped_identity_expose_aborts() {
+        // If peer previously exposed identity (has userKey) and now does NOT, abort.
+        let user = make_user();
+        let known_user_hex = hex::encode(user.public_key_bytes());
+        let arr = vec![serde_json::json!({
+            "name": "bob",
+            "userKey": known_user_hex,
+            "v": 2,
+            "caps": ["transfer"]
+        })];
+        // No cert now, but previously had userKey -> must abort
+        let res = check_fail_closed(&arr, "bob", None);
+        assert!(res.is_err(), "fail-closed: stripped identity-expose must abort, not silent normal connection");
+        // If no prior userKey, no cert is OK (first pairing, no identity yet)
+        let arr_no_id = vec![serde_json::json!({
+            "name": "carol",
+            "v": 2,
+            "caps": ["transfer"]
+        })];
+        let res2 = check_fail_closed(&arr_no_id, "carol", None);
+        assert!(res2.is_ok(), "no prior identity, no cert now is OK (unauthenticated but not abort)");
+        // If prior had userKey and now has cert, OK
+        let cert = DeviceCert::certify(&user, [0x11; 32], now_secs(), CERT_TTL_SECS).unwrap();
+        let res3 = check_fail_closed(&arr, "bob", Some(&cert));
+        assert!(res3.is_ok(), "prior identity and now has cert is OK");
     }
 }

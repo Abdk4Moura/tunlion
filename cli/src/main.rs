@@ -1488,20 +1488,19 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
     None
 }
 
-/// Pure in-memory merge of a peer identity cert into a device array, with takeover guard.
-/// Delegates to identity::apply_peer_identity for single source of truth.
-fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert) -> Result<()> {
-    identity::apply_peer_identity(arr, name, peer_cert).map_err(|e| anyhow::anyhow!("{}", e))
+/// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
+fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
+    identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert) -> Result<()> {
+fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
     let p = devices_path();
     let mut arr: Vec<Value> = std::fs::read_to_string(&p)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    apply_peer_identity(&mut arr, name, peer_cert)?;
+    apply_peer_identity(&mut arr, name, peer_cert, scope)?;
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
 }
@@ -2732,10 +2731,24 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 // Scope byte was derived from authenticated token, no default to broad scope.
                 devices_store_v2(&n, &sec, &caps)?;
                 // If peer exposed its device cert inside the PAKE-authed channel, store
-                // its userKey + deviceCert alongside the device record. This is the
-                // continuity anchor: same user key = same person, no new trust decision.
+                // its userKey + deviceCert alongside the device record. Scope-aware:
+                // Device-scope stores pair (user, device), User-scope stores user.
+                // Continuity: same user key = same person for User-scope, exact device for Device-scope.
                 if let Some(ref pcert) = peer_identity_cert {
-                    let _ = update_peer_identity(&n, pcert);
+                    let _ = update_peer_identity(&n, pcert, scope);
+                }
+                // Fail-closed: if peer previously exposed identity (has userKey) and now does NOT,
+                // abort rather than proceed as normal peer. Session with no identity must be visibly unauthenticated.
+                if peer_identity_cert.is_none() {
+                    // Check existing record for this name has userKey
+                    let p = devices_path();
+                    if let Ok(raw) = std::fs::read_to_string(&p) {
+                        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                            if let Err(e) = identity::check_fail_closed(&arr, &n, None) {
+                                bail!("fail-closed: {}", e);
+                            }
+                        }
+                    }
                 }
                 ui::say(&format!(
                     "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
@@ -2788,15 +2801,49 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 }
             }
             // Identity expose: after PAKE confirmation and secret agreed, if we have a local
-            // device cert, send EXACTLY ONE device + its cert inside the authed PAKE channel.
-            // Server never sees user key or device set. Privacy test asserts on actual payload.
+            // device cert, send EXACTLY ONE device + its cert sealed under K-derived key
+            // with possession signature, inside the authed channel. Server never sees
+            // user key (sealed) and cannot substitute (possession sig binds to session).
             if !sent_identity {
                 if agreed_secret.is_some() {
                     if let Some(local_cert) = local_device_cert() {
                         if let Some(pid2) = pake_peer.clone() {
-                            let payload = json!({"type": "identity-expose", "v": 2, "cert": local_cert.to_json()});
-                            sio.emit("signal", json!({"to": pid2, "data": payload})).await.ok();
-                            sent_identity = true;
+                            if let Some(k) = cer.k() {
+                                if let Some(l) = conn.link(&pid2) {
+                                    if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
+                                        // Confirm MAC that we sent (session-bound, already binds K+fps+caps+scope)
+                                        let confirm_mac_vec = crate::pake::our_confirm(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope());
+                                        let mut cmv_arr = [0u8; 32];
+                                        cmv_arr.copy_from_slice(&confirm_mac_vec);
+                                        let device_pub = local_cert.device_pub;
+                                        let scope_byte = cer.scope();
+                                        let caps_digest = crate::identity::caps_digest(cer.caps_canon());
+                                        let chash = crate::identity::cert_hash(&local_cert);
+                                        let receiver_zero = [0u8; 32];
+                                        let possession_msg = crate::identity::possession_msg(
+                                            0x01, &cmv_arr, scope_byte, &caps_digest, &chash, &device_pub, &receiver_zero
+                                        );
+                                        if let Ok(possession_sig) = crate::overlay::overlay_sign_possession(&possession_msg) {
+                                            let inner = serde_json::json!({
+                                                "cert": local_cert.to_json(),
+                                                "possession_sig": hex::encode(possession_sig),
+                                                "device_pub": hex::encode(device_pub)
+                                            });
+                                            let sealing_key = crate::identity::sealing_key_from_k(k);
+                                            if let Ok((nonce, sealed)) = crate::identity::seal_plaintext(&sealing_key, inner.to_string().as_bytes()) {
+                                                let payload = serde_json::json!({
+                                                    "type": "identity-expose",
+                                                    "v": 2,
+                                                    "nonce": hex::encode(nonce),
+                                                    "sealed": hex::encode(sealed)
+                                                });
+                                                sio.emit("signal", serde_json::json!({"to": pid2, "data": payload})).await.ok();
+                                                sent_identity = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2899,18 +2946,74 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     }
                     continue;
                 }
-                // Identity expose: ONE device + its DeviceCert inside the authed PAKE channel.
-                // Server never sees user key or device set. Peer verifies chain to known user key.
+                // Identity expose: sealed cert + possession signature, inside authed PAKE channel.
+                // Fixes holes A (confidentiality+integrity via K-derived seal, server never sees user_pub)
+                // and B (replayable bearer: possession signature over session-bound confirm MAC, bound to device key).
                 if data["type"].as_str() == Some("identity-expose") {
-                    if let Some(cert_json) = data.get("cert") {
-                        if let Some(cert) = identity::DeviceCert::from_json(cert_json) {
-                            if cert.verify(identity::now_secs()).is_ok() {
-                                // If we already know this user key (continuity), verify chain to same user.
-                                // Otherwise TOFU: accept as new person.
-                                // For negative test: cert NOT chaining to claimed user is REFUSED.
-                                // Here we just store; the verify_chain check happens if we have known_user_pub.
-                                // For flow-level test, we will have a known_user_pub from previous pairing.
-                                peer_identity_cert = Some(cert);
+                    if let Some(k) = cer.k() {
+                        if let Some(nonce_hex) = data.get("nonce").and_then(|v| v.as_str()) {
+                            if let Some(sealed_hex) = data.get("sealed").and_then(|v| v.as_str()) {
+                                if let Ok(nonce_bytes) = hex::decode(nonce_hex) {
+                                    if let Ok(sealed_bytes) = hex::decode(sealed_hex) {
+                                        if nonce_bytes.len() == 12 {
+                                            let mut nonce_arr = [0u8; 12];
+                                            nonce_arr.copy_from_slice(&nonce_bytes);
+                                            let sealing_key = identity::sealing_key_from_k(k);
+                                            if let Ok(plaintext) = identity::open_sealed(&sealing_key, &nonce_arr, &sealed_bytes) {
+                                                if let Ok(inner) = serde_json::from_slice::<Value>(&plaintext) {
+                                                    if let Some(cert_json) = inner.get("cert") {
+                                                        if let Some(cert) = identity::DeviceCert::from_json(cert_json) {
+                                                            if cert.verify(identity::now_secs()).is_ok() {
+                                                                if let Some(sig_hex) = inner.get("possession_sig").and_then(|v| v.as_str()) {
+                                                                    if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                                                                        if sig_bytes.len() == 64 {
+                                                                            let mut sig_arr = [0u8; 64];
+                                                                            sig_arr.copy_from_slice(&sig_bytes);
+                                                                            // Re-derive fps for possession verification (session-bound)
+                                                                            let fps2 = match conn.link(&from) {
+                                                                                Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
+                                                                                None => None,
+                                                                            };
+                                                                            if let Some((my_fp2, their_fp2)) = fps2 {
+                                                                                let (lo, hi) = crate::pake::sort_fps(&my_fp2, &their_fp2);
+                                                                                let scope = cer.scope();
+                                                                                let (_send, expect_dir) = crate::pake::confirm_dirs(&my_fp2, lo);
+                                                                                let expected_confirm_vec = crate::pake::confirm_mac(k, expect_dir, lo, hi, cer.caps_canon(), scope);
+                                                                                let mut cmv_arr = [0u8; 32];
+                                                                                cmv_arr.copy_from_slice(&expected_confirm_vec);
+                                                                                // Reconstruct cert_hash locally from parsed cert fields (never hash sender-framed blob)
+                                                                                let chash = identity::cert_hash(&cert);
+                                                                                let caps_digest = identity::caps_digest(cer.caps_canon());
+                                                                                let sender_pub = cert.device_pub;
+                                                                                let receiver_zero = [0u8; 32];
+                                                                                // For PAKE path, receiver_device_pub MUST be zeros (verifier rejects non-zero)
+                                                                                let possession_msg = identity::possession_msg(
+                                                                                    0x01, &cmv_arr, scope, &caps_digest, &chash, &sender_pub, &receiver_zero
+                                                                                );
+                                                                                if identity::verify_possession_sig(&cert.device_pub, &possession_msg, &sig_arr).is_ok() {
+                                                                                    // Reflection check: cert.user_pub != own user_pub
+                                                                                    if let Some(own_uk) = identity::UserKey::load().unwrap_or(None) {
+                                                                                        if cert.user_pub == own_uk.public_key_bytes() {
+                                                                                            // reflection-to-self refused
+                                                                                        } else {
+                                                                                            peer_identity_cert = Some(cert);
+                                                                                        }
+                                                                                    } else {
+                                                                                        peer_identity_cert = Some(cert);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
