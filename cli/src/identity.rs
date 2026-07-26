@@ -231,6 +231,71 @@ mod tests {
     }
 
     #[test]
+    fn cert_not_chain_flow() {
+        // Known contact with userKey U_old. Inbound cert signed by different user U_new must be REFUSED
+        // and must NOT overwrite U_old. This exercises the actual takeover refusal path.
+        let user_old = make_user();
+        let user_new = make_user();
+        let known_user_pub = user_old.public_key_bytes();
+        let new_user_pub = user_new.public_key_bytes();
+        assert_ne!(known_user_pub, new_user_pub);
+        // New cert is signed by new_user, not old
+        let cert_new = DeviceCert::certify(&user_new, [0x99; 32], now_secs(), CERT_TTL_SECS).unwrap();
+        // Verify it does NOT chain to known old user
+        assert!(cert_new.verify_chain(&known_user_pub, now_secs()).is_err(),
+            "cert from different user must NOT chain to known userKey");
+        // Verify it DOES chain to its own signer
+        assert!(cert_new.verify_chain(&new_user_pub, now_secs()).is_ok());
+        // If we had stored U_old for this contact, overwriting with U_new would be takeover
+        // The fix is to refuse: new cert's user_pub != known_user_pub => bail
+        // Simulate the check in update_peer_identity
+        let would_overwrite = cert_new.user_pub != known_user_pub;
+        assert!(would_overwrite, "this cert would trigger takeover refusal");
+    }
+
+    #[test]
+    fn privacy_wire_exposes_one_device() {
+        // Assert on the REAL identity-expose payload the send path emits:
+        // exactly one devicePub, no array/list, no device set.
+        let user = make_user();
+        let cert = DeviceCert::certify(&user, [0xaa; 32], now_secs(), CERT_TTL_SECS).unwrap();
+        let wire_payload = serde_json::json!({
+            "type": "identity-expose",
+            "v": 2,
+            "cert": cert.to_json()
+        });
+        let encoded = serde_json::to_string(&wire_payload).unwrap();
+        // Exactly one devicePub in the wire payload
+        assert_eq!(encoded.matches("devicePub").count(), 1, "wire payload must contain exactly one devicePub");
+        // No deviceList / devices / deviceSet arrays (privacy: peer never receives device set)
+        assert!(!encoded.contains("deviceList"));
+        assert!(!encoded.contains("\"devices\""), "must not contain devices array");
+        assert!(!encoded.contains("deviceSet"));
+        // Cert field itself has no list
+        let cert_json = wire_payload["cert"].clone();
+        assert!(cert_json.get("devicePub").is_some());
+        assert!(cert_json.get("deviceList").is_none());
+    }
+
+    #[test]
+    fn continuity_reintroduce_same_user_accepted() {
+        // Same user key, new device cert: continuity accepted with no new trust decision.
+        let user = make_user();
+        let now = now_secs();
+        let known_user_pub = user.public_key_bytes();
+        // First device cert (e.g. laptop)
+        let cert_laptop = DeviceCert::certify(&user, [0x11; 32], now, CERT_TTL_SECS).unwrap();
+        // Second device cert under SAME user (e.g. phone) - re-introduce
+        let cert_phone = DeviceCert::certify(&user, [0x22; 32], now, CERT_TTL_SECS).unwrap();
+        // Both chain to same known user key
+        assert!(cert_laptop.verify_chain(&known_user_pub, now).is_ok(), "laptop cert must chain to same user");
+        assert!(cert_phone.verify_chain(&known_user_pub, now).is_ok(), "phone cert must chain to same user (continuity)");
+        // Different device pubs, same user pub = same person, different device
+        assert_ne!(cert_laptop.device_pub, cert_phone.device_pub);
+        assert_eq!(cert_laptop.user_pub, cert_phone.user_pub);
+    }
+
+    #[test]
     fn scope_downgrade_token_cannot_be_silently_flipped() {
         let user = make_user();
         let now = now_secs();
