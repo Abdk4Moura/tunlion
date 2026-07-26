@@ -16,49 +16,16 @@ Event contract (kept in sync with CONTRACT.md):
 """
 import os
 import re
-import secrets as _secrets
 import time as _time
 from collections import defaultdict, deque
 
 from flask import request
 from flask_socketio import emit, join_room, leave_room
 
-# Speakable one-time codes: easy to say across a table, unique by NX semantics.
-#
-# Entropy budget (see the variance analysis repo): 64 adjectives x 64 animals
-# x 900 numbers = 3,686,400 codes (~21.8 bits). Combined with the claim rate
-# limit below, sweeping the space inside a code's 10-minute TTL is infeasible;
-# the 10x10x90 = 9,000-code (~13.1 bit) original was not. Words are chosen to
-# be short, common, and phonetically distinct so codes stay easy to SAY.
-# Keep these lists in sync with frontend/src/lib/useFilament.js (peer names
-# draw from the same vocabulary).
-_ADJ = [
-    "amber", "bold", "brave", "brisk", "calm", "cheery", "chill", "civil",
-    "clever", "cosy", "crisp", "daring", "deft", "dewy", "eager", "early",
-    "fancy", "fiery", "fleet", "fond", "frank", "free", "fresh", "gentle",
-    "giddy", "glad", "golden", "grand", "happy", "hardy", "hasty", "honest",
-    "humble", "jolly", "keen", "kind", "lively", "loyal", "lucky", "lunar",
-    "mellow", "merry", "mighty", "misty", "neat", "noble", "perky", "plucky",
-    "polar", "proud", "quick", "quiet", "rapid", "rosy", "royal", "shiny",
-    "snappy", "solid", "spry", "stout", "sunny", "swift", "tidy", "witty",
-]
-_ANIMAL = [
-    "otter", "panda", "falcon", "lynx", "koala", "heron", "fox", "ibex",
-    "marten", "tapir", "badger", "beaver", "bison", "bongo", "camel", "civet",
-    "condor", "crane", "dingo", "dove", "eland", "ermine", "ferret", "finch",
-    "gecko", "gibbon", "hare", "hawk", "hyrax", "jackal", "kestrel", "kiwi",
-    "lemur", "llama", "macaw", "magpie", "mole", "moose", "murre", "newt",
-    "ocelot", "okapi", "oriole", "osprey", "owl", "pika", "plover", "puffin",
-    "quokka", "rabbit", "raven", "robin", "seal", "shrew", "skink", "sparrow",
-    "stoat", "swan", "tern", "toucan", "vole", "wombat", "wren", "zebra",
-]
-assert len(_ADJ) == 64 and len(set(_ADJ)) == 64, "adjective list must be 64 unique words"
-assert len(_ANIMAL) == 64 and len(set(_ANIMAL)) == 64, "animal list must be 64 unique words"
-
-
-def _mint_pair_code():
-    """CSPRNG-minted speakable code: adj-animal-NNN, ~21.8 bits."""
-    return f"{_secrets.choice(_ADJ)}-{_secrets.choice(_ANIMAL)}-{_secrets.randbelow(900) + 100}"
+# One-time pairing nameplate allocation. v2 ONLY: the client CSPRNG-mints the
+# WORDS locally (spec S2.0), the server allocates/matches only the numeric
+# nameplate (the password NEVER reaches the server). The v1 word-minting path
+# has been removed (Decision #1: v2-only cutover).
 
 
 def _norm_code(raw):
@@ -337,13 +304,16 @@ def _tel(event, **kv):
         _sys.stderr.write("TEL-fail\n")
 
 
+# ALLOWS 3-5 digits (spec nameplate: 900 -- 3-digit, but 4-5 gas for widening).
+_NAMEPLATE_RE = re.compile(r"^[0-9]{3,5}$")
+
 def register(socketio, registry):
     local_sids = set()  # connections owned by THIS instance (for lease refresh)
 
     def _eio_alive(sid):
         """Ground truth for sids THIS instance owns: is the underlying
         engine.io socket still open? Catches a SIGKILL'd client the moment the
-        transport sees FIN/RST — long before any lease lapses or the ping
+        transport sees FIN/RST -- long before any lease lapses or the ping
         timeout fires."""
         try:
             eio_sid = socketio.server.manager.eio_sid_from_sid(sid, "/")
@@ -418,55 +388,41 @@ def register(socketio, registry):
     # client can never smuggle words into it; the server stores ONLY that
     # nameplate and never echoes any code back (the creator displays its own
     # locally-assembled `words-nameplate`).
-    _NAMEPLATE_RE = re.compile(r"^[0-9]{3,5}$")
 
     @socketio.on("pair-create")
     def on_pair_create(data=None):
         sid = request.sid
-        # C24: this event proves the creator's socket is alive RIGHT NOW —
-        # refresh its liveness lease so a code can never be minted by a
-        # creator the claim-side lease check would call dead (the zombie-tab
-        # failure observed live).
+        # C24: refresh liveness lease so the nameplate is never minted by a
+        # creator the claim-side lease check would call dead (zombie-tab bug).
         if hasattr(registry, "refresh"):
             registry.refresh([sid])
         data = data or {}
-        # GATE 6 fixture hook (downgrade-refused): FIL_FORCE_V1 makes the server
-        # behave like a malicious/legacy relay that STRIPS the v:2 flag — it
-        # ignores `v` and falls into the v1 word-minting branch. A v2 client must
-        # REFUSE this (it gets a legacy `pair-code` instead of `pair-ok` and
-        # aborts with "update to pair securely"). Pinned like FIL_CLAIM_LIMIT so
-        # prod is untouched.
+        # v2-only: client mints the words locally, sends ONLY the numeric
+        # nameplate. Non-v2 clients receive "update-required" (Decision #1).
+        # FIL_FORCE_V1 fixture hook retained for Gate #6 (downgrade-refused)
+        # testing: when set, the server simulates a legacy relay that omits
+        # the v:2 field, forcing the client to refuse.
         force_v1 = os.environ.get("FIL_FORCE_V1") == "1"
-        # --- v2 path: nameplate-only allocation, no words ever cross the wire.
-        if data.get("v") == 2 and not force_v1:
-            nameplate = _norm_code(data.get("nameplate"))
-            if not _NAMEPLATE_RE.match(nameplate):
-                # Defense-in-depth: reject anything that isn't a bare number so
-                # a buggy/malicious v2 client can't park words server-side.
-                emit("pair-error", {"error": "bad-nameplate"})
+        if data.get("v") != 2 or force_v1:
+            if force_v1:
+                emit("pair-code", {"code": "legacy-downgrade-test-000", "ttl": 600})
                 return
-            if registry.pair_create(nameplate, sid, ttl=PAIR_TTL):
-                # NO words echoed; the creator shows its OWN minted full code.
-                _tel("pair-create", sid=sid, nameplate=nameplate, v=2,
-                     in_room=bool(registry.room_of(sid)), leased=registry.meta(sid) is not None)
-                emit("pair-ok", {"nameplate": nameplate, "ttl": PAIR_TTL, "v": 2})
-                return
-            # Collision: the client re-mints a fresh nameplate and retries.
-            emit("pair-error", {"error": "taken"})
+            emit("pair-error", {"error": "update-required", "why": "this server requires v2 (PAKE handshake); update your client"})
             return
-        # --- v1 path (unchanged): server mints the whole adj-animal-NNN code.
-        keyword = _norm_code(data.get("keyword"))
-        for _ in range(4):
-            code = keyword or _mint_pair_code()
-            if registry.pair_create(code, sid, ttl=PAIR_TTL):
-                _tel("pair-create", sid=sid, code=code,
-                     in_room=bool(registry.room_of(sid)), leased=registry.meta(sid) is not None)
-                emit("pair-code", {"code": code, "ttl": PAIR_TTL})
-                return
-            if keyword:  # a chosen keyword that's in use is an error, not a retry
-                emit("pair-error", {"error": "taken"})
-                return
-        emit("pair-error", {"error": "exhausted"})
+        nameplate = _norm_code(data.get("nameplate"))
+        if not _NAMEPLATE_RE.match(nameplate):
+            # Defense-in-depth: reject anything that is not a bare number so
+            # a buggy/malicious client cannot park words server-side.
+            emit("pair-error", {"error": "bad-nameplate"})
+            return
+        if registry.pair_create(nameplate, sid, ttl=PAIR_TTL):
+            # NO words echoed; the creator shows its OWN minted full code.
+            _tel("pair-create", sid=sid, nameplate=nameplate, v=2,
+                 in_room=bool(registry.room_of(sid)), leased=registry.meta(sid) is not None)
+            emit("pair-ok", {"nameplate": nameplate, "ttl": PAIR_TTL, "v": 2})
+            return
+        # Collision: the client re-mints a fresh nameplate and retries.
+        emit("pair-error", {"error": "taken"})
 
     # Claim rate limit: 21.8 bits of code entropy only holds if nobody can
     # sweep the space. 5 attempts/min per connection (and per client IP, so
@@ -499,17 +455,15 @@ def register(socketio, registry):
             emit("pair-error", {"error": "slow-down"})
             return
         data = data or {}
-        # L1-a (PAKE v2): a v:2 claimer sends ONLY the nameplate — the password
-        # (words) NEVER reaches the server (relay-blind, gate 2). The full typed
-        # code is split CLIENT-SIDE; only the numeric nameplate is the rendezvous
-        # selector here. For v1 clients the whole `code` is still the selector.
-        if data.get("v") == 2:
-            code = _norm_code(data.get("nameplate"))
-            if not _NAMEPLATE_RE.match(code):
-                emit("pair-error", {"error": "invalid", "why": "bad-nameplate"})
-                return
-        else:
-            code = _norm_code(data.get("code"))
+        # v2-only: claimer sends ONLY the nameplate (the password NEVER reaches
+        # the server, relay-blind, gate 2). Non-v2 receives "update-required".
+        if data.get("v") != 2:
+            emit("pair-error", {"error": "update-required", "why": "this server requires v2 (PAKE handshake); update your client"})
+            return
+        code = _norm_code(data.get("nameplate"))
+        if not _NAMEPLATE_RE.match(code):
+            emit("pair-error", {"error": "invalid", "why": "bad-nameplate"})
+            return
         existed, peek_creator, creator_alive = registry.peek_pair(code) if code else (False, None, False)
         creator = registry.pair_claim(code) if code else None
         room = registry.room_of(creator) if creator else None

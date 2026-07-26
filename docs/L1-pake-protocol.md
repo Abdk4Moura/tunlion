@@ -421,3 +421,49 @@ The pinned device record grows a capability list, **deny-by-default**:
 
 **STOP HERE.** Implementation of the real pairing change is a separate task
 behind human review of this spec.
+
+---
+
+## 13. Decisions locked (2026-07-26, owner review)
+
+The §11 human-review checkpoint is resolved. Implementation may proceed with:
+
+1. **v2-only cutover, no v1 fallback.** All clients are changed at once, so there
+   is no mixed-version population. The entire §6.1 downgrade-attack surface and the
+   legacy secret-over-DataChannel fallback are DROPPED; the server's v1 word-minting
+   path is removed. (Resolves §6, §6.1, §11.6.)
+
+2. **Auto-mint widened to 16 bits (256 x 256).** The CSPRNG-minted default (for
+   users who do not type their own) uses 256 adjectives x 256 animals = 65,536
+   (~16 bits), online single-guess = 1/65,536. Curate the two 256-word lists from
+   phonetically-distinct sources (EFF/PGP-style), keep the adj-animal format.
+   Supersedes the 64x64 lists in `backend/signaling.py` and
+   `frontend/src/lib/words.js`. (Resolves §11.4.)
+
+3. **User-chosen passwords stay (the steered default) but are gated to reject the
+   predictable.** The current frontend gate (">= 2 words") is strengthened to: at
+   least two DISTINCT words that are not a common/predictable phrase (a small
+   blocklist of the obvious bullseyes: "hello world", "let me in", "test test", the
+   user's own name/device name, dictionary bigrams). Rationale: burn-on-claim gives
+   the attacker exactly ONE online guess per code, so a user-chosen password only
+   has to survive the attacker's single BEST guess, the requirement is "not the
+   bullseye," not high entropy. Do NOT impose a heavy zxcvbn/password-manager bar.
+   Same gate on CLI and browser.
+
+4. **Gate #3 (burn-on-claim + no-retry) is THE load-bearing dependency and a HARD,
+   negatively-tested requirement.** A wrong password/confirmation MUST consume the
+   nameplate (GETDEL) AND force the creator to re-mint fresh words, never retry the
+   same code. The negative test must prove a wrong guesser is forced to a fresh
+   code. Decisions 2 and 3 rest entirely on this.
+
+5. **Nameplate: ship 900 (~9.8-bit), monitor collisions.** Widening to 4 digits is
+   a one-line change if concurrency forces it. (Resolves §11.5.)
+
+6. **Crate: `spake2 = "=0.4.0"` pinned, accepted** (RustCrypto, unaudited, same as
+   magic-wormhole). Do NOT ship 0.5.0-pre. (Resolves §11.1.)
+
+**Implementation ownership: contracted to filament-professional.** The browser PAKE
+v2 (`words.js`, `pairing.js`, `PakePairing`, the custom-code form) is substantially
+built; remaining scope is the CLI/native side, the server nameplate-only split
+(remove word minting), decisions 2-4 above, and the §10 gates, especially the
+negative gates #2 (server-can't-derive) and #3 (burn + no-retry).

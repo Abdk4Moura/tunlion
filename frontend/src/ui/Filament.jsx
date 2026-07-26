@@ -504,10 +504,10 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
           {pv.autoAssigned && <span style={{ fontSize: 10.5, color: T.dim }}>  (number added for you)</span>}
         </div>
       )}
-      {/* Steering nudge: weak (single-word) input; typing stays allowed. */}
+      {/* Steering nudge: weak or blocked input. */}
       {pv && typed.trim() && !pv.strongEnough && (
         <div data-testid="custom-nudge" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>
-          use at least two words, e.g. gigantic-element (easier to say, harder to guess)
+          {pv.blockedReason || 'use at least two words, e.g. gigantic-element (easier to say, harder to guess)'}
         </div>
       )}
     </div>

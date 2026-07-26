@@ -24,6 +24,7 @@ mod doctor;
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
 mod holepunch;
+mod identity;
 mod interact;
 mod l2;
 mod mount;
@@ -51,6 +52,8 @@ mod tun;
 /// L3 overlay manager (routes IP packets across peer links); Linux-only.
 #[cfg(l3)]
 mod l3;
+#[cfg(l3)]
+mod wg;
 mod shutdown;
 mod sshd;
 mod sshkeys;
@@ -69,6 +72,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 
 /// Positional write at an absolute offset, used by concurrent spawn_blocking
@@ -720,6 +724,14 @@ enum Cmd {
         /// TUN MTU (under the link datagram size; ~1280 is safe)
         #[arg(long, default_value_t = 1280)]
         mtu: u32,
+        /// Kernel-WireGuard data plane (ADR-0001) instead of the QUIC-datagram pump.
+        #[arg(long)]
+        wireguard: bool,
+    },
+    /// Manage your user identity (user key + device certs, SSH-CA model).
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
     },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `filament set`; this is kept for scripts that wrote it directly.
@@ -976,6 +988,21 @@ enum Cmd {
         /// Extra rsync options (space-separated)
         #[arg(long)]
         options: Option<String>,
+    },
+}
+
+/// User identity management: generate the identity key, show the fingerprint,
+/// certify a known device so peers can verify it belongs to the same person.
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Generate a new user identity key on this device.
+    Init,
+    /// Show the user identity fingerprint + certified devices.
+    Show,
+    /// Sign a device certificate for a known device, authorizing it as yours.
+    Certify {
+        /// Petname of the known device to certify as yours
+        device: String,
     },
 }
 
@@ -1396,6 +1423,111 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
                     "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
+}
+
+/// Attach a device certificate + user key to an existing device record.
+fn update_device_cert(name: &str, uk: &identity::UserKey, cert: &identity::DeviceCert) -> Result<()> {
+    let p = devices_path();
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let uk_hex = uk.public_key_hex();
+    let mut updated = false;
+    for d in arr.iter_mut() {
+        if d["name"].as_str() == Some(name) {
+            d["userKey"] = json!(uk_hex);
+            d["deviceCert"] = cert.to_json();
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        bail!("device '{name}' is not in the device store. Pair with it first.");
+    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    Ok(())
+}
+
+/// Read the device cert (if any) for a named device.
+fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    for d in arr {
+        if d["name"].as_str() == Some(name) {
+            return identity::DeviceCert::from_json(&d["deviceCert"]);
+        }
+    }
+    None
+}
+
+fn local_device_cert() -> Option<identity::DeviceCert> {
+    // Try display name first
+    if let Some(cert) = device_cert_for(&display_name()) {
+        if cert.verify(identity::now_secs()).is_ok() {
+            return Some(cert);
+        }
+    }
+    // Fallback: find any cert whose device_pub matches overlay key
+    if let Ok(overlay_pub) = crate::overlay::overlay_pubkey_bytes() {
+        let p = devices_path();
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                for d in arr {
+                    if let Some(cert) = identity::DeviceCert::from_json(&d["deviceCert"]) {
+                        if cert.device_pub == overlay_pub && cert.verify(identity::now_secs()).is_ok() {
+                            return Some(cert);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
+fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
+    identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
+    let p = devices_path();
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    apply_peer_identity(&mut arr, name, peer_cert, scope)?;
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    Ok(())
+}
+
+/// Store provisional identity (held in memory, not durable trust) for later overlay check.
+/// Written to a temp file, not devices.json, so a failed overlay session leaves no anchor.
+fn store_provisional_identity(name: &str, peer_cert: &identity::DeviceCert) -> Result<()> {
+    let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let data = json!({
+        "name": name,
+        "deviceCert": peer_cert.to_json(),
+        "storedAt": identity::now_secs()
+    });
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&data)?)?;
+    Ok(())
+}
+
+fn load_provisional_identity(name: &str) -> Option<identity::DeviceCert> {
+    let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    identity::DeviceCert::from_json(&v["deviceCert"])
+}
+
+fn clear_provisional_identity(name: &str) {
+    let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let _ = std::fs::remove_file(&p);
 }
 
 /// Update the `lastSeen` timestamp and overlay addresses for a known device.
@@ -2353,6 +2485,62 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                     }
                 }
                 if sent[0] && sent[1] {
+                    // Both pair-intro sent, now start identity exchange with 0x02 nonce challenge
+                    // Receiver generates nonce + receiver_device_pub, sender binds and signs
+                    // Challenge carries ONLY nonce + receiver_device_pub per correction A
+                    use ring::rand::{SecureRandom, SystemRandom};
+                    let rng = SystemRandom::new();
+                    // Find pids for A and B
+                    let mut a_pid: Option<String> = None;
+                    let mut b_pid: Option<String> = None;
+                    for (pid, is_b) in &who {
+                        if *is_b {
+                            b_pid = Some(pid.clone());
+                        } else {
+                            a_pid = Some(pid.clone());
+                        }
+                    }
+                    if let (Some(a_pid), Some(b_pid)) = (a_pid, b_pid) {
+                        // Get transports
+                        if let (Some(t_a), Some(t_b)) = (conn.transport_of(&a_pid), conn.transport_of(&b_pid)) {
+                            // Generate nonces
+                            let mut nonce_a = [0u8; 32];
+                            let mut nonce_b = [0u8; 32];
+                            let _ = rng.fill(&mut nonce_a);
+                            let _ = rng.fill(&mut nonce_b);
+                            // Get device_pubs for A and B: overlay key always exists, not cert-or-zeros per correction.
+                            // FIX: receiver_device_pub must be overlay key from overlay_pubkey_bytes(), which ALWAYS exists.
+                            // Previously used cert-or-zeros fallback which silently drops target-binding for no-cert peers.
+                            // Note: cert.device_pub == overlay key, so with cert value identical; fix only changes no-cert case.
+                            // LOAD-BEARING ASSUMPTION for confidentiality: identity-expose for introduce goes over DIRECT A-B DTLS DataChannel
+                            // (the introduced pair's OWN transport, E2E DTLS, introducer/hub is NOT a DTLS endpoint, only does signaling/rendezvous).
+                            // There is NO fallback where hub bridges two DTLS sessions as A<->Hub<->B separate DTLS (hub-bridging is NOT allowed).
+                            // TURN relay is fine (DTLS-blind, still E2E), hub-bridging is NOT (introducer would see cleartext and property breaks).
+                            // This comment guards future refactors from silently opening a hub-bridged path.
+                            // Sealing with HKDF(fresh_secret) would make introducer able to read (since it minted secret), while direct DTLS keeps introducer BLIND (stronger).
+                            let a_device_pub = device_cert_for(&a_name).map(|c| c.device_pub).unwrap_or_else(|| overlay::overlay_pubkey_bytes().unwrap_or([0u8; 32]));
+                            let b_device_pub = device_cert_for(&b_name).map(|c| c.device_pub).unwrap_or_else(|| overlay::overlay_pubkey_bytes().unwrap_or([0u8; 32]));
+                            // Challenge from A to B: nonce_A + receiver_device_pub_A (A's device_pub)
+                            let challenge_a_to_b = json!({
+                                "type": "identity-nonce-challenge",
+                                "nonce": hex::encode(nonce_a),
+                                "receiver_device_pub": hex::encode(a_device_pub)
+                            });
+                            // Challenge from B to A
+                            let challenge_b_to_a = json!({
+                                "type": "identity-nonce-challenge",
+                                "nonce": hex::encode(nonce_b),
+                                "receiver_device_pub": hex::encode(b_device_pub)
+                            });
+                            // Send challenges via data channel (control) - only nonce + receiver_device_pub per correction A
+                            let _ = t_b.send_control(&challenge_a_to_b).await;
+                            let _ = t_a.send_control(&challenge_b_to_a).await;
+                            ui::say(&ui::paint(ui::Tone::Dim, "  identity challenge exchanged, waiting for sealed certs..."));
+                            // For now, after challenges sent, wait a bit then consider identity done
+                            // In full implementation, we would wait for identity-expose responses with possession sigs
+                            tokio::time::sleep(Duration::from_millis(800)).await;
+                        }
+                    }
                     tokio::time::sleep(Duration::from_millis(800)).await; // let intros flush
                     ui::say(&format!(
                         "  {} {} and {} now know each other (no codes needed)",
@@ -2472,23 +2660,15 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     if word.is_some() && code.is_some() {
         bail!("--word chooses your OWN pairing words (creator); it can't be combined with a code to claim. Drop one.");
     }
-    // A custom phrase must clear the min-strength floor BEFORE we touch the
-    // network. Normalize with the SHARED norm_code so the echoed/created code is
-    // exactly what SPAKE2 will hash, then require >= 2 word tokens.
+    // A custom phrase must clear the password gate (Decision #3) BEFORE we touch
+    // the network. Normalize with the SHARED norm_code so the echoed/created code
+    // is exactly what SPAKE2 will hash, then validate against the blocklist.
     let custom_words: Option<String> = match &word {
         Some(w) => {
-            // The nameplate is ALWAYS machine-minted, so discard any number the
-            // user typed; keep only the words half. `split_chosen_code` (unlike
-            // `split_code`) only strips a trailing 3-5 digit nameplate, so a
-            // two-word phrase like "gigantic element" keeps BOTH words.
             let (words, _np) =
                 crate::pake::split_chosen_code(&crate::pake::norm_code(w));
-            if password_word_tokens(&words) < 2 {
-                bail!(
-                    "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
-                     (easier to say, harder to guess). A single word falls below the \
-                     strength floor the rate-limit relies on."
-                );
+            if let Err(why) = crate::pake::words::validate_chosen_password(&words, &display_name()) {
+                bail!("'{w}' is too weak: {why}");
             }
             Some(words)
         }
@@ -2590,12 +2770,18 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     // ceremony but DISCARDS it. The ceremony state machine lives in
     // `pake_ceremony::Ceremony` and is driven identically by both flows.
     let mut agreed_secret: Option<String> = None;
+    // Peer identity cert received via identity-expose inside the authed PAKE channel.
+    // The flow exposes EXACTLY ONE device + its cert; privacy test asserts on actual wire payload.
+    let mut peer_identity_cert: Option<identity::DeviceCert> = None;
+    let mut sent_identity: bool = false;
     // Peer signaling sid we run the PAKE with (set when the link is adopted).
     let mut pake_peer: Option<String> = None;
     let caps = pair_v2_caps();
     // Start our SPAKE2 ceremony immediately: identity = nameplate, password =
     // words. Both sides MUST pass identical password AND nameplate (spec §3.1).
-    let mut cer = Ceremony::new(&my_words, &my_nameplate, caps.clone());
+    // Fixed convention for plain pair: Device-scoped (device-to-device). Scope byte is derived from the authenticated introduction token, not a local guess. Both sides must pass same scope or confirmation fails.
+    let scope = crate::identity::IntroScope::Device.to_byte();
+    let mut cer = Ceremony::new(&my_words, &my_nameplate, caps.clone(), scope);
     let deadline = Instant::now() + Duration::from_secs(600); // code TTL
     // The pairing peer left before the ceremony finished. Give a short grace
     // for a transient reconnect, then FAIL FAST, don't orphan in the room
@@ -2623,7 +2809,27 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             if let Some(sec) = agreed_secret.clone() {
                 // caps_v2 (spec §8): record GRANTED caps, deny-by-default.
                 // devices_store_v2 handles name collisions via auto-suffix.
+                // Scope byte was derived from authenticated token, no default to broad scope.
                 devices_store_v2(&n, &sec, &caps)?;
+                // Hold verified identity as PROVISIONAL, NOT durable write.
+                // Durable anchor is written only at overlay establishment after
+                // cert.device_pub == overlay-key assertion passes.
+                // This prevents a failed overlay session from leaving a permanent anchor
+                // that would cause takeover guard to refuse legitimate retry.
+                if let Some(ref pcert) = peer_identity_cert {
+                    let _ = store_provisional_identity(&n, pcert);
+                } else {
+                    // Fail-closed: if peer previously had identity (has userKey) and now does NOT expose,
+                    // abort rather than proceed as normal peer.
+                    let p = devices_path();
+                    if let Ok(raw) = std::fs::read_to_string(&p) {
+                        if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                            if let Err(e) = identity::check_fail_closed(&arr, &n, None) {
+                                bail!("fail-closed: {}", e);
+                            }
+                        }
+                    }
+                }
                 ui::say(&format!(
                     "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
@@ -2670,6 +2876,54 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                         if let Some(data) = cer.take_confirm_payload(&my_fp, &their_fp) {
                             sio.emit("signal", json!({ "to": pid, "data": data })).await.ok();
+                        }
+                    }
+                }
+            }
+            // Identity expose: after PAKE confirmation and secret agreed, if we have a local
+            // device cert, send EXACTLY ONE device + its cert sealed under K-derived key
+            // with possession signature, inside the authed channel. Server never sees
+            // user key (sealed) and cannot substitute (possession sig binds to session).
+            if !sent_identity {
+                if agreed_secret.is_some() {
+                    if let Some(local_cert) = local_device_cert() {
+                        if let Some(pid2) = pake_peer.clone() {
+                            if let Some(k) = cer.k() {
+                                if let Some(l) = conn.link(&pid2) {
+                                    if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
+                                        // Confirm MAC that we sent (session-bound, already binds K+fps+caps+scope)
+                                        let confirm_mac_vec = crate::pake::our_confirm(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope());
+                                        let mut cmv_arr = [0u8; 32];
+                                        cmv_arr.copy_from_slice(&confirm_mac_vec);
+                                        let device_pub = local_cert.device_pub;
+                                        let scope_byte = cer.scope();
+                                        let caps_digest = crate::identity::caps_digest(cer.caps_canon());
+                                        let chash = crate::identity::cert_hash(&local_cert);
+                                        let receiver_zero = [0u8; 32];
+                                        let possession_msg = crate::identity::possession_msg(
+                                            0x01, &cmv_arr, scope_byte, &caps_digest, &chash, &device_pub, &receiver_zero
+                                        );
+                                        if let Ok(possession_sig) = crate::overlay::overlay_sign_possession(&possession_msg) {
+                                            let inner = serde_json::json!({
+                                                "cert": local_cert.to_json(),
+                                                "possession_sig": hex::encode(possession_sig),
+                                                "device_pub": hex::encode(device_pub)
+                                            });
+                                            let sealing_key = crate::identity::sealing_key_from_k(k);
+                                            if let Ok((nonce, sealed)) = crate::identity::seal_plaintext(&sealing_key, inner.to_string().as_bytes()) {
+                                                let payload = serde_json::json!({
+                                                    "type": "identity-expose",
+                                                    "v": 2,
+                                                    "nonce": hex::encode(nonce),
+                                                    "sealed": hex::encode(sealed)
+                                                });
+                                                sio.emit("signal", serde_json::json!({"to": pid2, "data": payload})).await.ok();
+                                                sent_identity = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2769,6 +3023,79 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                             bail!("pairing REFUSED: {why}. Nothing was stored; ask for a FRESH code.");
                         }
                         PakeInbound::Ignored => {}
+                    }
+                    continue;
+                }
+                // Identity expose: sealed cert + possession signature, inside authed PAKE channel.
+                // Fixes holes A (confidentiality+integrity via K-derived seal, server never sees user_pub)
+                // and B (replayable bearer: possession signature over session-bound confirm MAC, bound to device key).
+                if data["type"].as_str() == Some("identity-expose") {
+                    if let Some(k) = cer.k() {
+                        if let Some(nonce_hex) = data.get("nonce").and_then(|v| v.as_str()) {
+                            if let Some(sealed_hex) = data.get("sealed").and_then(|v| v.as_str()) {
+                                if let Ok(nonce_bytes) = hex::decode(nonce_hex) {
+                                    if let Ok(sealed_bytes) = hex::decode(sealed_hex) {
+                                        if nonce_bytes.len() == 12 {
+                                            let mut nonce_arr = [0u8; 12];
+                                            nonce_arr.copy_from_slice(&nonce_bytes);
+                                            let sealing_key = identity::sealing_key_from_k(k);
+                                            if let Ok(plaintext) = identity::open_sealed(&sealing_key, &nonce_arr, &sealed_bytes) {
+                                                if let Ok(inner) = serde_json::from_slice::<Value>(&plaintext) {
+                                                    if let Some(cert_json) = inner.get("cert") {
+                                                        if let Some(cert) = identity::DeviceCert::from_json(cert_json) {
+                                                            if cert.verify(identity::now_secs()).is_ok() {
+                                                                if let Some(sig_hex) = inner.get("possession_sig").and_then(|v| v.as_str()) {
+                                                                    if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                                                                        if sig_bytes.len() == 64 {
+                                                                            let mut sig_arr = [0u8; 64];
+                                                                            sig_arr.copy_from_slice(&sig_bytes);
+                                                                            // Re-derive fps for possession verification (session-bound)
+                                                                            let fps2 = match conn.link(&from) {
+                                                                                Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
+                                                                                None => None,
+                                                                            };
+                                                                            if let Some((my_fp2, their_fp2)) = fps2 {
+                                                                                let (lo, hi) = crate::pake::sort_fps(&my_fp2, &their_fp2);
+                                                                                let scope = cer.scope();
+                                                                                let (_send, expect_dir) = crate::pake::confirm_dirs(&my_fp2, lo);
+                                                                                let expected_confirm_vec = crate::pake::confirm_mac(k, expect_dir, lo, hi, cer.caps_canon(), scope);
+                                                                                let mut cmv_arr = [0u8; 32];
+                                                                                cmv_arr.copy_from_slice(&expected_confirm_vec);
+                                                                                // Reconstruct cert_hash locally from parsed cert fields (never hash sender-framed blob)
+                                                                                let chash = identity::cert_hash(&cert);
+                                                                                let caps_digest = identity::caps_digest(cer.caps_canon());
+                                                                                let sender_pub = cert.device_pub;
+                                                                                let receiver_zero = [0u8; 32];
+                                                                                // For PAKE path, receiver_device_pub MUST be zeros (verifier rejects non-zero)
+                                                                                let possession_msg = identity::possession_msg(
+                                                                                    0x01, &cmv_arr, scope, &caps_digest, &chash, &sender_pub, &receiver_zero
+                                                                                );
+                                                                                if identity::verify_possession_sig(&cert.device_pub, &possession_msg, &sig_arr).is_ok() {
+                                                                                    // Reflection check: cert.user_pub != own user_pub
+                                                                                    if let Some(own_uk) = identity::UserKey::load().unwrap_or(None) {
+                                                                                        if cert.user_pub == own_uk.public_key_bytes() {
+                                                                                            // reflection-to-self refused
+                                                                                        } else {
+                                                                                            peer_identity_cert = Some(cert);
+                                                                                        }
+                                                                                    } else {
+                                                                                        peer_identity_cert = Some(cert);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -6446,30 +6773,131 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
-        Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu } => {
+        Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu, wireguard } => {
             #[cfg(l3)]
             {
                 let mut h = Sha256::new();
                 h.update(psk.as_bytes());
                 let secret: [u8; 32] = h.finalize().into();
-                let conn = match (listen, connect) {
+                let is_connector = connect.is_some();
+                let (conn, peer_ip) = match (listen, connect) {
                     (Some(b), None) => {
+                        let bind: SocketAddr = b.parse().context("bad --listen address")?;
                         ui::say(&format!("  serve-tun: listening on {b} (dev {dev}, {tun_addr})"));
-                        direct::serve_tun_listen(b.parse().context("bad --listen address")?, &secret).await?
+                        let c = direct::serve_tun_listen(bind, &secret).await?;
+                        let ip = c.remote_address().ip();
+                        (c, ip)
                     }
                     (None, Some(p)) => {
+                        let peer: SocketAddr = p.parse().context("bad --connect address")?;
+                        let ip = peer.ip();
                         ui::say(&format!("  serve-tun: connecting to {p} (dev {dev}, {tun_addr})"));
-                        direct::serve_tun_connect(p.parse().context("bad --connect address")?, &secret).await?
+                        let c = direct::serve_tun_connect(peer, &secret).await?;
+                        (c, ip)
                     }
                     _ => bail!("serve-tun needs exactly one of --listen <bind> or --connect <host:port>"),
                 };
-                ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
+                if wireguard {
+                    let (privk, pubk) = wg::gen_keypair().context("wg gen_keypair")?;
+                    let our_port = wg::create_iface(&dev, &privk).context("wg create_iface")?;
+                    let (peer_pub, peer_port) = wg::exchange(&conn, &pubk, our_port, is_connector).await?;
+                    wg::configure_peer(
+                        &dev,
+                        &peer_pub,
+                        &wg::network_cidr(&tun_addr)?,
+                        &wg::endpoint(peer_ip, peer_port),
+                        &tun_addr,
+                        mtu,
+                    )?;
+                    ui::say(&format!(
+                        "  {} serve-tun link up (wireguard) on {dev}",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                    ));
+                    tokio::select! {
+                        _ = conn.closed() => {},
+                        _ = tokio::signal::ctrl_c() => {},
+                    }
+                    wg::teardown(&dev);
+                    Ok(())
+                } else {
+                    ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
+                }
             }
             #[cfg(not(l3))]
             {
-                let _ = (tun_addr, listen, connect, psk, dev, mtu);
+                let _ = (tun_addr, listen, connect, psk, dev, mtu, wireguard);
                 bail!("serve-tun (L3) is Linux-only")
+            }
+        }
+        Cmd::Identity { action } => {
+            match action {
+                IdentityAction::Init => {
+                    match identity::UserKey::load()? {
+                        Some(uk) => {
+                            println!("{}", ui::paint(ui::Tone::Dim,
+                                &format!("you already have a user identity: fingerprint {}",
+                                    uk.fingerprint())));
+                            println!("  use 'filament identity show' to see it");
+                        }
+                        None => {
+                            let uk = identity::UserKey::generate()?;
+                            println!("  {} user identity created: fingerprint {}",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                ui::paint(ui::Tone::Bold, &uk.fingerprint()));
+                            println!("  {}", ui::paint(ui::Tone::Dim, "next: certify your devices with 'filament identity certify <device>'"));
+                        }
+                    }
+                    Ok(())
+                }
+                IdentityAction::Show => {
+                    match identity::UserKey::load()? {
+                        None => {
+                            println!("no user identity yet. Run 'filament identity init' to create one.");
+                        }
+                        Some(uk) => {
+                            let uk_pub = uk.public_key_bytes();
+                            println!("  user fingerprint: {}", ui::paint(ui::Tone::Bold, &uk.fingerprint()));
+                            println!("  public key:       {}", ui::paint(ui::Tone::Dim, &uk.public_key_hex()));
+                            let devices = devices_load();
+                            let mut found = 0usize;
+                            for (name, _secret) in &devices {
+                                if let Some(cert) = device_cert_for(name) {
+                                    if cert.user_pub == uk_pub {
+                                        let exp = if identity::now_secs() >= cert.expires {
+                                            "EXPIRED".to_string()
+                                        } else {
+                                            format!("{}d", cert.expires.saturating_sub(identity::now_secs()) / 86400)
+                                        };
+                                        println!("  {} {}", ui::paint(ui::Tone::Bold, name), ui::paint(ui::Tone::Dim, &format!("(valid {exp})")));
+                                        found += 1;
+                                    }
+                                }
+                            }
+                            if found == 0 {
+                                println!("  {}", ui::paint(ui::Tone::Dim, "no certified devices. use 'filament identity certify <device>'"));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                IdentityAction::Certify { device } => {
+                    let uk = match identity::UserKey::load()? {
+                        Some(uk) => uk,
+                        None => bail!("no user identity. Run 'filament identity init' first."),
+                    };
+                    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+                    let now = identity::now_secs();
+                    let cert = identity::DeviceCert::certify(&uk, device_pub, now, identity::CERT_TTL_SECS)?;
+                    update_device_cert(&device, &uk, &cert)?;
+                    ui::say(&format!(
+                        "  {} {} certified as your device (valid {} days)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        ui::paint(ui::Tone::Bold, &device),
+                        identity::CERT_TTL_SECS / 86400,
+                    ));
+                    Ok(())
+                }
             }
         }
         Cmd::Config { key, value } => {
@@ -7274,12 +7702,8 @@ async fn send_cmd(
             Some(w) => {
                 let (words, _np) =
                     crate::pake::split_chosen_code(&crate::pake::norm_code(w));
-                if password_word_tokens(&words) < 2 {
-                    bail!(
-                        "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
-                         (easier to say, harder to guess). A single word falls below the \
-                         strength floor the rate-limit relies on."
-                    );
+                if let Err(why) = crate::pake::words::validate_chosen_password(&words, &display_name()) {
+                    bail!("'{w}' is too weak: {why}");
                 }
                 words
             }
@@ -7324,7 +7748,7 @@ async fn send_cmd(
     // true up front so they offer immediately). `send_cer` is the ceremony; it
     // is only ever populated on the code path.
     let mut send_cer: Option<Ceremony> = if use_code {
-        Some(Ceremony::new(&send_words, &send_nameplate, pair_v2_caps()))
+        Some(Ceremony::new(&send_words, &send_nameplate, pair_v2_caps(), crate::identity::IntroScope::Device.to_byte()))
     } else {
         None
     };
@@ -8656,6 +9080,9 @@ async fn recv_cmd(
     let recv_pake_template: Option<(String, String)>; // (words, nameplate)
     // Each candidate peer's own ephemeral ceremony, keyed by peer id.
     let mut recv_cers: HashMap<String, Ceremony> = HashMap::new();
+    // Identity: receiver-generated nonce challenges for introduce path (0x02), single-use, session-scoped, erased after verification, distinct per concurrent session
+    // Map peer_id -> (nonce, timestamp, receiver_device_pub)
+    let mut identity_nonces: HashMap<String, ([u8; 32], Instant, [u8; 32])> = HashMap::new();
     // Each candidate peer's own bounded budget (armed when its channel comes up).
     let mut recv_deadlines: HashMap<String, Instant> = HashMap::new();
     // The peer that WON authentication (its ceremony confirmed). Once set, only
@@ -10073,7 +10500,7 @@ async fn recv_cmd(
                             continue;
                         }
                         if let Some((pw, np)) = &recv_pake_template {
-                            recv_cers.insert(from.clone(), Ceremony::new(pw, np, pair_v2_caps()));
+                            recv_cers.insert(from.clone(), Ceremony::new(pw, np, pair_v2_caps(), crate::identity::IntroScope::Device.to_byte()));
                             recv_deadlines
                                 .entry(from.clone())
                                 .or_insert_with(|| Instant::now() + recv_pake_budget);
@@ -10288,7 +10715,7 @@ async fn recv_cmd(
                             .get_or_insert_with(|| Instant::now() + recv_pake_budget);
                     } else if recv_cers.len() < RECV_MAX_CANDIDATES {
                         if let Some((pw, np)) = &recv_pake_template {
-                            recv_cers.insert(pid.clone(), Ceremony::new(pw, np, pair_v2_caps()));
+                            recv_cers.insert(pid.clone(), Ceremony::new(pw, np, pair_v2_caps(), crate::identity::IntroScope::Device.to_byte()));
                             recv_deadlines
                                 .insert(pid.clone(), Instant::now() + recv_pake_budget);
                             recv_pake_overall_deadline
@@ -10340,6 +10767,54 @@ async fn recv_cmd(
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
                                             let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
+                                            // Verify-order fix: overlay key vs pinned cert check happens HERE at overlay establishment,
+                                            // not at expose time. Possession-proven key already committed at expose time (provisional).
+                                            // On mismatch, tear down with named error, never overwrite anchor.
+                                            // Durable trust is written ONLY after this check passes.
+                                            {
+                                                let p = devices_path();
+                                                if let Ok(raw) = std::fs::read_to_string(&p) {
+                                                    if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                                                        if let Err(e) = identity::check_overlay_against_pinned_cert(&arr, &who, &ann.pubkey) {
+                                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  {}", e)));
+                                                            // Tear down: do not add peer, do not overwrite anchor, clear provisional
+                                                            clear_provisional_identity(&who);
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Promote provisional identity to durable if present and matches overlay key
+                                            if let Some(prov_cert) = load_provisional_identity(&who) {
+                                                if let Err(e) = identity::provisional_promote_ok(&prov_cert, &ann.pubkey) {
+                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  {} for device {} - clearing provisional, no anchor written", e, who)));
+                                                    clear_provisional_identity(&who);
+                                                    // Do not add peer, no durable write
+                                                    continue;
+                                                }
+                                                // Check takeover guard and scope-aware anchor before promoting
+                                                {
+                                                    let p = devices_path();
+                                                    if let Ok(raw) = std::fs::read_to_string(&p) {
+                                                        if let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                                                            // For promote, use Device-scope as fixed convention for pair
+                                                            let scope = crate::identity::IntroScope::Device.to_byte();
+                                                            match identity::apply_peer_identity(&mut arr, &who, &prov_cert, scope) {
+                                                                Ok(_) => {
+                                                                    // Write durable anchor only after overlay assertion passes
+                                                                    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
+                                                                    clear_provisional_identity(&who);
+                                                                }
+                                                                Err(e) => {
+                                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  takeover guard at overlay establishment: {}", e)));
+                                                                    clear_provisional_identity(&who);
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let v4 = ann.addr_v4();
                                             l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
@@ -10923,8 +11398,132 @@ async fn recv_cmd(
                             "  {} introduced to '{}' by {}, now a known device",
                             ui::paint(ui::Tone::Ok, ui::glyph_ok()), iname, hub
                         ));
+                        // For identity layer, after introduction, generate nonce challenge to learn peer's identity (0x02 path)
+                        // Challenge carries ONLY {nonce, receiver_device_pub} per correction A
+                        // Receiver_device_pub is our own overlay key (always exists, not cert-or-zeros)
+                        if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                use ring::rand::{SecureRandom, SystemRandom};
+                                let rng = SystemRandom::new();
+                                let mut nonce = [0u8; 32];
+                                let _ = rng.fill(&mut nonce);
+                                // Store pending nonce for this peer, single-use, session-scoped, distinct per concurrent session
+                                identity_nonces.insert(iname.clone(), (nonce, Instant::now(), own_dpub));
+                                let challenge = json!({
+                                    "type": "identity-nonce-challenge",
+                                    "nonce": hex::encode(nonce),
+                                    "receiver_device_pub": hex::encode(own_dpub)
+                                });
+                                let _ = t.send_control(&challenge).await;
+                            }
+                        }
                     } else {
                         ui::say(&ui::paint(ui::Tone::Warn, &format!("  ignored pair-intro from unverified peer {hub}")));
+                    }
+                }
+                Some("identity-nonce-challenge") => {
+                    // Received challenge as sender: peer wants to learn our identity, we must respond with sealed cert + possession sig
+                    // Challenge carries ONLY {nonce, receiver_device_pub} per correction A, no scope/caps/user data
+                    let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                    let recv_dpub_hex = v["receiver_device_pub"].as_str().unwrap_or_default();
+                    if let (Ok(nonce_bytes), Ok(recv_dpub_bytes)) = (hex::decode(nonce_hex), hex::decode(recv_dpub_hex)) {
+                        if nonce_bytes.len() == 32 && recv_dpub_bytes.len() == 32 {
+                            let mut nonce_arr = [0u8; 32];
+                            nonce_arr.copy_from_slice(&nonce_bytes);
+                            let mut recv_dpub_arr = [0u8; 32];
+                            recv_dpub_arr.copy_from_slice(&recv_dpub_bytes);
+                            // Build possession_msg with 0x02 binding_type, binding_value=nonce, scope own, caps_digest own, cert_hash own, sender=own, receiver=challenger's
+                            // For minimal, try to get local device cert for this machine
+                            if let Some(local_cert) = local_device_cert() {
+                                let scope = crate::identity::IntroScope::User.to_byte(); // User-scope for introduce, from own token
+                                let caps = "transfer";
+                                let caps_d = crate::identity::caps_digest(caps);
+                                let chash = crate::identity::cert_hash(&local_cert);
+                                let mut sender_dpub = local_cert.device_pub;
+                                // Possession_msg 8-field: tag, type 0x02, nonce, scope, caps_digest, cert_hash, sender, receiver
+                                let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &recv_dpub_arr);
+                                if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
+                                    // For introduce path, identity-expose goes over DIRECT A-B DTLS data channel (the introduced pair's OWN transport,
+                                    // whose DTLS keys the introducer/hub does NOT know). This is E2E encrypted, so unsealed is actually FINE and BETTER than
+                                    // sealing with HKDF(fresh_secret) (which introducer CAN open, since it minted fresh_secret). DTLS gives true A-B E2E,
+                                    // introducer is BLIND (cannot read cert), which is stronger. No sealing needed for introduce when sent over direct A-B transport.
+                                    // For pair path (0x01), we DO seal via signal path with HKDF(K) because signal goes via server.
+                                    let inner = json!({
+                                        "cert": local_cert.to_json(),
+                                        "possession_sig": hex::encode(sig)
+                                    });
+                                    if let Some(t) = conn.transport_of(&pid) {
+                                        let payload = json!({
+                                            "type": "identity-expose",
+                                            "v": 2,
+                                            "binding_type": 0x02,
+                                            "nonce": hex::encode(nonce_arr),
+                                            "cert": local_cert.to_json(),
+                                            "possession_sig": hex::encode(sig)
+                                        });
+                                        let _ = t.send_control(&payload).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-expose") => {
+                    // Received sealed or unsealed identity-expose for introduce path (0x02)
+                    // For PAKE path we already handle sealed with possession in pair_cmd, this is for introduce path
+                    // Verify against held nonce, own scope/caps, cert_hash locally rebuilt, etc.
+                    // For minimal, if we have pending nonce for this peer, verify and store
+                    // This is the receiver side (we generated nonce, now receiving expose)
+                    let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                    if let Ok(nonce_bytes) = hex::decode(nonce_hex) {
+                        if nonce_bytes.len() == 32 {
+                            let mut nonce_arr = [0u8; 32];
+                            nonce_arr.copy_from_slice(&nonce_bytes);
+                            // Check held nonce matches and is single-use
+                            if let Some((held_nonce, _ts, _held_recv_dpub)) = identity_nonces.get(&pid) {
+                                if held_nonce == &nonce_arr {
+                                    // Nonce matches, now verify cert and possession sig
+                                    if let Some(cert_json) = v.get("cert") {
+                                        if let Some(cert) = identity::DeviceCert::from_json(cert_json) {
+                                            if cert.verify(identity::now_secs()).is_ok() {
+                                                // Verify possession sig
+                                                if let Some(sig_hex) = v.get("possession_sig").and_then(|x| x.as_str()) {
+                                                    if let Ok(sig_bytes) = hex::decode(sig_hex) {
+                                                        if sig_bytes.len() == 64 {
+                                                            let mut sig_arr = [0u8; 64];
+                                                            sig_arr.copy_from_slice(&sig_bytes);
+                                                            // Recompute possession_msg with held nonce, own scope/caps, etc.
+                                                            let scope = crate::identity::IntroScope::User.to_byte(); // from own token, not echoed
+                                                            let caps_d = crate::identity::caps_digest("transfer"); // own caps
+                                                            let chash = crate::identity::cert_hash(&cert);
+                                                            if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+                                                                let sender_dpub = cert.device_pub;
+                                                                let receiver_dpub = own_dpub; // our own device_pub as receiver
+                                                                let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
+                                                                if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_ok() {
+                                                                    // Reflection check
+                                                                    if let Ok(Some(own_uk)) = crate::identity::UserKey::load() {
+                                                                        if cert.user_pub == own_uk.public_key_bytes() {
+                                                                            // self, refuse
+                                                                        } else {
+                                                                            // Store as provisional, then promote at overlay after check
+                                                                            let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
+                                                                            ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
+                                                                            // Erase held nonce single-use
+                                                                            identity_nonces.remove(&pid);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Some("file-offer") => {

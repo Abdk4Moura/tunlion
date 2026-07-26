@@ -14,6 +14,7 @@
 
 import initPake, { PakeSession, canonicalCaps, normCode, splitCode, splitChosenCode as wasmSplitChosenCode } from '../pake/filament_pake.js'
 import pakeWasmUrl from '../pake/filament_pake_bg.wasm?url'
+import { validateChosenPassword } from './words.js'
 
 let _ready = null
 /// Initialize the WASM module once (idempotent). Vite serves the .wasm via ?url.
@@ -149,25 +150,21 @@ export function passwordWordTokens(password) {
   return m ? m.length : 0
 }
 
-/// STEERING preview for the browser "choose your own code" entry. Returns the
-/// shared-normalized {nameplate, password}, the >= 2-token strength verdict, and
-/// the FINAL code we'd create, exactly what SPAKE2 will hash. The nameplate is
-/// machine-assigned (`autoNameplate`) when the user typed none, shown dimmed in
-/// the UI; a typed nameplate is honored on the first create (server may bump it
-/// on collision). `pakeReady()` MUST have resolved before calling (uses WASM).
-export function previewCustomCode(typed, autoNameplate) {
+/// STEERING preview for the browser "choose your own code" entry. Uses the
+/// shared split + Decision #3 password gate (blocklist + identical-word check).
+/// The nameplate is machine-assigned when the user typed none.
+export function previewCustomCode(typed, autoNameplate, userName = '') {
   const { password, nameplate, normalized } = splitChosenCode(typed)
   const hasNumber = !!nameplate
   const np = hasNumber ? nameplate : (autoNameplate || '')
-  const tokens = passwordWordTokens(password)
+  const blockedReason = validateChosenPassword(password, userName)
   return {
     password,
     nameplate: np,
-    autoAssigned: !hasNumber, // the number was machine-appended (show dimmed)
-    strongEnough: tokens >= 2,
-    tokens,
+    autoAssigned: !hasNumber,
+    strongEnough: !blockedReason && !!password,
+    blockedReason: blockedReason || null,
     normalized,
-    // The full code we'd create; empty until both halves exist.
     full: password && np ? `${password}-${np}` : '',
   }
 }

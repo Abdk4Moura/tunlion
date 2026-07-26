@@ -1,0 +1,23 @@
+# Local dev build configuration for filament-cli.
+#
+# The default `bfd` linker relinks the entire ~30k-line binary on every
+# rebuild, which dominates edit/build/test cycle time. A faster linker (lld or
+# mold) cuts that link step dramatically. We do NOT enable one by default,
+# because neither is installed on a stock box and an active override would break
+# `cargo build` for anyone without the linker on PATH.
+#
+# To speed up your local builds, install one and uncomment the matching block:
+#
+#   lld : sudo apt install lld     (LLVM's linker; ships with the clang toolchain)
+#   mold: sudo apt install mold    (usually the fastest; https://github.com/rui314/mold)
+#
+# --- lld (needs the `clang` package for the cc driver) ---
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#
+# --- mold ---
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# On macOS the default linker is already fast; on newer nightlies you can try
+# the `rust-lld` self-contained linker instead of installing anything.
