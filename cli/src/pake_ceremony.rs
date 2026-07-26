@@ -91,6 +91,7 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Outcome of feeding an inbound `signal` payload into the ceremony.
+#[derive(Debug)]
 pub enum Inbound {
     /// The payload WAS a PAKE message (consumed). The caller must NOT route it
     /// into the WebRTC signal path. Drive the ceremony again afterwards.
@@ -354,6 +355,76 @@ mod tests {
         for n in 0..40usize {
             let data: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
             assert_eq!(b64_decode(&b64_encode(&data)).unwrap(), data);
+        }
+    }
+
+    // ---- Gate #2 (server-can't-derive): NEGATIVE security test ----
+    // A relay/MITM that does NOT know the password cannot derive K and cannot
+    // silently substitute its own key. It runs its own SPAKE2 under a WRONG
+    // password, injects its element toward A, and the confirmation MAC MUST
+    // fail on A's side, agreeing ZERO secret. Per the ledger rule, an auth
+    // feature is VERIFIED only if this negative test exists.
+    #[test]
+    fn gate2_spake2_substitution_detected() {
+        // Honest A and B with the same password. A fake relay (C) does NOT know
+        // the password; it guesses wrong and substitutes ITS element for B's
+        // when forwarding to A. A must detect the tampering and abort.
+        let pw_a = "brave-otter";
+        let np = "314";
+        let caps = pair_v2_caps();
+        let mut a = Ceremony::new(pw_a, np, caps.clone());
+        let mut b = Ceremony::new(pw_a, np, caps.clone());
+        // The fake relay C runs its own SPAKE2 with a GUESSED password.
+        let relay_pw = "tidy-walrus"; // wrong password
+        let mut relay = Ceremony::new(relay_pw, np, caps);
+
+        // A sends its element; relay receives it for forwarding.
+        let a_msg = a.take_msg_payload().unwrap();
+        // B sends its element; relay intercepts it.
+        let b_msg = b.take_msg_payload().unwrap();
+        // Relay sends its OWN element (under wrong password) to A.
+        let relay_msg = relay.take_msg_payload().unwrap();
+
+        // A receives the relay's (forged) element instead of B's.
+        assert!(matches!(a.on_signal(&relay_msg, None), Inbound::Consumed));
+        assert!(a.has_k(), "A derived K from the forged element (different K)");
+
+        // B receives A's element honestly.
+        assert!(matches!(b.on_signal(&a_msg, None), Inbound::Consumed));
+        assert!(b.has_k(), "B derived K from A's element");
+
+        // Now the confirmation step. Both sides have different K.
+        let a_conf = a.take_confirm_payload("SHA-256 A", "SHA-256 MITM").unwrap();
+        // B verifies A's confirm under B's OWN K. Since K differs, it MUST fail.
+        let r = b.on_signal(&a_conf, Some(("SHA-256 B", "SHA-256 A")));
+        // The MITM substitution must be DETECTED: confirmation fails.
+        assert!(matches!(r, Inbound::Abort(_)), "Gate #2 BROKEN: MITM substitution undetected, {r:?}");
+        assert!(b.secret().is_none(), "Gate #2 BROKEN: B agreed a secret despite MITM");
+        assert!(b.aborted().is_some(), "Gate #2: confirmed abort flag is set");
+        // A also has no secret (the relay never completed the ceremony).
+        assert!(a.secret().is_none(), "Gate #2: A agreed nothing (ceremony incomplete)");
+    }
+
+    // ---- Gate #2b: relay cannot derive the password from relayed bytes ----
+    // The password NEVER appears in any relayed payload (spec gate:relay-blind).
+    #[test]
+    fn gate2b_password_never_in_relayed_payloads() {
+        let mut a = Ceremony::new("brave-otter", "314", pair_v2_caps());
+        let mut b = Ceremony::new("brave-otter", "314", pair_v2_caps());
+        let a_msg = a.take_msg_payload().unwrap();
+        let b_msg = b.take_msg_payload().unwrap();
+        // The password "brave-otter" must not appear in either payload.
+        for payload in &[&a_msg, &b_msg] {
+            let s = serde_json::to_string(payload).unwrap();
+            assert!(!s.contains("brave-otter"), "Gate #2b BROKEN: password leaked in payload: {s}");
+        }
+        b.on_signal(&a_msg, None);
+        a.on_signal(&b_msg, None);
+        let a_conf = a.take_confirm_payload("SHA-256 A", "SHA-256 B").unwrap();
+        let b_conf = b.take_confirm_payload("SHA-256 B", "SHA-256 A").unwrap();
+        for payload in &[&a_conf, &b_conf] {
+            let s = serde_json::to_string(payload).unwrap();
+            assert!(!s.contains("brave-otter"), "Gate #2b BROKEN: password leaked in confirm payload: {s}");
         }
     }
 }

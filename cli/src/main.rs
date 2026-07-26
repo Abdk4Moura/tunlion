@@ -2470,23 +2470,15 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     if word.is_some() && code.is_some() {
         bail!("--word chooses your OWN pairing words (creator); it can't be combined with a code to claim. Drop one.");
     }
-    // A custom phrase must clear the min-strength floor BEFORE we touch the
-    // network. Normalize with the SHARED norm_code so the echoed/created code is
-    // exactly what SPAKE2 will hash, then require >= 2 word tokens.
+    // A custom phrase must clear the password gate (Decision #3) BEFORE we touch
+    // the network. Normalize with the SHARED norm_code so the echoed/created code
+    // is exactly what SPAKE2 will hash, then validate against the blocklist.
     let custom_words: Option<String> = match &word {
         Some(w) => {
-            // The nameplate is ALWAYS machine-minted, so discard any number the
-            // user typed; keep only the words half. `split_chosen_code` (unlike
-            // `split_code`) only strips a trailing 3-5 digit nameplate, so a
-            // two-word phrase like "gigantic element" keeps BOTH words.
             let (words, _np) =
                 crate::pake::split_chosen_code(&crate::pake::norm_code(w));
-            if password_word_tokens(&words) < 2 {
-                bail!(
-                    "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
-                     (easier to say, harder to guess). A single word falls below the \
-                     strength floor the rate-limit relies on."
-                );
+            if let Err(why) = crate::pake::words::validate_chosen_password(&words, &display_name()) {
+                bail!("'{w}' is too weak: {why}");
             }
             Some(words)
         }
@@ -7303,12 +7295,8 @@ async fn send_cmd(
             Some(w) => {
                 let (words, _np) =
                     crate::pake::split_chosen_code(&crate::pake::norm_code(w));
-                if password_word_tokens(&words) < 2 {
-                    bail!(
-                        "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
-                         (easier to say, harder to guess). A single word falls below the \
-                         strength floor the rate-limit relies on."
-                    );
+                if let Err(why) = crate::pake::words::validate_chosen_password(&words, &display_name()) {
+                    bail!("'{w}' is too weak: {why}");
                 }
                 words
             }
