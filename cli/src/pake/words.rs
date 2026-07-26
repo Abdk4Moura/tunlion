@@ -200,7 +200,7 @@ mod tests {
         use std::collections::HashSet;
         assert_eq!(ADJ.len(), 256);
         assert_eq!(ANIMAL.len(), 256);
-        // 256x256 = 65536 = 2^16 — the minted password entropy.
+        // 256x256 = 65536 = 2^16, the minted password entropy.
         assert_eq!(ADJ.len() * ANIMAL.len(), 1 << 16);
         let adj_set: HashSet<_> = ADJ.iter().collect();
         let animal_set: HashSet<_> = ANIMAL.iter().collect();

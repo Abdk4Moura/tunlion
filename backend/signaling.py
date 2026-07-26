@@ -456,7 +456,7 @@ def register(socketio, registry):
             return
         data = data or {}
         # v2-only: claimer sends ONLY the nameplate (the password NEVER reaches
-        # the server — relay-blind, gate 2). Non-v2 receives "update-required".
+        # the server, relay-blind, gate 2). Non-v2 receives "update-required".
         if data.get("v") != 2:
             emit("pair-error", {"error": "update-required", "why": "this server requires v2 (PAKE handshake); update your client"})
             return
