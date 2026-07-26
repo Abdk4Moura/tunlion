@@ -96,6 +96,10 @@ Tailscale."
   thin SDK (Python first for the compute MVP, then Rust/JS).
 - Boundary: filament owns the API + primitives; products own compute-specific logic
   on the consumer side. Capabilities meet the interface at `open`.
+- Spec: `docs/design-product-interface.md` (design 2026-07-26, stress-tested):
+  versioned JSON-NDJSON over UDS, persistent-subscription events (2 lanes,
+  replay), grants = authz + registration = service-discovery/consent, 0600 now +
+  scope-able later. Build seq ends by porting the lend-gpu MVP onto the SDK.
 
 ### Identity + access UX -- DESIGNED + COMMITTED
 - `docs/design-identity-access-ux.md`: onboarding, contact book, introduce,
