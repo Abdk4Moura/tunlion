@@ -40,3 +40,10 @@ deploy/coturn/*.pem
 packaging/npm/vendor/
 packaging/npm/node_modules/
 target/
+
+# Throughput/benchmark artifacts (never commit; a 200MB b200.bin.part once
+# slipped into history and had to be stripped)
+*.bin.part
+*.bin.part.meta
+b200.bin
+/b*.bin
