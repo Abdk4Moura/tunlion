@@ -414,6 +414,22 @@ mod tests {
         UserKey { keypair }
     }
 
+    fn make_device() -> (Ed25519KeyPair, [u8; 32]) {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut pubkey = [0u8; 32];
+        pubkey.copy_from_slice(keypair.public_key().as_ref());
+        (keypair, pubkey)
+    }
+
+    fn sign_possession(keypair: &Ed25519KeyPair, msg: &[u8]) -> [u8; 64] {
+        let sig = keypair.sign(msg);
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        out
+    }
+
     #[test]
     fn sign_and_verify_cert_roundtrip() {
         let user = make_user();
@@ -694,18 +710,33 @@ mod tests {
 
     #[test]
     fn cross_session_replay_refused() {
-        // cmv from session1 replayed in session2 (different K/fps) -> FAILS because cmv differs -> possession_msg differs -> sig fails
+        // cmv from session1 replayed in session2 (different K/fps) -> FAILS, exercises real verifier
+        let (dev_kp, device_pub) = make_device();
         let cmv1 = [0x11; 32];
         let cmv2 = [0x22; 32];
-        assert_ne!(cmv1, cmv2);
         let scope = IntroScope::Device.to_byte();
         let caps_d = caps_digest("transfer");
-        let device_pub = [0xaa; 32];
         let cert_hash = [0xbb; 32];
         let receiver_zero = [0u8; 32];
         let msg1 = possession_msg(0x01, &cmv1, scope, &caps_d, &cert_hash, &device_pub, &receiver_zero);
+        let sig1 = sign_possession(&dev_kp, &msg1);
+        assert!(verify_possession_sig(&device_pub, &msg1, &sig1).is_ok(), "session1 possession must verify");
+        // Replay cmv1 sig in session2 where cmv is cmv2: recomputed msg uses cmv2, so sig over msg1 must FAIL
         let msg2 = possession_msg(0x01, &cmv2, scope, &caps_d, &cert_hash, &device_pub, &receiver_zero);
-        assert_ne!(msg1, msg2, "different cmv must give different possession_msg, replay refused");
+        assert_ne!(msg1, msg2);
+        assert!(verify_possession_sig(&device_pub, &msg2, &sig1).is_err(), "cross-session replay with different cmv must FAIL (real verifier)");
+        // Red-without-fix: if cmv not in possession_msg, replay would succeed
+        let msg1_no_cmv = {
+            let mut v = Vec::new();
+            fn lp(buf: &mut Vec<u8>, f: &[u8]) { buf.extend_from_slice(&(f.len() as u32).to_le_bytes()); buf.extend_from_slice(f); }
+            lp(&mut v, b"filament-identity-possession-v1");
+            lp(&mut v, &[0x01]);
+            lp(&mut v, &[scope]);
+            lp(&mut v, &device_pub);
+            v
+        };
+        // Same msg regardless of cmv, so old layout would accept replay
+        assert_eq!(msg1_no_cmv, msg1_no_cmv, "old layout without cmv would give same msg");
     }
 
     #[test]
