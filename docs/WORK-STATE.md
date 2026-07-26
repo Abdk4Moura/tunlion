@@ -25,27 +25,47 @@ interface. Nothing product-specific (GPU sandbox, job protocol, OpenAI routing)
 lives in filament core. filament's job is to make itself usable for those purposes,
 not to be them.
 
+**NO BACKWARD COMPAT (2026-07-26).** No real users yet (owner + friends), so clean
+breaks everywhere: no v1 paths, no fallback shims, no mixed-version negotiation, no
+migration windows. Prioritize clean single-path implementations; everyone re-pairs
+/ reconnects on the current format. (Applies to L1 gate #7 and the L2 per-sid v1
+fallback, both dropped.)
+
 ## Master build order (and why this sequence)
 
-1. **L1 PAKE v2** (trust root). Identity/certs/capabilities root in the
-   first-pairing secret; PAKE closes the first-pairing MITM gap. Decisions locked.
-   IN PROGRESS -> filament-professional.
-2. **L2 per-sid QUIC streams** (HoL-free multiplexing). Each sid its own QUIC
-   stream; kills head-of-line blocking. IN PROGRESS -> mimo-0x0
-   (`design-l2-perstream-quic.md`).
-3. **Merge WireGuard L3 data plane** (`feat/wireguard-l3`). Built + measured, ready.
-4. **Product interface.** Formalize the control socket (`ctl.rs`) into a stable,
-   versioned local API + a thin SDK (pair, peers+events, streams gated by grants,
-   transfer, mount). The seam every product builds on. The highest-leverage
-   "make filament usable" move.
-5. **Identity layer** (user-key over device-certs). Roots in L1.
-6. **Capabilities / grant** (edge-local typed signed ops). Generalize L2's
-   `filament grant`; the exposed authz primitive; meets the interface at `open`.
-7. **[SEPARATE PRODUCT] Compute product (lend-gpu).** CONSUMES the interface; GPU
-   sandbox + consent + edge routing (OpenAI-compatible) + model distribution
-   (`mount <cid>`). The p2p-send inverted. NOT filament core.
+THE TRUST ARC (sequential, one continuous code area, filament-professional):
+1. **L1 PAKE v2** (trust root). PAKE closes the first-pairing MITM gap; produces
+   the per-device pinned secret + v2 device record. IN PROGRESS.
+2. **Identity layer** (user-key over device-certs). The CONTINUATION of L1: extends
+   the same pairing/device-record code; ADDITIVE on top of L1's device secret (user
+   key vouches for device certs). SSH-CA shaped. filament-professional continues here.
+3. **Capabilities / grant** (edge-local typed signed ops). Device-certs carry caps;
+   generalizes L2's `filament grant`; the exposed authz primitive; meets the product
+   interface at `open`.
+
+PARALLEL CORE TRACKS (independent of the trust arc):
+4. **L2 per-sid QUIC streams** (HoL-free multiplexing). Each sid its own QUIC
+   stream. IN PROGRESS -> mimo-0x0 (`design-l2-perstream-quic.md`, single-path).
+5. **Merge WireGuard L3 data plane** (`feat/wireguard-l3`). Built + measured, ready.
+6. **Product interface** (`docs/design-product-interface.md`). Formalize `ctl.rs`
+   into a stable local API + SDK. Exposes whatever identity/grant model exists, so
+   it proceeds alongside the trust arc. Highest-leverage "make filament usable" move.
+
+PRODUCTS (downstream, SEPARATE consumers of the interface):
+7. **Compute product (lend-gpu).** GPU sandbox + consent + edge routing
+   (OpenAI-compatible) + model distribution (`mount <cid>`). The p2p-send inverted.
+   NOT filament core.
 8. **Enterprise envelope** (org authority: SSO/audit/device-approval). LAST,
    demand-pulled, not a wedge.
+
+REACHABILITY (a filament-core concern surfaced 2026-07-26, to spec): a public-IP
+filament node doubles as the user's RENDEZVOUS + RELAY (not a coordinator; moves
+ciphertext + brokers hole-punch, never authorizes). Multiple public nodes = an
+interchangeable endpoint SET published in the DHT (introduce-gated, on top of the
+pairwise core), TTL'd so a dead node drops and devices happy-eyeballs a live one
+(failover without leader election). api.filament = opt-out-able hosted fallback.
+Aligned with `design-mesh-network.md` (relay-peer doubles as rendezvous,
+self-hostable, distinct services).
 
 Fabric is the FOUNDATION we own standalone (Tailscale = compat bridge only). The
 WEDGE is compute (govern USE, not reachability), built as a separate product ON the
@@ -81,7 +101,7 @@ Tailscale."
 - Spec: `docs/design-l2-perstream-quic.md` (PROPOSED). Each L2 `sid` gets its own
   QUIC bidi stream (QUIC gives per-stream flow control + no cross-stream HoL), so a
   stalled stream no longer blocks the others. App-credit (`feat/l2-credit`) was
-  tried and FAILED validation. Breaking wire change: v2 negotiation + v1 fallback.
+  tried and FAILED validation. SINGLE PATH (no v1 fallback / no compat needed).
 - File: `cli/src/direct.rs` (also touched by the WireGuard branch; merge ordering TBD).
 - NEXT: mimo-0x0 returns a plan, then implements; money test = fast stream not
   blocked by a stalled slow stream over one link.
