@@ -2652,7 +2652,9 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     let caps = pair_v2_caps();
     // Start our SPAKE2 ceremony immediately: identity = nameplate, password =
     // words. Both sides MUST pass identical password AND nameplate (spec §3.1).
-    let mut cer = Ceremony::new(&my_words, &my_nameplate, caps.clone());
+    // Fixed convention for plain pair: Device-scoped (device-to-device). Scope byte is derived from the authenticated introduction token, not a local guess. Both sides must pass same scope or confirmation fails.
+    let scope = crate::identity::IntroScope::Device.to_byte();
+    let mut cer = Ceremony::new(&my_words, &my_nameplate, caps.clone(), scope);
     let deadline = Instant::now() + Duration::from_secs(600); // code TTL
     // The pairing peer left before the ceremony finished. Give a short grace
     // for a transient reconnect, then FAIL FAST, don't orphan in the room
@@ -7482,7 +7484,7 @@ async fn send_cmd(
     // true up front so they offer immediately). `send_cer` is the ceremony; it
     // is only ever populated on the code path.
     let mut send_cer: Option<Ceremony> = if use_code {
-        Some(Ceremony::new(&send_words, &send_nameplate, pair_v2_caps()))
+        Some(Ceremony::new(&send_words, &send_nameplate, pair_v2_caps(), crate::identity::IntroScope::Device.to_byte()))
     } else {
         None
     };
@@ -10231,7 +10233,7 @@ async fn recv_cmd(
                             continue;
                         }
                         if let Some((pw, np)) = &recv_pake_template {
-                            recv_cers.insert(from.clone(), Ceremony::new(pw, np, pair_v2_caps()));
+                            recv_cers.insert(from.clone(), Ceremony::new(pw, np, pair_v2_caps(), crate::identity::IntroScope::Device.to_byte()));
                             recv_deadlines
                                 .entry(from.clone())
                                 .or_insert_with(|| Instant::now() + recv_pake_budget);
@@ -10446,7 +10448,7 @@ async fn recv_cmd(
                             .get_or_insert_with(|| Instant::now() + recv_pake_budget);
                     } else if recv_cers.len() < RECV_MAX_CANDIDATES {
                         if let Some((pw, np)) = &recv_pake_template {
-                            recv_cers.insert(pid.clone(), Ceremony::new(pw, np, pair_v2_caps()));
+                            recv_cers.insert(pid.clone(), Ceremony::new(pw, np, pair_v2_caps(), crate::identity::IntroScope::Device.to_byte()));
                             recv_deadlines
                                 .insert(pid.clone(), Instant::now() + recv_pake_budget);
                             recv_pake_overall_deadline

@@ -94,8 +94,13 @@ pub fn finish(state: Spake2<Ed25519Group>, peer_msg: &[u8]) -> Option<Vec<u8>> {
 /// ("A->B"/"B->A") that prevents reflection in the symmetric variant.
 ///
 /// `caps` is the canonical capability string (callers MUST pass the SAME
-/// canonical form on both sides — see `canonical_caps`).
-pub fn confirm_mac(k: &[u8], dir: &str, fp_lo: &str, fp_hi: &str, caps: &str) -> Vec<u8> {
+/// canonical form on both sides — see `canonical_caps`). `scope` is the
+/// introduction scope byte (0x00 User-scoped "reach me", 0x01 Device-scoped),
+/// bound into the transcript so a confused-deputy downgrade is detected.
+/// Scope is a MANDATORY parameter: there is no default, every production call
+/// site must explicitly pass the scope byte it derived from the authenticated
+/// introduction token (or the fixed convention for plain pair).
+pub fn confirm_mac(k: &[u8], dir: &str, fp_lo: &str, fp_hi: &str, caps: &str, scope: u8) -> Vec<u8> {
     let mut m = <HmacSha256 as Mac>::new_from_slice(k).expect("HMAC accepts any key length");
     m.update(CONFIRM_LABEL);
     m.update(dir.as_bytes());
@@ -104,6 +109,9 @@ pub fn confirm_mac(k: &[u8], dir: &str, fp_lo: &str, fp_hi: &str, caps: &str) ->
     update_lp(&mut m, fp_lo.as_bytes());
     update_lp(&mut m, fp_hi.as_bytes());
     update_lp(&mut m, caps.as_bytes());
+    // Scope binding: length-prefixed single byte, alongside caps + fingerprints.
+    // Changing scope without re-MACing breaks confirmation (confused-deputy prevention).
+    update_lp(&mut m, &[scope]);
     m.finalize().into_bytes().to_vec()
 }
 
@@ -139,20 +147,20 @@ pub fn sort_fps<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
 
 /// High-level: compute the confirmation MAC THIS side sends, given its own and
 /// the peer's fingerprint and the agreed caps. Handles sorting + role
-/// derivation so callers can't get the symmetry wrong.
-pub fn our_confirm(k: &[u8], my_fp: &str, their_fp: &str, caps: &str) -> Vec<u8> {
+/// derivation so callers can't get the symmetry wrong. Scope byte is MANDATORY.
+pub fn our_confirm(k: &[u8], my_fp: &str, their_fp: &str, caps: &str, scope: u8) -> Vec<u8> {
     let (lo, hi) = sort_fps(my_fp, their_fp);
     let (send_dir, _expect) = confirm_dirs(my_fp, lo);
-    confirm_mac(k, send_dir, lo, hi, caps)
+    confirm_mac(k, send_dir, lo, hi, caps, scope)
 }
 
-/// High-level: verify the peer's received confirmation MAC under OUR K. Returns
-/// true iff it matches what we expect from the peer (derives the peer's
-/// direction tag from the SAME sorted fingerprints).
-pub fn verify_peer_confirm(k: &[u8], my_fp: &str, their_fp: &str, caps: &str, received: &[u8]) -> bool {
+/// High-level: verify the peer's received confirmation MAC under OUR K.
+/// Scope is MANDATORY: both sides must pass the same scope byte they derived
+/// from the authenticated introduction token (or the fixed convention for plain pair).
+pub fn verify_peer_confirm(k: &[u8], my_fp: &str, their_fp: &str, caps: &str, scope: u8, received: &[u8]) -> bool {
     let (lo, hi) = sort_fps(my_fp, their_fp);
     let (_send, expect_dir) = confirm_dirs(my_fp, lo);
-    let expected = confirm_mac(k, expect_dir, lo, hi, caps);
+    let expected = confirm_mac(k, expect_dir, lo, hi, caps, scope);
     ct_eq(&expected, received)
 }
 
@@ -446,6 +454,10 @@ mod tests {
     // derivation (no hardcoded A/B). fp_a and fp_b are each side's own fp.
     const FP_A: &str = "SHA-256 AA:BB:CC";
     const FP_B: &str = "SHA-256 DD:EE:FF";
+    // Scope for tests: Device-scoped is the fixed convention for plain pair (device-to-device).
+    // Both sides derive scope from the authenticated token, so honest ends match.
+    const SCOPE_USER: u8 = 0x00;
+    const SCOPE_DEVICE: u8 = 0x01;
 
     #[test]
     fn mutual_key_same_password_same_secret() {
@@ -454,29 +466,26 @@ mod tests {
         let ka = finish(sa, &mb).unwrap();
         let kb = finish(sb, &ma).unwrap();
         let caps = canonical_caps(&["transfer".into()]);
-        // Each side independently derives its role from fingerprint ownership.
-        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps);
-        let b_sends = our_confirm(&kb, FP_B, FP_A, &caps);
-        // Each verifies the other's MAC under its OWN K.
-        assert!(verify_peer_confirm(&kb, FP_B, FP_A, &caps, &a_sends), "B verifies A");
-        assert!(verify_peer_confirm(&ka, FP_A, FP_B, &caps, &b_sends), "A verifies B");
-        // Same pinned secret.
+        // Fixed convention for plain pair: Device-scoped (device-to-device).
+        // Both sides derive scope from the authenticated token, so honest ends match.
+        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps, SCOPE_DEVICE);
+        let b_sends = our_confirm(&kb, FP_B, FP_A, &caps, SCOPE_DEVICE);
+        assert!(verify_peer_confirm(&kb, FP_B, FP_A, &caps, SCOPE_DEVICE, &a_sends), "B verifies A");
+        assert!(verify_peer_confirm(&ka, FP_A, FP_B, &caps, SCOPE_DEVICE, &b_sends), "A verifies B");
         assert_eq!(secret_from_k(&ka), secret_from_k(&kb));
         assert_eq!(secret_from_k(&ka).len(), 64);
     }
 
     #[test]
     fn reflection_is_rejected() {
-        // A relay mirrors A's own confirm MAC back to A. Because A sends "A->B"
-        // and EXPECTS "B->A", verifying its own message must FAIL.
         let (sa, ma) = start_with_rng(b"brave-otter", b"314", SeedRng::new([1u8; 32]));
         let (sb, mb) = start_with_rng(b"brave-otter", b"314", SeedRng::new([2u8; 32]));
         let ka = finish(sa, &mb).unwrap();
         let _kb = finish(sb, &ma).unwrap();
         let caps = canonical_caps(&["transfer".into()]);
-        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps);
-        // Reflected back to A: A must NOT accept its own MAC.
-        assert!(!verify_peer_confirm(&ka, FP_A, FP_B, &caps, &a_sends), "reflection rejected");
+        // Fixed convention for plain pair: Device-scoped.
+        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps, SCOPE_DEVICE);
+        assert!(!verify_peer_confirm(&ka, FP_A, FP_B, &caps, SCOPE_DEVICE, &a_sends), "reflection rejected");
     }
 
     #[test]
@@ -486,38 +495,54 @@ mod tests {
         let ka = finish(sa, &mb).unwrap();
         let kb = finish(sb, &ma).unwrap();
         let caps = canonical_caps(&["transfer".into()]);
-        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps);
-        // B cannot verify A's MAC: different K.
-        assert!(!verify_peer_confirm(&kb, FP_B, FP_A, &caps, &a_sends));
+        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps, SCOPE_DEVICE);
+        assert!(!verify_peer_confirm(&kb, FP_B, FP_A, &caps, SCOPE_DEVICE, &a_sends));
     }
 
     #[test]
     fn fingerprint_mismatch_confirmation_fails() {
-        // §5.2: a DTLS-MITM makes the two sides see DIFFERENT fingerprint pairs.
         let (sa, ma) = start_with_rng(b"brave-otter", b"314", SeedRng::new([1u8; 32]));
         let (sb, mb) = start_with_rng(b"brave-otter", b"314", SeedRng::new([2u8; 32]));
         let ka = finish(sa, &mb).unwrap();
         let kb = finish(sb, &ma).unwrap();
         let caps = canonical_caps(&["transfer".into()]);
-        // A's view: own=FP_A, peer=MITM_TO_A. B's view: own=FP_B, peer=MITM_TO_B.
         let mitm_to_a = "SHA-256 99:MITM:A";
         let mitm_to_b = "SHA-256 99:MITM:B";
-        let a_sends = our_confirm(&ka, FP_A, mitm_to_a, &caps);
-        // B recomputes the expected A-message under its OWN fingerprint view.
-        assert!(!verify_peer_confirm(&kb, FP_B, mitm_to_b, &caps, &a_sends));
+        // Scope byte derived from authenticated token, same on both sides for honest pair.
+        let a_sends = our_confirm(&ka, FP_A, mitm_to_a, &caps, SCOPE_DEVICE);
+        assert!(!verify_peer_confirm(&kb, FP_B, mitm_to_b, &caps, SCOPE_DEVICE, &a_sends));
     }
 
     #[test]
     fn caps_tamper_confirmation_fails() {
-        // §6.1: a server rewriting caps breaks the MAC.
         let (sa, ma) = start_with_rng(b"brave-otter", b"314", SeedRng::new([1u8; 32]));
         let (sb, mb) = start_with_rng(b"brave-otter", b"314", SeedRng::new([2u8; 32]));
         let ka = finish(sa, &mb).unwrap();
         let kb = finish(sb, &ma).unwrap();
-        let a_sends = our_confirm(&ka, FP_A, FP_B, &canonical_caps(&["transfer".into()]));
-        // B was told (by a tampering server) caps=["transfer","remote-exec"].
+        let a_sends = our_confirm(&ka, FP_A, FP_B, &canonical_caps(&["transfer".into()]), SCOPE_DEVICE);
         let tampered_caps = canonical_caps(&["transfer".into(), "remote-exec".into()]);
-        assert!(!verify_peer_confirm(&kb, FP_B, FP_A, &tampered_caps, &a_sends));
+        assert!(!verify_peer_confirm(&kb, FP_B, FP_A, &tampered_caps, SCOPE_DEVICE, &a_sends));
+    }
+
+    #[test]
+    fn scope_downgrade_confirmation_fails() {
+        // Confused-deputy: token scope is User on one side, Device on the other.
+        // Both sides derived scope from the authenticated token; a tamper that
+        // flips one side's view must break confirmation.
+        let (sa, ma) = start_with_rng(b"brave-otter", b"314", SeedRng::new([1u8; 32]));
+        let (sb, mb) = start_with_rng(b"brave-otter", b"314", SeedRng::new([2u8; 32]));
+        let ka = finish(sa, &mb).unwrap();
+        let kb = finish(sb, &ma).unwrap();
+        let caps = canonical_caps(&["transfer".into()]);
+        // Scope byte is mandatory: User-scoped token (reach me, broad).
+        let a_sends = our_confirm(&ka, FP_A, FP_B, &caps, SCOPE_USER);
+        // B's view was downgraded to Device-scoped by a tampering relay.
+        assert!(!verify_peer_confirm(&kb, FP_B, FP_A, &caps, SCOPE_DEVICE, &a_sends),
+            "scope downgrade must be detected: User vs Device scope must break MAC");
+        // And vice versa.
+        let b_sends = our_confirm(&kb, FP_B, FP_A, &caps, SCOPE_DEVICE);
+        assert!(!verify_peer_confirm(&ka, FP_A, FP_B, &caps, SCOPE_USER, &b_sends),
+            "scope downgrade must be detected in opposite direction");
     }
 
     #[test]
@@ -576,7 +601,8 @@ mod tests {
         let ka = finish(sa, &mb).unwrap();
         let kb = finish(sb, &ma).unwrap();
         let caps = canonical_caps(&["transfer".into()]);
-        assert!(verify_peer_confirm(&kb, FP_B, FP_A, &caps, &our_confirm(&ka, FP_A, FP_B, &caps)));
+        // Plain pair convention: Device-scoped.
+        assert!(verify_peer_confirm(&kb, FP_B, FP_A, &caps, SCOPE_DEVICE, &our_confirm(&ka, FP_A, FP_B, &caps, SCOPE_DEVICE)));
         assert_eq!(secret_from_k(&ka), secret_from_k(&kb));
     }
 
