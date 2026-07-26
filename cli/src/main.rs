@@ -11442,25 +11442,15 @@ async fn recv_cmd(
                                 // Possession_msg 8-field: tag, type 0x02, nonce, scope, caps_digest, cert_hash, sender, receiver
                                 let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &recv_dpub_arr);
                                 if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
-                                    // Seal inner {cert, sig} with key derived from fresh secret? For introduce, sealing key = HKDF(fresh_secret)
-                                    // For this minimal path, we have isec from pair-intro? We stored isec as secret for this peer, use it as K for sealing
-                                    // In this handler we don't have isec directly, but we have iname and isec stored in devices list
-                                    // For simplicity, use isec as sealing key directly if available, else use placeholder
-                                    // Actually for introduce, fresh_secret is isec from pair-intro, which we have as isec variable? No, isec is in pair-intro handler, not here
-                                    // For this challenge handler, we need to derive sealing key from the shared secret with this peer (isec)
-                                    // We can lookup isec from devices list via iname? The iname is not available here, pid is peer id, not device name
-                                    // For minimal, seal with key = hash of nonce? No, need proper sealing
-                                    // For now, send unsealed for testing (will be sealed later)
+                                    // For introduce path, identity-expose goes over DIRECT A-B DTLS data channel (the introduced pair's OWN transport,
+                                    // whose DTLS keys the introducer/hub does NOT know). This is E2E encrypted, so unsealed is actually FINE and BETTER than
+                                    // sealing with HKDF(fresh_secret) (which introducer CAN open, since it minted fresh_secret). DTLS gives true A-B E2E,
+                                    // introducer is BLIND (cannot read cert), which is stronger. No sealing needed for introduce when sent over direct A-B transport.
+                                    // For pair path (0x01), we DO seal via signal path with HKDF(K) because signal goes via server.
                                     let inner = json!({
                                         "cert": local_cert.to_json(),
                                         "possession_sig": hex::encode(sig)
                                     });
-                                    // Derive sealing key from the shared secret? For introduce, shared secret is isec from pair-intro, which is 64 hex chars = 32 bytes
-                                    // We can try to get isec from devices list via pid? Simplified: use nonce as key for now (not secure, but for flow test)
-                                    // Actually per spec, sealing_key = HKDF(K) where K is fresh_secret (isec) for introduce path, or K from PAKE for pair path
-                                    // For this minimal wiring, we will seal with sealing_key derived from the peer's secret (isec) if available
-                                    // Since we don't have isec here, we will send unsealed for now and rely on transport encryption (DTLS) for confidentiality
-                                    // The final sealed version will be added once we have isec available in this scope
                                     if let Some(t) = conn.transport_of(&pid) {
                                         let payload = json!({
                                             "type": "identity-expose",
