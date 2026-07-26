@@ -1505,6 +1505,31 @@ fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8)
     Ok(())
 }
 
+/// Store provisional identity (held in memory, not durable trust) for later overlay check.
+/// Written to a temp file, not devices.json, so a failed overlay session leaves no anchor.
+fn store_provisional_identity(name: &str, peer_cert: &identity::DeviceCert) -> Result<()> {
+    let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let data = json!({
+        "name": name,
+        "deviceCert": peer_cert.to_json(),
+        "storedAt": identity::now_secs()
+    });
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&data)?)?;
+    Ok(())
+}
+
+fn load_provisional_identity(name: &str) -> Option<identity::DeviceCert> {
+    let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    identity::DeviceCert::from_json(&v["deviceCert"])
+}
+
+fn clear_provisional_identity(name: &str) {
+    let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let _ = std::fs::remove_file(&p);
+}
+
 /// Update the `lastSeen` timestamp and overlay addresses for a known device.
 /// Called on each connect so `filament addr <device>` can show recency and addresses.
 fn devices_touch(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>) {
@@ -2730,17 +2755,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 // devices_store_v2 handles name collisions via auto-suffix.
                 // Scope byte was derived from authenticated token, no default to broad scope.
                 devices_store_v2(&n, &sec, &caps)?;
-                // If peer exposed its device cert inside the PAKE-authed channel, store
-                // its userKey + deviceCert alongside the device record. Scope-aware:
-                // Device-scope stores pair (user, device), User-scope stores user.
-                // Continuity: same user key = same person for User-scope, exact device for Device-scope.
+                // Hold verified identity as PROVISIONAL, NOT durable write.
+                // Durable anchor is written only at overlay establishment after
+                // cert.device_pub == overlay-key assertion passes.
+                // This prevents a failed overlay session from leaving a permanent anchor
+                // that would cause takeover guard to refuse legitimate retry.
                 if let Some(ref pcert) = peer_identity_cert {
-                    let _ = update_peer_identity(&n, pcert, scope);
-                }
-                // Fail-closed: if peer previously exposed identity (has userKey) and now does NOT,
-                // abort rather than proceed as normal peer. Session with no identity must be visibly unauthenticated.
-                if peer_identity_cert.is_none() {
-                    // Check existing record for this name has userKey
+                    let _ = store_provisional_identity(&n, pcert);
+                } else {
+                    // Fail-closed: if peer previously had identity (has userKey) and now does NOT expose,
+                    // abort rather than proceed as normal peer.
                     let p = devices_path();
                     if let Ok(raw) = std::fs::read_to_string(&p) {
                         if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
@@ -10688,6 +10712,55 @@ async fn recv_cmd(
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
                                             let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
+                                            // Verify-order fix: overlay key vs pinned cert check happens HERE at overlay establishment,
+                                            // not at expose time. Possession-proven key already committed at expose time (provisional).
+                                            // On mismatch, tear down with named error, never overwrite anchor.
+                                            // Durable trust is written ONLY after this check passes.
+                                            {
+                                                let p = devices_path();
+                                                if let Ok(raw) = std::fs::read_to_string(&p) {
+                                                    if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                                                        if let Err(e) = identity::check_overlay_against_pinned_cert(&arr, &who, &ann.pubkey) {
+                                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  {}", e)));
+                                                            // Tear down: do not add peer, do not overwrite anchor, clear provisional
+                                                            clear_provisional_identity(&who);
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Promote provisional identity to durable if present and matches overlay key
+                                            if let Some(prov_cert) = load_provisional_identity(&who) {
+                                                if prov_cert.device_pub != ann.pubkey {
+                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  connection_key_divergence: provisional device {} has cert device_pub {} != overlay key {} - clearing provisional, no anchor written",
+                                                        who, hex::encode(prov_cert.device_pub), hex::encode(ann.pubkey))));
+                                                    clear_provisional_identity(&who);
+                                                    // Do not add peer, no durable write
+                                                    continue;
+                                                }
+                                                // Check takeover guard and scope-aware anchor before promoting
+                                                {
+                                                    let p = devices_path();
+                                                    if let Ok(raw) = std::fs::read_to_string(&p) {
+                                                        if let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) {
+                                                            // For promote, use Device-scope as fixed convention for pair
+                                                            let scope = crate::identity::IntroScope::Device.to_byte();
+                                                            match identity::apply_peer_identity(&mut arr, &who, &prov_cert, scope) {
+                                                                Ok(_) => {
+                                                                    // Write durable anchor only after overlay assertion passes
+                                                                    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
+                                                                    clear_provisional_identity(&who);
+                                                                }
+                                                                Err(e) => {
+                                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  takeover guard at overlay establishment: {}", e)));
+                                                                    clear_provisional_identity(&who);
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let v4 = ann.addr_v4();
                                             l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));

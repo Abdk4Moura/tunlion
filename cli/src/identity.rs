@@ -222,6 +222,34 @@ pub fn check_fail_closed(arr: &[serde_json::Value], name: &str, peer_cert: Optio
     Ok(())
 }
 
+/// Check overlay key divergence at overlay establishment (not at expose time, overlay not up then).
+/// If device record has pinned cert.device_pub, assert overlay-authenticated pubkey == pinned cert.device_pub.
+/// On mismatch, tear down with named error, never overwrite anchor. This is where Device-scope pin is enforced.
+pub fn check_overlay_against_pinned_cert(
+    arr: &[serde_json::Value],
+    name: &str,
+    overlay_pubkey: &[u8; 32],
+) -> anyhow::Result<()> {
+    for d in arr {
+        if d["name"].as_str() == Some(name) {
+            if let Some(cert_json) = d.get("deviceCert") {
+                if let Some(pinned) = DeviceCert::from_json(cert_json) {
+                    if &pinned.device_pub != overlay_pubkey {
+                        anyhow::bail!(
+                            "connection_key_divergence: device '{}' overlay key {} != pinned cert device_pub {}",
+                            name,
+                            hex::encode(overlay_pubkey),
+                            hex::encode(pinned.device_pub)
+                        );
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
 pub fn now_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
