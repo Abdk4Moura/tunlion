@@ -728,6 +728,11 @@ enum Cmd {
         #[arg(long)]
         wireguard: bool,
     },
+    /// Manage your user identity (user key + device certs, SSH-CA model).
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `filament set`; this is kept for scripts that wrote it directly.
     #[command(hide = true)]
@@ -983,6 +988,21 @@ enum Cmd {
         /// Extra rsync options (space-separated)
         #[arg(long)]
         options: Option<String>,
+    },
+}
+
+/// User identity management: generate the identity key, show the fingerprint,
+/// certify a known device so peers can verify it belongs to the same person.
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Generate a new user identity key on this device.
+    Init,
+    /// Show the user identity fingerprint + certified devices.
+    Show,
+    /// Sign a device certificate for a known device, authorizing it as yours.
+    Certify {
+        /// Petname of the known device to certify as yours
+        device: String,
     },
 }
 
@@ -1403,6 +1423,44 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
                     "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
+}
+
+/// Attach a device certificate + user key to an existing device record.
+fn update_device_cert(name: &str, uk: &identity::UserKey, cert: &identity::DeviceCert) -> Result<()> {
+    let p = devices_path();
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let uk_hex = uk.public_key_hex();
+    let mut updated = false;
+    for d in arr.iter_mut() {
+        if d["name"].as_str() == Some(name) {
+            d["userKey"] = json!(uk_hex);
+            d["deviceCert"] = cert.to_json();
+            updated = true;
+            break;
+        }
+    }
+    if !updated {
+        bail!("device '{name}' is not in the device store. Pair with it first.");
+    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    Ok(())
+}
+
+/// Read the device cert (if any) for a named device.
+fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    for d in arr {
+        if d["name"].as_str() == Some(name) {
+            return identity::DeviceCert::from_json(&d["deviceCert"]);
+        }
+    }
+    None
 }
 
 /// Update the `lastSeen` timestamp and overlay addresses for a known device.
@@ -6500,6 +6558,76 @@ async fn main() -> Result<()> {
             {
                 let _ = (tun_addr, listen, connect, psk, dev, mtu, wireguard);
                 bail!("serve-tun (L3) is Linux-only")
+            }
+        }
+        Cmd::Identity { action } => {
+            match action {
+                IdentityAction::Init => {
+                    match identity::UserKey::load()? {
+                        Some(uk) => {
+                            println!("{}", ui::paint(ui::Tone::Dim,
+                                &format!("you already have a user identity: fingerprint {}",
+                                    uk.fingerprint())));
+                            println!("  use 'filament identity show' to see it");
+                        }
+                        None => {
+                            let uk = identity::UserKey::generate()?;
+                            println!("  {} user identity created: fingerprint {}",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                ui::paint(ui::Tone::Bold, &uk.fingerprint()));
+                            println!("  {}", ui::paint(ui::Tone::Dim, "next: certify your devices with 'filament identity certify <device>'"));
+                        }
+                    }
+                    Ok(())
+                }
+                IdentityAction::Show => {
+                    match identity::UserKey::load()? {
+                        None => {
+                            println!("no user identity yet. Run 'filament identity init' to create one.");
+                        }
+                        Some(uk) => {
+                            let uk_pub = uk.public_key_bytes();
+                            println!("  user fingerprint: {}", ui::paint(ui::Tone::Bold, &uk.fingerprint()));
+                            println!("  public key:       {}", ui::paint(ui::Tone::Dim, &uk.public_key_hex()));
+                            let devices = devices_load();
+                            let mut found = 0usize;
+                            for (name, _secret) in &devices {
+                                if let Some(cert) = device_cert_for(name) {
+                                    if cert.user_pub == uk_pub {
+                                        let exp = if identity::now_secs() >= cert.expires {
+                                            "EXPIRED".to_string()
+                                        } else {
+                                            format!("{}d", cert.expires.saturating_sub(identity::now_secs()) / 86400)
+                                        };
+                                        println!("  {} {}", ui::paint(ui::Tone::Bold, name), ui::paint(ui::Tone::Dim, &format!("(valid {exp})")));
+                                        found += 1;
+                                    }
+                                }
+                            }
+                            if found == 0 {
+                                println!("  {}", ui::paint(ui::Tone::Dim, "no certified devices. use 'filament identity certify <device>'"));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                IdentityAction::Certify { device } => {
+                    let uk = match identity::UserKey::load()? {
+                        Some(uk) => uk,
+                        None => bail!("no user identity. Run 'filament identity init' first."),
+                    };
+                    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+                    let now = identity::now_secs();
+                    let cert = identity::DeviceCert::certify(&uk, device_pub, now, identity::CERT_TTL_SECS)?;
+                    update_device_cert(&device, &uk, &cert)?;
+                    ui::say(&format!(
+                        "  {} {} certified as your device (valid {} days)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        ui::paint(ui::Tone::Bold, &device),
+                        identity::CERT_TTL_SECS / 86400,
+                    ));
+                    Ok(())
+                }
             }
         }
         Cmd::Config { key, value } => {
