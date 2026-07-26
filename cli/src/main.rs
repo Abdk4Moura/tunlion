@@ -2501,10 +2501,15 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                             let _ = rng.fill(&mut nonce_a);
                             let _ = rng.fill(&mut nonce_b);
                             // Get device_pubs for A and B: overlay key always exists, not cert-or-zeros per correction.
-                            // Device cert's device_pub == overlay key, so with cert value identical; fix changes no-cert case from zeros to real key.
-                            // For hub generating on behalf of remote A/B, try cert first, then fallback to overlay key of this device (hub) as placeholder is wrong;
-                            // proper fix is receiver (A/B themselves) generates challenge with their own overlay key via overlay_pubkey_bytes() in up daemon.
-                            // For now, use cert if available, else own overlay key (always exists) to avoid zeros silently dropping target-binding.
+                            // FIX: receiver_device_pub must be overlay key from overlay_pubkey_bytes(), which ALWAYS exists.
+                            // Previously used cert-or-zeros fallback which silently drops target-binding for no-cert peers.
+                            // Note: cert.device_pub == overlay key, so with cert value identical; fix only changes no-cert case.
+                            // LOAD-BEARING ASSUMPTION for confidentiality: identity-expose for introduce goes over DIRECT A-B DTLS DataChannel
+                            // (the introduced pair's OWN transport, E2E DTLS, introducer/hub is NOT a DTLS endpoint, only does signaling/rendezvous).
+                            // There is NO fallback where hub bridges two DTLS sessions as A<->Hub<->B separate DTLS (hub-bridging is NOT allowed).
+                            // TURN relay is fine (DTLS-blind, still E2E), hub-bridging is NOT (introducer would see cleartext and property breaks).
+                            // This comment guards future refactors from silently opening a hub-bridged path.
+                            // Sealing with HKDF(fresh_secret) would make introducer able to read (since it minted secret), while direct DTLS keeps introducer BLIND (stronger).
                             let a_device_pub = device_cert_for(&a_name).map(|c| c.device_pub).unwrap_or_else(|| overlay::overlay_pubkey_bytes().unwrap_or([0u8; 32]));
                             let b_device_pub = device_cert_for(&b_name).map(|c| c.device_pub).unwrap_or_else(|| overlay::overlay_pubkey_bytes().unwrap_or([0u8; 32]));
                             // Challenge from A to B: nonce_A + receiver_device_pub_A (A's device_pub)

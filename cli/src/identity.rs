@@ -960,4 +960,105 @@ mod tests {
         let msg_device = possession_msg(0x01, &cmv, IntroScope::Device.to_byte(), &caps_d, &cert_hash, &sender, &receiver);
         assert!(verify_possession_sig(&device_pub, &msg_device, &sig_user).is_err(), "scope disagreement must FAIL verify");
     }
+    #[test]
+    fn introduce_challenge_wire_only_nonce_and_receiver_dpub() {
+        // Challenge must carry ONLY {nonce, receiver_device_pub} per correction A
+        let nonce = [0x11; 32];
+        let receiver_dpub = [0x22; 32];
+        let challenge = serde_json::json!({
+            "type": "identity-nonce-challenge",
+            "nonce": hex::encode(nonce),
+            "receiver_device_pub": hex::encode(receiver_dpub)
+        });
+        let encoded = serde_json::to_string(&challenge).unwrap();
+        // Must contain nonce and receiver_device_pub
+        assert!(encoded.contains("nonce"));
+        assert!(encoded.contains("receiver_device_pub"));
+        // Must NOT contain scope, caps, user data
+        assert!(!encoded.contains("scope"), "challenge must NOT contain scope");
+        assert!(!encoded.contains("caps"), "challenge must NOT contain caps");
+        assert!(!encoded.contains("userKey"), "challenge must NOT contain user data");
+        assert!(!encoded.contains("userPub"), "challenge must NOT contain user data");
+        assert!(!encoded.contains("deviceCert"), "challenge must NOT contain cert");
+    }
+
+    #[test]
+    fn introduce_expose_one_cert_only() {
+        // Expose carries exactly ONE cert, no list
+        let user = make_user();
+        let (dev_kp, device_pub) = make_device();
+        let cert = DeviceCert::certify(&user, device_pub, now_secs(), CERT_TTL_SECS).unwrap();
+        let cmv = [0x11; 32];
+        let scope = IntroScope::User.to_byte();
+        let caps_d = caps_digest("transfer");
+        let chash = cert_hash(&cert);
+        let sender = device_pub;
+        let receiver = [0x33; 32];
+        let msg = possession_msg(0x02, &cmv, scope, &caps_d, &chash, &sender, &receiver);
+        let sig = sign_possession(&dev_kp, &msg);
+        let payload = serde_json::json!({
+            "type": "identity-expose",
+            "v": 2,
+            "binding_type": 0x02,
+            "nonce": hex::encode(cmv),
+            "cert": cert.to_json(),
+            "possession_sig": hex::encode(sig)
+        });
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert_eq!(encoded.matches("devicePub").count(), 1, "expose must contain exactly one devicePub");
+        assert!(!encoded.contains("deviceList"));
+        assert!(!encoded.contains("\"devices\""));
+    }
+
+    #[test]
+    fn introduce_hub_cert_swap_refused() {
+        // Hub takes A's cert sig over device A, mints cert' {dpub_A, U_hub} and swaps
+        // Must be refused because cert_hash differs -> possession_msg differs -> sig FAILS
+        let user_a = make_user();
+        let user_hub = make_user();
+        let (dev_kp_a, device_a) = make_device();
+        let now = now_secs();
+        let cert_a = DeviceCert::certify(&user_a, device_a, now, CERT_TTL_SECS).unwrap();
+        let cert_hash_a = cert_hash(&cert_a);
+        let cert_prime = DeviceCert::certify(&user_hub, device_a, now, CERT_TTL_SECS).unwrap();
+        let cert_hash_prime = cert_hash(&cert_prime);
+        assert_ne!(cert_hash_a, cert_hash_prime);
+
+        let nonce = [0x11; 32];
+        let scope = IntroScope::User.to_byte();
+        let caps_d = caps_digest("transfer");
+        let sender = device_a;
+        let receiver = [0x22; 32];
+
+        let msg_a = possession_msg(0x02, &nonce, scope, &caps_d, &cert_hash_a, &sender, &receiver);
+        let sig_a = sign_possession(&dev_kp_a, &msg_a);
+        assert!(verify_possession_sig(&device_a, &msg_a, &sig_a).is_ok());
+
+        let msg_prime = possession_msg(0x02, &nonce, scope, &caps_d, &cert_hash_prime, &sender, &receiver);
+        assert!(verify_possession_sig(&device_a, &msg_prime, &sig_a).is_err(), "hub cert-swap with different cert_hash must FAIL");
+    }
+
+    #[test]
+    fn introduce_scope_caps_disagreement_refused() {
+        let (dev_kp, device_pub) = make_device();
+        let nonce = [0x11; 32];
+        let cert_hash = [0x22; 32];
+        let sender = device_pub;
+        let receiver = [0x33; 32];
+
+        let caps_transfer = caps_digest("transfer");
+        let caps_admin = caps_digest("transfer,admin");
+        assert_ne!(caps_transfer, caps_admin);
+
+        let msg_user = possession_msg(0x02, &nonce, IntroScope::User.to_byte(), &caps_transfer, &cert_hash, &sender, &receiver);
+        let sig_user = sign_possession(&dev_kp, &msg_user);
+        assert!(verify_possession_sig(&device_pub, &msg_user, &sig_user).is_ok());
+
+        let msg_device = possession_msg(0x02, &nonce, IntroScope::Device.to_byte(), &caps_transfer, &cert_hash, &sender, &receiver);
+        assert!(verify_possession_sig(&device_pub, &msg_device, &sig_user).is_err(), "scope disagreement must FAIL");
+
+        let msg_caps_tamper = possession_msg(0x02, &nonce, IntroScope::User.to_byte(), &caps_admin, &cert_hash, &sender, &receiver);
+        assert!(verify_possession_sig(&device_pub, &msg_caps_tamper, &sig_user).is_err(), "caps disagreement must FAIL");
+    }
 }
+
