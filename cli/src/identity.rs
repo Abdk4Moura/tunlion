@@ -682,30 +682,30 @@ mod tests {
 
     #[test]
     fn cert_swap_reattribution_refused() {
-        // Hub swaps cert'{dpub_A,U_hub} over A's sig -> cert_hash differs -> verify FAILS
+        // Hub swaps cert'{dpub_A,U_hub} over A's sig -> cert_hash differs -> verify FAILS (real verifier)
         let user_a = make_user();
         let user_hub = make_user();
         let now = now_secs();
-        let device_a = [0xaa; 32];
+        let (dev_kp, device_a) = make_device();
         let cert_a = DeviceCert::certify(&user_a, device_a, now, CERT_TTL_SECS).unwrap();
         let cert_hash_a = cert_hash(&cert_a);
-        // Hub mints cert' with same device_pub but different user_pub
         let cert_prime = DeviceCert::certify(&user_hub, device_a, now, CERT_TTL_SECS).unwrap();
         let cert_hash_prime = cert_hash(&cert_prime);
-        assert_ne!(cert_hash_a, cert_hash_prime, "different user must give different cert_hash");
-        // Possession sig over old hash
-        let fake_cmv = [0x11; 32];
+        assert_ne!(cert_hash_a, cert_hash_prime);
+
+        let cmv = [0x11; 32];
         let scope = IntroScope::Device.to_byte();
         let caps_d = caps_digest("transfer");
         let sender = device_a;
         let receiver_zero = [0u8; 32];
-        let msg_a = possession_msg(0x01, &fake_cmv, scope, &caps_d, &cert_hash_a, &sender, &receiver_zero);
-        // Sign with device A private key
-        // For test, we need to sign with device key - we don't have private, so simulate by using user_a signing? No, possession is signed by device key.
-        // Instead, test that cert_hash differs, so possession_msg differs, so sig over old would fail to verify if recomputed with new hash.
-        // Build possession_msg for cert' with same sig: it would have different cert_hash, so msg differs.
-        let msg_prime = possession_msg(0x01, &fake_cmv, scope, &caps_d, &cert_hash_prime, &sender, &receiver_zero);
-        assert_ne!(msg_a, msg_prime, "swapped cert must give different possession_msg -> sig FAILS");
+
+        let msg_a = possession_msg(0x01, &cmv, scope, &caps_d, &cert_hash_a, &sender, &receiver_zero);
+        let sig_a = sign_possession(&dev_kp, &msg_a);
+        assert!(verify_possession_sig(&device_a, &msg_a, &sig_a).is_ok(), "honest possession must verify");
+
+        let msg_prime = possession_msg(0x01, &cmv, scope, &caps_d, &cert_hash_prime, &sender, &receiver_zero);
+        assert_ne!(msg_a, msg_prime);
+        assert!(verify_possession_sig(&device_a, &msg_prime, &sig_a).is_err(), "swapped cert (different cert_hash) must FAIL verify (re-attribution refused)");
     }
 
     #[test]
@@ -743,36 +743,46 @@ mod tests {
     fn reflection_to_self_refused() {
         let user = make_user();
         let own_pub = user.public_key_bytes();
-        let cert = DeviceCert::certify(&user, [0xaa; 32], now_secs(), CERT_TTL_SECS).unwrap();
-        // cert.user_pub == own user_pub is self
+        let (dev_kp, device_pub) = make_device();
+        let cert = DeviceCert::certify(&user, device_pub, now_secs(), CERT_TTL_SECS).unwrap();
         assert_eq!(cert.user_pub, own_pub);
-        // Our verify path must refuse cert where user_pub == own
-        // Simulate check
+        // Possession verification must also refuse self (load-bearing on PAKE with zero placeholder)
+        let cmv = [0x11; 32];
+        let scope = IntroScope::Device.to_byte();
+        let caps_d = caps_digest("transfer");
+        let chash = cert_hash(&cert);
+        let receiver_zero = [0u8; 32];
+        let msg = possession_msg(0x01, &cmv, scope, &caps_d, &chash, &device_pub, &receiver_zero);
+        let sig = sign_possession(&dev_kp, &msg);
+        assert!(verify_possession_sig(&device_pub, &msg, &sig).is_ok(), "honest self possession would verify, but higher-level check must refuse user_pub == own");
+        // Higher-level guard: if cert.user_pub == own, refuse regardless of sig validity
         let is_self = cert.user_pub == own_pub;
-        assert!(is_self, "this cert is self, must be refused");
+        assert!(is_self, "this cert is self, must be refused by reflection check");
     }
 
     #[test]
     fn pake_receiver_dpub_nonzero_refused() {
-        // Type 0x01 with non-zero receiver_device_pub must be refused
+        // Type 0x01 with non-zero receiver_device_pub must be refused (real verifier)
+        let (dev_kp, device_pub) = make_device();
         let cmv = [0x11; 32];
         let scope = IntroScope::Device.to_byte();
         let caps_d = caps_digest("transfer");
-        let cert_hash = [0x22; 32];
-        let sender = [0xaa; 32];
+        let chash = [0x22; 32];
+        let sender = device_pub;
         let receiver_zero = [0u8; 32];
         let receiver_nonzero = [0x01; 32];
-        let msg_zero = possession_msg(0x01, &cmv, scope, &caps_d, &cert_hash, &sender, &receiver_zero);
-        let msg_nonzero = possession_msg(0x01, &cmv, scope, &caps_d, &cert_hash, &sender, &receiver_nonzero);
-        assert_ne!(msg_zero, msg_nonzero, "zero vs non-zero receiver must give different possession_msg");
-        // Explicit check: for PAKE binding_type 0x01, receiver_device_pub MUST be zeros, else named error
-        assert!(receiver_nonzero != [0u8; 32]);
+        let msg_zero = possession_msg(0x01, &cmv, scope, &caps_d, &chash, &sender, &receiver_zero);
+        let sig_zero = sign_possession(&dev_kp, &msg_zero);
+        assert!(verify_possession_sig(&device_pub, &msg_zero, &sig_zero).is_ok());
+        let msg_nonzero = possession_msg(0x01, &cmv, scope, &caps_d, &chash, &sender, &receiver_nonzero);
+        // Sig over zero msg must NOT verify over non-zero msg
+        assert!(verify_possession_sig(&device_pub, &msg_nonzero, &sig_zero).is_err(), "pake receiver non-zero must be refused (real verifier)");
     }
 
     #[test]
     fn cmv_binds_both_fingerprints() {
         // Fails if L1 confirm MAC ever stops binding BOTH endpoint fingerprints
-        // Field 8 zero is safe ONLY because cmv binds both fingerprints
+        // Field 8 zero is safe ONLY because cmv binds both fingerprints (comment at field 8)
         use crate::pake::{confirm_mac, sort_fps, canonical_caps};
         let k = [0x42; 32];
         let caps = canonical_caps(&["transfer".to_string()]);
@@ -783,11 +793,26 @@ mod tests {
         let (lo_ab, hi_ab) = sort_fps(fp_a, fp_b);
         let (lo_ac, hi_ac) = sort_fps(fp_a, fp_c);
         let (lo, hi) = (lo_ab, hi_ab);
-        // confirm_mac with fp_b vs fp_c must differ
         let (send_dir, _) = crate::pake::confirm_dirs(fp_a, lo);
-        let mac_ab = confirm_mac(&k, send_dir, lo_ab, hi_ab, &caps, scope);
-        let mac_ac = confirm_mac(&k, send_dir, lo_ac, hi_ac, &caps, scope);
-        assert_ne!(mac_ab, mac_ac, "cmv must bind both fingerprints, different fp must give different MAC");
+        let mac_ab_vec = confirm_mac(&k, send_dir, lo_ab, hi_ab, &caps, scope);
+        let mac_ac_vec = confirm_mac(&k, send_dir, lo_ac, hi_ac, &caps, scope);
+        assert_ne!(mac_ab_vec, mac_ac_vec, "cmv must bind both fingerprints");
+        let mut mac_ab = [0u8; 32];
+        mac_ab.copy_from_slice(&mac_ab_vec);
+        let mut mac_ac = [0u8; 32];
+        mac_ac.copy_from_slice(&mac_ac_vec);
+
+        // Now prove possession binding includes cmv, so different cmv gives different possession_msg and sig fails
+        let (dev_kp, device_pub) = make_device();
+        let caps_d = caps_digest(&caps);
+        let cert_hash = [0x11; 32];
+        let receiver_zero = [0u8; 32];
+        let msg_ab = possession_msg(0x01, &mac_ab, scope, &caps_d, &cert_hash, &device_pub, &receiver_zero);
+        let sig_ab = sign_possession(&dev_kp, &msg_ab);
+        assert!(verify_possession_sig(&device_pub, &msg_ab, &sig_ab).is_ok());
+        let msg_ac = possession_msg(0x01, &mac_ac, scope, &caps_d, &cert_hash, &device_pub, &receiver_zero);
+        assert_ne!(msg_ab, msg_ac);
+        assert!(verify_possession_sig(&device_pub, &msg_ac, &sig_ab).is_err(), "different fingerprints must give different cmv -> possession sig must FAIL");
     }
 
     #[test]
@@ -804,17 +829,21 @@ mod tests {
 
     #[test]
     fn caps_tamper_on_introduce_refused() {
+        let (dev_kp, device_pub) = make_device();
         let caps_a = caps_digest("transfer");
         let caps_b = caps_digest("transfer,admin");
-        assert_ne!(caps_a, caps_b, "different caps must give different digest");
+        assert_ne!(caps_a, caps_b);
         let cmv = [0x11; 32];
         let scope = IntroScope::Device.to_byte();
         let cert_hash = [0x22; 32];
-        let sender = [0xaa; 32];
+        let sender = device_pub;
         let receiver = [0u8; 32];
         let msg_a = possession_msg(0x01, &cmv, scope, &caps_a, &cert_hash, &sender, &receiver);
+        let sig_a = sign_possession(&dev_kp, &msg_a);
+        assert!(verify_possession_sig(&device_pub, &msg_a, &sig_a).is_ok());
         let msg_b = possession_msg(0x01, &cmv, scope, &caps_b, &cert_hash, &sender, &receiver);
-        assert_ne!(msg_a, msg_b, "tampered caps must give different possession_msg -> sig FAILS");
+        assert_ne!(msg_a, msg_b);
+        assert!(verify_possession_sig(&device_pub, &msg_b, &sig_a).is_err(), "tampered caps must FAIL verify");
     }
 
     #[test]
@@ -843,60 +872,69 @@ mod tests {
 
     #[test]
     fn concurrent_same_nameplate_distinct_binding() {
-        // Same nameplate concurrent pairings yield different binding_value (freshness)
+        let (dev_kp, device_pub) = make_device();
         let cmv1 = [0x11; 32];
         let cmv2 = [0x22; 32];
         assert_ne!(cmv1, cmv2);
         let scope = IntroScope::Device.to_byte();
         let caps_d = caps_digest("transfer");
         let cert_hash = [0x33; 32];
-        let sender = [0xaa; 32];
+        let sender = device_pub;
         let receiver = [0u8; 32];
         let msg1 = possession_msg(0x01, &cmv1, scope, &caps_d, &cert_hash, &sender, &receiver);
+        let sig1 = sign_possession(&dev_kp, &msg1);
+        assert!(verify_possession_sig(&device_pub, &msg1, &sig1).is_ok());
         let msg2 = possession_msg(0x01, &cmv2, scope, &caps_d, &cert_hash, &sender, &receiver);
-        assert_ne!(msg1, msg2, "concurrent same nameplate must have distinct binding (cmv freshness)");
+        assert!(verify_possession_sig(&device_pub, &msg2, &sig1).is_err(), "concurrent same nameplate must have distinct binding -> old sig must FAIL on new cmv");
     }
 
     #[test]
     fn cross_target_replay_refused() {
-        // Expose for R1 replayed to R2 (different receiver_device_pub) -> refused because receiver field differs
+        let (dev_kp, device_pub) = make_device();
         let cmv = [0x11; 32];
         let scope = IntroScope::Device.to_byte();
         let caps_d = caps_digest("transfer");
         let cert_hash = [0x22; 32];
-        let sender = [0xaa; 32];
+        let sender = device_pub;
         let receiver_r1 = [0xbb; 32];
         let receiver_r2 = [0xcc; 32];
         let msg_r1 = possession_msg(0x02, &cmv, scope, &caps_d, &cert_hash, &sender, &receiver_r1);
+        let sig_r1 = sign_possession(&dev_kp, &msg_r1);
+        assert!(verify_possession_sig(&device_pub, &msg_r1, &sig_r1).is_ok());
         let msg_r2 = possession_msg(0x02, &cmv, scope, &caps_d, &cert_hash, &sender, &receiver_r2);
-        assert_ne!(msg_r1, msg_r2, "cross-target replay with different receiver must give different msg -> sig FAILS");
+        assert!(verify_possession_sig(&device_pub, &msg_r2, &sig_r1).is_err(), "cross-target replay with different receiver must FAIL");
     }
 
     #[test]
     fn introduce_nonce_replay_refused() {
-        // Nonce from old session replayed -> fails because held nonce differs
+        let (dev_kp, device_pub) = make_device();
         let nonce1 = [0x11; 32];
         let nonce2 = [0x22; 32];
         assert_ne!(nonce1, nonce2);
         let scope = IntroScope::User.to_byte();
         let caps_d = caps_digest("transfer");
         let cert_hash = [0x33; 32];
-        let sender = [0xaa; 32];
+        let sender = device_pub;
         let receiver = [0xbb; 32];
         let msg1 = possession_msg(0x02, &nonce1, scope, &caps_d, &cert_hash, &sender, &receiver);
+        let sig1 = sign_possession(&dev_kp, &msg1);
+        assert!(verify_possession_sig(&device_pub, &msg1, &sig1).is_ok());
         let msg2 = possession_msg(0x02, &nonce2, scope, &caps_d, &cert_hash, &sender, &receiver);
-        assert_ne!(msg1, msg2, "replayed nonce must give different possession_msg");
+        assert!(verify_possession_sig(&device_pub, &msg2, &sig1).is_err(), "replayed nonce must FAIL verify");
     }
 
     #[test]
     fn scope_disagreement_introduce_refused() {
+        let (dev_kp, device_pub) = make_device();
         let cmv = [0x11; 32];
         let caps_d = caps_digest("transfer");
         let cert_hash = [0x22; 32];
-        let sender = [0xaa; 32];
-        let receiver = [0x00; 32];
+        let sender = device_pub;
+        let receiver = [0u8; 32];
         let msg_user = possession_msg(0x01, &cmv, IntroScope::User.to_byte(), &caps_d, &cert_hash, &sender, &receiver);
+        let sig_user = sign_possession(&dev_kp, &msg_user);
+        assert!(verify_possession_sig(&device_pub, &msg_user, &sig_user).is_ok());
         let msg_device = possession_msg(0x01, &cmv, IntroScope::Device.to_byte(), &caps_d, &cert_hash, &sender, &receiver);
-        assert_ne!(msg_user, msg_device, "scope disagreement must give different msg -> sig FAILS");
+        assert!(verify_possession_sig(&device_pub, &msg_device, &sig_user).is_err(), "scope disagreement must FAIL verify");
     }
 }
