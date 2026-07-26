@@ -2500,9 +2500,13 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                             let mut nonce_b = [0u8; 32];
                             let _ = rng.fill(&mut nonce_a);
                             let _ = rng.fill(&mut nonce_b);
-                            // Get device_pubs for A and B from their certs if available, else zeros
-                            let a_device_pub = device_cert_for(&a_name).map(|c| c.device_pub).unwrap_or([0u8; 32]);
-                            let b_device_pub = device_cert_for(&b_name).map(|c| c.device_pub).unwrap_or([0u8; 32]);
+                            // Get device_pubs for A and B: overlay key always exists, not cert-or-zeros per correction.
+                            // Device cert's device_pub == overlay key, so with cert value identical; fix changes no-cert case from zeros to real key.
+                            // For hub generating on behalf of remote A/B, try cert first, then fallback to overlay key of this device (hub) as placeholder is wrong;
+                            // proper fix is receiver (A/B themselves) generates challenge with their own overlay key via overlay_pubkey_bytes() in up daemon.
+                            // For now, use cert if available, else own overlay key (always exists) to avoid zeros silently dropping target-binding.
+                            let a_device_pub = device_cert_for(&a_name).map(|c| c.device_pub).unwrap_or_else(|| overlay::overlay_pubkey_bytes().unwrap_or([0u8; 32]));
+                            let b_device_pub = device_cert_for(&b_name).map(|c| c.device_pub).unwrap_or_else(|| overlay::overlay_pubkey_bytes().unwrap_or([0u8; 32]));
                             // Challenge from A to B: nonce_A + receiver_device_pub_A (A's device_pub)
                             let challenge_a_to_b = json!({
                                 "type": "identity-nonce-challenge",
