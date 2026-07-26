@@ -192,4 +192,73 @@ mod tests {
         assert_eq!(cert.user_pub,cert2.user_pub);
         cert2.verify(now_secs()).unwrap();
     }
+
+    #[test]
+    fn continuity_same_user_different_devices_accepted() {
+        let user = make_user();
+        let now = now_secs();
+        let up = user.public_key_bytes();
+        let cert_a = DeviceCert::certify(&user, [0x11; 32], now, CERT_TTL_SECS).unwrap();
+        let cert_b = DeviceCert::certify(&user, [0x22; 32], now, CERT_TTL_SECS).unwrap();
+        assert!(cert_a.verify_chain(&up, now).is_ok(), "device A should chain to same user");
+        assert!(cert_b.verify_chain(&up, now).is_ok(), "device B should chain to same user");
+        assert_ne!(cert_a.device_pub, cert_b.device_pub);
+    }
+
+    #[test]
+    fn privacy_cert_exposes_only_one_device() {
+        let user = make_user();
+        let cert = DeviceCert::certify(&user, [0xaa; 32], now_secs(), CERT_TTL_SECS).unwrap();
+        let j = cert.to_json();
+        assert!(j.get("devicePub").is_some());
+        assert!(j.get("userPub").is_some());
+        assert!(j.get("deviceList").is_none(), "cert must not contain device list");
+        assert!(j.get("devices").is_none(), "cert must not contain devices array");
+        assert!(j.get("deviceSet").is_none(), "cert must not contain device set");
+        let encoded = serde_json::to_string(&j).unwrap();
+        assert_eq!(encoded.matches("devicePub").count(), 1, "exactly one devicePub");
+    }
+
+    #[test]
+    fn scope_downgrade_byte_distinct_and_invalid_rejected() {
+        let user_byte = IntroScope::User.to_byte();
+        let device_byte = IntroScope::Device.to_byte();
+        assert_ne!(user_byte, device_byte, "User and Device scope bytes must differ");
+        assert_eq!(IntroScope::from_byte(user_byte), Some(IntroScope::User));
+        assert_eq!(IntroScope::from_byte(device_byte), Some(IntroScope::Device));
+        assert_eq!(IntroScope::from_byte(0x02), None, "invalid scope byte must be rejected");
+        assert_eq!(IntroScope::from_byte(0xFF), None, "invalid scope byte must be rejected");
+    }
+
+    #[test]
+    fn scope_downgrade_token_cannot_be_silently_flipped() {
+        let user = make_user();
+        let now = now_secs();
+        let cert = DeviceCert::certify(&user, [0x55; 32], now, CERT_TTL_SECS).unwrap();
+        let canonical = cert.canonical_for_signing();
+        let flipped_scope_cert_canonical_user = {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"filament/identity-device-cert/v1");
+            v.extend_from_slice(&cert.device_pub);
+            v.extend_from_slice(&cert.user_pub);
+            v.extend_from_slice(&cert.expires.to_le_bytes());
+            v.extend_from_slice(&cert.issued.to_le_bytes());
+            v.push(IntroScope::User.to_byte());
+            v
+        };
+        let flipped_scope_cert_canonical_device = {
+            let mut v = Vec::new();
+            v.extend_from_slice(b"filament/identity-device-cert/v1");
+            v.extend_from_slice(&cert.device_pub);
+            v.extend_from_slice(&cert.user_pub);
+            v.extend_from_slice(&cert.expires.to_le_bytes());
+            v.extend_from_slice(&cert.issued.to_le_bytes());
+            v.push(IntroScope::Device.to_byte());
+            v
+        };
+        assert_ne!(flipped_scope_cert_canonical_user, flipped_scope_cert_canonical_device,
+            "User vs Device scope must produce different transcript bytes");
+        assert_eq!(canonical.len() + 1, flipped_scope_cert_canonical_user.len(),
+            "adding scope byte must change length, proving scope is bound separately");
+    }
 }
