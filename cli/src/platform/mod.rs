@@ -226,17 +226,59 @@ impl SecretFile {
     }
 }
 
+/// Resolve the current process's user SID from the access token.
+///
+/// We deliberately do NOT use the `%USERNAME%` env var: in a Windows SERVICE
+/// context (LocalSystem, a machine account, or any non-interactive logon)
+/// USERNAME is frequently absent, so keying the ACL off it makes
+/// `restrict_dacl` fail for a reason unrelated to key exposure. Even when set,
+/// a display name is locale- and rename-fragile.
+///
+/// `whoami /user` reads the calling process's token directly (the same
+/// TokenUser SID an interactive user would get), is present on every supported
+/// Windows SKU, and needs no added dependency, so it works identically whether
+/// filament runs interactively or as a service. Fail-closed: if no SID can be
+/// parsed we return Err (the caller fails loud) rather than guessing a
+/// principal.
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<String> {
+    let out = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to run whoami: {e}")))?;
+    if !out.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("whoami /user failed with exit code {:?}", out.status.code()),
+        ));
+    }
+    // Output is one CSV row, no header: "DOMAIN\\user","S-1-5-21-...".
+    // Extract the SID token (well-known `S-1-...` form) by scanning fields
+    // rather than trusting exact quoting/positions across locales. A SID
+    // contains only 'S', digits, and '-', so it is isolated cleanly by
+    // splitting on comma / quote / whitespace.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let sid = stdout
+        .split(|c: char| c == ',' || c == '"' || c.is_whitespace())
+        .find(|tok| tok.starts_with("S-1-"));
+    match sid {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("could not parse a user SID from whoami output: {:?}", stdout.trim()),
+        )),
+    }
+}
+
 #[cfg(windows)]
 fn restrict_dacl(path: &Path) -> io::Result<()> {
-    let user = std::env::var("USERNAME").map_err(|_| {
-        io::Error::new(io::ErrorKind::Other, "USERNAME env var not set; cannot ACL-restrict the key")
-    })?;
-    if user.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::Other, "USERNAME is empty; cannot ACL-restrict the key"));
-    }
+    // Grant to the current user's SID (from the process token), NOT %USERNAME%.
+    // icacls accepts a raw SID via the `*S-1-...` syntax, which is the
+    // canonical, service-safe, locale-independent principal.
+    let sid = current_user_sid()?;
     let path_str = path.display().to_string();
     let st = std::process::Command::new("icacls")
-        .args([&path_str, "/inheritance:r", "/grant:r", &format!("{user}:(F)"), "/Q"])
+        .args([&path_str, "/inheritance:r", "/grant:r", &format!("*{sid}:(F)"), "/Q"])
         .status()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to run icacls: {e}")))?;
     if !st.success() {
