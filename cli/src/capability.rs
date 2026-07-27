@@ -669,6 +669,88 @@ pub fn cap_authorize(
     evaluate(&store, &hdr, &device_pub, &user_pub, resource, action, now_secs())
 }
 
+/// A single authorization query for preview enumeration.
+pub struct AuthQuery {
+    pub principal_device_pub: [u8; 32],
+    pub principal_user_pub: [u8; 32],
+    pub action: String,
+}
+
+pub struct PreviewEntry {
+    pub query: AuthQuery,
+    pub authorized: bool,
+}
+
+/// Preview the effect of applying `ops` to a cloned store: compute
+/// evaluate() for each query against the post-apply state. Same
+/// evaluate() fn, so preview cannot diverge from enforcement.
+pub fn preview(
+    store: &[Value],
+    header: &CapHeader,
+    ops: &[CapOp],
+    queries: &[AuthQuery],
+    now: u64,
+) -> Vec<PreviewEntry> {
+    let mut cloned_store = store.to_vec();
+    for op in ops {
+        let _ = apply_cap_op(&mut cloned_store, header, op, now);
+    }
+    queries
+        .iter()
+        .map(|q| {
+            let d = evaluate(
+                &cloned_store,
+                header,
+                &q.principal_device_pub,
+                &q.principal_user_pub,
+                &header.resource,
+                &q.action,
+                now,
+            );
+            PreviewEntry {
+                query: AuthQuery {
+                    principal_device_pub: q.principal_device_pub,
+                    principal_user_pub: q.principal_user_pub,
+                    action: q.action.clone(),
+                },
+                authorized: matches!(d, Decision::Authorized),
+            }
+        })
+        .collect()
+}
+
+/// Check whether applying an op self-locks out the admin: if a principal
+/// held Authorized on an action before but is Denied after, return a
+/// warning. The caller surfaces this toward the owner; it does NOT refuse
+/// the op.
+pub fn check_self_lockout(
+    store: &[Value],
+    header: &CapHeader,
+    op: &CapOp,
+    principals: &[(String, [u8; 32], [u8; 32])],
+    admin_actions: &[&str],
+    now: u64,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut after_store = store.to_vec();
+    if apply_cap_op(&mut after_store, header, op, now).is_err() {
+        return warnings;
+    }
+    for (label, dev_pub, user_pub) in principals {
+        for action in admin_actions {
+            let before = evaluate(store, header, dev_pub, user_pub, &header.resource, action, now);
+            let after = evaluate(&after_store, header, dev_pub, user_pub, &header.resource, action, now);
+            if matches!(before, Decision::Authorized) && matches!(after, Decision::Denied(_)) {
+                warnings.push(format!(
+                    "self-lockout WARNING: {} would lose '{}' on resource '{}'",
+                    label, action, header.resource
+                ));
+            }
+        }
+    }
+    warnings
+}
+
 // ---------------------------------------------------------------------------
 // Store fns
 // ---------------------------------------------------------------------------
@@ -1924,5 +2006,102 @@ mod tests {
             Decision::Authorized => panic!("no-header cap_authorize must return Denied (gates fall back to legacy path)"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -- B4 preview + self-lockout ------------------------------------------
+
+    #[test]
+    fn preview_matches_enforcement() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+        let v1 = hlc_next(0, now_ms());
+        let principal_user = [0xaa; 32];
+
+        // Store with one grant
+        let mut store = init_store(&header);
+        let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        // Preview applying a revoke of that grant
+        let v2 = hlc_next(v1, now_ms());
+        let revoke = make_revoke(&owner, target, &header.resource, v2, 86400);
+        let revoke2 = revoke.clone();
+
+        let queries = vec![
+            AuthQuery {
+                principal_device_pub: [0xcc; 32],
+                principal_user_pub: principal_user,
+                action: "ssh".to_string(),
+            },
+        ];
+
+        let preview_results = preview(&store, &header, &[revoke2], &queries, now_secs());
+        assert!(!preview_results[0].authorized, "preview of revoke must show Denied");
+
+        // Apply revoke for real and evaluate — must match preview
+        apply_cap_op(&mut store, &header, &revoke, now_secs()).unwrap();
+        let real_d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        assert!(matches!(real_d, Decision::Denied(_)), "real enforcement must match preview");
+
+        // No-op preview: should show Authorized (preview doesn't mutate store)
+        let mut store2 = init_store(&header);
+        apply_cap_op(&mut store2, &header, &grant, now_secs()).unwrap();
+        let preview_current = preview(&store2, &header, &[], &queries, now_secs());
+        assert!(preview_current[0].authorized, "preview of no-op must show Authorized for existing grant");
+    }
+
+    #[test]
+    fn self_lockout_warns_on_admin_loss() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let v1 = hlc_next(0, now_ms());
+        let v2 = hlc_next(v1, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["admin", "ssh"], v1, 86400);
+        let narrow = make_grant(&owner, target, &header.resource, &["ssh"], v2, 86400);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        let principals = vec![(
+            "bob".to_string(),
+            [0xcc; 32],
+            [0xaa; 32],
+        )];
+
+        // Narrowing from ["admin","ssh"] to ["ssh"] loses "admin"
+        let warnings = check_self_lockout(
+            &store, &header, &narrow, &principals, &["admin", "ssh", "shell"], now_secs(),
+        );
+        assert!(!warnings.is_empty(), "must warn when admin action is lost");
+        assert!(warnings[0].contains("admin"), "warning must mention the lost action");
+    }
+
+    #[test]
+    fn self_lockout_no_warn_on_gain() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let v1 = hlc_next(0, now_ms());
+        let v2 = hlc_next(v1, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
+        let expand = make_grant(&owner, target, &header.resource, &["ssh", "admin"], v2, 86400);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        let principals = vec![("bob".to_string(), [0xcc; 32], [0xaa; 32])];
+
+        // Expanding grants must NOT warn (no loss)
+        let warnings = check_self_lockout(
+            &store, &header, &expand, &principals, &["admin"], now_secs(),
+        );
+        assert!(warnings.is_empty(), "must not warn when gaining access");
     }
 }
