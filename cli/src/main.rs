@@ -11310,7 +11310,21 @@ async fn recv_cmd(
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     if !l2::is_l2_sid(sid) { continue; }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    if !trusted {
+                    // Capability-layer authorization for mount
+                    let cap_ok = {
+                        let link = conn.link(&pid);
+                        matches!(
+                            crate::capability::cap_authorize(
+                                &crate::settings::config_dir(),
+                                "self",
+                                "mount",
+                                link.and_then(|l| l.identity_device_pub.as_ref()),
+                                link.and_then(|l| l.identity_user_pub.as_ref()),
+                            ),
+                            crate::capability::Decision::Authorized
+                        )
+                    };
+                    if !trusted && !cap_ok {
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: untrusted peer" })).await;
                         continue;
                     }
@@ -11734,10 +11748,24 @@ async fn recv_cmd(
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let consented = v["__consent"].as_str() == Some(consent_token());
+                    // Capability-layer transfer authorization via owner-signed grant
+                    let cap_transfer = {
+                        let link = conn.link(&pid);
+                        matches!(
+                            crate::capability::cap_authorize(
+                                &crate::settings::config_dir(),
+                                "self",
+                                "transfer",
+                                link.and_then(|l| l.identity_device_pub.as_ref()),
+                                link.and_then(|l| l.identity_user_pub.as_ref()),
+                            ),
+                            crate::capability::Decision::Authorized
+                        )
+                    };
                     let ok = if daemon {
-                        link_trusted
+                        link_trusted || cap_transfer
                     } else {
-                        yes || consented || link_trusted || (is_resume && offset > 0)
+                        yes || consented || link_trusted || cap_transfer || (is_resume && offset > 0)
                     };
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() {

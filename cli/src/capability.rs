@@ -641,8 +641,9 @@ pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io:
 }
 
 /// Bridging authorization: loads the cap store, finds the header for `resource`,
-/// and calls evaluate(). Falls back to `Denied("no capability store")` if no
-/// header exists for the resource.
+/// and calls evaluate(). If no header exists, returns Authorized (zero-config
+/// pass-through: the existing trusted + device_allows gates still apply, and
+/// the owner is never locked out on a fresh no-header device).
 pub fn cap_authorize(
     config_dir: &std::path::Path,
     resource: &str,
@@ -660,7 +661,9 @@ pub fn cap_authorize(
         .and_then(CapHeader::from_json);
 
     let Some(hdr) = header else {
-        return Decision::Denied("no capability store for resource".into());
+        // No header: zero-config pass-through. The existing trusted +
+        // device_allows gates still apply; the owner is never locked out.
+        return Decision::Authorized;
     };
 
     let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
@@ -1907,5 +1910,21 @@ mod tests {
         let mut store = init_store(&header);
         let res = update_ratchet(&mut store, &owner_pub(&owner), far_future);
         assert!(res.is_err(), "far-future issued_at must be rejected");
+    }
+
+    /// Zero-config: cap_authorize returns Authorized when no header exists,
+    /// so the owner is never locked out on a fresh device.
+    #[test]
+    fn cap_authorize_no_header_returns_authorized() {
+        use std::path::Path;
+        // An empty temp dir = no caps.json, no header
+        let tmp = std::env::temp_dir().join(format!("fil-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]));
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("zero-config must not lock out: {}", reason),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
