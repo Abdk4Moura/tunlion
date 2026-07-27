@@ -94,6 +94,23 @@ grant (hard cutover). No preview command, no auto-migrate. The blast-radius
 enumeration exists if ever needed (`devices_with_shell_revoked` / the `CAP-SHADOW
 RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
 
+## Validation status (as of this session)
+
+- [x] Cap gate LOGIC: proven by unit tests (feat 054f41d, full binary suite green,
+      incl. both-branches tests for every restrictive gate).
+- [x] Shadow SAMPLING on real traffic: proven (la_authorized=3, shell+mount coverage,
+      zero disagreement, single stable daemon PID). Instrument proven by the six-bucket
+      detector-proof.
+- [x] Authoritative grant / evaluate / cap-status display: confirmed working under
+      `FILAMENT_CAP_AUTHORITATIVE=1`.
+- [ ] Live-traffic authoritative ENFORCEMENT matrix (granted->allow, revoked->deny +
+      key removed, ungranted->deny, Inferred->deny, trust-floor, rollback): NOT yet run.
+      Blocked on the same-box rig by transport (signaling `api.filament.autumated.com`
+      503; same-box direct/loopback also won't establish). Controlled-proven to be a
+      transport-layer limitation, not authoritative-mode-specific (a fresh SHADOW daemon
+      fails transport identically). Run this on a CROSS-MACHINE rig (do-vm <-> other-do)
+      when signaling is healthy before a production flip.
+
 ## Rollback
 
 The flag is the rollback: unset `FILAMENT_CAP_AUTHORITATIVE` to return to legacy
