@@ -2319,6 +2319,48 @@ mod tests {
         assert!(disagree.summary().contains("flip_ready=false"));
     }
 
+    /// Grant must initialize the per-owner ratchet so evaluate() never hits
+    /// "ratchet uninitialized". The grant command in main.rs constructs CapOp
+    /// and CapHeader JSON directly (not via apply_cap_op / apply_header), so
+    /// it must explicitly call update_ratchet. Without it, a freshly-granted
+    /// resource always denies.
+    #[test]
+    fn grant_initializes_ratchet() {
+        let owner = make_owner();
+        let pk = owner_pub(&owner);
+        let nonce = [0x01; 32];
+        // A DIFFERENT principal, not the owner, so evaluate() must scan grants.
+        let principal = make_owner();
+        let principal_pub = owner_pub(&principal);
+        let target = CapTarget::Device(principal_pub);
+
+        // Simulate the grant-command path: push header + grant JSON directly
+        // without apply_header / apply_cap_op (so no ratchet side-effect).
+        let mut store = Vec::new();
+        let header = make_genesis_header(&owner, &nonce, &[]);
+        let header_json = header.to_json();
+        store.push(header_json);
+
+        let v1 = hlc_next(0, now_ms());
+        let mut grant = make_grant(&owner, target, &header.resource, &["shell"], v1, 86400);
+        grant.sig = sign_cap_op(&grant, &owner);
+        let mut grant_json = grant.to_json();
+        grant_json["type"] = serde_json::Value::from("cap_grant");
+        store.push(grant_json);
+
+        // Before update_ratchet: evaluate must deny ("ratchet uninitialized")
+        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs()) {
+            Decision::Denied(reason) => assert!(reason.contains("ratchet uninitialized")),
+            Decision::Authorized => panic!("evaluate must refuse before ratchet is initialized"),
+        }
+        // After update_ratchet: evaluate must authorize
+        update_ratchet(&mut store, &pk, grant.issued_at).unwrap();
+        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs()) {
+            Decision::Authorized => {}
+            Decision::Denied(reason) => panic!("evaluate must authorize after ratchet init, got: {reason}"),
+        }
+    }
+
     // -- B4 preview + self-lockout ------------------------------------------
 
     #[test]

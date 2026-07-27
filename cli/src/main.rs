@@ -1500,6 +1500,44 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
     None
 }
 
+/// Populate link identity from the peer's stored device cert, if the
+/// link already has a proof-verified name but identity pubkeys are absent.
+/// Cached back onto the link on first successful resolution (resolve-once,
+/// not per open).
+///
+/// The binding model: `verified_name` is set ONLY after a session-bound
+/// pair-proof HMAC (proof_for over shared secret + UIDs + fingerprints),
+/// so the name is cryptographically bound to this link. `device_cert_for`
+/// returns the cert we already verified at pairing (provisional_promote_ok
+/// checked device_pub against the overlay transport key at storage time).
+/// Together these form a sufficient trust join: a proven name plus the
+/// cert trusted-for-that-name. No additional link-level cert-to-transport
+/// comparison is needed.
+///
+/// Fail-closed to None on: no verified_name, no stored cert, cert expired
+/// or otherwise invalid.
+fn resolve_peer_identity(link: &mut Link) {
+    // Precedence rule: a Proven binding must NOT be downgraded to Inferred.
+    // The identity-expose handler (possession-sig) sets Proven, and this
+    // function (symmetric-secret proof + name->cert lookup) sets Inferred.
+    // An Inferred MAY later be upgraded to Proven by identity-expose.
+    if link.identity_device_pub.is_some() || link.identity_user_pub.is_some() {
+        return; // already resolved (any binding, Proven or Inferred, stays)
+    }
+    let name = match &link.verified_name {
+        Some(n) => n.clone(),
+        None => return, // no proven name, nothing to resolve
+    };
+    let Some(cert) = device_cert_for(&name) else { return };
+    let now = crate::identity::now_secs();
+    if cert.verify(now).is_err() {
+        return;
+    }
+    link.identity_device_pub = Some(cert.device_pub);
+    link.identity_user_pub = Some(cert.user_pub);
+    link.identity_binding = BindingStrength::Inferred;
+}
+
 /// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
 fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
     identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
@@ -3316,6 +3354,21 @@ struct Link {
     identity_device_pub: Option<[u8; 32]>,
     /// Identity cert user_pub (set when identity-expose is verified).
     identity_user_pub: Option<[u8; 32]>,
+    /// Binding strength of the identity fields (set alongside them).
+    identity_binding: BindingStrength,
+}
+
+/// How the peer's identity was bound to this link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingStrength {
+    /// Default: identity not yet populated.
+    None,
+    /// Proven via device_priv possession signature (identity-expose handler).
+    Proven,
+    /// Inferred from symmetric pairing-secret proof + name-to-cert lookup
+    /// (resolve_peer_identity). A Proven binding must NOT be downgraded
+    /// to Inferred; an Inferred MAY be upgraded to Proven.
+    Inferred,
 }
 
 impl Link {
@@ -4433,6 +4486,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
+                identity_binding: BindingStrength::None,
             },
         );
         Ok(())
@@ -4832,6 +4886,7 @@ impl Conn {
             if let Some((n, _)) = &expected_secret {
                 existing.verified_name = Some(n.clone());
             }
+            resolve_peer_identity(existing);
             if expected_secret.is_some() {
                 existing.expected_secret = expected_secret;
             }
@@ -4860,6 +4915,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
+                identity_binding: BindingStrength::None,
             },
         );
         }
@@ -5746,6 +5802,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
+                identity_binding: BindingStrength::None,
             },
         );
     }
@@ -7219,6 +7276,17 @@ async fn main() -> Result<()> {
                 let mut op_json = op.to_json();
                 op_json["type"] = serde_json::json!("cap_grant");
                 store.push(op_json);
+                // Grant must initialize the per-owner ratchet so evaluate()
+                // does not hit "ratchet uninitialized". apply_cap_op normally
+                // does this, but the grant command constructs CapOp JSON
+                // directly. On failure the grant did NOT take (evaluate()
+                // will deny forever), so fail the command instead of printing
+                // a misleading "granted" line.
+                // TODO: route grant through apply_cap_op so there is one
+                // validated op-creation path (sig-verify + floor + monotonic
+                // + ratchet), not two.
+                crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
+                    .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
                 let _ = crate::capability::save_cap_store(&config_dir, &store);
             }
             println!(
@@ -11059,10 +11127,18 @@ async fn recv_cmd(
                                 .unwrap_or(false);
                             l2_open_allowed(blanket, peer_has_shell)
                         };
-                        // Capability layer evaluated UNCONDITIONALLY (not short-
-                        // circuited on legacy) so shadow mode samples the legacy-
-                        // ALLOWED population, the only opens a flip can change.
-                        // Legacy stands in shadow; cap gates under the flag.
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11173,6 +11249,12 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11269,6 +11351,12 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11414,6 +11502,12 @@ async fn recv_cmd(
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
                     let authorized = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11610,10 +11704,8 @@ async fn recv_cmd(
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
-                            // Record the proven devices.json petname, the cap
-                            // store key (the `shell` bootstrap gate looks up caps
-                            // under exactly this, not the presence display name).
                             l.verified_name = Some(n.clone());
+                            resolve_peer_identity(l);
                         }
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
                         true
@@ -11759,6 +11851,7 @@ async fn recv_cmd(
                                                                             if let Some(l) = conn.link_mut(&pid) {
                                                                                 l.identity_device_pub = Some(cert.device_pub);
                                                                                 l.identity_user_pub = Some(cert.user_pub);
+                                                                                l.identity_binding = BindingStrength::Proven;
                                                                             }
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
@@ -11869,6 +11962,12 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let (ok, xfer_deny_reason) = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
