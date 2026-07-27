@@ -620,6 +620,56 @@ pub fn update_ratchet(store: &mut Vec<Value>, owner_pub: &[u8; 32], issued_at: u
 }
 
 // ---------------------------------------------------------------------------
+// File-based store I/O  (thin wrappers, mirror update_peer_identity)
+// ---------------------------------------------------------------------------
+
+/// Load the capability store from `caps.json` in the filament config dir.
+pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
+    let p = config_dir.join("caps.json");
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+}
+
+/// Persist the capability store to `caps.json`.
+pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
+    let p = config_dir.join("caps.json");
+    if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
+    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)
+}
+
+/// Bridging authorization: loads the cap store, finds the header for `resource`,
+/// and calls evaluate(). Falls back to `Denied("no capability store")` if no
+/// header exists for the resource.
+pub fn cap_authorize(
+    config_dir: &std::path::Path,
+    resource: &str,
+    action: &str,
+    principal_device_pub: Option<&[u8; 32]>,
+    principal_user_pub: Option<&[u8; 32]>,
+) -> Decision {
+    let store = load_cap_store(config_dir);
+    let header = store
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some(resource)
+        })
+        .and_then(CapHeader::from_json);
+
+    let Some(hdr) = header else {
+        return Decision::Denied("no capability store for resource".into());
+    };
+
+    let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
+    let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
+
+    evaluate(&store, &hdr, &device_pub, &user_pub, resource, action, now_secs())
+}
+
+// ---------------------------------------------------------------------------
 // Store fns
 // ---------------------------------------------------------------------------
 

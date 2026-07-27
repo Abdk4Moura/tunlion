@@ -57,6 +57,10 @@ impl UserKey {
         self.public_key_hex().chars().take(8).collect()
     }
 
+    pub fn keypair(&self) -> &Ed25519KeyPair {
+        &self.keypair
+    }
+
     pub fn sign_cert(&self, cert: &DeviceCert) -> Result<[u8; 64]> {
         let canonical = cert.canonical_for_signing();
         let sig = self.keypair.sign(&canonical);

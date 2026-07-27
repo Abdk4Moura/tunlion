@@ -3235,6 +3235,10 @@ struct Link {
     /// `warm_hold_tick` skips re-establish for a live link within this window,
     /// preventing churn while pair-proof verification completes.
     established_at: Option<Instant>,
+    /// Identity cert device_pub (set when identity-expose is verified).
+    identity_device_pub: Option<[u8; 32]>,
+    /// Identity cert user_pub (set when identity-expose is verified).
+    identity_user_pub: Option<[u8; 32]>,
 }
 
 impl Link {
@@ -4350,6 +4354,8 @@ impl Conn {
                 direct: false,
                 direct_route: "direct-quic", // unused for WebRTC links (peer.is_some())
                 established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
             },
         );
         Ok(())
@@ -4775,6 +4781,8 @@ impl Conn {
                 direct: true,
                 direct_route: route,
                 established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
             },
         );
         }
@@ -5659,6 +5667,8 @@ impl Conn {
                 direct: true,
                 direct_route: route,
                 established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
             },
         );
     }
@@ -7071,6 +7081,76 @@ async fn main() -> Result<()> {
         }
         Cmd::Grant { device, capability } => {
             device_set_cap(&device, &capability, true)?;
+            // If identity layer is active, also issue an owner-signed CapOp
+            if let Ok(Some(user_key)) = crate::identity::UserKey::load() {
+                let config_dir = crate::settings::config_dir();
+                let mut store = crate::capability::load_cap_store(&config_dir);
+                let pk = user_key.public_key_bytes();
+
+                // Ensure a genesis header exists for resource "self"
+                let has_header = store.iter().any(|e| {
+                    e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                        && e["resource"].as_str() == Some("self")
+                });
+                if !has_header {
+                    use ring::rand::SystemRandom;
+                    let rng = SystemRandom::new();
+                    let mut nonce = [0u8; 32];
+                    let _ = ring::rand::SecureRandom::fill(&rng, &mut nonce);
+                    let pk = user_key.public_key_bytes();
+                    let resource = crate::capability::make_resource_id(&pk, &nonce);
+                    // We want resource="self" for introspection; re-derive if needed
+                    let mut hdr = crate::capability::CapHeader {
+                        resource: "self".to_string(),
+                        epoch: 0,
+                        owner_pub: pk,
+                        nonce,
+                        floors: vec![],
+                        issued_at: crate::capability::now_secs(),
+                        prev_owner_pub: None,
+                        prev_header_hash: None,
+                        sig: [0u8; 64],
+                    };
+                    // Override the resource with self-certifying id... but we want "self"
+                    // For the genesis, set resource = make_resource_id for verification
+                    hdr.resource = resource;
+                    hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
+                    // Make it identifiable as "self" by storing with a resource alias
+                    let mut hdr_json = hdr.to_json();
+                    hdr_json["resource"] = serde_json::json!("self");
+                    store.push(hdr_json);
+                }
+
+                // Create CapOp: target=User(hashed device name)
+                use sha2_pake::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(device.as_bytes());
+                let target = h.finalize();
+                let mut target_arr = [0u8; 32];
+                target_arr.copy_from_slice(&target);
+
+                let v = crate::capability::hlc_next(0, crate::capability::now_ms());
+                let mut op = crate::capability::CapOp {
+                    op: crate::capability::CapOpKind::Grant,
+                    grantor: pk,
+                    target_kind: 0x00, // User
+                    target: target_arr,
+                    resource: "self".to_string(),
+                    permissions: vec![capability.clone()],
+                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                    issued_at: crate::capability::now_secs(),
+                    version: v,
+                    sig: [0u8; 64],
+                };
+                op.sig = crate::capability::sign_cap_op(&op, &user_key.keypair());
+                let mut hdr_json = serde_json::json!({
+                    "type": "cap_grant",
+                });
+                let mut op_json = op.to_json();
+                op_json["type"] = serde_json::json!("cap_grant");
+                store.push(op_json);
+                let _ = crate::capability::save_cap_store(&config_dir, &store);
+            }
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
@@ -10891,6 +10971,23 @@ async fn recv_cmd(
                             .unwrap_or(false);
                         l2_open_allowed(blanket, peer_has_shell)
                     };
+                    // Capability-layer authorization: an owner-signed grant
+                    // overrides the default caps-array check. Only evaluated if
+                    // the blanket/grant check above denied the request.
+                    let authorized = authorized || {
+                        let link = conn.link(&pid);
+                        let cap_auth = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "shell",
+                            link.and_then(|l| l.identity_device_pub.as_ref()),
+                            link.and_then(|l| l.identity_user_pub.as_ref()),
+                        );
+                        match cap_auth {
+                            crate::capability::Decision::Authorized => true,
+                            crate::capability::Decision::Denied(_) => false,
+                        }
+                    };
                     if !authorized {
                         let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                         ui::say(&format!("l2: refused stream {sid:#x}: device not granted shell"));
@@ -10980,6 +11077,18 @@ async fn recv_cmd(
                             .as_deref()
                             .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
                             .unwrap_or(false);
+                    // Capability-layer authorization override
+                    let granted = granted || {
+                        let link = conn.link(&pid);
+                        let cap_auth = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "shell",
+                            link.and_then(|l| l.identity_device_pub.as_ref()),
+                            link.and_then(|l| l.identity_user_pub.as_ref()),
+                        );
+                        matches!(cap_auth, crate::capability::Decision::Authorized)
+                    };
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)"));
@@ -11060,6 +11169,18 @@ async fn recv_cmd(
                             .as_deref()
                             .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
                             .unwrap_or(false);
+                    // Capability-layer authorization override
+                    let granted = granted || {
+                        let link = conn.link(&pid);
+                        let cap_auth = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "shell",
+                            link.and_then(|l| l.identity_device_pub.as_ref()),
+                            link.and_then(|l| l.identity_user_pub.as_ref()),
+                        );
+                        matches!(cap_auth, crate::capability::Decision::Authorized)
+                    };
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: pty refused: {who} (no shell cap / untrusted)"));
@@ -11509,6 +11630,11 @@ async fn recv_cmd(
                                                                         } else {
                                                                             // Store as provisional, then promote at overlay after check
                                                                             let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
+                                                                            // Store identity on the link for capability authorization
+                                                                            if let Some(l) = conn.link_mut(&pid) {
+                                                                                l.identity_device_pub = Some(cert.device_pub);
+                                                                                l.identity_user_pub = Some(cert.user_pub);
+                                                                            }
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
