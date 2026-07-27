@@ -7248,13 +7248,20 @@ async fn main() -> Result<()> {
                     store.push(hdr_json);
                 }
 
-                // Create CapOp: target=User(hashed device name)
-                use sha2_pake::{Digest, Sha256};
-                let mut h = Sha256::new();
-                h.update(device.as_bytes());
-                let target = h.finalize();
-                let mut target_arr = [0u8; 32];
-                target_arr.copy_from_slice(&target);
+                // Create CapOp: target the peer's real user_pub from their
+                // stored device cert (not SHA-256 of the device name, which
+                // never matches evaluate()'s principal_user_pub comparison).
+                // Requires the peer to have a certified identity (paired +
+                // identity-expose completed).
+                let Some(peer_cert) = device_cert_for(&device) else {
+                    return Err(anyhow!(
+                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known user key to target"
+                    ));
+                };
+                if peer_cert.verify(crate::identity::now_secs()).is_err() {
+                    return Err(anyhow!("peer identity cert for '{device}' is expired; re-pair to refresh it"));
+                }
+                let target_arr = peer_cert.user_pub;
 
                 let v = crate::capability::hlc_next(0, crate::capability::now_ms());
                 let mut op = crate::capability::CapOp {

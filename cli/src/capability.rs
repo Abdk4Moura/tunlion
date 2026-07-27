@@ -2361,6 +2361,50 @@ mod tests {
         }
     }
 
+    /// Grant must target the peer's real user_pub, not SHA-256 of the device
+    /// name. evaluate() matches User-target grants against principal_user_pub
+    /// (an Ed25519 key), so a name hash never matches.
+    #[test]
+    fn grant_target_user_pub_not_name_hash() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        // A different principal (the grantee) with a real user_pub
+        let principal = make_owner();
+        let principal_pub = owner_pub(&principal);
+
+        // The name-hash approach (old bug): SHA-256("root@do-vm") never matches
+        use sha2_pake::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"root@do-vm");
+        let name_hash = h.finalize();
+        let mut name_hash_arr = [0u8; 32];
+        name_hash_arr.copy_from_slice(&name_hash);
+        assert_ne!(&name_hash_arr[..], &principal_pub[..],
+            "SHA-256(device_name) must not equal the user_pub");
+
+        // The correct approach: target = principal_pub (the real user key)
+        let target = CapTarget::User(principal_pub);
+        let mut store = init_store(&header);
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["shell"], v1, 86400);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        // evaluate() with the principal's user_pub must authorize
+        match evaluate(&store, &header, &principal_pub, &principal_pub, &header.resource, "shell", now_secs()) {
+            Decision::Authorized => {}
+            Decision::Denied(reason) => panic!("grant targeting real user_pub must authorize, got: {reason}"),
+        }
+        // evaluate() with a WRONG user_pub must deny
+        let wrong_pub = [0xbb; 32];
+        assert_ne!(&wrong_pub[..], &principal_pub[..]);
+        match evaluate(&store, &header, &wrong_pub, &wrong_pub, &header.resource, "shell", now_secs()) {
+            Decision::Authorized => panic!("wrong user_pub must NOT authorize"),
+            Decision::Denied(_) => {}
+        }
+    }
+
     // -- B4 preview + self-lockout ------------------------------------------
 
     #[test]
