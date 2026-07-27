@@ -1500,6 +1500,38 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
     None
 }
 
+/// Populate link identity from the peer's stored device cert, if the
+/// link already has a proof-verified name but identity pubkeys are absent.
+/// Cached back onto the link on success (resolve-once, not per open).
+/// Fail-closed on cert-missing, expired, or overlay-key mismatch: the
+/// stored cert's device_pub must match the one previously set on this
+/// link (from the identity-expose handler during pairing), so a cert
+/// from a different device under the same petname cannot attach.
+fn resolve_peer_identity(link: &mut Link) {
+    if link.identity_device_pub.is_some() || link.identity_user_pub.is_some() {
+        return; // already resolved
+    }
+    let name = match &link.verified_name {
+        Some(n) => n.clone(),
+        None => return, // no proven name, nothing to resolve
+    };
+    let Some(cert) = device_cert_for(&name) else { return };
+    let now = crate::identity::now_secs();
+    if cert.verify(now).is_err() {
+        return;
+    }
+    // Overlay-key binding: if the link already carries an identity from a
+    // prior identity-expose, the stored cert must carry the same device_pub.
+    // This guards against a petname reused for a different device key.
+    if let Some(prev) = link.identity_device_pub {
+        if cert.device_pub != prev {
+            return;
+        }
+    }
+    link.identity_device_pub = Some(cert.device_pub);
+    link.identity_user_pub = Some(cert.user_pub);
+}
+
 /// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
 fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
     identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
@@ -4832,6 +4864,7 @@ impl Conn {
             if let Some((n, _)) = &expected_secret {
                 existing.verified_name = Some(n.clone());
             }
+            resolve_peer_identity(existing);
             if expected_secret.is_some() {
                 existing.expected_secret = expected_secret;
             }
@@ -7222,8 +7255,14 @@ async fn main() -> Result<()> {
                 // Grant must initialize the per-owner ratchet so evaluate()
                 // does not hit "ratchet uninitialized". apply_cap_op normally
                 // does this, but the grant command constructs CapOp JSON
-                // directly. Best-effort (narrow window, bounded by expiry).
-                let _ = crate::capability::update_ratchet(&mut store, &pk, op.issued_at);
+                // directly. On failure the grant did NOT take (evaluate()
+                // will deny forever), so fail the command instead of printing
+                // a misleading "granted" line.
+                // TODO: route grant through apply_cap_op so there is one
+                // validated op-creation path (sig-verify + floor + monotonic
+                // + ratchet), not two.
+                crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
+                    .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
                 let _ = crate::capability::save_cap_store(&config_dir, &store);
             }
             println!(
@@ -11064,10 +11103,18 @@ async fn recv_cmd(
                                 .unwrap_or(false);
                             l2_open_allowed(blanket, peer_has_shell)
                         };
-                        // Capability layer evaluated UNCONDITIONALLY (not short-
-                        // circuited on legacy) so shadow mode samples the legacy-
-                        // ALLOWED population, the only opens a flip can change.
-                        // Legacy stands in shadow; cap gates under the flag.
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11178,6 +11225,12 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11274,6 +11327,12 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let granted = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11419,6 +11478,12 @@ async fn recv_cmd(
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
                     let authorized = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11615,10 +11680,8 @@ async fn recv_cmd(
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
-                            // Record the proven devices.json petname, the cap
-                            // store key (the `shell` bootstrap gate looks up caps
-                            // under exactly this, not the presence display name).
                             l.verified_name = Some(n.clone());
+                            resolve_peer_identity(l);
                         }
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
                         true
@@ -11874,6 +11937,12 @@ async fn recv_cmd(
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
                     let (ok, xfer_deny_reason) = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
