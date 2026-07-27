@@ -2307,6 +2307,16 @@ async fn up_cmd(
         let server = server.to_string();
         tokio::spawn(async move { direct::warm_public_ip(&server).await; });
     }
+    // Startup shell-key reconciliation: remove authorized_keys for devices
+    // no longer authorized by the cap store (repairs offline-revoke drift).
+    {
+        let config_dir = crate::settings::config_dir();
+        for device in crate::capability::devices_with_shell_revoked(&config_dir) {
+            if let Err(e) = sshkeys::remove_authorized_key(&device) {
+                eprintln!("shell-key reconcile (startup): failed to remove key for '{}': {e}", device);
+            }
+        }
+    }
     let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user, no_proxy_fallback).await;
     let _ = std::fs::remove_file(pidfile());
     res
