@@ -641,9 +641,8 @@ pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io:
 }
 
 /// Bridging authorization: loads the cap store, finds the header for `resource`,
-/// and calls evaluate(). If no header exists, returns Authorized (zero-config
-/// pass-through: the existing trusted + device_allows gates still apply, and
-/// the owner is never locked out on a fresh no-header device).
+/// and calls evaluate(). If no header exists, returns Denied (the existing
+/// trusted + device_allows gates in main.rs still apply as fallback).
 pub fn cap_authorize(
     config_dir: &std::path::Path,
     resource: &str,
@@ -661,9 +660,7 @@ pub fn cap_authorize(
         .and_then(CapHeader::from_json);
 
     let Some(hdr) = header else {
-        // No header: zero-config pass-through. The existing trusted +
-        // device_allows gates still apply; the owner is never locked out.
-        return Decision::Authorized;
+        return Decision::Denied("no capability store for resource".into());
     };
 
     let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
@@ -1912,18 +1909,19 @@ mod tests {
         assert!(res.is_err(), "far-future issued_at must be rejected");
     }
 
-    /// Zero-config: cap_authorize returns Authorized when no header exists,
-    /// so the owner is never locked out on a fresh device.
+    /// Zero-config: cap_authorize returns Denied when no header exists.
+    /// The gate in main.rs ORs this with the legacy trusted/device_allows
+    /// check, so a fresh device owner is never locked out — the legacy
+    /// path still gates.
     #[test]
-    fn cap_authorize_no_header_returns_authorized() {
+    fn cap_authorize_no_header_returns_denied_legacy_fallback() {
         use std::path::Path;
-        // An empty temp dir = no caps.json, no header
         let tmp = std::env::temp_dir().join(format!("fil-cap-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
         let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]));
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("zero-config must not lock out: {}", reason),
+            Decision::Denied(_) => {},
+            Decision::Authorized => panic!("no-header cap_authorize must return Denied (gates fall back to legacy path)"),
         }
         std::fs::remove_dir_all(&tmp).ok();
     }
