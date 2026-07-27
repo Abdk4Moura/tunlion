@@ -657,20 +657,37 @@ pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io:
     std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)
 }
 
-/// Returns true when capability enforcement is in SHADOW mode (log-only).
-/// Set `FILAMENT_CAP_SHADOW=1` to evaluate without gating — the legacy
-/// trusted/device_allows path still authorizes. Flip to authoritative when
-/// the shadow log shows no unexpected denials.
-pub fn cap_shadow_enabled() -> bool {
-    std::env::var("FILAMENT_CAP_SHADOW").map(|x| x == "1").unwrap_or(false)
+/// Returns true when capability enforcement is AUTHORITATIVE (live-gating).
+/// Flip only when the shadow log shows a NONZERO evaluated count and ZERO
+/// unexpected denies on real traffic. Cite the shadow-log evidence in the
+/// commit that sets this to true. Until then, the legacy path decides.
+pub fn cap_authoritative() -> bool {
+    std::env::var("FILAMENT_CAP_AUTHORITATIVE").map(|x| x == "1").unwrap_or(false)
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static SHADOW_EVALUATED: AtomicU64 = AtomicU64::new(0);
+static SHADOW_DENIED: AtomicU64 = AtomicU64::new(0);
+static SHADOW_AUTHORIZED: AtomicU64 = AtomicU64::new(0);
+
+/// Return (evaluated, denied, authorized) counts since start.
+pub fn cap_shadow_counts() -> (u64, u64, u64) {
+    (
+        SHADOW_EVALUATED.load(Ordering::Relaxed),
+        SHADOW_DENIED.load(Ordering::Relaxed),
+        SHADOW_AUTHORIZED.load(Ordering::Relaxed),
+    )
 }
 
 /// Bridging authorization: loads the cap store, finds the header for `resource`,
-/// and calls evaluate(). If no header exists, returns Denied (the existing
-/// trusted + device_allows gates in main.rs still apply as fallback).
+/// and calls evaluate().
 ///
-/// In shadow mode (FILAMENT_CAP_SHADOW=1), evaluates but always returns Denied
-/// so the legacy path decides; logs any denial that would happen under authority.
+/// Two modes, controlled by FILAMENT_CAP_AUTHORITATIVE:
+///   - SHADOW (default, FILAMENT_CAP_AUTHORITATIVE=0): evaluates and records
+///     counts but returns Denied (abstain). Legacy path decides. Logs would-deny
+///     lines to stderr with the running counted totals.
+///   - AUTHORITATIVE (FILAMENT_CAP_AUTHORITATIVE=1): the evaluate() result
+///     gates live traffic. Must be flipped only after the shadow log is clean.
 pub fn cap_authorize(
     config_dir: &std::path::Path,
     resource: &str,
@@ -696,15 +713,21 @@ pub fn cap_authorize(
 
     let result = evaluate(&store, &hdr, &device_pub, &user_pub, resource, action, now_secs());
 
-    if cap_shadow_enabled() {
-        if matches!(result, Decision::Denied(_)) {
-            eprintln!(
-                "CAP-SHADOW: cap_authorize would DENY '{}' for principal dev={} user={} on resource='{}' — legacy path still authorizes",
-                action,
-                hex::encode(device_pub),
-                hex::encode(user_pub),
-                resource,
-            );
+    if !cap_authoritative() {
+        SHADOW_EVALUATED.fetch_add(1, Ordering::Relaxed);
+        match &result {
+            Decision::Denied(_) => {
+                SHADOW_DENIED.fetch_add(1, Ordering::Relaxed);
+                let (ev, dn, au) = cap_shadow_counts();
+                eprintln!(
+                    "CAP-SHADOW [{ev} evaluated/{dn} denied/{au} authorized]: would DENY '{action}' for dev={} user={} on resource='{resource}' — legacy still authorizes",
+                    hex::encode(device_pub),
+                    hex::encode(user_pub),
+                );
+            }
+            Decision::Authorized => {
+                SHADOW_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         return Decision::Denied("shadow mode — abstain".into());
     }
