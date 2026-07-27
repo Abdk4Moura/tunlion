@@ -282,24 +282,24 @@ pub fn evaluate(
         let target_kind = entry["targetKind"].as_u64().unwrap_or(0) as u8;
         let target_matches = match target_kind {
             0x00 => {
-                // User target: match principal_user_pub
                 let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
                 t.len() == 32 && t.as_slice() == principal_user_pub
             }
-            _ => {
-                // Device target: match principal_device_pub
+            0x01 => {
                 let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
                 t.len() == 32 && t.as_slice() == principal_device_pub
             }
+            _ => continue, // unknown target kind: skip (owner-signed, but reject)
         };
         if !target_matches {
             continue;
         }
 
-        // Check expiry (fail-closed: eval_time >= expires means expired)
+        // Check expiry: on expired grant, continue scanning (it must not
+        // shadow a second matching grant that is still valid)
         let expires = entry["expires"].as_u64().unwrap_or(0);
         if eval_time >= expires {
-            return Decision::Denied("grant expired".into());
+            continue;
         }
 
         // Check action is in permissions
@@ -1611,15 +1611,58 @@ mod tests {
         let mut expired_entry = grant.to_json();
         expired_entry["type"] = Value::from("cap_grant");
         expired_store.push(expired_entry);
-        // Also need ratchet from the header
-        let hdr_issued = header.issued_at;
-        let expired_ratchet = hdr_issued; // ratchet was set by apply_header
 
         // evaluate should see the grant but consider it expired
         let d2 = evaluate(&expired_store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
         match d2 {
-            Decision::Denied(reason) => assert!(reason.contains("expired"), "must be expired: {}", reason),
+            Decision::Denied(reason) => assert!(reason.contains("not authorized"), "expired-only store must be denied: {}", reason),
             Decision::Authorized => panic!("expired grant must be denied"),
+        }
+    }
+
+    #[test]
+    fn evaluate_expired_grant_does_not_shadow_valid_grant() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let device_target = CapTarget::Device([0xcc; 32]);
+        let user_pub = [0xaa; 32];
+        let user_target = CapTarget::User(user_pub);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        // Expired Device grant (will be skipped)
+        let expired_issued = now_secs().saturating_sub(86401);
+        let mut expired_grant = CapOp {
+            op: CapOpKind::Grant,
+            grantor: owner_pub(&owner),
+            target_kind: device_target.kind_byte(),
+            target: device_target.target_bytes(),
+            resource: header.resource.clone(),
+            permissions: vec!["ssh".to_string()],
+            expires: expired_issued.saturating_add(86400),
+            issued_at: expired_issued,
+            version: hlc_next(0, now_ms()),
+            sig: [0u8; 64],
+        };
+        expired_grant.sig = sign_cap_op(&expired_grant, &owner);
+
+        // Valid User grant
+        let v = hlc_next(0, now_ms());
+        let user_grant = make_grant(&owner, user_target, &header.resource, &["ssh"], v, 86400);
+
+        let mut store = init_store(&header);
+        // Push expired grant first
+        let mut expired_entry = expired_grant.to_json();
+        expired_entry["type"] = Value::from("cap_grant");
+        store.push(expired_entry);
+        // Then valid User grant via apply_cap_op
+        apply_cap_op(&mut store, &header, &user_grant, now_secs()).unwrap();
+
+        // A principal with device=0xcc and user=0xaa matches BOTH grants.
+        // The expired Device grant must NOT shadow the valid User grant.
+        let d = evaluate(&store, &header, &[0xcc; 32], &user_pub, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("valid User grant must authorize despite expired Device grant: {}", reason),
         }
     }
 
