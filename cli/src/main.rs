@@ -7295,6 +7295,13 @@ async fn main() -> Result<()> {
                 crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
                     .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
                 let _ = crate::capability::save_cap_store(&config_dir, &store);
+                // Shell-key reconciler: remove authorized_keys blocks for devices
+                // no longer authorized by the cap store (idempotent).
+                for device in crate::capability::devices_with_shell_revoked(&config_dir) {
+                    if let Err(e) = sshkeys::remove_authorized_key(&device) {
+                        eprintln!("shell-key reconcile: failed to remove key for '{}': {e}", device);
+                    }
+                }
             }
             println!(
                 "granted '{capability}' to '{device}'. {}",

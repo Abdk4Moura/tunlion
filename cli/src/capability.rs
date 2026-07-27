@@ -963,6 +963,65 @@ pub fn cap_gate_effective(
     }
 }
 
+/// Compute the set of devices whose managed authorized_keys blocks must be
+/// removed because the capability layer no longer authorizes `shell`.
+/// Returns petnames. Called by the shell-key reconciler on daemon start
+/// and on cap-store change. Idempotent — running it with no drift is a no-op.
+pub fn devices_with_shell_revoked(config_dir: &std::path::Path) -> Vec<String> {
+    let cap_store = load_cap_store(config_dir);
+    let devices_path = config_dir.join("devices.json");
+    let devices: Vec<Value> = std::fs::read_to_string(&devices_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    let header = cap_store
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some("self")
+        })
+        .and_then(CapHeader::from_json);
+
+    let Some(hdr) = header else {
+        return Vec::new(); // No header = no cap store to enforce, nothing to revoke
+    };
+
+    let now = now_secs();
+    let mut revoked = Vec::new();
+
+    for entry in &devices {
+        let name = entry["name"].as_str().unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        // Extract device_pub and user_pub from stored cert
+        let cert_json = match entry.get("deviceCert") {
+            Some(cj) => cj,
+            None => continue,
+        };
+        let Some(cert) = crate::identity::DeviceCert::from_json(cert_json) else {
+            continue;
+        };
+
+        let d = evaluate(
+            &cap_store,
+            &hdr,
+            &cert.device_pub,
+            &cert.user_pub,
+            &hdr.resource,
+            "shell",
+            now,
+        );
+        if matches!(d, Decision::Denied(_)) {
+            revoked.push(name.to_string());
+        }
+    }
+
+    revoked
+}
+
 /// A single authorization query for preview enumeration.
 pub struct AuthQuery {
     pub principal_device_pub: [u8; 32],
@@ -2500,5 +2559,88 @@ mod tests {
             &store, &header, &expand, &principals, &["admin"], now_secs(),
         );
         assert!(warnings.is_empty(), "must not warn when gaining access");
+    }
+
+    /// Shell-key reconciler test: after revoking shell, the device must appear
+    /// in the revoked list (the cap store no longer authorizes it). The actual
+    /// authorized_keys cleanup is done by the caller in main.rs.
+    #[test]
+    fn shell_revoke_returns_device_in_revoked_list() {
+        let owner = make_owner();
+        let nonce = self_resource_nonce();
+        let pk = owner_pub(&owner);
+        let resource = self_resource_id(&pk);
+        let target = CapTarget::Device([0xcc; 32]);
+
+        // Build self header (same pattern as filament grant)
+        let mut hdr = CapHeader {
+            resource: resource.clone(),
+            epoch: 0,
+            owner_pub: pk,
+            nonce,
+            floors: vec![],
+            issued_at: now_secs(),
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        hdr.sig = sign_cap_header(&hdr, &owner);
+
+        // Store header has resource="self" (override after signing, same as Cmd::Grant)
+        let store_hdr = CapHeader {
+            resource: "self".to_string(),
+            ..hdr.clone()
+        };
+
+        // Grant shell (resource="self" matches the stored header)
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, "self", &["shell"], v1, 86400);
+
+        let mut store = vec![];
+        let mut hdr_json = hdr.to_json();
+        hdr_json["resource"] = serde_json::json!("self");
+        store.push(hdr_json);
+        apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
+
+        // Write mock devices.json with cert for device "bob"
+        // Use a distinct (non-owner) user_pub so the owner-always rule doesn't trigger
+        let bob_user_pub = [0xaa; 32];
+        let cert_json = serde_json::json!({
+            "devicePub": hex::encode([0xcc; 32]),
+            "userPub": hex::encode(bob_user_pub),
+            "expires": now_secs() + 90 * 24 * 3600,
+            "issued": now_secs(),
+            "sig": hex::encode([0u8; 64]),
+        });
+        let devices = vec![serde_json::json!({
+            "name": "bob",
+            "secret": "aa".repeat(32),
+            "v": 2,
+            "caps": ["transfer"],
+            "deviceCert": cert_json,
+            "userKey": hex::encode(bob_user_pub),
+        })];
+
+        let tmp = std::env::temp_dir().join(format!("fil-recon-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        std::fs::write(&tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
+
+        // Before revoke: device should NOT be in revoked list (has shell)
+        let before = devices_with_shell_revoked(&tmp);
+        assert!(before.is_empty(), "before revoke, device must not be in revoked list");
+
+        // Apply revoke to cap store
+        let v2 = hlc_next(v1, now_ms());
+        let revoke = make_revoke(&owner, target, "self", v2, 86400);
+        apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+
+        // After revoke: device MUST be in revoked list
+        let after = devices_with_shell_revoked(&tmp);
+        assert_eq!(after, vec!["bob".to_string()],
+            "device must appear in revoked list after shell revoke (authorized_keys block still exists — reconciler needed)");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
