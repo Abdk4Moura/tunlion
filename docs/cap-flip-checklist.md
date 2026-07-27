@@ -46,9 +46,12 @@ the counters are process-global and a fresh CLI invocation reads zeros.
 
 ## Performance
 
-- [ ] `load_cap_store` cache with invalidation. `cap_authorize` reads and JSON-parses
-      the store on every open now (correct for sampling in shadow). Before authoritative
-      under load, cache it and invalidate on `apply_cap_op` / `apply_header`.
+- [x] `load_cap_store` cache with invalidation. DONE (#27): nanosecond-mtime cache,
+      explicitly invalidated inside `save_cap_store` (the single write funnel; all
+      persists go through `save_and_list_revoked` -> `save_cap_store`). Nanosecond (not
+      seconds) mtime so a sub-second direct rewrite can't serve stale data. Known
+      follow-up (non-blocking): `save_cap_store` still uses `std::fs::write` (non-atomic),
+      unlike the devices.json path made atomic in #23; deferred under the clean-slate call.
 
 ## Correctness corroboration (owed by capability.rs owner)
 
@@ -56,6 +59,40 @@ the counters are process-global and a fresh CLI invocation reads zeros.
       (the `resource` field is overridden to "self" after signing) and its self-cert
       / genesis check passes. `la_no_header == 0` on a provisioned node corroborates
       this empirically, but confirm it structurally too.
+
+## Authoritative-only restrictive gates (added, all purely restrictive)
+
+Under `FILAMENT_CAP_AUTHORITATIVE` the effective decision is composed from the cap
+outcome plus these gates, each of which can only downgrade Authorized -> Denied,
+never widen. All are no-ops in shadow. Each has a both-branches CI test.
+
+- [x] #21 binding-strength: a cap-authorized open with binding != `Proven` (identity
+      not device_priv-proven) is denied. `cap_authorize_proven`.
+- [x] #22 cert-expiry: re-checked per authorize (not only at resolve); expired or
+      unknown-expiry (None) fails closed. `cap_authorize_expired`.
+- [x] #26 trust floor: for gates whose legacy check is trust-based (transfer, mount),
+      an untrusted link (not pair-proven) is denied even if cap-authorized. Prevents the
+      flip from silently swapping the trust basis from pair-proof to device-key.
+      `cap_trust_floor`. Shell is exempt (its legacy check is capability-equivalent).
+
+### Caveat: shadow counters are BLIND to these gates
+
+The shadow counters (and therefore `flip_ready`) bucket the raw cap-STORE outcome.
+The restrictive gates above are no-ops in shadow, so `flip_ready == true` means
+"the cap store agrees with legacy", NOT "the full authoritative gate agrees with
+legacy." A peer that is la_authorized in shadow can still be denied at the flip by a
+restrictive gate (e.g. an Inferred-binding, shell-granted peer). Do NOT read
+`flip_ready` as "nothing breaks at the flip." If a breakage-accurate sample is ever
+needed, the counters must apply the restrictive gates as-if-authoritative for the
+COUNTING (separate from the returned decision).
+
+## Migration (#25): RESOLVED — no migration, clean slate
+
+Owner decision (2026-07-27): there is no install base to preserve, so the flip
+simply reconciles away any device that is legacy-shell-authorized but has no cap
+grant (hard cutover). No preview command, no auto-migrate. The blast-radius
+enumeration exists if ever needed (`devices_with_shell_revoked` / the `CAP-SHADOW
+RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
 
 ## Rollback
 
