@@ -1517,8 +1517,12 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
 /// Fail-closed to None on: no verified_name, no stored cert, cert expired
 /// or otherwise invalid.
 fn resolve_peer_identity(link: &mut Link) {
+    // Precedence rule: a Proven binding must NOT be downgraded to Inferred.
+    // The identity-expose handler (possession-sig) sets Proven, and this
+    // function (symmetric-secret proof + name->cert lookup) sets Inferred.
+    // An Inferred MAY later be upgraded to Proven by identity-expose.
     if link.identity_device_pub.is_some() || link.identity_user_pub.is_some() {
-        return; // already resolved
+        return; // already resolved (any binding, Proven or Inferred, stays)
     }
     let name = match &link.verified_name {
         Some(n) => n.clone(),
@@ -1531,6 +1535,7 @@ fn resolve_peer_identity(link: &mut Link) {
     }
     link.identity_device_pub = Some(cert.device_pub);
     link.identity_user_pub = Some(cert.user_pub);
+    link.identity_binding = BindingStrength::Inferred;
 }
 
 /// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
@@ -3349,6 +3354,21 @@ struct Link {
     identity_device_pub: Option<[u8; 32]>,
     /// Identity cert user_pub (set when identity-expose is verified).
     identity_user_pub: Option<[u8; 32]>,
+    /// Binding strength of the identity fields (set alongside them).
+    identity_binding: BindingStrength,
+}
+
+/// How the peer's identity was bound to this link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingStrength {
+    /// Default: identity not yet populated.
+    None,
+    /// Proven via device_priv possession signature (identity-expose handler).
+    Proven,
+    /// Inferred from symmetric pairing-secret proof + name-to-cert lookup
+    /// (resolve_peer_identity). A Proven binding must NOT be downgraded
+    /// to Inferred; an Inferred MAY be upgraded to Proven.
+    Inferred,
 }
 
 impl Link {
@@ -4466,6 +4486,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
+                identity_binding: BindingStrength::None,
             },
         );
         Ok(())
@@ -4894,6 +4915,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
+                identity_binding: BindingStrength::None,
             },
         );
         }
@@ -5780,6 +5802,7 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
+                identity_binding: BindingStrength::None,
             },
         );
     }
@@ -11828,6 +11851,7 @@ async fn recv_cmd(
                                                                             if let Some(l) = conn.link_mut(&pid) {
                                                                                 l.identity_device_pub = Some(cert.device_pub);
                                                                                 l.identity_user_pub = Some(cert.user_pub);
+                                                                                l.identity_binding = BindingStrength::Proven;
                                                                             }
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
