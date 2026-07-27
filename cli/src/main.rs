@@ -2395,18 +2395,20 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                 }
             }
             if let Some(counts) = v.get("counts") {
-                ui::say(&format!(
-                    "  la_authorized={}  la_denied={}  la_no_header={}",
-                    counts["la_authorized"].as_u64().unwrap_or(0),
-                    counts["la_denied"].as_u64().unwrap_or(0),
-                    counts["la_no_header"].as_u64().unwrap_or(0),
-                ));
-                ui::say(&format!(
-                    "  WIDENING(ld_authorized)={}  ld_denied={}  ld_no_header={}",
-                    counts["ld_authorized"].as_u64().unwrap_or(0),
-                    counts["ld_denied"].as_u64().unwrap_or(0),
-                    counts["ld_no_header"].as_u64().unwrap_or(0),
-                ));
+                if !counts.is_null() {
+                    ui::say(&format!(
+                        "  la_authorized={}  la_denied={}  la_no_header={}",
+                        counts["la_authorized"].as_u64().unwrap_or(0),
+                        counts["la_denied"].as_u64().unwrap_or(0),
+                        counts["la_no_header"].as_u64().unwrap_or(0),
+                    ));
+                    ui::say(&format!(
+                        "  WIDENING(ld_authorized)={}  ld_denied={}  ld_no_header={}",
+                        counts["ld_authorized"].as_u64().unwrap_or(0),
+                        counts["ld_denied"].as_u64().unwrap_or(0),
+                        counts["ld_no_header"].as_u64().unwrap_or(0),
+                    ));
+                }
             }
         }
         None => {

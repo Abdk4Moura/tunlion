@@ -64,11 +64,16 @@ pub fn ensure_managed_key() -> Result<String> {
         chmod(&pub_path, 0o644);
     }
     // Run unconditionally: repairs existing keys whose ACLs were never
-    // applied by the old code, and is a failsafe for a fresh create whose
-    // restrict failed on run-1 (the unprotected key is on disk; run-2
-    // must pick it up, not skip the block and return Ok silently).
-    crate::platform::SecretFile::restrict(&key)
-        .context("restrict managed key permissions")?;
+    // applied by the old code, and closes the run-2 hole. On failure the
+    // unprotected key MUST be deleted before returning: a co-tenant who
+    // copied it during the gap gets a credential that filament itself
+    // blesses shortly after on run-2 (where restrict succeeds). Deleting
+    // on failure invalidates anything captured and forces regeneration.
+    if let Err(e) = crate::platform::SecretFile::restrict(&key) {
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&pub_path);
+        return Err(e).context("restrict managed key permissions; removed unprotected key to force regeneration");
+    }
     let line = std::fs::read_to_string(&pub_path).context("read managed pubkey")?;
     Ok(line.trim().to_string())
 }
