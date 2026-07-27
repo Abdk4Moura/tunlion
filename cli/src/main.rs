@@ -11327,7 +11327,16 @@ async fn recv_cmd(
                         crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr)
                     };
                     if !authorized {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: not authorized" })).await;
+                        let who = conn
+                            .link(&pid)
+                            .and_then(|l| l.verified_name.clone())
+                            .unwrap_or_else(|| "<unverified>".into());
+                        // Operator-side diagnostic in BOTH modes, so a mount refusal
+                        // is never invisible on the default (shadow) path and never
+                        // reads as a transport failure. The peer-facing string stays a
+                        // coarse category and leaks no authz internals.
+                        ui::say(&format!("mount: refused for '{who}': not authorized (mount capability required)"));
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
                     let root_encoded = v["root"].as_str().unwrap_or(".");

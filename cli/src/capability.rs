@@ -689,10 +689,11 @@ pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io:
 
 /// Returns true when capability enforcement is AUTHORITATIVE (live-gating).
 /// Read this in ONE place only, `cap_gate_effective`, the single policy site. The
-/// FLIP CRITERION lives on `cap_shadow_counts`: flip only when `la_authorized > 0`
-/// AND `la_denied == 0` AND `la_no_header == 0`. A bare total is NOT sufficient.
-/// Cite the shadow-count evidence in the commit that sets this to true. Until then,
-/// legacy decides.
+/// FLIP CRITERION lives on `ShadowCounts::flip_ready`: flip only when
+/// `la_authorized > 0` AND `la_denied == 0` AND `la_no_header == 0`. A bare total is
+/// NOT sufficient. The commit that sets this to true MUST cite the full shadow
+/// counts, INCLUDING `ld_authorized` (the WIDENING count of opens the flip newly
+/// allows); if it is nonzero, enumerate which and why. Until then, legacy decides.
 pub fn cap_authoritative() -> bool {
     std::env::var("FILAMENT_CAP_AUTHORITATIVE").map(|x| x == "1").unwrap_or(false)
 }
@@ -708,7 +709,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static LA_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, cap authorizes (agree)
 static LA_DENIED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, header EXISTS and denies  <- real breakage-on-flip
 static LA_NO_HEADER: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, resource UNPROVISIONED (absent)
-static LD_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, cap would ALLOW (cap widens, info)
+static LD_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, cap AUTHORIZES = an open the flip NEWLY ALLOWS (WIDENING; a mandatory review item, never merely informational)
 static LD_DENIED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, header exists and denies (agree)
 static LD_NO_HEADER: AtomicU64 = AtomicU64::new(0); // legacy DENIED, resource unprovisioned
 
@@ -743,9 +744,22 @@ pub fn cap_shadow_counts() -> ShadowCounts {
 impl ShadowCounts {
     /// The FLIP CRITERION, in code (not just prose): flip to authoritative only when
     /// a real sample of legacy-ALLOWED opens has been seen (`la_authorized > 0`), NO
-    /// header disagreed (`la_denied == 0`), and every reachable resource was
-    /// provisioned (`la_no_header == 0`). Reads only the legacy-ALLOWED buckets by
-    /// design; the legacy-DENIED buckets are informational.
+    /// header disagreed (`la_denied == 0`), and every reachable resource EXERCISED in
+    /// the window was provisioned (`la_no_header == 0`).
+    ///
+    /// This boolean guards BREAKAGE (access the flip would remove). It deliberately
+    /// does NOT read `ld_authorized`, the WIDENING count (opens legacy refused that
+    /// cap authorizes, which the flip will newly ALLOW), because some widening is the
+    /// intended point of the migration and a hard zero would forbid it. Widening is
+    /// instead a MANDATORY REVIEW gate: the commit that sets the flag MUST cite
+    /// `ld_authorized` alongside the `la_*` numbers, and if it is nonzero, enumerate
+    /// which opens will be newly permitted and why. A number written down gets looked
+    /// at; a number labeled "informational" does not.
+    ///
+    /// Caveat: `la_no_header == 0` proves every resource EXERCISED during the window
+    /// was provisioned, not that every resource is. Today all gates pass "self" (one
+    /// resource) so the claim is tight; when resources multiply this silently becomes
+    /// a sampled claim, the biased-sample problem one level up. Revisit then.
     pub fn flip_ready(&self) -> bool {
         self.la_authorized > 0 && self.la_denied == 0 && self.la_no_header == 0
     }
@@ -753,7 +767,7 @@ impl ShadowCounts {
     /// One-line operator summary of both populations plus flip-readiness.
     pub fn summary(&self) -> String {
         format!(
-            "legacy-allowed ok={} deny={} no-header={} | legacy-denied ok={} deny={} no-header={} | flip_ready={}",
+            "legacy-allowed ok={} deny={} no-header={} | WIDENING(newly-allowed-on-flip)={} legacy-denied[deny={} no-header={}] | flip_ready={}",
             self.la_authorized,
             self.la_denied,
             self.la_no_header,
@@ -867,9 +881,10 @@ pub fn cap_gate_effective(
     let usr = user_pub.copied().unwrap_or([0u8; 32]);
 
     if !authoritative {
-        // Shadow: shout only about a REAL disagreement (a header that DENIES an open
-        // legacy allowed). Unprovisioned is logged once per resource, not per open,
-        // so a fresh node never floods.
+        // Shadow: surface the two directions that matter for a flip. BREAKAGE, a
+        // header that DENIES an open legacy allowed (CRITICAL). WIDENING, an open
+        // legacy refused that cap authorizes, which the flip will newly permit.
+        // Unprovisioned is logged once per resource so a fresh node never floods.
         match (legacy_allowed, outcome) {
             (true, CapOutcome::Denied(reason)) => {
                 eprintln!(
@@ -880,6 +895,13 @@ pub fn cap_gate_effective(
                 );
             }
             (true, CapOutcome::Unprovisioned) => log_no_header_once(resource),
+            (false, CapOutcome::Authorized) => {
+                eprintln!(
+                    "CAP-SHADOW WIDENING: '{action}' on '{resource}' for dev={} user={} was REFUSED by legacy but cap AUTHORIZES; a flip will NEWLY PERMIT this open. This is the direction to scrutinize; cite it in the flip decision.",
+                    hex::encode(dev),
+                    hex::encode(usr),
+                );
+            }
             _ => {}
         }
     } else if !effective {
