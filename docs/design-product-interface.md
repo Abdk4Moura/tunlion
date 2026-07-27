@@ -83,6 +83,21 @@ to the ask.
   | policy, max_concurrent, requires_display, ...}`. Registration says "I serve this
   action, here is my consent behavior"; it never grants authority.
 
+### Two consent modes, and the no-surface fallback
+
+`consent: prompt` presumes a registered product with a display (`requires_display`)
+that can answer the ask in real time; the tray/companion app is that surface. This
+is **live approval (push)**. A CLI cannot be a prompt surface, so when no display
+product is connected the daemon must not hang: the critical-lane timeout DENIES
+(fail-safe), and the request drops into a **pending-requests queue** the owner sees
+in-band (`filament requests`, plus a line in `filament devices`) alongside any
+configured notify hook. The other mode, **deliberate grant (pull)**, needs none of
+this: the owner issues `grant` ahead of time and the inbound `open` authorizes with
+no prompt at all. See `docs/design-identity-access-ux.md`, "the one recurring
+pattern", for the split. Rule of thumb: `consent: prompt` is only meaningful with a
+display product connected; without one, design the flow around deliberate,
+time-bounded grants.
+
 ## Socket authorization
 
 - **Now**: 0600, same-user, full authority. Products are local trusted code; the

@@ -215,6 +215,31 @@ consent, each showing *who/what* and requiring an explicit yes. One pattern reus
 is the product's trust model made tangible, and it is the thing to build first and
 reuse everywhere.
 
+### Two delivery modes for that gate (the CLI serves only one)
+
+The gate is one concept but reaches the human two ways, and a CLI is natively good
+at only the first:
+
+- **Deliberate grant (pull).** The owner decides and issues the grant themselves,
+  ahead of the access: `filament grant <peer> shell --for 1h`. No interruption, no
+  surface needed, because the owner is already the party acting. This is the
+  CLI-native mode and the correct default. Helping a friend lands entirely here: the
+  friend is already at his keyboard, so *he* runs the grant; it is directional and
+  expiring, so it cannot leak back to your machine and needs no `off` cleanup. It is
+  also safer than a prompt, no connection blocked on a human, no approve-reflex
+  trained by a modal, every grant logged and time-bounded.
+- **Live approval (push).** Someone asks while the owner is not looking and wants a
+  yes in the moment. This REQUIRES a persistent notification surface, which a CLI
+  structurally is not. Degrade honestly: the daemon holds a **pending-requests
+  queue** surfaced in-band on next CLI use (`filament requests`, plus a line in
+  `filament devices`), and optional owner-configured **notify hooks** (notify-send /
+  webhook / email). The instant tap-allow experience is the first-class job of the
+  daemon + tray/companion app (see `docs/design-product-interface.md`), not
+  something to fake in the terminal.
+
+Do not collapse the two: **grant** is deliberate and CLI-native; **approve** is live
+and is the concrete reason the companion surface exists.
+
 ## Postures, and the enterprise envelope
 
 All of the above is one substrate (pairwise channels, user-key over device-certs,
