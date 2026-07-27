@@ -6128,7 +6128,7 @@ async fn handle_warm_req(
         ctl::ReqKind::Unmount { .. } => req.reject("unmount not handled here").await,
         ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
-        ctl::ReqKind::CapStatus => req.reply(&json!({ "ok": true, "counts": null, "flip_ready": false, "summary": "CapStatus handled inline" })).await,
+        ctl::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
     }
 }
 
