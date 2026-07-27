@@ -907,12 +907,15 @@ pub fn cap_gate_effective(
             ),
             // Dedupe WIDENING by the (action, resource, device) triple: the reviewer
             // needs the distinct SET to enumerate, not one line per retry, and the
-            // count is preserved losslessly in ld_authorized.
+            // count is preserved losslessly in ld_authorized. Print the user too: a
+            // widening can come from a user_pub-targeted grant, so the user is part
+            // of the "why" a reviewer enumerates.
             (false, CapOutcome::Authorized) => log_once(
                 format!("wd|{action}|{resource}|{}", hex::encode(dev)),
                 &format!(
-                    "CAP-SHADOW WIDENING: '{action}' on '{resource}' for dev={} was REFUSED by legacy but cap AUTHORIZES; a flip will NEWLY PERMIT this open. Enumerate this (action, resource, device) in the flip decision.",
+                    "CAP-SHADOW WIDENING: '{action}' on '{resource}' for dev={} user={} was REFUSED by legacy but cap AUTHORIZES; a flip will NEWLY PERMIT this open. Enumerate it in the flip decision.",
                     hex::encode(dev),
+                    hex::encode(usr),
                 ),
             ),
             _ => {}
