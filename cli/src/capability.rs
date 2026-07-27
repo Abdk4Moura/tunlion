@@ -1132,12 +1132,12 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
 /// layer returns `Some(reason)` and the caller must hard-decline immediately
 /// (no accept prompt, send decline wire with `reason`). In shadow, returns
 /// `None` and the legacy accept/consent path still decides (report-only).
-pub fn transfer_gate_decision(gate: &GateDecision) -> Option<String> {
+pub fn transfer_gate_decision(gate: &GateDecision, authoritative: bool) -> Option<String> {
     match gate {
         GateDecision::Allow => None,
-        GateDecision::Deny {
-            cap_reason: Some(reason),
-        } if cap_authoritative() => Some(reason.clone()),
+        GateDecision::Deny { cap_reason } if authoritative => {
+            Some(cap_reason.clone().unwrap_or_else(|| "capability denied".into()))
+        }
         _ => None, // shadow, or legacy-only deny without cap reason
     }
 }
@@ -3032,12 +3032,23 @@ mod tests {
         let deny = GateDecision::Deny {
             cap_reason: Some("not authorized".into()),
         };
-        // Under shadow (default, FILAMENT_CAP_AUTHORITATIVE not set), no hard-decline
-        let r_shadow = transfer_gate_decision(&deny);
-        assert!(r_shadow.is_none(), "shadow: must fall through to legacy consent");
+        // Under authoritative: hard-decline with the real reason
+        let r_auth = transfer_gate_decision(&deny, true);
+        assert_eq!(r_auth, Some("not authorized".into()),
+            "authoritative: must return Some(reason) to hard-decline");
+
+        // Under shadow: fall through to legacy consent (None)
+        let r_shadow = transfer_gate_decision(&deny, false);
+        assert!(r_shadow.is_none(), "shadow: must fall through");
+
+        // Deny with no reason string (structurally fail-closed)
+        let deny_noreason = GateDecision::Deny { cap_reason: None };
+        let r_noreason = transfer_gate_decision(&deny_noreason, true);
+        assert_eq!(r_noreason, Some("capability denied".into()),
+            "authoritative Deny without cap_reason must still hard-decline (fail-closed)");
 
         // Allow always returns None
-        let r_allow = transfer_gate_decision(&GateDecision::Allow);
-        assert!(r_allow.is_none(), "Allow never hard-declines");
+        assert!(transfer_gate_decision(&GateDecision::Allow, true).is_none());
+        assert!(transfer_gate_decision(&GateDecision::Allow, false).is_none());
     }
 }

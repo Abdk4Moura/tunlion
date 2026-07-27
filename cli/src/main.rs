@@ -12063,7 +12063,10 @@ async fn recv_cmd(
                     };
                     // Under authoritative, a capability Deny hard-declines
                     // immediately: no prompt, skip the accept path entirely.
-                    if let Some(reason) = crate::capability::transfer_gate_decision(&xfer_gate) {
+                    if let Some(reason) = crate::capability::transfer_gate_decision(
+                        &xfer_gate,
+                        crate::capability::cap_authoritative(),
+                    ) {
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({reason})",
                         )));
