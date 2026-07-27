@@ -61,7 +61,8 @@ pub fn ensure_managed_key() -> Result<String> {
         if !st.success() {
             return Err(anyhow!("ssh-keygen failed to create the managed key"));
         }
-        crate::platform::SecretFile::restrict(&key);
+        crate::platform::SecretFile::restrict(&key)
+            .context("restrict managed key permissions")?;
         chmod(&pub_path, 0o644);
     }
     let line = std::fs::read_to_string(&pub_path).context("read managed pubkey")?;

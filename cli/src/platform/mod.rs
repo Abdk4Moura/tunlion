@@ -228,14 +228,23 @@ impl SecretFile {
 
 #[cfg(windows)]
 fn restrict_dacl(path: &Path) -> io::Result<()> {
-    let user = std::env::var("USERNAME").unwrap_or_default();
+    let user = std::env::var("USERNAME").map_err(|_| {
+        io::Error::new(io::ErrorKind::Other, "USERNAME env var not set; cannot ACL-restrict the key")
+    })?;
     if user.is_empty() {
-        return Ok(());
+        return Err(io::Error::new(io::ErrorKind::Other, "USERNAME is empty; cannot ACL-restrict the key"));
     }
     let path_str = path.display().to_string();
-    let _ = std::process::Command::new("icacls")
+    let st = std::process::Command::new("icacls")
         .args([&path_str, "/inheritance:r", "/grant:r", &format!("{user}:(F)"), "/Q"])
-        .output();
+        .status()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to run icacls: {e}")))?;
+    if !st.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("icacls failed with exit code {:?}", st.code()),
+        ));
+    }
     Ok(())
 }
 
