@@ -2315,19 +2315,20 @@ async fn up_cmd(
     {
         let config_dir = crate::settings::config_dir();
         let authoritative = crate::capability::cap_authoritative();
+        let revoked = crate::capability::devices_with_shell_revoked(&config_dir);
         let ak_path = sshkeys::authorized_keys_path();
         let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
-        for device in crate::capability::devices_with_shell_revoked(&config_dir) {
-            // Only act on devices that actually have a managed block.
-            if !sshkeys::has_block(&ak_content, &device) {
-                continue;
-            }
-            if authoritative {
-                if let Err(e) = sshkeys::remove_authorized_key(&device) {
-                    eprintln!("shell-key reconcile (startup): failed to remove key for '{device}': {e}");
-                }
-            } else {
+        // Emit per-device shadow logs for the WOULD-remove devices that
+        // actually have a block (avoid noise for devices without one).
+        for device in &revoked {
+            if sshkeys::has_block(&ak_content, device) && !authoritative {
                 eprintln!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+            }
+        }
+        let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
+        if new_ak != ak_content {
+            if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
+                eprintln!("shell-key reconcile (startup): failed to write authorized_keys: {e}");
             }
         }
     }
@@ -7347,18 +7348,16 @@ async fn main() -> Result<()> {
                     let authoritative = crate::capability::cap_authoritative();
                     let ak_path = sshkeys::authorized_keys_path();
                     let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+                    // Emit per-device shadow logs for actual-block devices.
                     for device in &revoked {
-                        // Only act on devices that actually have a managed block
-                        // (authorized_keys is human-editable — avoid noise rewrites).
-                        if !sshkeys::has_block(&ak_content, device) {
-                            continue;
-                        }
-                        if authoritative {
-                            if let Err(e) = sshkeys::remove_authorized_key(device) {
-                                eprintln!("shell-key reconcile: failed to remove key for '{device}': {e}");
-                            }
-                        } else {
+                        if sshkeys::has_block(&ak_content, device) && !authoritative {
                             eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                        }
+                    }
+                    let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
+                    if new_ak != ak_content {
+                        if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
+                            eprintln!("shell-key reconcile: failed to write authorized_keys: {e}");
                         }
                     }
                 }

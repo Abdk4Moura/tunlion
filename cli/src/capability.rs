@@ -1109,6 +1109,22 @@ pub fn devices_with_shell_revoked(config_dir: &std::path::Path) -> Vec<String> {
     revoked
 }
 
+/// Gated shell-key reconciliation: strips managed authorized_keys blocks for
+/// `revoked` devices from `ak_content`. Under authoritative, blocks are stripped;
+/// in shadow, content is returned UNCHANGED (report-only). Caller emits per-device
+/// WOULD-remove log lines in shadow from the `revoked` list, then writes the returned
+/// content only when it differs from the input.
+pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative: bool) -> String {
+    if !authoritative {
+        return ak_content.to_string();
+    }
+    let mut content = ak_content.to_string();
+    for device in revoked {
+        content = crate::sshkeys::strip_block(&content, device);
+    }
+    content
+}
+
 /// A single authorization query for preview enumeration.
 pub struct AuthQuery {
     pub principal_device_pub: [u8; 32],
@@ -2969,5 +2985,25 @@ mod tests {
             "e2e: after reconcile, NO filament-managed authorized_keys block must remain for bob");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Proves the EXACT safety property whose absence was the shadow #24 bug:
+    /// authoritative=true → block IS stripped; authoritative=false → block
+    /// is NOT stripped (shadow report-only). Both assertions on the SAME
+    /// input so a regression in the gate is caught by CI, not by inspection.
+    #[test]
+    fn reconcile_shell_keys_gated_on_authoritative() {
+        let mock_ak = "# BEGIN filament-managed bob\nssh-ed25519 AAAAfake filament-managed\n# END filament-managed bob\n";
+        let revoked = vec!["bob".to_string()];
+
+        // Under authoritative, the block IS removed.
+        let out_auth = reconcile_shell_keys(&revoked, mock_ak, true);
+        assert!(!crate::sshkeys::has_block(&out_auth, "bob"),
+            "authoritative: block must be removed");
+
+        // Under shadow, the block is NOT removed (report-only).
+        let out_shadow = reconcile_shell_keys(&revoked, mock_ak, false);
+        assert!(crate::sshkeys::has_block(&out_shadow, "bob"),
+            "shadow: block must NOT be removed — report-only");
     }
 }
