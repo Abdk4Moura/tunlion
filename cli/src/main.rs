@@ -2414,10 +2414,12 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                 ));
             } else {
                 let widening = v["counts"]["ld_authorized"].as_u64().unwrap_or(0);
+                let la_authorized = v["counts"]["la_authorized"].as_u64().unwrap_or(0);
                 if flip && widening == 0 {
                     ui::say(&format!(
-                        "  flip_ready: {} ready (la_authorized>0, la_denied==0, la_no_header==0)",
+                        "  flip_ready: {} no blockers detected (n={} legacy-allowed opens)",
                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        la_authorized,
                     ));
                 } else if flip {
                     ui::say(&format!(
@@ -3196,9 +3198,27 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                                                                                         }
                                                                                     } else {
                                                                                         peer_identity_cert = Some(cert);
-                                                                                    }
-                                                                                }
-                                                                            }
+                }
+            }
+            // Per-action breakdown: the coverage matrix for the flip decision.
+            if let Some(by_action) = v.get("by_action").and_then(|v| v.as_array()) {
+                if !by_action.is_empty() {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  coverage matrix (per-action):"));
+                    for a in by_action {
+                        let action = a["action"].as_str().unwrap_or("?");
+                        let la = a["la_authorized"].as_u64().unwrap_or(0);
+                        let ld = a["la_denied"].as_u64().unwrap_or(0);
+                        let ln = a["la_no_header"].as_u64().unwrap_or(0);
+                        let wa = a["ld_authorized"].as_u64().unwrap_or(0);
+                        let wd = a["ld_denied"].as_u64().unwrap_or(0);
+                        let wn = a["ld_no_header"].as_u64().unwrap_or(0);
+                        ui::say(&format!(
+                            "    {action}: la_ok={la} la_deny={ld} la_nh={ln} | widen={wa} ld_deny={wd} ld_nh={wn}"
+                        ));
+                    }
+                }
+            }
+        }
                                                                         }
                                                                     }
                                                                 }
@@ -9950,6 +9970,7 @@ async fn recv_cmd(
                             handle_mount_health(req, &daemon_mounts).await;
                         } else if matches!(&req.kind, ctl::ReqKind::CapStatus) {
                             let counts = crate::capability::cap_shadow_counts();
+                            let action_counts = crate::capability::cap_action_counts();
                             req.reply(&json!({
                                 "ok": true,
                                 "counts": {
@@ -9960,6 +9981,7 @@ async fn recv_cmd(
                                     "ld_denied": counts.ld_denied,
                                     "ld_no_header": counts.ld_no_header,
                                 },
+                                "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
                                 "summary": counts.summary(),
                             })).await;
