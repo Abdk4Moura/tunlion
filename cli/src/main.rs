@@ -966,6 +966,17 @@ enum Cmd {
         /// Local mount point to unmount
         path: String,
     },
+    /// Print the daemon's live capability shadow counters.
+    ///
+    /// The counters accumulate in the running daemon (`filament up`) across live
+    /// opens. A fresh `filament cap-status` process queries the daemon over the
+    /// control socket; only the daemon sees real traffic, so this is the only
+    /// path to useful numbers.
+    CapStatus {
+        /// Output raw JSON instead of the summary line
+        #[arg(long)]
+        json: bool,
+    },
     /// Sync files to/from a peer via rsync over the mesh.
     ///
     /// Requires rsync on both ends. Uses `filament ssh` as the remote shell,
@@ -2341,6 +2352,55 @@ fn status_cmd(json: bool) -> Result<()> {
             ui::say(&ui::paint(ui::Tone::Dim, "  recent receives:"));
             for l in recent.iter().rev() {
                 ui::say(&format!("    {l}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cap_status_cmd(json: bool) -> Result<()> {
+    let reply = crate::ctl::try_cap_status().await;
+    match reply {
+        Some(v) if json => {
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(v) => {
+            if let Some(summary) = v["summary"].as_str() {
+                ui::say(summary);
+            }
+            let flip = v["flip_ready"].as_bool().unwrap_or(false);
+            let marker = if flip {
+                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            } else {
+                ui::paint(ui::Tone::Warn, "x")
+            };
+            ui::say(&format!(
+                "  flip_ready: {} {}",
+                marker,
+                if flip { "ready (la_authorized>0, la_denied==0, la_no_header==0)" } else { "not ready" }
+            ));
+            if let Some(counts) = v.get("counts") {
+                ui::say(&format!(
+                    "  la_authorized={}  la_denied={}  la_no_header={}",
+                    counts["la_authorized"].as_u64().unwrap_or(0),
+                    counts["la_denied"].as_u64().unwrap_or(0),
+                    counts["la_no_header"].as_u64().unwrap_or(0),
+                ));
+                ui::say(&format!(
+                    "  ld_authorized={}  ld_denied={}  ld_no_header={}",
+                    counts["ld_authorized"].as_u64().unwrap_or(0),
+                    counts["ld_denied"].as_u64().unwrap_or(0),
+                    counts["ld_no_header"].as_u64().unwrap_or(0),
+                ));
+            }
+        }
+        None => {
+            ui::say(&format!("  {} daemon not running; counters are zero in a fresh process", ui::paint(ui::Tone::Dim, "·")));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "ok": false,
+                    "err": "daemon not reachable; start with filament up",
+                }))?);
             }
         }
     }
@@ -6068,6 +6128,7 @@ async fn handle_warm_req(
         ctl::ReqKind::Unmount { .. } => req.reject("unmount not handled here").await,
         ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
+        ctl::ReqKind::CapStatus => req.reply(&json!({ "ok": true, "counts": null, "flip_ready": false, "summary": "CapStatus handled inline" })).await,
     }
 }
 
@@ -7242,6 +7303,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
+        Cmd::CapStatus { json } => cap_status_cmd(json).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -9794,6 +9856,21 @@ async fn recv_cmd(
                             handle_list_mounts(req, &daemon_mounts).await;
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::CapStatus) {
+                            let counts = crate::capability::cap_shadow_counts();
+                            req.reply(&json!({
+                                "ok": true,
+                                "counts": {
+                                    "la_authorized": counts.la_authorized,
+                                    "la_denied": counts.la_denied,
+                                    "la_no_header": counts.la_no_header,
+                                    "ld_authorized": counts.ld_authorized,
+                                    "ld_denied": counts.ld_denied,
+                                    "ld_no_header": counts.ld_no_header,
+                                },
+                                "flip_ready": counts.flip_ready(),
+                                "summary": counts.summary(),
+                            })).await;
                         } else {
                             // Auto-warm: feed LRU for pty sessions (bounded, no leak).
                             if let ctl::ReqKind::Pty { peer, .. } = &req.kind {

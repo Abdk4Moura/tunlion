@@ -41,8 +41,8 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
     pub use imp::{
-        daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_list_mounts,
-        try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
+        daemon_present, send_reply, serve, serve_at, try_bootstrap, try_cap_status, try_dial,
+        try_list_mounts, try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
         try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
     };
 
@@ -366,6 +366,25 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask the daemon for its live capability shadow counters (synchronous).
+    /// Returns the daemon's reply (`{"ok":true,"counts":{...}}`) or `None` if
+    /// no daemon answered. A fresh process has zero counters; only the running
+    /// daemon (`filament up`) accumulates them across live opens.
+    pub async fn try_cap_status() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "cap-status" });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -420,6 +439,8 @@ mod imp {
         ListMounts,
         /// Check health of a specific mount by local path or mount ID.
         MountHealth { target: String },
+        /// Return the daemon's live capability shadow counters (synchronous).
+        CapStatus,
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -560,6 +581,7 @@ mod imp {
                         let Some(target) = v["target"].as_str().map(str::to_string) else { return };
                         ReqKind::MountHealth { target }
                     }
+                    Some("cap-status") => ReqKind::CapStatus,
                     _ => return,
                 };
                 let _ = tx.send(Req { kind, sock });
