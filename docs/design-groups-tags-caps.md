@@ -363,10 +363,28 @@ grants apply to CI runners.
 ## Open / to settle before build
 
 - **Pinned vs unpinned group versions in grants.** Default: unpinned (latest
-  group version at eval time). Pin as an opt-in per-grant. Design: `version`
-  in the group reference (a variant of `target_bytes` that includes a
-  `group_version`), or a separate `target_version` field in CapOp. The
-  separate field is cleaner but widens the wire format.
+  group version at eval time). Pin as an opt-in per-grant. Two options,
+  neither widens the CapOp wire, decide before build:
+  - **Option A** (preferred, zero wire change): encode the pinned version into
+    the target_bytes hash domain. `target_bytes = SHA-256(owner_pub || group_id
+    || "v1" || version.to_le_bytes())`. The 32-byte field stays the same; the
+    hash is just computed with a different domain separator. The unpinned
+    variant uses `SHA-256(owner_pub || group_id || "latest")`.
+  - **Option B** (cleaner but widens CapOp): add an optional
+    `target_version: Option<u64>` field to CapOp. When set, the group
+    resolution uses the pinned version. When None, the latest version applies.
+    Adds 9 bytes to the canonical signing blob. The design note defaults to
+    Option A unless implementation complexity forces Option B.
+- **Resolution-time vs insertion-time object verification (OPEN).**
+  `apply_cap_op` verifies CapOp signatures at insertion today. The design
+  asserts group/tag object signatures MUST be verified at resolution time (in
+  extended `evaluate()`), not only at insertion. The real question: can any
+  SYNC path insert an unverified `cap_group`, `cap_tag`, or
+  `cap_tag_binding`? If yes, resolution-time verification is mandatory
+  (security-critical). If no (all insertion paths go through verify-then-store),
+  resolution-time verification is defense-in-depth. This is for filament-0x1
+  (owns apply_cap_op) and claude-advisor to settle. Until resolved, the safe
+  posture is resolution-time verify.
 - **Group-as-contact-book auto-population.** Should the auto-contacts group be
   a special built-in group (`group_id = "__contacts__"`) or a regular group
   the user opts into syncing? Built-in is simpler; regular group gives the
