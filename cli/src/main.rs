@@ -2307,13 +2307,21 @@ async fn up_cmd(
         let server = server.to_string();
         tokio::spawn(async move { direct::warm_public_ip(&server).await; });
     }
-    // Startup shell-key reconciliation: remove authorized_keys for devices
-    // no longer authorized by the cap store (repairs offline-revoke drift).
+    // Startup shell-key reconciliation. GATED on authoritative: in shadow the cap
+    // layer gates NOTHING, so only REPORT what would be removed (it becomes part of
+    // the pre-flip sample). Never delete a working key while the cap store is not
+    // yet the authority, else the first `grant` on any node wipes every device that
+    // has no cap grant yet.
     {
         let config_dir = crate::settings::config_dir();
+        let authoritative = crate::capability::cap_authoritative();
         for device in crate::capability::devices_with_shell_revoked(&config_dir) {
-            if let Err(e) = sshkeys::remove_authorized_key(&device) {
-                eprintln!("shell-key reconcile (startup): failed to remove key for '{}': {e}", device);
+            if authoritative {
+                if let Err(e) = sshkeys::remove_authorized_key(&device) {
+                    eprintln!("shell-key reconcile (startup): failed to remove key for '{device}': {e}");
+                }
+            } else {
+                eprintln!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
             }
         }
     }
@@ -7325,11 +7333,20 @@ async fn main() -> Result<()> {
                 crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
                     .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
                 let _ = crate::capability::save_cap_store(&config_dir, &store);
-                // Shell-key reconciler: remove authorized_keys blocks for devices
-                // no longer authorized by the cap store (idempotent).
-                for device in crate::capability::devices_with_shell_revoked(&config_dir) {
-                    if let Err(e) = sshkeys::remove_authorized_key(&device) {
-                        eprintln!("shell-key reconcile: failed to remove key for '{}': {e}", device);
+                // Shell-key reconciler, GATED on authoritative: in shadow, only
+                // REPORT what would be removed (never wipe a working key while the
+                // cap store is not yet the authority, else granting one device
+                // revokes every device without a cap grant).
+                {
+                    let authoritative = crate::capability::cap_authoritative();
+                    for device in crate::capability::devices_with_shell_revoked(&config_dir) {
+                        if authoritative {
+                            if let Err(e) = sshkeys::remove_authorized_key(&device) {
+                                eprintln!("shell-key reconcile: failed to remove key for '{device}': {e}");
+                            }
+                        } else {
+                            eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                        }
                     }
                 }
             }
