@@ -271,6 +271,18 @@ pub enum Decision {
     Denied(String),
 }
 
+/// The outcome of a capability query at a gate. Unlike `Decision`, it separates an
+/// ABSENT header (the resource is UNPROVISIONED) from a header that EXISTS and
+/// refused (`Denied`, a real disagreement). Absent means "provision this node";
+/// denied means "the grants disagree". Conflating them floods the shadow log and
+/// makes the flip criterion unsatisfiable.
+#[derive(Debug)]
+pub enum CapOutcome {
+    Authorized,
+    Denied(String),
+    Unprovisioned,
+}
+
 /// Single pure authorization fn. Both enforcement and preview call this, so
 /// preview cannot diverge from enforcement.
 ///
@@ -676,72 +688,114 @@ pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io:
 }
 
 /// Returns true when capability enforcement is AUTHORITATIVE (live-gating).
-/// Flip only when the shadow log shows a NONZERO evaluated count and ZERO
-/// unexpected denies on real traffic. Cite the shadow-log evidence in the
-/// commit that sets this to true. Until then, the legacy path decides.
+/// Read this in ONE place only, `cap_gate_effective`, the single policy site. The
+/// FLIP CRITERION lives on `cap_shadow_counts`: flip only when `la_authorized > 0`
+/// AND `la_denied == 0` AND `la_no_header == 0`. A bare total is NOT sufficient.
+/// Cite the shadow-count evidence in the commit that sets this to true. Until then,
+/// legacy decides.
 pub fn cap_authoritative() -> bool {
     std::env::var("FILAMENT_CAP_AUTHORITATIVE").map(|x| x == "1").unwrap_or(false)
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
-// Shadow counters bucketed by the LEGACY decision on the same open. The only opens
-// a flip to authoritative can CHANGE are the legacy-ALLOWED ones: a cap-deny on a
-// legacy-denied open alters nothing (refused either way). A log dominated by the
-// legacy-denied population is biased toward agreement-on-denial and looks clean for
-// a reason unrelated to correctness, so the two populations are kept separate and a
-// legacy-denied-only sample can never be misread as coverage.
-static LA_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, cap agrees (authorizes)
-static LA_DENIED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, cap would DENY  <- breakage-on-flip
+// Shadow counters bucketed by the LEGACY decision AND by three cap outcomes:
+// authorized, denied (a header EXISTS and refused, a real disagreement), and
+// no-header (the resource is UNPROVISIONED, not a disagreement). The only opens a
+// flip can change are legacy-ALLOWED ones; a cap-deny on a legacy-denied open
+// alters nothing. Keeping ABSENT separate from DENIED is what stops a fresh,
+// unprovisioned node from flooding CRITICAL on every normal open and from making
+// the flip criterion unsatisfiable.
+static LA_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, cap authorizes (agree)
+static LA_DENIED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, header EXISTS and denies  <- real breakage-on-flip
+static LA_NO_HEADER: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, resource UNPROVISIONED (absent)
 static LD_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, cap would ALLOW (cap widens, info)
-static LD_DENIED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, cap agrees (denies)
+static LD_DENIED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, header exists and denies (agree)
+static LD_NO_HEADER: AtomicU64 = AtomicU64::new(0); // legacy DENIED, resource unprovisioned
 
-/// Shadow counts bucketed by legacy outcome:
-/// `((legacy_allowed_authorized, legacy_allowed_denied),
-///   (legacy_denied_authorized, legacy_denied_denied))`.
-/// The flip criterion reads the legacy-ALLOWED bucket ONLY: flip when
-/// `la_authorized` is nonzero and meaningful and `la_denied == 0`.
-pub fn cap_shadow_counts() -> ((u64, u64), (u64, u64)) {
-    (
-        (
-            LA_AUTHORIZED.load(Ordering::Relaxed),
-            LA_DENIED.load(Ordering::Relaxed),
-        ),
-        (
-            LD_AUTHORIZED.load(Ordering::Relaxed),
-            LD_DENIED.load(Ordering::Relaxed),
-        ),
-    )
+/// Shadow counts, bucketed by legacy outcome and cap outcome.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowCounts {
+    pub la_authorized: u64,
+    pub la_denied: u64,
+    pub la_no_header: u64,
+    pub ld_authorized: u64,
+    pub ld_denied: u64,
+    pub ld_no_header: u64,
+}
+
+/// Shadow counts since start. The FLIP CRITERION reads only the legacy-ALLOWED
+/// buckets: flip when `la_authorized > 0` (a real, meaningful sample) AND
+/// `la_denied == 0` (no header disagrees) AND `la_no_header == 0` (every reachable
+/// resource is provisioned). A missing header is `la_no_header`, never `la_denied`,
+/// so an unprovisioned node cannot be mistaken for a disagreement and cannot make
+/// the criterion unreachable.
+pub fn cap_shadow_counts() -> ShadowCounts {
+    ShadowCounts {
+        la_authorized: LA_AUTHORIZED.load(Ordering::Relaxed),
+        la_denied: LA_DENIED.load(Ordering::Relaxed),
+        la_no_header: LA_NO_HEADER.load(Ordering::Relaxed),
+        ld_authorized: LD_AUTHORIZED.load(Ordering::Relaxed),
+        ld_denied: LD_DENIED.load(Ordering::Relaxed),
+        ld_no_header: LD_NO_HEADER.load(Ordering::Relaxed),
+    }
+}
+
+impl ShadowCounts {
+    /// The FLIP CRITERION, in code (not just prose): flip to authoritative only when
+    /// a real sample of legacy-ALLOWED opens has been seen (`la_authorized > 0`), NO
+    /// header disagreed (`la_denied == 0`), and every reachable resource was
+    /// provisioned (`la_no_header == 0`). Reads only the legacy-ALLOWED buckets by
+    /// design; the legacy-DENIED buckets are informational.
+    pub fn flip_ready(&self) -> bool {
+        self.la_authorized > 0 && self.la_denied == 0 && self.la_no_header == 0
+    }
+
+    /// One-line operator summary of both populations plus flip-readiness.
+    pub fn summary(&self) -> String {
+        format!(
+            "legacy-allowed ok={} deny={} no-header={} | legacy-denied ok={} deny={} no-header={} | flip_ready={}",
+            self.la_authorized,
+            self.la_denied,
+            self.la_no_header,
+            self.ld_authorized,
+            self.ld_denied,
+            self.ld_no_header,
+            self.flip_ready(),
+        )
+    }
+}
+
+/// Log an unprovisioned resource ONCE (not per open), so a fresh node with no
+/// capability header does not flood stderr during entirely normal operation.
+fn log_no_header_once(resource: &str) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut g) = seen.lock() {
+        if g.insert(resource.to_string()) {
+            eprintln!(
+                "CAP-SHADOW [unprovisioned]: resource '{resource}' has no capability header; opens rely on legacy authz. Expected until you provision (filament grant/init); not a disagreement."
+            );
+        }
+    }
 }
 
 /// Bridging authorization: loads the cap store, finds the header for `resource`,
-/// and calls evaluate().
+/// and returns the REAL cap outcome. It never abstains and never reads the mode, so
+/// its return value is always the truth about the capability decision. The mode
+/// (shadow vs authoritative), the counters, and the logging all live in
+/// `cap_gate_effective`, the single policy site.
 ///
-/// `legacy_allowed` is the decision the pre-capability (legacy) gate reached for
-/// this same open. It does NOT change the returned Decision; it buckets the shadow
-/// counters, because the only opens a flip to authoritative can change are the
-/// legacy-ALLOWED ones.
-///
-/// Two modes, controlled by FILAMENT_CAP_AUTHORITATIVE:
-///   - SHADOW (default, =0): evaluates and records counts bucketed by
-///     `legacy_allowed`, then returns Denied (abstain) so the legacy path decides.
-///     A cap-deny on a legacy-ALLOWED open is logged CRITICAL: that is the exact
-///     open a flip would break.
-///   - AUTHORITATIVE (=1): the evaluate() result gates live traffic.
-///
-/// FLIP CRITERION (it lives here, next to the code it governs): flip only when a
-/// nonzero, meaningful number of legacy-ALLOWED opens have been evaluated
-/// (`la_authorized > 0`) and ZERO produced a cap-deny (`la_denied == 0`). A nonzero
-/// TOTAL count is NOT sufficient: a sample drawn only from legacy-DENIED opens is
-/// biased toward agreement-on-denial and proves nothing about the opens a flip
-/// changes. Read `cap_shadow_counts()`'s legacy-ALLOWED bucket, never the total.
+/// Returns `Unprovisioned` when no header exists for `resource` (distinct from
+/// `Denied`, where a header exists and refused), so callers can tell "provision
+/// this node" from "the grants disagree".
 pub fn cap_authorize(
     config_dir: &std::path::Path,
     resource: &str,
     action: &str,
     principal_device_pub: Option<&[u8; 32]>,
     principal_user_pub: Option<&[u8; 32]>,
-    legacy_allowed: bool,
-) -> Decision {
+) -> CapOutcome {
     let store = load_cap_store(config_dir);
     let header = store
         .iter()
@@ -754,60 +808,98 @@ pub fn cap_authorize(
     let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
     let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
 
-    // Compute the cap decision on ALL paths, no-header included, so shadow
-    // accounting sees a missing self-header (which denies under authoritative) as a
-    // would-deny bucketed against what legacy did, instead of silently skipping it.
-    let result = match header {
-        Some(hdr) => evaluate(
+    match header {
+        None => CapOutcome::Unprovisioned,
+        Some(hdr) => match evaluate(
             &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(),
-        ),
-        None => Decision::Denied("no capability header for resource".into()),
-    };
-
-    if !cap_authoritative() {
-        let denied = matches!(result, Decision::Denied(_));
-        match (legacy_allowed, denied) {
-            (true, true) => {
-                LA_DENIED.fetch_add(1, Ordering::Relaxed);
-                let la_ok = LA_AUTHORIZED.load(Ordering::Relaxed);
-                let la_dn = LA_DENIED.load(Ordering::Relaxed);
-                eprintln!(
-                    "CAP-SHADOW CRITICAL [legacy-allowed: {la_ok} agree / {la_dn} would-DENY]: cap would DENY '{action}' for dev={} user={} on resource='{resource}' that legacy ALLOWED; a flip would BREAK this open",
-                    hex::encode(device_pub),
-                    hex::encode(user_pub),
-                );
-            }
-            (true, false) => {
-                LA_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
-            }
-            (false, true) => {
-                LD_DENIED.fetch_add(1, Ordering::Relaxed);
-            }
-            (false, false) => {
-                LD_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "CAP-SHADOW [legacy-denied, cap would ALLOW]: '{action}' for dev={} user={} on resource='{resource}'; cap widens vs legacy (informational)",
-                    hex::encode(device_pub),
-                    hex::encode(user_pub),
-                );
-            }
-        }
-        return Decision::Denied("shadow mode: abstain".into());
+        ) {
+            Decision::Authorized => CapOutcome::Authorized,
+            Decision::Denied(reason) => CapOutcome::Denied(reason),
+        },
     }
-
-    result
 }
 
-/// The effective gate decision, given the legacy outcome and the cap `Decision`.
-/// In shadow mode (default) the legacy decision stands; under
-/// FILAMENT_CAP_AUTHORITATIVE the cap decision gates. Centralized so every gate
-/// site shares one policy and cannot drift.
-pub fn cap_gate_effective(legacy_allowed: bool, cap: &Decision) -> bool {
-    if cap_authoritative() {
-        matches!(cap, Decision::Authorized)
+/// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
+/// modes (so observability survives the flip), logs, and returns the effective gate
+/// decision: the legacy decision stands in shadow; the cap outcome gates under
+/// FILAMENT_CAP_AUTHORITATIVE. `legacy_allowed` is the pre-capability gate's
+/// decision for this same open; it buckets the counters and is the effective answer
+/// in shadow.
+pub fn cap_gate_effective(
+    legacy_allowed: bool,
+    outcome: &CapOutcome,
+    action: &str,
+    resource: &str,
+    device_pub: Option<&[u8; 32]>,
+    user_pub: Option<&[u8; 32]>,
+) -> bool {
+    let authoritative = cap_authoritative();
+
+    // Counters: recorded in BOTH modes so a flip does not blind us.
+    match (legacy_allowed, outcome) {
+        (true, CapOutcome::Authorized) => {
+            LA_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, CapOutcome::Denied(_)) => {
+            LA_DENIED.fetch_add(1, Ordering::Relaxed);
+        }
+        (true, CapOutcome::Unprovisioned) => {
+            LA_NO_HEADER.fetch_add(1, Ordering::Relaxed);
+        }
+        (false, CapOutcome::Authorized) => {
+            LD_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+        }
+        (false, CapOutcome::Denied(_)) => {
+            LD_DENIED.fetch_add(1, Ordering::Relaxed);
+        }
+        (false, CapOutcome::Unprovisioned) => {
+            LD_NO_HEADER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let effective = if authoritative {
+        matches!(outcome, CapOutcome::Authorized)
     } else {
         legacy_allowed
+    };
+
+    let dev = device_pub.copied().unwrap_or([0u8; 32]);
+    let usr = user_pub.copied().unwrap_or([0u8; 32]);
+
+    if !authoritative {
+        // Shadow: shout only about a REAL disagreement (a header that DENIES an open
+        // legacy allowed). Unprovisioned is logged once per resource, not per open,
+        // so a fresh node never floods.
+        match (legacy_allowed, outcome) {
+            (true, CapOutcome::Denied(reason)) => {
+                eprintln!(
+                    "CAP-SHADOW CRITICAL: a header EXISTS and DENIES '{action}' on '{resource}' for dev={} user={} that legacy ALLOWED (reason: {reason}); a flip would BREAK this open [{}]",
+                    hex::encode(dev),
+                    hex::encode(usr),
+                    cap_shadow_counts().summary(),
+                );
+            }
+            (true, CapOutcome::Unprovisioned) => log_no_header_once(resource),
+            _ => {}
+        }
+    } else if !effective {
+        // Authoritative: emit a legible reason operator-side so a cap refusal is
+        // never debugged as a transport failure.
+        let reason: &str = match outcome {
+            CapOutcome::Denied(r) => r,
+            CapOutcome::Unprovisioned => {
+                "resource unprovisioned (no capability header); run filament grant/init"
+            }
+            CapOutcome::Authorized => "",
+        };
+        eprintln!(
+            "CAP-DENY [authoritative]: '{action}' on '{resource}' for dev={} user={}: {reason}",
+            hex::encode(dev),
+            hex::encode(usr),
+        );
     }
+
+    effective
 }
 
 /// A single authorization query for preview enumeration.
@@ -2132,20 +2224,38 @@ mod tests {
         assert!(res.is_err(), "far-future issued_at must be rejected");
     }
 
-    /// Zero-config: cap_authorize returns Denied when no header exists (in shadow
-    /// mode it abstains regardless). The gate in main.rs feeds the legacy outcome
-    /// to cap_gate_effective, which keeps legacy authoritative in shadow, so a
-    /// fresh device owner is never locked out; the legacy path still gates.
+    /// Zero-config: a resource with no header is UNPROVISIONED, distinct from a
+    /// header that denies. cap_gate_effective keeps legacy authoritative in shadow,
+    /// so a fresh owner is never locked out, and buckets this as no-header (not a
+    /// disagreement) so it neither floods CRITICAL nor blocks the flip criterion.
     #[test]
-    fn cap_authorize_no_header_returns_denied_legacy_fallback() {
+    fn cap_authorize_no_header_is_unprovisioned() {
         let tmp = std::env::temp_dir().join(format!("fil-cap-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
-        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]), true);
+        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]));
         match d {
-            Decision::Denied(_) => {},
-            Decision::Authorized => panic!("no-header cap_authorize must return Denied (gates fall back to legacy path)"),
+            CapOutcome::Unprovisioned => {}
+            other => panic!("no-header must be Unprovisioned, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The flip criterion is code, not prose: a clean legacy-ALLOWED sample with
+    /// everything provisioned is ready; a bare zero total, a real disagreement, or
+    /// any unprovisioned resource each block the flip. Pure (no global atomics), so
+    /// it is not subject to the parallel-test interference the process-global
+    /// counters would have.
+    #[test]
+    fn shadow_flip_criterion() {
+        let ready = ShadowCounts { la_authorized: 5, la_denied: 0, la_no_header: 0, ld_authorized: 2, ld_denied: 3, ld_no_header: 0 };
+        assert!(ready.flip_ready(), "clean legacy-allowed sample, all provisioned, must be flip-ready");
+        let empty = ShadowCounts { la_authorized: 0, la_denied: 0, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0 };
+        assert!(!empty.flip_ready(), "no sample yet: a bare zero total must NOT pass");
+        let disagree = ShadowCounts { la_authorized: 10, la_denied: 1, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0 };
+        assert!(!disagree.flip_ready(), "a real header disagreement must block the flip");
+        let unprov = ShadowCounts { la_authorized: 10, la_denied: 0, la_no_header: 4, ld_authorized: 0, ld_denied: 0, ld_no_header: 0 };
+        assert!(!unprov.flip_ready(), "an unprovisioned resource must block the flip (absent != clean)");
+        assert!(disagree.summary().contains("flip_ready=false"));
     }
 
     // -- B4 preview + self-lockout ------------------------------------------
