@@ -77,19 +77,36 @@ log) is then confined to whoever reads it, not extended to every peer contacted.
 ## Block 2: caps are a ceiling, via a delegated principal class
 
 An auth-key-enrolled machine is `principal_kind = Delegated`, NOT a device of the
-owner. Two mechanisms would otherwise make `auth_key.caps` decorative: the
-same-user full-trust default (an owner device inherits everything), and
-`user_pub`-targeted grants (which apply to any device of that user). Both are
-closed by the principal class. In `evaluate()`:
+owner. Without a distinct class two mechanisms would make `auth_key.caps`
+decorative: the same-user full-trust default (an owner device inherits
+everything), and `user_pub`-targeted grants (which apply to any device of that
+user). The delegated class closes both, but the rule must be stated as WIDENING,
+not COUNTING, or it fails in one of two opposite directions (empty result, or
+escalation). In `evaluate()`:
 
-- `effective(delegated) = (what the user principal would be authorized for) INTERSECT auth_key.caps`.
-- The same-user full-trust default does NOT apply to delegated principals.
-- `user_pub`-targeted grants do NOT widen a delegated principal.
+- `effective(delegated) = effective(owner at this peer) INTERSECT auth_key.caps`,
+  where `effective(owner at this peer)` is the owner's full rights computed
+  NORMALLY, including the same-user default and any `user_pub`-targeted grants.
+  Those grants DO participate: they form the intersection base.
+- No grant path may raise a delegated principal ABOVE `auth_key.caps`. The
+  exclusion is about widening past the ceiling, never about dropping grants from
+  the base computation.
 
-Invariant: for a delegated principal, `auth_key.caps` is an upper bound that no
-grant path can widen. This is the entire value of the headline cases (constrained
-borrower, browser, CI), so it is safe by construction, not by every future grant
-author remembering.
+Two invariants to write next to the formula, each checkable:
+
+- **A delegated principal never exceeds `auth_key.caps`** (the ceiling).
+- **A delegated principal never exceeds what the OWNER holds at that peer.** You
+  cannot delegate access you do not have; without this, a narrow-looking auth key
+  becomes an escalation primitive the moment `caps` names something the owner was
+  never granted.
+
+Property test (catches both failure directions): for random stores, owners, and
+auth keys, assert `effective(delegated)` is a subset of `caps` AND a subset of
+`effective(owner)`. Dropping the intersection fails the first; excluding
+user-targeted grants from the base empties the result and defeats the feature.
+
+This is the entire value of the headline cases (constrained borrower, browser,
+CI), so it is safe by construction, not by every future grant author remembering.
 
 ## Single-use, honestly
 
@@ -155,7 +172,8 @@ mesh anyway and the ban would buy nothing.
 ## Security summary
 
 - No bearer secret (enroll keypair); leak confined, not fanned out to every peer.
-- Caps as a hard ceiling via the delegated principal class.
+- Caps as a hard ceiling, AND never above what the owner holds at that peer, via
+  the delegated principal class (`effective(delegated)` is a subset of both).
 - Mesh disallowed, verifier-enforced.
 - Owner validated against the verifier's own trust anchor.
 - Session-bound possession (no cross-session replay).
