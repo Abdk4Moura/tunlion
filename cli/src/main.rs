@@ -11619,6 +11619,13 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
+                        // Trust floor: under authoritative, an untrusted link
+                        // must never authorize mount (pair-proof vs device-key).
+                        let outcome = crate::capability::cap_trust_floor(
+                            &outcome,
+                            trusted,
+                            crate::capability::cap_authoritative(),
+                        );
                         crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires)
                     };
                     if !authorized.allowed() {
@@ -12081,6 +12088,13 @@ async fn recv_cmd(
                             "transfer",
                             idev,
                             iusr,
+                        );
+                        // Trust floor: under authoritative, an untrusted link
+                        // must never authorize transfer (pair-proof vs device-key).
+                        let outcome = crate::capability::cap_trust_floor(
+                            &outcome,
+                            link_trusted,
+                            crate::capability::cap_authoritative(),
                         );
                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {

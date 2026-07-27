@@ -986,6 +986,24 @@ pub fn cap_authorize_expired(
     }
 }
 
+/// Trust floor: under authoritative, an untrusted link must never authorize.
+/// Purely restrictive — downgrades Authorized→Denied only; Denied/Unprov
+/// pass through. Shadow always passes through. Only needed at gates whose
+/// legacy check is trust-based (transfer, mount).
+pub fn cap_trust_floor(
+    outcome: &CapOutcome,
+    trusted: bool,
+    authoritative: bool,
+) -> CapOutcome {
+    if !authoritative || trusted {
+        return outcome.clone();
+    }
+    match outcome {
+        CapOutcome::Authorized => CapOutcome::Denied("session not trusted".into()),
+        _ => outcome.clone(),
+    }
+}
+
 /// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
 /// modes (so observability survives the flip), logs, and returns the effective gate
 /// decision. `binding` and `cert_expires` are transport/policy facts composed under
@@ -3163,5 +3181,20 @@ mod tests {
         // Proven + expired → denied (expiry gate wins)
         let r3 = cap_authorize_proven(&auth, BindingStrength::Proven, true);
         assert!(matches!(cap_authorize_expired(&r3, Some(past), true), CapOutcome::Denied(_)));
+    }
+
+    #[test]
+    fn cap_trust_floor_purely_restrictive() {
+        let auth = CapOutcome::Authorized;
+        let deny = CapOutcome::Denied("no grant".into());
+
+        // Authoritative + untrusted + Authorized → Denied
+        assert!(matches!(cap_trust_floor(&auth, false, true), CapOutcome::Denied(_)));
+        // Authoritative + trusted + Authorized → passes through
+        assert_eq!(cap_trust_floor(&auth, true, true), CapOutcome::Authorized);
+        // Shadow + untrusted + Authorized → passes through
+        assert_eq!(cap_trust_floor(&auth, false, false), CapOutcome::Authorized);
+        // Denied + untrusted + authoritative → stays Denied
+        assert_eq!(cap_trust_floor(&deny, false, true), deny);
     }
 }
