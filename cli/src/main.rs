@@ -11047,6 +11047,7 @@ async fn recv_cmd(
                     // tears a stream down, so it is never gated here). In a blanket
                     // mode any trusted peer may open; in grant-only mode the opening
                     // peer must hold the shell grant itself.
+                    let mut l2_deny_reason: Option<String> = None;
                     let authorized = v["type"].as_str() != Some("l2-open") || {
                         let legacy_ok = {
                             let blanket = shell_policy.enables_l2()
@@ -11072,11 +11073,16 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr)
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr);
+                        if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
+                            l2_deny_reason = Some(r.clone());
+                        }
+                        d.allowed()
                     };
                     if !authorized {
                         let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                        ui::say(&format!("l2: refused stream {sid:#x}: device not granted shell"));
+                        let diag = l2_deny_reason.as_deref().unwrap_or("device not granted shell");
+                        ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
                             .await;
@@ -11179,9 +11185,9 @@ async fn recv_cmd(
                         );
                         crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr)
                     };
-                    if !granted {
+                    if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)"));
+                        ui::say(&format!("l2: shell bootstrap refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
                         let _ = t
                             .send_control(&json!({
                                 "type": "shell-bootstrap-deny",
@@ -11275,9 +11281,9 @@ async fn recv_cmd(
                         );
                         crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr)
                     };
-                    if !granted {
+                    if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!("l2: pty refused: {who} (no shell cap / untrusted)"));
+                        ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
                             .await;
@@ -11420,7 +11426,7 @@ async fn recv_cmd(
                         );
                         crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr)
                     };
-                    if !authorized {
+                    if !authorized.allowed() {
                         let who = conn
                             .link(&pid)
                             .and_then(|l| l.verified_name.clone())
@@ -11429,7 +11435,7 @@ async fn recv_cmd(
                         // is never invisible on the default (shadow) path and never
                         // reads as a transport failure. The peer-facing string stays a
                         // coarse category and leaks no authz internals.
-                        ui::say(&format!("mount: refused for '{who}': not authorized (mount capability required)"));
+                        ui::say(&format!("mount: refused for '{who}': {}", authorized.deny_reason("not authorized (mount capability required)")));
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
@@ -11862,7 +11868,7 @@ async fn recv_cmd(
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
-                    let ok = {
+                    let (ok, xfer_deny_reason) = {
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -11873,7 +11879,13 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr)
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr);
+                        let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
+                            cap_reason.clone()
+                        } else {
+                            None
+                        };
+                        (d.allowed(), reason)
                     };
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() {
@@ -11892,7 +11904,7 @@ async fn recv_cmd(
                         }
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({})",
-                            if daemon { "unverified peer" } else { "no tty, use -y to auto-accept" }
+                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") } else { "no tty, use -y to auto-accept" }
                         )));
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;

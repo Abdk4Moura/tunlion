@@ -838,6 +838,29 @@ pub fn cap_authorize(
     }
 }
 
+/// The effective gate decision with an optional capability denial reason so
+/// the operator-facing diagnostic can say what actually happened instead of
+/// repeating the legacy assertion.
+pub enum GateDecision {
+    Allow,
+    Deny { cap_reason: Option<String> },
+}
+
+impl GateDecision {
+    pub fn allowed(&self) -> bool {
+        matches!(self, GateDecision::Allow)
+    }
+
+    /// Operator-facing denial reason: the real cap reason when present
+    /// (authoritative), else `legacy`.
+    pub fn deny_reason<'a>(&'a self, legacy: &'a str) -> &'a str {
+        match self {
+            GateDecision::Deny { cap_reason: Some(r) } => r,
+            _ => legacy,
+        }
+    }
+}
+
 /// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
 /// modes (so observability survives the flip), logs, and returns the effective gate
 /// decision: the legacy decision stands in shadow; the cap outcome gates under
@@ -851,7 +874,7 @@ pub fn cap_gate_effective(
     resource: &str,
     device_pub: Option<&[u8; 32]>,
     user_pub: Option<&[u8; 32]>,
-) -> bool {
+) -> GateDecision {
     let authoritative = cap_authoritative();
 
     // Counters: recorded in BOTH modes so a flip does not blind us.
@@ -920,24 +943,24 @@ pub fn cap_gate_effective(
             ),
             _ => {}
         }
-    } else if !effective {
-        // Authoritative: emit a legible reason operator-side so a cap refusal is
-        // never debugged as a transport failure.
-        let reason: &str = match outcome {
-            CapOutcome::Denied(r) => r,
-            CapOutcome::Unprovisioned => {
-                "resource unprovisioned (no capability header); run filament grant/init"
-            }
-            CapOutcome::Authorized => "",
-        };
-        eprintln!(
-            "CAP-DENY [authoritative]: '{action}' on '{resource}' for dev={} user={}: {reason}",
-            hex::encode(dev),
-            hex::encode(usr),
-        );
+    } else {
+        // Authoritative: the gate surfaces the reason now, so the dedicated
+        // CAP-DENY [authoritative] eprintln block is removed. The operator sees
+        // the real reason through GateDecision::deny_reason().
     }
 
-    effective
+    if effective {
+        GateDecision::Allow
+    } else if authoritative {
+        let reason = match outcome {
+            CapOutcome::Denied(r) => r.clone(),
+            CapOutcome::Unprovisioned => "resource unprovisioned (no capability header); run filament grant/init".to_string(),
+            CapOutcome::Authorized => String::new(),
+        };
+        GateDecision::Deny { cap_reason: Some(reason) }
+    } else {
+        GateDecision::Deny { cap_reason: None }
+    }
 }
 
 /// A single authorization query for preview enumeration.
