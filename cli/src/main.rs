@@ -1502,11 +1502,20 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
 
 /// Populate link identity from the peer's stored device cert, if the
 /// link already has a proof-verified name but identity pubkeys are absent.
-/// Cached back onto the link on success (resolve-once, not per open).
-/// Fail-closed on cert-missing, expired, or overlay-key mismatch: the
-/// stored cert's device_pub must match the one previously set on this
-/// link (from the identity-expose handler during pairing), so a cert
-/// from a different device under the same petname cannot attach.
+/// Cached back onto the link on first successful resolution (resolve-once,
+/// not per open).
+///
+/// The binding model: `verified_name` is set ONLY after a session-bound
+/// pair-proof HMAC (proof_for over shared secret + UIDs + fingerprints),
+/// so the name is cryptographically bound to this link. `device_cert_for`
+/// returns the cert we already verified at pairing (provisional_promote_ok
+/// checked device_pub against the overlay transport key at storage time).
+/// Together these form a sufficient trust join: a proven name plus the
+/// cert trusted-for-that-name. No additional link-level cert-to-transport
+/// comparison is needed.
+///
+/// Fail-closed to None on: no verified_name, no stored cert, cert expired
+/// or otherwise invalid.
 fn resolve_peer_identity(link: &mut Link) {
     if link.identity_device_pub.is_some() || link.identity_user_pub.is_some() {
         return; // already resolved
@@ -1519,14 +1528,6 @@ fn resolve_peer_identity(link: &mut Link) {
     let now = crate::identity::now_secs();
     if cert.verify(now).is_err() {
         return;
-    }
-    // Overlay-key binding: if the link already carries an identity from a
-    // prior identity-expose, the stored cert must carry the same device_pub.
-    // This guards against a petname reused for a different device key.
-    if let Some(prev) = link.identity_device_pub {
-        if cert.device_pub != prev {
-            return;
-        }
     }
     link.identity_device_pub = Some(cert.device_pub);
     link.identity_user_pub = Some(cert.user_pub);
