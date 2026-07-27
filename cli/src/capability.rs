@@ -28,6 +28,9 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Maximum clock skew for ratchet far-future clamp (seconds).
+pub const MAX_SKEW_SECS: u64 = 300;
+
 /// Self-certifying resource id: hex(SHA-256(owner_pub || nonce)).
 /// Only a genesis whose owner_pub+nonce hash to this id is accepted.
 pub fn make_resource_id(owner_pub: &[u8; 32], nonce: &[u8; 32]) -> String {
@@ -221,6 +224,93 @@ pub fn sign_cap_op(op: &CapOp, keypair: &Ed25519KeyPair) -> [u8; 64] {
     let mut out = [0u8; 64];
     out.copy_from_slice(sig.as_ref());
     out
+}
+
+// ---------------------------------------------------------------------------
+// evaluate() -- the single pure authorization fn
+// ---------------------------------------------------------------------------
+
+/// The outcome of an authorization check.
+pub enum Decision {
+    Authorized,
+    Denied(String),
+}
+
+/// Single pure authorization fn. Both enforcement and preview call this, so
+/// preview cannot diverge from enforcement.
+///
+/// Returns `Authorized` if:
+/// - `principal_user_pub == header.owner_pub` (derived owner, always allowed)
+/// - OR a non-expired grant exists where `grantor == header.owner_pub` and
+///   target matches (Device→principal_device_pub, User→principal_user_pub)
+///   and `action` is listed in permissions.
+///
+/// Expiry uses `eval_time = max(now, ratchet_for(header.owner_pub))`. If the
+/// per-owner ratchet is uninitialized, grants are DENIED (fail-closed).
+pub fn evaluate(
+    store: &[Value],
+    header: &CapHeader,
+    principal_device_pub: &[u8; 32],
+    principal_user_pub: &[u8; 32],
+    resource: &str,
+    action: &str,
+    now: u64,
+) -> Decision {
+    // Owner is always authorized (derived, outside cap list)
+    if principal_user_pub == &header.owner_pub {
+        return Decision::Authorized;
+    }
+
+    // Lazy-loaded ratchet: None means uninitialized (fail-closed for grants)
+    let ratchet = ratchet_for(store, &header.owner_pub);
+    if ratchet.is_none() {
+        return Decision::Denied("ratchet uninitialized".into());
+    }
+    let eval_time = std::cmp::max(now, ratchet.unwrap());
+
+    for entry in store {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("cap_grant") {
+            continue;
+        }
+        if entry["grantor"].as_str() != Some(hex::encode(header.owner_pub).as_str()) {
+            continue;
+        }
+        if entry["resource"].as_str() != Some(resource) {
+            continue;
+        }
+
+        let target_kind = entry["targetKind"].as_u64().unwrap_or(0) as u8;
+        let target_matches = match target_kind {
+            0x00 => {
+                // User target: match principal_user_pub
+                let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
+                t.len() == 32 && t.as_slice() == principal_user_pub
+            }
+            _ => {
+                // Device target: match principal_device_pub
+                let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
+                t.len() == 32 && t.as_slice() == principal_device_pub
+            }
+        };
+        if !target_matches {
+            continue;
+        }
+
+        // Check expiry (fail-closed: eval_time >= expires means expired)
+        let expires = entry["expires"].as_u64().unwrap_or(0);
+        if eval_time >= expires {
+            return Decision::Denied("grant expired".into());
+        }
+
+        // Check action is in permissions
+        if let Some(perms) = entry["permissions"].as_array() {
+            if perms.iter().any(|p| p.as_str() == Some(action)) {
+                return Decision::Authorized;
+            }
+        }
+    }
+
+    Decision::Denied("not authorized".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +572,54 @@ pub fn sign_cap_header(header: &CapHeader, keypair: &Ed25519KeyPair) -> [u8; 64]
 }
 
 // ---------------------------------------------------------------------------
+// Per-owner freshness ratchet
+// ---------------------------------------------------------------------------
+
+/// Read the ratchet for `owner_pub`. Returns `None` if uninitialized.
+fn ratchet_for(store: &[Value], owner_pub: &[u8; 32]) -> Option<u64> {
+    let owner_hex = hex::encode(owner_pub);
+    store
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_ratchet")
+                && e["owner_pub"].as_str() == Some(owner_hex.as_str())
+        })
+        .and_then(|e| e["max_issued_at"].as_u64())
+}
+
+/// Update the per-owner ratchet. Clamps `issued_at` to `local_clock + MAX_SKEW_SECS`;
+/// far-future values are rejected. On success, stores `max(existing, issued_at)`.
+pub fn update_ratchet(store: &mut Vec<Value>, owner_pub: &[u8; 32], issued_at: u64) -> Result<()> {
+    let local_now = now_secs();
+    let max_allowed = local_now.saturating_add(MAX_SKEW_SECS);
+    if issued_at > max_allowed {
+        bail!(
+            "far-future issued_at {} rejected (local clock {} + skew {})",
+            issued_at,
+            local_now,
+            MAX_SKEW_SECS
+        );
+    }
+
+    let owner_hex = hex::encode(owner_pub);
+    for e in store.iter_mut() {
+        if e.get("type").and_then(|v| v.as_str()) == Some("cap_ratchet")
+            && e["owner_pub"].as_str() == Some(owner_hex.as_str())
+        {
+            let existing = e["max_issued_at"].as_u64().unwrap_or(0);
+            e["max_issued_at"] = Value::from(std::cmp::max(existing, issued_at));
+            return Ok(());
+        }
+    }
+    store.push(serde_json::json!({
+        "type": "cap_ratchet",
+        "owner_pub": owner_hex,
+        "max_issued_at": issued_at,
+    }));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Store fns
 // ---------------------------------------------------------------------------
 
@@ -502,6 +640,7 @@ pub fn apply_header(store: &mut Vec<Value>, new_header: &CapHeader) -> Result<()
         // Genesis: first header for this resource
         new_header.verify_genesis()?;
         store.push(new_header.to_json());
+        update_ratchet(store, &new_header.owner_pub, new_header.issued_at)?;
         return Ok(());
     }
 
@@ -548,6 +687,7 @@ pub fn apply_header(store: &mut Vec<Value>, new_header: &CapHeader) -> Result<()
     new_header.verify_succession(&current)?;
 
     store[existing_idx.unwrap()] = new_header.to_json();
+    update_ratchet(store, &new_header.owner_pub, new_header.issued_at)?;
     Ok(())
 }
 
@@ -623,6 +763,7 @@ pub fn apply_cap_op(
         json_entry["max_issued_at"] = Value::from(op.issued_at);
         store.push(json_entry);
     }
+    update_ratchet(store, &op.grantor, op.issued_at)?;
     Ok(())
 }
 
@@ -1349,7 +1490,10 @@ mod tests {
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant_shell, now_secs()).unwrap();
         apply_cap_op(&mut store, &header, &grant_transfer, now_secs()).unwrap();
-        assert_eq!(store.len(), 3); // header + 2 grants
+        let grant_count = store.iter()
+            .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_grant"))
+            .count();
+        assert_eq!(grant_count, 2); // shell + transfer
     }
 
     // -- HLC ----------------------------------------------------------------
@@ -1360,5 +1504,315 @@ mod tests {
         assert!(v > 0);
         let v2 = hlc_next(v, now_ms());
         assert!(v2 > v);
+    }
+
+    // -- B1 evaluate() authorization ----------------------------------------
+
+    #[test]
+    fn evaluate_owner_authorized() {
+        let alice = make_owner();
+        let nonce = [0x01; 32];
+        let header = make_genesis_header(&alice, &nonce, &[]);
+        let store = init_store(&header);
+
+        let device_pub = [0xff; 32];
+        let user_pub = owner_pub(&alice);
+
+        let d = evaluate(&store, &header, &device_pub, &user_pub, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("owner must be authorized, got: {}", reason),
+        }
+    }
+
+    #[test]
+    fn evaluate_granted_action_ok() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["ssh", "shell"], v1, 86400);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        let principal_user = [0xaa; 32]; // different user, not the owner
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("granted action must be authorized, got: {}", reason),
+        }
+    }
+
+    #[test]
+    fn evaluate_ungranted_denied() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        let principal_user = [0xaa; 32];
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "admin", now_secs());
+        match d {
+            Decision::Denied(_) => {},
+            Decision::Authorized => panic!("ungranted action must be denied"),
+        }
+    }
+
+    #[test]
+    fn evaluate_expired_denied() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let pk = owner_pub(&owner);
+        let target = CapTarget::Device([0xcc; 32]);
+        let issued_at = now_secs().saturating_sub(86401);
+        let mut grant = CapOp {
+            op: CapOpKind::Grant,
+            grantor: pk,
+            target_kind: target.kind_byte(),
+            target: target.target_bytes(),
+            resource: header.resource.clone(),
+            permissions: vec!["ssh".to_string()],
+            expires: issued_at.saturating_add(86400),
+            issued_at,
+            version: hlc_next(0, now_ms()),
+            sig: [0u8; 64],
+        };
+        grant.sig = sign_cap_op(&grant, &owner);
+
+        let mut store = init_store(&header);
+        // Grant expired, but apply_cap_op doesn't check expiry — that's evaluate's job
+        // We need to apply a non-expired op first so ratchet is initialized
+        let v = hlc_next(0, now_ms());
+        let fresh = make_grant(&owner, target, &header.resource, &["ssh"], v, 86400);
+        apply_cap_op(&mut store, &header, &fresh, now_secs()).unwrap();
+
+        let principal_user = [0xaa; 32];
+        // fresh grant covers "ssh", expired grant is not there — test evaluates against stored grants
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("non-expired grant must be authorized, got: {}", reason),
+        }
+
+        // Now test with an expired grant
+        let mut expired_store = init_store(&header);
+        // Store the expired grant directly (bypassing apply_cap_op's monotonicity)
+        let mut expired_entry = grant.to_json();
+        expired_entry["type"] = Value::from("cap_grant");
+        expired_store.push(expired_entry);
+        // Also need ratchet from the header
+        let hdr_issued = header.issued_at;
+        let expired_ratchet = hdr_issued; // ratchet was set by apply_header
+
+        // evaluate should see the grant but consider it expired
+        let d2 = evaluate(&expired_store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        match d2 {
+            Decision::Denied(reason) => assert!(reason.contains("expired"), "must be expired: {}", reason),
+            Decision::Authorized => panic!("expired grant must be denied"),
+        }
+    }
+
+    #[test]
+    fn evaluate_wrong_target_denied() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        let principal_user = [0xaa; 32];
+        // Wrong device pubkey
+        let d = evaluate(&store, &header, &[0xdd; 32], &principal_user, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Denied(_) => {},
+            Decision::Authorized => panic!("wrong target device must be denied"),
+        }
+    }
+
+    #[test]
+    fn evaluate_user_grant_matches_device() {
+        // target_kind=User: a device chaining to that user_pub is authorized
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let principal_user_pub = [0xaa; 32];
+        let target = CapTarget::User(principal_user_pub);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        // Any device pubkey works when target_kind=User and principal_user_pub matches
+        let d = evaluate(&store, &header, &[0x11; 32], &principal_user_pub, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("User grant must authorize device chaining to that user, got: {}", reason),
+        }
+
+        // Wrong user_pub must be denied even with correct device
+        let d2 = evaluate(&store, &header, &[0x11; 32], &[0xbb; 32], &header.resource, "ssh", now_secs());
+        match d2 {
+            Decision::Denied(_) => {},
+            Decision::Authorized => panic!("wrong user must be denied"),
+        }
+    }
+
+    #[test]
+    fn evaluate_ratchet_uninitialized_denies() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        // Store has the header (via init_store which calls apply_header → update_ratchet)
+        // So ratchet IS initialized. To test uninitialized, construct a store without the ratchet.
+        let mut store: Vec<Value> = vec![];
+        // Manually add header without ratchet
+        let mut hdr_json = header.to_json();
+        hdr_json["type"] = Value::from("cap_header");
+        store.push(hdr_json);
+
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
+        let mut grant_json = grant.to_json();
+        grant_json["type"] = Value::from("cap_grant");
+        store.push(grant_json);
+
+        let principal_user = [0xaa; 32];
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        match d {
+            Decision::Denied(reason) => assert!(reason.contains("ratchet"), "must fail on uninitialized ratchet: {}", reason),
+            Decision::Authorized => panic!("uninitialized ratchet must deny grants"),
+        }
+
+        // But owner is still authorized even with uninitialized ratchet
+        let owner_pubkey = owner_pub(&owner);
+        let d2 = evaluate(&store, &header, &[0x00; 32], &owner_pubkey, &header.resource, "ssh", now_secs());
+        match d2 {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("owner must be authorized even without ratchet, got: {}", reason),
+        }
+    }
+
+    #[test]
+    fn evaluate_clock_set_back_uses_ratchet() {
+        let owner = make_owner();
+        let nonce = [0x01; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        // Create a grant with a future issued_at (within skew) to advance ratchet
+        let future_issued = now_secs() + 100;
+        let future_expires = future_issued + 86400;
+        let mut grant = CapOp {
+            op: CapOpKind::Grant,
+            grantor: owner_pub(&owner),
+            target_kind: target.kind_byte(),
+            target: target.target_bytes(),
+            resource: header.resource.clone(),
+            permissions: vec!["ssh".to_string()],
+            expires: future_expires,
+            issued_at: future_issued,
+            version: hlc_next(0, now_ms()),
+            sig: [0u8; 64],
+        };
+        grant.sig = sign_cap_op(&grant, &owner);
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
+
+        // Now test with `now` set behind the ratchet (clock went backwards)
+        let clock_back_now = future_issued.saturating_sub(50);
+        let principal_user = [0xaa; 32];
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", clock_back_now);
+        // eval_time = max(clock_back_now, ratchet) = ratchet (future_issued)
+        // grant.expires = future_issued + 86400
+        // eval_time (future_issued) < grant.expires (future_issued + 86400) -> authorized
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("clock set back must still authorize via ratchet, got: {}", reason),
+        }
+    }
+
+    // -- B2 per-owner ratchet -----------------------------------------------
+
+    #[test]
+    fn ratchet_per_owner_isolation() {
+        let alice = make_owner();
+        let bob = make_owner();
+        let nonce_a = [0x01; 32];
+        let nonce_b = [0x02; 32];
+        let target = CapTarget::Device([0xcc; 32]);
+
+        let header_a = make_genesis_header(&alice, &nonce_a, &[]);
+        let header_b = make_genesis_header(&bob, &nonce_b, &[]);
+
+        let mut store = init_store(&header_a);
+        // Use a combined store with both headers and ratchets
+        // Bob's future issued_at must NOT expire Alice's grants
+
+        // Bob issues a grant with a far-future issued_at (but within skew)
+        let future_issued = now_secs() + 100;
+        let mut bob_grant = CapOp {
+            op: CapOpKind::Grant,
+            grantor: owner_pub(&bob),
+            target_kind: target.kind_byte(),
+            target: [0xdd; 32],
+            resource: header_b.resource.clone(),
+            permissions: vec!["ssh".to_string()],
+            expires: future_issued + 86400,
+            issued_at: future_issued,
+            version: hlc_next(0, now_ms()),
+            sig: [0u8; 64],
+        };
+        bob_grant.sig = sign_cap_op(&bob_grant, &bob);
+
+        // Initialize Bob's header and apply his grant
+        apply_header(&mut store, &header_b).unwrap();
+        apply_cap_op(&mut store, &header_b, &bob_grant, now_secs()).unwrap();
+
+        // Alice's grant with now-ish issued_at
+        let v1 = hlc_next(0, now_ms());
+        let alice_grant = make_grant(&alice, target, &header_a.resource, &["ssh"], v1, 86400);
+        apply_cap_op(&mut store, &header_a, &alice_grant, now_secs()).unwrap();
+
+        // Bob's ratchet is at future_issued. Alice's ratchet should be her own.
+        // evaluate Alice's grant: ratchet_for(Alice's owner) != future_issued
+        let principal_user = [0xaa; 32];
+        let d = evaluate(&store, &header_a, &[0xcc; 32], &principal_user, &header_a.resource, "ssh", now_secs());
+        match d {
+            Decision::Authorized => {},
+            Decision::Denied(reason) => panic!("Bob's ratchet must not expire Alice's grant: {}", reason),
+        }
+    }
+
+    #[test]
+    fn ratchet_far_future_clamp() {
+        let owner = make_owner();
+        let far_future = now_secs() + MAX_SKEW_SECS + 1;
+        let nonce = [0x01; 32];
+        let header = make_genesis_header(&owner, &nonce, &[]);
+
+        let mut store = init_store(&header);
+        let res = update_ratchet(&mut store, &owner_pub(&owner), far_future);
+        assert!(res.is_err(), "far-future issued_at must be rejected");
     }
 }
