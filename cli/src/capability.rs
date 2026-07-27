@@ -31,6 +31,23 @@ pub fn now_secs() -> u64 {
 /// Maximum clock skew for ratchet far-future clamp (seconds).
 pub const MAX_SKEW_SECS: u64 = 300;
 
+/// Domain constant for the deterministic "self" resource nonce.
+/// Survives cold-key restore: the key survives, so the resource id does too.
+pub const SELF_RESOURCE_DOMAIN: &[u8] = b"filament-self-resource-v1";
+
+pub fn self_resource_nonce() -> [u8; 32] {
+    use sha2_pake::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(SELF_RESOURCE_DOMAIN);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
+pub fn self_resource_id(owner_pub: &[u8; 32]) -> String {
+    make_resource_id(owner_pub, &self_resource_nonce())
+}
+
 /// Self-certifying resource id: hex(SHA-256(owner_pub || nonce)).
 /// Only a genesis whose owner_pub+nonce hash to this id is accepted.
 pub fn make_resource_id(owner_pub: &[u8; 32], nonce: &[u8; 32]) -> String {
@@ -640,9 +657,20 @@ pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io:
     std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)
 }
 
+/// Returns true when capability enforcement is in SHADOW mode (log-only).
+/// Set `FILAMENT_CAP_SHADOW=1` to evaluate without gating — the legacy
+/// trusted/device_allows path still authorizes. Flip to authoritative when
+/// the shadow log shows no unexpected denials.
+pub fn cap_shadow_enabled() -> bool {
+    std::env::var("FILAMENT_CAP_SHADOW").map(|x| x == "1").unwrap_or(false)
+}
+
 /// Bridging authorization: loads the cap store, finds the header for `resource`,
 /// and calls evaluate(). If no header exists, returns Denied (the existing
 /// trusted + device_allows gates in main.rs still apply as fallback).
+///
+/// In shadow mode (FILAMENT_CAP_SHADOW=1), evaluates but always returns Denied
+/// so the legacy path decides; logs any denial that would happen under authority.
 pub fn cap_authorize(
     config_dir: &std::path::Path,
     resource: &str,
@@ -666,7 +694,22 @@ pub fn cap_authorize(
     let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
     let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
 
-    evaluate(&store, &hdr, &device_pub, &user_pub, resource, action, now_secs())
+    let result = evaluate(&store, &hdr, &device_pub, &user_pub, resource, action, now_secs());
+
+    if cap_shadow_enabled() {
+        if matches!(result, Decision::Denied(_)) {
+            eprintln!(
+                "CAP-SHADOW: cap_authorize would DENY '{}' for principal dev={} user={} on resource='{}' — legacy path still authorizes",
+                action,
+                hex::encode(device_pub),
+                hex::encode(user_pub),
+                resource,
+            );
+        }
+        return Decision::Denied("shadow mode — abstain".into());
+    }
+
+    result
 }
 
 /// A single authorization query for preview enumeration.

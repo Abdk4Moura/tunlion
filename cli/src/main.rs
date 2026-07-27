@@ -7093,15 +7093,11 @@ async fn main() -> Result<()> {
                         && e["resource"].as_str() == Some("self")
                 });
                 if !has_header {
-                    use ring::rand::SystemRandom;
-                    let rng = SystemRandom::new();
-                    let mut nonce = [0u8; 32];
-                    let _ = ring::rand::SecureRandom::fill(&rng, &mut nonce);
                     let pk = user_key.public_key_bytes();
-                    let resource = crate::capability::make_resource_id(&pk, &nonce);
-                    // We want resource="self" for introspection; re-derive if needed
+                    let nonce = crate::capability::self_resource_nonce();
+                    let resource = crate::capability::self_resource_id(&pk);
                     let mut hdr = crate::capability::CapHeader {
-                        resource: "self".to_string(),
+                        resource,
                         epoch: 0,
                         owner_pub: pk,
                         nonce,
@@ -7111,11 +7107,7 @@ async fn main() -> Result<()> {
                         prev_header_hash: None,
                         sig: [0u8; 64],
                     };
-                    // Override the resource with self-certifying id... but we want "self"
-                    // For the genesis, set resource = make_resource_id for verification
-                    hdr.resource = resource;
                     hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
-                    // Make it identifiable as "self" by storing with a resource alias
                     let mut hdr_json = hdr.to_json();
                     hdr_json["resource"] = serde_json::json!("self");
                     store.push(hdr_json);
