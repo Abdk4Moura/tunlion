@@ -7219,6 +7219,11 @@ async fn main() -> Result<()> {
                 let mut op_json = op.to_json();
                 op_json["type"] = serde_json::json!("cap_grant");
                 store.push(op_json);
+                // Grant must initialize the per-owner ratchet so evaluate()
+                // does not hit "ratchet uninitialized". apply_cap_op normally
+                // does this, but the grant command constructs CapOp JSON
+                // directly. Best-effort (narrow window, bounded by expiry).
+                let _ = crate::capability::update_ratchet(&mut store, &pk, op.issued_at);
                 let _ = crate::capability::save_cap_store(&config_dir, &store);
             }
             println!(
