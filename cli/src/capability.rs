@@ -672,23 +672,67 @@ pub fn update_ratchet(store: &mut Vec<Value>, owner_pub: &[u8; 32], issued_at: u
 // File-based store I/O  (thin wrappers, mirror update_peer_identity)
 // ---------------------------------------------------------------------------
 
+/// Cache cap store reads per config_dir, invalidated on every write.
+/// Hot path: load_cap_store is called on every gated open; without this cache
+/// each open re-reads + re-parses caps.json.
+type CachedStore = (std::path::PathBuf, u64, Vec<Value>); // (path, mtime, parsed)
+static CAP_CACHE: OnceLock<Mutex<Option<CachedStore>>> = OnceLock::new();
+
+fn cache_init() -> &'static Mutex<Option<CachedStore>> {
+    CAP_CACHE.get_or_init(|| Mutex::new(None))
+}
+
 /// Load the capability store from `caps.json` in the filament config dir.
+/// Cached: subsequent calls with unchanged mtime return the cached store.
 pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
     let p = config_dir.join("caps.json");
-    std::fs::read_to_string(&p)
+
+    // Check mtime of the file for cache invalidation
+    let mtime = std::fs::metadata(&p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    if let Some(mtime_val) = mtime {
+        let cache = cache_init().lock().unwrap();
+        if let Some((cached_path, cached_mtime, cached_store)) = cache.as_ref() {
+            if cached_path == &p && *cached_mtime == mtime_val {
+                return cached_store.clone();
+            }
+        }
+    }
+
+    // Cache miss: read + parse
+    let store = std::fs::read_to_string(&p)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    // Cache store with mtime
+    if let Some(mtime_val) = mtime {
+        let mut cache = cache_init().lock().unwrap();
+        *cache = Some((p, mtime_val, store.clone()));
+    }
+
+    store
 }
 
 /// Persist the capability store to `caps.json` (module-internal).
 /// Callers MUST use `save_and_list_revoked` so reconciliation is a property
-/// of the write — a future sync path cannot forget it.
+/// of the write. INVALIDATES the read cache so next cap_authorize sees the
+/// fresh store immediately, never stale after a grant/revoke.
 pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
     let p = config_dir.join("caps.json");
     if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
-    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)
+    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store)))?;
+    // Invalidate cache: next load_cap_store will see the new mtime and re-read.
+    let cache = cache_init();
+    if let Ok(mut c) = cache.lock() {
+        *c = None;
+    }
+    Ok(())
 }
 
 /// Persist the cap store, then return the devices whose shell keys must be
@@ -3196,5 +3240,39 @@ mod tests {
         assert_eq!(cap_trust_floor(&auth, false, false), CapOutcome::Authorized);
         // Denied + untrusted + authoritative → stays Denied
         assert_eq!(cap_trust_floor(&deny, false, true), deny);
+    }
+
+    /// Cache returns same result as uncached load for identical store.
+    #[test]
+    fn cache_matches_uncached_load() {
+        let dir = temp_dir("cache-match");
+        let store = vec![json!({"op":"grant","perms":["shell"]})];
+        save_cap_store(&dir, &store).unwrap();
+        let loaded = load_cap_store(&dir);
+        // Second load should be cached (same mtime)
+        let cached = load_cap_store(&dir);
+        assert_eq!(loaded, cached, "cached load must match uncached");
+    }
+
+    /// Write invalidates cache: a grant then save must be visible to next load.
+    #[test]
+    fn cache_invalidated_on_save() {
+        let dir = temp_dir("cache-inval");
+        let store = vec![json!({"perm":"shell"})];
+        save_cap_store(&dir, &store).unwrap();
+        assert_eq!(load_cap_store(&dir).len(), 1);
+
+        // Mutate and save: invalidate cache
+        let updated = vec![json!({"perm":"shell"}), json!({"perm":"deploy"})];
+        save_cap_store(&dir, &updated).unwrap();
+
+        let loaded = load_cap_store(&dir);
+        assert_eq!(loaded.len(), 2, "cache must be invalidated after save, reflecting new grant");
+    }
+
+    // Unique per-test dir (name suffix) so parallel cache tests never share a
+    // caps.json — they'd otherwise race on the same file and the global cache.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("filament-cap-test-{}-{}", std::process::id(), name))
     }
 }
