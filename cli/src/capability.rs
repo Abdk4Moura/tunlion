@@ -3,6 +3,24 @@
 //! CapOp: an owner-signed grant/revoke/modify.  CapHeader: the owner-signed
 //! resource header (self-certifying resource id, hash-chained succession,
 //! fork detection).  Ownership is derived from the header, never a grant.
+//!
+//! ## LIMIT — WireGuard / serve-tun mesh (accepted posture)
+//!
+//! The WG mesh is a COARSER trust tier. Mesh-join (filament serve-tun) grants
+//! L3 IP reach to raw TCP services bound on the overlay address (SSH, exposed
+//! ports). These services are NOT constrained by L2 capability gates (l2-open,
+//! mount-open, pty-open) because the WG data path is L3 IP, not L2 control-plane
+//! streams over QUIC/WebRTC.
+//!
+//! Everything reachable by WG peers with ONLY L3 IP: SSH daemon on overlay
+//! address, any port exposed via `filament expose`. Everything else (forward,
+//! netcat, proxy, file transfer, mount, PTY) requires an L2 control channel
+//! that a WG-only peer lacks.
+//!
+//! Mesh-join is therefore a weighty grant at the transport layer. A peer
+//! with WG access can reach SSH and exposed ports regardless of capability
+//! grants. This is the stated boundary — the WG PSK IS the authorization
+//! for SSH and exposed-port reach on the overlay.
 use anyhow::{anyhow, bail, Result};
 use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::Value;
