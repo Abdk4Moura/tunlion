@@ -34,6 +34,7 @@ mod mount_fuse;
 #[cfg(all(target_os = "windows", feature = "mount-windows"))]
 mod mount_winfsp;
 mod backup;
+mod capability;
 mod net;
 mod overlay;
 mod platform;
