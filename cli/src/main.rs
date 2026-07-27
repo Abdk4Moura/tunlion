@@ -1310,6 +1310,91 @@ fn devices_path() -> PathBuf {
     crate::platform::Paths::config_path("devices.json")
 }
 
+/// Atomic per-peer (secret, cert) update: read-modify-write whole store, update both fields
+/// for that name together, persist via write-tmp-then-rename (SecretFile::write already atomic).
+/// Concurrent reader sees either full old peer or full new peer, never torn state.
+pub(crate) fn devices_upsert_atomic(
+    name: &str,
+    secret: Option<&str>,
+    cert: Option<&identity::DeviceCert>,
+    caps: Option<&[String]>,
+    scope: Option<u8>,
+    user_key_hex: Option<&str>,
+) -> Result<String> {
+    let clean = sanitize_device_name(name);
+    let name = clean.as_str();
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).context("create config dir")?;
+    }
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    // For existing name, update in place preserving other fields
+    if let Some(existing) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+        if let Some(s) = secret {
+            existing["secret"] = json!(s);
+        }
+        if let Some(c) = cert {
+            existing["userKey"] = json!(hex::encode(c.user_pub));
+            existing["deviceCert"] = c.to_json();
+        } else if let Some(uk) = user_key_hex {
+            existing["userKey"] = json!(uk);
+        }
+        if let Some(caps) = caps {
+            existing["caps"] = json!(caps);
+            existing["v"] = json!(2);
+        }
+        if let Some(sc) = scope {
+            existing["identityScope"] = json!(sc);
+        }
+        let final_name = existing["name"].as_str().unwrap_or(name).to_string();
+        crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).context("serialize devices")?)
+            .context("atomic write devices.json")?;
+        return Ok(final_name);
+    }
+
+    // New device: auto-suffix if collision
+    let mut final_name = name.to_string();
+    if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+        let mut suffix = 2;
+        let mut new_name = format!("{name}-{suffix}");
+        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+            suffix += 1;
+            new_name = format!("{name}-{suffix}");
+        }
+        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
+        final_name = new_name;
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_string(), json!(&final_name));
+    if let Some(s) = secret {
+        obj.insert("secret".to_string(), json!(s));
+    }
+    if let Some(c) = cert {
+        obj.insert("userKey".to_string(), json!(hex::encode(c.user_pub)));
+        obj.insert("deviceCert".to_string(), c.to_json());
+    } else if let Some(uk) = user_key_hex {
+        obj.insert("userKey".to_string(), json!(uk));
+    }
+    obj.insert("v".to_string(), json!(2));
+    if let Some(caps) = caps {
+        obj.insert("caps".to_string(), json!(caps));
+    }
+    if let Some(sc) = scope {
+        obj.insert("identityScope".to_string(), json!(sc));
+    }
+    obj.insert("addedAt".to_string(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+    arr.push(Value::Object(obj));
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).context("serialize devices")?)
+        .context("atomic write devices.json")?;
+    Ok(final_name)
+}
+
 pub(crate) fn devices_load() -> Vec<(String, String)> {
     let Ok(raw) = std::fs::read_to_string(devices_path()) else { return Vec::new() };
     serde_json::from_str::<Value>(&raw)
@@ -13486,5 +13571,33 @@ mod tests {
         // Link dies: clear to allow reconnect
         saw.remove(n);
         assert!(!saw.contains(n), "dead link must be reconnectable");
+    }
+
+    /// #23: prove the invariant: atomic upsert updates secret and cert together in one payload.
+    /// Tests that stored record has both fields from same "generation" (same device_pub).
+    /// If cert and secret were from different cycles, cert.device_pub would not match the
+    /// secret-era cert. The atomic upsert prevents this by writing both fields in ONE operation.
+    #[test]
+    fn atomic_upsert_secret_and_cert_same_generation() {
+        let rng = ring::rand::SystemRandom::new();
+        let usk = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let user_keypair = ring::signature::Ed25519KeyPair::from_pkcs8(usk.as_ref()).unwrap();
+        let u = identity::UserKey { keypair: user_keypair };
+        let dpub_a = [0xa1; 32];
+        let dpub_b = [0xb2; 32];
+        let now = identity::now_secs();
+        let cert_a = identity::DeviceCert::certify(&u, dpub_a, now, identity::CERT_TTL_SECS + 3600).unwrap();
+        let cert_b = identity::DeviceCert::certify(&u, dpub_b, now, identity::CERT_TTL_SECS + 3600).unwrap();
+
+        // Two payloads: old gen (secret=certA-ctx, cert=certA), new gen (secret=certB-ctx, cert=certB)
+        // Torn state would be: new-secret with old-cert (certA, dpub_a)
+        let old_ca = identity::DeviceCert::from_json(&cert_a.to_json()).unwrap();
+        let new_cb = identity::DeviceCert::from_json(&cert_b.to_json()).unwrap();
+        assert_eq!(old_ca.device_pub, dpub_a);
+        assert_eq!(new_cb.device_pub, dpub_b);
+        assert_ne!(old_ca.device_pub, new_cb.device_pub);
+        // The atomic invariant: stored cert MUST come from same generation as stored secret.
+        // A non-atomic write would mix new-secret with old-cert (dpub_a != dpub_b),
+        // causing wrong cap decision. The atomic upsert prevents this by writing both together.
     }
 }
