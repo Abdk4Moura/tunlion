@@ -2369,27 +2369,30 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                 ui::say(summary);
             }
             let flip = v["flip_ready"].as_bool().unwrap_or(false);
-            let widening = if let Some(counts) = v.get("counts") {
-                counts["ld_authorized"].as_u64().unwrap_or(0)
-            } else {
-                0
-            };
-            if flip && widening == 0 {
+            if v.get("counts").is_none() || v["counts"].is_null() {
                 ui::say(&format!(
-                    "  flip_ready: {} ready (la_authorized>0, la_denied==0, la_no_header==0)",
-                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                ));
-            } else if flip {
-                ui::say(&format!(
-                    "  flip_ready: {} breakage-clean, but {} WIDENING opens will be NEWLY PERMITTED; review and cite them before flipping",
-                    ui::paint(ui::Tone::Warn, "x"),
-                    widening,
-                ));
-            } else {
-                ui::say(&format!(
-                    "  flip_ready: {} not ready",
+                    "  flip_ready: {} counts unavailable; cannot assess flip readiness",
                     ui::paint(ui::Tone::Warn, "x"),
                 ));
+            } else {
+                let widening = v["counts"]["ld_authorized"].as_u64().unwrap_or(0);
+                if flip && widening == 0 {
+                    ui::say(&format!(
+                        "  flip_ready: {} ready (la_authorized>0, la_denied==0, la_no_header==0)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                    ));
+                } else if flip {
+                    ui::say(&format!(
+                        "  flip_ready: {} breakage-clean, but {} WIDENING opens will be NEWLY PERMITTED; review and cite them before flipping",
+                        ui::paint(ui::Tone::Warn, "x"),
+                        widening,
+                    ));
+                } else {
+                    ui::say(&format!(
+                        "  flip_ready: {} not ready",
+                        ui::paint(ui::Tone::Warn, "x"),
+                    ));
+                }
             }
             if let Some(counts) = v.get("counts") {
                 ui::say(&format!(
