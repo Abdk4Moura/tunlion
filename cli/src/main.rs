@@ -1446,41 +1446,8 @@ fn sanitize_device_name(name: &str) -> String {
 }
 
 fn devices_store(name: &str, secret: &str) -> Result<()> {
-    let clean = sanitize_device_name(name);
-    let name = clean.as_str();
-    let p = devices_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Operate on the raw JSON so OTHER records keep their v2 fields (caps,
-    // addedAt) verbatim. Going through the (name, secret) tuples of
-    // devices_load() silently rewrote every other device as bare
-    // {name, secret}, wiping their `shell` grants on any store (pairing,
-    // introduce, rename), a quiet privilege-loss bug.
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    // Check for name collision and auto-suffix if needed
-    let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
-        let mut suffix = 2;
-        let mut new_name = format!("{name}-{suffix}");
-        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
-            suffix += 1;
-            new_name = format!("{name}-{suffix}");
-        }
-        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
-        new_name
-    } else {
-        name.to_string()
-    };
-    match arr.iter_mut().find(|d| d["name"].as_str() == Some(&final_name)) {
-        // Re-storing an existing name: only the secret rotates; keep its caps.
-        Some(existing) => existing["secret"] = json!(secret),
-        None => arr.push(json!({"name": &final_name, "secret": secret})),
-    }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: secret only, preserve cert
+    devices_upsert_atomic(name, Some(secret), None, None, None, None)?;
     Ok(())
 }
 
@@ -1490,60 +1457,22 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
 /// working byte-for-byte, no regression.
 fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
-    let clean = sanitize_device_name(name);
-    let name = clean.as_str();
-    let p = devices_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Preserve other records verbatim (including their v/caps if present).
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    // Check for name collision and auto-suffix if needed
-    let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
-        let mut suffix = 2;
-        let mut new_name = format!("{name}-{suffix}");
-        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
-            suffix += 1;
-            new_name = format!("{name}-{suffix}");
-        }
-        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
-        new_name
-    } else {
-        name.to_string()
-    };
-    arr.retain(|d| d["name"].as_str() != Some(&final_name));
-    arr.push(json!({"name": &final_name, "secret": secret, "v": 2, "caps": caps,
-                    "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: secret + caps together, preserve cert
+    devices_upsert_atomic(name, Some(secret), None, Some(caps), None, None)?;
     Ok(())
 }
 
 /// Attach a device certificate + user key to an existing device record.
 fn update_device_cert(name: &str, uk: &identity::UserKey, cert: &identity::DeviceCert) -> Result<()> {
+    // Check existence first (atomic upsert doesn't fail if missing for existing -> it would create new)
     let p = devices_path();
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    let uk_hex = uk.public_key_hex();
-    let mut updated = false;
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(name) {
-            d["userKey"] = json!(uk_hex);
-            d["deviceCert"] = cert.to_json();
-            updated = true;
-            break;
-        }
-    }
-    if !updated {
+    let raw = std::fs::read_to_string(&p).ok().unwrap_or_default();
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok().unwrap_or_default();
+    if !arr.iter().any(|d| d["name"].as_str() == Some(name)) {
         bail!("device '{name}' is not in the device store. Pair with it first.");
     }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: cert only, preserve secret
+    devices_upsert_atomic(name, None, Some(cert), None, None, Some(&uk.public_key_hex()))?;
     Ok(())
 }
 
@@ -1630,14 +1559,8 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 }
 
 fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
-    let p = devices_path();
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    apply_peer_identity(&mut arr, name, peer_cert, scope)?;
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: cert only, preserve secret & caps
+    devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None)?;
     Ok(())
 }
 
@@ -3036,20 +2959,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         // same on both sides; it drops straight into devices.json.
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
-                // caps_v2 (spec §8): record GRANTED caps, deny-by-default.
-                // devices_store_v2 handles name collisions via auto-suffix.
-                // Scope byte was derived from authenticated token, no default to broad scope.
-                devices_store_v2(&n, &sec, &caps)?;
-                // Hold verified identity as PROVISIONAL, NOT durable write.
-                // Durable anchor is written only at overlay establishment after
-                // cert.device_pub == overlay-key assertion passes.
-                // This prevents a failed overlay session from leaving a permanent anchor
-                // that would cause takeover guard to refuse legitimate retry.
-                if let Some(ref pcert) = peer_identity_cert {
-                    let _ = store_provisional_identity(&n, pcert);
-                } else {
-                    // Fail-closed: if peer previously had identity (has userKey) and now does NOT expose,
-                    // abort rather than proceed as normal peer.
+                // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
+                if peer_identity_cert.is_none() {
                     let p = devices_path();
                     if let Ok(raw) = std::fs::read_to_string(&p) {
                         if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
@@ -3058,6 +2969,19 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                             }
                         }
                     }
+                    // No cert: store secret only (legacy or first-pair no identity)
+                    devices_store_v2(&n, &sec, &caps)?;
+                } else {
+                    // #23: atomic (secret,cert) together in ONE write, not separate writes.
+                    // devices_store_v2 writes secret, store_provisional writes cert to temp file.
+                    // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
+                    // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
+                    let pcert = peer_identity_cert.as_ref().unwrap();
+                    devices_upsert_atomic(&n, Some(&sec), Some(pcert), Some(&caps), Some(scope), None)
+                        .context("atomic store secret+cert")?;
+                    // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
+                    store_provisional_identity(&n, pcert)
+                        .context("store provisional")?;
                 }
                 ui::say(&format!(
                     "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
