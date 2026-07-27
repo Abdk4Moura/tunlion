@@ -684,34 +684,63 @@ pub fn cap_authoritative() -> bool {
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
-static SHADOW_EVALUATED: AtomicU64 = AtomicU64::new(0);
-static SHADOW_DENIED: AtomicU64 = AtomicU64::new(0);
-static SHADOW_AUTHORIZED: AtomicU64 = AtomicU64::new(0);
+// Shadow counters bucketed by the LEGACY decision on the same open. The only opens
+// a flip to authoritative can CHANGE are the legacy-ALLOWED ones: a cap-deny on a
+// legacy-denied open alters nothing (refused either way). A log dominated by the
+// legacy-denied population is biased toward agreement-on-denial and looks clean for
+// a reason unrelated to correctness, so the two populations are kept separate and a
+// legacy-denied-only sample can never be misread as coverage.
+static LA_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, cap agrees (authorizes)
+static LA_DENIED: AtomicU64 = AtomicU64::new(0); // legacy ALLOWED, cap would DENY  <- breakage-on-flip
+static LD_AUTHORIZED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, cap would ALLOW (cap widens, info)
+static LD_DENIED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, cap agrees (denies)
 
-/// Return (evaluated, denied, authorized) counts since start.
-pub fn cap_shadow_counts() -> (u64, u64, u64) {
+/// Shadow counts bucketed by legacy outcome:
+/// `((legacy_allowed_authorized, legacy_allowed_denied),
+///   (legacy_denied_authorized, legacy_denied_denied))`.
+/// The flip criterion reads the legacy-ALLOWED bucket ONLY: flip when
+/// `la_authorized` is nonzero and meaningful and `la_denied == 0`.
+pub fn cap_shadow_counts() -> ((u64, u64), (u64, u64)) {
     (
-        SHADOW_EVALUATED.load(Ordering::Relaxed),
-        SHADOW_DENIED.load(Ordering::Relaxed),
-        SHADOW_AUTHORIZED.load(Ordering::Relaxed),
+        (
+            LA_AUTHORIZED.load(Ordering::Relaxed),
+            LA_DENIED.load(Ordering::Relaxed),
+        ),
+        (
+            LD_AUTHORIZED.load(Ordering::Relaxed),
+            LD_DENIED.load(Ordering::Relaxed),
+        ),
     )
 }
 
 /// Bridging authorization: loads the cap store, finds the header for `resource`,
 /// and calls evaluate().
 ///
+/// `legacy_allowed` is the decision the pre-capability (legacy) gate reached for
+/// this same open. It does NOT change the returned Decision; it buckets the shadow
+/// counters, because the only opens a flip to authoritative can change are the
+/// legacy-ALLOWED ones.
+///
 /// Two modes, controlled by FILAMENT_CAP_AUTHORITATIVE:
-///   - SHADOW (default, FILAMENT_CAP_AUTHORITATIVE=0): evaluates and records
-///     counts but returns Denied (abstain). Legacy path decides. Logs would-deny
-///     lines to stderr with the running counted totals.
-///   - AUTHORITATIVE (FILAMENT_CAP_AUTHORITATIVE=1): the evaluate() result
-///     gates live traffic. Must be flipped only after the shadow log is clean.
+///   - SHADOW (default, =0): evaluates and records counts bucketed by
+///     `legacy_allowed`, then returns Denied (abstain) so the legacy path decides.
+///     A cap-deny on a legacy-ALLOWED open is logged CRITICAL: that is the exact
+///     open a flip would break.
+///   - AUTHORITATIVE (=1): the evaluate() result gates live traffic.
+///
+/// FLIP CRITERION (it lives here, next to the code it governs): flip only when a
+/// nonzero, meaningful number of legacy-ALLOWED opens have been evaluated
+/// (`la_authorized > 0`) and ZERO produced a cap-deny (`la_denied == 0`). A nonzero
+/// TOTAL count is NOT sufficient: a sample drawn only from legacy-DENIED opens is
+/// biased toward agreement-on-denial and proves nothing about the opens a flip
+/// changes. Read `cap_shadow_counts()`'s legacy-ALLOWED bucket, never the total.
 pub fn cap_authorize(
     config_dir: &std::path::Path,
     resource: &str,
     action: &str,
     principal_device_pub: Option<&[u8; 32]>,
     principal_user_pub: Option<&[u8; 32]>,
+    legacy_allowed: bool,
 ) -> Decision {
     let store = load_cap_store(config_dir);
     let header = store
@@ -722,35 +751,63 @@ pub fn cap_authorize(
         })
         .and_then(CapHeader::from_json);
 
-    let Some(hdr) = header else {
-        return Decision::Denied("no capability store for resource".into());
-    };
-
     let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
     let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
 
-    let result = evaluate(&store, &hdr, &device_pub, &user_pub, resource, action, now_secs());
+    // Compute the cap decision on ALL paths, no-header included, so shadow
+    // accounting sees a missing self-header (which denies under authoritative) as a
+    // would-deny bucketed against what legacy did, instead of silently skipping it.
+    let result = match header {
+        Some(hdr) => evaluate(
+            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(),
+        ),
+        None => Decision::Denied("no capability header for resource".into()),
+    };
 
     if !cap_authoritative() {
-        SHADOW_EVALUATED.fetch_add(1, Ordering::Relaxed);
-        match &result {
-            Decision::Denied(_) => {
-                SHADOW_DENIED.fetch_add(1, Ordering::Relaxed);
-                let (ev, dn, au) = cap_shadow_counts();
+        let denied = matches!(result, Decision::Denied(_));
+        match (legacy_allowed, denied) {
+            (true, true) => {
+                LA_DENIED.fetch_add(1, Ordering::Relaxed);
+                let la_ok = LA_AUTHORIZED.load(Ordering::Relaxed);
+                let la_dn = LA_DENIED.load(Ordering::Relaxed);
                 eprintln!(
-                    "CAP-SHADOW [{ev} evaluated/{dn} denied/{au} authorized]: would DENY '{action}' for dev={} user={} on resource='{resource}' — legacy still authorizes",
+                    "CAP-SHADOW CRITICAL [legacy-allowed: {la_ok} agree / {la_dn} would-DENY]: cap would DENY '{action}' for dev={} user={} on resource='{resource}' that legacy ALLOWED; a flip would BREAK this open",
                     hex::encode(device_pub),
                     hex::encode(user_pub),
                 );
             }
-            Decision::Authorized => {
-                SHADOW_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+            (true, false) => {
+                LA_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+            }
+            (false, true) => {
+                LD_DENIED.fetch_add(1, Ordering::Relaxed);
+            }
+            (false, false) => {
+                LD_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "CAP-SHADOW [legacy-denied, cap would ALLOW]: '{action}' for dev={} user={} on resource='{resource}'; cap widens vs legacy (informational)",
+                    hex::encode(device_pub),
+                    hex::encode(user_pub),
+                );
             }
         }
-        return Decision::Denied("shadow mode — abstain".into());
+        return Decision::Denied("shadow mode: abstain".into());
     }
 
     result
+}
+
+/// The effective gate decision, given the legacy outcome and the cap `Decision`.
+/// In shadow mode (default) the legacy decision stands; under
+/// FILAMENT_CAP_AUTHORITATIVE the cap decision gates. Centralized so every gate
+/// site shares one policy and cannot drift.
+pub fn cap_gate_effective(legacy_allowed: bool, cap: &Decision) -> bool {
+    if cap_authoritative() {
+        matches!(cap, Decision::Authorized)
+    } else {
+        legacy_allowed
+    }
 }
 
 /// A single authorization query for preview enumeration.
@@ -2075,16 +2132,15 @@ mod tests {
         assert!(res.is_err(), "far-future issued_at must be rejected");
     }
 
-    /// Zero-config: cap_authorize returns Denied when no header exists.
-    /// The gate in main.rs ORs this with the legacy trusted/device_allows
-    /// check, so a fresh device owner is never locked out — the legacy
-    /// path still gates.
+    /// Zero-config: cap_authorize returns Denied when no header exists (in shadow
+    /// mode it abstains regardless). The gate in main.rs feeds the legacy outcome
+    /// to cap_gate_effective, which keeps legacy authoritative in shadow, so a
+    /// fresh device owner is never locked out; the legacy path still gates.
     #[test]
     fn cap_authorize_no_header_returns_denied_legacy_fallback() {
-        use std::path::Path;
         let tmp = std::env::temp_dir().join(format!("fil-cap-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
-        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]));
+        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]), true);
         match d {
             Decision::Denied(_) => {},
             Decision::Authorized => panic!("no-header cap_authorize must return Denied (gates fall back to legacy path)"),

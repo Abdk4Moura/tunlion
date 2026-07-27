@@ -10954,19 +10954,20 @@ async fn recv_cmd(
                     // mode any trusted peer may open; in grant-only mode the opening
                     // peer must hold the shell grant itself.
                     let authorized = v["type"].as_str() != Some("l2-open") || {
-                        let blanket = shell_policy.enables_l2()
-                            || std::env::var("FILAMENT_L2").map(|x| x == "1").unwrap_or(false);
-                        let peer_has_shell = conn
-                            .link(&pid)
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(|n| device_allows(n, "shell"))
-                            .unwrap_or(false);
-                        l2_open_allowed(blanket, peer_has_shell)
-                    };
-                    // Capability-layer authorization: an owner-signed grant
-                    // overrides the default caps-array check. Only evaluated if
-                    // the blanket/grant check above denied the request.
-                    let authorized = authorized || {
+                        let legacy_ok = {
+                            let blanket = shell_policy.enables_l2()
+                                || std::env::var("FILAMENT_L2").map(|x| x == "1").unwrap_or(false);
+                            let peer_has_shell = conn
+                                .link(&pid)
+                                .and_then(|l| l.verified_name.as_deref())
+                                .map(|n| device_allows(n, "shell"))
+                                .unwrap_or(false);
+                            l2_open_allowed(blanket, peer_has_shell)
+                        };
+                        // Capability layer evaluated UNCONDITIONALLY (not short-
+                        // circuited on legacy) so shadow mode samples the legacy-
+                        // ALLOWED population, the only opens a flip can change.
+                        // Legacy stands in shadow; cap gates under the flag.
                         let link = conn.link(&pid);
                         let cap_auth = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -10974,11 +10975,9 @@ async fn recv_cmd(
                             "shell",
                             link.and_then(|l| l.identity_device_pub.as_ref()),
                             link.and_then(|l| l.identity_user_pub.as_ref()),
+                            legacy_ok,
                         );
-                        match cap_auth {
-                            crate::capability::Decision::Authorized => true,
-                            crate::capability::Decision::Denied(_) => false,
-                        }
+                        crate::capability::cap_gate_effective(legacy_ok, &cap_auth)
                     };
                     if !authorized {
                         let sid = v["sid"].as_u64().unwrap_or(0) as u32;
@@ -11064,13 +11063,15 @@ async fn recv_cmd(
                     // Granted if the device was explicitly `grant`ed shell OR an
                     // active `up --shell[-only]` policy auto-allows it. Trust
                     // (pair-proof) is still required either way.
-                    let granted = trusted
+                    let legacy_ok = trusted
                         && dev
                             .as_deref()
                             .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
                             .unwrap_or(false);
-                    // Capability-layer authorization override
-                    let granted = granted || {
+                    // Capability layer evaluated unconditionally (shadow samples the
+                    // legacy-allowed population); legacy stands in shadow, cap gates
+                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    let granted = {
                         let link = conn.link(&pid);
                         let cap_auth = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -11078,8 +11079,9 @@ async fn recv_cmd(
                             "shell",
                             link.and_then(|l| l.identity_device_pub.as_ref()),
                             link.and_then(|l| l.identity_user_pub.as_ref()),
+                            legacy_ok,
                         );
-                        matches!(cap_auth, crate::capability::Decision::Authorized)
+                        crate::capability::cap_gate_effective(legacy_ok, &cap_auth)
                     };
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -11156,13 +11158,15 @@ async fn recv_cmd(
                     }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    let granted = trusted
+                    let legacy_ok = trusted
                         && dev
                             .as_deref()
                             .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
                             .unwrap_or(false);
-                    // Capability-layer authorization override
-                    let granted = granted || {
+                    // Capability layer evaluated unconditionally (shadow samples the
+                    // legacy-allowed population); legacy stands in shadow, cap gates
+                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    let granted = {
                         let link = conn.link(&pid);
                         let cap_auth = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -11170,8 +11174,9 @@ async fn recv_cmd(
                             "shell",
                             link.and_then(|l| l.identity_device_pub.as_ref()),
                             link.and_then(|l| l.identity_user_pub.as_ref()),
+                            legacy_ok,
                         );
-                        matches!(cap_auth, crate::capability::Decision::Authorized)
+                        crate::capability::cap_gate_effective(legacy_ok, &cap_auth)
                     };
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -11302,22 +11307,23 @@ async fn recv_cmd(
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     if !l2::is_l2_sid(sid) { continue; }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    // Capability-layer authorization for mount
-                    let cap_ok = {
+                    // Capability layer for mount evaluated unconditionally (shadow
+                    // samples the legacy-allowed population); legacy (trusted) stands
+                    // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
+                    let authorized = {
                         let link = conn.link(&pid);
-                        matches!(
-                            crate::capability::cap_authorize(
-                                &crate::settings::config_dir(),
-                                "self",
-                                "mount",
-                                link.and_then(|l| l.identity_device_pub.as_ref()),
-                                link.and_then(|l| l.identity_user_pub.as_ref()),
-                            ),
-                            crate::capability::Decision::Authorized
-                        )
+                        let cap_auth = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "mount",
+                            link.and_then(|l| l.identity_device_pub.as_ref()),
+                            link.and_then(|l| l.identity_user_pub.as_ref()),
+                            trusted,
+                        );
+                        crate::capability::cap_gate_effective(trusted, &cap_auth)
                     };
-                    if !trusted && !cap_ok {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: untrusted peer" })).await;
+                    if !authorized {
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: not authorized" })).await;
                         continue;
                     }
                     let root_encoded = v["root"].as_str().unwrap_or(".");
@@ -11740,25 +11746,27 @@ async fn recv_cmd(
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let consented = v["__consent"].as_str() == Some(consent_token());
-                    // Capability-layer transfer authorization via owner-signed grant
+                    // Legacy (pre-capability) decision, per mode.
+                    let legacy_ok = if daemon {
+                        link_trusted
+                    } else {
+                        yes || consented || link_trusted || (is_resume && offset > 0)
+                    };
+                    // Capability layer evaluated unconditionally (shadow samples the
+                    // legacy-allowed population); legacy stands in shadow, cap gates
+                    // under FILAMENT_CAP_AUTHORITATIVE.
                     let cap_transfer = {
                         let link = conn.link(&pid);
-                        matches!(
-                            crate::capability::cap_authorize(
-                                &crate::settings::config_dir(),
-                                "self",
-                                "transfer",
-                                link.and_then(|l| l.identity_device_pub.as_ref()),
-                                link.and_then(|l| l.identity_user_pub.as_ref()),
-                            ),
-                            crate::capability::Decision::Authorized
+                        crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "transfer",
+                            link.and_then(|l| l.identity_device_pub.as_ref()),
+                            link.and_then(|l| l.identity_user_pub.as_ref()),
+                            legacy_ok,
                         )
                     };
-                    let ok = if daemon {
-                        link_trusted || cap_transfer
-                    } else {
-                        yes || consented || link_trusted || cap_transfer || (is_resume && offset > 0)
-                    };
+                    let ok = crate::capability::cap_gate_effective(legacy_ok, &cap_transfer);
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() {
                             pending.push_back((pid.clone(), v.clone()));
