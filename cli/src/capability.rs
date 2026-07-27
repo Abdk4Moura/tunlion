@@ -1126,9 +1126,6 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
 }
 
 /// Transfer-gate decision: under authoritative, a Deny from the capability
-/// layer must hard-decline the transfer (no accept prompt, send decline wire).
-/// In shadow, fall through to the legacy accept/consent path (report-only).
-/// Transfer-gate decision: under authoritative, a Deny from the capability
 /// layer returns `Some(reason)` and the caller must hard-decline immediately
 /// (no accept prompt, send decline wire with `reason`). In shadow, returns
 /// `None` and the legacy accept/consent path still decides (report-only).
