@@ -2508,6 +2508,99 @@ mod tests {
         assert!(find("transfer", true));
     }
 
+    /// Detector proof: one input per outcome bucket, asserting each increments
+    /// exactly the right global counter and no sibling. A mis-bucketed increment
+    /// would satisfy flip_ready() silently, so this proves the instrument before any
+    /// rig reading is trusted. Delta-based, since the counters are process-global.
+    #[test]
+    fn shadow_detector_proof_six_buckets() {
+        let uk = [0xaa; 32];
+
+        fn snap() -> [u64; 6] {
+            [
+                LA_AUTHORIZED.load(Ordering::Relaxed),
+                LA_DENIED.load(Ordering::Relaxed),
+                LA_NO_HEADER.load(Ordering::Relaxed),
+                LD_AUTHORIZED.load(Ordering::Relaxed),
+                LD_DENIED.load(Ordering::Relaxed),
+                LD_NO_HEADER.load(Ordering::Relaxed),
+            ]
+        }
+
+        // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
+        let before = snap();
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
+        assert_eq!(after[1] - before[1], 0);
+        assert_eq!(after[2] - before[2], 0);
+        assert_eq!(after[3] - before[3], 0);
+        assert_eq!(after[4] - before[4], 0);
+        assert_eq!(after[5] - before[5], 0);
+
+        // (legacy_allowed=true, Denied) -> LA_DENIED++
+        let before = snap();
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 0);
+        assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
+        assert_eq!(after[2] - before[2], 0);
+        assert_eq!(after[3] - before[3], 0);
+        assert_eq!(after[4] - before[4], 0);
+        assert_eq!(after[5] - before[5], 0);
+
+        // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
+        let before = snap();
+        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 0);
+        assert_eq!(after[1] - before[1], 0);
+        assert_eq!(after[2] - before[2], 1, "LA_NO_HEADER must increment");
+        assert_eq!(after[3] - before[3], 0);
+        assert_eq!(after[4] - before[4], 0);
+        assert_eq!(after[5] - before[5], 0);
+
+        // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
+        let before = snap();
+        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 0);
+        assert_eq!(after[1] - before[1], 0);
+        assert_eq!(after[2] - before[2], 0);
+        assert_eq!(after[3] - before[3], 1, "LD_AUTHORIZED must increment");
+        assert_eq!(after[4] - before[4], 0);
+        assert_eq!(after[5] - before[5], 0);
+
+        // (legacy_allowed=false, Denied) -> LD_DENIED++
+        let before = snap();
+        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 0);
+        assert_eq!(after[1] - before[1], 0);
+        assert_eq!(after[2] - before[2], 0);
+        assert_eq!(after[3] - before[3], 0);
+        assert_eq!(after[4] - before[4], 1, "LD_DENIED must increment");
+        assert_eq!(after[5] - before[5], 0);
+
+        // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
+        let before = snap();
+        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 0);
+        assert_eq!(after[1] - before[1], 0);
+        assert_eq!(after[2] - before[2], 0);
+        assert_eq!(after[3] - before[3], 0);
+        assert_eq!(after[4] - before[4], 0);
+        assert_eq!(after[5] - before[5], 1, "LD_NO_HEADER must increment");
+
+        // Same-bucket repeat proves no cross-contamination on a second call.
+        let before = snap();
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk));
+        let after = snap();
+        assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
+        assert_eq!(after[1] - before[1], 0);
+    }
+
     /// Grant must initialize the per-owner ratchet so evaluate() never hits
     /// "ratchet uninitialized". The grant command in main.rs constructs CapOp
     /// and CapHeader JSON directly (not via apply_cap_op / apply_header), so
