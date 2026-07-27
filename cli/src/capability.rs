@@ -675,7 +675,7 @@ pub fn update_ratchet(store: &mut Vec<Value>, owner_pub: &[u8; 32], issued_at: u
 /// Cache cap store reads per config_dir, invalidated on every write.
 /// Hot path: load_cap_store is called on every gated open; without this cache
 /// each open re-reads + re-parses caps.json.
-type CachedStore = (std::path::PathBuf, u64, Vec<Value>); // (path, mtime, parsed)
+type CachedStore = (std::path::PathBuf, u128, Vec<Value>); // (path, mtime_nanos, parsed)
 static CAP_CACHE: OnceLock<Mutex<Option<CachedStore>>> = OnceLock::new();
 
 fn cache_init() -> &'static Mutex<Option<CachedStore>> {
@@ -687,12 +687,14 @@ fn cache_init() -> &'static Mutex<Option<CachedStore>> {
 pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
     let p = config_dir.join("caps.json");
 
-    // Check mtime of the file for cache invalidation
+    // Check mtime of the file for cache invalidation. NANOSECOND precision:
+    // seconds-only mtime would serve stale data for two writes in the same second
+    // (a direct file rewrite that bypasses save_cap_store's explicit invalidation).
     let mtime = std::fs::metadata(&p)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
+        .map(|d| d.as_nanos());
 
     if let Some(mtime_val) = mtime {
         let cache = cache_init().lock().unwrap();
@@ -726,7 +728,7 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
 pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
     let p = config_dir.join("caps.json");
     if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
-    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store)))?;
+    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)?;
     // Invalidate cache: next load_cap_store will see the new mtime and re-read.
     let cache = cache_init();
     if let Ok(mut c) = cache.lock() {
@@ -3246,7 +3248,7 @@ mod tests {
     #[test]
     fn cache_matches_uncached_load() {
         let dir = temp_dir("cache-match");
-        let store = vec![json!({"op":"grant","perms":["shell"]})];
+        let store = vec![serde_json::json!({"op":"grant","perms":["shell"]})];
         save_cap_store(&dir, &store).unwrap();
         let loaded = load_cap_store(&dir);
         // Second load should be cached (same mtime)
@@ -3258,12 +3260,12 @@ mod tests {
     #[test]
     fn cache_invalidated_on_save() {
         let dir = temp_dir("cache-inval");
-        let store = vec![json!({"perm":"shell"})];
+        let store = vec![serde_json::json!({"perm":"shell"})];
         save_cap_store(&dir, &store).unwrap();
         assert_eq!(load_cap_store(&dir).len(), 1);
 
         // Mutate and save: invalidate cache
-        let updated = vec![json!({"perm":"shell"}), json!({"perm":"deploy"})];
+        let updated = vec![serde_json::json!({"perm":"shell"}), serde_json::json!({"perm":"deploy"})];
         save_cap_store(&dir, &updated).unwrap();
 
         let loaded = load_cap_store(&dir);
