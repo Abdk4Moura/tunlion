@@ -2500,6 +2500,24 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                     ));
                 }
             }
+            // Per-action breakdown: the coverage matrix for the flip decision.
+            if let Some(by_action) = v.get("by_action").and_then(|v| v.as_array()) {
+                if !by_action.is_empty() {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  coverage matrix (per-action):"));
+                    for a in by_action {
+                        let action = a["action"].as_str().unwrap_or("?");
+                        let la = a["la_authorized"].as_u64().unwrap_or(0);
+                        let ld = a["la_denied"].as_u64().unwrap_or(0);
+                        let ln = a["la_no_header"].as_u64().unwrap_or(0);
+                        let wa = a["ld_authorized"].as_u64().unwrap_or(0);
+                        let wd = a["ld_denied"].as_u64().unwrap_or(0);
+                        let wn = a["ld_no_header"].as_u64().unwrap_or(0);
+                        ui::say(&format!(
+                            "    {action}: la_ok={la} la_deny={ld} la_nh={ln} | widen={wa} ld_deny={wd} ld_nh={wn}"
+                        ));
+                    }
+                }
+            }
         }
         None => {
             ui::say(&format!("  {} daemon not running; counters are zero in a fresh process", ui::paint(ui::Tone::Dim, "·")));
@@ -3251,26 +3269,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                                                                                         peer_identity_cert = Some(cert);
                 }
             }
-            // Per-action breakdown: the coverage matrix for the flip decision.
-            if let Some(by_action) = v.get("by_action").and_then(|v| v.as_array()) {
-                if !by_action.is_empty() {
-                    ui::say(&ui::paint(ui::Tone::Dim, "  coverage matrix (per-action):"));
-                    for a in by_action {
-                        let action = a["action"].as_str().unwrap_or("?");
-                        let la = a["la_authorized"].as_u64().unwrap_or(0);
-                        let ld = a["la_denied"].as_u64().unwrap_or(0);
-                        let ln = a["la_no_header"].as_u64().unwrap_or(0);
-                        let wa = a["ld_authorized"].as_u64().unwrap_or(0);
-                        let wd = a["ld_denied"].as_u64().unwrap_or(0);
-                        let wn = a["ld_no_header"].as_u64().unwrap_or(0);
-                        ui::say(&format!(
-                            "    {action}: la_ok={la} la_deny={ld} la_nh={ln} | widen={wa} ld_deny={wd} ld_nh={wn}"
-                        ));
-                    }
                 }
             }
-        }
-                                                                        }
                                                                     }
                                                                 }
                                                             }
