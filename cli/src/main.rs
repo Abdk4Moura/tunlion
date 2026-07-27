@@ -2369,16 +2369,28 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                 ui::say(summary);
             }
             let flip = v["flip_ready"].as_bool().unwrap_or(false);
-            let marker = if flip {
-                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            let widening = if let Some(counts) = v.get("counts") {
+                counts["ld_authorized"].as_u64().unwrap_or(0)
             } else {
-                ui::paint(ui::Tone::Warn, "x")
+                0
             };
-            ui::say(&format!(
-                "  flip_ready: {} {}",
-                marker,
-                if flip { "ready (la_authorized>0, la_denied==0, la_no_header==0)" } else { "not ready" }
-            ));
+            if flip && widening == 0 {
+                ui::say(&format!(
+                    "  flip_ready: {} ready (la_authorized>0, la_denied==0, la_no_header==0)",
+                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ));
+            } else if flip {
+                ui::say(&format!(
+                    "  flip_ready: {} breakage-clean, but {} WIDENING opens will be NEWLY PERMITTED; review and cite them before flipping",
+                    ui::paint(ui::Tone::Warn, "x"),
+                    widening,
+                ));
+            } else {
+                ui::say(&format!(
+                    "  flip_ready: {} not ready",
+                    ui::paint(ui::Tone::Warn, "x"),
+                ));
+            }
             if let Some(counts) = v.get("counts") {
                 ui::say(&format!(
                     "  la_authorized={}  la_denied={}  la_no_header={}",
@@ -2387,7 +2399,7 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                     counts["la_no_header"].as_u64().unwrap_or(0),
                 ));
                 ui::say(&format!(
-                    "  ld_authorized={}  ld_denied={}  ld_no_header={}",
+                    "  WIDENING(ld_authorized)={}  ld_denied={}  ld_no_header={}",
                     counts["ld_authorized"].as_u64().unwrap_or(0),
                     counts["ld_denied"].as_u64().unwrap_or(0),
                     counts["ld_no_header"].as_u64().unwrap_or(0),
