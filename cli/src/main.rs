@@ -1535,7 +1535,8 @@ fn resolve_peer_identity(link: &mut Link) {
     }
     link.identity_device_pub = Some(cert.device_pub);
     link.identity_user_pub = Some(cert.user_pub);
-    link.identity_binding = BindingStrength::Inferred;
+    link.identity_binding = crate::capability::BindingStrength::Inferred;
+    link.identity_cert_expires = Some(cert.expires);
 }
 
 /// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
@@ -3400,20 +3401,9 @@ struct Link {
     /// Identity cert user_pub (set when identity-expose is verified).
     identity_user_pub: Option<[u8; 32]>,
     /// Binding strength of the identity fields (set alongside them).
-    identity_binding: BindingStrength,
-}
-
-/// How the peer's identity was bound to this link.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindingStrength {
-    /// Default: identity not yet populated.
-    None,
-    /// Proven via device_priv possession signature (identity-expose handler).
-    Proven,
-    /// Inferred from symmetric pairing-secret proof + name-to-cert lookup
-    /// (resolve_peer_identity). A Proven binding must NOT be downgraded
-    /// to Inferred; an Inferred MAY be upgraded to Proven.
-    Inferred,
+    identity_binding: crate::capability::BindingStrength,
+    /// Identity cert expiry (unix seconds). None = no cert resolved.
+    identity_cert_expires: Option<u64>,
 }
 
 impl Link {
@@ -4531,7 +4521,8 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
-                identity_binding: BindingStrength::None,
+                identity_binding: crate::capability::BindingStrength::None,
+                identity_cert_expires: None,
             },
         );
         Ok(())
@@ -4960,7 +4951,8 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
-                identity_binding: BindingStrength::None,
+                identity_binding: crate::capability::BindingStrength::None,
+                identity_cert_expires: None,
             },
         );
         }
@@ -5847,7 +5839,8 @@ impl Conn {
                 established_at: Some(Instant::now()),
                 identity_device_pub: None,
                 identity_user_pub: None,
-                identity_binding: BindingStrength::None,
+                identity_binding: crate::capability::BindingStrength::None,
+                identity_cert_expires: None,
             },
         );
     }
@@ -11217,6 +11210,8 @@ async fn recv_cmd(
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -11224,7 +11219,7 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr);
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -11333,6 +11328,8 @@ async fn recv_cmd(
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -11340,7 +11337,7 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -11435,6 +11432,8 @@ async fn recv_cmd(
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -11442,7 +11441,7 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -11586,6 +11585,8 @@ async fn recv_cmd(
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -11593,7 +11594,7 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr)
+                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires)
                     };
                     if !authorized.allowed() {
                         let who = conn
@@ -11926,7 +11927,8 @@ async fn recv_cmd(
                                                                             if let Some(l) = conn.link_mut(&pid) {
                                                                                 l.identity_device_pub = Some(cert.device_pub);
                                                                                 l.identity_user_pub = Some(cert.user_pub);
-                                                                                l.identity_binding = BindingStrength::Proven;
+                                                                                l.identity_binding = crate::capability::BindingStrength::Proven;
+                                                                                l.identity_cert_expires = Some(cert.expires);
                                                                             }
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
@@ -12046,6 +12048,8 @@ async fn recv_cmd(
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -12053,7 +12057,7 @@ async fn recv_cmd(
                             idev,
                             iusr,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr);
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {

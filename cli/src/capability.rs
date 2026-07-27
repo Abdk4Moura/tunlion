@@ -278,7 +278,7 @@ pub enum Decision {
 /// refused (`Denied`, a real disagreement). Absent means "provision this node";
 /// denied means "the grants disagree". Conflating them floods the shadow log and
 /// makes the flip criterion unsatisfiable.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapOutcome {
     Authorized,
     Denied(String),
@@ -939,12 +939,57 @@ impl GateDecision {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingStrength {
+    None,
+    Proven,
+    Inferred,
+}
+
+/// Purely restrictive: under authoritative, downgrades Authorized→Denied when
+/// binding is not Proven. Denied/Unprovisioned pass through; shadow passes through.
+pub fn cap_authorize_proven(
+    outcome: &CapOutcome,
+    binding: BindingStrength,
+    authoritative: bool,
+) -> CapOutcome {
+    if !authoritative || binding == BindingStrength::Proven {
+        return outcome.clone();
+    }
+    match outcome {
+        CapOutcome::Authorized => CapOutcome::Denied("identity not proven".into()),
+        _ => outcome.clone(),
+    }
+}
+
+/// Purely restrictive: under authoritative, downgrades Authorized→Denied when
+/// the cert is expired or expiry is unknown (None = fail-closed).
+pub fn cap_authorize_expired(
+    outcome: &CapOutcome,
+    cert_expires: Option<u64>,
+    authoritative: bool,
+) -> CapOutcome {
+    if !authoritative {
+        return outcome.clone();
+    }
+    let expired = match cert_expires {
+        None => true,
+        Some(exp) => now_secs() >= exp,
+    };
+    if expired {
+        match outcome {
+            CapOutcome::Authorized => CapOutcome::Denied("cert expired".into()),
+            _ => outcome.clone(),
+        }
+    } else {
+        outcome.clone()
+    }
+}
+
 /// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
 /// modes (so observability survives the flip), logs, and returns the effective gate
-/// decision: the legacy decision stands in shadow; the cap outcome gates under
-/// FILAMENT_CAP_AUTHORITATIVE. `legacy_allowed` is the pre-capability gate's
-/// decision for this same open; it buckets the counters and is the effective answer
-/// in shadow.
+/// decision. `binding` and `cert_expires` are transport/policy facts composed under
+/// authoritative (purely restrictive).
 pub fn cap_gate_effective(
     legacy_allowed: bool,
     outcome: &CapOutcome,
@@ -952,8 +997,19 @@ pub fn cap_gate_effective(
     resource: &str,
     device_pub: Option<&[u8; 32]>,
     user_pub: Option<&[u8; 32]>,
+    binding: BindingStrength,
+    cert_expires: Option<u64>,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
+
+    // Compose restrictive gates under authoritative (order-independent:
+    // both are purely restrictive — Authorized→Denied or pass-through).
+    let outcome = &cap_authorize_proven(
+        outcome, binding, authoritative,
+    );
+    let outcome = &cap_authorize_expired(
+        outcome, cert_expires, authoritative,
+    );
 
     // Counters: recorded in BOTH modes so a flip does not blind us.
     // Per-action bucketing runs in parallel so the flip decision can cite
@@ -2506,12 +2562,12 @@ mod tests {
         let uk = [0xaa; 32];
         // Legacy-allowed, cap denies (Unprovisioned) → la_no_header
         for action in ["shell", "mount"] {
-            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk));
+            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk));
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         // Legacy-denied, cap authorizes → ld_authorized (widening)
-        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk));
+        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
 
         let ac = cap_action_counts();
         // shell: la_no_header=2 (two calls but second is mount, first is shell? Wait...)
@@ -2573,7 +2629,7 @@ mod tests {
 
         // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk));
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -2584,7 +2640,7 @@ mod tests {
 
         // (legacy_allowed=true, Denied) -> LA_DENIED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk));
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
@@ -2595,7 +2651,7 @@ mod tests {
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk));
+        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2606,7 +2662,7 @@ mod tests {
 
         // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk));
+        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2617,7 +2673,7 @@ mod tests {
 
         // (legacy_allowed=false, Denied) -> LD_DENIED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk));
+        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2628,7 +2684,7 @@ mod tests {
 
         // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk));
+        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2639,7 +2695,7 @@ mod tests {
 
         // Same-bucket repeat proves no cross-contamination on a second call.
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk));
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -3047,5 +3103,65 @@ mod tests {
         // Allow always returns None
         assert!(transfer_gate_decision(&GateDecision::Allow, true).is_none());
         assert!(transfer_gate_decision(&GateDecision::Allow, false).is_none());
+    }
+
+    #[test]
+    fn cap_authorize_proven_purely_restrictive() {
+        // All arms: (Authorized/Denied/Unprovisioned) × (Proven/Inferred/None) × (auth/shadow)
+        let auth = CapOutcome::Authorized;
+        let deny = CapOutcome::Denied("no grant".into());
+        let unprov = CapOutcome::Unprovisioned;
+
+        // Authorized + Proven + authoritative → passes through
+        assert_eq!(cap_authorize_proven(&auth, BindingStrength::Proven, true), CapOutcome::Authorized);
+        // Authorized + Inferred + authoritative → downgraded
+        assert!(matches!(cap_authorize_proven(&auth, BindingStrength::Inferred, true), CapOutcome::Denied(_)));
+        // Authorized + None + authoritative → downgraded
+        assert!(matches!(cap_authorize_proven(&auth, BindingStrength::None, true), CapOutcome::Denied(_)));
+        // Authorized + Inferred + shadow → passes through (no downgrade)
+        assert_eq!(cap_authorize_proven(&auth, BindingStrength::Inferred, false), CapOutcome::Authorized);
+        // Denied + Inferred + authoritative → stays Denied (no laundering)
+        assert_eq!(cap_authorize_proven(&deny, BindingStrength::Inferred, true), deny);
+        // Unprovisioned + Inferred + authoritative → stays Unprovisioned
+        assert_eq!(cap_authorize_proven(&unprov, BindingStrength::Inferred, true), unprov);
+    }
+
+    #[test]
+    fn cap_authorize_expired_purely_restrictive() {
+        let auth = CapOutcome::Authorized;
+        let deny = CapOutcome::Denied("no grant".into());
+
+        let future = now_secs() + 86400;
+        let past = now_secs().saturating_sub(86400);
+
+        // Authorized + valid cert + authoritative → passes
+        assert_eq!(cap_authorize_expired(&auth, Some(future), true), CapOutcome::Authorized);
+        // Authorized + expired cert + authoritative → downgraded
+        assert!(matches!(cap_authorize_expired(&auth, Some(past), true), CapOutcome::Denied(_)));
+        // Authorized + None expiry + authoritative → downgraded (fail-closed)
+        assert!(matches!(cap_authorize_expired(&auth, None, true), CapOutcome::Denied(_)));
+        // Authorized + expired + shadow → passes through
+        assert_eq!(cap_authorize_expired(&auth, Some(past), false), CapOutcome::Authorized);
+        // Denied + expired + authoritative → stays Denied
+        assert_eq!(cap_authorize_expired(&deny, Some(past), true), deny);
+    }
+
+    #[test]
+    fn cap_authorize_proven_expired_composed() {
+        let auth = CapOutcome::Authorized;
+        let future = now_secs() + 86400;
+        let past = now_secs().saturating_sub(86400);
+
+        // Proven + valid → passes
+        let r = cap_authorize_proven(&auth, BindingStrength::Proven, true);
+        assert_eq!(cap_authorize_expired(&r, Some(future), true), CapOutcome::Authorized);
+
+        // Inferred + valid → denied (proven gate wins)
+        let r2 = cap_authorize_proven(&auth, BindingStrength::Inferred, true);
+        assert!(matches!(r2, CapOutcome::Denied(_)));
+
+        // Proven + expired → denied (expiry gate wins)
+        let r3 = cap_authorize_proven(&auth, BindingStrength::Proven, true);
+        assert!(matches!(cap_authorize_expired(&r3, Some(past), true), CapOutcome::Denied(_)));
     }
 }
