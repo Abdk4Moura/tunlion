@@ -12036,7 +12036,7 @@ async fn recv_cmd(
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
                     // under FILAMENT_CAP_AUTHORITATIVE.
-                    let (ok, xfer_deny_reason) = {
+                    let (ok, xfer_deny_reason, xfer_gate) = {
                         // Lazy-resolve peer identity from stored device cert
                         {
                             if let Some(l) = conn.link_mut(&pid) {
@@ -12059,8 +12059,17 @@ async fn recv_cmd(
                         } else {
                             None
                         };
-                        (d.allowed(), reason)
+                        (d.allowed(), reason, d)
                     };
+                    // Under authoritative, a capability Deny hard-declines
+                    // immediately: no prompt, skip the accept path entirely.
+                    if let Some(reason) = crate::capability::transfer_gate_decision(&xfer_gate) {
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!(
+                            "  declined {name} from {sender_name} ({reason})",
+                        )));
+                        t.send_control(&protocol::decline_msg(&id)).await?;
+                        continue;
+                    }
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() {
                             pending.push_back((pid.clone(), v.clone()));

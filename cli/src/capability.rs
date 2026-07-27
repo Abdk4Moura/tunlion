@@ -1125,6 +1125,23 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
     content
 }
 
+/// Transfer-gate decision: under authoritative, a Deny from the capability
+/// layer must hard-decline the transfer (no accept prompt, send decline wire).
+/// In shadow, fall through to the legacy accept/consent path (report-only).
+/// Transfer-gate decision: under authoritative, a Deny from the capability
+/// layer returns `Some(reason)` and the caller must hard-decline immediately
+/// (no accept prompt, send decline wire with `reason`). In shadow, returns
+/// `None` and the legacy accept/consent path still decides (report-only).
+pub fn transfer_gate_decision(gate: &GateDecision) -> Option<String> {
+    match gate {
+        GateDecision::Allow => None,
+        GateDecision::Deny {
+            cap_reason: Some(reason),
+        } if cap_authoritative() => Some(reason.clone()),
+        _ => None, // shadow, or legacy-only deny without cap reason
+    }
+}
+
 /// A single authorization query for preview enumeration.
 pub struct AuthQuery {
     pub principal_device_pub: [u8; 32],
@@ -3005,5 +3022,22 @@ mod tests {
         let out_shadow = reconcile_shell_keys(&revoked, mock_ak, false);
         assert!(crate::sshkeys::has_block(&out_shadow, "bob"),
             "shadow: block must NOT be removed — report-only");
+    }
+
+    /// Transfer gate: under authoritative + Deny → hard-decline (Some(reason));
+    /// under shadow + Deny → fall through (None, legacy consent path decides).
+    #[test]
+    fn transfer_gate_hard_decline_under_authoritative() {
+        // Deny with a cap reason
+        let deny = GateDecision::Deny {
+            cap_reason: Some("not authorized".into()),
+        };
+        // Under shadow (default, FILAMENT_CAP_AUTHORITATIVE not set), no hard-decline
+        let r_shadow = transfer_gate_decision(&deny);
+        assert!(r_shadow.is_none(), "shadow: must fall through to legacy consent");
+
+        // Allow always returns None
+        let r_allow = transfer_gate_decision(&GateDecision::Allow);
+        assert!(r_allow.is_none(), "Allow never hard-declines");
     }
 }
