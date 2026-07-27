@@ -2315,7 +2315,13 @@ async fn up_cmd(
     {
         let config_dir = crate::settings::config_dir();
         let authoritative = crate::capability::cap_authoritative();
+        let ak_path = sshkeys::authorized_keys_path();
+        let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
         for device in crate::capability::devices_with_shell_revoked(&config_dir) {
+            // Only act on devices that actually have a managed block.
+            if !sshkeys::has_block(&ak_content, &device) {
+                continue;
+            }
             if authoritative {
                 if let Err(e) = sshkeys::remove_authorized_key(&device) {
                     eprintln!("shell-key reconcile (startup): failed to remove key for '{device}': {e}");
@@ -7332,16 +7338,23 @@ async fn main() -> Result<()> {
                 // + ratchet), not two.
                 crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
                     .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
-                let _ = crate::capability::save_cap_store(&config_dir, &store);
-                // Shell-key reconciler, GATED on authoritative: in shadow, only
-                // REPORT what would be removed (never wipe a working key while the
-                // cap store is not yet the authority, else granting one device
-                // revokes every device without a cap grant).
+                // save_and_list_revoked: persist THEN reconcile (reconciliation
+                // is a property of the write). GATED on authoritative: in shadow
+                // only REPORT what would be removed.
+                let revoked = crate::capability::save_and_list_revoked(&store, &config_dir)
+                    .context("save cap store")?;
                 {
                     let authoritative = crate::capability::cap_authoritative();
-                    for device in crate::capability::devices_with_shell_revoked(&config_dir) {
+                    let ak_path = sshkeys::authorized_keys_path();
+                    let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+                    for device in &revoked {
+                        // Only act on devices that actually have a managed block
+                        // (authorized_keys is human-editable — avoid noise rewrites).
+                        if !sshkeys::has_block(&ak_content, device) {
+                            continue;
+                        }
                         if authoritative {
-                            if let Err(e) = sshkeys::remove_authorized_key(&device) {
+                            if let Err(e) = sshkeys::remove_authorized_key(device) {
                                 eprintln!("shell-key reconcile: failed to remove key for '{device}': {e}");
                             }
                         } else {

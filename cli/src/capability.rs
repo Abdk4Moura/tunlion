@@ -682,11 +682,25 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Persist the capability store to `caps.json`.
-pub fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
+/// Persist the capability store to `caps.json` (module-internal).
+/// Callers MUST use `save_and_list_revoked` so reconciliation is a property
+/// of the write — a future sync path cannot forget it.
+pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
     let p = config_dir.join("caps.json");
     if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
     std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)
+}
+
+/// Persist the cap store, then return the devices whose shell keys must be
+/// reconciled. Reconciliation is a property of the WRITE: any code path that
+/// saves the cap store MUST process the returned list (gated on authoritative,
+/// filtered by `sshkeys::has_block`), so a future sync path cannot forget it.
+pub fn save_and_list_revoked(
+    store: &[Value],
+    config_dir: &std::path::Path,
+) -> std::io::Result<Vec<String>> {
+    save_cap_store(config_dir, store)?;
+    Ok(devices_with_shell_revoked(config_dir))
 }
 
 /// Returns true when capability enforcement is AUTHORITATIVE (live-gating).
@@ -2863,6 +2877,96 @@ mod tests {
         let after = devices_with_shell_revoked(&tmp);
         assert_eq!(after, vec!["bob".to_string()],
             "device must appear in revoked list after shell revoke (authorized_keys block still exists — reconciler needed)");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// E2E: after revoke + reconciler, NO filament-managed authorized_keys
+    /// block remains. Exercises the full pipeline: devices_with_shell_revoked
+    /// → strip_block → block gone.
+    #[test]
+    fn shell_revoke_e2e_block_removed_after_reconcile() {
+        let owner = make_owner();
+        let nonce = self_resource_nonce();
+        let pk = owner_pub(&owner);
+        let resource = self_resource_id(&pk);
+        let target = CapTarget::Device([0xcc; 32]);
+        let bob_user_pub = [0xaa; 32];
+
+        let mut hdr = CapHeader {
+            resource: resource.clone(),
+            epoch: 0,
+            owner_pub: pk,
+            nonce,
+            floors: vec![],
+            issued_at: now_secs(),
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        hdr.sig = sign_cap_header(&hdr, &owner);
+        let store_hdr = CapHeader { resource: "self".to_string(), ..hdr.clone() };
+
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, "self", &["shell"], v1, 86400);
+        let v2 = hlc_next(v1, now_ms());
+        let revoke = make_revoke(&owner, target, "self", v2, 86400);
+
+        let cert_json = serde_json::json!({
+            "devicePub": hex::encode([0xcc; 32]),
+            "userPub": hex::encode(bob_user_pub),
+            "expires": now_secs() + 90 * 24 * 3600,
+            "issued": now_secs(),
+            "sig": hex::encode([0u8; 64]),
+        });
+
+        let tmp = std::env::temp_dir().join(format!("fil-recon2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 1. Setup: grant shell, write caps.json + devices.json
+        let mut store = vec![];
+        let mut hdr_json = hdr.to_json();
+        hdr_json["resource"] = serde_json::json!("self");
+        store.push(hdr_json);
+        apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+
+        let devices = vec![serde_json::json!({
+            "name": "bob",
+            "secret": "aa".repeat(32),
+            "v": 2,
+            "caps": ["transfer"],
+            "deviceCert": cert_json,
+            "userKey": hex::encode(bob_user_pub),
+        })];
+        std::fs::write(&tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
+
+        // 2. Mock authorized_keys with managed block for "bob"
+        let mock_ak = format!(
+            "# BEGIN filament-managed bob\nssh-ed25519 AAAAfake filament-managed\n# END filament-managed bob\n"
+        );
+        assert!(crate::sshkeys::has_block(&mock_ak, "bob"));
+        assert!(crate::sshkeys::has_block(&mock_ak, "bob"));
+
+        // 3. Apply revoke, save caps.json
+        apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+
+        // 4. Reconciler pipeline: devices_with_shell_revoked → strip_block → block gone
+        let revoked = devices_with_shell_revoked(&tmp);
+        assert!(revoked.contains(&"bob".to_string()),
+            "bob must appear in revoked list after shell revoke");
+
+        // Simulate what the caller (Cmd::Grant / daemon-start) does:
+        // for each revoked device, strip its block from the mock authorized_keys
+        let mut cleaned = mock_ak.clone();
+        for device in &revoked {
+            cleaned = crate::sshkeys::strip_block(&cleaned, device);
+        }
+
+        // Verify the block is actually removed
+        assert!(!crate::sshkeys::has_block(&cleaned, "bob"),
+            "e2e: after reconcile, NO filament-managed authorized_keys block must remain for bob");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
