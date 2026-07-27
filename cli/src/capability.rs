@@ -714,7 +714,7 @@ static LD_DENIED: AtomicU64 = AtomicU64::new(0); // legacy DENIED, header exists
 static LD_NO_HEADER: AtomicU64 = AtomicU64::new(0); // legacy DENIED, resource unprovisioned
 
 /// Shadow counts, bucketed by legacy outcome and cap outcome.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ShadowCounts {
     pub la_authorized: u64,
     pub la_denied: u64,
@@ -779,18 +779,23 @@ impl ShadowCounts {
     }
 }
 
-/// Log an unprovisioned resource ONCE (not per open), so a fresh node with no
-/// capability header does not flood stderr during entirely normal operation.
-fn log_no_header_once(resource: &str) {
+/// Log `msg` at most once per distinct `key` for the process lifetime, so shadow
+/// diagnostics that recur per open (unprovisioned resources, widening opens) do not
+/// flood. The reviewer needs the SET of distinct cases to enumerate; the lossless
+/// volume already lives in the counters. The dedup set is CAPPED, because a key
+/// space like distinct device_pubs is unbounded; past the cap, new keys stop logging
+/// (their count is still counted), bounding memory.
+fn log_once(key: String, msg: &str) {
+    const LOG_ONCE_CAP: usize = 4096;
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     if let Ok(mut g) = seen.lock() {
-        if g.insert(resource.to_string()) {
-            eprintln!(
-                "CAP-SHADOW [unprovisioned]: resource '{resource}' has no capability header; opens rely on legacy authz. Expected until you provision (filament grant/init); not a disagreement."
-            );
+        if g.contains(&key) || g.len() >= LOG_ONCE_CAP {
+            return;
         }
+        g.insert(key);
+        eprintln!("{msg}");
     }
 }
 
@@ -894,14 +899,22 @@ pub fn cap_gate_effective(
                     cap_shadow_counts().summary(),
                 );
             }
-            (true, CapOutcome::Unprovisioned) => log_no_header_once(resource),
-            (false, CapOutcome::Authorized) => {
-                eprintln!(
-                    "CAP-SHADOW WIDENING: '{action}' on '{resource}' for dev={} user={} was REFUSED by legacy but cap AUTHORIZES; a flip will NEWLY PERMIT this open. This is the direction to scrutinize; cite it in the flip decision.",
+            (true, CapOutcome::Unprovisioned) => log_once(
+                format!("nh|{resource}"),
+                &format!(
+                    "CAP-SHADOW [unprovisioned]: resource '{resource}' has no capability header; opens rely on legacy authz. Expected until you provision (filament grant/init); not a disagreement."
+                ),
+            ),
+            // Dedupe WIDENING by the (action, resource, device) triple: the reviewer
+            // needs the distinct SET to enumerate, not one line per retry, and the
+            // count is preserved losslessly in ld_authorized.
+            (false, CapOutcome::Authorized) => log_once(
+                format!("wd|{action}|{resource}|{}", hex::encode(dev)),
+                &format!(
+                    "CAP-SHADOW WIDENING: '{action}' on '{resource}' for dev={} was REFUSED by legacy but cap AUTHORIZES; a flip will NEWLY PERMIT this open. Enumerate this (action, resource, device) in the flip decision.",
                     hex::encode(dev),
-                    hex::encode(usr),
-                );
-            }
+                ),
+            ),
             _ => {}
         }
     } else if !effective {
