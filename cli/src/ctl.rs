@@ -48,7 +48,9 @@ pub fn reuse_disabled() -> bool {
     };
 
 #[cfg(not(unix))]
-pub use stub::{try_ping, Req};
+pub use stub::{
+    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_ping, Req,
+};
 
 // --------------------------------------------------------------- unix impl ----
 #[cfg(unix)]
@@ -735,6 +737,31 @@ mod stub {
     /// back to a fresh establish. Present so the `via_daemon`-gated call sites —
     /// dead here, since `via_daemon` is always false on non-unix — still compile.
     pub async fn try_ping(_peer: &str) -> Option<Value> {
+        None
+    }
+
+    /// No control socket on this platform, so there is no daemon to query for
+    /// capability status. Callers treat `None` as "no daemon reply" and degrade
+    /// gracefully. Present so the unconditional call sites compile on non-unix.
+    pub async fn try_cap_status() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so there is no daemon consent queue to list.
+    /// Callers treat `None` as "no daemon reply" and degrade gracefully.
+    pub async fn try_list_pending() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so there is no daemon consent queue to approve
+    /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
+    pub async fn try_approve_request(_id: u64) -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so there is no daemon consent queue to deny
+    /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
+    pub async fn try_deny_request(_id: u64) -> Option<Value> {
         None
     }
 }
