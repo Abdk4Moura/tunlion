@@ -103,13 +103,24 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
       detector-proof.
 - [x] Authoritative grant / evaluate / cap-status display: confirmed working under
       `FILAMENT_CAP_AUTHORITATIVE=1`.
-- [ ] Live-traffic authoritative ENFORCEMENT matrix (granted->allow, revoked->deny +
-      key removed, ungranted->deny, Inferred->deny, trust-floor, rollback): NOT yet run.
-      Blocked on the same-box rig by transport (signaling `api.filament.autumated.com`
-      503; same-box direct/loopback also won't establish). Controlled-proven to be a
-      transport-layer limitation, not authoritative-mode-specific (a fresh SHADOW daemon
-      fails transport identically). Run this on a CROSS-MACHINE rig (do-vm <-> other-do)
-      when signaling is healthy before a production flip.
+- [~] Live-traffic authoritative ENFORCEMENT: PARTIAL, proven cross-machine (do-vm <->
+      4-days-late/other-do over Tailscale, same DC, 2026-07-28). The same-box rig could
+      not establish transport (a same-box/loopback limitation, NOT a cap issue); the
+      cross-machine rig works. Demonstrated on real cross-machine traffic:
+        * transport + file transfer establish and complete cross-machine;
+        * the cap gate FIRES on real traffic (counters move, coverage matrix records);
+        * DENY-BY-DEFAULT enforced: an unprovisioned transfer that legacy ALLOWS (delivered
+          in shadow) is DECLINED under FILAMENT_CAP_AUTHORITATIVE=1;
+        * #19 real reason surfaced: "resource unprovisioned (no capability header); run
+          filament grant/init" (the true cap cause, not a legacy assertion);
+        * ROLLBACK: unsetting the flag returns to legacy gating, the transfer delivers again;
+        * SANDBOX HELD: the live destructive reconciler ran under sandboxed HOME; do-vm's
+          real ~/.ssh/authorized_keys byte-identical before/after.
+      STILL OWED (needs identity-EXPOSE so a grant binds to the peer's user_pub; the plain
+      transfer flow exchanges only the pair secret, not the device cert): the positive
+      granted->ALLOW path, and revoked->deny+key-removed (#24 live). Those need a session
+      that runs identity-expose (shell/l2 path or an explicit identity exchange). Finish
+      the ALLOW and REVOKE-key cases on the same cross-machine rig before a production flip.
 
 ## Rollback
 
