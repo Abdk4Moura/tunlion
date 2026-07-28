@@ -3060,15 +3060,14 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
     // Join enrollment rendezvous channel derived from owner's public key.
-    // Network-independent — join as ROOM so PeerJoined fires.
+    // Enroller sets its own room (so signals route) + subscribes to the
+    // enrollment channel. Discovery via KnownPeer on shared channel.
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(format!("enrollup-{}", fresh_secret()));
     sess.channels = vec![enroll_chan.clone()];
-    // JOIN the enroll room (owner daemon is in the same room) so peer-joined
-    // fires on both sides and the WebRTC offers route. A channel SUBSCRIBE does
-    // not bridge signal routing between two peers that share no room.
-    sess.room = Some(enroll_chan.clone());
-    sess.emit(&sio, "join", json!({ "room": enroll_chan.clone(), "name": display_name(), "uid": my_uid.clone() })).await;
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(
         server,
@@ -3268,8 +3267,9 @@ async fn enroll_and_send_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = vec![enroll_chan.clone()];
-    sess.room = Some(enroll_chan.clone());
-    sess.emit(&sio, "join", json!({ "room": enroll_chan.clone(), "name": display_name(), "uid": my_uid.clone() })).await;
+    sess.room = Some(format!("enrollup-{}", fresh_secret()));
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -3501,8 +3501,9 @@ async fn enroll_and_netcat_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = vec![enroll_chan.clone()];
-    sess.room = Some(enroll_chan.clone());
-    sess.emit(&sio, "join", json!({ "room": enroll_chan.clone(), "name": display_name(), "uid": my_uid.clone() })).await;
+    sess.room = Some(format!("enrollup-{}", fresh_secret()));
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -10872,25 +10873,19 @@ async fn recv_cmd(
             recv_pake_template = None; // no code claim, no ephemeral PAKE
             // C19: the daemon joins NO room. Presence-channel subscriptions
             // only, strangers can't see it, probe it, or offer to it.
-            // Enroll rendezvous: arm-gated on an outstanding non-expired auth key.
-            // Joins the enroll ROOM derived from owner_pub only when armed — this
-            // bounds the presence oracle to the auth-key TTL window. Unarmed daemon
-            // stays in its unguessable solo room only (invisible).
+            // Enrollment rendezvous: subscribe to enroll_channel(owner_pub)
+            // when armed (outstanding non-expired auth key). Channel-based
+            // (not room) because the server supports 1 room/socket and we
+            // need the solo room for known-device discovery.
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
             if crate::ephemeral::is_armed() {
-                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
-                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-                    sess.enroll_room = Some(ek.clone());
-                    sess.emit(&sio, "join", json!({ "room": ek, "name": display_name(), "uid": my_uid })).await;
-                }
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
-                ui::debug("enrollment closed (no armed keys — 'filament ephemeral mint' to arm)");
+                ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-            // Subscribe to enrollment rendezvous channel (also arm-gated).
             let mut c = chans;
             if crate::ephemeral::is_armed() {
                 if let Ok(Some(uk)) = crate::identity::UserKey::load() {
@@ -11718,17 +11713,18 @@ async fn recv_cmd(
                                 sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
                             }
         sess.tick(&sio).await;
-        // Arm-gate: rejoin/leave enroll room based on armed set
-        {
+        // Arm-gate: toggle enrollment channel subscription based on armed set.
+        // Channel-based (not room) because the server supports 1 room/socket.
+        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+            let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
             let armed = crate::ephemeral::is_armed();
-            if armed && sess.enroll_room.is_none() {
-                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
-                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-                    sess.enroll_room = Some(ek.clone());
-                    let _ = sio.emit("join", json!({ "room": ek, "name": display_name(), "uid": conn.my_uid })).await;
-                }
-            } else if !armed && sess.enroll_room.is_some() {
-                sess.enroll_room = None;
+            let subscribed = sess.channels.contains(&ek);
+            if armed && !subscribed {
+                sess.channels.push(ek.clone());
+                let _ = sio.emit("subscribe", json!({ "channels": [ek] })).await;
+            } else if !armed && subscribed {
+                sess.channels.retain(|c| c != &ek);
+                let _ = sio.emit("channel-goodbye", json!({ "channels": [ek] })).await;
             }
         }
                             // optimistic: a clean connect proves reachability; let
