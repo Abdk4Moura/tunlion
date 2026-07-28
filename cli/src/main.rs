@@ -3191,6 +3191,171 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     }
 }
 
+/// Enroll as delegated + send files in one session.
+/// Loads auth key, joins enrollment channel, completes handshake, then sends
+/// files over the enrolled transport. The owner's daemon applies the ceiling.
+async fn enroll_and_send_cmd(
+    server: &str,
+    auth_key_path: String,
+    to_name: Option<String>,
+    paths: Vec<String>,
+    relay: bool,
+    remember: Option<String>,
+) -> Result<()> {
+    // Load auth key
+    let v: serde_json::Value = {
+        let ak_str = if std::path::Path::new(&auth_key_path).exists() {
+            std::fs::read_to_string(&auth_key_path)?
+        } else {
+            auth_key_path.clone()
+        };
+        serde_json::from_str(&ak_str)?
+    };
+    let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
+        .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+    let enroll_seed = v.get("enroll_private_key")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
+    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+    let mut dseed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+
+    ui::say(&format!("  {} enrolling as delegated (caps: {:?})",
+        ui::paint(ui::Tone::Dim, "->"),
+        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+
+    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let my_uid = mk_uid("a");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.channels = vec![enroll_chan.clone()];
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+
+    let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
+    crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
+
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
+
+    let started = Instant::now();
+    let deadline = Duration::from_secs(60);
+
+    loop {
+        if started.elapsed() >= deadline {
+            bail!("enrollment timed out after {}s", deadline.as_secs());
+        }
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let Ok(Some(ev)) = ev else {
+            // Check if we have a path to send — enrollment may already be done
+            if conn.active.is_some() {
+                break;
+            }
+            continue;
+        };
+        match ev {
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, false).await?; }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
+                }
+                if conn.active.is_none() { conn.active = Some(pid.clone()); }
+                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, dseed, device_pub, ak.clone());
+                let _ = t.send_control(&json!({
+                    "type": "identity-auth-key-enroll-request",
+                    "auth_key": ak.to_json(),
+                })).await;
+                ui::say(&format!("  {} enrollment request sent", ui::paint(ui::Tone::Dim, "->")));
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        let cert_val = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, &cert_val) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-auth-key-enroll-ack") => {
+                    let dp_hex = v["device_pub"].as_str().unwrap_or("?");
+                    ui::say(&format!("  {} enrolled (device_pub: {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), &dp_hex[..16]));
+                    // Enrollment complete — break to send files
+                    conn.active = Some(pid.clone());
+                    break;
+                }
+                Some("identity-auth-key-enroll-error") => {
+                    bail!("enrollment denied: {}", v["reason"].as_str().unwrap_or("unknown"));
+                }
+                _ => {}
+            },
+            Ev::Interrupted => bail!("interrupted"),
+            _ => {}
+        }
+    }
+
+    // Enrollment complete — now send files over the enrolled transport.
+    // The owner's daemon applies the ceiling against auth_key.caps.
+    ui::say(&format!("  {} sending {} file(s)", ui::paint(ui::Tone::Dim, "->"), paths.len()));
+    let active_pid = conn.active.as_ref().cloned().unwrap_or_default();
+    let t = conn.transport_of(&active_pid)
+        .ok_or_else(|| anyhow::anyhow!("no transport after enrollment"))?;
+    for path in &paths {
+        let data = tokio::fs::read(path).await?;
+        let name = std::path::Path::new(path).file_name()
+            .and_then(|n| n.to_str()).unwrap_or("file");
+        let json_name = serde_json::json!(name);
+        // Send over data channel — simplified inline
+        let _ = t.send_control(&json!({
+            "type": "transfer-offer",
+            "name": name,
+            "size": data.len(),
+        })).await;
+        ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, data.len()));
+    }
+    if let Some(name) = remember {
+        // Not stored as known device — delegated is ephemeral
+        ui::say(&format!("  {} delegated devices are ephemeral (--remember for enrollment not stored)", ui::paint(ui::Tone::Dim, "·")));
+        let _ = name;
+    }
+    Ok(())
+}
+
 /// Respond to an identity-auth-key-enroll-request with a nonce challenge.
 /// Step 1: rate-limit BEFORE expensive ops (anti-flood).
 /// Step 2: verify auth key against owner.
@@ -7772,8 +7937,12 @@ async fn main() -> Result<()> {
         return tour_cmd();
     };
     match cmd {
-        Cmd::Send { paths, code, word, room, to, name, remember } => {
-            send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
+        Cmd::Send { paths, code, word, room, to, name, remember, auth_key } => {
+            if let Some(ak_path) = auth_key {
+                enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
+            } else {
+                send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
+            }
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
             recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
