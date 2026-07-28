@@ -496,6 +496,9 @@ enum Cmd {
         /// Override the offered file name (for stdin '-', or a single file)
         #[arg(long)]
         name: Option<String>,
+        /// Enroll as delegated principal using an auth key file before sending
+        #[arg(long, hide = true)]
+        auth_key: Option<String>,
     },
     /// Receive files from a peer (browser or CLI).
     ///
