@@ -1611,6 +1611,93 @@ fn resolve_peer_identity(link: &mut Link) {
     link.identity_cert_expires = Some(cert.expires);
 }
 
+/// When a link becomes trusted, send a nonce challenge to the peer so it can
+/// prove device-key possession (0x02 possession_sig). When the response arrives
+/// in the event loop, the `identity-expose` handler upgrades the binding to
+/// Proven. MUST be called at LINK ADOPTION (DirectReady), NOT at individual
+/// open sites — so Proven settles once before any gated open decides.
+fn send_identity_challenge(
+    conn: &crate::Conn,
+    pid: &str,
+    identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) {
+    if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+        if let Some(t) = conn.transport_of(pid) {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let rng = SystemRandom::new();
+            let mut nonce = [0u8; 32];
+            let _ = rng.fill(&mut nonce);
+            identity_nonces.insert(pid.to_string(), (nonce, Instant::now(), own_dpub));
+            let challenge = json!({
+                "type": "identity-nonce-challenge",
+                "nonce": hex::encode(nonce),
+                "receiver_device_pub": hex::encode(own_dpub)
+            });
+            let _ = t.send_control(&challenge);
+        }
+    }
+}
+
+/// Handle a possession-sig identity-expose response sent by a peer after we
+/// challenged it. Verifies the nonce (single-use), the possession_sig under
+/// the peer's device_pub, and reflection (not self). On success, upgrades the
+/// link binding to Proven so capability gates under authoritative can pass.
+fn handle_identity_expose(
+    conn: &mut crate::Conn,
+    pid: &str,
+    v: &Value,
+    identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) {
+    let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+    if let Ok(nonce_bytes) = hex::decode(nonce_hex) {
+        if nonce_bytes.len() != 32 {
+            return;
+        }
+        let mut nonce_arr = [0u8; 32];
+        nonce_arr.copy_from_slice(&nonce_bytes);
+        // Check held nonce matches (single-use)
+        let Some((held_nonce, _ts, _held_recv_dpub)) = identity_nonces.get(pid) else { return };
+        if held_nonce != &nonce_arr { return; }
+        // Verify cert and possession sig
+        let Some(cert_json) = v.get("cert") else { return };
+        let Some(cert) = identity::DeviceCert::from_json(cert_json) else { return };
+        if cert.verify(identity::now_secs()).is_err() { return; }
+        let Some(sig_hex) = v.get("possession_sig").and_then(|x| x.as_str()) else { return };
+        let Ok(sig_bytes) = hex::decode(sig_hex) else { return };
+        if sig_bytes.len() != 64 { return; }
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        // Recompute possession_msg with held nonce
+        let scope = crate::identity::IntroScope::User.to_byte();
+        let caps_d = crate::identity::caps_digest("transfer");
+        let chash = crate::identity::cert_hash(&cert);
+        let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() else { return };
+        let sender_dpub = cert.device_pub;
+        let receiver_dpub = own_dpub;
+        let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
+        if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_err() { return; }
+        // Reflection: refuse self-cert
+        if let Ok(Some(own_uk)) = crate::identity::UserKey::load() {
+            if cert.user_pub == own_uk.public_key_bytes() { return; }
+        }
+        // Store as provisional, then promote on link
+        let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
+        if let Some(l) = conn.link_mut(pid) {
+            l.identity_device_pub = Some(cert.device_pub);
+            l.identity_user_pub = Some(cert.user_pub);
+            l.identity_binding = crate::capability::BindingStrength::Proven;
+            l.identity_cert_expires = Some(cert.expires);
+        }
+        ui::say(&format!(
+            "{} identity proven for peer {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            pid
+        ));
+        // Erase held nonce (single-use)
+        identity_nonces.remove(pid);
+    }
+}
+
 /// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
 fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
     identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
@@ -11215,6 +11302,19 @@ async fn recv_cmd(
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
+                // #30: Send nonce challenge at link adoption so Proven settles
+                // once before any gated open. If the identity is resolved
+                // (Inferred from stored cert, per resolve_peer_identity inside
+                // adopt_direct) AND not yet Proven, challenge the peer to
+                // prove device-key possession (0x02 possession_sig). Gate sites
+                // are async-race safe: Proven is already set when opens arrive.
+                if let Some(l) = conn.link(&pid) {
+                    if l.identity_device_pub.is_some()
+                        && l.identity_binding != crate::capability::BindingStrength::Proven
+                    {
+                        send_identity_challenge(&conn, &pid, &mut identity_nonces);
+                    }
+                }
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::DirectWorkersReady(pid, workers) => {
@@ -11465,6 +11565,46 @@ async fn recv_cmd(
                         }
                         Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
                     }
+                }
+                // #30: respond to identity nonce challenge by producing a
+                // possession_sig (0x02) over the peer-provided nonce. The
+                // challenger verifies and upgrades our binding to Proven.
+                Some("identity-nonce-challenge") => {
+                    let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                    let recv_dpub_hex = v["receiver_device_pub"].as_str().unwrap_or_default();
+                    if let (Ok(nonce_bytes), Ok(recv_dpub_bytes)) = (hex::decode(nonce_hex), hex::decode(recv_dpub_hex)) {
+                        if nonce_bytes.len() == 32 && recv_dpub_bytes.len() == 32 {
+                            let mut nonce_arr = [0u8; 32];
+                            nonce_arr.copy_from_slice(&nonce_bytes);
+                            let mut recv_dpub_arr = [0u8; 32];
+                            recv_dpub_arr.copy_from_slice(&recv_dpub_bytes);
+                            if let Some(local_cert) = local_device_cert() {
+                                let scope = crate::identity::IntroScope::User.to_byte();
+                                let caps_d = crate::identity::caps_digest("transfer");
+                                let chash = crate::identity::cert_hash(&local_cert);
+                                let sender_dpub = local_cert.device_pub;
+                                let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &recv_dpub_arr);
+                                if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
+                                    if let Some(t) = conn.transport_of(&pid) {
+                                        let payload = json!({
+                                            "type": "identity-expose",
+                                            "v": 2,
+                                            "binding_type": 0x02,
+                                            "nonce": hex::encode(nonce_arr),
+                                            "cert": local_cert.to_json(),
+                                            "possession_sig": hex::encode(sig)
+                                        });
+                                        let _ = t.send_control(&payload).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // #30: received possession-sig from peer after our challenge.
+                // Verify, upgrade binding to Proven so capability gates pass.
+                Some("identity-expose") => {
+                    handle_identity_expose(&mut conn, &pid, &v, &mut identity_nonces);
                 }
                 Some("worker-ports") => {
                     let pid = v["for"].as_str().unwrap_or_default();
