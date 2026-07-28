@@ -31,17 +31,17 @@ fn devices_shows_granted_label() {
     // Note: may contain "caps" in other contexts (like "capabilities")
     // so we check for the specific label format
     assert!(
-        !stdout.contains("caps:"),
+        !stdout.to_lowercase().contains("caps:"),
         "Expected no 'caps:' label in devices output, got: {}",
         stdout
     );
 
-    // Should contain "granted:" if there are any devices
-    // (empty devices list is also valid - just check the label format)
+    // Should contain "granted" label if there are any devices
+    // The column header is uppercase "GRANTED" in the table output
     if !stdout.contains("no known devices") {
         assert!(
-            stdout.contains("granted:"),
-            "Expected 'granted:' label in devices output, got: {}",
+            stdout.to_lowercase().contains("granted"),
+            "Expected 'granted' label in devices output, got: {}",
             stdout
         );
     }

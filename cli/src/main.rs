@@ -20,6 +20,9 @@ mod ctl;
 mod diag;
 mod direct;
 mod doctor;
+/// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
+/// self-enrollment, and delegated principal ceiling enforcement.
+mod ephemeral;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
@@ -11839,6 +11842,7 @@ async fn recv_cmd(
                             "shell",
                             idev,
                             iusr,
+                            None,
                         );
                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
@@ -11957,6 +11961,7 @@ async fn recv_cmd(
                             "shell",
                             idev,
                             iusr,
+                            None,
                         );
                         crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
                     };
@@ -12062,6 +12067,7 @@ async fn recv_cmd(
                             "shell",
                             idev,
                             iusr,
+                            None,
                         );
                         crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
                     };
@@ -12216,6 +12222,7 @@ async fn recv_cmd(
                             "mount",
                             idev,
                             iusr,
+                            None,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize mount (pair-proof vs device-key).
@@ -12719,6 +12726,7 @@ async fn recv_cmd(
                             "transfer",
                             idev,
                             iusr,
+                            None,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize transfer (pair-proof vs device-key).

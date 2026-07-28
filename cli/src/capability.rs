@@ -338,7 +338,19 @@ pub fn evaluate(
     resource: &str,
     action: &str,
     now: u64,
+    auth_key_caps: Option<&[String]>,
 ) -> Decision {
+    // Delegated principal ceiling: if auth_key_caps is present, the action
+    // must be within the auth key's stated caps. Even if the principal is
+    // the owner (user_pub matches header owner_pub), a delegated principal
+    // never inherits full owner rights — it gets the intersection.
+    if let Some(caps) = auth_key_caps {
+        let action_lc = action.to_lowercase();
+        if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
+            return Decision::Denied("not in auth key caps".into());
+        }
+    }
+
     // Owner is always authorized (derived, outside cap list)
     if principal_user_pub == &header.owner_pub {
         return Decision::Authorized;
@@ -1088,6 +1100,7 @@ pub fn cap_authorize(
     action: &str,
     principal_device_pub: Option<&[u8; 32]>,
     principal_user_pub: Option<&[u8; 32]>,
+    auth_key_caps: Option<&[String]>,
 ) -> CapOutcome {
     let store = load_cap_store(config_dir);
     let header = store
@@ -1104,7 +1117,7 @@ pub fn cap_authorize(
     match header {
         None => CapOutcome::Unprovisioned,
         Some(hdr) => match evaluate(
-            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(),
+            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(), None,
         ) {
             Decision::Authorized => CapOutcome::Authorized,
             Decision::Denied(reason) => CapOutcome::Denied(reason),
@@ -1370,6 +1383,7 @@ pub fn devices_with_shell_revoked(config_dir: &std::path::Path) -> Vec<String> {
             &hdr.resource,
             "shell",
             now,
+            None,
         );
         if matches!(d, Decision::Denied(_)) {
             revoked.push(name.to_string());
@@ -1446,6 +1460,7 @@ pub fn preview(
                 &header.resource,
                 &q.action,
                 now,
+                None,
             );
             PreviewEntry {
                 query: AuthQuery {
@@ -1478,8 +1493,8 @@ pub fn check_self_lockout(
     }
     for (label, dev_pub, user_pub) in principals {
         for action in admin_actions {
-            let before = evaluate(store, header, dev_pub, user_pub, &header.resource, action, now);
-            let after = evaluate(&after_store, header, dev_pub, user_pub, &header.resource, action, now);
+            let before = evaluate(store, header, dev_pub, user_pub, &header.resource, action, now, None);
+            let after = evaluate(&after_store, header, dev_pub, user_pub, &header.resource, action, now, None);
             if matches!(before, Decision::Authorized) && matches!(after, Decision::Denied(_)) {
                 warnings.push(format!(
                     "self-lockout WARNING: {} would lose '{}' on resource '{}'",
@@ -2390,7 +2405,7 @@ mod tests {
         let device_pub = [0xff; 32];
         let user_pub = owner_pub(&alice);
 
-        let d = evaluate(&store, &header, &device_pub, &user_pub, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &device_pub, &user_pub, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("owner must be authorized, got: {}", reason),
@@ -2411,7 +2426,7 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         let principal_user = [0xaa; 32]; // different user, not the owner
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("granted action must be authorized, got: {}", reason),
@@ -2432,7 +2447,7 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "admin", now_secs());
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "admin", now_secs(), None);
         match d {
             Decision::Denied(_) => {},
             Decision::Authorized => panic!("ungranted action must be denied"),
@@ -2471,7 +2486,7 @@ mod tests {
 
         let principal_user = [0xaa; 32];
         // fresh grant covers "ssh", expired grant is not there — test evaluates against stored grants
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("non-expired grant must be authorized, got: {}", reason),
@@ -2485,7 +2500,7 @@ mod tests {
         expired_store.push(expired_entry);
 
         // evaluate should see the grant but consider it expired
-        let d2 = evaluate(&expired_store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        let d2 = evaluate(&expired_store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
         match d2 {
             Decision::Denied(reason) => assert!(reason.contains("not authorized"), "expired-only store must be denied: {}", reason),
             Decision::Authorized => panic!("expired grant must be denied"),
@@ -2531,7 +2546,7 @@ mod tests {
 
         // A principal with device=0xcc and user=0xaa matches BOTH grants.
         // The expired Device grant must NOT shadow the valid User grant.
-        let d = evaluate(&store, &header, &[0xcc; 32], &user_pub, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &[0xcc; 32], &user_pub, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("valid User grant must authorize despite expired Device grant: {}", reason),
@@ -2553,7 +2568,7 @@ mod tests {
 
         let principal_user = [0xaa; 32];
         // Wrong device pubkey
-        let d = evaluate(&store, &header, &[0xdd; 32], &principal_user, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &[0xdd; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Denied(_) => {},
             Decision::Authorized => panic!("wrong target device must be denied"),
@@ -2576,14 +2591,14 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         // Any device pubkey works when target_kind=User and principal_user_pub matches
-        let d = evaluate(&store, &header, &[0x11; 32], &principal_user_pub, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &[0x11; 32], &principal_user_pub, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("User grant must authorize device chaining to that user, got: {}", reason),
         }
 
         // Wrong user_pub must be denied even with correct device
-        let d2 = evaluate(&store, &header, &[0x11; 32], &[0xbb; 32], &header.resource, "ssh", now_secs());
+        let d2 = evaluate(&store, &header, &[0x11; 32], &[0xbb; 32], &header.resource, "ssh", now_secs(), None);
         match d2 {
             Decision::Denied(_) => {},
             Decision::Authorized => panic!("wrong user must be denied"),
@@ -2612,7 +2627,7 @@ mod tests {
         store.push(grant_json);
 
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
         match d {
             Decision::Denied(reason) => assert!(reason.contains("ratchet"), "must fail on uninitialized ratchet: {}", reason),
             Decision::Authorized => panic!("uninitialized ratchet must deny grants"),
@@ -2620,7 +2635,7 @@ mod tests {
 
         // But owner is still authorized even with uninitialized ratchet
         let owner_pubkey = owner_pub(&owner);
-        let d2 = evaluate(&store, &header, &[0x00; 32], &owner_pubkey, &header.resource, "ssh", now_secs());
+        let d2 = evaluate(&store, &header, &[0x00; 32], &owner_pubkey, &header.resource, "ssh", now_secs(), None);
         match d2 {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("owner must be authorized even without ratchet, got: {}", reason),
@@ -2657,7 +2672,7 @@ mod tests {
         // Now test with `now` set behind the ratchet (clock went backwards)
         let clock_back_now = future_issued.saturating_sub(50);
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", clock_back_now);
+        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", clock_back_now, None);
         // eval_time = max(clock_back_now, ratchet) = ratchet (future_issued)
         // grant.expires = future_issued + 86400
         // eval_time (future_issued) < grant.expires (future_issued + 86400) -> authorized
@@ -2712,7 +2727,7 @@ mod tests {
         // Bob's ratchet is at future_issued. Alice's ratchet should be her own.
         // evaluate Alice's grant: ratchet_for(Alice's owner) != future_issued
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header_a, &[0xcc; 32], &principal_user, &header_a.resource, "ssh", now_secs());
+        let d = evaluate(&store, &header_a, &[0xcc; 32], &principal_user, &header_a.resource, "ssh", now_secs(), None);
         match d {
             Decision::Authorized => {},
             Decision::Denied(reason) => panic!("Bob's ratchet must not expire Alice's grant: {}", reason),
@@ -2739,7 +2754,7 @@ mod tests {
     fn cap_authorize_no_header_is_unprovisioned() {
         let tmp = std::env::temp_dir().join(format!("fil-cap-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
-        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]));
+        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]), None);
         match d {
             CapOutcome::Unprovisioned => {}
             other => panic!("no-header must be Unprovisioned, got {other:?}"),
@@ -2945,13 +2960,13 @@ mod tests {
         store.push(grant_json);
 
         // Before update_ratchet: evaluate must deny ("ratchet uninitialized")
-        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs()) {
+        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs(), None) {
             Decision::Denied(reason) => assert!(reason.contains("ratchet uninitialized")),
             Decision::Authorized => panic!("evaluate must refuse before ratchet is initialized"),
         }
         // After update_ratchet: evaluate must authorize
         update_ratchet(&mut store, &pk, grant.issued_at).unwrap();
-        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs()) {
+        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs(), None) {
             Decision::Authorized => {}
             Decision::Denied(reason) => panic!("evaluate must authorize after ratchet init, got: {reason}"),
         }
@@ -2988,14 +3003,14 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         // evaluate() with the principal's user_pub must authorize
-        match evaluate(&store, &header, &principal_pub, &principal_pub, &header.resource, "shell", now_secs()) {
+        match evaluate(&store, &header, &principal_pub, &principal_pub, &header.resource, "shell", now_secs(), None) {
             Decision::Authorized => {}
             Decision::Denied(reason) => panic!("grant targeting real user_pub must authorize, got: {reason}"),
         }
         // evaluate() with a WRONG user_pub must deny
         let wrong_pub = [0xbb; 32];
         assert_ne!(&wrong_pub[..], &principal_pub[..]);
-        match evaluate(&store, &header, &wrong_pub, &wrong_pub, &header.resource, "shell", now_secs()) {
+        match evaluate(&store, &header, &wrong_pub, &wrong_pub, &header.resource, "shell", now_secs(), None) {
             Decision::Authorized => panic!("wrong user_pub must NOT authorize"),
             Decision::Denied(_) => {}
         }
@@ -3035,7 +3050,7 @@ mod tests {
 
         // Apply revoke for real and evaluate — must match preview
         apply_cap_op(&mut store, &header, &revoke, now_secs()).unwrap();
-        let real_d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs());
+        let real_d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
         assert!(matches!(real_d, Decision::Denied(_)), "real enforcement must match preview");
 
         // No-op preview: should show Authorized (preview doesn't mutate store)
