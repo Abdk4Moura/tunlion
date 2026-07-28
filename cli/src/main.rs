@@ -3028,10 +3028,18 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
             let verifier_pub = crate::overlay::overlay_pubkey_bytes()?;
 
-            // Phase 2 TODO: wire into actual enrollment flow over control channel.
-            // For now, the auth key module is verified — the handler integration
-            // (challenge/response over live connection) is deferred.
-            let _ = (server, relay, enroll_kp, device_kp, device_pub, verifier_pub);
+            // Register pending enrollment for the enroller challenge handler.
+            // When the daemon sends identity-auth-key-enroll-challenge, the
+            // event-loop handler in send_cmd/recv_cmd looks up this registration
+            // and builds the EnrollmentPayload.
+            crate::ephemeral::register_enrollment(
+                String::new(), // peer_id will be set when connected
+                enroll_seed,
+                dseed,
+                device_pub,
+                ak.clone(),
+            );
+            let _ = (server, relay, enroll_kp, device_kp, verifier_pub);
             ui::say(&format!("{} auth key loaded (caps: {:?}, issuer: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -9350,6 +9358,30 @@ async fn send_cmd(
                 Some("identity-nonce-challenge") => {
                     if let Some(t) = conn.transport_of(&pid) {
                         respond_to_identity_challenge(&t, &v).await;
+                    }
+                }
+                // Enroller receives the daemon's nonce challenge — build
+                // EnrollmentPayload and send the response.
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
                     }
                 }
                 _ if !conn.is_active(&pid) => {}

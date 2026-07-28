@@ -606,6 +606,55 @@ pub fn now_secs() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Pending enrollment state (enroller side)
+// ---------------------------------------------------------------------------
+
+struct PendingEnroll {
+    enroll_seed: [u8; 32],
+    device_seed: [u8; 32],
+    device_pub: [u8; 32],
+    auth_key: AuthKey,
+}
+
+static PENDING_ENROLLS: OnceLock<Mutex<HashMap<String, PendingEnroll>>> = OnceLock::new();
+
+/// Register a pending enrollment attempt. Called by the ephemeral enroll CLI.
+pub fn register_enrollment(
+    peer_id: String,
+    enroll_seed: [u8; 32],
+    device_seed: [u8; 32],
+    device_pub: [u8; 32],
+    auth_key: AuthKey,
+) {
+    let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    store.insert(peer_id, PendingEnroll { enroll_seed, device_seed, device_pub, auth_key });
+}
+
+/// Take a pending enrollment and build the response to the daemon's challenge.
+/// Returns the EnrollmentPayload JSON or None if no pending enrollment for this peer.
+pub fn build_enrollment_response(peer_id: &str, nonce: [u8; 32], verifier_pub: [u8; 32]) -> Option<serde_json::Value> {
+    let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let pe = store.remove(peer_id)?;
+    let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.enroll_seed).ok()?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.device_seed).ok()?;
+    let payload = EnrollmentPayload::build(
+        pe.auth_key,
+        pe.device_pub,
+        &enroll_kp,
+        &device_kp,
+        nonce,
+        verifier_pub,
+    );
+    // NONCE IS NOT on the wire — the daemon uses its own stored nonce from consume_latest_nonce
+    Some(serde_json::json!({
+        "auth_key": payload.auth_key.to_json(),
+        "device_pub": hex::encode(payload.device_pub),
+        "enroll_possession_sig": hex::encode(payload.enroll_possession_sig),
+        "device_possession_sig": hex::encode(payload.device_possession_sig),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
