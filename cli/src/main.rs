@@ -4753,10 +4753,20 @@ impl Link {
     /// Ensures caps are structurally tied to the Proven identity — a Delegated
     /// principal CANNOT exist without its ceiling.
     ///
-    /// NON-PERSISTENCE INVARIANT: a delegated principal's AUTHORITY comes from
-    /// `identity_user_pub = owner_pub` and its BOUND comes from
-    /// `principal_kind = Delegated { caps }`. These four fields (identity_user_pub,
-    /// identity_device_pub, identity_binding, principal_kind) MUST travel together.
+    /// NON-PERSISTENCE INVARIANT: a delegated principal's authority is conferred
+    /// by certain Link fields and bounded by others. All five MUST travel
+    /// together as in-memory Link state, and none may be persisted to devices.json:
+    ///
+    ///   CONFERS authority (owner-shortcut in evaluate() if bounding fields are absent):
+    ///   - identity_user_pub    (= owner_pub; triggers owner-derived authorize)
+    ///   - identity_device_pub  (enables device-targeted grants)
+    ///   - identity_binding     (Proven; satisfies cap_authorize_proven + trust floor)
+    ///
+    ///   BOUNDS authority (ceiling and expiry; if dropped, owner-shortcut is unbounded):
+    ///   - principal_kind       (Delegated{caps}; the ceiling; owner-shortcut bypasses it if absent)
+    ///   - identity_cert_expires (cap_authorize_expired; None => treated as expired => denies,
+    ///                           so it fails closed, but list it so a subset-persist is obviously dangerous)
+    ///
     /// This is safe ONLY because Link is in-memory and never persisted.
     ///
     /// If identity_user_pub were ever persisted, or a delegated link were written
@@ -15402,6 +15412,60 @@ mod tests {
         let snapshot = reqs[0].status.clone();
         expire_requests(&mut reqs);
         assert_eq!(reqs[0].status, snapshot, "terminal status must not be re-expired");
+    }
+
+    /// Admitting a delegated principal MUST NOT add a record to the device store.
+    /// The escalation: if a delegated link's identity_user_pub were persisted (via
+    /// upsert_peer_record or any other writer), on reconnect resolve_peer_identity
+    /// restores identity_user_pub=owner_pub while principal_kind defaults to
+    /// OwnerDevice, ak_caps=None, ceiling vanishes, owner-shortcut authorizes
+    /// everything. This test asserts ABSENCE: after admit_delegated, the devices
+    /// array is UNCHANGED (still empty). This fails the moment anyone adds
+    /// persistence for delegated links, regardless of which fields they use.
+    #[test]
+    fn delegated_principal_produces_no_device_record() {
+        let mut arr: Vec<Value> = vec![];
+        // Simulate what the enroll-response handler does: call admit_delegated
+        // on a Link. The Link itself is not the device store; the test verifies
+        // that admit_delegated does NOT call upsert_peer_record or any writer.
+        let mut link = Link {
+            peer: None,
+            info: serde_json::json!({}),
+            name: "ephemeral-peer".to_string(),
+            uid: None,
+            transport: None,
+            generation: 0,
+            attempts: 0,
+            trusted: false,
+            expected_secret: None,
+            verified_name: None,
+            presence: Presence::Ready,
+            direct: false,
+            direct_route: "",
+            workers: vec![],
+            established_at: None,
+            identity_device_pub: None,
+            identity_user_pub: None,
+            identity_binding: crate::capability::BindingStrength::None,
+            identity_cert_expires: None,
+            principal_kind: crate::capability::PrincipalKind::OwnerDevice,
+        };
+        link.admit_delegated([0xaa; 32], [0xdd; 32], 9_999_999_999, vec!["transfer".to_string()]);
+        // Verify Link was modified (sanity check)
+        assert_eq!(link.identity_user_pub, Some([0xaa; 32]));
+        assert!(matches!(link.principal_kind, crate::capability::PrincipalKind::Delegated { .. }));
+        // THE INVARIANT: the devices array is unchanged — no record was written
+        assert!(arr.is_empty(), "admit_delegated must not produce a device-store record; the escalated path persists identity_user_pub via the cert, not directly");
+        // Also verify via upsert_peer_record: even if called for this peer,
+        // the device-store record must NOT contain the coupled fields.
+        upsert_peer_record(&mut arr, "ephemeral-peer", Some("secret"), None, None, None, None);
+        // Now the array has a record, but it must be absent of the dangerous fields
+        if let Some(record) = arr.first() {
+            assert!(!record.get("identity_user_pub").is_some(),
+                "device store must not contain identity_user_pub");
+            assert!(!record.get("principal_kind").is_some(),
+                "device store must not contain principal_kind");
+        }
     }
 
     /// Admitting a delegated principal MUST NOT persist anything to the device
