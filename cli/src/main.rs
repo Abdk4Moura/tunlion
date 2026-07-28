@@ -3156,12 +3156,9 @@ async fn handle_auth_key_enroll_response(
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
             }
-            // Admit as Delegated principal
+            // Admit as Delegated principal — structurally, all four fields together
             if let Some(link) = conn.link_mut(&pid) {
-                link.identity_device_pub = Some(device_pub);
-                link.identity_binding = crate::capability::BindingStrength::Proven;
-                link.identity_cert_expires = Some(ak.expires);
-                link.auth_key_caps = Some(ak.caps.clone());
+                link.admit_delegated(device_pub, ak.expires, ak.caps.clone());
             }
             let _ = t.send_control(&json!({
                 "type": "identity-auth-key-enroll-ack",
@@ -4125,6 +4122,16 @@ impl Link {
     /// broadcast name is the fallback only for an unverified / unknown peer.
     fn shown(&self) -> &str {
         self.verified_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Admit this link as a delegated (auth-key-enrolled) principal.
+    /// Sets all four identity fields together so "Proven implies ceiling recorded"
+    /// is guaranteed by the type — no second path can set Proven without caps.
+    fn admit_delegated(&mut self, device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
+        self.identity_device_pub = Some(device_pub);
+        self.identity_binding = crate::capability::BindingStrength::Proven;
+        self.identity_cert_expires = Some(expires);
+        self.auth_key_caps = Some(caps);
     }
 }
 
@@ -12106,13 +12113,14 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "shell",
                             idev,
                             iusr,
-                            None,
+                            ak_caps,
                         );
                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
@@ -12225,13 +12233,14 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "shell",
                             idev,
                             iusr,
-                            None,
+                            ak_caps,
                         );
                         crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
                     };
@@ -12331,13 +12340,14 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "shell",
                             idev,
                             iusr,
-                            None,
+                            ak_caps,
                         );
                         crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
                     };
@@ -12486,13 +12496,14 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "mount",
                             idev,
                             iusr,
-                            None,
+                            ak_caps,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize mount (pair-proof vs device-key).
@@ -12990,13 +13001,14 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "transfer",
                             idev,
                             iusr,
-                            None,
+                            ak_caps,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize transfer (pair-proof vs device-key).
