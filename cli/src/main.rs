@@ -3044,10 +3044,12 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
-    let room = net::fetch_auto_room(server).await?;
+    // Join enrollment rendezvous channel derived from owner's public key.
+    // Network-independent — same model as channel_of for pairing secrets.
+    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.room = Some(room.clone());
-    sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
+    sess.channels = vec![enroll_chan.clone()];
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(
         server,
@@ -10408,7 +10410,21 @@ async fn recv_cmd(
                 bail!("no known devices, run `filament pair` once, or `filament up` in a terminal to pair interactively");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-            sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+            // Subscribe to enrollment rendezvous channel so ephemeral devices
+            // can self-enroll cross-network, derived from the owner's UserKey.
+            if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                if !chans.contains(&ek) {
+                    let mut c = chans;
+                    c.push(ek);
+                    sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
+                    sess.channels = c;
+                } else {
+                    sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+                }
+            } else {
+                sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+            }
             ui::say(&format!(
                 "  {} filament up, {} known device{} {} {}",
                 ui::paint(ui::Tone::Brand, "●"),

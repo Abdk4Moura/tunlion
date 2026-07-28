@@ -605,6 +605,17 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Derive a network-independent enrollment rendezvous channel from the owner's
+/// public key. Both the `up` daemon and the enroller join this channel so they
+/// can rendezvous cross-network (same model as channel_of for pairing secrets).
+pub fn enroll_channel(owner_pub: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"filament-enroll-v1");
+    h.update(owner_pub);
+    hex::encode(h.finalize().as_slice())
+}
+
 // ---------------------------------------------------------------------------
 // Pending enrollment state (enroller side)
 // ---------------------------------------------------------------------------
@@ -1257,6 +1268,15 @@ mod tests {
         assert_eq!(ak.ephemeral, round.ephemeral);
         assert_eq!(ak.tag, round.tag);
         assert_eq!(ak.sig, round.sig);
+    }
+
+    #[test]
+    fn enroll_channel_deterministic() {
+        let owner = [0xAA; 32];
+        let c1 = enroll_channel(&owner);
+        let c2 = enroll_channel(&owner);
+        assert_eq!(c1, c2, "enroll_channel must be deterministic");
+        assert_eq!(c1.len(), 64, "SHA-256 hex is 64 chars");
     }
 
     #[test]
