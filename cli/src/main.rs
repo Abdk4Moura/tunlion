@@ -4115,11 +4115,9 @@ struct Link {
     identity_binding: crate::capability::BindingStrength,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     identity_cert_expires: Option<u64>,
-    /// Auth key caps ceiling for a delegated (auth-key-enrolled) principal.
-    /// None = this principal is an owner device with full rights (subject to
-    /// individual grants). Some = caps are intersected with owner's effective
-    /// caps (delegated-ceiling rule).
-    auth_key_caps: Option<Vec<String>>,
+    /// Principal kind: OwnerDevice or Delegated { caps }. A Delegated
+    /// principal CANNOT exist without its ceiling — the compiler enforces it.
+    principal_kind: crate::capability::PrincipalKind,
 }
 
 impl Link {
@@ -4133,13 +4131,13 @@ impl Link {
     }
 
     /// Admit this link as a delegated (auth-key-enrolled) principal.
-    /// Sets all four identity fields together so "Proven implies ceiling recorded"
-    /// is guaranteed by the type — no second path can set Proven without caps.
+    /// Ensures caps are structurally tied to the Proven identity — a Delegated
+    /// principal CANNOT exist without its ceiling.
     fn admit_delegated(&mut self, device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = crate::capability::BindingStrength::Proven;
         self.identity_cert_expires = Some(expires);
-        self.auth_key_caps = Some(caps);
+        self.principal_kind = crate::capability::PrincipalKind::Delegated { caps };
     }
 }
 
@@ -5249,7 +5247,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
-                auth_key_caps: None,
+                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
         Ok(())
@@ -5680,7 +5678,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
-                auth_key_caps: None,
+                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
         }
@@ -6569,7 +6567,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
-                auth_key_caps: None,
+                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
     }
@@ -12145,7 +12143,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -12265,7 +12263,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -12372,7 +12370,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -12528,7 +12526,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
@@ -13033,7 +13031,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let ak_caps = link.and_then(|l| l.auth_key_caps.as_deref());
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",

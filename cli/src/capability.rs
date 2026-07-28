@@ -1117,7 +1117,7 @@ pub fn cap_authorize(
     match header {
         None => CapOutcome::Unprovisioned,
         Some(hdr) => match evaluate(
-            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(), None,
+            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(), auth_key_caps,
         ) {
             Decision::Authorized => CapOutcome::Authorized,
             Decision::Denied(reason) => CapOutcome::Denied(reason),
@@ -1153,6 +1153,24 @@ pub enum BindingStrength {
     None,
     Proven,
     Inferred,
+}
+
+/// A delegated principal CANNOT exist without its caps ceiling — the compiler
+/// enforces what convention previously did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrincipalKind {
+    OwnerDevice,
+    Delegated { caps: Vec<String> },
+}
+
+impl PrincipalKind {
+    /// Extract auth_key_caps for evaluate. Delegated always has caps; OwnerDevice has None.
+    pub fn auth_key_caps(&self) -> Option<&[String]> {
+        match self {
+            PrincipalKind::OwnerDevice => None,
+            PrincipalKind::Delegated { caps } => Some(caps),
+        }
+    }
 }
 
 /// Purely restrictive: under authoritative, downgrades Authorized→Denied when
@@ -2765,7 +2783,7 @@ mod tests {
     /// Delegated ceiling: a principal with auth_key_caps=[transfer] is
     /// Authorized for transfer but Denied for shell, even when the owner
     /// has both — the ceiling gates BEFORE the owner shortcut.
-    /// Tests evaluate() directly (in-memory) to avoid full header construction.
+    /// Enters at cap_authorize (the PRODUCTION boundary), not evaluate.
     #[test]
     fn delegated_ceiling_gates_before_owner_shortcut() {
         let owner = make_owner();
@@ -2773,18 +2791,25 @@ mod tests {
         let mut nonce = [0u8; 32];
         let rng = ring::rand::SystemRandom::new();
         ring::rand::SecureRandom::fill(&rng, &mut nonce).unwrap();
-        let header = make_genesis_header(&owner, &nonce, &[]);
-        let store = vec![header.to_json()];
+        let header = make_self_header(&owner_pub, "self", &nonce, &owner);
+        let tmp = std::env::temp_dir().join(format!("fil-authcap-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).ok();
+        save_cap_store(&tmp, &[header.to_json()]).unwrap();
         let ak_caps = vec!["transfer".to_string()];
         // Same user_pub as header owner — normally shortcut to Authorized.
         // auth_key_caps ceiling gates first: transfer in caps → Authorized
-        let r1 = evaluate(&store, &header, &[0xCC; 32], &owner_pub, "self", "transfer", now_secs(), Some(&ak_caps));
-        assert!(matches!(r1, Decision::Authorized),
-            "transfer in auth_key_caps must authorize even with owner shortcut");
-        // Shell NOT in auth_key_caps → Denied (ceiling enforced before owner shortcut)
-        let r2 = evaluate(&store, &header, &[0xCC; 32], &owner_pub, "self", "shell", now_secs(), Some(&ak_caps));
-        assert!(matches!(r2, Decision::Denied(_)),
-            "shell not in auth_key_caps must be denied (ceiling)");
+        let r1 = cap_authorize(&tmp, "self", "transfer", Some(&[0xCC; 32]), Some(&owner_pub), Some(&ak_caps));
+        assert_eq!(r1, CapOutcome::Authorized,
+            "transfer in auth_key_caps must authorize (ceiling passed)");
+        // Shell NOT in auth_key_caps → Denied
+        let r2 = cap_authorize(&tmp, "self", "shell", Some(&[0xCC; 32]), Some(&owner_pub), Some(&ak_caps));
+        assert!(matches!(r2, CapOutcome::Denied(_)),
+            "shell not in auth_key_caps must be denied (ceiling enforced)");
+        // Mount NOT in auth_key_caps → Denied
+        let r3 = cap_authorize(&tmp, "self", "mount", Some(&[0xCC; 32]), Some(&owner_pub), Some(&ak_caps));
+        assert!(matches!(r3, CapOutcome::Denied(_)),
+            "mount not in auth_key_caps must be denied (ceiling enforced)");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// The flip criterion is code, not prose: a clean legacy-ALLOWED sample with
