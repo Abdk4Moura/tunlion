@@ -895,16 +895,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Bind a tag to a device (owner-signed).
+    #[command(hide = true)]
+    TagBind {
+        /// Tag name
+        tag: String,
+        /// Device petname
+        device: String,
+    },
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
     /// (Prefer `filament set shell on --peer <device>`.)
     #[command(hide = true)]
     Grant {
-        /// Known device (petname)
+        /// Known device (petname), or omit with --tag
         device: String,
         /// Capability to grant (e.g. `shell`)
         capability: String,
+        /// Target a tag instead of a device
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Revoke a capability from a known device. Revoking `shell` also strips the
     /// device's filament-managed block from this machine's authorized_keys.
@@ -1529,6 +1540,10 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
         }
     }
     None
+}
+
+fn load_owner_key() -> Option<crate::identity::UserKey> {
+    crate::identity::UserKey::load().ok().flatten()
 }
 
 fn local_device_cert() -> Option<identity::DeviceCert> {
@@ -7547,7 +7562,68 @@ async fn main() -> Result<()> {
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
-        Cmd::Grant { device, capability } => {
+        Cmd::TagBind { tag, device } => {
+            let Some(user_key) = load_owner_key() else { bail!("identity not initialized; run `filament identity init` first"); };
+            let config_dir = crate::settings::config_dir();
+            let mut store = crate::capability::load_cap_store(&config_dir);
+            let pk = user_key.public_key_bytes();
+            let Some(cert) = device_cert_for(&device) else {
+                bail!("device '{device}' has no stored identity cert");
+            };
+            let tag_ref = crate::capability::make_tag_target(&pk, &tag);
+            let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
+            let mut binding = crate::capability::TagBindingObj {
+                tag_ref,
+                subject_kind: 0x01,
+                subject: cert.device_pub,
+                owner_pub: pk,
+                version: ver,
+                issued_at: crate::capability::now_secs(),
+                expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                sig: [0u8; 64],
+            };
+            let canon = binding.canonical_for_signing();
+            let sig = user_key.keypair().sign(&canon);
+            binding.sig.copy_from_slice(sig.as_ref());
+            crate::capability::apply_tag_binding(&mut store, &binding)
+                .context("create tag binding")?;
+            let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
+                .context("save cap store")?;
+            println!("bound tag '{tag}' to device '{device}'.");
+            Ok(())
+        }
+        Cmd::Grant { device, capability, tag } => {
+            let config_dir = crate::settings::config_dir();
+            let mut store = crate::capability::load_cap_store(&config_dir);
+
+            if let Some(ref t) = tag {
+                // Grant to tag
+                let Some(user_key) = load_owner_key() else {
+                    bail!("identity not initialized");
+                };
+                let pk = user_key.public_key_bytes();
+                let target_bytes = crate::capability::make_tag_target(&pk, t);
+                let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
+                let mut op = crate::capability::CapOp {
+                    op: crate::capability::CapOpKind::Grant,
+                    grantor: pk,
+                    target_kind: 0x03,
+                    target: target_bytes,
+                    resource: "self".to_string(),
+                    permissions: vec![capability.clone()],
+                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                    issued_at: crate::capability::now_secs(),
+                    version: ver,
+                    sig: [0u8; 64],
+                };
+                op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+                store.push(op.to_json());
+                let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
+                    .context("save cap store")?;
+                println!("granted '{capability}' to tag '{t}'.");
+                return Ok(());
+            }
+            // Original device grant path (unchanged)
             device_set_cap(&device, &capability, true)?;
             // If identity layer is active, also issue an owner-signed CapOp
             if let Ok(Some(user_key)) = crate::identity::UserKey::load() {

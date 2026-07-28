@@ -120,9 +120,7 @@ impl CapOpKind {
 pub enum CapTarget {
     User([u8; 32]),
     Device([u8; 32]),
-    /// SHA-256(owner_pub || group_id) — scoped to owner
-    Group([u8; 32]),
-    /// SHA-256(owner_pub || tag_id) — scoped to owner
+    /// SHA-256(owner_pub || tag_id) — scoped to owner. 0x02 (Group) is reserved.
     Tag([u8; 32]),
 }
 
@@ -131,14 +129,13 @@ impl CapTarget {
         match self {
             CapTarget::User(_) => 0x00,
             CapTarget::Device(_) => 0x01,
-            CapTarget::Group(_) => 0x02,
             CapTarget::Tag(_) => 0x03,
         }
     }
 
     pub fn target_bytes(&self) -> [u8; 32] {
         match self {
-            CapTarget::User(b) | CapTarget::Device(b) | CapTarget::Group(b) | CapTarget::Tag(b) => *b,
+            CapTarget::User(b) | CapTarget::Device(b) | CapTarget::Tag(b) => *b,
         }
     }
 
@@ -150,17 +147,7 @@ impl CapTarget {
     }
 }
 
-/// SHA-256(owner_pub || group_id) → 32-byte group target.
-pub fn make_group_target(owner_pub: &[u8; 32], group_id: &str) -> [u8; 32] {
-    use sha2_pake::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(owner_pub);
-    h.update(group_id.as_bytes());
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&h.finalize());
-    out
-}
-
+/// 0x02 (Group) is reserved for future use.
 /// SHA-256(owner_pub || tag_id) → 32-byte tag target.
 pub fn make_tag_target(owner_pub: &[u8; 32], tag_id: &str) -> [u8; 32] {
     use sha2_pake::{Digest, Sha256};
@@ -325,31 +312,6 @@ pub enum CapOutcome {
 /// Expiry uses `eval_time = max(now, ratchet_for(header.owner_pub))`. If the
 /// per-owner ratchet is uninitialized, grants are DENIED (fail-closed).
 
-/// Resolve a Group-targeted grant: find the group object, verify signature,
-/// check membership. Returns true if principal is a member.
-fn resolve_group_match(
-    store: &[Value],
-    grantor: &[u8; 32],
-    group_hash: [u8; 32],
-    principal_user_pub: &[u8; 32],
-    principal_device_pub: &[u8; 32],
-    eval_time: u64,
-) -> bool {
-    let Some(group) = find_group(store, grantor, group_hash) else {
-        return false; // group not found, grant invisible
-    };
-    if group.verify().is_err() {
-        return false;
-    }
-    if eval_time >= group.expires {
-        return false;
-    }
-    group.members.iter().any(|m| {
-        (m.kind == 0x00 && &m.pubkey == principal_user_pub)
-            || (m.kind == 0x01 && &m.pubkey == principal_device_pub)
-    })
-}
-
 /// Resolve a Tag-targeted grant: find tag bindings, verify signatures,
 /// check if any binding's subject matches the principal.
 fn resolve_tag_match(
@@ -410,14 +372,7 @@ pub fn evaluate(
                 let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
                 t.len() == 32 && t.as_slice() == principal_device_pub
             }
-            0x02 => {
-                let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
-                if t.len() != 32 { false }
-                else {
-                    let mut hash = [0u8; 32]; hash.copy_from_slice(&t);
-                    resolve_group_match(store, &header.owner_pub, hash, principal_user_pub, principal_device_pub, eval_time)
-                }
-            }
+            0x02 => continue, // reserved (Group) — 0x03 (Tag) is the active kind
             0x03 => {
                 let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
                 if t.len() != 32 { false }
@@ -451,25 +406,8 @@ pub fn evaluate(
 }
 
 // ---------------------------------------------------------------------------
-// Group & Tag store objects  (owner-signed, verified at resolution time)
+// Tag store objects  (owner-signed, verified at resolution time)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct GroupMember {
-    pub kind: u8,     // 0x00 = user_pub, 0x01 = device_pub
-    pub pubkey: [u8; 32],
-}
-
-#[derive(Debug, Clone)]
-pub struct GroupObj {
-    pub group_id: String,
-    pub owner_pub: [u8; 32],
-    pub members: Vec<GroupMember>,
-    pub version: u64,
-    pub issued_at: u64,
-    pub expires: u64,
-    pub sig: [u8; 64],
-}
 
 #[derive(Debug, Clone)]
 pub struct TagBindingObj {
@@ -481,89 +419,6 @@ pub struct TagBindingObj {
     pub issued_at: u64,
     pub expires: u64,
     pub sig: [u8; 64],
-}
-
-impl GroupObj {
-    pub fn canonical_for_signing(&self) -> Vec<u8> {
-        fn lp(buf: &mut Vec<u8>, f: &[u8]) {
-            buf.extend_from_slice(&(f.len() as u32).to_le_bytes());
-            buf.extend_from_slice(f);
-        }
-        let mut mblob = Vec::new();
-        mblob.extend_from_slice(&(self.members.len() as u32).to_le_bytes());
-        for m in &self.members {
-            mblob.push(m.kind);
-            mblob.extend_from_slice(&m.pubkey);
-        }
-        let mut v = Vec::new();
-        v.extend_from_slice(b"filament/group-object/v1");
-        lp(&mut v, self.group_id.as_bytes());
-        lp(&mut v, &self.owner_pub);
-        lp(&mut v, &mblob);
-        lp(&mut v, &self.version.to_le_bytes());
-        lp(&mut v, &self.issued_at.to_le_bytes());
-        lp(&mut v, &self.expires.to_le_bytes());
-        v
-    }
-
-    pub fn verify(&self) -> Result<()> {
-        if now_secs() >= self.expires {
-            bail!("group '{}' expired", self.group_id);
-        }
-        let canonical = self.canonical_for_signing();
-        let peer_pub = UnparsedPublicKey::new(&ED25519, &self.owner_pub);
-        peer_pub
-            .verify(&canonical, &self.sig)
-            .map_err(|_| anyhow!("group '{}' signature invalid", self.group_id))
-    }
-
-    pub fn to_json(&self) -> Value {
-        let members: Vec<Value> = self
-            .members
-            .iter()
-            .map(|m| serde_json::json!({"kind": m.kind, "pubkey": hex::encode(m.pubkey)}))
-            .collect();
-        serde_json::json!({
-            "type": "cap_group",
-            "group_id": self.group_id,
-            "owner_pub": hex::encode(self.owner_pub),
-            "members": members,
-            "version": self.version,
-            "issued_at": self.issued_at,
-            "expires": self.expires,
-            "sig": hex::encode(self.sig),
-        })
-    }
-
-    pub fn from_json(v: &Value) -> Option<Self> {
-        if v.get("type").and_then(|x| x.as_str()) != Some("cap_group") { return None; }
-        let owner_pub = {
-            let b = hex::decode(v["owner_pub"].as_str()?).ok()?;
-            if b.len() != 32 { return None; }
-            let mut a = [0u8; 32]; a.copy_from_slice(&b); a
-        };
-        let members: Vec<GroupMember> = v["members"].as_array()?.iter().map(|m| {
-            let kind = m["kind"].as_u64()? as u8;
-            let b = hex::decode(m["pubkey"].as_str()?).ok()?;
-            if b.len() != 32 { return None; }
-            let mut a = [0u8; 32]; a.copy_from_slice(&b);
-            Some(GroupMember { kind, pubkey: a })
-        }).collect::<Option<Vec<_>>>()?;
-        let sig = {
-            let b = hex::decode(v["sig"].as_str()?).ok()?;
-            if b.len() != 64 { return None; }
-            let mut a = [0u8; 64]; a.copy_from_slice(&b); a
-        };
-        Some(GroupObj {
-            group_id: v["group_id"].as_str()?.to_string(),
-            owner_pub,
-            members,
-            version: v["version"].as_u64()?,
-            issued_at: v["issued_at"].as_u64()?,
-            expires: v["expires"].as_u64()?,
-            sig,
-        })
-    }
 }
 
 impl TagBindingObj {
@@ -596,22 +451,6 @@ impl TagBindingObj {
     }
 }
 
-/// Find a group object by (owner_pub, group_hash) from the store.
-fn find_group(store: &[Value], owner: &[u8; 32], group_hash: [u8; 32]) -> Option<GroupObj> {
-    let owner_hex = hex::encode(owner);
-    let hash_hex = hex::encode(group_hash);
-    store.iter().find_map(|e| {
-        if e.get("type").and_then(|v| v.as_str()) != Some("cap_group") { return None; }
-        let entry_owner = e["owner_pub"].as_str()?;
-        if entry_owner != owner_hex { return None; }
-        // Reconstruct the hash from stored group_id: SHA-256(owner_pub || group_id)
-        let gid = e["group_id"].as_str()?;
-        let computed = make_group_target(owner, gid);
-        if hex::encode(computed) != hash_hex { return None; }
-        GroupObj::from_json(e)
-    })
-}
-
 /// Find tag bindings for (owner_pub, tag_hash) that are not expired and sig-valid.
 fn find_tag_bindings(store: &[Value], owner: &[u8; 32], tag_hash: [u8; 32]) -> Vec<TagBindingObj> {
     store.iter().filter_map(|e| {
@@ -631,31 +470,6 @@ fn find_tag_bindings(store: &[Value], owner: &[u8; 32], tag_hash: [u8; 32]) -> V
         if b.verify().is_err() { return None; }
         Some(b)
     }).collect()
-}
-
-/// Apply a group object with monotonic version check (anti-rollback).
-pub fn apply_group(store: &mut Vec<Value>, group: &GroupObj) -> Result<()> {
-    group.verify()?;
-    let owner_hex = hex::encode(group.owner_pub);
-    let group_hash = make_group_target(&group.owner_pub, &group.group_id);
-    let hash_hex = hex::encode(group_hash);
-
-    for entry in store.iter_mut() {
-        if entry.get("type").and_then(|v| v.as_str()) != Some("cap_group") { continue; }
-        if entry["owner_pub"].as_str() != Some(&owner_hex) { continue; }
-        let gid = entry["group_id"].as_str().unwrap_or("");
-        let existing_hash = make_group_target(&group.owner_pub, gid);
-        if hex::encode(existing_hash) != hash_hex { continue; }
-        let existing_ver = entry["version"].as_u64().unwrap_or(0);
-        if existing_ver >= group.version {
-            bail!("group '{}' version rollback: existing {} >= new {}",
-                group.group_id, existing_ver, group.version);
-        }
-        *entry = group.to_json();
-        return Ok(());
-    }
-    store.push(group.to_json());
-    Ok(())
 }
 
 /// Apply a tag binding with monotonic version check (anti-rollback).
@@ -3612,165 +3426,6 @@ mod tests {
     // caps.json — they'd otherwise race on the same file and the global cache.
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("filament-cap-test-{}-{}", std::process::id(), name))
-    }
-
-    fn sign_group(group: &mut GroupObj, keypair: &Ed25519KeyPair) {
-        let canon = group.canonical_for_signing();
-        let sig = keypair.sign(&canon);
-        group.sig.copy_from_slice(sig.as_ref());
-    }
-
-    #[test]
-    fn group_grant_matches_member() {
-        let owner = make_owner();
-        let nonce = self_resource_nonce();
-        let pk = owner_pub(&owner);
-        let resource = self_resource_id(&pk);
-        let hdr = make_self_header(&pk, &resource, &nonce, &owner);
-
-        let mut store = hdr_to_store(&hdr);
-        let group_target = make_group_target(&pk, "admins");
-        let mut group = GroupObj {
-            group_id: "admins".into(), owner_pub: pk,
-            members: vec![GroupMember { kind: 0x01, pubkey: [0xcc; 32] }],
-            version: 1, issued_at: now_secs(), expires: now_secs() + 86400, sig: [0u8; 64],
-        };
-        sign_group(&mut group, &owner);
-        apply_group(&mut store, &group).unwrap();
-
-        let v1 = hlc_next(0, now_ms());
-        let mut grant = CapOp {
-            op: CapOpKind::Grant, grantor: pk,
-            target_kind: 0x02, target: group_target,
-            resource: "self".to_string(),
-            permissions: vec!["shell".to_string()],
-            expires: now_secs() + 86400, issued_at: now_secs(), version: v1, sig: [0u8; 64],
-        };
-        grant.sig = sign_cap_op(&grant, &owner);
-        apply_cap_op(&mut store, &hdr, &grant, now_secs()).unwrap();
-
-        let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &hdr, &[0xcc; 32], &principal_user, &hdr.resource, "shell", now_secs());
-        match d {
-            Decision::Authorized => {},
-            Decision::Denied(r) => panic!("group member device must be authorized: {r}"),
-        }
-    }
-
-    #[test]
-    fn group_grant_non_member_denied() {
-        let owner = make_owner();
-        let nonce = self_resource_nonce();
-        let pk = owner_pub(&owner);
-        let resource = self_resource_id(&pk);
-        let hdr = make_self_header(&pk, &resource, &nonce, &owner);
-
-        let mut store = hdr_to_store(&hdr);
-        let group_target = make_group_target(&pk, "admins");
-        let mut group = GroupObj {
-            group_id: "admins".into(), owner_pub: pk,
-            members: vec![GroupMember { kind: 0x01, pubkey: [0xcc; 32] }],
-            version: 1, issued_at: now_secs(), expires: now_secs() + 86400, sig: [0u8; 64],
-        };
-        sign_group(&mut group, &owner);
-        apply_group(&mut store, &group).unwrap();
-
-        let v1 = hlc_next(0, now_ms());
-        let mut grant = CapOp {
-            op: CapOpKind::Grant, grantor: pk,
-            target_kind: 0x02, target: group_target,
-            resource: "self".to_string(),
-            permissions: vec!["shell".to_string()],
-            expires: now_secs() + 86400, issued_at: now_secs(), version: v1, sig: [0u8; 64],
-        };
-        grant.sig = sign_cap_op(&grant, &owner);
-        apply_cap_op(&mut store, &hdr, &grant, now_secs()).unwrap();
-
-        // Different device, not in group
-        let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &hdr, &[0xdd; 32], &principal_user, &hdr.resource, "shell", now_secs());
-        match d {
-            Decision::Denied(_) => {},
-            Decision::Authorized => panic!("non-group-member must be denied"),
-        }
-    }
-
-    #[test]
-    fn group_anti_rollback_version_rejected() {
-        let owner = make_owner();
-        let pk = owner_pub(&owner);
-        let mut group = GroupObj {
-            group_id: "admins".into(), owner_pub: pk,
-            members: vec![GroupMember { kind: 0x01, pubkey: [0xcc; 32] }],
-            version: 5, issued_at: now_secs(), expires: now_secs() + 86400, sig: [0u8; 64],
-        };
-        sign_group(&mut group, &owner);
-
-        let mut store: Vec<Value> = vec![];
-        apply_group(&mut store, &group).unwrap();
-
-        let mut group_v3 = group.clone();
-        group_v3.version = 3;
-        sign_group(&mut group_v3, &owner);
-        let res = apply_group(&mut store, &group_v3);
-        assert!(res.is_err(), "rollback v5->v3 must be rejected");
-    }
-
-    #[test]
-    fn group_not_found_grant_invisible() {
-        let owner = make_owner();
-        let nonce = self_resource_nonce();
-        let pk = owner_pub(&owner);
-        let resource = self_resource_id(&pk);
-        let hdr = make_self_header(&pk, &resource, &nonce, &owner);
-
-        let mut store = hdr_to_store(&hdr);
-        let group_target = make_group_target(&pk, "ghosts");
-
-        let v1 = hlc_next(0, now_ms());
-        let mut grant = CapOp {
-            op: CapOpKind::Grant, grantor: pk,
-            target_kind: 0x02, target: group_target,
-            resource: "self".to_string(),
-            permissions: vec!["shell".to_string()],
-            expires: now_secs() + 86400, issued_at: now_secs(), version: v1, sig: [0u8; 64],
-        };
-        grant.sig = sign_cap_op(&grant, &owner);
-        apply_cap_op(&mut store, &hdr, &grant, now_secs()).unwrap();
-
-        let d = evaluate(&store, &hdr, &[0xcc; 32], &[0xaa; 32], &hdr.resource, "shell", now_secs());
-        match d {
-            Decision::Denied(_) => {},
-            Decision::Authorized => panic!("grant to unknown group must be invisible (denied)"),
-        }
-    }
-
-    #[test]
-    fn evaluate_unknown_target_kind_skipped() {
-        let owner = make_owner();
-        let nonce = self_resource_nonce();
-        let pk = owner_pub(&owner);
-        let resource = self_resource_id(&pk);
-        let hdr = make_self_header(&pk, &resource, &nonce, &owner);
-
-        let mut store = hdr_to_store(&hdr);
-        let v1 = hlc_next(0, now_ms());
-        let mut grant = CapOp {
-            op: CapOpKind::Grant, grantor: pk,
-            target_kind: 0xFF, target: [0u8; 32],
-            resource: "self".to_string(),
-            permissions: vec!["shell".to_string()],
-            expires: now_secs() + 86400, issued_at: now_secs(), version: v1, sig: [0u8; 64],
-        };
-        grant.sig = sign_cap_op(&grant, &owner);
-        apply_cap_op(&mut store, &hdr, &grant, now_secs()).unwrap();
-
-        // Unknown kind must be skipped — backward-compat
-        let d = evaluate(&store, &hdr, &[0xcc; 32], &[0xaa; 32], &hdr.resource, "shell", now_secs());
-        match d {
-            Decision::Denied(_) => {},
-            Decision::Authorized => panic!("unknown target kind must be skipped (backward-compat)"),
-        }
     }
 
     fn make_self_header(pk: &[u8; 32], resource: &str, nonce: &[u8; 32], owner: &Ed25519KeyPair) -> CapHeader {
