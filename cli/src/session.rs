@@ -185,13 +185,8 @@ impl Session {
             return;
         }
         self.last_attempt = Some(now);
-        let _ = room; // room presence is enforced by the early return above
+        let _ = room;
         self.emit(sio, "sync", self.sync_payload()).await;
-        // Re-assert enrollment room membership on each tick (it's a SECOND room,
-        // not persisted by the solo-room sync cycle).
-        if let Some(ref er) = self.enroll_room {
-            let _ = sio.emit("join", json!({ "room": er, "name": self.name, "uid": self.uid })).await;
-        }
     }
 }
 

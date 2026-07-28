@@ -3123,7 +3123,7 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
                     && v["channel"].as_str() == Some(enroll_chan.as_str())
                 {
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if !pid.is_empty() && !conn.links.contains_key(&pid) {
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
                         conn.roster.insert(pid.clone(), v.clone());
                         conn.establish_as(v.clone(), Some(false)).await?;
                         if conn.active.is_none() { conn.active = Some(pid); }
@@ -3308,7 +3308,7 @@ async fn enroll_and_send_cmd(
                     && v["channel"].as_str() == Some(enroll_chan.as_str())
                 {
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if !pid.is_empty() && !conn.links.contains_key(&pid) {
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
                         conn.roster.insert(pid.clone(), v.clone());
                         conn.establish_as(v.clone(), Some(false)).await?;
                         if conn.active.is_none() { conn.active = Some(pid); }
@@ -3438,7 +3438,8 @@ async fn enroll_and_send_cmd(
         let _ = t.flush().await;
         // File-end marker so the receiver finalizes + hashes the complete file.
         // Must match the sid declared in the offer (0).
-        let _ = t.send_control(&crate::protocol::end_msg(&id, 0)).await;
+        t.send_control(&crate::protocol::end_msg(&id, 0)).await
+            .map_err(|e| anyhow::anyhow!("failed to send file-end for {name}: {e}"))?;
         ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, total));
     }
     if let Some(name) = remember {
@@ -3532,7 +3533,7 @@ async fn enroll_and_netcat_cmd(
                     && v["channel"].as_str() == Some(enroll_chan.as_str())
                 {
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
-                    if !pid.is_empty() && !conn.links.contains_key(&pid) {
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
                         conn.roster.insert(pid.clone(), v.clone());
                         conn.establish_as(v.clone(), Some(false)).await?;
                         if conn.active.is_none() { conn.active = Some(pid); }
@@ -7556,6 +7557,10 @@ async fn handle_warm_req(
         // Reconfigure is handled inline in the daemon loop (it mutates loop state),
         // so it never reaches this dispatcher; answer defensively if it ever does.
         ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
+        ctl::ReqKind::Arm { key_id, expiry } => {
+            crate::ephemeral::arm(key_id.clone(), *expiry);
+            req.reply(&json!({ "ok": true })).await;
+        }
         // ReloadExpose is likewise handled inline in the daemon loop (it owns the
         // Exposer); answer defensively if it ever reaches here.
         ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
@@ -10858,47 +10863,34 @@ async fn recv_cmd(
             recv_pake_template = None; // no code claim, no ephemeral PAKE
             // C19: the daemon joins NO room. Presence-channel subscriptions
             // only, strangers can't see it, probe it, or offer to it.
-            // (We still `join` an unguessable solo room so the registry holds
-            // our meta for known-peer events, but nobody else can land there.)
-            // Enroll rendezvous: an enroll-capable daemon (has a user key) JOINS
-            // the enroll ROOM derived from its owner_pub, so an enroller joining
-            // the same room fires peer-joined on BOTH sides and their WebRTC
-            // offers route (a channel SUBSCRIBE does not bridge signal routing).
-            // sess.room is re-asserted every sync tick, so membership survives the
-            // cadence. The enrollment room is a SECOND simultaneous membership when
-            // a UserKey exists — re-joined on each sync tick alongside the solo room.
+            // Enroll rendezvous: arm-gated on an outstanding non-expired auth key.
+            // Joins the enroll ROOM derived from owner_pub only when armed — this
+            // bounds the presence oracle to the auth-key TTL window. Unarmed daemon
+            // stays in its unguessable solo room only (invisible).
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
-            if let Ok(Some(uk)) = crate::identity::UserKey::load() {
-                let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-                sess.enroll_room = Some(ek.clone());
-                sess.emit(&sio, "join", json!({ "room": ek, "name": display_name(), "uid": my_uid })).await;
-            }
-            // C29: an interactive up can START empty and pair in-session.
-            // When shell (--shell / --shell-only) is enabled, the daemon
-            // explicitly accepts devices paired later, so do NOT bail just
-            // because the device list is empty at startup — the live-pairing
-            // scan (below) will pick them up from devices.json.
-            if devices.is_empty() && !std::io::stdin().is_terminal() && !shell_policy.enables_l2() {
-                bail!("no known devices, run `filament pair` once, or `filament up` in a terminal to pair interactively");
+            if crate::ephemeral::is_armed() {
+                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    sess.enroll_room = Some(ek.clone());
+                    sess.emit(&sio, "join", json!({ "room": ek, "name": display_name(), "uid": my_uid })).await;
+                }
+                ui::debug("enrollment armed: ephemeral devices may enroll");
+            } else {
+                ui::debug("enrollment closed (no armed keys — 'filament ephemeral mint' to arm)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-            // Subscribe to enrollment rendezvous channel so ephemeral devices
-            // can self-enroll cross-network, derived from the owner's UserKey.
-            if let Ok(Some(uk)) = crate::identity::UserKey::load() {
-                let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-                if !chans.contains(&ek) {
-                    let mut c = chans;
-                    c.push(ek);
-                    sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
-                    sess.channels = c;
-                } else {
-                    sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+            // Subscribe to enrollment rendezvous channel (also arm-gated).
+            let mut c = chans;
+            if crate::ephemeral::is_armed() {
+                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    if !c.contains(&ek) { c.push(ek); }
                 }
-            } else {
-                sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
             }
+            sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
+            sess.channels = c;
             ui::say(&format!(
                 "  {} filament up, {} known device{} {} {}",
                 ui::paint(ui::Tone::Brand, "●"),
@@ -11716,7 +11708,20 @@ async fn recv_cmd(
                                 let chans = sess.channels.clone();
                                 sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
                             }
-                            sess.tick(&sio).await;
+        sess.tick(&sio).await;
+        // Arm-gate: rejoin/leave enroll room based on armed set
+        {
+            let armed = crate::ephemeral::is_armed();
+            if armed && sess.enroll_room.is_none() {
+                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    sess.enroll_room = Some(ek.clone());
+                    let _ = sio.emit("join", json!({ "room": ek, "name": display_name(), "uid": conn.my_uid })).await;
+                }
+            } else if !armed && sess.enroll_room.is_some() {
+                sess.enroll_room = None;
+            }
+        }
                             // optimistic: a clean connect proves reachability; let
                             // the welcome confirm it (which resets the counters).
                             last_signaling = Instant::now();

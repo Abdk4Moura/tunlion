@@ -496,6 +496,10 @@ mod imp {
         ApproveRequest { id: u64 },
         /// Deny a pending request by id.
         DenyRequest { id: u64 },
+        /// Arm the daemon for enrollment: a minted auth key is outstanding.
+        /// The daemon joins the enrollment room for the key's TTL.
+        /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
+        Arm { key_id: String, expiry: u64 },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link

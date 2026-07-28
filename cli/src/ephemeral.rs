@@ -604,6 +604,41 @@ pub fn consume_latest_nonce(peer_id: &str) -> Result<[u8; 32]> {
 // Remove consume_nonce (peer_id, nonce) — no longer needed since single-outstanding.
 
 // ---------------------------------------------------------------------------
+// Arm-gate: armed set for enrollment room membership
+// ---------------------------------------------------------------------------
+
+struct ArmedEntry {
+    expiry: u64, // absolute unix seconds
+    key_id: String,
+}
+
+struct ArmedSet {
+    entries: Vec<ArmedEntry>,
+}
+
+static ARMED: OnceLock<Mutex<ArmedSet>> = OnceLock::new();
+
+fn armed_set() -> &'static Mutex<ArmedSet> {
+    ARMED.get_or_init(|| Mutex::new(ArmedSet { entries: Vec::new() }))
+}
+
+/// Arm the daemon: add a key to the armed set. Called from Mint via ctl socket.
+pub fn arm(key_id: String, expires_at: u64) {
+    let mut set = armed_set().lock().unwrap();
+    set.entries.retain(|e| e.key_id != key_id); // dedup
+    set.entries.push(ArmedEntry { expiry: expires_at, key_id });
+}
+
+/// Check if the daemon should be in the enroll room (any unexpired armed key).
+/// Prunes expired entries.
+pub fn is_armed() -> bool {
+    let now = now_secs();
+    let mut set = armed_set().lock().unwrap();
+    set.entries.retain(|e| e.expiry > now);
+    !set.entries.is_empty()
+}
+
+// ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
 
