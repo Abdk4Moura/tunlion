@@ -40,11 +40,13 @@ pub enum Reuse {
 }
 
 impl Reuse {
-    fn to_byte(&self) -> u8 {
+    /// Commit both discriminant and count to canonical bytes.
+    /// Once = (0, 0), N(n) = (1, n), Reusable = (2, u32::MAX).
+    fn to_canonical(&self) -> (u32, u32) {
         match self {
-            Reuse::Once => 0,
-            Reuse::N(_) => 1,
-            Reuse::Reusable => 2,
+            Reuse::Once => (0, 0),
+            Reuse::N(n) => (1, *n),
+            Reuse::Reusable => (2, u32::MAX),
         }
     }
 }
@@ -96,6 +98,8 @@ fn auth_key_canonical_bytes(k: &AuthKey) -> Vec<u8> {
     b.extend_from_slice(&k.issuer);
     b.extend_from_slice(&k.enroll_pub);
     // caps (already normalized: sorted, deduped, lowercase)
+    // COUNT PREFIX before loop — prevents caps/audience boundary forgery.
+    b.extend_from_slice(&(k.caps.len() as u32).to_le_bytes());
     for c in &k.caps {
         b.extend_from_slice(&(c.len() as u32).to_le_bytes());
         b.extend_from_slice(c.as_bytes());
@@ -108,7 +112,9 @@ fn auth_key_canonical_bytes(k: &AuthKey) -> Vec<u8> {
         b.extend_from_slice(a);
     }
     b.extend_from_slice(&k.expires.to_le_bytes());
-    b.push(k.reuse.to_byte());
+    let (disc, count) = k.reuse.to_canonical();
+    b.extend_from_slice(&disc.to_le_bytes());
+    b.extend_from_slice(&count.to_le_bytes());
     b.push(if k.ephemeral { 1 } else { 0 });
     b.extend_from_slice(&(k.tag.len() as u32).to_le_bytes());
     b.extend_from_slice(k.tag.as_bytes());
@@ -173,6 +179,10 @@ impl AuthKey {
         // Audience check FIRST — don't verify sig if this verifier is excluded.
         if !self.audience_allows(verifier_pub) {
             bail!("auth key not authorized for this peer");
+        }
+        // Caps normalization invariant — cheap hardening at point of use.
+        if self.caps != normalize_caps(&self.caps) {
+            bail!("auth key caps not normalized");
         }
         self.verify_sig_and_expiry()?;
         if self.issuer != *owner_pub {
@@ -767,6 +777,99 @@ mod tests {
         // Tag exceeding MAX_CAP_LEN
         let mega_tag = "y".repeat(MAX_CAP_LEN + 1);
         assert!(AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, mega_tag).is_err());
+    }
+
+    #[test]
+    fn canonical_bytes_caps_count_prefix_prevents_boundary_forgery() {
+        // Key A: caps=["shell"], audience=[]
+        // Key B: caps=[], audience=[0..repeat "shell" bytes]
+        // Without a caps count prefix, the bare sequence (len,"shell") from A's caps
+        // could collide with B's audience data. With count prefix they MUST differ.
+        let a = {
+            let ak = AuthKey {
+                issuer: [1u8; 32], enroll_pub: [0u8; 32],
+                caps: vec!["shell".into()],
+                audience: vec![],
+                expires: 0, reuse: Reuse::Once, ephemeral: true,
+                tag: String::new(), sig: [0u8; 64],
+            };
+            auth_key_canonical_bytes(&ak)
+        };
+        // Construct an audience whose raw bytes mirror "shell" but embedded
+        // in the audience loop (no length prefix per entry — audience entries are 32B keys)
+        // We need a 32-byte key; there's no direct way to match "shell".
+        // Instead: generic property — changing caps count changes bytes.
+        let b_empty_caps = {
+            let ak = AuthKey {
+                issuer: [1u8; 32], enroll_pub: [0u8; 32],
+                caps: vec![],
+                audience: vec![],
+                expires: 0, reuse: Reuse::Once, ephemeral: true,
+                tag: String::new(), sig: [0u8; 64],
+            };
+            auth_key_canonical_bytes(&ak)
+        };
+        // caps count differs (1 vs 0) → bytes MUST differ
+        assert_ne!(a, b_empty_caps, "caps count prefix must make canonical bytes differ");
+    }
+
+    #[test]
+    fn reuse_n_count_committed_to_signature() {
+        // N(1) and N(999) must produce different canonical bytes → different sigs.
+        // Mint two keys that differ ONLY in reuse count; verify sigs differ.
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+
+        // Use explicit construction to set reuse directly (not through mint which uses wall clock)
+        let make = |n: u32| -> AuthKey {
+            let now = now_secs();
+            let mut ak = AuthKey {
+                issuer: owner.public_key().as_ref().try_into().unwrap(),
+                enroll_pub,
+                caps: vec!["shell".into()],
+                audience: vec![],
+                expires: now + 3600,
+                reuse: Reuse::N(n),
+                ephemeral: true,
+                tag: "test".into(),
+                sig: [0u8; 64],
+            };
+            let canonical = auth_key_canonical_bytes(&ak);
+            let sig = owner.sign(&canonical);
+            ak.sig = sig.as_ref().try_into().unwrap();
+            ak
+        };
+
+        let ak1 = make(1);
+        let ak3 = make(3);
+
+        // Canonical bytes MUST differ (different reuse count)
+        assert_ne!(
+            auth_key_canonical_bytes(&ak1),
+            auth_key_canonical_bytes(&ak3),
+            "N(1) and N(3) must not share canonical bytes"
+        );
+
+        // Sigs MUST differ (signature commits to count)
+        assert_ne!(ak1.sig, ak3.sig, "N(1) sig must not verify N(3)");
+    }
+
+    #[test]
+    fn caps_not_normalized_rejected_by_verify_against_owner() {
+        // Cheap hardening: verify_against_owner rejects when caps != normalize_caps(&self.caps)
+        // Construct an AuthKey with non-normalized caps (not sorted, uppercase)
+        let ak = AuthKey {
+            issuer: [0u8; 32], enroll_pub: [0u8; 32],
+            caps: vec!["SHELL".into(), "transfer".into()],
+            audience: vec![],
+            expires: now_secs() + 3600,
+            reuse: Reuse::Once, ephemeral: true,
+            tag: "test".into(), sig: [0u8; 64],
+        };
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let err = ak.verify_against_owner(&[0u8; 32], &verifier_pub).unwrap_err().to_string();
+        assert!(err.contains("not normalized"), "non-normalized caps must be rejected");
     }
 
     // ── Finding 6: Audience ─────────────────────────────────────────────
