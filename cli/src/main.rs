@@ -1053,6 +1053,9 @@ enum EphemeralAction {
     Enroll {
         /// Path to the auth key JSON file, or the raw JSON string
         auth_key: String,
+        /// Target peer display name or channel (the owner device to enroll at)
+        #[arg(long)]
+        to: Option<String>,
     },
 }
 
@@ -3002,50 +3005,180 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()));
             Ok(())
         }
-        EphemeralAction::Enroll { auth_key } => {
-            use crate::ephemeral::{AuthKey, EnrollmentPayload};
-            let v: serde_json::Value = {
-                let ak_str = if std::path::Path::new(&auth_key).exists() {
-                    std::fs::read_to_string(&auth_key)?
-                } else {
-                    auth_key.clone()
-                };
-                serde_json::from_str(&ak_str)?
-            };
-            let ak = AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)).ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
-            let enroll_seed = v.get("enroll_private_key")
-                .and_then(|s| s.as_str())
-                .and_then(|s| hex::decode(s).ok())
-                .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key in auth key JSON"))?;
-            let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
-            let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&enroll_seed)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let mut dseed = [0u8; 32];
-            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
-            let verifier_pub = crate::overlay::overlay_pubkey_bytes()?;
+        EphemeralAction::Enroll { auth_key, to } => {
+            enroll_cmd(server, &auth_key, to, relay).await
+        }
+    }
+}
 
-            // Register pending enrollment for the enroller challenge handler.
-            // When the daemon sends identity-auth-key-enroll-challenge, the
-            // event-loop handler in send_cmd/recv_cmd looks up this registration
-            // and builds the EnrollmentPayload.
-            crate::ephemeral::register_enrollment(
-                String::new(), // peer_id will be set when connected
-                enroll_seed,
-                dseed,
-                device_pub,
-                ak.clone(),
-            );
-            let _ = (server, relay, enroll_kp, device_kp, verifier_pub);
-            ui::say(&format!("{} auth key loaded (caps: {:?}, issuer: {})",
-                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                hex::encode(&ak.issuer[..4])));
-            ui::say(&ui::paint(ui::Tone::Dim, "  enrollment handler not yet wired (Phase 2 in progress)"));
-            Ok(())
+async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, relay: bool) -> Result<()> {
+    use crate::ephemeral::AuthKey;
+
+    let v: serde_json::Value = {
+        let ak_str = if std::path::Path::new(auth_key_json).exists() {
+            std::fs::read_to_string(auth_key_json)?
+        } else {
+            auth_key_json.to_string()
+        };
+        serde_json::from_str(&ak_str)?
+    };
+    let ak = AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)).ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+    let enroll_seed = v.get("enroll_private_key")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key in auth key JSON"))?;
+    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key seed"))?;
+    let mut dseed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+
+    ui::say(&format!("{} auth key loaded (caps: {:?}, issuer: {})",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        hex::encode(&ak.issuer[..4])));
+
+    let my_uid = mk_uid("e");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+
+    let room = net::fetch_auto_room(server).await?;
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(room.clone());
+    sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
+
+    let mut conn = Conn::for_command(
+        server,
+        sio.clone(),
+        tx.clone(),
+        my_uid,
+        relay,
+        to_name,
+        false,
+        direct::direct_enabled(),
+    );
+
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown::arm_force_exit(130, shutdown::grace());
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
+
+    let started = Instant::now();
+    let enroll_deadline = Duration::from_secs(60);
+
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= enroll_deadline {
+            bail!("enrollment timed out after {}s (no response from peer)", enroll_deadline.as_secs());
+        }
+
+        let slice = Duration::from_secs(2).min(enroll_deadline.saturating_sub(elapsed));
+        let ev = match tokio::time::timeout(slice, rx.recv()).await {
+            Ok(Some(ev)) => Some(ev),
+            Ok(None) => bail!("signaling channel closed"),
+            Err(_) => None,
+        };
+
+        sess.tick(&sio).await;
+
+        let Some(ev) = ev else { continue };
+
+        match ev {
+            Ev::Welcome(v) => {
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers {
+                        conn.maybe_adopt(p, false).await?;
+                    }
+                }
+            }
+            Ev::PeerJoined(v) => {
+                conn.maybe_adopt(&v, false).await?;
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
+                }
+                if conn.active.is_none() {
+                    conn.active = Some(pid.clone());
+                }
+
+                crate::ephemeral::register_enrollment(
+                    pid.clone(),
+                    enroll_seed,
+                    dseed,
+                    device_pub,
+                    ak.clone(),
+                );
+
+                let _ = t.send_control(&json!({
+                    "type": "identity-auth-key-enroll-request",
+                    "auth_key": ak.to_json(),
+                    "device_pub": hex::encode(device_pub),
+                })).await;
+
+                ui::say(&format!("  {} sent enrollment request to {}",
+                    ui::paint(ui::Tone::Dim, "->"),
+                    pid));
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-auth-key-enroll-ack") => {
+                    let name = v["name"].as_str().unwrap_or("ephemeral-device");
+                    ui::say(&format!("{} enrolled as ephemeral device '{}' (device_pub: {})",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        name,
+                        hex::encode(device_pub)));
+                    return Ok(());
+                }
+                Some("identity-auth-key-enroll-error") => {
+                    bail!("enrollment rejected: {}", v["reason"].as_str().unwrap_or("unknown reason"));
+                }
+                _ => {}
+            },
+            Ev::Interrupted => bail!("cancelled"),
+            Ev::SignalingDown(reason) => {
+                bail!("signaling connection lost: {reason}");
+            }
+            _ => {}
         }
     }
 }
