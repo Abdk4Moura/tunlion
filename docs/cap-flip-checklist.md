@@ -116,11 +116,17 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
         * ROLLBACK: unsetting the flag returns to legacy gating, the transfer delivers again;
         * SANDBOX HELD: the live destructive reconciler ran under sandboxed HOME; do-vm's
           real ~/.ssh/authorized_keys byte-identical before/after.
-      STILL OWED (needs identity-EXPOSE so a grant binds to the peer's user_pub; the plain
-      transfer flow exchanges only the pair secret, not the device cert): the positive
-      granted->ALLOW path, and revoked->deny+key-removed (#24 live). Those need a session
-      that runs identity-expose (shell/l2 path or an explicit identity exchange). Finish
-      the ALLOW and REVOKE-key cases on the same cross-machine rig before a production flip.
+      GRANTED->ALLOW now VERIFIED (2026-07-28, after #29 + #30): a granted peer's FIRST
+      transfer under authoritative DELIVERS (cap-status transfer la_ok=1, "identity proven"
+      logged), ungranted/unproven still denied. Required #29 (pairing exchanges deviceCert)
+      AND #30 (in-session possession-sig sets binding=Proven: challenge fires after resolve,
+      the async send is awaited, the sender answers via a shared responder, and the offer
+      honors the pending_proven hold). So allow + deny + rollback + deny-by-default + real
+      reasons are all proven on live cross-machine traffic.
+      STILL OWED before a production flip: revoked->deny+SSH-key-removed (#24 reconciler live)
+      demonstrated end-to-end on the rig (the mechanism is unit-tested and the shadow WOULD-remove
+      path is proven; the live authoritative removal on a real session is the last unrun case),
+      and a broader multi-device / multi-action sample.
 
 ## Rollback
 
