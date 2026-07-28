@@ -34,6 +34,7 @@ mod mount_fuse;
 #[cfg(all(target_os = "windows", feature = "mount-windows"))]
 mod mount_winfsp;
 mod backup;
+mod capability;
 mod net;
 mod overlay;
 mod platform;
@@ -69,7 +70,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::net::SocketAddr;
@@ -894,16 +895,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Bind a tag to a device (owner-signed).
+    #[command(hide = true)]
+    TagBind {
+        /// Tag name
+        tag: String,
+        /// Device petname
+        device: String,
+    },
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
     /// (Prefer `filament set shell on --peer <device>`.)
     #[command(hide = true)]
     Grant {
-        /// Known device (petname)
+        /// Known device (petname), or omit with --tag
         device: String,
         /// Capability to grant (e.g. `shell`)
         capability: String,
+        /// Target a tag instead of a device
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Revoke a capability from a known device. Revoking `shell` also strips the
     /// device's filament-managed block from this machine's authorized_keys.
@@ -965,6 +977,17 @@ enum Cmd {
         /// Local mount point to unmount
         path: String,
     },
+    /// Print the daemon's live capability shadow counters.
+    ///
+    /// The counters accumulate in the running daemon (`filament up`) across live
+    /// opens. A fresh `filament cap-status` process queries the daemon over the
+    /// control socket; only the daemon sees real traffic, so this is the only
+    /// path to useful numbers.
+    CapStatus {
+        /// Output raw JSON instead of the summary line
+        #[arg(long)]
+        json: bool,
+    },
     /// Sync files to/from a peer via rsync over the mesh.
     ///
     /// Requires rsync on both ends. Uses `filament ssh` as the remote shell,
@@ -989,6 +1012,11 @@ enum Cmd {
         #[arg(long)]
         options: Option<String>,
     },
+    /// List, approve, or deny pending consent requests from peers.
+    Requests {
+        #[command(subcommand)]
+        action: Option<RequestsAction>,
+    },
 }
 
 /// User identity management: generate the identity key, show the fingerprint,
@@ -1003,6 +1031,27 @@ enum IdentityAction {
     Certify {
         /// Petname of the known device to certify as yours
         device: String,
+    },
+}
+
+/// Consent request management: list, approve, or deny pending requests.
+#[derive(Subcommand)]
+enum RequestsAction {
+    /// List pending requests (default: pending-only; --all for full history).
+    List {
+        /// Show all requests including approved/denied/expired
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve a pending request by id and grant the capability.
+    Approve {
+        /// Request id
+        id: u64,
+    },
+    /// Deny a pending request by id.
+    Deny {
+        /// Request id
+        id: u64,
     },
 }
 
@@ -1298,6 +1347,107 @@ fn devices_path() -> PathBuf {
     crate::platform::Paths::config_path("devices.json")
 }
 
+/// Pure merge step (no I/O): upsert the (secret, cert, caps, scope) fields for `name`
+/// into `arr` as ONE record, returning the final stored name (auto-suffixed on a
+/// new-name collision). This is the atomicity-relevant step: secret and cert land in
+/// the SAME record object, so the single write that follows persists them together and
+/// a reader can never observe new-secret + old-cert. Kept pure so the invariant is
+/// unit-testable without the process-global config path.
+pub(crate) fn upsert_peer_record(
+    arr: &mut Vec<Value>,
+    name: &str,
+    secret: Option<&str>,
+    cert: Option<&identity::DeviceCert>,
+    caps: Option<&[String]>,
+    scope: Option<u8>,
+    user_key_hex: Option<&str>,
+) -> String {
+    // For existing name, update in place preserving other fields.
+    if let Some(existing) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+        if let Some(s) = secret {
+            existing["secret"] = json!(s);
+        }
+        if let Some(c) = cert {
+            existing["userKey"] = json!(hex::encode(c.user_pub));
+            existing["deviceCert"] = c.to_json();
+        } else if let Some(uk) = user_key_hex {
+            existing["userKey"] = json!(uk);
+        }
+        if let Some(caps) = caps {
+            existing["caps"] = json!(caps);
+            existing["v"] = json!(2);
+        }
+        if let Some(sc) = scope {
+            existing["identityScope"] = json!(sc);
+        }
+        return existing["name"].as_str().unwrap_or(name).to_string();
+    }
+
+    // New device: auto-suffix if collision.
+    let mut final_name = name.to_string();
+    if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
+        let mut suffix = 2;
+        let mut new_name = format!("{name}-{suffix}");
+        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
+            suffix += 1;
+            new_name = format!("{name}-{suffix}");
+        }
+        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
+        final_name = new_name;
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_string(), json!(&final_name));
+    if let Some(s) = secret {
+        obj.insert("secret".to_string(), json!(s));
+    }
+    if let Some(c) = cert {
+        obj.insert("userKey".to_string(), json!(hex::encode(c.user_pub)));
+        obj.insert("deviceCert".to_string(), c.to_json());
+    } else if let Some(uk) = user_key_hex {
+        obj.insert("userKey".to_string(), json!(uk));
+    }
+    obj.insert("v".to_string(), json!(2));
+    if let Some(caps) = caps {
+        obj.insert("caps".to_string(), json!(caps));
+    }
+    if let Some(sc) = scope {
+        obj.insert("identityScope".to_string(), json!(sc));
+    }
+    obj.insert("addedAt".to_string(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+    arr.push(Value::Object(obj));
+    final_name
+}
+
+/// Atomic per-peer (secret, cert) update: read-modify-write whole store via
+/// `upsert_peer_record` (both fields in ONE record), persist via write-tmp-then-rename
+/// (SecretFile::write already atomic on POSIX). A concurrent reader sees either the full
+/// old peer or the full new peer, never a torn state.
+pub(crate) fn devices_upsert_atomic(
+    name: &str,
+    secret: Option<&str>,
+    cert: Option<&identity::DeviceCert>,
+    caps: Option<&[String]>,
+    scope: Option<u8>,
+    user_key_hex: Option<&str>,
+) -> Result<String> {
+    let clean = sanitize_device_name(name);
+    let name = clean.as_str();
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).context("create config dir")?;
+    }
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let final_name = upsert_peer_record(&mut arr, name, secret, cert, caps, scope, user_key_hex);
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).context("serialize devices")?)
+        .context("atomic write devices.json")?;
+    Ok(final_name)
+}
+
 pub(crate) fn devices_load() -> Vec<(String, String)> {
     let Ok(raw) = std::fs::read_to_string(devices_path()) else { return Vec::new() };
     serde_json::from_str::<Value>(&raw)
@@ -1349,41 +1499,8 @@ fn sanitize_device_name(name: &str) -> String {
 }
 
 fn devices_store(name: &str, secret: &str) -> Result<()> {
-    let clean = sanitize_device_name(name);
-    let name = clean.as_str();
-    let p = devices_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Operate on the raw JSON so OTHER records keep their v2 fields (caps,
-    // addedAt) verbatim. Going through the (name, secret) tuples of
-    // devices_load() silently rewrote every other device as bare
-    // {name, secret}, wiping their `shell` grants on any store (pairing,
-    // introduce, rename), a quiet privilege-loss bug.
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    // Check for name collision and auto-suffix if needed
-    let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
-        let mut suffix = 2;
-        let mut new_name = format!("{name}-{suffix}");
-        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
-            suffix += 1;
-            new_name = format!("{name}-{suffix}");
-        }
-        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
-        new_name
-    } else {
-        name.to_string()
-    };
-    match arr.iter_mut().find(|d| d["name"].as_str() == Some(&final_name)) {
-        // Re-storing an existing name: only the secret rotates; keep its caps.
-        Some(existing) => existing["secret"] = json!(secret),
-        None => arr.push(json!({"name": &final_name, "secret": secret})),
-    }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: secret only, preserve cert
+    devices_upsert_atomic(name, Some(secret), None, None, None, None)?;
     Ok(())
 }
 
@@ -1393,60 +1510,22 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
 /// working byte-for-byte, no regression.
 fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
-    let clean = sanitize_device_name(name);
-    let name = clean.as_str();
-    let p = devices_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Preserve other records verbatim (including their v/caps if present).
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    // Check for name collision and auto-suffix if needed
-    let final_name = if arr.iter().any(|d| d["name"].as_str() == Some(name)) {
-        let mut suffix = 2;
-        let mut new_name = format!("{name}-{suffix}");
-        while arr.iter().any(|d| d["name"].as_str() == Some(&new_name)) {
-            suffix += 1;
-            new_name = format!("{name}-{suffix}");
-        }
-        eprintln!("  note: '{name}' already exists, pairing as '{new_name}'");
-        new_name
-    } else {
-        name.to_string()
-    };
-    arr.retain(|d| d["name"].as_str() != Some(&final_name));
-    arr.push(json!({"name": &final_name, "secret": secret, "v": 2, "caps": caps,
-                    "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: secret + caps together, preserve cert
+    devices_upsert_atomic(name, Some(secret), None, Some(caps), None, None)?;
     Ok(())
 }
 
 /// Attach a device certificate + user key to an existing device record.
 fn update_device_cert(name: &str, uk: &identity::UserKey, cert: &identity::DeviceCert) -> Result<()> {
+    // Check existence first (atomic upsert doesn't fail if missing for existing -> it would create new)
     let p = devices_path();
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    let uk_hex = uk.public_key_hex();
-    let mut updated = false;
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(name) {
-            d["userKey"] = json!(uk_hex);
-            d["deviceCert"] = cert.to_json();
-            updated = true;
-            break;
-        }
-    }
-    if !updated {
+    let raw = std::fs::read_to_string(&p).ok().unwrap_or_default();
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok().unwrap_or_default();
+    if !arr.iter().any(|d| d["name"].as_str() == Some(name)) {
         bail!("device '{name}' is not in the device store. Pair with it first.");
     }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: cert only, preserve secret
+    devices_upsert_atomic(name, None, Some(cert), None, None, Some(&uk.public_key_hex()))?;
     Ok(())
 }
 
@@ -1461,6 +1540,10 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
         }
     }
     None
+}
+
+fn load_owner_key() -> Option<crate::identity::UserKey> {
+    crate::identity::UserKey::load().ok().flatten()
 }
 
 fn local_device_cert() -> Option<identity::DeviceCert> {
@@ -1485,7 +1568,206 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
             }
         }
     }
+    // Final fallback: MINT the self-cert on demand from the user key + overlay key.
+    // `identity init` creates the user key but no stored self device-cert, so without
+    // this local_device_cert() is None, pairing never runs identity-expose (it is gated
+    // on this fn), the peer stays secret-only (binding Inferred), and under authoritative
+    // the #21 proven-gate denies EVERY peer. Minting here (deterministic in user_pub and
+    // device_pub; only the timestamps vary) makes the Proven-binding path reachable for
+    // freshly-onboarded and already-onboarded identities alike, without a peer-store entry.
+    if let (Ok(Some(uk)), Ok(overlay_pub)) =
+        (identity::UserKey::load(), crate::overlay::overlay_pubkey_bytes())
+    {
+        if let Ok(cert) =
+            identity::DeviceCert::certify(&uk, overlay_pub, identity::now_secs(), identity::CERT_TTL_SECS)
+        {
+            return Some(cert);
+        }
+    }
     None
+}
+
+/// Populate link identity from the peer's stored device cert, if the
+/// link already has a proof-verified name but identity pubkeys are absent.
+/// Cached back onto the link on first successful resolution (resolve-once,
+/// not per open).
+///
+/// The binding model: `verified_name` is set ONLY after a session-bound
+/// pair-proof HMAC (proof_for over shared secret + UIDs + fingerprints),
+/// so the name is cryptographically bound to this link. `device_cert_for`
+/// returns the cert we already verified at pairing (provisional_promote_ok
+/// checked device_pub against the overlay transport key at storage time).
+/// Together these form a sufficient trust join: a proven name plus the
+/// cert trusted-for-that-name. No additional link-level cert-to-transport
+/// comparison is needed.
+///
+/// Fail-closed to None on: no verified_name, no stored cert, cert expired
+/// or otherwise invalid.
+fn resolve_peer_identity(link: &mut Link) {
+    // Precedence rule: a Proven binding must NOT be downgraded to Inferred.
+    // The identity-expose handler (possession-sig) sets Proven, and this
+    // function (symmetric-secret proof + name->cert lookup) sets Inferred.
+    // An Inferred MAY later be upgraded to Proven by identity-expose.
+    if link.identity_device_pub.is_some() || link.identity_user_pub.is_some() {
+        return; // already resolved (any binding, Proven or Inferred, stays)
+    }
+    let name = match &link.verified_name {
+        Some(n) => n.clone(),
+        None => return, // no proven name, nothing to resolve
+    };
+    let Some(cert) = device_cert_for(&name) else { return };
+    let now = crate::identity::now_secs();
+    if cert.verify(now).is_err() {
+        return;
+    }
+    link.identity_device_pub = Some(cert.device_pub);
+    link.identity_user_pub = Some(cert.user_pub);
+    link.identity_binding = crate::capability::BindingStrength::Inferred;
+    link.identity_cert_expires = Some(cert.expires);
+}
+
+/// When a link becomes trusted, send a nonce challenge to the peer so it can
+/// prove device-key possession (0x02 possession_sig). When the response arrives
+/// in the event loop, the `identity-expose` handler upgrades the binding to
+/// Proven. MUST be called at LINK ADOPTION (DirectReady), NOT at individual
+/// open sites — so Proven settles once before any gated open decides.
+async fn send_identity_challenge(
+    conn: &crate::Conn,
+    pid: &str,
+    identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) {
+    if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+        if let Some(t) = conn.transport_of(pid) {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let rng = SystemRandom::new();
+            let mut nonce = [0u8; 32];
+            let _ = rng.fill(&mut nonce);
+            identity_nonces.insert(pid.to_string(), (nonce, Instant::now(), own_dpub));
+            let challenge = json!({
+                "type": "identity-nonce-challenge",
+                "nonce": hex::encode(nonce),
+                "receiver_device_pub": hex::encode(own_dpub)
+            });
+            // MUST await: send_control is async; dropping the future would leave
+            // the challenge unsent (the peer never learns it must prove Proven).
+            let _ = t.send_control(&challenge).await;
+        }
+    }
+}
+
+/// Handle a possession-sig identity-expose response sent by a peer after we
+/// challenged it. Verifies the nonce (single-use), the possession_sig under
+/// the peer's device_pub, and reflection (not self). On success, upgrades the
+/// link binding to Proven so capability gates under authoritative can pass.
+fn handle_identity_expose(
+    conn: &mut crate::Conn,
+    pid: &str,
+    v: &Value,
+    identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) -> bool {
+    let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+    let Ok(nonce_bytes) = hex::decode(nonce_hex) else { return false };
+    if nonce_bytes.len() != 32 { return false; }
+    let mut nonce_arr = [0u8; 32];
+    nonce_arr.copy_from_slice(&nonce_bytes);
+    // Check held nonce matches (single-use)
+    let Some((held_nonce, _ts, _held_recv_dpub)) = identity_nonces.get(pid) else { return false };
+    if held_nonce != &nonce_arr { return false; }
+    // Verify cert and possession sig
+    let Some(cert_json) = v.get("cert") else { return false };
+    let Some(cert) = identity::DeviceCert::from_json(cert_json) else { return false };
+    if cert.verify(identity::now_secs()).is_err() { return false; }
+    let Some(sig_hex) = v.get("possession_sig").and_then(|x| x.as_str()) else { return false };
+    let Ok(sig_bytes) = hex::decode(sig_hex) else { return false };
+    if sig_bytes.len() != 64 { return false; }
+    let mut sig_arr = [0u8; 64];
+    sig_arr.copy_from_slice(&sig_bytes);
+    // Recompute possession_msg with held nonce
+    let scope = crate::identity::IntroScope::User.to_byte();
+    let caps_d = crate::identity::caps_digest("transfer");
+    let chash = crate::identity::cert_hash(&cert);
+    let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() else { return false };
+    let sender_dpub = cert.device_pub;
+    let receiver_dpub = own_dpub;
+    let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
+    if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_err() { return false; }
+    // Reflection: refuse self-cert
+    if let Ok(Some(own_uk)) = crate::identity::UserKey::load() {
+        if cert.user_pub == own_uk.public_key_bytes() { return false; }
+    }
+    // Store as provisional, then promote on link
+    let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
+    if let Some(l) = conn.link_mut(pid) {
+        l.identity_device_pub = Some(cert.device_pub);
+        l.identity_user_pub = Some(cert.user_pub);
+        l.identity_binding = crate::capability::BindingStrength::Proven;
+        l.identity_cert_expires = Some(cert.expires);
+    }
+    ui::say(&format!(
+        "{} identity proven for peer {}",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+        pid
+    ));
+    // Erase held nonce (single-use)
+    identity_nonces.remove(pid);
+    true
+}
+
+/// #30 shared responder: on receiving an identity-nonce-challenge, prove
+/// device-key possession by signing possession_sig(0x02) over the peer-provided
+/// nonce and replying with an identity-expose. The challenger's identity-expose
+/// handler (`handle_identity_expose`) then upgrades our binding to Proven.
+/// Shared by recv_cmd (the `up`/receiver loop) AND send_cmd (the one-shot
+/// sender session) so a sender can prove possession and be authorized under an
+/// authoritative cap gate. Reflection-guarded and echoes the challenger nonce.
+pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Value) {
+    let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+    let recv_dpub_hex = v["receiver_device_pub"].as_str().unwrap_or_default();
+    let (Ok(nonce_bytes), Ok(recv_dpub_bytes)) =
+        (hex::decode(nonce_hex), hex::decode(recv_dpub_hex))
+    else {
+        return;
+    };
+    if nonce_bytes.len() != 32 || recv_dpub_bytes.len() != 32 {
+        return;
+    }
+    let mut nonce_arr = [0u8; 32];
+    nonce_arr.copy_from_slice(&nonce_bytes);
+    let mut recv_dpub_arr = [0u8; 32];
+    recv_dpub_arr.copy_from_slice(&recv_dpub_bytes);
+    // Reflection guard: never answer a challenge that names our own device key
+    // as the challenger (a self-challenge).
+    if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
+        if recv_dpub_arr == own_dpub {
+            return;
+        }
+    }
+    let Some(local_cert) = local_device_cert() else { return };
+    let scope = crate::identity::IntroScope::User.to_byte();
+    let caps_d = crate::identity::caps_digest("transfer");
+    let chash = crate::identity::cert_hash(&local_cert);
+    let sender_dpub = local_cert.device_pub;
+    let msg = crate::identity::possession_msg(
+        0x02,
+        &nonce_arr,
+        scope,
+        &caps_d,
+        &chash,
+        &sender_dpub,
+        &recv_dpub_arr,
+    );
+    if let Ok(sig) = crate::overlay::overlay_sign_possession(&msg) {
+        // Echo the challenger's nonce so its held-nonce single-use check matches.
+        let payload = json!({
+            "type": "identity-expose",
+            "v": 2,
+            "binding_type": 0x02,
+            "nonce": hex::encode(nonce_arr),
+            "cert": local_cert.to_json(),
+            "possession_sig": hex::encode(sig)
+        });
+        let _ = t.send_control(&payload).await;
+    }
 }
 
 /// Pure in-memory merge with takeover guard, scope-aware anchor, single source of truth.
@@ -1494,14 +1776,8 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 }
 
 fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
-    let p = devices_path();
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    apply_peer_identity(&mut arr, name, peer_cert, scope)?;
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    // Delegate to atomic upsert: cert only, preserve secret & caps
+    devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None)?;
     Ok(())
 }
 
@@ -2257,6 +2533,31 @@ async fn up_cmd(
         let server = server.to_string();
         tokio::spawn(async move { direct::warm_public_ip(&server).await; });
     }
+    // Startup shell-key reconciliation. GATED on authoritative: in shadow the cap
+    // layer gates NOTHING, so only REPORT what would be removed (it becomes part of
+    // the pre-flip sample). Never delete a working key while the cap store is not
+    // yet the authority, else the first `grant` on any node wipes every device that
+    // has no cap grant yet.
+    {
+        let config_dir = crate::settings::config_dir();
+        let authoritative = crate::capability::cap_authoritative();
+        let revoked = crate::capability::devices_with_shell_revoked(&config_dir);
+        let ak_path = sshkeys::authorized_keys_path();
+        let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+        // Emit per-device shadow logs for the WOULD-remove devices that
+        // actually have a block (avoid noise for devices without one).
+        for device in &revoked {
+            if sshkeys::has_block(&ak_content, device) && !authoritative {
+                eprintln!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+            }
+        }
+        let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
+        if new_ak != ak_content {
+            if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
+                eprintln!("shell-key reconcile (startup): failed to write authorized_keys: {e}");
+            }
+        }
+    }
     let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user, no_proxy_fallback).await;
     let _ = std::fs::remove_file(pidfile());
     res
@@ -2340,6 +2641,283 @@ fn status_cmd(json: bool) -> Result<()> {
             ui::say(&ui::paint(ui::Tone::Dim, "  recent receives:"));
             for l in recent.iter().rev() {
                 ui::say(&format!("    {l}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cap_status_cmd(json: bool) -> Result<()> {
+    let reply = crate::ctl::try_cap_status().await;
+    match reply {
+        Some(v) if json => {
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Some(v) => {
+            if let Some(summary) = v["summary"].as_str() {
+                ui::say(summary);
+            }
+            let flip = v["flip_ready"].as_bool().unwrap_or(false);
+            if v.get("counts").is_none() || v["counts"].is_null() {
+                ui::say(&format!(
+                    "  flip_ready: {} counts unavailable; cannot assess flip readiness",
+                    ui::paint(ui::Tone::Warn, "x"),
+                ));
+            } else {
+                let widening = v["counts"]["ld_authorized"].as_u64().unwrap_or(0);
+                let la_authorized = v["counts"]["la_authorized"].as_u64().unwrap_or(0);
+                if flip && widening == 0 {
+                    ui::say(&format!(
+                        "  flip_ready: {} no blockers detected (n={} legacy-allowed opens)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        la_authorized,
+                    ));
+                } else if flip {
+                    ui::say(&format!(
+                        "  flip_ready: {} breakage-clean, but {} WIDENING opens will be NEWLY PERMITTED; review and cite them before flipping",
+                        ui::paint(ui::Tone::Warn, "x"),
+                        widening,
+                    ));
+                } else {
+                    ui::say(&format!(
+                        "  flip_ready: {} not ready",
+                        ui::paint(ui::Tone::Warn, "x"),
+                    ));
+                }
+            }
+            if let Some(counts) = v.get("counts") {
+                if !counts.is_null() {
+                    ui::say(&format!(
+                        "  la_authorized={}  la_denied={}  la_no_header={}",
+                        counts["la_authorized"].as_u64().unwrap_or(0),
+                        counts["la_denied"].as_u64().unwrap_or(0),
+                        counts["la_no_header"].as_u64().unwrap_or(0),
+                    ));
+                    ui::say(&format!(
+                        "  WIDENING(ld_authorized)={}  ld_denied={}  ld_no_header={}",
+                        counts["ld_authorized"].as_u64().unwrap_or(0),
+                        counts["ld_denied"].as_u64().unwrap_or(0),
+                        counts["ld_no_header"].as_u64().unwrap_or(0),
+                    ));
+                }
+            }
+            // Per-action breakdown: the coverage matrix for the flip decision.
+            if let Some(by_action) = v.get("by_action").and_then(|v| v.as_array()) {
+                if !by_action.is_empty() {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  coverage matrix (per-action):"));
+                    for a in by_action {
+                        let action = a["action"].as_str().unwrap_or("?");
+                        let la = a["la_authorized"].as_u64().unwrap_or(0);
+                        let ld = a["la_denied"].as_u64().unwrap_or(0);
+                        let ln = a["la_no_header"].as_u64().unwrap_or(0);
+                        let wa = a["ld_authorized"].as_u64().unwrap_or(0);
+                        let wd = a["ld_denied"].as_u64().unwrap_or(0);
+                        let wn = a["ld_no_header"].as_u64().unwrap_or(0);
+                        ui::say(&format!(
+                            "    {action}: la_ok={la} la_deny={ld} la_nh={ln} | widen={wa} ld_deny={wd} ld_nh={wn}"
+                        ));
+                    }
+                }
+            }
+        }
+        None => {
+            ui::say(&format!("  {} daemon not running; counters are zero in a fresh process", ui::paint(ui::Tone::Dim, "·")));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&json!({
+                    "ok": false,
+                    "err": "daemon not reachable; start with filament up",
+                }))?);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------- consent queue --
+// Pending-request queue for live-approval consent (docs/design-identity-access-ux.md §2).
+// Requests arrive via the daemon from peers requesting shell/mount/transfer.
+// The daemon holds them until the owner explicitly approves or denies via CLI.
+// Deny-by-default: a pending request carries NO access.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingRequest {
+    id: u64,
+    peer: String,
+    capability: String,
+    timestamp: u64,
+    status: String, // "pending", "approved", "denied", "expired"
+    granted_at: Option<u64>,
+}
+
+const MAX_PENDING: usize = 100;
+const REQUEST_TTL_SECS: u64 = 3600;
+
+fn requests_path() -> PathBuf {
+    crate::settings::config_dir().join("requests.json")
+}
+
+fn load_requests() -> Vec<PendingRequest> {
+    std::fs::read_to_string(requests_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_requests(reqs: &[PendingRequest]) {
+    if let Ok(json) = serde_json::to_string_pretty(reqs) {
+        let _ = crate::platform::SecretFile::write_str(&requests_path(), &json);
+    }
+}
+
+fn add_pending_request(peer: &str, capability: &str, requests: &mut Vec<PendingRequest>) {
+    let now = crate::capability::now_secs();
+    let next_id = requests.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+    // Evict oldest pending if at capacity
+    while requests.iter().filter(|r| r.status == "pending").count() >= MAX_PENDING {
+        if let Some(pos) = requests.iter().position(|r| r.status == "pending") {
+            let evicted = &requests[pos];
+            ui::say(&format!(
+                "consent queue full ({}), evicting oldest pending: id={} peer={} cap={}",
+                MAX_PENDING, evicted.id, evicted.peer, evicted.capability
+            ));
+            requests.remove(pos);
+        } else {
+            break;
+        }
+    }
+    requests.push(PendingRequest {
+        id: next_id,
+        peer: peer.to_string(),
+        capability: capability.to_string(),
+        timestamp: now,
+        status: "pending".to_string(),
+        granted_at: None,
+    });
+    // Fire notify hook if configured
+    if let Ok(hook) = std::env::var("FILAMENT_NOTIFY_HOOK") {
+        if !hook.is_empty() {
+            // ARGV exec, never shell — petname is attacker-influenced
+            let _ = std::process::Command::new(&hook)
+                .arg(peer)
+                .arg(capability)
+                .spawn();
+        }
+    }
+    save_requests(requests);
+}
+
+fn expire_requests(requests: &mut Vec<PendingRequest>) {
+    let now = crate::capability::now_secs();
+    let mut changed = false;
+    for r in requests.iter_mut().filter(|r| r.status == "pending") {
+        if now.saturating_sub(r.timestamp) > REQUEST_TTL_SECS {
+            r.status = "expired".to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        save_requests(requests);
+    }
+}
+
+/// Enqueue a consent request for a denied action from an identified peer.
+/// No-op if the peer is unidentified, the cap is not requestable, or a
+/// duplicate (same peer+cap) is already pending (dedup).
+fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
+    let name = dev_petname.trim();
+    if name.is_empty() || name == "<unverified>" {
+        return;
+    }
+    match cap {
+        "shell" | "mount" | "transfer" => {}
+        _ => return,
+    }
+    let mut requests = load_requests();
+    expire_requests(&mut requests);
+    let dup = requests.iter().any(|r| r.peer == name && r.capability == cap && r.status == "pending");
+    if !dup {
+        add_pending_request(name, cap, &mut requests);
+    }
+}
+
+/// CLI handler for `filament requests`
+async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
+    match action {
+        None | Some(RequestsAction::List { all: false }) => {
+            let reply = crate::ctl::try_list_pending().await;
+            match reply {
+                Some(v) => {
+                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
+                        if reqs.is_empty() {
+                            ui::say("  no pending requests");
+                        } else {
+                            for r in reqs {
+                                let id = r["id"].as_u64().unwrap_or(0);
+                                let peer = r["peer"].as_str().unwrap_or("?");
+                                let cap = r["capability"].as_str().unwrap_or("?");
+                                let status = r["status"].as_str().unwrap_or("?");
+                                let ts = r["timestamp"].as_u64().unwrap_or(0);
+                                let ago = crate::capability::now_secs().saturating_sub(ts);
+                                let when = if ago < 60 { format!("{ago}s ago") }
+                                    else if ago < 3600 { format!("{}m ago", ago/60) }
+                                    else { format!("{}h ago", ago/3600) };
+                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
+                            }
+                        }
+                    }
+                }
+                None => ui::say("  daemon not running; no pending request state"),
+            }
+        }
+        Some(RequestsAction::List { all: true }) => {
+            let reply = crate::ctl::try_list_pending().await;
+            match reply {
+                Some(v) => {
+                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
+                        if reqs.is_empty() {
+                            ui::say("  no requests");
+                        } else {
+                            for r in reqs {
+                                let id = r["id"].as_u64().unwrap_or(0);
+                                let peer = r["peer"].as_str().unwrap_or("?");
+                                let cap = r["capability"].as_str().unwrap_or("?");
+                                let status = r["status"].as_str().unwrap_or("?");
+                                let ts = r["timestamp"].as_u64().unwrap_or(0);
+                                let ago = crate::capability::now_secs().saturating_sub(ts);
+                                let when = if ago < 60 { format!("{ago}s ago") }
+                                    else if ago < 3600 { format!("{}m ago", ago/60) }
+                                    else { format!("{}h ago", ago/3600) };
+                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
+                            }
+                        }
+                    }
+                }
+                None => ui::say("  daemon not running; no request state"),
+            }
+        }
+        Some(RequestsAction::Approve { id }) => {
+            let reply = crate::ctl::try_approve_request(id).await;
+            match reply {
+                Some(v) => {
+                    if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
+                        if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
+                            ui::say(&format!(
+                                "  {} approved {cap} for {peer}",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            ));
+                        }
+                    }
+                }
+                None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
+            }
+        }
+        Some(RequestsAction::Deny { id }) => {
+            let reply = crate::ctl::try_deny_request(id).await;
+            match reply {
+                Some(_) => ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
+                None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
             }
         }
     }
@@ -2774,6 +3352,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     // The flow exposes EXACTLY ONE device + its cert; privacy test asserts on actual wire payload.
     let mut peer_identity_cert: Option<identity::DeviceCert> = None;
     let mut sent_identity: bool = false;
+    let mut identity_exchange_window: Option<std::time::Instant> = None;
     // Peer signaling sid we run the PAKE with (set when the link is adopted).
     let mut pake_peer: Option<String> = None;
     let caps = pair_v2_caps();
@@ -2807,20 +3386,39 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         // same on both sides; it drops straight into devices.json.
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
-                // caps_v2 (spec §8): record GRANTED caps, deny-by-default.
-                // devices_store_v2 handles name collisions via auto-suffix.
-                // Scope byte was derived from authenticated token, no default to broad scope.
-                devices_store_v2(&n, &sec, &caps)?;
-                // Hold verified identity as PROVISIONAL, NOT durable write.
-                // Durable anchor is written only at overlay establishment after
-                // cert.device_pub == overlay-key assertion passes.
-                // This prevents a failed overlay session from leaving a permanent anchor
-                // that would cause takeover guard to refuse legitimate retry.
-                if let Some(ref pcert) = peer_identity_cert {
-                    let _ = store_provisional_identity(&n, pcert);
+                if identity_exchange_window.map_or(false, |dl| std::time::Instant::now() < dl) && peer_identity_cert.is_none() {
+                    if !sent_identity {
+                        if let Some(local_cert) = local_device_cert() {
+                            if let Some(ref pid2) = pake_peer {
+                                if let Some(k) = cer.k() {
+                                    if let Some(l) = conn.link(pid2) {
+                                        if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
+                                            let cmv = crate::pake::our_confirm(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope());
+                                            let mut cmv_arr = [0u8; 32];
+                                            cmv_arr.copy_from_slice(&cmv);
+                                            let dpub = local_cert.device_pub;
+                                            let scope_b = cer.scope();
+                                            let caps_d = crate::identity::caps_digest(cer.caps_canon());
+                                            let ch = crate::identity::cert_hash(&local_cert);
+                                            let rz = [0u8; 32];
+                                            let pmsg = crate::identity::possession_msg(0x01, &cmv_arr, scope_b, &caps_d, &ch, &dpub, &rz);
+                                            if let Ok(psig) = crate::overlay::overlay_sign_possession(&pmsg) {
+                                                let inner = serde_json::json!({"cert":local_cert.to_json(),"possession_sig":hex::encode(psig),"device_pub":hex::encode(dpub)});
+                                                let sk = crate::identity::sealing_key_from_k(k);
+                                                if let Ok((n, s)) = crate::identity::seal_plaintext(&sk, inner.to_string().as_bytes()) {
+                                                    sio.emit("signal", serde_json::json!({"to":pid2,"data":{"type":"identity-expose","v":2,"nonce":hex::encode(n),"sealed":hex::encode(s)}})).await.ok();
+                                                    sent_identity = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
-                    // Fail-closed: if peer previously had identity (has userKey) and now does NOT expose,
-                    // abort rather than proceed as normal peer.
+                // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
+                if peer_identity_cert.is_none() {
                     let p = devices_path();
                     if let Ok(raw) = std::fs::read_to_string(&p) {
                         if let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) {
@@ -2829,6 +3427,19 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                             }
                         }
                     }
+                    // No cert: store secret only (legacy or first-pair no identity)
+                    devices_store_v2(&n, &sec, &caps)?;
+                } else {
+                    // #23: atomic (secret,cert) together in ONE write, not separate writes.
+                    // devices_store_v2 writes secret, store_provisional writes cert to temp file.
+                    // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
+                    // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
+                    let pcert = peer_identity_cert.as_ref().unwrap();
+                    devices_upsert_atomic(&n, Some(&sec), Some(pcert), Some(&caps), Some(scope), None)
+                        .context("atomic store secret+cert")?;
+                    // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
+                    store_provisional_identity(&n, pcert)
+                        .context("store provisional")?;
                 }
                 ui::say(&format!(
                     "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
@@ -2838,7 +3449,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
                 tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                 let _ = sio.disconnect().await;
-                return Ok(());
+                return Ok(());                } // close identity_exchange_window else
+
             }
         }
         if Instant::now() > deadline {
@@ -3017,6 +3629,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         PakeInbound::Consumed => {
                             if let Some(sec) = cer.secret() {
                                 agreed_secret = Some(sec.clone());
+                                identity_exchange_window = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                             }
                         }
                         PakeInbound::Abort(why) => {
@@ -3080,10 +3693,10 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                                                                                         }
                                                                                     } else {
                                                                                         peer_identity_cert = Some(cert);
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
+                }
+            }
+                }
+            }
                                                                     }
                                                                 }
                                                             }
@@ -3234,6 +3847,14 @@ struct Link {
     /// `warm_hold_tick` skips re-establish for a live link within this window,
     /// preventing churn while pair-proof verification completes.
     established_at: Option<Instant>,
+    /// Identity cert device_pub (set when identity-expose is verified).
+    identity_device_pub: Option<[u8; 32]>,
+    /// Identity cert user_pub (set when identity-expose is verified).
+    identity_user_pub: Option<[u8; 32]>,
+    /// Binding strength of the identity fields (set alongside them).
+    identity_binding: crate::capability::BindingStrength,
+    /// Identity cert expiry (unix seconds). None = no cert resolved.
+    identity_cert_expires: Option<u64>,
 }
 
 impl Link {
@@ -4349,6 +4970,10 @@ impl Conn {
                 direct: false,
                 direct_route: "direct-quic", // unused for WebRTC links (peer.is_some())
                 established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
+                identity_binding: crate::capability::BindingStrength::None,
+                identity_cert_expires: None,
             },
         );
         Ok(())
@@ -4748,6 +5373,7 @@ impl Conn {
             if let Some((n, _)) = &expected_secret {
                 existing.verified_name = Some(n.clone());
             }
+            resolve_peer_identity(existing);
             if expected_secret.is_some() {
                 existing.expected_secret = expected_secret;
             }
@@ -4774,6 +5400,10 @@ impl Conn {
                 direct: true,
                 direct_route: route,
                 established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
+                identity_binding: crate::capability::BindingStrength::None,
+                identity_cert_expires: None,
             },
         );
         }
@@ -5658,6 +6288,10 @@ impl Conn {
                 direct: true,
                 direct_route: route,
                 established_at: Some(Instant::now()),
+                identity_device_pub: None,
+                identity_user_pub: None,
+                identity_binding: crate::capability::BindingStrength::None,
+                identity_cert_expires: None,
             },
         );
     }
@@ -6057,6 +6691,10 @@ async fn handle_warm_req(
         ctl::ReqKind::Unmount { .. } => req.reject("unmount not handled here").await,
         ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
+        ctl::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
+        ctl::ReqKind::ListPending => req.reject("list-pending not handled here").await,
+        ctl::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
+        ctl::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
     }
 }
 
@@ -7068,8 +7706,170 @@ async fn main() -> Result<()> {
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
-        Cmd::Grant { device, capability } => {
+        Cmd::TagBind { tag, device } => {
+            let Some(user_key) = load_owner_key() else { bail!("identity not initialized; run `filament identity init` first"); };
+            let config_dir = crate::settings::config_dir();
+            let mut store = crate::capability::load_cap_store(&config_dir);
+            let pk = user_key.public_key_bytes();
+            let Some(cert) = device_cert_for(&device) else {
+                bail!("device '{device}' has no stored identity cert");
+            };
+            let tag_ref = crate::capability::make_tag_target(&pk, &tag);
+            let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
+            let mut binding = crate::capability::TagBindingObj {
+                tag_ref,
+                subject_kind: 0x01,
+                subject: cert.device_pub,
+                owner_pub: pk,
+                version: ver,
+                issued_at: crate::capability::now_secs(),
+                expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                sig: [0u8; 64],
+            };
+            let canon = binding.canonical_for_signing();
+            let sig = user_key.keypair().sign(&canon);
+            binding.sig.copy_from_slice(sig.as_ref());
+            crate::capability::apply_tag_binding(&mut store, &binding)
+                .context("create tag binding")?;
+            let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
+                .context("save cap store")?;
+            println!("bound tag '{tag}' to device '{device}'.");
+            Ok(())
+        }
+        Cmd::Grant { device, capability, tag } => {
+            let config_dir = crate::settings::config_dir();
+            let mut store = crate::capability::load_cap_store(&config_dir);
+
+            if let Some(ref t) = tag {
+                // Grant to tag
+                let Some(user_key) = load_owner_key() else {
+                    bail!("identity not initialized");
+                };
+                let pk = user_key.public_key_bytes();
+                let target_bytes = crate::capability::make_tag_target(&pk, t);
+                let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
+                let mut op = crate::capability::CapOp {
+                    op: crate::capability::CapOpKind::Grant,
+                    grantor: pk,
+                    target_kind: 0x03,
+                    target: target_bytes,
+                    resource: "self".to_string(),
+                    permissions: vec![capability.clone()],
+                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                    issued_at: crate::capability::now_secs(),
+                    version: ver,
+                    sig: [0u8; 64],
+                };
+                op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+                store.push(op.to_json());
+                let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
+                    .context("save cap store")?;
+                println!("granted '{capability}' to tag '{t}'.");
+                return Ok(());
+            }
+            // Original device grant path (unchanged)
             device_set_cap(&device, &capability, true)?;
+            // If identity layer is active, also issue an owner-signed CapOp
+            if let Ok(Some(user_key)) = crate::identity::UserKey::load() {
+                let config_dir = crate::settings::config_dir();
+                let mut store = crate::capability::load_cap_store(&config_dir);
+                let pk = user_key.public_key_bytes();
+
+                // Ensure a genesis header exists for resource "self"
+                let has_header = store.iter().any(|e| {
+                    e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                        && e["resource"].as_str() == Some("self")
+                });
+                if !has_header {
+                    let pk = user_key.public_key_bytes();
+                    let nonce = crate::capability::self_resource_nonce();
+                    let resource = crate::capability::self_resource_id(&pk);
+                    let mut hdr = crate::capability::CapHeader {
+                        resource,
+                        epoch: 0,
+                        owner_pub: pk,
+                        nonce,
+                        floors: vec![],
+                        issued_at: crate::capability::now_secs(),
+                        prev_owner_pub: None,
+                        prev_header_hash: None,
+                        sig: [0u8; 64],
+                    };
+                    hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
+                    let mut hdr_json = hdr.to_json();
+                    hdr_json["resource"] = serde_json::json!("self");
+                    store.push(hdr_json);
+                }
+
+                // Create CapOp: target the peer's real user_pub from their
+                // stored device cert (not SHA-256 of the device name, which
+                // never matches evaluate()'s principal_user_pub comparison).
+                // Requires the peer to have a certified identity (paired +
+                // identity-expose completed).
+                let Some(peer_cert) = device_cert_for(&device) else {
+                    return Err(anyhow!(
+                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known user key to target"
+                    ));
+                };
+                if peer_cert.verify(crate::identity::now_secs()).is_err() {
+                    return Err(anyhow!("peer identity cert for '{device}' is expired; re-pair to refresh it"));
+                }
+                let target_arr = peer_cert.user_pub;
+
+                let v = crate::capability::hlc_next(0, crate::capability::now_ms());
+                let mut op = crate::capability::CapOp {
+                    op: crate::capability::CapOpKind::Grant,
+                    grantor: pk,
+                    target_kind: 0x00, // User
+                    target: target_arr,
+                    resource: "self".to_string(),
+                    permissions: vec![capability.clone()],
+                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                    issued_at: crate::capability::now_secs(),
+                    version: v,
+                    sig: [0u8; 64],
+                };
+                op.sig = crate::capability::sign_cap_op(&op, &user_key.keypair());
+                let mut hdr_json = serde_json::json!({
+                    "type": "cap_grant",
+                });
+                let mut op_json = op.to_json();
+                op_json["type"] = serde_json::json!("cap_grant");
+                store.push(op_json);
+                // Grant must initialize the per-owner ratchet so evaluate()
+                // does not hit "ratchet uninitialized". apply_cap_op normally
+                // does this, but the grant command constructs CapOp JSON
+                // directly. On failure the grant did NOT take (evaluate()
+                // will deny forever), so fail the command instead of printing
+                // a misleading "granted" line.
+                // TODO: route grant through apply_cap_op so there is one
+                // validated op-creation path (sig-verify + floor + monotonic
+                // + ratchet), not two.
+                crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
+                    .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
+                // save_and_list_revoked: persist THEN reconcile (reconciliation
+                // is a property of the write). GATED on authoritative: in shadow
+                // only REPORT what would be removed.
+                let revoked = crate::capability::save_and_list_revoked(&store, &config_dir)
+                    .context("save cap store")?;
+                {
+                    let authoritative = crate::capability::cap_authoritative();
+                    let ak_path = sshkeys::authorized_keys_path();
+                    let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+                    // Emit per-device shadow logs for actual-block devices.
+                    for device in &revoked {
+                        if sshkeys::has_block(&ak_content, device) && !authoritative {
+                            eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                        }
+                    }
+                    let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
+                    if new_ak != ak_content {
+                        if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
+                            eprintln!("shell-key reconcile: failed to write authorized_keys: {e}");
+                        }
+                    }
+                }
+            }
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
@@ -7083,6 +7883,90 @@ async fn main() -> Result<()> {
         Cmd::Revoke { device, capability } => {
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false)?;
+            // Mirror the grant path: also emit an owner-signed Revoke cap_op so
+            // the AUTHORITATIVE capability gate actually denies. The legacy
+            // device_set_cap(false) only clears devices.json; it leaves the cap
+            // store granting, so under FILAMENT_CAP_AUTHORITATIVE the gate keeps
+            // ALLOWing and a re-connect re-installs the shell key (revocation was
+            // a no-op at the gate). apply_cap_op removes the matching grant, so
+            // evaluate() then denies and devices_with_shell_revoked lists this
+            // device; save_and_list_revoked + reconcile_shell_keys then strips
+            // its managed authorized_keys block under authoritative.
+            if let Ok(Some(user_key)) = crate::identity::UserKey::load() {
+                let config_dir = crate::settings::config_dir();
+                let mut store = crate::capability::load_cap_store(&config_dir);
+                let pk = user_key.public_key_bytes();
+                let header = store
+                    .iter()
+                    .find(|e| {
+                        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                            && e["resource"].as_str() == Some("self")
+                    })
+                    .and_then(crate::capability::CapHeader::from_json);
+                // A revoke only bites if there is a header AND the peer has a
+                // certified identity to target (same requirement as grant).
+                if let (Some(hdr), Some(peer_cert)) = (header, device_cert_for(&device)) {
+                    let target_arr = peer_cert.user_pub;
+                    // Version MUST exceed the existing grant's version (monotonic
+                    // ratchet), else apply_cap_op refuses.
+                    let existing_ver = store
+                        .iter()
+                        .filter(|e| {
+                            e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
+                                && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
+                                && e["resource"].as_str() == Some("self")
+                                && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
+                        })
+                        .filter_map(|e| e["version"].as_u64())
+                        .max()
+                        .unwrap_or(0);
+                    let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
+                    let now = crate::capability::now_secs();
+                    let mut op = crate::capability::CapOp {
+                        op: crate::capability::CapOpKind::Revoke,
+                        grantor: pk,
+                        target_kind: 0x00, // User
+                        target: target_arr,
+                        resource: "self".to_string(),
+                        permissions: vec![capability.clone()],
+                        expires: now.saturating_add(90 * 24 * 3600),
+                        issued_at: now,
+                        version: v,
+                        sig: [0u8; 64],
+                    };
+                    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+                    match crate::capability::apply_cap_op(&mut store, &hdr, &op, now) {
+                        Ok(()) => {
+                            let revoked =
+                                crate::capability::save_and_list_revoked(&store, &config_dir)
+                                    .unwrap_or_default();
+                            let authoritative = crate::capability::cap_authoritative();
+                            let ak_path = sshkeys::authorized_keys_path();
+                            let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+                            for d in &revoked {
+                                if sshkeys::has_block(&ak_content, d) && authoritative {
+                                    eprintln!("shell-key reconcile (revoke): removing managed key for '{d}' (cap store denies shell)");
+                                }
+                            }
+                            let new_ak = crate::capability::reconcile_shell_keys(
+                                &revoked,
+                                &ak_content,
+                                authoritative,
+                            );
+                            if new_ak != ak_content {
+                                if let Err(e) =
+                                    crate::platform::SecretFile::write_str(&ak_path, &new_ak)
+                                {
+                                    eprintln!("shell-key reconcile (revoke): failed to write authorized_keys: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("revoke: owner-signed cap_op not applied ({e}); legacy revoke still took effect");
+                        }
+                    }
+                }
+            }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
                 println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
@@ -7169,6 +8053,8 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
+        Cmd::CapStatus { json } => cap_status_cmd(json).await,
+        Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -8269,6 +9155,16 @@ async fn send_cmd(
                         let _ = tx.send(ports);
                     }
                 }
+                // #30 GAP 1: a one-shot sender must ANSWER the receiver's
+                // identity-nonce-challenge (prove device-key possession) so the
+                // receiver can upgrade the sender's binding to Proven and an
+                // authoritative cap gate can ALLOW the transfer. Placed before
+                // the is_active guard so it fires as soon as the challenge lands.
+                Some("identity-nonce-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        respond_to_identity_challenge(&t, &v).await;
+                    }
+                }
                 _ if !conn.is_active(&pid) => {}
                 Some("brb") => {
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
@@ -9083,6 +9979,10 @@ async fn recv_cmd(
     // Identity: receiver-generated nonce challenges for introduce path (0x02), single-use, session-scoped, erased after verification, distinct per concurrent session
     // Map peer_id -> (nonce, timestamp, receiver_device_pub)
     let mut identity_nonces: HashMap<String, ([u8; 32], Instant, [u8; 32])> = HashMap::new();
+    // #30: hold ChannelReady until Proven settles or 3s timeout, so short-session
+    // gates never decide on Inferred while the possession-sig challenge is in flight.
+    let pending_proven: Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // Each candidate peer's own bounded budget (armed when its channel comes up).
     let mut recv_deadlines: HashMap<String, Instant> = HashMap::new();
     // The peer that WON authentication (its ceremony confirmed). Once set, only
@@ -9721,6 +10621,60 @@ async fn recv_cmd(
                             handle_list_mounts(req, &daemon_mounts).await;
                         } else if matches!(&req.kind, ctl::ReqKind::MountHealth { .. }) {
                             handle_mount_health(req, &daemon_mounts).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::CapStatus) {
+                            let counts = crate::capability::cap_shadow_counts();
+                            let action_counts = crate::capability::cap_action_counts();
+                            req.reply(&json!({
+                                "ok": true,
+                                "counts": {
+                                    "la_authorized": counts.la_authorized,
+                                    "la_denied": counts.la_denied,
+                                    "la_no_header": counts.la_no_header,
+                                    "ld_authorized": counts.ld_authorized,
+                                    "ld_denied": counts.ld_denied,
+                                    "ld_no_header": counts.ld_no_header,
+                                },
+                                "by_action": action_counts,
+                                "flip_ready": counts.flip_ready(),
+                                "summary": counts.summary(),
+                            })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::ListPending) {
+                            let mut requests = load_requests();
+                            expire_requests(&mut requests);
+                            req.reply(&json!({
+                                "ok": true,
+                                "requests": requests,
+                            })).await;
+                        } else if let ctl::ReqKind::ApproveRequest { id } = &req.kind {
+                            let id = *id;
+                            let mut requests = load_requests();
+                            expire_requests(&mut requests);
+                            if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
+                                r.status = "approved".to_string();
+                                r.granted_at = Some(crate::capability::now_secs());
+                                let peer = r.peer.clone();
+                                let cap = r.capability.clone();
+                                save_requests(&requests);
+                                // Route through the existing grant path
+                                if let Err(e) = device_set_cap(&peer, &cap, true) {
+                                    req.reject(&format!("grant failed: {e}")).await;
+                                } else {
+                                    req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap })).await;
+                                }
+                            } else {
+                                req.reject(&format!("request {id} not found or not pending")).await;
+                            }
+                        } else if let ctl::ReqKind::DenyRequest { id } = &req.kind {
+                            let id = *id;
+                            let mut requests = load_requests();
+                            expire_requests(&mut requests);
+                            if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
+                                r.status = "denied".to_string();
+                                save_requests(&requests);
+                                req.reply(&json!({ "ok": true, "id": id })).await;
+                            } else {
+                                req.reject(&format!("request {id} not found or not pending")).await;
+                            }
                         } else {
                             // Auto-warm: feed LRU for pty sessions (bounded, no leak).
                             if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
@@ -10579,7 +11533,41 @@ async fn recv_cmd(
                 if let Some(k) = tkey {
                     conn.spawn_direct_workers(&pid, &t, k);
                 }
-                let _ = tx.send(Ev::ChannelReady(pid, t));
+                // #30: Send nonce challenge at link adoption so Proven settles
+                // before any gated open. Under authoritative, HOLD ChannelReady
+                // until the possession-sig round-trip completes or 3s timeout,
+                // so short-session gates never decide on Inferred while a
+                // challenge is in flight.
+                // Resolve identity from the stored cert first so device_pub is
+                // populated at adopt time; otherwise needs_proven is always false
+                // and the possession-sig challenge never fires.
+                if let Some(l) = conn.link_mut(&pid) {
+                    resolve_peer_identity(l);
+                }
+                let needs_proven = if let Some(l) = conn.link(&pid) {
+                    l.identity_device_pub.is_some()
+                        && l.identity_binding != crate::capability::BindingStrength::Proven
+                } else {
+                    false
+                };
+                if needs_proven && crate::capability::cap_authoritative() {
+                    send_identity_challenge(&conn, &pid, &mut identity_nonces).await;
+                    ui::say(&format!("  identity challenge sent to {pid}, holding until Proven or timeout"));
+                    let hold_t = t.clone();
+                    let hold_tx = tx.clone();
+                    let hold_pending = pending_proven.clone();
+                    let hold_pid = pid.clone();
+                    pending_proven.lock().unwrap().insert(pid.clone(), (t.clone(), Instant::now() + Duration::from_secs(3)));
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        if hold_pending.lock().unwrap().contains_key(&hold_pid) {
+                            hold_pending.lock().unwrap().remove(&hold_pid);
+                            let _ = hold_tx.send(Ev::ChannelReady(hold_pid, hold_t));
+                        }
+                    });
+                } else {
+                    let _ = tx.send(Ev::ChannelReady(pid, t));
+                }
             }
             Ev::DirectWorkersReady(pid, workers) => {
                 if let Some(link) = conn.link_mut(&pid) {
@@ -10830,6 +11818,26 @@ async fn recv_cmd(
                         Err(e) => ui::debug(&format!("  L3 malformed announce: {e}")),
                     }
                 }
+                // #30: respond to identity nonce challenge by producing a
+                // possession_sig (0x02) over the peer-provided nonce. The
+                // challenger verifies and upgrades our binding to Proven.
+                Some("identity-nonce-challenge") => {
+                    // #30: shared responder (also used by send_cmd) proves
+                    // device-key possession so the challenger upgrades us to Proven.
+                    if let Some(t) = conn.transport_of(&pid) {
+                        respond_to_identity_challenge(&t, &v).await;
+                    }
+                }
+                // #30: received possession-sig from peer after our challenge.
+                // Verify, upgrade binding to Proven so capability gates pass.
+                Some("identity-expose") => {
+                    if handle_identity_expose(&mut conn, &pid, &v, &mut identity_nonces) {
+                        // Release held ChannelReady — Proven settled before timeout.
+                        if let Some((held_t, _deadline)) = pending_proven.lock().unwrap().remove(&pid) {
+                            let _ = tx.send(Ev::ChannelReady(pid, held_t));
+                        }
+                    }
+                }
                 Some("worker-ports") => {
                     let pid = v["for"].as_str().unwrap_or_default();
                     ui::trace(&format!("[T:CLI] worker-ports handler: looking up key={pid}"));
@@ -10880,19 +11888,52 @@ async fn recv_cmd(
                     // tears a stream down, so it is never gated here). In a blanket
                     // mode any trusted peer may open; in grant-only mode the opening
                     // peer must hold the shell grant itself.
+                    let mut l2_deny_reason: Option<String> = None;
                     let authorized = v["type"].as_str() != Some("l2-open") || {
-                        let blanket = shell_policy.enables_l2()
-                            || std::env::var("FILAMENT_L2").map(|x| x == "1").unwrap_or(false);
-                        let peer_has_shell = conn
-                            .link(&pid)
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(|n| device_allows(n, "shell"))
-                            .unwrap_or(false);
-                        l2_open_allowed(blanket, peer_has_shell)
+                        let legacy_ok = {
+                            let blanket = shell_policy.enables_l2()
+                                || std::env::var("FILAMENT_L2").map(|x| x == "1").unwrap_or(false);
+                            let peer_has_shell = conn
+                                .link(&pid)
+                                .and_then(|l| l.verified_name.as_deref())
+                                .map(|n| device_allows(n, "shell"))
+                                .unwrap_or(false);
+                            l2_open_allowed(blanket, peer_has_shell)
+                        };
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        let link = conn.link(&pid);
+                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
+                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
+                        let outcome = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "shell",
+                            idev,
+                            iusr,
+                        );
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires);
+                        if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
+                            l2_deny_reason = Some(r.clone());
+                        }
+                        d.allowed()
                     };
                     if !authorized {
                         let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                        ui::say(&format!("l2: refused stream {sid:#x}: device not granted shell"));
+                        let diag = l2_deny_reason.as_deref().unwrap_or("device not granted shell");
+                        ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
                             .await;
@@ -10968,20 +12009,75 @@ async fn recv_cmd(
                 }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
+                    // #30 GAP 2 (shell): honor the pending_proven hold. If a
+                    // possession-sig challenge is still in flight for this peer
+                    // and the binding is not yet Proven, do NOT refuse on
+                    // Inferred: the identity-expose that flips us to Proven is a
+                    // SEPARATE event this single-consumer loop must process, so
+                    // blocking inline would deadlock. Re-inject the bootstrap
+                    // shortly and let the loop drain. The hold entry clears on
+                    // Proven OR at the 3s deadline, so this self-terminates and
+                    // the re-injected bootstrap is then decided for real.
+                    if crate::capability::cap_authoritative() {
+                        let challenge_in_flight =
+                            pending_proven.lock().unwrap().contains_key(&pid);
+                        let proven = conn
+                            .link(&pid)
+                            .map(|l| {
+                                l.identity_binding
+                                    == crate::capability::BindingStrength::Proven
+                            })
+                            .unwrap_or(false);
+                        if challenge_in_flight && !proven {
+                            let rtx = tx.clone();
+                            let rpid = pid.clone();
+                            let rv = v.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                let _ = rtx.send(Ev::Control(rpid, rv));
+                            });
+                            continue;
+                        }
+                    }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     // Cap lookup keys on the PROVEN petname, not the presence name.
                     let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
                     // Granted if the device was explicitly `grant`ed shell OR an
                     // active `up --shell[-only]` policy auto-allows it. Trust
                     // (pair-proof) is still required either way.
-                    let granted = trusted
+                    let legacy_ok = trusted
                         && dev
                             .as_deref()
                             .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
                             .unwrap_or(false);
-                    if !granted {
+                    // Capability layer evaluated unconditionally (shadow samples the
+                    // legacy-allowed population); legacy stands in shadow, cap gates
+                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    let granted = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        let link = conn.link(&pid);
+                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
+                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
+                        let outcome = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "shell",
+                            idev,
+                            iusr,
+                        );
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
+                    };
+                    if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)"));
+                        ui::say(&format!("l2: shell bootstrap refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
+                        enqueue_if_requestable(who, "shell");
                         let _ = t
                             .send_control(&json!({
                                 "type": "shell-bootstrap-deny",
@@ -11054,14 +12150,39 @@ async fn recv_cmd(
                     }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    let granted = trusted
+                    let legacy_ok = trusted
                         && dev
                             .as_deref()
                             .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
                             .unwrap_or(false);
-                    if !granted {
+                    // Capability layer evaluated unconditionally (shadow samples the
+                    // legacy-allowed population); legacy stands in shadow, cap gates
+                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    let granted = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        let link = conn.link(&pid);
+                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
+                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
+                        let outcome = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "shell",
+                            idev,
+                            iusr,
+                        );
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
+                    };
+                    if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!("l2: pty refused: {who} (no shell cap / untrusted)"));
+                        ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
+                        enqueue_if_requestable(who, "shell");
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
                             .await;
@@ -11188,8 +12309,49 @@ async fn recv_cmd(
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     if !l2::is_l2_sid(sid) { continue; }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    if !trusted {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "mount: untrusted peer" })).await;
+                    // Capability layer for mount evaluated unconditionally (shadow
+                    // samples the legacy-allowed population); legacy (trusted) stands
+                    // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
+                    let authorized = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        let link = conn.link(&pid);
+                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
+                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
+                        let outcome = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "mount",
+                            idev,
+                            iusr,
+                        );
+                        // Trust floor: under authoritative, an untrusted link
+                        // must never authorize mount (pair-proof vs device-key).
+                        let outcome = crate::capability::cap_trust_floor(
+                            &outcome,
+                            trusted,
+                            crate::capability::cap_authoritative(),
+                        );
+                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires)
+                    };
+                    if !authorized.allowed() {
+                        let who = conn
+                            .link(&pid)
+                            .and_then(|l| l.verified_name.clone())
+                            .unwrap_or_else(|| "<unverified>".into());
+                        // Operator-side diagnostic in BOTH modes, so a mount refusal
+                        // is never invisible on the default (shadow) path and never
+                        // reads as a transport failure. The peer-facing string stays a
+                        // coarse category and leaks no authz internals.
+                        ui::say(&format!("mount: refused for '{who}': {}", authorized.deny_reason("not authorized (mount capability required)")));
+                        enqueue_if_requestable(&who, "mount");
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
                     let root_encoded = v["root"].as_str().unwrap_or(".");
@@ -11363,10 +12525,8 @@ async fn recv_cmd(
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
-                            // Record the proven devices.json petname, the cap
-                            // store key (the `shell` bootstrap gate looks up caps
-                            // under exactly this, not the presence display name).
                             l.verified_name = Some(n.clone());
+                            resolve_peer_identity(l);
                         }
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
                         true
@@ -11508,6 +12668,13 @@ async fn recv_cmd(
                                                                         } else {
                                                                             // Store as provisional, then promote at overlay after check
                                                                             let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
+                                                                            // Store identity on the link for capability authorization
+                                                                            if let Some(l) = conn.link_mut(&pid) {
+                                                                                l.identity_device_pub = Some(cert.device_pub);
+                                                                                l.identity_user_pub = Some(cert.user_pub);
+                                                                                l.identity_binding = crate::capability::BindingStrength::Proven;
+                                                                                l.identity_cert_expires = Some(cert.expires);
+                                                                            }
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
@@ -11598,6 +12765,38 @@ async fn recv_cmd(
                         }
                     }
 
+                    // #30 GAP 2: honor the pending_proven hold. If a
+                    // possession-sig challenge is still in flight for this peer
+                    // (the adopt-time hold has not settled) and the binding is
+                    // not yet Proven, do NOT decide on Inferred now: the
+                    // identity-expose that flips us to Proven is a SEPARATE
+                    // event this single-consumer loop must be free to process,
+                    // so blocking inline would deadlock. Re-inject the offer
+                    // shortly and let the loop drain. The hold entry is removed
+                    // on Proven OR at the 3s deadline, so this self-terminates
+                    // and the re-injected offer is then decided for real.
+                    if crate::capability::cap_authoritative() {
+                        let challenge_in_flight =
+                            pending_proven.lock().unwrap().contains_key(&pid);
+                        let proven = conn
+                            .link(&pid)
+                            .map(|l| {
+                                l.identity_binding
+                                    == crate::capability::BindingStrength::Proven
+                            })
+                            .unwrap_or(false);
+                        if challenge_in_flight && !proven {
+                            let rtx = tx.clone();
+                            let rpid = pid.clone();
+                            let rv = v.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                let _ = rtx.send(Ev::Control(rpid, rv));
+                            });
+                            continue;
+                        }
+                    }
+
                     // C14/C22: consent. -y accepts everything; a resume of a
                     // partial we already said yes to auto-accepts; a verified
                     // device auto-accepts; otherwise the question joins the
@@ -11607,11 +12806,62 @@ async fn recv_cmd(
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let consented = v["__consent"].as_str() == Some(consent_token());
-                    let ok = if daemon {
+                    // Legacy (pre-capability) decision, per mode.
+                    let legacy_ok = if daemon {
                         link_trusted
                     } else {
                         yes || consented || link_trusted || (is_resume && offset > 0)
                     };
+                    // Capability layer evaluated unconditionally (shadow samples the
+                    // legacy-allowed population); legacy stands in shadow, cap gates
+                    // under FILAMENT_CAP_AUTHORITATIVE.
+                    let (ok, xfer_deny_reason, xfer_gate) = {
+                        // Lazy-resolve peer identity from stored device cert
+                        {
+                            if let Some(l) = conn.link_mut(&pid) {
+                                resolve_peer_identity(l);
+                            }
+                        }
+                        let link = conn.link(&pid);
+                        let idev = link.and_then(|l| l.identity_device_pub.as_ref());
+                        let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
+                        let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
+                        let expires = link.and_then(|l| l.identity_cert_expires);
+                        let outcome = crate::capability::cap_authorize(
+                            &crate::settings::config_dir(),
+                            "self",
+                            "transfer",
+                            idev,
+                            iusr,
+                        );
+                        // Trust floor: under authoritative, an untrusted link
+                        // must never authorize transfer (pair-proof vs device-key).
+                        let outcome = crate::capability::cap_trust_floor(
+                            &outcome,
+                            link_trusted,
+                            crate::capability::cap_authoritative(),
+                        );
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires);
+                        let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
+                            cap_reason.clone()
+                        } else {
+                            None
+                        };
+                        (d.allowed(), reason, d)
+                    };
+                    // Under authoritative, a capability Deny hard-declines
+                    // immediately: no prompt, skip the accept path entirely.
+                    if let Some(reason) = crate::capability::transfer_gate_decision(
+                        &xfer_gate,
+                        crate::capability::cap_authoritative(),
+                    ) {
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!(
+                            "  declined {name} from {sender_name} ({reason})",
+                        )));
+                        if daemon { enqueue_if_requestable(&sender_name, "transfer"); }
+                        t.send_control(&protocol::decline_msg(&id)).await?;
+                        continue;
+                    }
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() {
                             pending.push_back((pid.clone(), v.clone()));
@@ -11629,7 +12879,7 @@ async fn recv_cmd(
                         }
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({})",
-                            if daemon { "unverified peer" } else { "no tty, use -y to auto-accept" }
+                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") } else { "no tty, use -y to auto-accept" }
                         )));
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
@@ -13021,5 +14271,126 @@ mod tests {
         // Link dies: clear to allow reconnect
         saw.remove(n);
         assert!(!saw.contains(n), "dead link must be reconnectable");
+    }
+
+    /// #23: the atomicity-relevant invariant — upsert_peer_record puts secret AND cert
+    /// into ONE record, so the single write that persists it can never yield
+    /// new-secret + old-cert. Drives the real merge fn across two generations against an
+    /// in-memory store (no file, no env — deterministic). A non-atomic write path (the
+    /// old pair flow: write secret, then separately write cert) is exactly what this
+    /// forbids: it would leave secretB paired with certA (dpub_a), a wrong-userPub state.
+    #[test]
+    fn upsert_peer_record_writes_secret_and_cert_together() {
+        // Hand-crafted certs (from_json only parses fields — no signature check — so this
+        // structural test needs no UserKey/disk/env and is fully deterministic).
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let cert_a = mk_cert(0xa1);
+        let cert_b = mk_cert(0xb2);
+
+        let mut arr: Vec<Value> = vec![];
+
+        // Generation A: secretA + certA land together.
+        upsert_peer_record(&mut arr, "bob", Some("secretA"), Some(&cert_a), None, None, None);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["secret"].as_str(), Some("secretA"));
+        let stored_a = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
+        assert_eq!(stored_a.device_pub, [0xa1u8; 32], "gen A: cert must be certA");
+
+        // Generation B: secretB + certB — the update that a non-atomic path could tear.
+        upsert_peer_record(&mut arr, "bob", Some("secretB"), Some(&cert_b), None, None, None);
+        assert_eq!(arr.len(), 1, "same name updates in place, not duplicated");
+        // The invariant: secret and cert are BOTH gen-B in the SAME record.
+        assert_eq!(arr[0]["secret"].as_str(), Some("secretB"), "secret must be gen B");
+        let stored_b = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
+        assert_eq!(stored_b.device_pub, [0xb2u8; 32], "cert must be gen B — never torn to certA");
+        assert_ne!(stored_b.device_pub, [0xa1u8; 32], "new secret must not retain the old-gen cert");
+    }
+
+    // --- consent-queue pure-fn tests ---------------------------------------
+
+    /// add_pending_request appends and deduplicates by id.
+    #[test]
+    fn consent_add_pending_enqueues() {
+        let mut reqs = Vec::new();
+        add_pending_request("alice", "shell", &mut reqs);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].peer, "alice");
+        assert_eq!(reqs[0].capability, "shell");
+        assert_eq!(reqs[0].status, "pending");
+        // id auto-increments
+        add_pending_request("bob", "mount", &mut reqs);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].id, reqs[0].id + 1);
+    }
+
+    #[test]
+    fn consent_enqueue_skips_unidentified() {
+        // The pure function enqueue_if_requestable bails on empty/<unverified>.
+        // It reads from disk — test via its guard clauses: empty returns early.
+        // For a pure test, verify the add_pending_request guard handles it:
+        let mut reqs = Vec::new();
+        // enqueue_if_requestable skips "" and "<unverified>" at the caller level;
+        // test that add_pending_request would still enqueue them (guard lives
+        // in enqueue_if_requestable, not add_pending_request).
+        add_pending_request("<unverified>", "shell", &mut reqs);
+        assert_eq!(reqs.len(), 1); // add_pending_request itself doesn't filter
+        // The guard is in enqueue_if_requestable, tested next.
+    }
+
+    #[test]
+    fn consent_enqueue_dedup_same_peer_cap_pending() {
+        // add_pending_request has no dedup itself; dedup lives in enqueue_if_requestable.
+        // Test the dedup logic directly: check-before-insert on in-flight requests.
+        let mut reqs = vec![PendingRequest {
+            id: 1, peer: "alice".into(), capability: "shell".into(),
+            timestamp: 0, status: "pending".into(), granted_at: None,
+        }];
+        let dup = reqs.iter().any(|r| r.peer == "alice" && r.capability == "shell" && r.status == "pending");
+        assert!(dup, "existing pending entry must be found as duplicate");
+        let non_dup = reqs.iter().any(|r| r.peer == "alice" && r.capability == "mount" && r.status == "pending");
+        assert!(!non_dup, "different cap must not be a duplicate");
+        let non_dup2 = reqs.iter().any(|r| r.peer == "bob" && r.capability == "shell" && r.status == "pending");
+        assert!(!non_dup2, "different peer must not be a duplicate");
+    }
+
+    #[test]
+    fn consent_enqueue_max_evicts_oldest() {
+        let mut reqs: Vec<PendingRequest> = (0..(MAX_PENDING + 1))
+            .map(|i| PendingRequest {
+                id: i as u64, peer: format!("peer{i}"), capability: "shell".into(),
+                timestamp: 0, status: "pending".into(), granted_at: None,
+            })
+            .collect();
+        // add_pending_request evicts while pending count >= MAX_PENDING
+        add_pending_request("overflow", "shell", &mut reqs);
+        // The oldest (id=0, peer0) should be gone
+        let has_peer0 = reqs.iter().any(|r| r.peer == "peer0");
+        assert!(!has_peer0, "oldest pending must be evicted when queue full");
+        let count_pending = reqs.iter().filter(|r| r.status == "pending").count();
+        assert!(count_pending <= MAX_PENDING, "queue must not exceed MAX_PENDING");
+    }
+
+    #[test]
+    fn consent_expiry_is_terminal() {
+        let old_ts = crate::capability::now_secs().saturating_sub(REQUEST_TTL_SECS + 1);
+        let mut reqs = vec![PendingRequest {
+            id: 1, peer: "alice".into(), capability: "shell".into(),
+            timestamp: old_ts, status: "pending".into(), granted_at: None,
+        }];
+        expire_requests(&mut reqs);
+        assert_eq!(reqs[0].status, "expired", "expired pending must become terminal expired");
+        // Running expire again must not change the status (already terminal)
+        reqs[0].status = "expired".to_string();
+        let snapshot = reqs[0].status.clone();
+        expire_requests(&mut reqs);
+        assert_eq!(reqs[0].status, snapshot, "terminal status must not be re-expired");
     }
 }

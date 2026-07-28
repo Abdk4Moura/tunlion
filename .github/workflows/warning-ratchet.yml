@@ -1,0 +1,39 @@
+name: Warning Ratchet
+
+on:
+  push:
+    branches: [main, feat/capability-layer]
+  pull_request:
+    branches: [main, feat/capability-layer]
+
+jobs:
+  ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and capture warning count
+        id: build
+        run: |
+          cd cli
+          CARGO_PROFILE_RELEASE_LTO=false cargo check -j2 2>&1 | grep "^warning:" > /tmp/warnings.txt || true
+          printf '%d' "$(wc -l < /tmp/warnings.txt)" > /tmp/warning-count
+          echo "current=$(cat /tmp/warning-count)" >> $GITHUB_OUTPUT
+
+      - name: Ratchet check
+        run: |
+          BASELINE=$(cat .github/warning-baseline 2>/dev/null || echo "9999")
+          CURRENT=${{ steps.build.outputs.current }}
+          echo "baseline=$BASELINE current=$CURRENT"
+          if [ "$CURRENT" -gt "$BASELINE" ]; then
+            echo "::error::Warning count increased from $BASELINE to $CURRENT. Diff against baseline:"
+            echo "Revert the change that introduced the warning, or update the baseline intentionally."
+            exit 1
+          fi
+          if [ "$CURRENT" -lt "$BASELINE" ]; then
+            echo "::notice::Warning count decreased from $BASELINE to $CURRENT. Update the baseline to ratchet down."
+          fi
+          echo "OK: warning count $CURRENT <= baseline $BASELINE"

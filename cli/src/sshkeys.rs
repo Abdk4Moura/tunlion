@@ -48,7 +48,14 @@ pub fn ensure_managed_key() -> Result<String> {
     // ssh-keygen writes the pubkey to "<key>.pub".
     let pub_path = PathBuf::from(format!("{}.pub", key.display()));
 
-    if !key.exists() {
+    // Capture whether THIS invocation created the key: the delete-on-failure
+    // below must only destroy keys we just minted (gap-captured material
+    // must be invalidated before it can be blessed on replay). A pre-existing,
+    // possibly-distributed key must never be deleted on a restrict failure
+    // (that breaks working access without un-exposing anything).
+    let created_this_call = !key.exists();
+
+    if created_this_call {
         if let Some(dir) = key.parent() {
             std::fs::create_dir_all(dir).context("create filament ssh dir")?;
             chmod(dir, 0o700);
@@ -61,8 +68,21 @@ pub fn ensure_managed_key() -> Result<String> {
         if !st.success() {
             return Err(anyhow!("ssh-keygen failed to create the managed key"));
         }
-        crate::platform::SecretFile::restrict(&key);
         chmod(&pub_path, 0o644);
+    }
+    // Run unconditionally: repairs existing keys whose ACLs were never
+    // applied by the old code. On failure, scope the delete to keys
+    // CREATED in this invocation: a fresh key we could not protect must be
+    // destroyed so gap-captured material is never blessed on a later run.
+    // A pre-existing, possibly-distributed key must NOT be deleted (that
+    // breaks working access and un-exposes nothing); fail loud instead.
+    if let Err(e) = crate::platform::SecretFile::restrict(&key) {
+        if created_this_call {
+            let _ = std::fs::remove_file(&key);
+            let _ = std::fs::remove_file(&pub_path);
+            return Err(e).context("restrict newly-created managed key failed; removed unprotected key to force regeneration");
+        }
+        return Err(e).context("could not confirm managed key permissions; left the key in place. If this machine is shared, rotate it manually");
     }
     let line = std::fs::read_to_string(&pub_path).context("read managed pubkey")?;
     Ok(line.trim().to_string())

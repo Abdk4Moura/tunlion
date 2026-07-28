@@ -110,6 +110,19 @@ class _MemRegistry:
             others = [s for s in members if self._alive(s)]
             if others:
                 affected[ch] = others
+        return affected
+
+    def unsubscribe(self, sid, channels):
+        affected = {}
+        bysid = getattr(self, "_sidchan", {})
+        sid_chans = bysid.get(sid, set())
+        for ch in channels:
+            sid_chans.discard(ch)
+            members = getattr(self, "_chan", {}).get(ch, set())
+            members.discard(sid)
+            others = [s for s in members if self._alive(s)]
+            if others:
+                affected[ch] = others
         return affected  # channel -> remaining sids to notify
 
     # -- one-time pairing codes (#11) --
@@ -226,6 +239,19 @@ class _RedisRegistry:
             p.expire(self._sck(sid), self.TTL)
         p.execute()
         return out
+
+    def unsubscribe(self, sid, channels):
+        affected = {}
+        p = self.r.pipeline()
+        for ch in channels:
+            p.srem(self._ck(ch), sid)
+            p.srem(self._sck(sid), ch)
+        p.execute()
+        for ch in channels:
+            others = [s for s in self.r.smembers(self._ck(ch)) if s != sid and self.r.exists(self._lk(s))]
+            if others:
+                affected[ch] = others
+        return affected
 
     def unsubscribe_all(self, sid):
         affected = {}
@@ -528,6 +554,22 @@ def register(socketio, registry):
         # socket left devices mutually invisible until a page reload). `peers`
         # carries the live channel roster so discovery is deterministic.
         return {"ok": bool(n), "n": n, "peers": roster}
+
+    @socketio.on("channel-goodbye")
+    def on_channel_goodbye(data=None):
+        """Unsubscribe the caller from named channels without dropping the socket
+        or affecting other subscriptions. Emits known-peer-left to remaining
+        members so they stop dialing.
+        Note: meta resolves through the socket's room; a room-less caller
+        disarms correctly but notifies nobody (om=None skips the emit)."""
+        registry.refresh([request.sid])
+        chans = (data or {}).get("channels") or []
+        for ch, others in registry.unsubscribe(request.sid, chans).items():
+            om = registry.meta(request.sid)
+            if om:
+                for other in others:
+                    emit("known-peer-left", {**om, "channel": ch}, to=other)
+        return {"ok": True, "n": len(chans)}
 
     # -- C30 convergent session: ONE idempotent, full-state event that ensures
     # membership + subscriptions + lease in a single ack'd round-trip. No emit
