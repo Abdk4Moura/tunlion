@@ -43,7 +43,7 @@ pub fn reuse_disabled() -> bool {
     pub use imp::{
         daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
         try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_mount,
-        try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+        try_arm, try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
         try_reload_expose, try_resize, try_unmount, Req, ReqKind,
     };
 
@@ -244,6 +244,23 @@ mod imp {
     pub async fn try_reconfigure(key: &str) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
         let req = json!({ "op": "reconfigure", "key": key });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Arm the local daemon for enrollment: tell it an auth key is outstanding.
+    /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
+    pub async fn try_arm(key_id: String, expiry: u64) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "arm", "key_id": key_id, "expiry": expiry });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;

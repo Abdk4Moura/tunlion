@@ -3009,6 +3009,15 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             println!("{}", json);
             eprintln!("{} auth key minted — save the JSON above. The enroll_private_key proves possession.",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()));
+            // Arm the local daemon so it joins the enrollment room
+            let ak = crate::ephemeral::AuthKey::from_json(&serde_json::from_str::<serde_json::Value>(&json)?.get("auth_key").unwrap_or(&serde_json::Value::Null))
+                .ok_or_else(|| anyhow::anyhow!("failed to re-parse minted auth key"))?;
+            if ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await.is_some() {
+                ui::debug("local daemon armed for enrollment");
+            } else {
+                ui::say(&format!("  {} no local daemon — enrollment room not armed (start 'filament up' first)",
+                    ui::paint(ui::Tone::Dim, "·")));
+            }
             Ok(())
         }
         EphemeralAction::Enroll { auth_key, to } => {
