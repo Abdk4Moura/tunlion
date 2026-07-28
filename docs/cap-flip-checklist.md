@@ -123,10 +123,19 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
       the async send is awaited, the sender answers via a shared responder, and the offer
       honors the pending_proven hold). So allow + deny + rollback + deny-by-default + real
       reasons are all proven on live cross-machine traffic.
-      STILL OWED before a production flip: revoked->deny+SSH-key-removed (#24 reconciler live)
-      demonstrated end-to-end on the rig (the mechanism is unit-tested and the shadow WOULD-remove
-      path is proven; the live authoritative removal on a real session is the last unrun case),
-      and a broader multi-device / multi-action sample.
+      REVOKED->DENY+SSH-KEY-REMOVED now VERIFIED too (2026-07-28, commit 4b1fa91): grant shell ->
+      first ssh ALLOWED + managed key installed; revoke -> real authoritative removal ("shell-key
+      reconcile (revoke): removing..."), caps.json 0 grants, next ssh DENIED "not authorized", key
+      NOT re-installed, authorized_keys byte-identical (sandbox). Closing this surfaced a real bug:
+      Cmd::Revoke never emitted a Revoke cap_op (only legacy device_set_cap), so under authoritative
+      the gate stayed Authorized and re-installed the key on the next open (widen=1) and the #24
+      reconciler never fired — now revoke emits an owner-signed Revoke op + reconciles. The shell path
+      also needed the same #30 Proven fixes transfer got (ssh initiator answers the challenge; receiver
+      shell-bootstrap honors the pending_proven hold). So the FULL enforcement matrix is proven on live
+      cross-machine traffic: grant->allow, revoke->deny+key-removed, deny-by-default, real reasons,
+      rollback, trust-floor, sandbox-contained reconciler — both allow and deny directions.
+      STILL nice-to-have before a production flip: a broader multi-device / multi-action sample and
+      the load_cap_store cache under real concurrency, but the enforcement itself is end-to-end proven.
 
 ## Rollback
 
