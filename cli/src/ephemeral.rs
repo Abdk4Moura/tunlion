@@ -631,14 +631,47 @@ pub fn register_enrollment(
 }
 
 /// Take a pending enrollment and build the response to the daemon's challenge.
-/// Returns the EnrollmentPayload JSON or None if no pending enrollment for this peer.
-pub fn build_enrollment_response(peer_id: &str, nonce: [u8; 32], verifier_pub: [u8; 32]) -> Option<serde_json::Value> {
+/// Verifies the daemon's device cert chains to the auth key's issuer (mutual
+/// authentication) and that the verifier_pub is in the auth key's audience
+/// (mirror audience check). Returns None on any verification failure OR if
+/// no pending enrollment exists for this peer.
+pub fn build_enrollment_response(
+    peer_id: &str,
+    nonce: [u8; 32],
+    verifier_pub: [u8; 32],
+    device_cert: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
     let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let pe = store.remove(peer_id)?;
+    let ak = &pe.auth_key;
+
+    // Mutual authentication: verify daemon's cert chains to auth_key.issuer.
+    // This prevents MITM by an untrusted signaling server that hands us a
+    // forged verifier_pub — the cert must be signed by the owner named in
+    // the auth key.
+    if let Some(cert_json) = device_cert {
+        if let Some(cert) = crate::identity::DeviceCert::from_json(cert_json) {
+            if cert.user_pub != ak.issuer
+                || cert.verify(now_secs()).is_err()
+                || cert.device_pub != verifier_pub
+            {
+                return None; // cert doesn't chain to issuer or doesn't match verifier_pub
+            }
+        } else {
+            return None; // malformed cert
+        }
+    }
+
+    // Mirror audience check: the enroller verifies it was handed a verifier_pub
+    // that its auth key actually authorizes (audience-scoped protection).
+    if !ak.audience_allows(&verifier_pub) {
+        return None;
+    }
+
     let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.enroll_seed).ok()?;
     let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.device_seed).ok()?;
     let payload = EnrollmentPayload::build(
-        pe.auth_key,
+        ak.clone(),
         pe.device_pub,
         &enroll_kp,
         &device_kp,

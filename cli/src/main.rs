@@ -3148,7 +3148,7 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
                                 nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                                 verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                             ) {
-                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, v.get("device_cert")) {
                                     let _ = t.send_control(&json!({
                                         "type": "identity-auth-key-enroll-response",
                                         "auth_key": response["auth_key"],
@@ -3230,7 +3230,8 @@ async fn respond_to_auth_key_enroll_request(
         return;
     }
 
-    // Generate nonce challenge
+    // Generate nonce challenge — include daemon's device cert so the enroller
+    // can verify it chains to the auth key's issuer (mutual authentication).
     let nonce = match crate::ephemeral::generate_nonce(&pid) {
         Ok(n) => n,
         Err(e) => {
@@ -3239,10 +3240,12 @@ async fn respond_to_auth_key_enroll_request(
             return;
         }
     };
+    let cert_value = local_device_cert().map(|c| c.to_json());
     let _ = t.send_control(&json!({
         "type": "identity-auth-key-enroll-challenge",
         "nonce": hex::encode(nonce),
-        "verifier_pub": hex::encode(verifier_pub)
+        "verifier_pub": hex::encode(verifier_pub),
+        "device_cert": cert_value,
     })).await;
 }
 
@@ -9510,7 +9513,7 @@ async fn send_cmd(
                                 nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                                 verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                             ) {
-                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, v.get("device_cert")) {
                                     let _ = t.send_control(&json!({
                                         "type": "identity-auth-key-enroll-response",
                                         "auth_key": response["auth_key"],
