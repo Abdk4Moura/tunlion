@@ -4752,6 +4752,19 @@ impl Link {
     /// Admit this link as a delegated (auth-key-enrolled) principal.
     /// Ensures caps are structurally tied to the Proven identity — a Delegated
     /// principal CANNOT exist without its ceiling.
+    ///
+    /// NON-PERSISTENCE INVARIANT: a delegated principal's AUTHORITY comes from
+    /// `identity_user_pub = owner_pub` and its BOUND comes from
+    /// `principal_kind = Delegated { caps }`. These four fields (identity_user_pub,
+    /// identity_device_pub, identity_binding, principal_kind) MUST travel together.
+    /// This is safe ONLY because Link is in-memory and never persisted.
+    ///
+    /// If identity_user_pub were ever persisted, or a delegated link were written
+    /// into devices.json, then on reconnect `resolve_peer_identity` would restore
+    /// `identity_user_pub = owner_pub` while `principal_kind` defaults to
+    /// `OwnerDevice`, `auth_key_caps()` returns `None`, the ceiling vanishes, and
+    /// the owner-shortcut in evaluate() authorizes everything — a full escalation.
+    /// SO: never persist a delegated link. The devices_json writer must exclude it.
     fn admit_delegated(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
         // A delegated principal acts UNDER the owner's user identity (the auth
         // key issuer), so it presents user_pub = owner_pub. evaluate()'s owner
@@ -8729,6 +8742,13 @@ async fn main() -> Result<()> {
                     };
                     hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
                     let mut hdr_json = hdr.to_json();
+                    // The header's signature is over the self-certifying resource id
+                    // (SHA-256(owner_pub||nonce)), but the STORED header has resource="self".
+                    // This signature is decorative: cap_authorize/evaluate never calls
+                    // verify_genesis/verify_sig on the stored header (those run only on
+                    // the grant-creation path, not the authorize path). Consistent with
+                    // Cmd::Grant which does the same. The header is trusted local state
+                    // in the owner's own caps.json, not a cross-verified object.
                     hdr_json["resource"] = serde_json::json!("self");
                     store.push(hdr_json);
                 }
@@ -13747,6 +13767,14 @@ async fn recv_cmd(
                     // #30 GAP 2: honor the pending_proven hold. If a
                     // possession-sig challenge is still in flight for this peer
                     // (the adopt-time hold has not settled) and the binding is
+                    // PRE-ADMIT RACE: a file-offer can arrive before
+                    // admit_delegated sets identity_user_pub + principal_kind for
+                    // this link. The ordering is UNENFORCED. This is safe only
+                    // because the pre-admit link state is authority-free:
+                    // identity_user_pub=None + binding=None => denied under
+                    // authoritative; refusal under shadow. If an unadmitted link
+                    // ever gains a default authority, the race opens.
+                    //
                     // not yet Proven, do NOT decide on Inferred now: the
                     // identity-expose that flips us to Proven is a SEPARATE
                     // event this single-consumer loop must be free to process,
@@ -15374,5 +15402,48 @@ mod tests {
         let snapshot = reqs[0].status.clone();
         expire_requests(&mut reqs);
         assert_eq!(reqs[0].status, snapshot, "terminal status must not be re-expired");
+    }
+
+    /// Admitting a delegated principal MUST NOT persist anything to the device
+    /// store. A delegated link's authority comes from identity_user_pub=owner_pub
+    /// + principal_kind=Delegated{caps}; these are in-memory Link fields only.
+    /// If identity_user_pub were ever written to devices.json, then on reconnect
+    /// resolve_peer_identity would restore it while principal_kind defaults to
+    /// OwnerDevice (ak_caps=None), the ceiling vanishes, and the owner-shortcut
+    /// authorizes everything — a full escalation.
+    #[test]
+    fn delegated_principal_never_written_to_device_store() {
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let cert = mk_cert(0xdd);
+        let mut arr: Vec<Value> = vec![];
+        // Simulate what the daemon does: store a device record via upsert_peer_record
+        upsert_peer_record(&mut arr, "delegated-peer", Some("secret123"), Some(&cert), None, None, None);
+        assert_eq!(arr.len(), 1);
+        let record = &arr[0];
+        // The device store record MUST NOT contain identity_user_pub or principal_kind
+        assert!(!record.get("identity_user_pub").is_some(),
+            "device store must not contain identity_user_pub — that is a Link-only field");
+        assert!(!record.get("principal_kind").is_some(),
+            "device store must not contain principal_kind — that is a Link-only field");
+        assert!(!record.get("identity_binding").is_some(),
+            "device store must not contain identity_binding — that is a Link-only field");
+        // The record should only have the fields the store actually uses:
+        // name, secret, caps, deviceCert, addedAt, userKey, identityScope, v
+        let allowed: std::collections::HashSet<&str> = [
+            "name", "secret", "caps", "deviceCert", "addedAt", "v",
+            "userKey", "identityScope",
+        ].iter().cloned().collect();
+        for key in record.as_object().unwrap().keys() {
+            assert!(allowed.contains(key.as_str()),
+                "unexpected device store field '{key}' — is a Link field leaking?");
+        }
     }
 }
