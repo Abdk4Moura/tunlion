@@ -3054,8 +3054,8 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     // Network-independent — join as ROOM so PeerJoined fires.
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.room = Some(enroll_chan.clone());
-    sess.emit(&sio, "join", json!({ "room": enroll_chan, "name": display_name(), "uid": my_uid })).await;
+    sess.channels = vec![enroll_chan.clone()];
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(
         server,
@@ -3237,8 +3237,8 @@ async fn enroll_and_send_cmd(
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.room = Some(enroll_chan.clone());
-    sess.emit(&sio, "join", json!({ "room": enroll_chan, "name": display_name(), "uid": my_uid })).await;
+    sess.channels = vec![enroll_chan.clone()];
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -3442,8 +3442,8 @@ async fn enroll_and_netcat_cmd(
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.room = Some(enroll_chan.clone());
-    sess.emit(&sio, "join", json!({ "room": enroll_chan, "name": display_name(), "uid": my_uid })).await;
+    sess.channels = vec![enroll_chan.clone()];
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -10789,12 +10789,6 @@ async fn recv_cmd(
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
-            // Join the enrollment rendezvous channel as a ROOM so ephemeral
-            // devices discover us via PeerJoined (not just presence subscribe).
-            if let Ok(Some(uk)) = crate::identity::UserKey::load() {
-                let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-                sess.emit(&sio, "join", json!({ "room": ek, "name": display_name(), "uid": my_uid })).await;
-            }
             // C29: an interactive up can START empty and pair in-session.
             // When shell (--shell / --shell-only) is enabled, the daemon
             // explicitly accepts devices paired later, so do NOT bail just
@@ -13436,8 +13430,19 @@ async fn recv_cmd(
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
-                                                                        }
-                                                                    }
+                    }
+                } else if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    // Enrollment channel: an ephemeral device is trying to enroll.
+                    // Recognize peers on enroll_channel(own_owner_pub) and dial them.
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    if v["channel"].as_str() == Some(&ek) {
+                        let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                            ui::debug(&format!("enrollment peer appeared on channel, dialing"));
+                        }
+                        conn.maybe_adopt(&v, true).await?;
+                    }
+                }
                                                                 }
                                                             }
                                                         }
