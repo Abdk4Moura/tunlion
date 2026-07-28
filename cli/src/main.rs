@@ -3535,14 +3535,18 @@ async fn enroll_and_netcat_cmd(
         Ok(()) => {
             ui::say(&format!("  {} shell request sent", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
             // Wait for l2-open-ack or close
+            let shell_start = Instant::now();
             loop {
-                let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
-                let Ok(Some(ev)) = ev else { break; };
+                if shell_start.elapsed() >= Duration::from_secs(30) {
+                    bail!("shell request timed out (no response from owner)");
+                }
+                let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+                let Ok(Some(ev)) = ev else { continue; };
                 if let Ev::Control(ref pid, ref v) = ev {
                     if pid == &active_pid {
                         match v["type"].as_str() {
                             Some("l2-open-ack") => {
-                                ui::say(&format!("  {} shell connected (sid {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), v["sid"]));
+                                ui::say(&format!("  {} shell authorized (sid {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), v["sid"]));
                                 break;
                             }
                             Some("l2-close") => {
