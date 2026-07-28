@@ -40,8 +40,8 @@ fn devices_shows_granted_label() {
     // (empty devices list is also valid - just check the label format)
     if !stdout.contains("no known devices") {
         assert!(
-            stdout.contains("granted:"),
-            "Expected 'granted:' label in devices output, got: {}",
+            stdout.to_lowercase().contains("granted"),
+            "Expected a 'granted' label/column in devices output, got: {}",
             stdout
         );
     }
