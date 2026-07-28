@@ -1527,6 +1527,22 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
             }
         }
     }
+    // Final fallback: MINT the self-cert on demand from the user key + overlay key.
+    // `identity init` creates the user key but no stored self device-cert, so without
+    // this local_device_cert() is None, pairing never runs identity-expose (it is gated
+    // on this fn), the peer stays secret-only (binding Inferred), and under authoritative
+    // the #21 proven-gate denies EVERY peer. Minting here (deterministic in user_pub and
+    // device_pub; only the timestamps vary) makes the Proven-binding path reachable for
+    // freshly-onboarded and already-onboarded identities alike, without a peer-store entry.
+    if let (Ok(Some(uk)), Ok(overlay_pub)) =
+        (identity::UserKey::load(), crate::overlay::overlay_pubkey_bytes())
+    {
+        if let Ok(cert) =
+            identity::DeviceCert::certify(&uk, overlay_pub, identity::now_secs(), identity::CERT_TTL_SECS)
+        {
+            return Some(cert);
+        }
+    }
     None
 }
 
