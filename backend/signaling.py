@@ -240,6 +240,19 @@ class _RedisRegistry:
         p.execute()
         return out
 
+    def unsubscribe(self, sid, channels):
+        affected = {}
+        p = self.r.pipeline()
+        for ch in channels:
+            p.srem(self._ck(ch), sid)
+            p.srem(self._sck(sid), ch)
+        p.execute()
+        for ch in channels:
+            others = [s for s in self.r.smembers(self._ck(ch)) if s != sid and self.r.exists(self._lk(s))]
+            if others:
+                affected[ch] = others
+        return affected
+
     def unsubscribe_all(self, sid):
         affected = {}
         for ch in self.r.smembers(self._sck(sid)):
