@@ -2762,6 +2762,31 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Delegated ceiling: a principal with auth_key_caps=[transfer] is
+    /// Authorized for transfer but Denied for shell, even when the owner
+    /// has both — the ceiling gates BEFORE the owner shortcut.
+    /// Tests evaluate() directly (in-memory) to avoid full header construction.
+    #[test]
+    fn delegated_ceiling_gates_before_owner_shortcut() {
+        let owner = make_owner();
+        let owner_pub = owner_pub(&owner);
+        let mut nonce = [0u8; 32];
+        let rng = ring::rand::SystemRandom::new();
+        ring::rand::SecureRandom::fill(&rng, &mut nonce).unwrap();
+        let header = make_genesis_header(&owner, &nonce, &[]);
+        let store = vec![header.to_json()];
+        let ak_caps = vec!["transfer".to_string()];
+        // Same user_pub as header owner — normally shortcut to Authorized.
+        // auth_key_caps ceiling gates first: transfer in caps → Authorized
+        let r1 = evaluate(&store, &header, &[0xCC; 32], &owner_pub, "self", "transfer", now_secs(), Some(&ak_caps));
+        assert!(matches!(r1, Decision::Authorized),
+            "transfer in auth_key_caps must authorize even with owner shortcut");
+        // Shell NOT in auth_key_caps → Denied (ceiling enforced before owner shortcut)
+        let r2 = evaluate(&store, &header, &[0xCC; 32], &owner_pub, "self", "shell", now_secs(), Some(&ak_caps));
+        assert!(matches!(r2, Decision::Denied(_)),
+            "shell not in auth_key_caps must be denied (ceiling)");
+    }
+
     /// The flip criterion is code, not prose: a clean legacy-ALLOWED sample with
     /// everything provisioned is ready; a bare zero total, a real disagreement, or
     /// any unprovisioned resource each block the flip. Pure (no global atomics), so
