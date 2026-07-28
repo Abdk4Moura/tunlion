@@ -3055,14 +3055,15 @@ async fn respond_to_auth_key_enroll_request(
     let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
         Some(ak) => ak,
         None => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "invalid auth key"})).await;
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
 
     // Rate-limit BEFORE anything expensive (window-only, no burn)
     if let Err(e) = crate::ephemeral::check_rate_limit(&ak.enroll_pub) {
-        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+        ui::debug(&format!("enroll request rate-limited: {e}"));
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
         return;
     }
 
@@ -3070,24 +3071,33 @@ async fn respond_to_auth_key_enroll_request(
     let owner_pub = match crate::identity::UserKey::load() {
         Ok(Some(uk)) => uk.public_key_bytes(),
         _ => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "no user identity"})).await;
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
     let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
         Ok(pk) => pk,
         Err(e) => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": format!("overlay key: {}", e)})).await;
+            ui::debug(&format!("enroll request overlay-key error: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
     if let Err(e) = ak.verify_against_owner(&owner_pub, &verifier_pub) {
-        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+        ui::debug(&format!("enroll request auth-key rejected: {e}"));
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
         return;
     }
 
     // Generate nonce challenge
-    let nonce = crate::ephemeral::generate_nonce(&pid);
+    let nonce = match crate::ephemeral::generate_nonce(&pid) {
+        Ok(n) => n,
+        Err(e) => {
+            ui::debug(&format!("enroll request nonce CSPRNG failure: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
     let _ = t.send_control(&json!({
         "type": "identity-auth-key-enroll-challenge",
         "nonce": hex::encode(nonce),
@@ -3106,21 +3116,22 @@ async fn handle_auth_key_enroll_response(
     let payload = match crate::ephemeral::EnrollmentPayload::from_json(&v) {
         Some(p) => p,
         None => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "invalid payload"})).await;
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
     let owner_pub = match crate::identity::UserKey::load() {
         Ok(Some(uk)) => uk.public_key_bytes(),
         _ => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "no user identity"})).await;
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
     let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
         Ok(pk) => pk,
         Err(e) => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": format!("overlay key: {}", e)})).await;
+            ui::debug(&format!("enroll response overlay-key error: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
@@ -3130,7 +3141,8 @@ async fn handle_auth_key_enroll_response(
     let nonce = match crate::ephemeral::consume_latest_nonce(&pid) {
         Ok(n) => n,
         Err(e) => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+            ui::debug(&format!("enroll response nonce consumption failed: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
@@ -3140,7 +3152,8 @@ async fn handle_auth_key_enroll_response(
         Ok((enroll_pub, device_pub, ak)) => {
             // Burn ON SUCCESS only (never-reset counter)
             if let Err(e) = crate::ephemeral::burn_auth_key(&enroll_pub, &ak.reuse) {
-                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+                ui::debug(&format!("enroll response burn failed: {e}"));
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
             }
             // Admit as Delegated principal
@@ -3148,8 +3161,7 @@ async fn handle_auth_key_enroll_response(
                 link.identity_device_pub = Some(device_pub);
                 link.identity_binding = crate::capability::BindingStrength::Proven;
                 link.identity_cert_expires = Some(ak.expires);
-                // Store auth_key_caps for delegated ceiling
-                // link.auth_key_caps = Some(ak.caps.clone());  // add field to Link when ready
+                link.auth_key_caps = Some(ak.caps.clone());
             }
             let _ = t.send_control(&json!({
                 "type": "identity-auth-key-enroll-ack",
@@ -3161,7 +3173,8 @@ async fn handle_auth_key_enroll_response(
                 ak.caps));
         }
         Err(e) => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+            ui::debug(&format!("enroll response verify failed: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
         }
     }
 }
@@ -4097,6 +4110,11 @@ struct Link {
     identity_binding: crate::capability::BindingStrength,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     identity_cert_expires: Option<u64>,
+    /// Auth key caps ceiling for a delegated (auth-key-enrolled) principal.
+    /// None = this principal is an owner device with full rights (subject to
+    /// individual grants). Some = caps are intersected with owner's effective
+    /// caps (delegated-ceiling rule).
+    auth_key_caps: Option<Vec<String>>,
 }
 
 impl Link {
@@ -5216,6 +5234,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
+                auth_key_caps: None,
             },
         );
         Ok(())
@@ -5646,6 +5665,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
+                auth_key_caps: None,
             },
         );
         }
@@ -6534,6 +6554,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
+                auth_key_caps: None,
             },
         );
     }

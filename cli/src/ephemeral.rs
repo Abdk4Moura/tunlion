@@ -396,10 +396,14 @@ impl EnrollmentPayload {
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// Two independent counters: burn_count never resets (reuse guard),
-/// window_count/window_start reset every 60s (rate-limit).
+/// Three independent counters:
+/// - burn_count / burn_start: never reset (reuse guard)
+/// - attempt_count / attempt_window_start: pre-flight anti-flood (incremented per call)
+/// - window_count / window_start: rate limit on successful burns
 struct BurnEntry {
     burn_count: u32,
+    attempt_count: u32,
+    attempt_window_start_secs: u64,
     window_count: u32,
     window_start_secs: u64,
 }
@@ -428,6 +432,8 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
     let mut state = burn_state().lock().unwrap();
     let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
         burn_count: 0,
+        attempt_count: 0,
+        attempt_window_start_secs: now_secs,
         window_count: 0,
         window_start_secs: now_secs,
     });
@@ -462,26 +468,27 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
     Ok(())
 }
 
-/// Rate-limit check only (no burn). Called BEFORE generating a challenge
-/// to prevent flooding. The burn counter is NOT incremented — burn only on
-/// a SUCCESSFUL enrollment verify.
+/// Rate-limit check INCREMENTS the attempt counter — this is the pre-flight
+/// anti-flood guard. Uses a SEPARATE attempt counter from burn accounting.
 pub fn check_rate_limit(enroll_pub: &[u8; 32]) -> Result<()> {
     let now_secs = now_secs();
     let mut state = burn_state().lock().unwrap();
     let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
         burn_count: 0,
+        attempt_count: 0,
+        attempt_window_start_secs: now_secs,
         window_count: 0,
         window_start_secs: now_secs,
     });
-    let elapsed = now_secs.saturating_sub(entry.window_start_secs);
+    let elapsed = now_secs.saturating_sub(entry.attempt_window_start_secs);
     if elapsed >= 60 {
-        entry.window_count = 0;
-        entry.window_start_secs = now_secs;
+        entry.attempt_count = 0;
+        entry.attempt_window_start_secs = now_secs;
     }
-    if entry.window_count >= ENROLL_RATE_LIMIT {
-        bail!("auth key rate-limited (max {} enrollments/min)", ENROLL_RATE_LIMIT);
+    if entry.attempt_count >= ENROLL_RATE_LIMIT {
+        bail!("too many enrollment attempts (max {}/min)", ENROLL_RATE_LIMIT);
     }
-    // DO NOT increment — this is pre-flight, not a burn
+    entry.attempt_count += 1;
     Ok(())
 }
 
@@ -537,60 +544,55 @@ fn nonce_store() -> &'static Mutex<NonceStore> {
 }
 
 /// Generate a fresh CSPRNG nonce for the given peer, store it, return the nonce.
-/// Each call generates a new nonce (attempts are independent).
-pub fn generate_nonce(peer_id: &str) -> [u8; 32] {
+/// Rate-limited: called once per attempt (by check_rate_limit), single outstanding
+/// nonce per peer (replaced on each new request). Sweeps expired entries on insert.
+/// Propagates CSPRNG fill error — never issues a zero-filled nonce.
+pub fn generate_nonce(peer_id: &str) -> Result<[u8; 32]> {
     use ring::rand::{SecureRandom, SystemRandom};
     let rng = SystemRandom::new();
     let mut nonce = [0u8; 32];
-    let _ = rng.fill(&mut nonce);
-    let mut store = nonce_store().lock().unwrap();
-    store.pending
-        .entry(peer_id.to_string())
-        .or_default()
-        .push(NonceEntry {
-            nonce,
-            deadline: StdInstant::now() + std::time::Duration::from_secs(ENROLL_NONCE_TTL_SECS),
-        });
-    nonce
-}
-
-/// Consume a nonce from the store — remove it, error if not found or expired.
-/// This is the structural single-use guarantee: the nonce is taken OUT of the
-/// store, so a second presentation of the same payload MUST fail.
-pub fn consume_nonce(peer_id: &str, nonce: &[u8; 32]) -> Result<()> {
-    let mut store = nonce_store().lock().unwrap();
-    let entries = match store.pending.get_mut(peer_id) {
-        Some(v) => v,
-        None => bail!("no enrollment nonce for peer {}", peer_id),
-    };
-    let now = StdInstant::now();
-    entries.retain(|e| e.deadline > now);
-    if let Some(pos) = entries.iter().position(|e| e.nonce == *nonce) {
-        entries.remove(pos);
-        Ok(())
-    } else {
-        bail!("enrollment nonce not found or already consumed")
+    rng.fill(&mut nonce).map_err(|e| anyhow!("CSPRNG failure: {}", e))?;
+    // Nonce must be non-zero after fill
+    if nonce == [0u8; 32] {
+        bail!("CSPRNG returned zero nonce");
     }
+    let mut store = nonce_store().lock().unwrap();
+    // Sweep expired entries across ALL peers
+    let now = StdInstant::now();
+    store.pending.retain(|_, entries| {
+        entries.iter().any(|e| e.deadline > now)
+    });
+    // Single outstanding nonce per peer — replace
+    store.pending.insert(peer_id.to_string(), vec![NonceEntry {
+        nonce,
+        deadline: now + std::time::Duration::from_secs(ENROLL_NONCE_TTL_SECS),
+    }]);
+    Ok(nonce)
 }
 
-/// Consume the latest nonce for a peer and return it.
-/// Called by the daemon at step 4 — it knows what it issued and doesn't trust
-/// the enroller to correctly state which nonce was used.
+/// Consume the outstanding nonce for a peer and return it.
+/// Since we maintain a single outstanding nonce per peer (replaced on each
+/// new request), this simply takes it. Errors if none found or expired.
 pub fn consume_latest_nonce(peer_id: &str) -> Result<[u8; 32]> {
     let mut store = nonce_store().lock().unwrap();
     let entries = match store.pending.get_mut(peer_id) {
         Some(v) => v,
-        None => bail!("no enrollment nonce for peer {}", peer_id),
+        None => bail!("no enrollment nonce for peer"),
     };
     let now = StdInstant::now();
     entries.retain(|e| e.deadline > now);
     if entries.is_empty() {
+        store.pending.remove(peer_id);
         bail!("enrollment nonce expired or already consumed");
     }
-    // Take the latest (last in list)
-    let nonce = entries.pop().unwrap().nonce;
+    let nonce = entries.remove(0).nonce;
+    if entries.is_empty() {
+        store.pending.remove(peer_id);
+    }
     Ok(nonce)
 }
+
+// Remove consume_nonce (peer_id, nonce) — no longer needed since single-outstanding.
 
 // ---------------------------------------------------------------------------
 // Utility
