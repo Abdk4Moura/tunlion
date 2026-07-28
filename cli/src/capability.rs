@@ -878,7 +878,12 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
 pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
     let p = config_dir.join("caps.json");
     if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
-    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)?;
+    // Atomic write: temp file -> sync -> rename (no torn/partial reads).
+    let tmp = config_dir.join(format!("caps.json.tmp.{}", std::process::id()));
+    let data = serde_json::to_string_pretty(&serde_json::json!(store))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&tmp, &data)?;
+    std::fs::rename(&tmp, &p)?;
     // Invalidate cache: next load_cap_store will see the new mtime and re-read.
     let cache = cache_init();
     if let Ok(mut c) = cache.lock() {
