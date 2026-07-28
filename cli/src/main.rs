@@ -2976,6 +2976,9 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     // The flow exposes EXACTLY ONE device + its cert; privacy test asserts on actual wire payload.
     let mut peer_identity_cert: Option<identity::DeviceCert> = None;
     let mut sent_identity: bool = false;
+    // #29: PAKE confirmation just arrived. Done check skips ONE iteration so
+    // progression block sends identity-expose and peer can respond.
+    let mut ceremony_confirmed_just_now: bool = false;
     // Peer signaling sid we run the PAKE with (set when the link is adopted).
     let mut pake_peer: Option<String> = None;
     let caps = pair_v2_caps();
@@ -3007,6 +3010,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         // Done when the petname is settled AND the PAKE agreed a secret (key
         // confirmation passed). The secret is HKDF(K), never transmitted, the
         // same on both sides; it drops straight into devices.json.
+        // #29: skip done check for one iteration after confirmation to let identity-expose exchange complete.
+        if !ceremony_confirmed_just_now {
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
                 // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
@@ -3043,6 +3048,9 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 let _ = sio.disconnect().await;
                 return Ok(());
             }
+        } // ceremony_confirmed_just_now guard
+        ceremony_confirmed_just_now = false;
+
         }
         if Instant::now() > deadline {
             bail!("timed out, the code was never used (codes expire after 10 minutes)");
@@ -3220,6 +3228,9 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         PakeInbound::Consumed => {
                             if let Some(sec) = cer.secret() {
                                 agreed_secret = Some(sec.clone());
+                                // #29: defer done-block exit for one iteration so
+                                // identity-expose can be sent in progression block.
+                                ceremony_confirmed_just_now = true;
                             }
                         }
                         PakeInbound::Abort(why) => {
