@@ -15,6 +15,19 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Maximum TTL an auth key may be minted with (30 days).
+const MAX_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Maximum enrollemnts per minute per enroll_pub (rate-limit, independent of burn).
+const ENROLL_RATE_LIMIT: u32 = 5;
+
+/// Maximum length for a canonical cap or tag string (cap truncation → collision defense).
+const MAX_CAP_LEN: usize = 65535;
+
+// ---------------------------------------------------------------------------
 // AuthKey — owner-signed delegation token (no bearer secret)
 // ---------------------------------------------------------------------------
 
@@ -36,8 +49,20 @@ impl Reuse {
     }
 }
 
+/// Normalize a slice of capability strings: lowercase, sort, deduplicate.
+pub fn normalize_caps(caps: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = caps.iter().map(|s| s.to_lowercase()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// An owner-signed delegation token that authorizes a device to self-enroll
 /// as a delegated principal. Carries an enroll PUBLIC key (no bearer secret).
+///
+/// Caps are NORMALIZED at construction and deserialization (lowercase, sorted,
+/// deduped), so signature commitments are case-consistent and mesh-ban
+/// comparisons (`c == "mesh"`) are sound.
 #[derive(Debug, Clone)]
 pub struct AuthKey {
     /// Owner's Ed25519 public key (the issuer, must match a trusted user_pub).
@@ -47,11 +72,11 @@ pub struct AuthKey {
     /// public key, nothing replayable.
     pub enroll_pub: [u8; 32],
     /// Semantic capability actions — a CEILING, not a floor (see delegated
-    /// principal). Sorted, deduplicated, lowercase for canonical marshalling.
+    /// principal). Normalized: sorted, deduplicated, lowercase.
     pub caps: Vec<String>,
     /// Which peer(s) may enroll this key. Empty = Any.
     pub audience: Vec<[u8; 32]>,
-    /// Absolute expiry (unix seconds). MANDATORY, capped low by construction.
+    /// Absolute expiry (unix seconds).
     pub expires: u64,
     /// How many times this key may be used.
     pub reuse: Reuse,
@@ -64,37 +89,37 @@ pub struct AuthKey {
 }
 
 /// Canonical bytes that the signature covers — deterministic, no ambiguity.
+/// Uses u32 length prefixes to prevent truncation-based canonical collisions.
 fn auth_key_canonical_bytes(k: &AuthKey) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(b"filament-auth-key-v1");
     b.extend_from_slice(&k.issuer);
     b.extend_from_slice(&k.enroll_pub);
-    // caps sorted, deduped, lowercase
-    let mut caps = k.caps.clone();
-    caps.sort();
-    caps.dedup();
-    for c in &caps {
-        let lc: String = c.to_lowercase();
-        b.extend_from_slice(&(lc.len() as u8).to_le_bytes());
-        b.extend_from_slice(lc.as_bytes());
+    // caps (already normalized: sorted, deduped, lowercase)
+    for c in &k.caps {
+        b.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        b.extend_from_slice(c.as_bytes());
     }
     // audience sorted
     let mut aud = k.audience.clone();
     aud.sort();
-    b.push(aud.len() as u8);
+    b.extend_from_slice(&(aud.len() as u32).to_le_bytes());
     for a in &aud {
         b.extend_from_slice(a);
     }
     b.extend_from_slice(&k.expires.to_le_bytes());
     b.push(k.reuse.to_byte());
     b.push(if k.ephemeral { 1 } else { 0 });
-    b.extend_from_slice(&(k.tag.len() as u8).to_le_bytes());
+    b.extend_from_slice(&(k.tag.len() as u32).to_le_bytes());
     b.extend_from_slice(k.tag.as_bytes());
     b
 }
 
 impl AuthKey {
     /// Mint a new auth key signed by the owner's user key.
+    /// Caps are normalized (lowercase, sorted, deduped) at construction.
+    /// ttl_secs is capped at MAX_TTL_SECS (30 days).
+    /// Rejects caps or tag exceeding MAX_CAP_LEN.
     pub fn mint(
         owner_uk: &Ed25519KeyPair,
         enroll_pub: [u8; 32],
@@ -104,13 +129,19 @@ impl AuthKey {
         reuse: Reuse,
         tag: String,
     ) -> Result<Self> {
+        if tag.len() > MAX_CAP_LEN {
+            bail!("tag too long (max {} bytes)", MAX_CAP_LEN);
+        }
+        if caps.iter().any(|c| c.len() > MAX_CAP_LEN) {
+            bail!("cap too long (max {} bytes)", MAX_CAP_LEN);
+        }
         let now = now_secs();
         let mut k = AuthKey {
             issuer: owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?,
             enroll_pub,
-            caps,
+            caps: normalize_caps(&caps),
             audience,
-            expires: now.saturating_add(ttl_secs),
+            expires: now.saturating_add(ttl_secs.min(MAX_TTL_SECS)),
             reuse,
             ephemeral: true,
             tag,
@@ -123,8 +154,9 @@ impl AuthKey {
         Ok(k)
     }
 
-    /// Verify the owner's signature + expiry (does NOT check issuer trust).
-    pub fn verify(&self) -> Result<()> {
+    /// Verify signature + expiry only.
+    /// Private — callers use verify_against_owner for the genesis-forgery guard.
+    fn verify_sig_and_expiry(&self) -> Result<()> {
         if now_secs() >= self.expires {
             bail!("auth key expired");
         }
@@ -135,14 +167,18 @@ impl AuthKey {
             .map_err(|_| anyhow!("auth key signature invalid"))
     }
 
-    /// Full verification against a trusted owner: sig valid, not expired,
-    /// AND the issuer equals the trusted owner_pub (genesis-forgery rule).
-    pub fn verify_against_owner(&self, owner_pub: &[u8; 32]) -> Result<()> {
-        self.verify()?;
-        if &self.issuer != owner_pub {
+    /// Full verification: audience allowed, sig valid, not expired,
+    /// issuer equals trusted owner_pub (genesis-forgery rule), mesh refused.
+    pub fn verify_against_owner(&self, owner_pub: &[u8; 32], verifier_pub: &[u8; 32]) -> Result<()> {
+        // Audience check FIRST — don't verify sig if this verifier is excluded.
+        if !self.audience_allows(verifier_pub) {
+            bail!("auth key not authorized for this peer");
+        }
+        self.verify_sig_and_expiry()?;
+        if self.issuer != *owner_pub {
             bail!("auth key issuer does not match trusted owner");
         }
-        // Mesh refusal: verifier-side structural ban, regardless of valid sig.
+        // Mesh refusal: caps are normalized (lowercase), so "mesh" catches all case variants.
         if self.caps.iter().any(|c| c == "mesh") {
             bail!("auth keys must not carry mesh capability");
         }
@@ -168,22 +204,25 @@ impl AuthKey {
         })
     }
 
+    /// SAFE deserialization: uses try_into() (no panics on wrong-length hex).
+    /// Caps are normalized at parse time.
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
-        let issuer = hex::decode(v.get("issuer")?.as_str()?).ok()?;
-        let enroll_pub = hex::decode(v.get("enroll_pub")?.as_str()?).ok()?;
+        let issuer: [u8; 32] = hex::decode(v.get("issuer")?.as_str()?).ok()?.try_into().ok()?;
+        let enroll_pub: [u8; 32] = hex::decode(v.get("enroll_pub")?.as_str()?).ok()?.try_into().ok()?;
         let caps: Vec<String> = v.get("caps")?.as_array()?
             .iter()
             .filter_map(|x| x.as_str().map(|s| s.to_string()))
             .collect();
-        let audience: Vec<[u8; 32]> = v.get("audience")?.as_array()?
-            .iter()
-            .filter_map(|x| {
+        let caps = normalize_caps(&caps);
+        let audience: Vec<[u8; 32]> = {
+            let raw = v.get("audience")?.as_array()?;
+            let mut out = Vec::with_capacity(raw.len());
+            for x in raw {
                 let b = hex::decode(x.as_str()?).ok()?;
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&b);
-                Some(arr)
-            })
-            .collect();
+                out.push(b.try_into().ok()?);
+            }
+            out
+        };
         let expires = v.get("expires")?.as_u64()?;
         let reuse = match v.get("reuse")?.as_str()? {
             "Once" => Reuse::Once,
@@ -196,14 +235,8 @@ impl AuthKey {
         };
         let ephemeral = v.get("ephemeral")?.as_bool()?;
         let tag = v.get("tag")?.as_str()?.to_string();
-        let sig = hex::decode(v.get("sig")?.as_str()?).ok()?;
-        let mut sig_arr = [0u8; 64];
-        sig_arr.copy_from_slice(&sig);
-        let mut issuer_arr = [0u8; 32];
-        issuer_arr.copy_from_slice(&issuer);
-        let mut enroll_arr = [0u8; 32];
-        enroll_arr.copy_from_slice(&enroll_pub);
-        Some(AuthKey { issuer: issuer_arr, enroll_pub: enroll_arr, caps, audience, expires, reuse, ephemeral, tag, sig: sig_arr })
+        let sig: [u8; 64] = hex::decode(v.get("sig")?.as_str()?).ok()?.try_into().ok()?;
+        Some(AuthKey { issuer, enroll_pub, caps, audience, expires, reuse, ephemeral, tag, sig })
     }
 }
 
@@ -238,37 +271,44 @@ impl<'de> serde::Deserialize<'de> for Reuse {
 
 /// The enrollment payload carried over the wire. The machine generates its own
 /// device keypair and presents the auth key + device_pub + possession proofs.
+///
+/// NONCE IS NOT ON THE WIRE. The verifier always knows the challenge it issued;
+/// keeping it on the wire enables replay attacks. The verifier passes its held
+/// nonce to verify() directly.
 pub struct EnrollmentPayload {
     pub auth_key: AuthKey,
     pub device_pub: [u8; 32],
-    /// Possession proof: sign("filament-auth-key-enroll-v1" || nonce || device_pub)
+    /// Possession proof: sign(possession_msg(nonce, device_pub, verifier_pub))
     /// with enroll_priv (proves holder possesses auth key's private half).
     pub enroll_possession_sig: [u8; 64],
     /// Possession proof: same message signed with device_priv (proves holder
     /// possesses the device key it claims).
     pub device_possession_sig: [u8; 64],
-    /// The session nonce used to bind to this enrollment attempt.
-    pub nonce: [u8; 32],
 }
 
-fn enrollment_possession_msg(nonce: &[u8; 32], device_pub: &[u8; 32]) -> Vec<u8> {
+/// Possession message: binds the enrollment to a specific nonce, device,
+/// AND verifier, so a payload captured for peer A cannot be presented to peer B.
+fn enrollment_possession_msg(nonce: &[u8; 32], device_pub: &[u8; 32], verifier_pub: &[u8; 32]) -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(b"filament-auth-key-enroll-v1");
     msg.extend_from_slice(nonce);
     msg.extend_from_slice(device_pub);
+    msg.extend_from_slice(verifier_pub);
     msg
 }
 
 impl EnrollmentPayload {
     /// Build payload: sign possession messages with both keys.
+    /// verifier_pub binds this payload to a specific verifier.
     pub fn build(
         auth_key: AuthKey,
         device_pub: [u8; 32],
         enroll_keypair: &Ed25519KeyPair,
         device_keypair: &Ed25519KeyPair,
         nonce: [u8; 32],
+        verifier_pub: [u8; 32],
     ) -> Self {
-        let msg = enrollment_possession_msg(&nonce, &device_pub);
+        let msg = enrollment_possession_msg(&nonce, &device_pub, &verifier_pub);
         let enroll_sig = enroll_keypair.sign(&msg);
         let device_sig = device_keypair.sign(&msg);
         let mut es = [0u8; 64];
@@ -280,24 +320,32 @@ impl EnrollmentPayload {
             device_pub,
             enroll_possession_sig: es,
             device_possession_sig: ds,
-            nonce,
         }
     }
 
     /// Verify the enrollment payload against a trusted owner.
+    /// `verifier_nonce` is the nonce THIS verifier issued — never trust the
+    /// payload's own claim. `verifier_pub` binds to this specific verifier.
     /// Returns (enroll_pub, device_pub, verified_auth_key) on success.
-    pub fn verify(&self, owner_pub: &[u8; 32]) -> Result<([u8; 32], [u8; 32], AuthKey)> {
-        // 1. Verify auth key under trusted owner
-        self.auth_key.verify_against_owner(owner_pub)?;
+    pub fn verify(
+        &self,
+        owner_pub: &[u8; 32],
+        verifier_nonce: &[u8; 32],
+        verifier_pub: &[u8; 32],
+    ) -> Result<([u8; 32], [u8; 32], AuthKey)> {
+        // 1. Verify auth key under trusted owner (audience + expiry + sig + issuer + mesh)
+        self.auth_key.verify_against_owner(owner_pub, verifier_pub)?;
 
-        // 2. Verify enroll possession — holder proves ownership of enroll_priv
-        let msg = enrollment_possession_msg(&self.nonce, &self.device_pub);
+        // 2. Build possession message from VERIFIER's held nonce, NOT payload bytes
+        let msg = enrollment_possession_msg(verifier_nonce, &self.device_pub, verifier_pub);
+
+        // 3. Verify enroll possession
         let enroll_pkey = UnparsedPublicKey::new(&ED25519, &self.auth_key.enroll_pub);
         enroll_pkey
             .verify(&msg, &self.enroll_possession_sig)
             .map_err(|_| anyhow!("enroll possession proof invalid"))?;
 
-        // 3. Verify device possession — holder proves ownership of device_priv
+        // 4. Verify device possession
         let device_pkey = UnparsedPublicKey::new(&ED25519, &self.device_pub);
         device_pkey
             .verify(&msg, &self.device_possession_sig)
@@ -312,42 +360,21 @@ impl EnrollmentPayload {
             "device_pub": hex::encode(self.device_pub),
             "enroll_possession_sig": hex::encode(self.enroll_possession_sig),
             "device_possession_sig": hex::encode(self.device_possession_sig),
-            "nonce": hex::encode(self.nonce),
         })
     }
 
+    /// SAFE deserialization: uses try_into() (no panics on wrong-length hex).
+    /// Nonce is NOT in the JSON — the verifier supplies its own.
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         let auth_key = AuthKey::from_json(v.get("auth_key")?)?;
-        let device_pub = {
-            let b = hex::decode(v.get("device_pub")?.as_str()?).ok()?;
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        };
-        let enroll_possession_sig = {
-            let b = hex::decode(v.get("enroll_possession_sig")?.as_str()?).ok()?;
-            let mut arr = [0u8; 64];
-            arr.copy_from_slice(&b);
-            arr
-        };
-        let device_possession_sig = {
-            let b = hex::decode(v.get("device_possession_sig")?.as_str()?).ok()?;
-            let mut arr = [0u8; 64];
-            arr.copy_from_slice(&b);
-            arr
-        };
-        let nonce = {
-            let b = hex::decode(v.get("nonce")?.as_str()?).ok()?;
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        };
+        let device_pub: [u8; 32] = hex::decode(v.get("device_pub")?.as_str()?).ok()?.try_into().ok()?;
+        let enroll_possession_sig: [u8; 64] = hex::decode(v.get("enroll_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
+        let device_possession_sig: [u8; 64] = hex::decode(v.get("device_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
         Some(EnrollmentPayload {
             auth_key,
             device_pub,
             enroll_possession_sig,
             device_possession_sig,
-            nonce,
         })
     }
 }
@@ -358,11 +385,13 @@ impl EnrollmentPayload {
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
+/// Two independent counters: burn_count never resets (reuse guard),
+/// window_count/window_start reset every 60s (rate-limit).
 struct BurnEntry {
-    used_count: u32,
-    first_seen: Instant,
+    burn_count: u32,
+    window_count: u32,
+    window_start_secs: u64,
 }
 
 struct BurnState {
@@ -376,40 +405,50 @@ fn burn_state() -> &'static Mutex<BurnState> {
 }
 
 /// Consume one use of an auth key identified by `enroll_pub`.
-/// Rate-limited: MAX 5 enrollments/min per enroll_pub per peer.
+/// Rate-limited: max 5 enrollments/min per enroll_pub per peer.
+/// Burn is process-local: a daemon restart clears all burn state.
+/// NEVER reset burn_count (reuse guard) — rate-limit window is independent.
 pub fn burn_auth_key(enroll_pub: &[u8; 32], reuse: &Reuse) -> Result<()> {
+    burn_auth_key_at(enroll_pub, reuse, now_secs())
+}
+
+/// Like burn_auth_key but takes an explicit now so tests can advance time
+/// without sleeping.
+pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u64) -> Result<()> {
     let mut state = burn_state().lock().unwrap();
     let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
-        used_count: 0,
-        first_seen: Instant::now(),
+        burn_count: 0,
+        window_count: 0,
+        window_start_secs: now_secs,
     });
 
-    // Rate limit: max 5 enrollments per minute per enroll_pub
-    let elapsed = entry.first_seen.elapsed().as_secs();
-    if entry.used_count >= 5 && elapsed < 60 {
-        bail!("auth key rate-limited (max 5 enrollments/min)");
-    }
-    // Reset rate window after 60s
+    // Rate-limit window (independent from burn, resets every 60s)
+    let elapsed = now_secs.saturating_sub(entry.window_start_secs);
     if elapsed >= 60 {
-        entry.used_count = 0;
-        entry.first_seen = Instant::now();
+        entry.window_count = 0;
+        entry.window_start_secs = now_secs;
+    }
+    if entry.window_count >= ENROLL_RATE_LIMIT {
+        bail!("auth key rate-limited (max {} enrollments/min)", ENROLL_RATE_LIMIT);
     }
 
+    // Burn guard (never reset — tracks lifetime uses)
     match reuse {
         Reuse::Once => {
-            if entry.used_count > 0 {
+            if entry.burn_count > 0 {
                 bail!("auth key already used (single-use)");
             }
         }
         Reuse::N(max) => {
-            if entry.used_count >= *max {
+            if entry.burn_count >= *max {
                 bail!("auth key exhausted ({} uses)", max);
             }
         }
-        Reuse::Reusable => {} // no limit, but rate-limit still applies
+        Reuse::Reusable => {} // no limit, rate-limit still applies
     }
 
-    entry.used_count += 1;
+    entry.burn_count += 1;
+    entry.window_count += 1;
     Ok(())
 }
 
@@ -418,25 +457,23 @@ pub fn burn_auth_key(enroll_pub: &[u8; 32], reuse: &Reuse) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// A delegated principal's effective capabilities are the INTERSECTION of the
-/// owner's effective caps at this peer AND the auth key's caps. This ensures
-/// the delegated principal never exceeds what the owner holds at that peer AND
-/// never exceeds the auth key's stated ceiling.
+/// owner's effective caps at this peer AND the auth key's caps. Both sides are
+/// normalized (lowercase) so mixed-case owner caps are correctly intersected.
 ///
-/// Both invariants are enforced:
+/// Invariants (property-testable):
 ///   effective(delegated) ⊆ auth_key_caps  (the ceiling)
 ///   effective(delegated) ⊆ effective(owner)  (no escalation)
 pub fn delegated_effective_caps(
     owner_effective: &[String],
     auth_key_caps: &[String],
 ) -> Vec<String> {
-    let mut result = Vec::new();
-    let owner_set: std::collections::HashSet<&str> = owner_effective.iter().map(|s| s.as_str()).collect();
-    for cap in auth_key_caps {
-        let lc = cap.to_lowercase();
-        if owner_set.contains(lc.as_str()) {
-            result.push(lc);
-        }
-    }
+    let owner_set: std::collections::HashSet<String> =
+        owner_effective.iter().map(|s| s.to_lowercase()).collect();
+    let mut result: Vec<String> = auth_key_caps
+        .iter()
+        .filter(|c| owner_set.contains(c.as_str()))
+        .cloned()
+        .collect();
     result.sort();
     result.dedup();
     result
@@ -470,25 +507,313 @@ mod tests {
         Ed25519KeyPair::from_seed_unchecked(&seed).unwrap()
     }
 
+    fn owner_pub(owner: &Ed25519KeyPair) -> [u8; 32] {
+        owner.public_key().as_ref().try_into().unwrap()
+    }
+
+    // ── Finding 1: Replay ──────────────────────────────────────────────
+
+    #[test]
+    fn replay_payload_rejected_with_wrong_nonce() {
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let device_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        let device_pub: [u8; 32] = device_kp.public_key().as_ref().try_into().unwrap();
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let rng = SystemRandom::new();
+        let mut nonce1 = [0u8; 32];
+        rng.fill(&mut nonce1).unwrap();
+        let mut nonce2 = [0u8; 32];
+        rng.fill(&mut nonce2).unwrap();
+
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce1, verifier_pub);
+        let op = owner_pub(&owner);
+
+        // Correct nonce passes
+        assert!(payload.verify(&op, &nonce1, &verifier_pub).is_ok());
+        // Replayed with wrong nonce fails
+        assert!(payload.verify(&op, &nonce2, &verifier_pub).is_err());
+        // Nonce is not on the wire (JSON roundtrip has no nonce field)
+        let json = payload.to_json();
+        assert!(json.get("nonce").is_none());
+    }
+
+    #[test]
+    fn replay_payload_verifier_bound() {
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let device_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        let device_pub: [u8; 32] = device_kp.public_key().as_ref().try_into().unwrap();
+        let verifier_a: [u8; 32] = [0xAA; 32];
+        let verifier_b: [u8; 32] = [0xBB; 32];
+        let rng = SystemRandom::new();
+        let mut nonce = [0u8; 32];
+        rng.fill(&mut nonce).unwrap();
+
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce, verifier_a);
+        let op = owner_pub(&owner);
+
+        assert!(payload.verify(&op, &nonce, &verifier_a).is_ok());
+        // Same payload presented to verifier B fails
+        assert!(payload.verify(&op, &nonce, &verifier_b).is_err());
+    }
+
+    // ── Finding 2: Mesh case-bypass ────────────────────────────────────
+
+    #[test]
+    fn mesh_refused_normalized_lowercase() {
+        let owner = gen_keypair();
+        let enroll = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["mesh".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        assert_eq!(ak.caps, vec!["mesh"]); // normalized
+        let op = owner_pub(&owner);
+        assert!(ak.verify_against_owner(&op, &verifier_pub).is_err());
+    }
+
+    #[test]
+    fn mesh_refused_case_bypass_defeated() {
+        let owner = gen_keypair();
+        let enroll = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["MESH".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        assert_eq!(ak.caps, vec!["mesh"]); // normalized at mint
+        let op = owner_pub(&owner);
+        assert!(ak.verify_against_owner(&op, &verifier_pub).is_err());
+    }
+
+    #[test]
+    fn mesh_refused_when_parsed_from_json() {
+        // Construct JSON with "MESH" (mixed or upper case) — from_json must normalize
+        let ak_json = serde_json::json!({
+            "issuer": hex::encode([0u8; 32]),
+            "enroll_pub": hex::encode([0u8; 32]),
+            "caps": ["MESH"],
+            "audience": [],
+            "expires": now_secs() + 3600,
+            "reuse": "Once",
+            "ephemeral": true,
+            "tag": "test",
+            "sig": hex::encode([0u8; 64])
+        });
+        let parsed = AuthKey::from_json(&ak_json).unwrap();
+        assert_eq!(parsed.caps, vec!["mesh"]); // normalized at parse
+    }
+
+    // ── Finding 3: Burn reset ──────────────────────────────────────────
+
+    #[test]
+    fn burn_once_not_undone_by_rate_window_reset() {
+        let kp = gen_keypair();
+        let enroll_pub: [u8; 32] = kp.public_key().as_ref().try_into().unwrap();
+
+        // Use once at t=0
+        assert!(burn_auth_key_at(&enroll_pub, &Reuse::Once, 0).is_ok());
+        // Still at t=0: second use fails (single-use consumed)
+        assert!(burn_auth_key_at(&enroll_pub, &Reuse::Once, 0).is_err());
+
+        // Manually reset window to simulate rate-window expiry at t=120
+        {
+            let mut state = burn_state().lock().unwrap();
+            if let Some(entry) = state.map.get_mut(&enroll_pub) {
+                entry.window_count = 0;
+                entry.window_start_secs = 120;
+            }
+        }
+        // At t=120, window is fresh — but burn_count is still 1, so Reuse::Once still fails
+        assert!(
+            burn_auth_key_at(&enroll_pub, &Reuse::Once, 120).is_err(),
+            "burn must not reset with rate-limit window"
+        );
+    }
+
+    #[test]
+    fn burn_n_count_enforced() {
+        let kp = gen_keypair();
+        let enroll_pub: [u8; 32] = kp.public_key().as_ref().try_into().unwrap();
+        assert!(burn_auth_key_at(&enroll_pub, &Reuse::N(3), 0).is_ok());
+        assert!(burn_auth_key_at(&enroll_pub, &Reuse::N(3), 1).is_ok());
+        assert!(burn_auth_key_at(&enroll_pub, &Reuse::N(3), 2).is_ok());
+        assert!(burn_auth_key_at(&enroll_pub, &Reuse::N(3), 3).is_err());
+    }
+
+    // ── Finding 4: Pre-auth panic ──────────────────────────────────────
+
+    #[test]
+    fn from_json_no_panic_on_wrong_length_hex() {
+        // AuthKey: short issuer
+        let ak_json = serde_json::json!({
+            "issuer": "aa",
+            "enroll_pub": hex::encode([0u8; 32]),
+            "caps": ["shell"],
+            "audience": [],
+            "expires": now_secs() + 3600,
+            "reuse": "Once",
+            "ephemeral": true,
+            "tag": "test",
+            "sig": hex::encode([0u8; 64])
+        });
+        assert!(AuthKey::from_json(&ak_json).is_none());
+
+        // AuthKey: short sig
+        let ak_json2 = serde_json::json!({
+            "issuer": hex::encode([0u8; 32]),
+            "enroll_pub": hex::encode([0u8; 32]),
+            "caps": ["shell"],
+            "audience": [],
+            "expires": now_secs() + 3600,
+            "reuse": "Once",
+            "ephemeral": true,
+            "tag": "test",
+            "sig": "aa"
+        });
+        assert!(AuthKey::from_json(&ak_json2).is_none());
+
+        // AuthKey: short audience element
+        let ak_json3 = serde_json::json!({
+            "issuer": hex::encode([0u8; 32]),
+            "enroll_pub": hex::encode([0u8; 32]),
+            "caps": ["shell"],
+            "audience": ["aa"],
+            "expires": now_secs() + 3600,
+            "reuse": "Once",
+            "ephemeral": true,
+            "tag": "test",
+            "sig": hex::encode([0u8; 64])
+        });
+        assert!(AuthKey::from_json(&ak_json3).is_none());
+
+        // EnrollmentPayload: short device_pub
+        let pl_json = serde_json::json!({
+            "auth_key": {
+                "issuer": hex::encode([0u8; 32]),
+                "enroll_pub": hex::encode([0u8; 32]),
+                "caps": ["shell"],
+                "audience": [],
+                "expires": now_secs() + 3600,
+                "reuse": "Once",
+                "ephemeral": true,
+                "tag": "test",
+                "sig": hex::encode([0u8; 64])
+            },
+            "device_pub": "aa",
+            "enroll_possession_sig": hex::encode([0u8; 64]),
+            "device_possession_sig": hex::encode([0u8; 64])
+        });
+        assert!(EnrollmentPayload::from_json(&pl_json).is_none());
+
+        // EnrollmentPayload: short possession sig
+        let pl_json2 = serde_json::json!({
+            "auth_key": {
+                "issuer": hex::encode([0u8; 32]),
+                "enroll_pub": hex::encode([0u8; 32]),
+                "caps": ["shell"],
+                "audience": [],
+                "expires": now_secs() + 3600,
+                "reuse": "Once",
+                "ephemeral": true,
+                "tag": "test",
+                "sig": hex::encode([0u8; 64])
+            },
+            "device_pub": hex::encode([0u8; 32]),
+            "enroll_possession_sig": "aa",
+            "device_possession_sig": hex::encode([0u8; 64])
+        });
+        assert!(EnrollmentPayload::from_json(&pl_json2).is_none());
+    }
+
+    // ── Finding 5: Canonical collision (length-prefix truncation) ──────
+
+    #[test]
+    fn canonical_bytes_uses_u32_prefixes() {
+        // Verify that a cap longer than 255 bytes still gets a full u32 prefix
+        let long_cap = vec!["x".repeat(500)];
+        let short_cap = vec![] as Vec<String>;
+        let b1 = {
+            let ak = AuthKey {
+                issuer: [0u8; 32], enroll_pub: [0u8; 32],
+                caps: long_cap, audience: vec![],
+                expires: 0, reuse: Reuse::Once, ephemeral: true,
+                tag: String::new(), sig: [0u8; 64],
+            };
+            auth_key_canonical_bytes(&ak)
+        };
+        let b2 = {
+            let ak = AuthKey {
+                issuer: [0u8; 32], enroll_pub: [0u8; 32],
+                caps: short_cap, audience: vec![],
+                expires: 0, reuse: Reuse::Once, ephemeral: true,
+                tag: String::new(), sig: [0u8; 64],
+            };
+            auth_key_canonical_bytes(&ak)
+        };
+        assert_ne!(b1, b2, "different caps must not collide canonical bytes");
+    }
+
+    #[test]
+    fn max_cap_len_rejected_at_mint() {
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        // Cap exceeding MAX_CAP_LEN (65535)
+        let mega_cap = "x".repeat(MAX_CAP_LEN + 1);
+        assert!(AuthKey::mint(&owner, enroll_pub, vec![mega_cap], vec![], 3600, Reuse::Once, "test".into()).is_err());
+        // Tag exceeding MAX_CAP_LEN
+        let mega_tag = "y".repeat(MAX_CAP_LEN + 1);
+        assert!(AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, mega_tag).is_err());
+    }
+
+    // ── Finding 6: Audience ─────────────────────────────────────────────
+
+    #[test]
+    fn audience_enforced_by_verify_against_owner() {
+        let owner = gen_keypair();
+        let enroll = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
+        let named_peer = [0xAA; 32];
+        let other_peer = [0xBB; 32];
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![named_peer], 3600, Reuse::Once, "test".into()).unwrap();
+        let op = owner_pub(&owner);
+        assert!(ak.verify_against_owner(&op, &named_peer).is_ok());
+        assert!(ak.verify_against_owner(&op, &other_peer).is_err(),
+            "audience-bound key must be rejected at unauthorized peer");
+    }
+
+    #[test]
+    fn audience_checked_before_sig() {
+        // Audience rejection should happen before signature verification.
+        // Even with invalid sig, audience mismatch should produce "not authorized for this peer".
+        let owner = gen_keypair();
+        let enroll = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
+        let named_peer = [0xAA; 32];
+        let other_peer = [0xBB; 32];
+        let mut ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![named_peer], 3600, Reuse::Once, "test".into()).unwrap();
+        // Corrupt sig so we can tell which check fired first
+        ak.sig = [0u8; 64];
+        let op = owner_pub(&owner);
+        let err = ak.verify_against_owner(&op, &other_peer).unwrap_err().to_string();
+        assert!(err.contains("not authorized for this peer"),
+            "audience rejection must come before sig error: got '{err}'");
+    }
+
+    // ── General tests ──────────────────────────────────────────────────
+
     #[test]
     fn auth_key_mint_verify_roundtrip() {
         let owner = gen_keypair();
         let enroll = gen_keypair();
         let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into(), "transfer".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-        assert!(ak.verify().is_ok());
-        assert!(ak.verify_against_owner(
-            &owner.public_key().as_ref().try_into().unwrap()
-        ).is_ok());
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into(), "transfer".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let op = owner_pub(&owner);
+        assert!(ak.verify_against_owner(&op, &verifier_pub).is_ok());
     }
 
     #[test]
@@ -496,22 +821,11 @@ mod tests {
         let owner = gen_keypair();
         let enroll = gen_keypair();
         let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
-        let mut ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-        // Force expiry
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let mut ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
         ak.expires = 0;
-        // verify_against_owner will catch expiry first
-        assert!(ak.verify().is_err());
-        // verify also catches it
-        assert!(ak.verify().is_err());
+        let op = owner_pub(&owner);
+        assert!(ak.verify_against_owner(&op, &verifier_pub).is_err());
     }
 
     #[test]
@@ -520,51 +834,37 @@ mod tests {
         let other = gen_keypair();
         let enroll = gen_keypair();
         let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-        let other_pub: [u8; 32] = other.public_key().as_ref().try_into().unwrap();
-        assert!(ak.verify_against_owner(&other_pub).is_err());
+        let verifier_pub: [u8; 32] = [0xAB; 32];
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let other_pub = owner_pub(&other);
+        assert!(ak.verify_against_owner(&other_pub, &verifier_pub).is_err());
     }
 
     #[test]
-    fn auth_key_mesh_refused() {
+    fn auth_key_caps_normalized_at_mint() {
         let owner = gen_keypair();
-        let enroll = gen_keypair();
-        let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["mesh".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
-        assert!(ak.verify_against_owner(&owner_pub).is_err());
+        let enroll_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["TRANSFER".into(), "shell".into(), "TRANSFER".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        assert_eq!(ak.caps, vec!["shell", "transfer"]);
+    }
+
+    #[test]
+    fn auth_key_ttl_capped() {
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        let now = now_secs();
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 90 * 24 * 3600, Reuse::Once, "test".into()).unwrap();
+        assert!(ak.expires <= now + MAX_TTL_SECS);
     }
 
     #[test]
     fn audience_allows_empty_is_any() {
         let ak = AuthKey {
-            issuer: [0u8; 32],
-            enroll_pub: [0u8; 32],
-            caps: vec![],
-            audience: vec![],
-            expires: now_secs() + 3600,
-            reuse: Reuse::Once,
-            ephemeral: true,
-            tag: "test".into(),
-            sig: [0u8; 64],
+            issuer: [0u8; 32], enroll_pub: [0u8; 32], caps: vec![], audience: vec![],
+            expires: now_secs() + 3600, reuse: Reuse::Once, ephemeral: true,
+            tag: "test".into(), sig: [0u8; 64],
         };
         assert!(ak.audience_allows(&[1u8; 32]));
     }
@@ -573,15 +873,9 @@ mod tests {
     fn audience_allows_named_peer() {
         let peer = [0xAA; 32];
         let ak = AuthKey {
-            issuer: [0u8; 32],
-            enroll_pub: [0u8; 32],
-            caps: vec![],
-            audience: vec![peer],
-            expires: now_secs() + 3600,
-            reuse: Reuse::Once,
-            ephemeral: true,
-            tag: "test".into(),
-            sig: [0u8; 64],
+            issuer: [0u8; 32], enroll_pub: [0u8; 32], caps: vec![], audience: vec![peer],
+            expires: now_secs() + 3600, reuse: Reuse::Once, ephemeral: true,
+            tag: "test".into(), sig: [0u8; 64],
         };
         assert!(ak.audience_allows(&peer));
         assert!(!ak.audience_allows(&[0xBB; 32]));
@@ -594,24 +888,15 @@ mod tests {
         let device_kp = gen_keypair();
         let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
         let device_pub: [u8; 32] = device_kp.public_key().as_ref().try_into().unwrap();
+        let verifier_pub: [u8; 32] = [0xAB; 32];
         let rng = SystemRandom::new();
         let mut nonce = [0u8; 32];
         rng.fill(&mut nonce).unwrap();
 
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-
-        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce);
-        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
-        let (ep, dp, _ak) = payload.verify(&owner_pub).unwrap();
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
+        let op = owner_pub(&owner);
+        let (ep, dp, _ak) = payload.verify(&op, &nonce, &verifier_pub).unwrap();
         assert_eq!(ep, enroll_pub);
         assert_eq!(dp, device_pub);
     }
@@ -624,50 +909,22 @@ mod tests {
         let device_kp = gen_keypair();
         let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
         let device_pub: [u8; 32] = device_kp.public_key().as_ref().try_into().unwrap();
+        let verifier_pub: [u8; 32] = [0xAB; 32];
         let rng = SystemRandom::new();
         let mut nonce = [0u8; 32];
         rng.fill(&mut nonce).unwrap();
 
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-
-        let payload = EnrollmentPayload::build(ak, device_pub, &wrong_kp, &device_kp, nonce);
-        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
-        assert!(payload.verify(&owner_pub).is_err());
-    }
-
-    #[test]
-    fn burn_once_twice_fails() {
-        let kp = gen_keypair();
-        let enroll_pub: [u8; 32] = kp.public_key().as_ref().try_into().unwrap();
-        assert!(burn_auth_key(&enroll_pub, &Reuse::Once).is_ok());
-        assert!(burn_auth_key(&enroll_pub, &Reuse::Once).is_err());
-    }
-
-    #[test]
-    fn burn_n_count_enforced() {
-        let kp = gen_keypair();
-        let enroll_pub: [u8; 32] = kp.public_key().as_ref().try_into().unwrap();
-        assert!(burn_auth_key(&enroll_pub, &Reuse::N(3)).is_ok());
-        assert!(burn_auth_key(&enroll_pub, &Reuse::N(3)).is_ok());
-        assert!(burn_auth_key(&enroll_pub, &Reuse::N(3)).is_ok());
-        assert!(burn_auth_key(&enroll_pub, &Reuse::N(3)).is_err());
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let payload = EnrollmentPayload::build(ak, device_pub, &wrong_kp, &device_kp, nonce, verifier_pub);
+        let op = owner_pub(&owner);
+        assert!(payload.verify(&op, &nonce, &verifier_pub).is_err());
     }
 
     #[test]
     fn delegated_effective_intersection() {
         let owner = vec!["shell".into(), "transfer".into(), "mount".into()];
         let ak_caps = vec!["shell".into(), "deploy".into()];
-        let eff = delegated_effective_caps(&owner, &ak_caps);
-        assert_eq!(eff, vec!["shell"]); // only shell is in both
+        assert_eq!(delegated_effective_caps(&owner, &ak_caps), vec!["shell"]);
     }
 
     #[test]
@@ -675,7 +932,7 @@ mod tests {
         let owner = vec!["shell".into(), "transfer".into(), "mount".into()];
         let ak_caps = vec!["shell".into()];
         let eff = delegated_effective_caps(&owner, &ak_caps);
-        assert!(eff.iter().all(|c| ak_caps.contains(c))); // subset of auth_key caps
+        assert!(eff.iter().all(|c| ak_caps.contains(c)));
     }
 
     #[test]
@@ -683,7 +940,14 @@ mod tests {
         let owner = vec!["shell".into()];
         let ak_caps = vec!["shell".into(), "transfer".into()];
         let eff = delegated_effective_caps(&owner, &ak_caps);
-        assert!(eff.iter().all(|c| owner.contains(c))); // subset of owner caps
+        assert!(eff.iter().all(|c| owner.contains(c)));
+    }
+
+    #[test]
+    fn delegated_mixed_case_owner() {
+        let owner = vec!["Shell".into(), "TRANSFER".into()];
+        let ak_caps = vec!["shell".into()];
+        assert_eq!(delegated_effective_caps(&owner, &ak_caps), vec!["shell"]);
     }
 
     #[test]
@@ -691,16 +955,7 @@ mod tests {
         let owner = gen_keypair();
         let enroll_kp = gen_keypair();
         let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into(), "transfer".into()],
-            vec![[0xAA; 32]],
-            3600,
-            Reuse::N(5),
-            "ci".into(),
-        )
-        .unwrap();
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into(), "transfer".into()], vec![[0xAA; 32]], 3600, Reuse::N(5), "ci".into()).unwrap();
         let json = ak.to_json();
         let round = AuthKey::from_json(&json).unwrap();
         assert_eq!(ak.issuer, round.issuer);
@@ -721,25 +976,15 @@ mod tests {
         let device_kp = gen_keypair();
         let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
         let device_pub: [u8; 32] = device_kp.public_key().as_ref().try_into().unwrap();
+        let verifier_pub: [u8; 32] = [0xAB; 32];
         let rng = SystemRandom::new();
         let mut nonce = [0u8; 32];
         rng.fill(&mut nonce).unwrap();
 
-        let ak = AuthKey::mint(
-            &owner,
-            enroll_pub,
-            vec!["shell".into()],
-            vec![],
-            3600,
-            Reuse::Once,
-            "test".into(),
-        )
-        .unwrap();
-
-        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce);
+        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
+        let payload = EnrollmentPayload::build(ak, device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
         let json = payload.to_json();
         let round = EnrollmentPayload::from_json(&json).unwrap();
-        assert_eq!(payload.nonce, round.nonce);
         assert_eq!(payload.device_pub, round.device_pub);
         assert_eq!(payload.enroll_possession_sig, round.enroll_possession_sig);
         assert_eq!(payload.device_possession_sig, round.device_possession_sig);
