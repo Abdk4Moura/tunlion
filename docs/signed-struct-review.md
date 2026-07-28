@@ -44,6 +44,29 @@ attacker changes the meaning.
    holds per-session, and consumes (single-use, erased after one attempt whether
    it passed or failed). Prefer consume-from-store so single-use is structural.
 
+## Companion rule: no optional security inputs
+
+A security check that reads an `Option` input runs only when the input is
+`Some`. If the input arrives from the peer/attacker, the attacker supplies
+`None` and the check is skipped — the guard "constrains only those who
+volunteer to be checked."
+
+> **A security input that can be absent will be absent when it's the attacker
+> supplying it. Make it non-optional at the type level.**
+
+- Don't gate a verification on `if let Some(x) = attacker_supplied { ...check... }`.
+  Use `let Some(x) = attacker_supplied else { return Deny/None }` — absence is a
+  refusal, not a skip.
+- Better, drop the `Option` from the parameter/field type so "no value" is
+  unrepresentable and a caller cannot express the unsafe state (same spirit as
+  `PrincipalKind { OwnerDevice, Delegated { caps } }` making a delegated
+  principal without caps impossible).
+- This bit the ephemeral auth-key feature three separate times: a dead
+  `auth_key_caps: Option` argument (ceiling inert), a challenge nonce that could
+  be a self-chosen value, and a `device_cert: Option` on the enroller so a
+  malicious daemon omits it and skips mutual auth. Each was one line; each
+  defeated the exact property the code around it was written to guarantee.
+
 ## Why it's here (six instances, one feature)
 
 The ephemeral auth-key work (#9) alone produced six findings of this exact shape:
