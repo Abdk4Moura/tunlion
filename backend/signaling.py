@@ -559,7 +559,9 @@ def register(socketio, registry):
     def on_channel_goodbye(data=None):
         """Unsubscribe the caller from named channels without dropping the socket
         or affecting other subscriptions. Emits known-peer-left to remaining
-        members so they stop dialing."""
+        members so they stop dialing.
+        Note: meta resolves through the socket's room; a room-less caller
+        disarms correctly but notifies nobody (om=None skips the emit)."""
         registry.refresh([request.sid])
         chans = (data or {}).get("channels") or []
         for ch, others in registry.unsubscribe(request.sid, chans).items():
