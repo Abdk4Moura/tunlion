@@ -941,6 +941,13 @@ static LD_AUTHORIZED: AtomicU64 = AtomicU64::new(0);
 static LD_DENIED: AtomicU64 = AtomicU64::new(0);
 static LD_NO_HEADER: AtomicU64 = AtomicU64::new(0);
 
+/// Dedicated counter for auth-key ceiling denials. Mode-independent (counted in
+/// BOTH authoritative and shadow), OUTSIDE the flip criterion — a ceiling denial
+/// is NOT something the flip changes. Exposed in cap-status for delegated-
+/// enforcement review.
+static CEILING_DENIED: AtomicU64 = AtomicU64::new(0);
+static PA_CEILING_DENIED: OnceLock<ActionCounters> = OnceLock::new();
+
 type ActionCounters = Mutex<HashMap<String, AtomicU64>>;
 
 static PA_LA_AUTHORIZED: OnceLock<ActionCounters> = OnceLock::new();
@@ -1008,6 +1015,8 @@ pub struct ShadowCounts {
     pub ld_authorized: u64,
     pub ld_denied: u64,
     pub ld_no_header: u64,
+    /// Auth-key ceiling denials (both modes, outside flip criterion).
+    pub ceiling_denied: u64,
 }
 
 /// Shadow counts since start. The FLIP CRITERION reads only the legacy-ALLOWED
@@ -1024,6 +1033,7 @@ pub fn cap_shadow_counts() -> ShadowCounts {
         ld_authorized: LD_AUTHORIZED.load(Ordering::Relaxed),
         ld_denied: LD_DENIED.load(Ordering::Relaxed),
         ld_no_header: LD_NO_HEADER.load(Ordering::Relaxed),
+        ceiling_denied: CEILING_DENIED.load(Ordering::Relaxed),
     }
 }
 
@@ -1255,13 +1265,11 @@ pub fn cap_gate_effective(
     if let Some(caps) = auth_key_caps {
         let action_lc = action.to_lowercase();
         if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
-            // Shadow counter: legacy would have allowed, but ceiling denied
-            if !authoritative && legacy_allowed {
-                LD_DENIED.fetch_add(1, Ordering::Relaxed);
-                pa_inc(PA_LD_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
-                LD_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
-                pa_inc(PA_LD_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())), action);
-            }
+            // Dedicated ceiling counter — mode-independent (both shadow AND
+            // authoritative increment it), OUTSIDE flip_ready. A ceiling denial
+            // does NOT change at the flip, so it doesn't belong in LA_/LD_.
+            CEILING_DENIED.fetch_add(1, Ordering::Relaxed);
+            pa_inc(PA_CEILING_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
             return GateDecision::Deny { cap_reason: Some("not in auth key caps".into()) };
         }
     }
@@ -2838,13 +2846,13 @@ mod tests {
     /// counters would have.
     #[test]
     fn shadow_flip_criterion() {
-        let ready = ShadowCounts { la_authorized: 5, la_denied: 0, la_no_header: 0, ld_authorized: 2, ld_denied: 3, ld_no_header: 0 };
+        let ready = ShadowCounts { la_authorized: 5, la_denied: 0, la_no_header: 0, ld_authorized: 2, ld_denied: 3, ld_no_header: 0, ceiling_denied: 0 };
         assert!(ready.flip_ready(), "clean legacy-allowed sample, all provisioned, must be flip-ready");
-        let empty = ShadowCounts { la_authorized: 0, la_denied: 0, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0 };
+        let empty = ShadowCounts { la_authorized: 0, la_denied: 0, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0 };
         assert!(!empty.flip_ready(), "no sample yet: a bare zero total must NOT pass");
-        let disagree = ShadowCounts { la_authorized: 10, la_denied: 1, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0 };
+        let disagree = ShadowCounts { la_authorized: 10, la_denied: 1, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0 };
         assert!(!disagree.flip_ready(), "a real header disagreement must block the flip");
-        let unprov = ShadowCounts { la_authorized: 10, la_denied: 0, la_no_header: 4, ld_authorized: 0, ld_denied: 0, ld_no_header: 0 };
+        let unprov = ShadowCounts { la_authorized: 10, la_denied: 0, la_no_header: 4, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0 };
         assert!(!unprov.flip_ready(), "an unprovisioned resource must block the flip (absent != clean)");
         assert!(disagree.summary().contains("flip_ready=false"));
     }

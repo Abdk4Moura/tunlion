@@ -775,6 +775,9 @@ enum Cmd {
         peer: String,
         /// Remote port on the peer's localhost
         rport: u16,
+        /// Enroll as delegated principal using an auth key file before connecting
+        #[arg(long, hide = true)]
+        auth_key: Option<String>,
     },
     /// Connect stdio to a service a peer EXPOSED on its overlay address, over L3.
     ///
@@ -3394,6 +3397,165 @@ async fn enroll_and_send_cmd(
         // Not stored as known device — delegated is ephemeral
         ui::say(&format!("  {} delegated devices are ephemeral (--remember for enrollment not stored)", ui::paint(ui::Tone::Dim, "·")));
         let _ = name;
+    }
+    Ok(())
+}
+
+/// Enroll as delegated + open shell in one session.
+/// Same flow as enroll_and_send_cmd but opens an l2 shell instead of sending files.
+async fn enroll_and_netcat_cmd(
+    server: &str,
+    auth_key_path: String,
+    to_name: Option<String>,
+    rport: u16,
+    relay: bool,
+) -> Result<()> {
+    // Load auth key (same as enroll_and_send_cmd)
+    let v: serde_json::Value = {
+        let ak_str = if std::path::Path::new(&auth_key_path).exists() {
+            std::fs::read_to_string(&auth_key_path)?
+        } else {
+            auth_key_path.clone()
+        };
+        serde_json::from_str(&ak_str)?
+    };
+    let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
+        .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+    let enroll_seed = v.get("enroll_private_key")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
+    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+    let mut dseed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+
+    ui::say(&format!("  {} enrolling as delegated (caps: {:?})",
+        ui::paint(ui::Tone::Dim, "->"),
+        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+
+    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let my_uid = mk_uid("n");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(enroll_chan.clone());
+    sess.emit(&sio, "join", json!({ "room": enroll_chan, "name": display_name(), "uid": my_uid })).await;
+
+    let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
+    crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
+
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move { let _ = tokio::signal::ctrl_c().await; let _ = tx.send(Ev::Interrupted); });
+    }
+
+    let started = Instant::now();
+    let deadline = Duration::from_secs(60);
+
+    loop {
+        if started.elapsed() >= deadline { bail!("enrollment timed out"); }
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let Ok(Some(ev)) = ev else {
+            if conn.active.is_some() { break; }
+            continue;
+        };
+        match ev {
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, false).await?; }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) { l.transport = Some(t.clone()); l.presence = Presence::Ready; }
+                if conn.active.is_none() { conn.active = Some(pid.clone()); }
+                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, dseed, device_pub, ak.clone());
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-request", "auth_key": ak.to_json()})).await;
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        let cert_val = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, &cert_val) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-auth-key-enroll-ack") => {
+                    let dp_hex = v["device_pub"].as_str().unwrap_or("?");
+                    ui::say(&format!("  {} enrolled (device_pub: {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), &dp_hex[..16]));
+                    conn.active = Some(pid.clone());
+                    break;
+                }
+                Some("identity-auth-key-enroll-error") => {
+                    bail!("enrollment denied: {}", v["reason"].as_str().unwrap_or("unknown"));
+                }
+                _ => {}
+            },
+            Ev::Interrupted => bail!("interrupted"),
+            _ => {}
+        }
+    }
+
+    ui::say(&format!("  {} opening shell to port {}", ui::paint(ui::Tone::Dim, "->"), rport));
+    let active_pid = conn.active.as_ref().cloned().unwrap_or_default();
+    let t = conn.transport_of(&active_pid)
+        .ok_or_else(|| anyhow::anyhow!("no transport after enrollment"))?;
+    // Send l2-open request for shell on rport
+    let r = t.send_control(&json!({
+        "type": "l2-open",
+        "host": "127.0.0.1",
+        "rport": rport,
+    })).await;
+    match r {
+        Ok(()) => {
+            ui::say(&format!("  {} shell request sent", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            // Wait for l2-open-ack or close
+            loop {
+                let ev = tokio::time::timeout(Duration::from_secs(30), rx.recv()).await;
+                let Ok(Some(ev)) = ev else { break; };
+                if let Ev::Control(ref pid, ref v) = ev {
+                    if pid == &active_pid {
+                        match v["type"].as_str() {
+                            Some("l2-open-ack") => {
+                                ui::say(&format!("  {} shell connected (sid {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), v["sid"]));
+                                break;
+                            }
+                            Some("l2-close") => {
+                                bail!("shell refused: {}", v["err"].as_str().unwrap_or("not authorized"));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if matches!(ev, Ev::Interrupted) { bail!("interrupted"); }
+            }
+        }
+        Err(e) => bail!("failed to send shell request: {e}"),
     }
     Ok(())
 }
@@ -8335,7 +8497,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
+        Cmd::Netcat { peer, rport, auth_key } => {
+            if let Some(ak_path) = auth_key {
+                enroll_and_netcat_cmd(&server, ak_path, Some(peer), rport, relay).await
+            } else {
+                l2::netcat_cmd(&server, &peer, rport, relay).await
+            }
+        }
         Cmd::Dial { peer, port } => l2::dial_cmd(&peer, port).await,
         Cmd::Pty { peer, cmd } => l2::pty_cmd(&server, &peer, relay, cmd).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
