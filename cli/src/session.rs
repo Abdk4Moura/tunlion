@@ -24,6 +24,7 @@ const CONFIRM_TTL: Duration = Duration::from_secs(30);
 
 pub struct Session {
     pub room: Option<String>,
+    pub enroll_room: Option<String>,
     pub name: String,
     pub uid: String,
     pub channels: Vec<String>,
@@ -63,6 +64,7 @@ impl Session {
         let (loss, seed) = emit_loss_params();
         Session {
             room: None,
+            enroll_room: None,
             name: name.to_string(),
             uid: uid.to_string(),
             channels: Vec::new(),
@@ -79,13 +81,17 @@ impl Session {
     /// `{ok:false}` ack (still proof the socket is alive), it just emits no
     /// `synced` event.
     pub fn sync_payload(&self) -> Value {
-        json!({
+        let mut p = json!({
             "v": 1,
             "room": self.room,
             "name": self.name,
             "uid": self.uid,
             "channels": self.channels,
-        })
+        });
+        if let Some(ref er) = self.enroll_room {
+            p["enroll_room"] = json!(er);
+        }
+        p
     }
 
     /// A liveness-only `sync` for the silence-watchdog heartbeat. `room` is
@@ -104,7 +110,7 @@ impl Session {
     fn desired_digest(&self) -> String {
         let mut chans = self.channels.clone();
         chans.sort();
-        format!("{}|{}", self.room.as_deref().unwrap_or(""), chans.join(","))
+        format!("{}|{}|{}", self.room.as_deref().unwrap_or(""), self.enroll_room.as_deref().unwrap_or(""), chans.join(","))
     }
 
     /// The server confirmed our state (Ev::Synced), record its digest.
@@ -181,6 +187,11 @@ impl Session {
         self.last_attempt = Some(now);
         let _ = room; // room presence is enforced by the early return above
         self.emit(sio, "sync", self.sync_payload()).await;
+        // Re-assert enrollment room membership on each tick (it's a SECOND room,
+        // not persisted by the solo-room sync cycle).
+        if let Some(ref er) = self.enroll_room {
+            let _ = sio.emit("join", json!({ "room": er, "name": self.name, "uid": self.uid })).await;
+        }
     }
 }
 

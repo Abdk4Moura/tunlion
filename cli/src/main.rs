@@ -3436,6 +3436,9 @@ async fn enroll_and_send_cmd(
             sent = end;
         }
         let _ = t.flush().await;
+        // File-end marker so the receiver finalizes + hashes the complete file.
+        // Must match the sid declared in the offer (0).
+        let _ = t.send_control(&crate::protocol::end_msg(&id, 0)).await;
         ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, total));
     }
     if let Some(name) = remember {
@@ -10862,13 +10865,16 @@ async fn recv_cmd(
             // the same room fires peer-joined on BOTH sides and their WebRTC
             // offers route (a channel SUBSCRIBE does not bridge signal routing).
             // sess.room is re-asserted every sync tick, so membership survives the
-            // cadence (the 2a2f223 room-undo bug). Falls back to an unguessable
-            // solo room when there is no user key.
-            let solo = crate::identity::UserKey::load().ok().flatten()
-                .map(|uk| crate::ephemeral::enroll_channel(&uk.public_key_bytes()))
-                .unwrap_or_else(|| format!("up-{}", fresh_secret()));
+            // cadence. The enrollment room is a SECOND simultaneous membership when
+            // a UserKey exists — re-joined on each sync tick alongside the solo room.
+            let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
+            if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                sess.enroll_room = Some(ek.clone());
+                sess.emit(&sio, "join", json!({ "room": ek, "name": display_name(), "uid": my_uid })).await;
+            }
             // C29: an interactive up can START empty and pair in-session.
             // When shell (--shell / --shell-only) is enabled, the daemon
             // explicitly accepts devices paired later, so do NOT bail just
