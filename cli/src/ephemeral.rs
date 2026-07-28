@@ -462,6 +462,29 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
     Ok(())
 }
 
+/// Rate-limit check only (no burn). Called BEFORE generating a challenge
+/// to prevent flooding. The burn counter is NOT incremented — burn only on
+/// a SUCCESSFUL enrollment verify.
+pub fn check_rate_limit(enroll_pub: &[u8; 32]) -> Result<()> {
+    let now_secs = now_secs();
+    let mut state = burn_state().lock().unwrap();
+    let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
+        burn_count: 0,
+        window_count: 0,
+        window_start_secs: now_secs,
+    });
+    let elapsed = now_secs.saturating_sub(entry.window_start_secs);
+    if elapsed >= 60 {
+        entry.window_count = 0;
+        entry.window_start_secs = now_secs;
+    }
+    if entry.window_count >= ENROLL_RATE_LIMIT {
+        bail!("auth key rate-limited (max {} enrollments/min)", ENROLL_RATE_LIMIT);
+    }
+    // DO NOT increment — this is pre-flight, not a burn
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Delegated principal — auth-key-enrolled devices have ceiling = caps ∩ owner
 // ---------------------------------------------------------------------------
@@ -487,6 +510,86 @@ pub fn delegated_effective_caps(
     result.sort();
     result.dedup();
     result
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment nonce store — challenge/response anti-replay
+// ---------------------------------------------------------------------------
+
+use std::time::Instant as StdInstant;
+
+const ENROLL_NONCE_TTL_SECS: u64 = 60;
+
+struct NonceEntry {
+    nonce: [u8; 32],
+    deadline: StdInstant,
+}
+
+struct NonceStore {
+    // peer_id → list of pending nonces (one enrollment attempt at a time expected)
+    pending: HashMap<String, Vec<NonceEntry>>,
+}
+
+static NONCE_STORE: OnceLock<Mutex<NonceStore>> = OnceLock::new();
+
+fn nonce_store() -> &'static Mutex<NonceStore> {
+    NONCE_STORE.get_or_init(|| Mutex::new(NonceStore { pending: HashMap::new() }))
+}
+
+/// Generate a fresh CSPRNG nonce for the given peer, store it, return the nonce.
+/// Each call generates a new nonce (attempts are independent).
+pub fn generate_nonce(peer_id: &str) -> [u8; 32] {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut nonce = [0u8; 32];
+    let _ = rng.fill(&mut nonce);
+    let mut store = nonce_store().lock().unwrap();
+    store.pending
+        .entry(peer_id.to_string())
+        .or_default()
+        .push(NonceEntry {
+            nonce,
+            deadline: StdInstant::now() + std::time::Duration::from_secs(ENROLL_NONCE_TTL_SECS),
+        });
+    nonce
+}
+
+/// Consume a nonce from the store — remove it, error if not found or expired.
+/// This is the structural single-use guarantee: the nonce is taken OUT of the
+/// store, so a second presentation of the same payload MUST fail.
+pub fn consume_nonce(peer_id: &str, nonce: &[u8; 32]) -> Result<()> {
+    let mut store = nonce_store().lock().unwrap();
+    let entries = match store.pending.get_mut(peer_id) {
+        Some(v) => v,
+        None => bail!("no enrollment nonce for peer {}", peer_id),
+    };
+    let now = StdInstant::now();
+    entries.retain(|e| e.deadline > now);
+    if let Some(pos) = entries.iter().position(|e| e.nonce == *nonce) {
+        entries.remove(pos);
+        Ok(())
+    } else {
+        bail!("enrollment nonce not found or already consumed")
+    }
+}
+
+/// Consume the latest nonce for a peer and return it.
+/// Called by the daemon at step 4 — it knows what it issued and doesn't trust
+/// the enroller to correctly state which nonce was used.
+pub fn consume_latest_nonce(peer_id: &str) -> Result<[u8; 32]> {
+    let mut store = nonce_store().lock().unwrap();
+    let entries = match store.pending.get_mut(peer_id) {
+        Some(v) => v,
+        None => bail!("no enrollment nonce for peer {}", peer_id),
+    };
+    let now = StdInstant::now();
+    entries.retain(|e| e.deadline > now);
+    if entries.is_empty() {
+        bail!("enrollment nonce expired or already consumed");
+    }
+    // Take the latest (last in list)
+    let nonce = entries.pop().unwrap().nonce;
+    Ok(nonce)
 }
 
 // ---------------------------------------------------------------------------

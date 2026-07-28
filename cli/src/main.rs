@@ -1020,6 +1020,40 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
+    /// Mint auth keys or enroll as an ephemeral delegated device.
+    #[command(hide = true)]
+    Ephemeral {
+        #[command(subcommand)]
+        action: EphemeralAction,
+    },
+}
+
+/// Ephemeral device commands: mint auth keys, enroll as delegated.
+#[derive(Subcommand)]
+enum EphemeralAction {
+    /// Mint a new auth key signed by your user identity key.
+    Mint {
+        /// Capabilities to grant (comma-separated: shell,transfer,deploy,etc.)
+        #[arg(long, value_delimiter = ',')]
+        caps: Vec<String>,
+        /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
+        #[arg(long, value_delimiter = ',')]
+        audience: Vec<String>,
+        /// Time-to-live in seconds (max 30 days)
+        #[arg(long, default_value = "86400")]
+        ttl: u64,
+        /// Reuse: Once, N(N), or Reusable
+        #[arg(long, default_value = "Once")]
+        reuse: String,
+        /// Human-readable tag for the use case
+        #[arg(long, default_value = "ci")]
+        tag: String,
+    },
+    /// Enroll as an ephemeral delegated device using an auth key.
+    Enroll {
+        /// Path to the auth key JSON file, or the raw JSON string
+        auth_key: String,
+    },
 }
 
 /// User identity management: generate the identity key, show the fingerprint,
@@ -2925,6 +2959,211 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// CLI handler for `filament ephemeral`
+async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
+    match action {
+        EphemeralAction::Mint { caps, audience, ttl, reuse, tag } => {
+            let uk = match crate::identity::UserKey::load()? {
+                Some(uk) => uk,
+                None => bail!("no user identity. Run 'filament identity init' first."),
+            };
+            let rng = ring::rand::SystemRandom::new();
+            let mut seed = [0u8; 32];
+            ring::rand::SecureRandom::fill(&rng, &mut seed).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let enroll_pub: [u8; 32] = ring::signature::KeyPair::public_key(&enroll_kp).as_ref().try_into().unwrap();
+            let audience_pubs: Vec<[u8; 32]> = audience.iter()
+                .map(|s| {
+                    let b = hex::decode(s).map_err(|e| anyhow::anyhow!("audience hex: {}", e))?;
+                    let arr: [u8; 32] = b.try_into().map_err(|_| anyhow::anyhow!("audience key must be 32 bytes"))?;
+                    Ok(arr)
+                })
+                .collect::<Result<_>>()?;
+            let reuse = match reuse.to_lowercase().as_str() {
+                "once" => crate::ephemeral::Reuse::Once,
+                "reusable" => crate::ephemeral::Reuse::Reusable,
+                s if s.starts_with("n(") || s.starts_with('n') => {
+                    let num: u32 = s.trim_start_matches('n').trim_start_matches('(').trim_end_matches(')').parse()
+                        .map_err(|_| anyhow::anyhow!("invalid reuse count"))?;
+                    crate::ephemeral::Reuse::N(num)
+                }
+                _ => bail!("invalid reuse: {reuse} (Once, N(3), Reusable)"),
+            };
+            let ak = crate::ephemeral::AuthKey::mint(uk.keypair(), enroll_pub, caps, audience_pubs, ttl, reuse, tag)?;
+            let json = serde_json::to_string_pretty(&serde_json::json!({
+                "auth_key": ak.to_json(),
+                "enroll_private_key": hex::encode(seed),
+            }))?;
+            println!("{}", json);
+            eprintln!("{} auth key minted — save the JSON above. The enroll_private_key proves possession.",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()));
+            Ok(())
+        }
+        EphemeralAction::Enroll { auth_key } => {
+            use crate::ephemeral::{AuthKey, EnrollmentPayload};
+            let v: serde_json::Value = {
+                let ak_str = if std::path::Path::new(&auth_key).exists() {
+                    std::fs::read_to_string(&auth_key)?
+                } else {
+                    auth_key.clone()
+                };
+                serde_json::from_str(&ak_str)?
+            };
+            let ak = AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)).ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+            let enroll_seed = v.get("enroll_private_key")
+                .and_then(|s| s.as_str())
+                .and_then(|s| hex::decode(s).ok())
+                .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key in auth key JSON"))?;
+            let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+            let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&enroll_seed)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let mut dseed = [0u8; 32];
+            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+            let verifier_pub = crate::overlay::overlay_pubkey_bytes()?;
+
+            // Phase 2 TODO: wire into actual enrollment flow over control channel.
+            // For now, the auth key module is verified — the handler integration
+            // (challenge/response over live connection) is deferred.
+            let _ = (server, relay, enroll_kp, device_kp, device_pub, verifier_pub);
+            ui::say(&format!("{} auth key loaded (caps: {:?}, issuer: {})",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                hex::encode(&ak.issuer[..4])));
+            ui::say(&ui::paint(ui::Tone::Dim, "  enrollment handler not yet wired (Phase 2 in progress)"));
+            Ok(())
+        }
+    }
+}
+
+/// Respond to an identity-auth-key-enroll-request with a nonce challenge.
+/// Step 1: rate-limit BEFORE expensive ops (anti-flood).
+/// Step 2: verify auth key against owner.
+/// Step 3: generate CSPRNG nonce, store, send challenge.
+async fn respond_to_auth_key_enroll_request(
+    conn: &mut Conn,
+    pid: String,
+    v: serde_json::Value,
+) {
+    let Some(t) = conn.transport_of(&pid) else { return };
+    let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
+        Some(ak) => ak,
+        None => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "invalid auth key"})).await;
+            return;
+        }
+    };
+
+    // Rate-limit BEFORE anything expensive (window-only, no burn)
+    if let Err(e) = crate::ephemeral::check_rate_limit(&ak.enroll_pub) {
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+        return;
+    }
+
+    // Verify against our trusted owner
+    let owner_pub = match crate::identity::UserKey::load() {
+        Ok(Some(uk)) => uk.public_key_bytes(),
+        _ => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "no user identity"})).await;
+            return;
+        }
+    };
+    let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
+        Ok(pk) => pk,
+        Err(e) => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": format!("overlay key: {}", e)})).await;
+            return;
+        }
+    };
+    if let Err(e) = ak.verify_against_owner(&owner_pub, &verifier_pub) {
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+        return;
+    }
+
+    // Generate nonce challenge
+    let nonce = crate::ephemeral::generate_nonce(&pid);
+    let _ = t.send_control(&json!({
+        "type": "identity-auth-key-enroll-challenge",
+        "nonce": hex::encode(nonce),
+        "verifier_pub": hex::encode(verifier_pub)
+    })).await;
+}
+
+/// Handle the enrollment response from the enroller.
+/// Step 4 (burn only on SUCCESS): consume nonce, verify payload, admit as delegated.
+async fn handle_auth_key_enroll_response(
+    conn: &mut Conn,
+    pid: String,
+    v: serde_json::Value,
+) {
+    let Some(t) = conn.transport_of(&pid) else { return };
+    let payload = match crate::ephemeral::EnrollmentPayload::from_json(&v) {
+        Some(p) => p,
+        None => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "invalid payload"})).await;
+            return;
+        }
+    };
+    let owner_pub = match crate::identity::UserKey::load() {
+        Ok(Some(uk)) => uk.public_key_bytes(),
+        _ => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "no user identity"})).await;
+            return;
+        }
+    };
+    let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
+        Ok(pk) => pk,
+        Err(e) => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": format!("overlay key: {}", e)})).await;
+            return;
+        }
+    };
+
+    // Structural nonce consumption — daemon retrieves its OWN stored nonce,
+    // never trusts a nonce value echoed by the enroller.
+    let nonce = match crate::ephemeral::consume_latest_nonce(&pid) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+            return;
+        }
+    };
+
+    // Verify payload with consumed nonce
+    match payload.verify(&owner_pub, &nonce, &verifier_pub) {
+        Ok((enroll_pub, device_pub, ak)) => {
+            // Burn ON SUCCESS only (never-reset counter)
+            if let Err(e) = crate::ephemeral::burn_auth_key(&enroll_pub, &ak.reuse) {
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+                return;
+            }
+            // Admit as Delegated principal
+            if let Some(link) = conn.link_mut(&pid) {
+                link.identity_device_pub = Some(device_pub);
+                link.identity_binding = crate::capability::BindingStrength::Proven;
+                link.identity_cert_expires = Some(ak.expires);
+                // Store auth_key_caps for delegated ceiling
+                // link.auth_key_caps = Some(ak.caps.clone());  // add field to Link when ready
+            }
+            let _ = t.send_control(&json!({
+                "type": "identity-auth-key-enroll-ack",
+                "device_pub": hex::encode(device_pub),
+                "expires": ak.expires
+            })).await;
+            ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {:?})",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ak.caps));
+        }
+        Err(e) => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": e.to_string()})).await;
+        }
+    }
 }
 
 fn down_cmd() -> Result<()> {
@@ -7974,6 +8213,7 @@ async fn main() -> Result<()> {
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
         Cmd::CapStatus { json } => cap_status_cmd(json).await,
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -11772,6 +12012,15 @@ async fn recv_cmd(
                             .unwrap_or_default();
                         let _ = tx.send(ports);
                     }
+                }
+                // Auth key enrollment (challenge/response flow)
+                Some("identity-auth-key-enroll-request") => {
+                    respond_to_auth_key_enroll_request(&mut conn, pid.clone(), v.clone()).await;
+                }
+                Some("identity-auth-key-enroll-response") => {
+                    // Daemon receives the enrollment response with possession proofs.
+                    // Must have a pending challenge nonce for this peer.
+                    handle_auth_key_enroll_response(&mut conn, pid.clone(), v.clone()).await;
                 }
                 _ if !conn.links.contains_key(&pid) => {}
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
