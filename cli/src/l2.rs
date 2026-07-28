@@ -3302,6 +3302,14 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Some(Ev::Control(_pid, v))) => match v["type"].as_str() {
+                // #30: the acceptor challenges us to prove device-key possession
+                // before it decides the shell gate. Answer it (shared responder)
+                // so our binding is upgraded to Proven; otherwise the acceptor
+                // refuses the bootstrap on Inferred ("identity not proven").
+                Some("identity-nonce-challenge") => {
+                    crate::respond_to_identity_challenge(&t, &v).await;
+                    continue;
+                }
                 Some("shell-bootstrap-ack") => {
                     let hostkeys: Vec<String> = v["hostkeys"]
                         .as_array()

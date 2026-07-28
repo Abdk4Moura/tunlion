@@ -1720,7 +1720,7 @@ fn handle_identity_expose(
 /// Shared by recv_cmd (the `up`/receiver loop) AND send_cmd (the one-shot
 /// sender session) so a sender can prove possession and be authorized under an
 /// authoritative cap gate. Reflection-guarded and echoes the challenger nonce.
-async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Value) {
+pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Value) {
     let nonce_hex = v["nonce"].as_str().unwrap_or_default();
     let recv_dpub_hex = v["receiver_device_pub"].as_str().unwrap_or_default();
     let (Ok(nonce_bytes), Ok(recv_dpub_bytes)) =
@@ -7883,6 +7883,90 @@ async fn main() -> Result<()> {
         Cmd::Revoke { device, capability } => {
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false)?;
+            // Mirror the grant path: also emit an owner-signed Revoke cap_op so
+            // the AUTHORITATIVE capability gate actually denies. The legacy
+            // device_set_cap(false) only clears devices.json; it leaves the cap
+            // store granting, so under FILAMENT_CAP_AUTHORITATIVE the gate keeps
+            // ALLOWing and a re-connect re-installs the shell key (revocation was
+            // a no-op at the gate). apply_cap_op removes the matching grant, so
+            // evaluate() then denies and devices_with_shell_revoked lists this
+            // device; save_and_list_revoked + reconcile_shell_keys then strips
+            // its managed authorized_keys block under authoritative.
+            if let Ok(Some(user_key)) = crate::identity::UserKey::load() {
+                let config_dir = crate::settings::config_dir();
+                let mut store = crate::capability::load_cap_store(&config_dir);
+                let pk = user_key.public_key_bytes();
+                let header = store
+                    .iter()
+                    .find(|e| {
+                        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                            && e["resource"].as_str() == Some("self")
+                    })
+                    .and_then(crate::capability::CapHeader::from_json);
+                // A revoke only bites if there is a header AND the peer has a
+                // certified identity to target (same requirement as grant).
+                if let (Some(hdr), Some(peer_cert)) = (header, device_cert_for(&device)) {
+                    let target_arr = peer_cert.user_pub;
+                    // Version MUST exceed the existing grant's version (monotonic
+                    // ratchet), else apply_cap_op refuses.
+                    let existing_ver = store
+                        .iter()
+                        .filter(|e| {
+                            e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
+                                && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
+                                && e["resource"].as_str() == Some("self")
+                                && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
+                        })
+                        .filter_map(|e| e["version"].as_u64())
+                        .max()
+                        .unwrap_or(0);
+                    let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
+                    let now = crate::capability::now_secs();
+                    let mut op = crate::capability::CapOp {
+                        op: crate::capability::CapOpKind::Revoke,
+                        grantor: pk,
+                        target_kind: 0x00, // User
+                        target: target_arr,
+                        resource: "self".to_string(),
+                        permissions: vec![capability.clone()],
+                        expires: now.saturating_add(90 * 24 * 3600),
+                        issued_at: now,
+                        version: v,
+                        sig: [0u8; 64],
+                    };
+                    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+                    match crate::capability::apply_cap_op(&mut store, &hdr, &op, now) {
+                        Ok(()) => {
+                            let revoked =
+                                crate::capability::save_and_list_revoked(&store, &config_dir)
+                                    .unwrap_or_default();
+                            let authoritative = crate::capability::cap_authoritative();
+                            let ak_path = sshkeys::authorized_keys_path();
+                            let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
+                            for d in &revoked {
+                                if sshkeys::has_block(&ak_content, d) && authoritative {
+                                    eprintln!("shell-key reconcile (revoke): removing managed key for '{d}' (cap store denies shell)");
+                                }
+                            }
+                            let new_ak = crate::capability::reconcile_shell_keys(
+                                &revoked,
+                                &ak_content,
+                                authoritative,
+                            );
+                            if new_ak != ak_content {
+                                if let Err(e) =
+                                    crate::platform::SecretFile::write_str(&ak_path, &new_ak)
+                                {
+                                    eprintln!("shell-key reconcile (revoke): failed to write authorized_keys: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("revoke: owner-signed cap_op not applied ({e}); legacy revoke still took effect");
+                        }
+                    }
+                }
+            }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
                 println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
@@ -11925,6 +12009,36 @@ async fn recv_cmd(
                 }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
+                    // #30 GAP 2 (shell): honor the pending_proven hold. If a
+                    // possession-sig challenge is still in flight for this peer
+                    // and the binding is not yet Proven, do NOT refuse on
+                    // Inferred: the identity-expose that flips us to Proven is a
+                    // SEPARATE event this single-consumer loop must process, so
+                    // blocking inline would deadlock. Re-inject the bootstrap
+                    // shortly and let the loop drain. The hold entry clears on
+                    // Proven OR at the 3s deadline, so this self-terminates and
+                    // the re-injected bootstrap is then decided for real.
+                    if crate::capability::cap_authoritative() {
+                        let challenge_in_flight =
+                            pending_proven.lock().unwrap().contains_key(&pid);
+                        let proven = conn
+                            .link(&pid)
+                            .map(|l| {
+                                l.identity_binding
+                                    == crate::capability::BindingStrength::Proven
+                            })
+                            .unwrap_or(false);
+                        if challenge_in_flight && !proven {
+                            let rtx = tx.clone();
+                            let rpid = pid.clone();
+                            let rv = v.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(80)).await;
+                                let _ = rtx.send(Ev::Control(rpid, rv));
+                            });
+                            continue;
+                        }
+                    }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     // Cap lookup keys on the PROVEN petname, not the presence name.
                     let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
