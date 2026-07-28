@@ -641,6 +641,8 @@ pub fn arm(key_id: String, expires_at: u64) {
 }
 
 /// Disarm: remove a key from the armed set (called when it burns).
+/// Lock order: burn_auth_key holds burn_state lock, then calls disarm.
+/// Never acquire armed_set before burn_state.
 pub fn disarm(key_id: &str) {
     let mut set = armed_set().lock().unwrap();
     set.entries.retain(|e| e.key_id != key_id);
