@@ -3148,7 +3148,10 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
                                 nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                                 verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                             ) {
-                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, v.get("device_cert")) {
+                                let device_cert = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(
+                                    &pid, nonce_arr, verifier_pub, &device_cert,
+                                ) {
                                     let _ = t.send_control(&json!({
                                         "type": "identity-auth-key-enroll-response",
                                         "auth_key": response["auth_key"],
@@ -9513,7 +9516,10 @@ async fn send_cmd(
                                 nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                                 verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
                             ) {
-                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, v.get("device_cert")) {
+                                let device_cert = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(
+                                    &pid, nonce_arr, verifier_pub, &device_cert,
+                                ) {
                                     let _ = t.send_control(&json!({
                                         "type": "identity-auth-key-enroll-response",
                                         "auth_key": response["auth_key"],

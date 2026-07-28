@@ -632,42 +632,43 @@ pub fn register_enrollment(
 
 /// Take a pending enrollment and build the response to the daemon's challenge.
 /// Verifies the daemon's device cert chains to the auth key's issuer (mutual
-/// authentication) and that the verifier_pub is in the auth key's audience
-/// (mirror audience check). Returns None on any verification failure OR if
-/// no pending enrollment exists for this peer.
+/// authentication — the cert is MANDATORY) and that the verifier_pub is in the
+/// auth key's audience (mirror audience check). Removal from the store happens
+/// ONLY on success so a failed attempt doesn't burn a single-use key.
 pub fn build_enrollment_response(
     peer_id: &str,
     nonce: [u8; 32],
     verifier_pub: [u8; 32],
-    device_cert: Option<&serde_json::Value>,
+    device_cert: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    let pe = store.remove(peer_id)?;
-    let ak = &pe.auth_key;
+    let store_ref = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut store = store_ref.lock().unwrap();
+    let pe = match store.get(peer_id) {
+        Some(p) => p,
+        None => return None,
+    };
+    let issuer = pe.auth_key.issuer;
+    let audience = pe.auth_key.audience.clone();
 
-    // Mutual authentication: verify daemon's cert chains to auth_key.issuer.
-    // This prevents MITM by an untrusted signaling server that hands us a
-    // forged verifier_pub — the cert must be signed by the owner named in
-    // the auth key.
-    if let Some(cert_json) = device_cert {
-        if let Some(cert) = crate::identity::DeviceCert::from_json(cert_json) {
-            if cert.user_pub != ak.issuer
-                || cert.verify(now_secs()).is_err()
-                || cert.device_pub != verifier_pub
-            {
-                return None; // cert doesn't chain to issuer or doesn't match verifier_pub
-            }
-        } else {
-            return None; // malformed cert
-        }
+    // Mutual authentication: daemon's cert MUST chain to auth_key.issuer.
+    // Cert is MANDATORY — no if-let bypass for a missing field.
+    let cert = crate::identity::DeviceCert::from_json(device_cert)?;
+    if cert.user_pub != issuer
+        || cert.verify(now_secs()).is_err()
+        || cert.device_pub != verifier_pub
+    {
+        return None;
     }
 
     // Mirror audience check: the enroller verifies it was handed a verifier_pub
     // that its auth key actually authorizes (audience-scoped protection).
-    if !ak.audience_allows(&verifier_pub) {
+    if !(audience.is_empty() || audience.contains(&verifier_pub)) {
         return None;
     }
 
+    // ALL checks passed — now remove from store and build.
+    let pe = store.remove(peer_id)?;
+    let ak = pe.auth_key;
     let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.enroll_seed).ok()?;
     let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.device_seed).ok()?;
     let payload = EnrollmentPayload::build(
@@ -678,7 +679,6 @@ pub fn build_enrollment_response(
         nonce,
         verifier_pub,
     );
-    // NONCE IS NOT on the wire — the daemon uses its own stored nonce from consume_latest_nonce
     Some(serde_json::json!({
         "auth_key": payload.auth_key.to_json(),
         "device_pub": hex::encode(payload.device_pub),
