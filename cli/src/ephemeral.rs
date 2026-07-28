@@ -498,6 +498,17 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
 
     entry.burn_count += 1;
     entry.window_count += 1;
+
+    // Burn-disarm: drop a consumed key from the armed set so the daemon
+    // leaves the enrollment channel immediately, not at TTL expiry.
+    let exhausted = match reuse {
+        Reuse::Once => true,
+        Reuse::N(max) => entry.burn_count >= *max,
+        Reuse::Reusable => false,
+    };
+    if exhausted {
+        disarm(&hex::encode(enroll_pub));
+    }
     Ok(())
 }
 
@@ -627,6 +638,12 @@ pub fn arm(key_id: String, expires_at: u64) {
     let mut set = armed_set().lock().unwrap();
     set.entries.retain(|e| e.key_id != key_id); // dedup
     set.entries.push(ArmedEntry { expiry: expires_at, key_id });
+}
+
+/// Disarm: remove a key from the armed set (called when it burns).
+pub fn disarm(key_id: &str) {
+    let mut set = armed_set().lock().unwrap();
+    set.entries.retain(|e| e.key_id != key_id);
 }
 
 /// Check if the daemon should be in the enroll room (any unexpired armed key).
