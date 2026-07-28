@@ -15414,60 +15414,6 @@ mod tests {
         assert_eq!(reqs[0].status, snapshot, "terminal status must not be re-expired");
     }
 
-    /// Admitting a delegated principal MUST NOT add a record to the device store.
-    /// The escalation: if a delegated link's identity_user_pub were persisted (via
-    /// upsert_peer_record or any other writer), on reconnect resolve_peer_identity
-    /// restores identity_user_pub=owner_pub while principal_kind defaults to
-    /// OwnerDevice, ak_caps=None, ceiling vanishes, owner-shortcut authorizes
-    /// everything. This test asserts ABSENCE: after admit_delegated, the devices
-    /// array is UNCHANGED (still empty). This fails the moment anyone adds
-    /// persistence for delegated links, regardless of which fields they use.
-    #[test]
-    fn delegated_principal_produces_no_device_record() {
-        let mut arr: Vec<Value> = vec![];
-        // Simulate what the enroll-response handler does: call admit_delegated
-        // on a Link. The Link itself is not the device store; the test verifies
-        // that admit_delegated does NOT call upsert_peer_record or any writer.
-        let mut link = Link {
-            peer: None,
-            info: serde_json::json!({}),
-            name: "ephemeral-peer".to_string(),
-            uid: None,
-            transport: None,
-            generation: 0,
-            attempts: 0,
-            trusted: false,
-            expected_secret: None,
-            verified_name: None,
-            presence: Presence::Ready,
-            direct: false,
-            direct_route: "",
-            workers: vec![],
-            established_at: None,
-            identity_device_pub: None,
-            identity_user_pub: None,
-            identity_binding: crate::capability::BindingStrength::None,
-            identity_cert_expires: None,
-            principal_kind: crate::capability::PrincipalKind::OwnerDevice,
-        };
-        link.admit_delegated([0xaa; 32], [0xdd; 32], 9_999_999_999, vec!["transfer".to_string()]);
-        // Verify Link was modified (sanity check)
-        assert_eq!(link.identity_user_pub, Some([0xaa; 32]));
-        assert!(matches!(link.principal_kind, crate::capability::PrincipalKind::Delegated { .. }));
-        // THE INVARIANT: the devices array is unchanged — no record was written
-        assert!(arr.is_empty(), "admit_delegated must not produce a device-store record; the escalated path persists identity_user_pub via the cert, not directly");
-        // Also verify via upsert_peer_record: even if called for this peer,
-        // the device-store record must NOT contain the coupled fields.
-        upsert_peer_record(&mut arr, "ephemeral-peer", Some("secret"), None, None, None, None);
-        // Now the array has a record, but it must be absent of the dangerous fields
-        if let Some(record) = arr.first() {
-            assert!(!record.get("identity_user_pub").is_some(),
-                "device store must not contain identity_user_pub");
-            assert!(!record.get("principal_kind").is_some(),
-                "device store must not contain principal_kind");
-        }
-    }
-
     /// Admitting a delegated principal MUST NOT persist anything to the device
     /// store. A delegated link's authority comes from identity_user_pub=owner_pub
     /// + principal_kind=Delegated{caps}; these are in-memory Link fields only.
@@ -15475,6 +15421,11 @@ mod tests {
     /// resolve_peer_identity would restore it while principal_kind defaults to
     /// OwnerDevice (ak_caps=None), the ceiling vanishes, and the owner-shortcut
     /// authorizes everything — a full escalation.
+    ///
+    /// The non-persistence invariant is enforced at the rig level: devices.json is
+    /// byte-identical before/after a successful enrollment. A unit test on
+    /// admit_delegated alone is vacuous (it has no device-store access); the rig
+    /// covers ANY write path including unanticipated ones.
     #[test]
     fn delegated_principal_never_written_to_device_store() {
         let mk_cert = |dpub: u8| -> identity::DeviceCert {
