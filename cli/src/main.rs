@@ -3193,6 +3193,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     // The flow exposes EXACTLY ONE device + its cert; privacy test asserts on actual wire payload.
     let mut peer_identity_cert: Option<identity::DeviceCert> = None;
     let mut sent_identity: bool = false;
+    let mut identity_exchange_window: Option<std::time::Instant> = None;
     // Peer signaling sid we run the PAKE with (set when the link is adopted).
     let mut pake_peer: Option<String> = None;
     let caps = pair_v2_caps();
@@ -3226,6 +3227,37 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         // same on both sides; it drops straight into devices.json.
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
+                if identity_exchange_window.map_or(false, |dl| std::time::Instant::now() < dl) && peer_identity_cert.is_none() {
+                    if !sent_identity {
+                        if let Some(local_cert) = local_device_cert() {
+                            if let Some(ref pid2) = pake_peer {
+                                if let Some(k) = cer.k() {
+                                    if let Some(l) = conn.link(pid2) {
+                                        if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
+                                            let cmv = crate::pake::our_confirm(k, &my_fp, &their_fp, cer.caps_canon(), cer.scope());
+                                            let mut cmv_arr = [0u8; 32];
+                                            cmv_arr.copy_from_slice(&cmv);
+                                            let dpub = local_cert.device_pub;
+                                            let scope_b = cer.scope();
+                                            let caps_d = crate::identity::caps_digest(cer.caps_canon());
+                                            let ch = crate::identity::cert_hash(&local_cert);
+                                            let rz = [0u8; 32];
+                                            let pmsg = crate::identity::possession_msg(0x01, &cmv_arr, scope_b, &caps_d, &ch, &dpub, &rz);
+                                            if let Ok(psig) = crate::overlay::overlay_sign_possession(&pmsg) {
+                                                let inner = serde_json::json!({"cert":local_cert.to_json(),"possession_sig":hex::encode(psig),"device_pub":hex::encode(dpub)});
+                                                let sk = crate::identity::sealing_key_from_k(k);
+                                                if let Ok((n, s)) = crate::identity::seal_plaintext(&sk, inner.to_string().as_bytes()) {
+                                                    sio.emit("signal", serde_json::json!({"to":pid2,"data":{"type":"identity-expose","v":2,"nonce":hex::encode(n),"sealed":hex::encode(s)}})).await.ok();
+                                                    sent_identity = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
                 // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
                 if peer_identity_cert.is_none() {
                     let p = devices_path();
@@ -3258,7 +3290,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
                 tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                 let _ = sio.disconnect().await;
-                return Ok(());
+                return Ok(());                } // close identity_exchange_window else
+
             }
         }
         if Instant::now() > deadline {
@@ -3437,6 +3470,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         PakeInbound::Consumed => {
                             if let Some(sec) = cer.secret() {
                                 agreed_secret = Some(sec.clone());
+                                identity_exchange_window = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
                             }
                         }
                         PakeInbound::Abort(why) => {
