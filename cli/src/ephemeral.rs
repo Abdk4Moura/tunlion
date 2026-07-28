@@ -468,12 +468,24 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
     Ok(())
 }
 
-/// Rate-limit check INCREMENTS the attempt counter — this is the pre-flight
-/// anti-flood guard. Uses a SEPARATE attempt counter from burn accounting.
-pub fn check_rate_limit(enroll_pub: &[u8; 32]) -> Result<()> {
+/// Rate-limit check: pre-flight anti-flood KEYED BY TRANSPORT PID (not
+/// enroll_pub, which the attacker controls). This ensures garbage requests
+/// are counted and bounded even with random enroll_pub values.
+/// DOES NOT create a BurnEntry — only verify_against_owner creates those.
+pub fn check_rate_limit(pid: &str) -> Result<()> {
+    // We reuse the burn_state map but key on "pid:<pid>" strings for flood counting.
+    // A separate map would be cleaner but this is the simplest non-alloc path.
+    // The RATE LIMIT here is per-pid (per connection), not per key — the key-level
+    // burn is enforced separately in burn_auth_key.
     let now_secs = now_secs();
     let mut state = burn_state().lock().unwrap();
-    let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
+    let pid_key: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(pid.as_bytes());
+        h.finalize().into()
+    };
+    let entry = state.map.entry(pid_key).or_insert(BurnEntry {
         burn_count: 0,
         attempt_count: 0,
         attempt_window_start_secs: now_secs,

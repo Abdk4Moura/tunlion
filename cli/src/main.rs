@@ -3339,14 +3339,56 @@ async fn enroll_and_send_cmd(
         let data = tokio::fs::read(path).await?;
         let name = std::path::Path::new(path).file_name()
             .and_then(|n| n.to_str()).unwrap_or("file");
-        let json_name = serde_json::json!(name);
-        // Send over data channel — simplified inline
-        let _ = t.send_control(&json!({
+
+        // Send transfer offer — actually check the result
+        if let Err(e) = t.send_control(&json!({
             "type": "transfer-offer",
             "name": name,
             "size": data.len(),
-        })).await;
-        ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, data.len()));
+        })).await {
+            bail!("failed to send transfer offer for {name}: {e}");
+        }
+
+        // Wait for accept/decline (30s)
+        let offer_start = Instant::now();
+        let mut accepted = false;
+        loop {
+            if offer_start.elapsed() >= Duration::from_secs(30) {
+                bail!("transfer offer for {name} timed out (no accept/decline)");
+            }
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            let Ok(Some(ev)) = ev else { continue; };
+            if let Ev::Control(ref pid, ref v) = ev {
+                if pid == &active_pid {
+                    match v["type"].as_str() {
+                        Some("transfer-accept") => { accepted = true; break; }
+                        Some("transfer-decline") => {
+                            bail!("transfer of {name} declined: {}", v["reason"].as_str().unwrap_or("not authorized"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if matches!(ev, Ev::Interrupted) { bail!("interrupted"); }
+        }
+        if !accepted {
+            bail!("transfer of {name} not accepted");
+        }
+
+        // Write data chunks via send_frame (sid=0, offset-incremented)
+        let total = data.len();
+        let max_payload = t.max_payload().max(1024);
+        let mut sent = 0usize;
+        while sent < total {
+            let end = total.min(sent + max_payload);
+            let chunk = &data[sent..end];
+            t.send_frame(0, sent as u64, chunk).await.map_err(|e| {
+                anyhow::anyhow!("data channel failed during transfer of {name} (sent {sent}/{total}): {e}")
+            })?;
+            sent = end;
+        }
+        let _ = t.flush().await;
+        ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, total));
     }
     if let Some(name) = remember {
         // Not stored as known device — delegated is ephemeral
@@ -3374,8 +3416,9 @@ async fn respond_to_auth_key_enroll_request(
         }
     };
 
-    // Rate-limit BEFORE anything expensive (window-only, no burn)
-    if let Err(e) = crate::ephemeral::check_rate_limit(&ak.enroll_pub) {
+    // Rate-limit BEFORE anything expensive (window-only, no burn).
+    // Keyed on pid (transport-derived, not attacker-chosen enroll_pub).
+    if let Err(e) = crate::ephemeral::check_rate_limit(&pid) {
         ui::debug(&format!("enroll request rate-limited: {e}"));
         let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
         return;
