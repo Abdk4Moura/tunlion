@@ -2663,6 +2663,26 @@ fn expire_requests(requests: &mut Vec<PendingRequest>) {
     }
 }
 
+/// Enqueue a consent request for a denied action from an identified peer.
+/// No-op if the peer is unidentified, the cap is not requestable, or a
+/// duplicate (same peer+cap) is already pending (dedup).
+fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
+    let name = dev_petname.trim();
+    if name.is_empty() || name == "<unverified>" {
+        return;
+    }
+    match cap {
+        "shell" | "mount" | "transfer" => {}
+        _ => return,
+    }
+    let mut requests = load_requests();
+    expire_requests(&mut requests);
+    let dup = requests.iter().any(|r| r.peer == name && r.capability == cap && r.status == "pending");
+    if !dup {
+        add_pending_request(name, cap, &mut requests);
+    }
+}
+
 /// CLI handler for `filament requests`
 async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     match action {
@@ -11621,6 +11641,7 @@ async fn recv_cmd(
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: shell bootstrap refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
+                        enqueue_if_requestable(who, "shell");
                         let _ = t
                             .send_control(&json!({
                                 "type": "shell-bootstrap-deny",
@@ -11725,6 +11746,7 @@ async fn recv_cmd(
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
+                        enqueue_if_requestable(who, "shell");
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
                             .await;
@@ -11892,6 +11914,7 @@ async fn recv_cmd(
                         // reads as a transport failure. The peer-facing string stays a
                         // coarse category and leaks no authz internals.
                         ui::say(&format!("mount: refused for '{who}': {}", authorized.deny_reason("not authorized (mount capability required)")));
+                        enqueue_if_requestable(&who, "mount");
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
@@ -12367,6 +12390,7 @@ async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({reason})",
                         )));
+                        if daemon { enqueue_if_requestable(&sender_name, "transfer"); }
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
                     }
