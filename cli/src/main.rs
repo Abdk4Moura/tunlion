@@ -12140,12 +12140,6 @@ async fn recv_cmd(
                                 resolve_peer_identity(l);
                             }
                         }
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -12160,7 +12154,7 @@ async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires);
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -12280,7 +12274,7 @@ async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps)
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -12387,7 +12381,7 @@ async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps)
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -12550,7 +12544,7 @@ async fn recv_cmd(
                             trusted,
                             crate::capability::cap_authoritative(),
                         );
-                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires)
+                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps)
                     };
                     if !authorized.allowed() {
                         let who = conn
@@ -13055,7 +13049,7 @@ async fn recv_cmd(
                             link_trusted,
                             crate::capability::cap_authoritative(),
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires);
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {

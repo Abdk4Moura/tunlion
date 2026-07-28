@@ -1244,8 +1244,27 @@ pub fn cap_gate_effective(
     user_pub: Option<&[u8; 32]>,
     binding: BindingStrength,
     cert_expires: Option<u64>,
+    auth_key_caps: Option<&[String]>,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
+
+    // Auth key ceiling applies UNCONDITIONALLY in both modes.
+    // Purely restrictive (Authorized→Denied), no-op for non-delegated (None).
+    // A delegated principal MUST never receive legacy_allowed if its ceiling
+    // denies the action — this is the only enforcement of delegation in shadow.
+    if let Some(caps) = auth_key_caps {
+        let action_lc = action.to_lowercase();
+        if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
+            // Shadow counter: legacy would have allowed, but ceiling denied
+            if !authoritative && legacy_allowed {
+                LD_DENIED.fetch_add(1, Ordering::Relaxed);
+                pa_inc(PA_LD_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
+                LD_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
+                pa_inc(PA_LD_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())), action);
+            }
+            return GateDecision::Deny { cap_reason: Some("not in auth key caps".into()) };
+        }
+    }
 
     // Compose restrictive gates under authoritative (order-independent:
     // both are purely restrictive — Authorized→Denied or pass-through).
@@ -2841,12 +2860,12 @@ mod tests {
         let uk = [0xaa; 32];
         // Legacy-allowed, cap denies (Unprovisioned) → la_no_header
         for action in ["shell", "mount"] {
-            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         // Legacy-denied, cap authorizes → ld_authorized (widening)
-        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
 
         let ac = cap_action_counts();
         // shell: la_no_header=2 (two calls but second is mount, first is shell? Wait...)
@@ -2908,7 +2927,7 @@ mod tests {
 
         // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -2919,7 +2938,7 @@ mod tests {
 
         // (legacy_allowed=true, Denied) -> LA_DENIED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
@@ -2930,7 +2949,7 @@ mod tests {
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2941,7 +2960,7 @@ mod tests {
 
         // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2952,7 +2971,7 @@ mod tests {
 
         // (legacy_allowed=false, Denied) -> LD_DENIED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2963,7 +2982,7 @@ mod tests {
 
         // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -2974,7 +2993,7 @@ mod tests {
 
         // Same-bucket repeat proves no cross-contamination on a second call.
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), crate::capability::BindingStrength::Proven, None, None);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
         assert_eq!(after[1] - before[1], 0);
