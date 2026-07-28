@@ -3668,6 +3668,21 @@ async fn respond_to_auth_key_enroll_request(
         return;
     }
 
+    // Enroll-and-use is only COHERENT under authoritative capability enforcement:
+    // in shadow mode a delegated principal's ceiling does not gate the legacy
+    // path, so admitting one yields a hollow "enrolled" that then can't act (and
+    // could even be over-permitted). Refuse at this boundary with an explicit,
+    // non-oracle reason (config state, not key validity) so the operator knows
+    // exactly what to change, instead of a silent later decline.
+    if !crate::capability::cap_authoritative() {
+        ui::debug("enroll request declined: capability enforcement not authoritative (set FILAMENT_CAP_AUTHORITATIVE=1)");
+        let _ = t.send_control(&json!({
+            "type": "identity-auth-key-enroll-error",
+            "reason": "delegated principal: capability enforcement not authoritative"
+        })).await;
+        return;
+    }
+
     let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
         Some(ak) => ak,
         None => {
@@ -3770,7 +3785,7 @@ async fn handle_auth_key_enroll_response(
             }
             // Admit as Delegated principal — structurally, all four fields together
             if let Some(link) = conn.link_mut(&pid) {
-                link.admit_delegated(device_pub, ak.expires, ak.caps.clone());
+                link.admit_delegated(owner_pub, device_pub, ak.expires, ak.caps.clone());
             }
             let _ = t.send_control(&json!({
                 "type": "identity-auth-key-enroll-ack",
@@ -4737,11 +4752,22 @@ impl Link {
     /// Admit this link as a delegated (auth-key-enrolled) principal.
     /// Ensures caps are structurally tied to the Proven identity — a Delegated
     /// principal CANNOT exist without its ceiling.
-    fn admit_delegated(&mut self, device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
+    fn admit_delegated(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
+        // A delegated principal acts UNDER the owner's user identity (the auth
+        // key issuer), so it presents user_pub = owner_pub. evaluate()'s owner
+        // shortcut then authorizes, but ONLY after the auth-key caps ceiling
+        // (checked first) has passed — so a transfer-only key gets transfer and
+        // is denied shell/mount. This is the delegation grant.
+        self.identity_user_pub = Some(owner_pub);
         self.identity_device_pub = Some(device_pub);
         self.identity_binding = crate::capability::BindingStrength::Proven;
         self.identity_cert_expires = Some(expires);
         self.principal_kind = crate::capability::PrincipalKind::Delegated { caps };
+        // NOTE: deliberately do NOT set self.trusted. binding=Proven satisfies
+        // cap_trust_floor under authoritative mode, and the auth-key caps ceiling
+        // (auth_key_caps ∩ owner_effective) bounds the principal. Setting trusted
+        // would leak into legacy_ok for gates that read it directly (e.g. mount),
+        // handing an ephemeral borrower an unbounded, un-ceilinged grant.
     }
 }
 
@@ -8376,6 +8402,10 @@ async fn main() -> Result<()> {
                         }
                         None => {
                             let uk = identity::UserKey::generate()?;
+                            // Seed the owner's self genesis cap header at init so
+                            // authoritative capability enforcement works from the
+                            // start (also healed on daemon start for older keys).
+                            ensure_self_genesis_header(&crate::settings::config_dir(), &uk);
                             println!("  {} user identity created: fingerprint {}",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &uk.fingerprint()));
@@ -10729,6 +10759,66 @@ async fn apply_reconfigure(
     }
 }
 
+/// Idempotently seed the owner's `self` genesis capability header AND the
+/// per-owner ratchet.
+///
+/// Under authoritative enforcement `cap_authorize` returns `Unprovisioned`
+/// until the `self` header exists, and `evaluate()` then denies "ratchet
+/// uninitialized" until the per-owner monotonic ratchet exists — so BOTH are
+/// required for the capability layer to authorize anything on `self` (owner or
+/// delegated principal under its ceiling). Both are tautological: the owner
+/// asserts ownership of its OWN self-certifying resource and its own ratchet
+/// floor; they widen nothing. Mirrors the genesis block `Cmd::Grant` was the
+/// sole (accidental) seeder of. Each half is seeded independently so a store
+/// missing only one is healed. Returns true when the store changed. Persisted
+/// with `save_cap_store` (a plain write, no reconcile): seeding grants no ssh
+/// access and must not trigger the authorized_keys reconciler.
+fn ensure_self_genesis_header(
+    config_dir: &std::path::Path,
+    user_key: &crate::identity::UserKey,
+) -> bool {
+    let mut store = crate::capability::load_cap_store(config_dir);
+    let pk = user_key.public_key_bytes();
+    let owner_hex = hex::encode(pk);
+    let has_header = store.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+            && e["resource"].as_str() == Some("self")
+    });
+    let has_ratchet = store.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_ratchet")
+            && e["owner_pub"].as_str() == Some(owner_hex.as_str())
+    });
+    if has_header && has_ratchet {
+        return false;
+    }
+    let now = crate::capability::now_secs();
+    if !has_header {
+        let nonce = crate::capability::self_resource_nonce();
+        let resource = crate::capability::self_resource_id(&pk);
+        let mut hdr = crate::capability::CapHeader {
+            resource,
+            epoch: 0,
+            owner_pub: pk,
+            nonce,
+            floors: vec![],
+            issued_at: now,
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
+        let mut hdr_json = hdr.to_json();
+        // Stored under the caller-facing resource id "self" (what cap_authorize
+        // looks up); the signature commits to the self-certifying derived id.
+        hdr_json["resource"] = serde_json::json!("self");
+        store.push(hdr_json);
+    }
+    if !has_ratchet && crate::capability::update_ratchet(&mut store, &pk, now).is_err() {
+        return false;
+    }
+    crate::capability::save_cap_store(config_dir, &store).is_ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recv_cmd(
     server: &str,
@@ -10749,6 +10839,18 @@ async fn recv_cmd(
     no_proxy_fallback: bool,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
+    // Daemon start: idempotently heal the owner's self genesis cap header.
+    // Identities created before this seeding existed have no header; seeding
+    // only at `identity init` would grandfather-trap them into permanent
+    // Unprovisioned. Healing on every daemon start makes old identities correct
+    // on next `up` and new ones born correct. Tautological; widens nothing.
+    if daemon {
+        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+            if ensure_self_genesis_header(&crate::settings::config_dir(), &uk) {
+                ui::debug("seeded owner self genesis capability header");
+            }
+        }
+    }
     // INTERACTIVE GATE (CLI `recv` only, never the daemon/`up`). With no code,
     // offer: type a code to connect to a specific person, or press Enter on an
     // empty buffer to use the local network (today's default). When the gate is
@@ -11713,20 +11815,6 @@ async fn recv_cmd(
                                 sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
                             }
         sess.tick(&sio).await;
-        // Arm-gate: toggle enrollment channel subscription based on armed set.
-        // Channel-based (not room) because the server supports 1 room/socket.
-        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
-            let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-            let armed = crate::ephemeral::is_armed();
-            let subscribed = sess.channels.contains(&ek);
-            if armed && !subscribed {
-                sess.channels.push(ek.clone());
-                let _ = sio.emit("subscribe", json!({ "channels": [ek] })).await;
-            } else if !armed && subscribed {
-                sess.channels.retain(|c| c != &ek);
-                let _ = sio.emit("channel-goodbye", json!({ "channels": [ek] })).await;
-            }
-        }
                             // optimistic: a clean connect proves reachability; let
                             // the welcome confirm it (which resets the counters).
                             last_signaling = Instant::now();
@@ -11743,6 +11831,24 @@ async fn recv_cmd(
                         }
                     }
                 }
+            }
+        }
+
+        // Arm-gate: toggle enrollment-channel subscription EVERY loop iteration
+        // based on the armed set. Channel-based (not room) because the server
+        // supports 1 room/socket. This MUST run at loop top-level, not nested in
+        // the signaling-reconnect Ok arm: a stable daemon (signaling never down)
+        // would otherwise never subscribe and no ephemeral device could enroll.
+        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+            let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+            let armed = crate::ephemeral::is_armed();
+            let subscribed = sess.channels.contains(&ek);
+            if armed && !subscribed {
+                sess.channels.push(ek.clone());
+                let _ = sio.emit("subscribe", json!({ "channels": [ek] })).await;
+            } else if !armed && subscribed {
+                sess.channels.retain(|c| c != &ek);
+                let _ = sio.emit("channel-goodbye", json!({ "channels": [ek] })).await;
             }
         }
 

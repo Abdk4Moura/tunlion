@@ -637,6 +637,11 @@ mod imp {
                         let Some(key) = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).map(str::to_string) else { return };
                         ReqKind::Reconfigure { key }
                     }
+                    Some("arm") => {
+                        let Some(key_id) = v["key_id"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string) else { return };
+                        let Some(expiry) = v["expiry"].as_u64() else { return };
+                        ReqKind::Arm { key_id, expiry }
+                    }
                     Some("reload-expose") => ReqKind::ReloadExpose,
                     Some("reload") => ReqKind::Reload,
                     Some("mount") => {
