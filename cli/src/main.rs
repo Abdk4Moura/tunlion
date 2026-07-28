@@ -3055,7 +3055,11 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = vec![enroll_chan.clone()];
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+    // JOIN the enroll room (owner daemon is in the same room) so peer-joined
+    // fires on both sides and the WebRTC offers route. A channel SUBSCRIBE does
+    // not bridge signal routing between two peers that share no room.
+    sess.room = Some(enroll_chan.clone());
+    sess.emit(&sio, "join", json!({ "room": enroll_chan.clone(), "name": display_name(), "uid": my_uid.clone() })).await;
 
     let mut conn = Conn::for_command(
         server,
@@ -3108,6 +3112,23 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
             }
             Ev::PeerJoined(v) => {
                 conn.maybe_adopt(&v, false).await?;
+            }
+            Ev::KnownPeer(v) => {
+                // The owner daemon is present on the enroll channel. DIAL it as
+                // the IMPOLITE peer (offerer): the owner answers via
+                // ensure_responder (forced polite) and cannot reliably learn of
+                // a late-arriving enroller from server presence, so the enroller
+                // MUST drive the offer regardless of uid ordering.
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
+                    && v["channel"].as_str() == Some(enroll_chan.as_str())
+                {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                        if conn.active.is_none() { conn.active = Some(pid); }
+                    }
+                }
             }
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
@@ -3238,7 +3259,8 @@ async fn enroll_and_send_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = vec![enroll_chan.clone()];
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+    sess.room = Some(enroll_chan.clone());
+    sess.emit(&sio, "join", json!({ "room": enroll_chan.clone(), "name": display_name(), "uid": my_uid.clone() })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -3267,7 +3289,32 @@ async fn enroll_and_send_cmd(
             continue;
         };
         match ev {
-            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, false).await?; }
+            Ev::Welcome(v) => {
+                // The owner daemon is already in the enroll room; the server hands
+                // us its roster here. Dial each peer (owner answers) so rendezvous
+                // does not depend on a later peer-joined we would otherwise miss.
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers { conn.maybe_adopt(p, true).await?; }
+                }
+            }
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
+            Ev::KnownPeer(v) => {
+                // Enroller drives: dial the owner daemon (present on the enroll
+                // channel) as the IMPOLITE offerer; the owner answers via
+                // ensure_responder. Server presence does not reliably notify the
+                // pre-existing owner of a late enroller, so we must initiate.
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
+                    && v["channel"].as_str() == Some(enroll_chan.as_str())
+                {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                        if conn.active.is_none() { conn.active = Some(pid); }
+                    }
+                }
+            }
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
@@ -3342,14 +3389,12 @@ async fn enroll_and_send_cmd(
         let data = tokio::fs::read(path).await?;
         let name = std::path::Path::new(path).file_name()
             .and_then(|n| n.to_str()).unwrap_or("file");
+        let id = format!("ak-{}", paths.iter().position(|p| p == path).unwrap_or(0));
 
-        // Send transfer offer — actually check the result
-        if let Err(e) = t.send_control(&json!({
-            "type": "transfer-offer",
-            "name": name,
-            "size": data.len(),
-        })).await {
-            bail!("failed to send transfer offer for {name}: {e}");
+        // Send file offer using the standard protocol
+        let offer = crate::protocol::offer_msg(&id, 0, name, data.len() as u64, None, None, false);
+        if let Err(e) = t.send_control(&offer).await {
+            bail!("failed to send file offer for {name}: {e}");
         }
 
         // Wait for accept/decline (30s)
@@ -3357,16 +3402,16 @@ async fn enroll_and_send_cmd(
         let mut accepted = false;
         loop {
             if offer_start.elapsed() >= Duration::from_secs(30) {
-                bail!("transfer offer for {name} timed out (no accept/decline)");
+                bail!("file offer for {name} timed out (no accept/decline)");
             }
             let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
             let Ok(Some(ev)) = ev else { continue; };
             if let Ev::Control(ref pid, ref v) = ev {
-                if pid == &active_pid {
+                if pid == &active_pid && v["id"].as_str() == Some(&id) {
                     match v["type"].as_str() {
-                        Some("transfer-accept") => { accepted = true; break; }
-                        Some("transfer-decline") => {
-                            bail!("transfer of {name} declined: {}", v["reason"].as_str().unwrap_or("not authorized"));
+                        Some("file-accept") => { accepted = true; break; }
+                        Some("file-decline") => {
+                            bail!("file {name} declined: {}", v["reason"].as_str().unwrap_or("not authorized"));
                         }
                         _ => {}
                     }
@@ -3443,7 +3488,8 @@ async fn enroll_and_netcat_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = vec![enroll_chan.clone()];
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+    sess.room = Some(enroll_chan.clone());
+    sess.emit(&sio, "join", json!({ "room": enroll_chan.clone(), "name": display_name(), "uid": my_uid.clone() })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -3464,7 +3510,32 @@ async fn enroll_and_netcat_cmd(
             continue;
         };
         match ev {
-            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, false).await?; }
+            Ev::Welcome(v) => {
+                // The owner daemon is already in the enroll room; the server hands
+                // us its roster here. Dial each peer (owner answers) so rendezvous
+                // does not depend on a later peer-joined we would otherwise miss.
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers { conn.maybe_adopt(p, true).await?; }
+                }
+            }
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
+            Ev::KnownPeer(v) => {
+                // Enroller drives: dial the owner daemon (present on the enroll
+                // channel) as the IMPOLITE offerer; the owner answers via
+                // ensure_responder. Server presence does not reliably notify the
+                // pre-existing owner of a late enroller, so we must initiate.
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
+                    && v["channel"].as_str() == Some(enroll_chan.as_str())
+                {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                        if conn.active.is_none() { conn.active = Some(pid); }
+                    }
+                }
+            }
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
@@ -10786,7 +10857,16 @@ async fn recv_cmd(
             // only, strangers can't see it, probe it, or offer to it.
             // (We still `join` an unguessable solo room so the registry holds
             // our meta for known-peer events, but nobody else can land there.)
-            let solo = format!("up-{}", fresh_secret());
+            // Enroll rendezvous: an enroll-capable daemon (has a user key) JOINS
+            // the enroll ROOM derived from its owner_pub, so an enroller joining
+            // the same room fires peer-joined on BOTH sides and their WebRTC
+            // offers route (a channel SUBSCRIBE does not bridge signal routing).
+            // sess.room is re-asserted every sync tick, so membership survives the
+            // cadence (the 2a2f223 room-undo bug). Falls back to an unguessable
+            // solo room when there is no user key.
+            let solo = crate::identity::UserKey::load().ok().flatten()
+                .map(|uk| crate::ephemeral::enroll_channel(&uk.public_key_bytes()))
+                .unwrap_or_else(|| format!("up-{}", fresh_secret()));
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
             // C29: an interactive up can START empty and pair in-session.
@@ -11404,6 +11484,7 @@ async fn recv_cmd(
                                     "ld_authorized": counts.ld_authorized,
                                     "ld_denied": counts.ld_denied,
                                     "ld_no_header": counts.ld_no_header,
+                                    "ceiling_denied": counts.ceiling_denied,
                                 },
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
@@ -12140,6 +12221,18 @@ async fn recv_cmd(
                     conn.maybe_adopt(&v, true).await?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
+                    }
+                } else if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    // Enrollment channel: an ephemeral device appeared on
+                    // enroll_channel(own_owner_pub). Dial it (channel-presence
+                    // path, no room-join) so the auth-key handshake can run.
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    if v["channel"].as_str() == Some(&ek) {
+                        let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                            ui::debug("enrollment peer appeared on channel, dialing");
+                        }
+                        conn.maybe_adopt(&v, true).await?;
                     }
                 }
             }
@@ -13088,6 +13181,7 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_trust_floor(
                             &outcome,
                             trusted,
+                            binding,
                             crate::capability::cap_authoritative(),
                         );
                         crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps)
@@ -13604,6 +13698,7 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_trust_floor(
                             &outcome,
                             link_trusted,
+                            binding,
                             crate::capability::cap_authoritative(),
                         );
                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps);

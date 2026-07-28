@@ -1223,16 +1223,19 @@ pub fn cap_authorize_expired(
     }
 }
 
-/// Trust floor: under authoritative, an untrusted link must never authorize.
+/// Trust floor: under authoritative, an untrusted OR unbound link must never
+/// authorize. Floor passes if the session is link-trusted (pair-proof completed)
+/// OR the identity is Proven (delegated-by-enrollment / possession-proven).
 /// Purely restrictive — downgrades Authorized→Denied only; Denied/Unprov
 /// pass through. Shadow always passes through. Only needed at gates whose
 /// legacy check is trust-based (transfer, mount).
 pub fn cap_trust_floor(
     outcome: &CapOutcome,
     trusted: bool,
+    binding: BindingStrength,
     authoritative: bool,
 ) -> CapOutcome {
-    if !authoritative || trusted {
+    if !authoritative || trusted || binding == BindingStrength::Proven {
         return outcome.clone();
     }
     match outcome {
@@ -3475,15 +3478,18 @@ mod tests {
     fn cap_trust_floor_purely_restrictive() {
         let auth = CapOutcome::Authorized;
         let deny = CapOutcome::Denied("no grant".into());
+        let inferred = BindingStrength::Inferred;
 
-        // Authoritative + untrusted + Authorized → Denied
-        assert!(matches!(cap_trust_floor(&auth, false, true), CapOutcome::Denied(_)));
-        // Authoritative + trusted + Authorized → passes through
-        assert_eq!(cap_trust_floor(&auth, true, true), CapOutcome::Authorized);
-        // Shadow + untrusted + Authorized → passes through
-        assert_eq!(cap_trust_floor(&auth, false, false), CapOutcome::Authorized);
+        // Authoritative + untrusted + Inferred + Authorized → Denied
+        assert!(matches!(cap_trust_floor(&auth, false, inferred, true), CapOutcome::Denied(_)));
+        // Authoritative + trusted + Inferred + Authorized → passes through
+        assert_eq!(cap_trust_floor(&auth, true, inferred, true), CapOutcome::Authorized);
+        // Shadow + untrusted + Inferred + Authorized → passes through
+        assert_eq!(cap_trust_floor(&auth, false, inferred, false), CapOutcome::Authorized);
+        // Proven binding alone passes the floor even without link.trusted
+        assert_eq!(cap_trust_floor(&auth, false, BindingStrength::Proven, true), CapOutcome::Authorized);
         // Denied + untrusted + authoritative → stays Denied
-        assert_eq!(cap_trust_floor(&deny, false, true), deny);
+        assert_eq!(cap_trust_floor(&deny, false, inferred, true), deny);
     }
 
     /// Cache returns same result as uncached load for identical store.
