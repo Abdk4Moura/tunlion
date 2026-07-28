@@ -396,15 +396,11 @@ impl EnrollmentPayload {
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// Three independent counters:
-/// - burn_count / burn_start: never reset (reuse guard)
-/// - attempt_count / attempt_window_start: pre-flight anti-flood (incremented per call)
-/// - window_count / window_start: rate limit on successful burns
+// ---- Burn store (enroll_pub-keyed, PERMANENT — must survive process lifetime for single-use) ----
+
 struct BurnEntry {
-    burn_count: u32,
-    attempt_count: u32,
-    attempt_window_start_secs: u64,
-    window_count: u32,
+    burn_count: u32,       // never reset (reuse guard)
+    window_count: u32,     // reset every 60s (rate limit on successful burns)
     window_start_secs: u64,
 }
 
@@ -416,6 +412,47 @@ static BURN: OnceLock<Mutex<BurnState>> = OnceLock::new();
 
 fn burn_state() -> &'static Mutex<BurnState> {
     BURN.get_or_init(|| Mutex::new(BurnState { map: HashMap::new() }))
+}
+
+// ---- Flood store (pid-keyed, TTL-sweepable — SEPARATE from burn so entries can be evicted) ----
+
+struct FloodEntry {
+    attempt_count: u32,
+    window_start_secs: u64,
+}
+
+struct FloodState {
+    map: HashMap<String, FloodEntry>,
+}
+
+static FLOOD: OnceLock<Mutex<FloodState>> = OnceLock::new();
+
+fn flood_state() -> &'static Mutex<FloodState> {
+    FLOOD.get_or_init(|| Mutex::new(FloodState { map: HashMap::new() }))
+}
+
+/// Rate-limit check: pre-flight anti-flood KEYED BY TRANSPORT PID.
+/// Separate map from burn store so expired entries can be swept without
+/// destroying permanent single-use burn state.
+pub fn check_rate_limit(pid: &str) -> Result<()> {
+    let now_secs = now_secs();
+    let mut state = flood_state().lock().unwrap();
+    // Sweep expired flood entries
+    state.map.retain(|_, e| now_secs.saturating_sub(e.window_start_secs) < 120);
+    let entry = state.map.entry(pid.to_string()).or_insert(FloodEntry {
+        attempt_count: 0,
+        window_start_secs: now_secs,
+    });
+    let elapsed = now_secs.saturating_sub(entry.window_start_secs);
+    if elapsed >= 60 {
+        entry.attempt_count = 0;
+        entry.window_start_secs = now_secs;
+    }
+    if entry.attempt_count >= ENROLL_RATE_LIMIT {
+        bail!("too many enrollment attempts (max {}/min)", ENROLL_RATE_LIMIT);
+    }
+    entry.attempt_count += 1;
+    Ok(())
 }
 
 /// Consume one use of an auth key identified by `enroll_pub`.
@@ -432,13 +469,10 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
     let mut state = burn_state().lock().unwrap();
     let entry = state.map.entry(*enroll_pub).or_insert(BurnEntry {
         burn_count: 0,
-        attempt_count: 0,
-        attempt_window_start_secs: now_secs,
         window_count: 0,
         window_start_secs: now_secs,
     });
 
-    // Rate-limit window (independent from burn, resets every 60s)
     let elapsed = now_secs.saturating_sub(entry.window_start_secs);
     if elapsed >= 60 {
         entry.window_count = 0;
@@ -448,7 +482,6 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
         bail!("auth key rate-limited (max {} enrollments/min)", ENROLL_RATE_LIMIT);
     }
 
-    // Burn guard (never reset — tracks lifetime uses)
     match reuse {
         Reuse::Once => {
             if entry.burn_count > 0 {
@@ -460,47 +493,11 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
                 bail!("auth key exhausted ({} uses)", max);
             }
         }
-        Reuse::Reusable => {} // no limit, rate-limit still applies
+        Reuse::Reusable => {}
     }
 
     entry.burn_count += 1;
     entry.window_count += 1;
-    Ok(())
-}
-
-/// Rate-limit check: pre-flight anti-flood KEYED BY TRANSPORT PID (not
-/// enroll_pub, which the attacker controls). This ensures garbage requests
-/// are counted and bounded even with random enroll_pub values.
-/// DOES NOT create a BurnEntry — only verify_against_owner creates those.
-pub fn check_rate_limit(pid: &str) -> Result<()> {
-    // We reuse the burn_state map but key on "pid:<pid>" strings for flood counting.
-    // A separate map would be cleaner but this is the simplest non-alloc path.
-    // The RATE LIMIT here is per-pid (per connection), not per key — the key-level
-    // burn is enforced separately in burn_auth_key.
-    let now_secs = now_secs();
-    let mut state = burn_state().lock().unwrap();
-    let pid_key: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(pid.as_bytes());
-        h.finalize().into()
-    };
-    let entry = state.map.entry(pid_key).or_insert(BurnEntry {
-        burn_count: 0,
-        attempt_count: 0,
-        attempt_window_start_secs: now_secs,
-        window_count: 0,
-        window_start_secs: now_secs,
-    });
-    let elapsed = now_secs.saturating_sub(entry.attempt_window_start_secs);
-    if elapsed >= 60 {
-        entry.attempt_count = 0;
-        entry.attempt_window_start_secs = now_secs;
-    }
-    if entry.attempt_count >= ENROLL_RATE_LIMIT {
-        bail!("too many enrollment attempts (max {}/min)", ENROLL_RATE_LIMIT);
-    }
-    entry.attempt_count += 1;
     Ok(())
 }
 

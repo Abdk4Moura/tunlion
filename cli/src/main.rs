@@ -3048,11 +3048,11 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
     // Join enrollment rendezvous channel derived from owner's public key.
-    // Network-independent — same model as channel_of for pairing secrets.
+    // Network-independent — join as ROOM so PeerJoined fires.
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.channels = vec![enroll_chan.clone()];
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+    sess.room = Some(enroll_chan.clone());
+    sess.emit(&sio, "join", json!({ "room": enroll_chan, "name": display_name(), "uid": my_uid })).await;
 
     let mut conn = Conn::for_command(
         server,
@@ -3234,8 +3234,8 @@ async fn enroll_and_send_cmd(
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let mut sess = session::Session::new(&display_name(), &my_uid);
-    sess.channels = vec![enroll_chan.clone()];
-    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+    sess.room = Some(enroll_chan.clone());
+    sess.emit(&sio, "join", json!({ "room": enroll_chan, "name": display_name(), "uid": my_uid })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
     crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
@@ -3408,6 +3408,15 @@ async fn respond_to_auth_key_enroll_request(
     v: serde_json::Value,
 ) {
     let Some(t) = conn.transport_of(&pid) else { return };
+
+    // Rate-limit FIRST — keyed on pid, counts EVERY request including garbage.
+    // An attacker sending unparseable JSON is bounded here, before parse cycles.
+    if let Err(e) = crate::ephemeral::check_rate_limit(&pid) {
+        ui::debug(&format!("enroll request rate-limited: {e}"));
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+        return;
+    }
+
     let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
         Some(ak) => ak,
         None => {
@@ -3415,14 +3424,6 @@ async fn respond_to_auth_key_enroll_request(
             return;
         }
     };
-
-    // Rate-limit BEFORE anything expensive (window-only, no burn).
-    // Keyed on pid (transport-derived, not attacker-chosen enroll_pub).
-    if let Err(e) = crate::ephemeral::check_rate_limit(&pid) {
-        ui::debug(&format!("enroll request rate-limited: {e}"));
-        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-        return;
-    }
 
     // Verify against our trusted owner
     let owner_pub = match crate::identity::UserKey::load() {
@@ -10616,6 +10617,12 @@ async fn recv_cmd(
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
+            // Join the enrollment rendezvous channel as a ROOM so ephemeral
+            // devices discover us via PeerJoined (not just presence subscribe).
+            if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                sess.emit(&sio, "join", json!({ "room": ek, "name": display_name(), "uid": my_uid })).await;
+            }
             // C29: an interactive up can START empty and pair in-session.
             // When shell (--shell / --shell-only) is enabled, the daemon
             // explicitly accepts devices paired later, so do NOT bail just
