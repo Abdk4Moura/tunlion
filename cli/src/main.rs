@@ -6667,10 +6667,18 @@ impl Conn {
     /// The roster entry is removed immediately (the sid truly left); only the
     /// LINK drop is deferred.
     fn on_peer_left(&mut self, v: &Value) -> bool {
-        let Some(pid) = v["id"].as_str() else { return false };
-        let pid = pid.to_string();
+        let Some(pid_val) = v["id"].as_str() else { return false };
+        let pid = pid_val.to_string();
         self.roster.remove(&pid);
         if !self.links.contains_key(&pid) {
+            return false;
+        }
+        // Delegated (ephemeral) devices are removed immediately on disconnect —
+        // not deferred, not rejoinable. They must re-enroll on reconnect.
+        if matches!(self.link(&pid).map(|l| &l.principal_kind), Some(crate::capability::PrincipalKind::Delegated { .. })) {
+            let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+            self.drop_link(&pid);
+            ui::debug(&format!("ephemeral device {name} disconnected, enrollment revoked"));
             return false;
         }
         // Defer the drop while the data channel is still moving bytes, unless
