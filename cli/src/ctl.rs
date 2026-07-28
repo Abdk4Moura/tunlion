@@ -41,9 +41,10 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
     pub use imp::{
-        daemon_present, send_reply, serve, serve_at, try_bootstrap, try_cap_status, try_dial,
-        try_list_mounts, try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
-        try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
+        daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
+        try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_mount,
+        try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+        try_reload_expose, try_resize, try_unmount, Req, ReqKind,
     };
 
 #[cfg(not(unix))]
@@ -385,6 +386,54 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask the daemon for the list of pending consent requests.
+    pub async fn try_list_pending() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "list-pending" });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 8192))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Ask the daemon to approve a pending request by id.
+    pub async fn try_approve_request(id: u64) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "approve-request", "id": id });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
+    /// Ask the daemon to deny a pending request by id.
+    pub async fn try_deny_request(id: u64) -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "deny-request", "id": id });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
+            .await
+            .ok()?
+            .ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
@@ -441,6 +490,12 @@ mod imp {
         MountHealth { target: String },
         /// Return the daemon's live capability shadow counters (synchronous).
         CapStatus,
+        /// List pending consent requests.
+        ListPending,
+        /// Approve a pending request by id.
+        ApproveRequest { id: u64 },
+        /// Deny a pending request by id.
+        DenyRequest { id: u64 },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -582,6 +637,15 @@ mod imp {
                         ReqKind::MountHealth { target }
                     }
                     Some("cap-status") => ReqKind::CapStatus,
+                    Some("list-pending") => ReqKind::ListPending,
+                    Some("approve-request") => {
+                        let Some(id) = v["id"].as_u64() else { return };
+                        ReqKind::ApproveRequest { id }
+                    }
+                    Some("deny-request") => {
+                        let Some(id) = v["id"].as_u64() else { return };
+                        ReqKind::DenyRequest { id }
+                    }
                     _ => return,
                 };
                 let _ = tx.send(Req { kind, sock });

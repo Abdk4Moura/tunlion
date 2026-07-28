@@ -1001,6 +1001,11 @@ enum Cmd {
         #[arg(long)]
         options: Option<String>,
     },
+    /// List, approve, or deny pending consent requests from peers.
+    Requests {
+        #[command(subcommand)]
+        action: Option<RequestsAction>,
+    },
 }
 
 /// User identity management: generate the identity key, show the fingerprint,
@@ -1015,6 +1020,27 @@ enum IdentityAction {
     Certify {
         /// Petname of the known device to certify as yours
         device: String,
+    },
+}
+
+/// Consent request management: list, approve, or deny pending requests.
+#[derive(Subcommand)]
+enum RequestsAction {
+    /// List pending requests (default: pending-only; --all for full history).
+    List {
+        /// Show all requests including approved/denied/expired
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve a pending request by id and grant the capability.
+    Approve {
+        /// Request id
+        id: u64,
+    },
+    /// Deny a pending request by id.
+    Deny {
+        /// Request id
+        id: u64,
     },
 }
 
@@ -2542,6 +2568,177 @@ async fn cap_status_cmd(json: bool) -> Result<()> {
                     "ok": false,
                     "err": "daemon not reachable; start with filament up",
                 }))?);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------- consent queue --
+// Pending-request queue for live-approval consent (docs/design-identity-access-ux.md §2).
+// Requests arrive via the daemon from peers requesting shell/mount/transfer.
+// The daemon holds them until the owner explicitly approves or denies via CLI.
+// Deny-by-default: a pending request carries NO access.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingRequest {
+    id: u64,
+    peer: String,
+    capability: String,
+    timestamp: u64,
+    status: String, // "pending", "approved", "denied", "expired"
+    granted_at: Option<u64>,
+}
+
+const MAX_PENDING: usize = 100;
+const REQUEST_TTL_SECS: u64 = 3600;
+
+fn requests_path() -> PathBuf {
+    crate::settings::config_dir().join("requests.json")
+}
+
+fn load_requests() -> Vec<PendingRequest> {
+    std::fs::read_to_string(requests_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_requests(reqs: &[PendingRequest]) {
+    if let Ok(json) = serde_json::to_string_pretty(reqs) {
+        let _ = crate::platform::SecretFile::write_str(&requests_path(), &json);
+    }
+}
+
+fn add_pending_request(peer: &str, capability: &str, requests: &mut Vec<PendingRequest>) {
+    let now = crate::capability::now_secs();
+    let next_id = requests.iter().map(|r| r.id).max().unwrap_or(0) + 1;
+    // Evict oldest pending if at capacity
+    while requests.iter().filter(|r| r.status == "pending").count() >= MAX_PENDING {
+        if let Some(pos) = requests.iter().position(|r| r.status == "pending") {
+            let evicted = &requests[pos];
+            ui::say(&format!(
+                "consent queue full ({}), evicting oldest pending: id={} peer={} cap={}",
+                MAX_PENDING, evicted.id, evicted.peer, evicted.capability
+            ));
+            requests.remove(pos);
+        } else {
+            break;
+        }
+    }
+    requests.push(PendingRequest {
+        id: next_id,
+        peer: peer.to_string(),
+        capability: capability.to_string(),
+        timestamp: now,
+        status: "pending".to_string(),
+        granted_at: None,
+    });
+    // Fire notify hook if configured
+    if let Ok(hook) = std::env::var("FILAMENT_NOTIFY_HOOK") {
+        if !hook.is_empty() {
+            // ARGV exec, never shell — petname is attacker-influenced
+            let _ = std::process::Command::new(&hook)
+                .arg(peer)
+                .arg(capability)
+                .spawn();
+        }
+    }
+    save_requests(requests);
+}
+
+fn expire_requests(requests: &mut Vec<PendingRequest>) {
+    let now = crate::capability::now_secs();
+    let mut changed = false;
+    for r in requests.iter_mut().filter(|r| r.status == "pending") {
+        if now.saturating_sub(r.timestamp) > REQUEST_TTL_SECS {
+            r.status = "expired".to_string();
+            changed = true;
+        }
+    }
+    if changed {
+        save_requests(requests);
+    }
+}
+
+/// CLI handler for `filament requests`
+async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
+    match action {
+        None | Some(RequestsAction::List { all: false }) => {
+            let reply = crate::ctl::try_list_pending().await;
+            match reply {
+                Some(v) => {
+                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
+                        if reqs.is_empty() {
+                            ui::say("  no pending requests");
+                        } else {
+                            for r in reqs {
+                                let id = r["id"].as_u64().unwrap_or(0);
+                                let peer = r["peer"].as_str().unwrap_or("?");
+                                let cap = r["capability"].as_str().unwrap_or("?");
+                                let status = r["status"].as_str().unwrap_or("?");
+                                let ts = r["timestamp"].as_u64().unwrap_or(0);
+                                let ago = crate::capability::now_secs().saturating_sub(ts);
+                                let when = if ago < 60 { format!("{ago}s ago") }
+                                    else if ago < 3600 { format!("{}m ago", ago/60) }
+                                    else { format!("{}h ago", ago/3600) };
+                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
+                            }
+                        }
+                    }
+                }
+                None => ui::say("  daemon not running; no pending request state"),
+            }
+        }
+        Some(RequestsAction::List { all: true }) => {
+            let reply = crate::ctl::try_list_pending().await;
+            match reply {
+                Some(v) => {
+                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
+                        if reqs.is_empty() {
+                            ui::say("  no requests");
+                        } else {
+                            for r in reqs {
+                                let id = r["id"].as_u64().unwrap_or(0);
+                                let peer = r["peer"].as_str().unwrap_or("?");
+                                let cap = r["capability"].as_str().unwrap_or("?");
+                                let status = r["status"].as_str().unwrap_or("?");
+                                let ts = r["timestamp"].as_u64().unwrap_or(0);
+                                let ago = crate::capability::now_secs().saturating_sub(ts);
+                                let when = if ago < 60 { format!("{ago}s ago") }
+                                    else if ago < 3600 { format!("{}m ago", ago/60) }
+                                    else { format!("{}h ago", ago/3600) };
+                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
+                            }
+                        }
+                    }
+                }
+                None => ui::say("  daemon not running; no request state"),
+            }
+        }
+        Some(RequestsAction::Approve { id }) => {
+            let reply = crate::ctl::try_approve_request(id).await;
+            match reply {
+                Some(v) => {
+                    if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
+                        if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
+                            ui::say(&format!(
+                                "  {} approved {cap} for {peer}",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            ));
+                        }
+                    }
+                }
+                None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
+            }
+        }
+        Some(RequestsAction::Deny { id }) => {
+            let reply = crate::ctl::try_deny_request(id).await;
+            match reply {
+                Some(_) => ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
+                None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
             }
         }
     }
@@ -6282,6 +6479,9 @@ async fn handle_warm_req(
         ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
         ctl::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
+        ctl::ReqKind::ListPending => req.reject("list-pending not handled here").await,
+        ctl::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
+        ctl::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
     }
 }
 
@@ -7496,6 +7696,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
         Cmd::CapStatus { json } => cap_status_cmd(json).await,
+        Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -10065,6 +10266,43 @@ async fn recv_cmd(
                                 "flip_ready": counts.flip_ready(),
                                 "summary": counts.summary(),
                             })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::ListPending) {
+                            let mut requests = load_requests();
+                            expire_requests(&mut requests);
+                            req.reply(&json!({
+                                "ok": true,
+                                "requests": requests,
+                            })).await;
+                        } else if let ctl::ReqKind::ApproveRequest { id } = &req.kind {
+                            let id = *id;
+                            let mut requests = load_requests();
+                            expire_requests(&mut requests);
+                            if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
+                                r.status = "approved".to_string();
+                                r.granted_at = Some(crate::capability::now_secs());
+                                let peer = r.peer.clone();
+                                let cap = r.capability.clone();
+                                save_requests(&requests);
+                                // Route through the existing grant path
+                                if let Err(e) = device_set_cap(&peer, &cap, true) {
+                                    req.reject(&format!("grant failed: {e}")).await;
+                                } else {
+                                    req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap })).await;
+                                }
+                            } else {
+                                req.reject(&format!("request {id} not found or not pending")).await;
+                            }
+                        } else if let ctl::ReqKind::DenyRequest { id } = &req.kind {
+                            let id = *id;
+                            let mut requests = load_requests();
+                            expire_requests(&mut requests);
+                            if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
+                                r.status = "denied".to_string();
+                                save_requests(&requests);
+                                req.reply(&json!({ "ok": true, "id": id })).await;
+                            } else {
+                                req.reject(&format!("request {id} not found or not pending")).await;
+                            }
                         } else {
                             // Auto-warm: feed LRU for pty sessions (bounded, no leak).
                             if let ctl::ReqKind::Pty { peer, .. } = &req.kind {
