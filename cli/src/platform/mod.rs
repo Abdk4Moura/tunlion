@@ -154,6 +154,24 @@ impl Paths {
 // keep resolving unchanged.
 pub use secret_write::SecretFile;
 
+/// Host key-persistence adapter for the standalone `filament-id` crate: it
+/// forwards to `secret-write` (owner-only atomic write) and `Paths` (config
+/// dir) so identity has no dependency on this platform module. Passed to
+/// `identity::UserKey::generate` / `::load` at the CLI's call sites.
+pub struct PlatformKeyStore;
+
+impl filament_id::KeyStore for PlatformKeyStore {
+    fn write_secret(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        SecretFile::write(path, data)
+    }
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+    fn config_path(&self, relative: &str) -> PathBuf {
+        Paths::config_path(relative)
+    }
+}
+
 // --------------------------------------------------------- ServiceHost --
 
 /// The detected service manager on this platform.

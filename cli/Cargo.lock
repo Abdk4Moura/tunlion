@@ -1145,6 +1145,7 @@ dependencies = [
  "clap_mangen",
  "crossterm",
  "directories",
+ "filament-id",
  "filament-pair",
  "flate2",
  "fuser",
@@ -1180,6 +1181,18 @@ dependencies = [
  "winfsp-sys",
  "wintun",
  "zip",
+]
+
+[[package]]
+name = "filament-id"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "hkdf",
+ "ring",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

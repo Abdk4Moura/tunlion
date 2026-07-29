@@ -64,6 +64,9 @@ secret-write = { path = "../crates/secret-write" }
 # Filament-managed authorized_keys block + managed ssh keypair, decoupled from
 # the CLI's config-dir resolution. `crate::sshkeys` is a thin shim over this.
 authkeys-managed = { path = "../crates/authkeys-managed" }
+# Multi-device user identity (user key over device certs, no CA). Aliased as
+# `crate::identity`; key persistence is injected via `platform::PlatformKeyStore`.
+filament-id = { path = "../crates/filament-id" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"

@@ -27,7 +27,10 @@ mod ephemeral;
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
 mod holepunch;
-mod identity;
+// Multi-device user identity lives in the standalone `filament-id` crate; alias
+// it as `identity` so every `crate::identity::…` / `identity::…` call site keeps
+// resolving unchanged. Key persistence is injected via `platform::PlatformKeyStore`.
+pub(crate) use filament_id as identity;
 mod interact;
 mod l2;
 mod mount;
@@ -1591,7 +1594,7 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
 }
 
 fn load_owner_key() -> Option<crate::identity::UserKey> {
-    crate::identity::UserKey::load().ok().flatten()
+    crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten()
 }
 
 fn local_device_cert() -> Option<identity::DeviceCert> {
@@ -1624,7 +1627,7 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
     // device_pub; only the timestamps vary) makes the Proven-binding path reachable for
     // freshly-onboarded and already-onboarded identities alike, without a peer-store entry.
     if let (Ok(Some(uk)), Ok(overlay_pub)) =
-        (identity::UserKey::load(), crate::overlay::overlay_pubkey_bytes())
+        (identity::UserKey::load(&crate::platform::PlatformKeyStore), crate::overlay::overlay_pubkey_bytes())
     {
         if let Ok(cert) =
             identity::DeviceCert::certify(&uk, overlay_pub, identity::now_secs(), identity::CERT_TTL_SECS)
@@ -1740,7 +1743,7 @@ fn handle_identity_expose(
     let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
     if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_err() { return false; }
     // Reflection: refuse self-cert
-    if let Ok(Some(own_uk)) = crate::identity::UserKey::load() {
+    if let Ok(Some(own_uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
         if cert.user_pub == own_uk.public_key_bytes() { return false; }
     }
     // Store as provisional, then promote on link
@@ -2976,7 +2979,7 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
 async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
     match action {
         EphemeralAction::Mint { caps, audience, ttl, reuse, tag } => {
-            let uk = match crate::identity::UserKey::load()? {
+            let uk = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                 Some(uk) => uk,
                 None => bail!("no user identity. Run 'filament identity init' first."),
             };
@@ -3694,7 +3697,7 @@ async fn respond_to_auth_key_enroll_request(
     };
 
     // Verify against our trusted owner
-    let owner_pub = match crate::identity::UserKey::load() {
+    let owner_pub = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
         Ok(Some(uk)) => uk.public_key_bytes(),
         _ => {
             let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
@@ -3749,7 +3752,7 @@ async fn handle_auth_key_enroll_response(
             return;
         }
     };
-    let owner_pub = match crate::identity::UserKey::load() {
+    let owner_pub = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
         Ok(Some(uk)) => uk.public_key_bytes(),
         _ => {
             let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
@@ -4566,7 +4569,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                                                                                 );
                                                                                 if identity::verify_possession_sig(&cert.device_pub, &possession_msg, &sig_arr).is_ok() {
                                                                                     // Reflection check: cert.user_pub != own user_pub
-                                                                                    if let Some(own_uk) = identity::UserKey::load().unwrap_or(None) {
+                                                                                    if let Some(own_uk) = identity::UserKey::load(&crate::platform::PlatformKeyStore).unwrap_or(None) {
                                                                                         if cert.user_pub == own_uk.public_key_bytes() {
                                                                                             // reflection-to-self refused
                                                                                         } else {
@@ -8418,7 +8421,7 @@ async fn main() -> Result<()> {
         Cmd::Identity { action } => {
             match action {
                 IdentityAction::Init => {
-                    match identity::UserKey::load()? {
+                    match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                         Some(uk) => {
                             println!("{}", ui::paint(ui::Tone::Dim,
                                 &format!("you already have a user identity: fingerprint {}",
@@ -8426,7 +8429,7 @@ async fn main() -> Result<()> {
                             println!("  use 'filament identity show' to see it");
                         }
                         None => {
-                            let uk = identity::UserKey::generate()?;
+                            let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore)?;
                             // Seed the owner's self genesis cap header at init so
                             // authoritative capability enforcement works from the
                             // start (also healed on daemon start for older keys).
@@ -8440,7 +8443,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 IdentityAction::Show => {
-                    match identity::UserKey::load()? {
+                    match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                         None => {
                             println!("no user identity yet. Run 'filament identity init' to create one.");
                         }
@@ -8471,7 +8474,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 IdentityAction::Certify { device } => {
-                    let uk = match identity::UserKey::load()? {
+                    let uk = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                         Some(uk) => uk,
                         None => bail!("no user identity. Run 'filament identity init' first."),
                     };
@@ -8727,7 +8730,7 @@ async fn main() -> Result<()> {
             // Original device grant path (unchanged)
             device_set_cap(&device, &capability, true)?;
             // If identity layer is active, also issue an owner-signed CapOp
-            if let Ok(Some(user_key)) = crate::identity::UserKey::load() {
+            if let Ok(Some(user_key)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
                 let pk = user_key.public_key_bytes();
@@ -8856,7 +8859,7 @@ async fn main() -> Result<()> {
             // evaluate() then denies and devices_with_shell_revoked lists this
             // device; save_and_list_revoked + reconcile_shell_keys then strips
             // its managed authorized_keys block under authoritative.
-            if let Ok(Some(user_key)) = crate::identity::UserKey::load() {
+            if let Ok(Some(user_key)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
                 let pk = user_key.public_key_bytes();
@@ -10961,7 +10964,7 @@ async fn recv_cmd(
     // Unprovisioned. Healing on every daemon start makes old identities correct
     // on next `up` and new ones born correct. Tautological; widens nothing.
     if daemon {
-        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+        if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
             if ensure_self_genesis_header(&crate::settings::config_dir(), &uk) {
                 ui::debug("seeded owner self genesis capability header");
             }
@@ -11106,7 +11109,7 @@ async fn recv_cmd(
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
             if crate::ephemeral::is_armed() {
-                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                     if !c.contains(&ek) { c.push(ek); }
                 }
@@ -11955,7 +11958,7 @@ async fn recv_cmd(
         // supports 1 room/socket. This MUST run at loop top-level, not nested in
         // the signaling-reconnect Ok arm: a stable daemon (signaling never down)
         // would otherwise never subscribe and no ephemeral device could enroll.
-        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+        if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
             let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
             let armed = crate::ephemeral::is_armed();
             let subscribed = sess.channels.contains(&ek);
@@ -12460,7 +12463,7 @@ async fn recv_cmd(
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
-                } else if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                } else if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     // Enrollment channel: an ephemeral device appeared on
                     // enroll_channel(own_owner_pub). Dial it (channel-presence
                     // path, no room-join) so the auth-key handshake can run.
@@ -13776,7 +13779,7 @@ async fn recv_cmd(
                                                                 let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
                                                                 if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_ok() {
                                                                     // Reflection check
-                                                                    if let Ok(Some(own_uk)) = crate::identity::UserKey::load() {
+                                                                    if let Ok(Some(own_uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                                                                         if cert.user_pub == own_uk.public_key_bytes() {
                                                                             // self, refuse
                                                                         } else {
@@ -13793,7 +13796,7 @@ async fn recv_cmd(
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
                     }
-                } else if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                } else if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     // Enrollment channel: an ephemeral device is trying to enroll.
                     // Recognize peers on enroll_channel(own_owner_pub) and dial them.
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());

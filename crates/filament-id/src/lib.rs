@@ -4,13 +4,25 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::{json, Value};
 
-use crate::platform;
+use std::path::{Path, PathBuf};
 
 pub const CERT_TTL_SECS: u64 = 90 * 24 * 3600;
 const CERT_SIGN_DOMAIN: &[u8] = b"filament/identity-device-cert/v1";
 
-pub fn user_key_path() -> std::path::PathBuf {
-    platform::Paths::config_path("identity.ed25519")
+/// Host-provided key persistence, injected so this crate stays decoupled from
+/// the CLI's platform module. The CLI's `PlatformKeyStore` forwards to
+/// `secret-write` (owner-only atomic write) and `platform::Paths` (config dir).
+pub trait KeyStore {
+    /// Write secret `data` to `path` with owner-only permissions.
+    fn write_secret(&self, path: &Path, data: &[u8]) -> std::io::Result<()>;
+    /// Read the raw bytes at `path`.
+    fn read(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    /// Resolve a config-relative filename to an absolute path.
+    fn config_path(&self, relative: &str) -> PathBuf;
+}
+
+pub fn user_key_path(store: &dyn KeyStore) -> PathBuf {
+    store.config_path("identity.ed25519")
 }
 
 pub struct UserKey {
@@ -18,25 +30,25 @@ pub struct UserKey {
 }
 
 impl UserKey {
-    pub fn generate() -> Result<Self> {
-        let path = user_key_path();
+    pub fn generate(store: &dyn KeyStore) -> Result<Self> {
+        let path = user_key_path(store);
         if path.exists() {
             bail!("a user identity already exists ({})", path.display());
         }
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|_| anyhow!("failed to generate user identity key"))?;
-        platform::SecretFile::write(&path, pkcs8.as_ref())
+        store.write_secret(&path, pkcs8.as_ref())
             .with_context(|| format!("write user identity to {}", path.display()))?;
         let keypair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
             .map_err(|_| anyhow!("failed to load freshly-generated user key"))?;
         Ok(UserKey { keypair })
     }
 
-    pub fn load() -> Result<Option<Self>> {
-        let path = user_key_path();
+    pub fn load(store: &dyn KeyStore) -> Result<Option<Self>> {
+        let path = user_key_path(store);
         if !path.exists() { return Ok(None); }
-        let pkcs8 = std::fs::read(&path)
+        let pkcs8 = store.read(&path)
             .with_context(|| format!("read user identity from {}", path.display()))?;
         let keypair = Ed25519KeyPair::from_pkcs8(&pkcs8)
             .map_err(|_| anyhow!("user identity key is corrupt"))?;
@@ -807,7 +819,7 @@ mod tests {
     fn cmv_binds_both_fingerprints() {
         // Fails if L1 confirm MAC ever stops binding BOTH endpoint fingerprints
         // Field 8 zero is safe ONLY because cmv binds both fingerprints (comment at field 8)
-        use crate::pake::{confirm_mac, sort_fps, canonical_caps};
+        use filament_pair::{confirm_mac, sort_fps, canonical_caps};
         let k = [0x42; 32];
         let caps = canonical_caps(&["transfer".to_string()]);
         let scope = IntroScope::Device.to_byte();
@@ -817,7 +829,7 @@ mod tests {
         let (lo_ab, hi_ab) = sort_fps(fp_a, fp_b);
         let (lo_ac, hi_ac) = sort_fps(fp_a, fp_c);
         let (lo, hi) = (lo_ab, hi_ab);
-        let (send_dir, _) = crate::pake::confirm_dirs(fp_a, lo);
+        let (send_dir, _) = filament_pair::confirm_dirs(fp_a, lo);
         let mac_ab_vec = confirm_mac(&k, send_dir, lo_ab, hi_ab, &caps, scope);
         let mac_ac_vec = confirm_mac(&k, send_dir, lo_ac, hi_ac, &caps, scope);
         assert_ne!(mac_ab_vec, mac_ac_vec, "cmv must bind both fingerprints");

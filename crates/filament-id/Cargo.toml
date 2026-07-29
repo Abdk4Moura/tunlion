@@ -1,0 +1,33 @@
+# filament-id — multi-device user identity (an SSH-CA-shaped user key over
+# per-device certs), carved out of the CLI. No CA server: a user key signs
+# device certs locally, and continuity is proven peer-to-peer.
+#
+# The one coupling to the host (key persistence: where the user key lives on
+# disk and how it is written with restrictive perms) is injected through the
+# `KeyStore` trait, so this crate has zero dependency on the CLI's platform
+# module. The CLI implements `PlatformKeyStore` (secret-write + platform::Paths)
+# and passes it to `UserKey::generate` / `UserKey::load`.
+[package]
+name = "filament-id"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Multi-device user identity for Filament: user key over device certs, no CA."
+
+[dependencies]
+# Versions copied verbatim from cli/Cargo.toml.
+anyhow = "1.0.102"
+ring = "0.17"
+serde_json = "1.0.150"
+hex = "0.4"
+# The possession/cert digests and identity-expose HKDF hash with sha2 0.10 (the
+# `sha2_pake` alias, matching the PAKE tree), NOT the CLI's sha2 0.11. Kept as a
+# real dependency of the moved code (the task's dep list under-specified it).
+sha2_pake = { package = "sha2", version = "0.10" }
+hkdf = "0.12"
+
+[dev-dependencies]
+# The identity tests exercise the PAKE confirm-MAC / capability-digest helpers
+# (the CLI reaches them as `crate::pake::…`, an alias of this crate).
+filament-pair = { path = "../filament-pair" }
