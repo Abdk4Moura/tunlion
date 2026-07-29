@@ -41,7 +41,9 @@ mod capability;
 mod net;
 mod overlay;
 mod platform;
-mod pake;
+// PAKE first-pairing lives in the standalone `filament-pair` crate; alias it as
+// `pake` so every `crate::pake::…` call site keeps resolving unchanged.
+pub(crate) use filament_pair as pake;
 mod pake_ceremony;
 mod ping;
 mod sdnotify;

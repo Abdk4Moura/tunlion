@@ -1,11 +1,8 @@
-// Thin WASM shim — the real source lives at cli/src/pake/mod.rs.
-// filament-pake is publish=false; used only for browser wasm builds.
-// The shared source is SHA-identical, parity-gated (GATE4 interop).
+// Thin WASM shim — the real source now lives in the standalone `filament-pair`
+// crate (crates/filament-pair). filament-pake is publish=false; used only for
+// browser wasm builds. Re-exporting keeps the wasm-bindgen surface (mod wasm in
+// filament-pair's lib.rs) and every public fn available under `filament_pake::*`.
 //
-// Keep pake/src/bin/ as-is (adversary, native_side) for the GATE4 parity
-// test — those are built via cargo in this directory and path-include the
-// shared source too.
-
-#[path = "../../cli/src/pake/mod.rs"]
-mod core;
-pub use core::*;
+// The GATE4 parity bins (src/bin/adversary.rs, native_side.rs) `use
+// filament_pake::…` and resolve through this re-export unchanged.
+pub use filament_pair::*;

@@ -1135,6 +1135,7 @@ dependencies = [
  "clap_mangen",
  "crossterm",
  "directories",
+ "filament-pair",
  "flate2",
  "fuser",
  "futures-util",
@@ -1168,6 +1169,20 @@ dependencies = [
  "winfsp-sys",
  "wintun",
  "zip",
+]
+
+[[package]]
+name = "filament-pair"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "hmac",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "spake2",
+ "wasm-bindgen",
 ]
 
 [[package]]

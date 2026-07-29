@@ -1,0 +1,34 @@
+# filament-pair — the standalone SPAKE2 first-pairing (PAKE) core, carved out of
+# the CLI. Zero app coupling: no `crate::` imports, only external crypto deps.
+# Shared by the CLI (native rlib) and the browser (wasm32 via the `pake` shim
+# crate, which re-exports this one). Promoted from cli/src/pake/.
+#
+# Crate decision: spake2 = "=0.4.0", RustCrypto/PAKEs, pinned exact. NEVER
+# 0.5.0-pre. TODO(audit): unaudited (RustCrypto provenance, used by
+# magic-wormhole); seek an independent audit before any 1.0.
+[package]
+name = "filament-pair"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Standalone SPAKE2 PAKE core for Filament first-pairing (CLI + browser)."
+
+[dependencies]
+# Versions copied verbatim from cli/Cargo.toml so the derived K / MAC / secret
+# stay byte-identical across the CLI and browser.
+spake2 = "=0.4.0"
+# sha2 0.10 (for hkdf/hmac 0.12 trait compat), renamed to `sha2_pake` to match
+# the source's alias and avoid the CLI's sha2 0.11 name clash.
+sha2_pake = { package = "sha2", version = "0.10" }
+hkdf = "0.12"
+hmac = "0.12"
+hex = "0.4"
+rand_core = "0.6"
+getrandom = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# OsRng -> crypto.getRandomValues in the browser; wasm-bindgen surface lives in
+# the (cfg-gated) `mod wasm` inside lib.rs.
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"

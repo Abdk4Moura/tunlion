@@ -56,6 +56,8 @@ sha2_pake = { package = "sha2", version = "0.10" }
 hkdf = "0.12"
 hmac = "0.12"
 spake2 = "=0.4.0"
+# PAKE first-pairing core, carved into its own crate (zero app coupling).
+filament-pair = { path = "../crates/filament-pair" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"
