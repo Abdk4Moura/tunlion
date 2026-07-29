@@ -1,5 +1,14 @@
 # Capability authoritative-flip checklist
 
+> **FLIP THROWN — 2026-07-29 (0.7).** `cap_authoritative()` now defaults to ON:
+> capability enforcement is authoritative by default. Devices without a matching
+> grant are denied shell/transfer/mount. Opt out (legacy shadow mode) with
+> `FILAMENT_CAP_AUTHORITATIVE=0`; the env var is the rollback. The prerequisite
+> checklist below was satisfied per the evidence trail in "Validation status"
+> (full enforcement matrix proven cross-machine 2026-07-28: grant->allow,
+> revoke->deny+key-removed, deny-by-default, real reasons, rollback,
+> trust-floor, sandbox-contained reconciler). History retained below.
+
 Prerequisites for setting `FILAMENT_CAP_AUTHORITATIVE=1` (making the capability
 layer the live gate instead of shadow). Do NOT flip until every item holds. The
 first week after a flip is exactly when someone reads the denial logs to work out

@@ -108,14 +108,22 @@ pub fn save_and_list_revoked(
 }
 
 /// Returns true when capability enforcement is AUTHORITATIVE (live-gating).
-/// Read this in ONE place only, `cap_gate_effective`, the single policy site. The
-/// FLIP CRITERION lives on `ShadowCounts::flip_ready`: flip only when
-/// `la_authorized > 0` AND `la_denied == 0` AND `la_no_header == 0`. A bare total is
-/// NOT sufficient. The commit that sets this to true MUST cite the full shadow
-/// counts, INCLUDING `ld_authorized` (the WIDENING count of opens the flip newly
-/// allows); if it is nonzero, enumerate which and why. Until then, legacy decides.
+/// Read this in ONE place only, `cap_gate_effective`, the single policy site.
+///
+/// FLIP THROWN (0.7): authoritative enforcement is now the DEFAULT. Devices
+/// without a matching grant are denied shell/transfer/mount. Opt out (return to
+/// legacy shadow gating) by setting `FILAMENT_CAP_AUTHORITATIVE=0` (or `false`);
+/// unsetting the var leaves enforcement ON. The env var is the rollback.
+///
+/// Historical FLIP CRITERION (satisfied before the throw) lived on
+/// `ShadowCounts::flip_ready`: flip only when `la_authorized > 0` AND
+/// `la_denied == 0` AND `la_no_header == 0`, and the throw commit cited the full
+/// shadow counts including `ld_authorized` (the WIDENING count). See
+/// docs/cap-flip-checklist.md for the evidence trail.
 pub fn cap_authoritative() -> bool {
-    std::env::var("FILAMENT_CAP_AUTHORITATIVE").map(|x| x == "1").unwrap_or(false)
+    std::env::var("FILAMENT_CAP_AUTHORITATIVE")
+        .map(|x| x != "0" && !x.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
 }
 
 // Shadow counters bucketed by the LEGACY decision AND by three cap outcomes:
@@ -641,15 +649,24 @@ mod tests {
         // Fresh owner + unknown principal; no actual store so outcome is
         // Unprovisioned (no cap header on disk). We test the counter
         // increment path directly via cap_gate_effective.
+        //
+        // This proves BUCKETING (which (legacy, cap-outcome) pair increments
+        // which counter), not gate behavior. Since the authoritative-default
+        // flip (0.7), cap_gate_effective reads FILAMENT_CAP_AUTHORITATIVE which
+        // now defaults ON, so the restrictive gates run. We pass Proven binding
+        // + Some(u64::MAX) cert expiry so cap_authorize_proven/expired are BOTH
+        // no-ops (a valid, proven, live cert), leaving the raw cap outcome to be
+        // counted verbatim in BOTH modes. The gates' downgrade behavior is
+        // covered by their own both-branches tests in filament-cap.
         let uk = [0xaa; 32];
         // Legacy-allowed, cap denies (Unprovisioned) → la_no_header
         for action in ["shell", "mount"] {
-            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, None, None);
+            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         // Legacy-denied, cap authorizes → ld_authorized (widening)
-        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
 
         let ac = cap_action_counts();
 
@@ -692,6 +709,10 @@ mod tests {
     /// rig reading is trusted. Delta-based, since the counters are process-global.
     #[test]
     fn shadow_detector_proof_six_buckets() {
+        // Mode-independent since the 0.7 authoritative-default flip: pass
+        // Proven binding + Some(u64::MAX) expiry so the restrictive gates are
+        // no-ops and each (legacy, cap-outcome) pair is counted verbatim,
+        // whether FILAMENT_CAP_AUTHORITATIVE is on (default) or off (shadow).
         let uk = [0xaa; 32];
 
         fn snap() -> [u64; 6] {
@@ -707,7 +728,7 @@ mod tests {
 
         // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -718,7 +739,7 @@ mod tests {
 
         // (legacy_allowed=true, Denied) -> LA_DENIED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
@@ -729,7 +750,7 @@ mod tests {
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -740,7 +761,7 @@ mod tests {
 
         // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -751,7 +772,7 @@ mod tests {
 
         // (legacy_allowed=false, Denied) -> LD_DENIED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -762,7 +783,7 @@ mod tests {
 
         // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -773,7 +794,7 @@ mod tests {
 
         // Same-bucket repeat proves no cross-contamination on a second call.
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, None, None);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
         assert_eq!(after[1] - before[1], 0);

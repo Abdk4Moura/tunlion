@@ -7,6 +7,16 @@
 //! COMPILE GATE: this entire file is `#[cfg(feature = "test-hooks")]`.
 //! The compiler strips it from default/release builds, so the signaling-bypass
 //! path can NEVER end up in a published binary (security gate per Claude).
+//!
+//! CAP MODE: every filament process spawned here runs with
+//! `FILAMENT_CAP_AUTHORITATIVE=0` (shadow). These are TRANSPORT / mechanics
+//! smoke tests (byte-transparency, PTY exec, pairing, warm-hold latency) run
+//! between two FRESH, UNPROVISIONED daemons with NO cap grant. Since the 0.7
+//! authoritative-default flip, that same setup is denied-by-default, which
+//! would break these tests for a reason orthogonal to what they assert. None
+//! of them exercises a granted flow, so pinning shadow here masks no
+//! enforcement regression; cap enforcement is covered by the unit tests and
+//! the cross-machine rig, not this per-OS transport harness.
 
 #![cfg(feature = "test-hooks")]
 
@@ -205,6 +215,7 @@ fn spawn_daemon_inner(
     let stderr_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = stderr_log.clone();
     let mut child = Command::new(bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_CONFIG_DIR", config_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_LOG", "debug")
@@ -330,6 +341,7 @@ fn pair_and_transfer_smoke() {
     // Spawn send; drain stderr continuously in background to avoid SIGPIPE.
     // Also watch for the minted code prefix.
     let mut send_proc = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env(
         "FILAMENT_DIRECT_LOOPBACK_ONLY",
@@ -371,6 +383,7 @@ fn pair_and_transfer_smoke() {
     let recv_dir = h.b_dir.join("received");
     std::fs::create_dir_all(&recv_dir).expect("create recv dir");
     let mut recv_proc = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env(
         "FILAMENT_DIRECT_LOOPBACK_ONLY",
@@ -435,6 +448,7 @@ fn two_nodes_pair_each_other() {
     let server = h.server_url();
 
     let out = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .args(["--server", &server, "--help"])
         .output()
         .expect("help");
@@ -479,6 +493,7 @@ fn pty_one_shot_exec_smoke() {
 
     let pair_word = format!("pairtest-mesh-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -517,6 +532,7 @@ fn pty_one_shot_exec_smoke() {
     eprintln!("pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -582,6 +598,7 @@ fn pty_one_shot_exec_smoke() {
 
     let nonce = format!("PTY-OK-{}", std::process::id());
     let mut pty_proc = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -657,6 +674,7 @@ fn shell_daemon_live_pairing_no_restart() {
     // pick it up without a restart.
     let pair_word = format!("livescan-pair-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -695,6 +713,7 @@ fn shell_daemon_live_pairing_no_restart() {
     eprintln!("live-pairing code: {pair_code}");
 
     let mut claim = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -747,6 +766,7 @@ fn shell_daemon_live_pairing_no_restart() {
 
     let nonce = format!("LIVE-PTY-OK-{}", std::process::id());
     let mut pty_proc = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -803,6 +823,7 @@ fn warm_all_makes_first_contact_warm() {
 
     let pair_word = format!("warmtest-mesh-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -841,6 +862,7 @@ fn warm_all_makes_first_contact_warm() {
     eprintln!("pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -916,6 +938,7 @@ fn warm_all_makes_first_contact_warm() {
     // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
     eprintln!("warm_all: running filament ping --json...");
     let mut ping_proc = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -946,6 +969,7 @@ fn warm_all_makes_first_contact_warm() {
     eprintln!("warm_all: waiting 20s then re-pinging...");
     std::thread::sleep(Duration::from_secs(20));
     let mut ping_proc2 = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -971,6 +995,7 @@ fn warm_all_makes_first_contact_warm() {
     // Spawn auto-warm-OFF daemon via custom Command (spawn_daemon_inner doesn't
     // support FILAMENT_AUTO_WARM override).
     let mut daemon_a_off = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_LOG", "debug")
@@ -1065,6 +1090,7 @@ fn warm_one_shot_pty_reuse() {
 
     let pair_word = format!("warm-reuse-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -1103,6 +1129,7 @@ fn warm_one_shot_pty_reuse() {
     eprintln!("warm pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -1123,6 +1150,7 @@ fn warm_one_shot_pty_reuse() {
     // Enable daemon A to proactively warm-hold test-b: write warm-peers
     // config so the daemon's warm_hold_tick establishes ONE link.
     let set = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "set", "warm-peers", "test-b"])
         .output()
@@ -1170,6 +1198,7 @@ fn warm_one_shot_pty_reuse() {
     // establishes a warm link to test-b. Now pty should hit the warm path.
     let nonce = format!("WARM-OK-{}", std::process::id());
     let out = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -1226,6 +1255,7 @@ fn warm_one_shot_pty_instant_eof() {
     // Pair a, claim b
     let pair_word = format!("warm-eof-p{:x}", std::process::id());
     let mut create = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -1264,6 +1294,7 @@ fn warm_one_shot_pty_instant_eof() {
     eprintln!("warm-eof pair code: {pair_code}");
 
     let mut claim = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
@@ -1282,6 +1313,7 @@ fn warm_one_shot_pty_instant_eof() {
 
     // Enable warm-hold and restart daemons.
     let set = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .args(["--server", &server, "set", "warm-peers", "test-b"])
         .output()
@@ -1335,6 +1367,7 @@ fn warm_one_shot_pty_instant_eof() {
     // serve_stream must NOT tear down the pty before output arrives.
     let nonce = format!("WARM-EOF-OK-{}", std::process::id());
     let out = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
