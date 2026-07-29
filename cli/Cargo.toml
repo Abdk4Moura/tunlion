@@ -61,6 +61,9 @@ filament-pair = { path = "../crates/filament-pair" }
 # Standalone atomic owner-only secret-file writer (chmod 0600 / icacls DACL),
 # re-exported as `crate::platform::SecretFile`.
 secret-write = { path = "../crates/secret-write" }
+# Filament-managed authorized_keys block + managed ssh keypair, decoupled from
+# the CLI's config-dir resolution. `crate::sshkeys` is a thin shim over this.
+authkeys-managed = { path = "../crates/authkeys-managed" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"

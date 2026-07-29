@@ -1,0 +1,24 @@
+# authkeys-managed — filament-managed ssh auth material (the seamless
+# `filament ssh` path). Carved out of the CLI. NEVER touches the user's ~/.ssh
+# except to write/remove a clearly-marked, removable `# BEGIN/END
+# filament-managed <device>` block in authorized_keys.
+#
+# Decoupled from the CLI's config-dir resolution: every function that needs the
+# filament config root takes `config_dir: &Path` as a parameter (the caller in
+# the CLI passes `crate::settings::config_dir()`).
+[package]
+name = "authkeys-managed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Filament-managed authorized_keys block + managed ssh keypair (config-dir injected)."
+
+[dependencies]
+# Versions copied verbatim from cli/Cargo.toml.
+anyhow = "1.0.102"
+# The bootstrap-cache read/write path serializes JSON, so serde_json is a real
+# dependency of the moved code (the task's dep list under-specified it).
+serde_json = "1.0.150"
+# Atomic owner-only secret writer for the private keypair / known_hosts / cache.
+secret-write = { path = "../secret-write" }
