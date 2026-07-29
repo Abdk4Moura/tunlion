@@ -135,14 +135,23 @@ fn restrict_dacl(path: &Path) -> io::Result<()> {
     // canonical, service-safe, locale-independent principal.
     let sid = current_user_sid()?;
     let path_str = path.display().to_string();
-    let st = std::process::Command::new("icacls")
+    // Capture (not inherit) icacls' stdout: even with `/Q` it prints the noisy
+    // "Successfully processed 1 files; Failed processing 0 files" banner to the
+    // parent's stdout, which leaks into every managed-key install. Buffer it and
+    // only surface the output when the call actually fails.
+    let out = std::process::Command::new("icacls")
         .args([&path_str, "/inheritance:r", "/grant:r", &format!("*{sid}:(F)"), "/Q"])
-        .status()
+        .output()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to run icacls: {e}")))?;
-    if !st.success() {
+    if !out.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("icacls failed with exit code {:?}", st.code()),
+            format!(
+                "icacls failed with exit code {:?}: {}{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
         ));
     }
     Ok(())

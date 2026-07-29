@@ -95,6 +95,15 @@ pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> s
     Ok(())
 }
 
+/// Drop the in-process cap-store read cache. Called after the on-disk store is
+/// deleted (e.g. `filament reset`) so a same-process reader can never serve the
+/// now-gone store from memory. Idempotent.
+pub fn invalidate_cap_cache() {
+    if let Ok(mut c) = cache_init().lock() {
+        *c = None;
+    }
+}
+
 /// Persist the cap store, then return the devices whose shell keys must be
 /// reconciled. Reconciliation is a property of the WRITE: any code path that
 /// saves the cap store MUST process the returned list (gated on authoritative,
@@ -110,20 +119,22 @@ pub fn save_and_list_revoked(
 /// Returns true when capability enforcement is AUTHORITATIVE (live-gating).
 /// Read this in ONE place only, `cap_gate_effective`, the single policy site.
 ///
-/// FLIP THROWN (0.7): authoritative enforcement is now the DEFAULT. Devices
-/// without a matching grant are denied shell/transfer/mount. Opt out (return to
-/// legacy shadow gating) by setting `FILAMENT_CAP_AUTHORITATIVE=0` (or `false`);
-/// unsetting the var leaves enforcement ON. The env var is the rollback.
+/// FLIP REVERTED (0.7.1): enforcement is OPT-IN again, default OFF (legacy
+/// shadow gating). The 0.7.0 default-on flip was premature — real same-owner
+/// fleets show `flip_ready=false` (paired daemons aren't provisioned, so
+/// authoritative-by-default broke ssh/transfer/mount until every capability was
+/// manually granted). Enable authoritative enforcement explicitly by setting
+/// `FILAMENT_CAP_AUTHORITATIVE=1` (or `true`); any other value, or leaving the
+/// var unset, keeps legacy shadow gating. The env var is the opt-in switch,
+/// pending same-owner fleet-trust that makes the default-on flip safe.
 ///
-/// Historical FLIP CRITERION (satisfied before the throw) lived on
-/// `ShadowCounts::flip_ready`: flip only when `la_authorized > 0` AND
-/// `la_denied == 0` AND `la_no_header == 0`, and the throw commit cited the full
-/// shadow counts including `ld_authorized` (the WIDENING count). See
+/// Historical FLIP CRITERION lived on `ShadowCounts::flip_ready`: flip only when
+/// `la_authorized > 0` AND `la_denied == 0` AND `la_no_header == 0`. See
 /// docs/cap-flip-checklist.md for the evidence trail.
 pub fn cap_authoritative() -> bool {
     std::env::var("FILAMENT_CAP_AUTHORITATIVE")
-        .map(|x| x != "0" && !x.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+        .map(|x| x == "1" || x.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 // Shadow counters bucketed by the LEGACY decision AND by three cap outcomes:

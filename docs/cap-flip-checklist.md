@@ -1,13 +1,24 @@
 # Capability authoritative-flip checklist
 
-> **FLIP THROWN — 2026-07-29 (0.7).** `cap_authoritative()` now defaults to ON:
-> capability enforcement is authoritative by default. Devices without a matching
-> grant are denied shell/transfer/mount. Opt out (legacy shadow mode) with
-> `FILAMENT_CAP_AUTHORITATIVE=0`; the env var is the rollback. The prerequisite
-> checklist below was satisfied per the evidence trail in "Validation status"
-> (full enforcement matrix proven cross-machine 2026-07-28: grant->allow,
-> revoke->deny+key-removed, deny-by-default, real reasons, rollback,
-> trust-floor, sandbox-contained reconciler). History retained below.
+> **FLIP REVERTED — 0.7.1.** The 0.7.0 default-on throw was premature. Real
+> same-owner fleets show `flip_ready=false`: paired daemons aren't provisioned,
+> so authoritative-by-default denied the owner's OWN ssh/transfer/mount until
+> every capability was granted by hand. `cap_authoritative()` now defaults to
+> OFF (legacy shadow gating) again; authoritative enforcement is **opt-in** via
+> `FILAMENT_CAP_AUTHORITATIVE=1` (or `true`). Any other value, or leaving it
+> unset, keeps shadow gating. Everything else the flip added (self-genesis
+> header, restrictive gates, shell-key reconciler) stays; only the default
+> changed. Re-throwing the default-on flip is gated on same-owner fleet-trust
+> (auto-provision paired same-owner daemons so `flip_ready` holds on a real
+> fleet), not just the single-node evidence below.
+>
+> **Prior throw (2026-07-29, 0.7.0, now reverted).** `cap_authoritative()`
+> defaulted to ON. The single-node prerequisite checklist below was satisfied
+> per the "Validation status" evidence trail (enforcement matrix proven
+> cross-machine 2026-07-28: grant->allow, revoke->deny+key-removed,
+> deny-by-default, real reasons, rollback, trust-floor, sandbox-contained
+> reconciler) — but that evidence did not cover an unprovisioned multi-device
+> same-owner fleet, which is what broke. History retained below.
 
 Prerequisites for setting `FILAMENT_CAP_AUTHORITATIVE=1` (making the capability
 layer the live gate instead of shadow). Do NOT flip until every item holds. The

@@ -1037,6 +1037,18 @@ enum Cmd {
         #[command(subcommand)]
         action: EphemeralAction,
     },
+    /// Wipe this machine's filament state (clean slate). DESTRUCTIVE.
+    ///
+    /// Removes the local identity + overlay keys, the paired-device store, the
+    /// capability store, pending consent requests, and the managed ssh material
+    /// (private key, known_hosts, bootstrap cache), and strips the
+    /// filament-managed blocks it installed in ~/.ssh/authorized_keys. Your own
+    /// ssh keys and any non-filament lines in authorized_keys are left untouched.
+    /// Stop the daemon first (`filament down`); reset refuses while it runs.
+    ///
+    /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
+    /// from a non-TTY / scripts).
+    Reset,
 }
 
 /// Ephemeral device commands: mint auth keys, enroll as delegated.
@@ -3821,6 +3833,110 @@ fn down_cmd() -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------- reset -----
+// `filament reset`: a conservative clean-slate for the LOCAL machine. It removes
+// only filament's OWN state under the config dir (identity/overlay keys, the
+// paired-device store, the capability store, pending consent requests, the
+// managed ssh material) and strips the delimited `# BEGIN/END filament-managed
+// <device>` blocks it installed in ~/.ssh/authorized_keys. It NEVER touches the
+// user's real ssh keys or any authorized_keys lines outside those blocks.
+
+/// Remove `path` if present, pushing a human line into `wiped`. Files and
+/// directories both handled; a missing path is silently skipped (idempotent).
+fn reset_remove(path: &std::path::Path, label: &str, wiped: &mut Vec<String>) {
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path).is_ok()
+    } else if path.exists() {
+        std::fs::remove_file(path).is_ok()
+    } else {
+        false
+    };
+    if removed {
+        wiped.push(format!("{label}  ({})", path.display()));
+    }
+}
+
+fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
+    // 1. Refuse while the daemon runs: reset yanks the keys and device store out
+    //    from under a live acceptor. Make the user stop it explicitly.
+    if let Some(pid) = daemon_alive() {
+        bail!("the filament daemon is running (pid {pid}); run `filament down` first, then `filament reset`");
+    }
+
+    // 2. Confirm (destructive). ui_caps.confirm honors the global -y/--yes and
+    //    REFUSES from a non-TTY without it, exactly the required behavior.
+    ui_caps.confirm("wipe ALL local filament state (identity, devices, caps, managed ssh keys) on this machine")?;
+
+    let cfg = crate::settings::config_dir();
+    let mut wiped: Vec<String> = Vec::new();
+
+    // 3. Strip the managed authorized_keys blocks BEFORE devices.json is gone,
+    //    so we know every petname whose block filament may have installed. Only
+    //    the delimited `# BEGIN/END filament-managed <device>` blocks are removed;
+    //    everything else in authorized_keys is preserved verbatim.
+    let ak_path = crate::sshkeys::authorized_keys_path();
+    if let Ok(existing) = std::fs::read_to_string(&ak_path) {
+        let mut content = existing.clone();
+        let mut stripped: Vec<String> = Vec::new();
+        for (name, _) in devices_load() {
+            if crate::sshkeys::has_block(&content, &name) {
+                content = crate::sshkeys::strip_block(&content, &name);
+                stripped.push(name);
+            }
+        }
+        if content != existing {
+            // Best-effort restrictive write (owner-only), same as the installer.
+            if crate::platform::SecretFile::write_str(&ak_path, &content).is_ok() {
+                wiped.push(format!(
+                    "managed authorized_keys blocks: {}  ({})",
+                    stripped.join(", "),
+                    ak_path.display()
+                ));
+            } else {
+                ui::say(&ui::paint(
+                    ui::Tone::Warn,
+                    &format!("  could not rewrite {} — leaving it untouched", ak_path.display()),
+                ));
+            }
+        }
+    }
+
+    // 4. Remove filament's own state files. Each is filament-authored; a missing
+    //    file is a silent no-op. Explicit list (NOT a blanket rmdir of the config
+    //    dir) so a mis-set FILAMENT_CONFIG_DIR can never take out unrelated files.
+    reset_remove(&cfg.join("identity.ed25519"), "user identity key", &mut wiped);
+    reset_remove(&cfg.join("overlay.ed25519"), "overlay key", &mut wiped);
+    reset_remove(&cfg.join("devices.json"), "paired-device store (device certs)", &mut wiped);
+    reset_remove(&cfg.join("caps.json"), "capability store", &mut wiped);
+    reset_remove(&cfg.join("requests.json"), "pending consent requests", &mut wiped);
+    reset_remove(&cfg.join("expose.json"), "exposed-service records", &mut wiped);
+    reset_remove(&cfg.join("mounts.json"), "mount records", &mut wiped);
+    reset_remove(&cfg.join("l2-allow.json"), "L2 forward allowlist", &mut wiped);
+    reset_remove(&cfg.join("signaling-dns.json"), "signaling DNS cache", &mut wiped);
+    reset_remove(&cfg.join("peerconf"), "per-peer settings", &mut wiped);
+    reset_remove(&cfg.join("config"), "global settings", &mut wiped);
+    reset_remove(&cfg.join("diag.jsonl"), "diagnostics log", &mut wiped);
+    reset_remove(&cfg.join("mount-profiles"), "saved mount profiles", &mut wiped);
+    // Managed ssh material (private key, known_hosts pins, bootstrap cache) lives
+    // under {config}/ssh — filament-authored, distinct from the user's ~/.ssh.
+    reset_remove(&cfg.join("ssh"), "managed ssh material (key, known_hosts, cache)", &mut wiped);
+
+    // 5. Invalidate the in-process cap-store read cache so a same-process reader
+    //    can't serve the just-deleted store from memory.
+    crate::capability::invalidate_cap_cache();
+
+    if wiped.is_empty() {
+        ui::say("  nothing to wipe — no local filament state found");
+    } else {
+        ui::say(&format!("  {} wiped local filament state:", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+        for line in &wiped {
+            ui::say(&format!("    - {line}"));
+        }
+        ui::say("  this machine is now a clean slate (re-pair / `filament identity init` to start over)");
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------ introduce ----
@@ -8196,7 +8312,16 @@ async fn main() -> Result<()> {
             s
         };
         if !first.starts_with('-') && !cmd_names.contains(first.as_str()) {
-            if std::path::Path::new(first).exists() {
+            if first == "help" {
+                // `help` / `help <sub>` as an alias for `--help`. clap's built-in
+                // `help` subcommand is not surfaced by `get_subcommands()` on the
+                // un-built command, so it never lands in `cmd_names` and the
+                // unknown-token guard below would otherwise reject it. Rewrite it
+                // to the long-help flag: `help` -> `--help`, `help ssh` ->
+                // `ssh --help`.
+                argv.remove(1); // drop the "help" token
+                argv.push("--help".into());
+            } else if std::path::Path::new(first).exists() {
                 argv.insert(1, "send".into());
                 argv.push("--code".into());
             } else if looks_like_pake_code(first) {
@@ -8233,13 +8358,28 @@ async fn main() -> Result<()> {
                     .min_by_key(|(d, _)| *d)
                     .map(|(_, c)| c.clone());
                 eprintln!("filament: unknown command or device '{first}'");
-                if let Some(h) = hint {
+                if first == "init" {
+                    // There is no top-level `init`; the user almost certainly
+                    // wants to create the user identity key.
+                    eprintln!("  did you mean `filament identity init`?");
+                } else if let Some(h) = hint {
                     eprintln!("  did you mean '{h}'?");
                 }
                 eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
                 std::process::exit(2);
             }
         }
+    }
+    // Papercut: `devices remove <x>` — `remove` is not a `devices` subcommand.
+    // clap's own did-you-mean points at `rename` (nearest by edit distance), but
+    // the semantic match for "remove a device" is `forget`. Intercept and say so
+    // before clap emits its less-helpful suggestion.
+    if argv.get(1).map(String::as_str) == Some("devices")
+        && argv.get(2).map(String::as_str) == Some("remove")
+    {
+        eprintln!("filament: `devices remove` is not a command");
+        eprintln!("  did you mean `filament devices forget <name>`?");
+        std::process::exit(2);
     }
     let cli = Cli::parse_from(argv);
     let ui_caps = UiCapability::from_cli(&cli);
@@ -8531,6 +8671,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
+        Cmd::Reset => reset_cmd(&ui_caps),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, relay).await,
         Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
         Cmd::Devices { action, json } => {
