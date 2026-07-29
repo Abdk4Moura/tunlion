@@ -23,6 +23,7 @@
 [package]
 name = "filament-cap"
 version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Abdk4Moura/filament"
