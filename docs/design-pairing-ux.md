@@ -183,6 +183,72 @@ only with a human present. Legacy devices migrate into review, not into trust. A
 invariant behind all of it: every default capability carries its own scope, because a
 capability that can name an arbitrary resource is not a capability, it is an account.
 
+## User-less devices: identity is opt-in, never forced
+
+A device must be fully functional with **no user identity at all**. Identity is an
+opt-in layer that *adds* fleet auto-trust; it is never a precondition for using
+filament. (0.7.0 violated this — authoritative-by-default made "create a user first"
+feel mandatory. It isn't.)
+
+Three tiers:
+1. **No identity — "no account" mode (the original pitch).** `filament video.mp4` →
+   speak a code → the other side claims it; `filament pair phone` remembers a specific
+   device. **Consent-gated, not capability-gated**: you approve each incoming action.
+   The capability layer never gates this path. Works forever with zero identity.
+2. **User identity (opt-in) — the fleet.** Add an identity and your own devices
+   auto-trust within scoped defaults.
+3. **Inter-user shares** layer on top of either.
+
+A user-less device lives in "explicit consent per action" mode; you opt into identity
+only when you want your own fleet to stop asking. The account-free onboarding is a
+feature, not a gap.
+
+## Approvals: pull-safe now, push-better later
+
+Every approval in this design — a fleet join, a deliberate-tier grant, an inter-user
+share — is **asynchronous and often cross-device** (the action starts on one device,
+the approval happens on a primary). Unlike `sudo` or a git credential helper, which
+prompt synchronously in the context you're already in, filament cannot assume the human
+is watching the granting device. And it has **no persistent notification channel yet**
+(the tray/companion app is a future feature).
+
+So the rule: **approvals are pull-safe now, push-better later.**
+- **The substrate is the consent queue** (`filament requests` — list/approve/deny).
+  Every approval lands there durably. With zero notification channel you can
+  `filament requests` on a primary and act. This is the sudo-equivalent: it waits for
+  the human, in a queue instead of a blocked terminal.
+- **Notify hooks fire OS-native notifications now** as the stopgap (`notify-send` /
+  Windows toast / `osascript`) — the consent-notify hooks already exist; wiring them to
+  a desktop toast closes most of the gap before any app ships.
+- **The tray/applet is a delivery upgrade, not a prerequisite.** No flow may work
+  *only* with push; everything routes through the queue first, push is enhancement.
+
+## Worked example: headless cloud fleet via an auth-key
+
+Scenario: a user wants all his devices in one mesh, everything reachable, and shell into
+every cloud box. You can't interactively pair 30 VMs — the auth-key (pre-auth
+self-enrollment) is the primitive. Same shape as `tailscale up --authkey`.
+
+```
+# on his primary, once — the ONE deliberate act:
+$ filament mint --fleet --shell --fleet-open --ttl 1h
+  ⚠ devices with this key can SHELL your fleet and reach ALL fleet ports.
+    confirm on this device: [y/N] y
+  fk_7b7e03e8_9d2a…   (valid 1h)
+
+# one line in cloud-init / Ansible / Dockerfile for every VM:
+  curl -fsSL https://filament.autumated.com/install | sh && \
+    filament identity join --key fk_7b7e03e8_9d2a… && filament up --shell
+```
+
+The security model holds: `shell` + `fleet-open` (reach-all-ports) are the deliberate
+tier, so **minting the key is the single deliberate decision** (interactive confirm on
+the primary), not one per box; `mint --fleet` *without* those flags gives the scoped
+defaults. Short TTL for the provisioning burst + short auto-renewed enrolled certs mean
+a leaked key or a decommissioned box **ages out** — no chasing 30 machines to revoke.
+Interactive primary-approval is for phones/laptops; the auth-key is for headless/scripted
+fleets; the two paths coexist.
+
 ## Open UX questions (next round)
 
 - **Inbox / share-root defaults.** Where is the default transfer inbox and the default
