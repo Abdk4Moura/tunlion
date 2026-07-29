@@ -122,10 +122,9 @@ impl DeviceCert {
         let dp = hex::decode(v["devicePub"].as_str()?).ok()?;
         let up = hex::decode(v["userPub"].as_str()?).ok()?;
         let sg = hex::decode(v["sig"].as_str()?).ok()?;
-        if dp.len()!=32||up.len()!=32||sg.len()!=64 { return None; }
-        let mut d=[0u8;32]; d.copy_from_slice(&dp);
-        let mut u=[0u8;32]; u.copy_from_slice(&up);
-        let mut s=[0u8;64]; s.copy_from_slice(&sg);
+        let d: [u8; 32] = dp.try_into().ok()?;
+        let u: [u8; 32] = up.try_into().ok()?;
+        let s: [u8; 64] = sg.try_into().ok()?;
         Some(DeviceCert{device_pub:d,user_pub:u,expires:v["expires"].as_u64()?,issued:v["issued"].as_u64()?,sig:s})
     }
 }

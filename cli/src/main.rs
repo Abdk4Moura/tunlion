@@ -20,6 +20,9 @@ mod ctl;
 mod diag;
 mod direct;
 mod doctor;
+/// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
+/// self-enrollment, and delegated principal ceiling enforcement.
+mod ephemeral;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
@@ -493,6 +496,9 @@ enum Cmd {
         /// Override the offered file name (for stdin '-', or a single file)
         #[arg(long)]
         name: Option<String>,
+        /// Enroll as delegated principal using an auth key file before sending
+        #[arg(long, hide = true)]
+        auth_key: Option<String>,
     },
     /// Receive files from a peer (browser or CLI).
     ///
@@ -769,6 +775,9 @@ enum Cmd {
         peer: String,
         /// Remote port on the peer's localhost
         rport: u16,
+        /// Enroll as delegated principal using an auth key file before connecting
+        #[arg(long, hide = true)]
+        auth_key: Option<String>,
     },
     /// Connect stdio to a service a peer EXPOSED on its overlay address, over L3.
     ///
@@ -1016,6 +1025,43 @@ enum Cmd {
     Requests {
         #[command(subcommand)]
         action: Option<RequestsAction>,
+    },
+    /// Mint auth keys or enroll as an ephemeral delegated device.
+    #[command(hide = true)]
+    Ephemeral {
+        #[command(subcommand)]
+        action: EphemeralAction,
+    },
+}
+
+/// Ephemeral device commands: mint auth keys, enroll as delegated.
+#[derive(Subcommand)]
+enum EphemeralAction {
+    /// Mint a new auth key signed by your user identity key.
+    Mint {
+        /// Capabilities to grant (comma-separated: shell,transfer,deploy,etc.)
+        #[arg(long, value_delimiter = ',')]
+        caps: Vec<String>,
+        /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
+        #[arg(long, value_delimiter = ',')]
+        audience: Vec<String>,
+        /// Time-to-live in seconds (max 30 days)
+        #[arg(long, default_value = "86400")]
+        ttl: u64,
+        /// Reuse: Once, N(N), or Reusable
+        #[arg(long, default_value = "Once")]
+        reuse: String,
+        /// Human-readable tag for the use case
+        #[arg(long, default_value = "ci")]
+        tag: String,
+    },
+    /// Enroll as an ephemeral delegated device using an auth key.
+    Enroll {
+        /// Path to the auth key JSON file, or the raw JSON string
+        auth_key: String,
+        /// Target peer display name or channel (the owner device to enroll at)
+        #[arg(long)]
+        to: Option<String>,
     },
 }
 
@@ -2924,6 +2970,839 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     Ok(())
 }
 
+/// CLI handler for `filament ephemeral`
+async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
+    match action {
+        EphemeralAction::Mint { caps, audience, ttl, reuse, tag } => {
+            let uk = match crate::identity::UserKey::load()? {
+                Some(uk) => uk,
+                None => bail!("no user identity. Run 'filament identity init' first."),
+            };
+            let rng = ring::rand::SystemRandom::new();
+            let mut seed = [0u8; 32];
+            ring::rand::SecureRandom::fill(&rng, &mut seed).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let enroll_pub: [u8; 32] = ring::signature::KeyPair::public_key(&enroll_kp).as_ref().try_into().unwrap();
+            let audience_pubs: Vec<[u8; 32]> = audience.iter()
+                .map(|s| {
+                    let b = hex::decode(s).map_err(|e| anyhow::anyhow!("audience hex: {}", e))?;
+                    let arr: [u8; 32] = b.try_into().map_err(|_| anyhow::anyhow!("audience key must be 32 bytes"))?;
+                    Ok(arr)
+                })
+                .collect::<Result<_>>()?;
+            let reuse = match reuse.to_lowercase().as_str() {
+                "once" => crate::ephemeral::Reuse::Once,
+                "reusable" => crate::ephemeral::Reuse::Reusable,
+                s if s.starts_with("n(") || s.starts_with('n') => {
+                    let num: u32 = s.trim_start_matches('n').trim_start_matches('(').trim_end_matches(')').parse()
+                        .map_err(|_| anyhow::anyhow!("invalid reuse count"))?;
+                    crate::ephemeral::Reuse::N(num)
+                }
+                _ => bail!("invalid reuse: {reuse} (Once, N(3), Reusable)"),
+            };
+            let ak = crate::ephemeral::AuthKey::mint(uk.keypair(), enroll_pub, caps, audience_pubs, ttl, reuse, tag)?;
+            let json = serde_json::to_string_pretty(&serde_json::json!({
+                "auth_key": ak.to_json(),
+                "enroll_private_key": hex::encode(seed),
+            }))?;
+            println!("{}", json);
+            eprintln!("{} auth key minted — save the JSON above. The enroll_private_key proves possession.",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()));
+            // Arm the local daemon so it joins the enrollment room
+            let ak = crate::ephemeral::AuthKey::from_json(&serde_json::from_str::<serde_json::Value>(&json)?.get("auth_key").unwrap_or(&serde_json::Value::Null))
+                .ok_or_else(|| anyhow::anyhow!("failed to re-parse minted auth key"))?;
+            if ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await.is_some() {
+                ui::debug("local daemon armed for enrollment");
+            } else {
+                ui::say(&format!("  {} no local daemon — enrollment room not armed (start 'filament up' first)",
+                    ui::paint(ui::Tone::Dim, "·")));
+            }
+            Ok(())
+        }
+        EphemeralAction::Enroll { auth_key, to } => {
+            enroll_cmd(server, &auth_key, to, relay).await
+        }
+    }
+}
+
+async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, relay: bool) -> Result<()> {
+    use crate::ephemeral::AuthKey;
+
+    let v: serde_json::Value = {
+        let ak_str = if std::path::Path::new(auth_key_json).exists() {
+            std::fs::read_to_string(auth_key_json)?
+        } else {
+            auth_key_json.to_string()
+        };
+        serde_json::from_str(&ak_str)?
+    };
+    let ak = AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)).ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+    let enroll_seed = v.get("enroll_private_key")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key in auth key JSON"))?;
+    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key seed"))?;
+    let mut dseed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+
+    ui::say(&format!("{} auth key loaded (caps: {:?}, issuer: {})",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        hex::encode(&ak.issuer[..4])));
+
+    let my_uid = mk_uid("e");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+
+    // Join enrollment rendezvous channel derived from owner's public key.
+    // Enroller sets its own room (so signals route) + subscribes to the
+    // enrollment channel. Discovery via KnownPeer on shared channel.
+    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(format!("enrollup-{}", fresh_secret()));
+    sess.channels = vec![enroll_chan.clone()];
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+
+    let mut conn = Conn::for_command(
+        server,
+        sio.clone(),
+        tx.clone(),
+        my_uid,
+        relay,
+        to_name,
+        false,
+        direct::direct_enabled(),
+    );
+
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown::arm_force_exit(130, shutdown::grace());
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
+
+    let started = Instant::now();
+    let enroll_deadline = Duration::from_secs(60);
+
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= enroll_deadline {
+            bail!("enrollment timed out after {}s (no response from peer)", enroll_deadline.as_secs());
+        }
+
+        let slice = Duration::from_secs(2).min(enroll_deadline.saturating_sub(elapsed));
+        let ev = match tokio::time::timeout(slice, rx.recv()).await {
+            Ok(Some(ev)) => Some(ev),
+            Ok(None) => bail!("signaling channel closed"),
+            Err(_) => None,
+        };
+
+        sess.tick(&sio).await;
+
+        let Some(ev) = ev else { continue };
+
+        match ev {
+            Ev::Welcome(v) => {
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers {
+                        conn.maybe_adopt(p, false).await?;
+                    }
+                }
+            }
+            Ev::PeerJoined(v) => {
+                conn.maybe_adopt(&v, false).await?;
+            }
+            Ev::KnownPeer(v) => {
+                // The owner daemon is present on the enroll channel. DIAL it as
+                // the IMPOLITE peer (offerer): the owner answers via
+                // ensure_responder (forced polite) and cannot reliably learn of
+                // a late-arriving enroller from server presence, so the enroller
+                // MUST drive the offer regardless of uid ordering.
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
+                    && v["channel"].as_str() == Some(enroll_chan.as_str())
+                {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                        if conn.active.is_none() { conn.active = Some(pid); }
+                    }
+                }
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
+                }
+                if conn.active.is_none() {
+                    conn.active = Some(pid.clone());
+                }
+
+                crate::ephemeral::register_enrollment(
+                    pid.clone(),
+                    enroll_seed,
+                    dseed,
+                    device_pub,
+                    ak.clone(),
+                );
+
+                let _ = t.send_control(&json!({
+                    "type": "identity-auth-key-enroll-request",
+                    "auth_key": ak.to_json(),
+                    "device_pub": hex::encode(device_pub),
+                })).await;
+
+                ui::say(&format!("  {} sent enrollment request to {}",
+                    ui::paint(ui::Tone::Dim, "->"),
+                    pid));
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                let device_cert = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(
+                                    &pid, nonce_arr, verifier_pub, &device_cert,
+                                ) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-auth-key-enroll-ack") => {
+                    let name = v["name"].as_str().unwrap_or("ephemeral-device");
+                    ui::say(&format!("{} enrolled as ephemeral device '{}' (device_pub: {})",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        name,
+                        hex::encode(device_pub)));
+                    return Ok(());
+                }
+                Some("identity-auth-key-enroll-error") => {
+                    bail!("enrollment rejected: {}", v["reason"].as_str().unwrap_or("unknown reason"));
+                }
+                _ => {}
+            },
+            Ev::Interrupted => bail!("cancelled"),
+            Ev::SignalingDown(reason) => {
+                bail!("signaling connection lost: {reason}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Enroll as delegated + send files in one session.
+/// Loads auth key, joins enrollment channel, completes handshake, then sends
+/// files over the enrolled transport. The owner's daemon applies the ceiling.
+async fn enroll_and_send_cmd(
+    server: &str,
+    auth_key_path: String,
+    to_name: Option<String>,
+    paths: Vec<String>,
+    relay: bool,
+    remember: Option<String>,
+) -> Result<()> {
+    // Load auth key
+    let v: serde_json::Value = {
+        let ak_str = if std::path::Path::new(&auth_key_path).exists() {
+            std::fs::read_to_string(&auth_key_path)?
+        } else {
+            auth_key_path.clone()
+        };
+        serde_json::from_str(&ak_str)?
+    };
+    let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
+        .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+    let enroll_seed = v.get("enroll_private_key")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
+    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+    let mut dseed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+
+    ui::say(&format!("  {} enrolling as delegated (caps: {:?})",
+        ui::paint(ui::Tone::Dim, "->"),
+        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+
+    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let my_uid = mk_uid("a");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.channels = vec![enroll_chan.clone()];
+    sess.room = Some(format!("enrollup-{}", fresh_secret()));
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+
+    let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
+    crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
+
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
+
+    let started = Instant::now();
+    let deadline = Duration::from_secs(60);
+
+    loop {
+        if started.elapsed() >= deadline {
+            bail!("enrollment timed out after {}s", deadline.as_secs());
+        }
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let Ok(Some(ev)) = ev else {
+            // Check if we have a path to send — enrollment may already be done
+            if conn.active.is_some() {
+                break;
+            }
+            continue;
+        };
+        match ev {
+            Ev::Welcome(v) => {
+                // The owner daemon is already in the enroll room; the server hands
+                // us its roster here. Dial each peer (owner answers) so rendezvous
+                // does not depend on a later peer-joined we would otherwise miss.
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers { conn.maybe_adopt(p, true).await?; }
+                }
+            }
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
+            Ev::KnownPeer(v) => {
+                // Enroller drives: dial the owner daemon (present on the enroll
+                // channel) as the IMPOLITE offerer; the owner answers via
+                // ensure_responder. Server presence does not reliably notify the
+                // pre-existing owner of a late enroller, so we must initiate.
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
+                    && v["channel"].as_str() == Some(enroll_chan.as_str())
+                {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                        if conn.active.is_none() { conn.active = Some(pid); }
+                    }
+                }
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
+                }
+                if conn.active.is_none() { conn.active = Some(pid.clone()); }
+                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, dseed, device_pub, ak.clone());
+                let _ = t.send_control(&json!({
+                    "type": "identity-auth-key-enroll-request",
+                    "auth_key": ak.to_json(),
+                })).await;
+                ui::say(&format!("  {} enrollment request sent", ui::paint(ui::Tone::Dim, "->")));
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        let cert_val = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, &cert_val) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-auth-key-enroll-ack") => {
+                    let dp_hex = v["device_pub"].as_str().unwrap_or("?");
+                    ui::say(&format!("  {} enrolled (device_pub: {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), &dp_hex[..16]));
+                    // Enrollment complete — break to send files
+                    conn.active = Some(pid.clone());
+                    break;
+                }
+                Some("identity-auth-key-enroll-error") => {
+                    bail!("enrollment denied: {}", v["reason"].as_str().unwrap_or("unknown"));
+                }
+                _ => {}
+            },
+            Ev::Interrupted => bail!("interrupted"),
+            _ => {}
+        }
+    }
+
+    // Enrollment complete — now send files over the enrolled transport.
+    // The owner's daemon applies the ceiling against auth_key.caps.
+    ui::say(&format!("  {} sending {} file(s)", ui::paint(ui::Tone::Dim, "->"), paths.len()));
+    let active_pid = conn.active.as_ref().cloned().unwrap_or_default();
+    let t = conn.transport_of(&active_pid)
+        .ok_or_else(|| anyhow::anyhow!("no transport after enrollment"))?;
+    for path in &paths {
+        let data = tokio::fs::read(path).await?;
+        let name = std::path::Path::new(path).file_name()
+            .and_then(|n| n.to_str()).unwrap_or("file");
+        let id = format!("ak-{}", paths.iter().position(|p| p == path).unwrap_or(0));
+
+        // Send file offer using the standard protocol
+        let offer = crate::protocol::offer_msg(&id, 0, name, data.len() as u64, None, None, false);
+        if let Err(e) = t.send_control(&offer).await {
+            bail!("failed to send file offer for {name}: {e}");
+        }
+
+        // Wait for accept/decline (30s)
+        let offer_start = Instant::now();
+        let mut accepted = false;
+        loop {
+            if offer_start.elapsed() >= Duration::from_secs(30) {
+                bail!("file offer for {name} timed out (no accept/decline)");
+            }
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            let Ok(Some(ev)) = ev else { continue; };
+            if let Ev::Control(ref pid, ref v) = ev {
+                if pid == &active_pid && v["id"].as_str() == Some(&id) {
+                    match v["type"].as_str() {
+                        Some("file-accept") => { accepted = true; break; }
+                        Some("file-decline") => {
+                            bail!("file {name} declined: {}", v["reason"].as_str().unwrap_or("not authorized"));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if matches!(ev, Ev::Interrupted) { bail!("interrupted"); }
+        }
+        if !accepted {
+            bail!("transfer of {name} not accepted");
+        }
+
+        // Write data chunks via send_frame (sid=0, offset-incremented)
+        let total = data.len();
+        let max_payload = t.max_payload().max(1024);
+        let mut sent = 0usize;
+        while sent < total {
+            let end = total.min(sent + max_payload);
+            let chunk = &data[sent..end];
+            t.send_frame(0, sent as u64, chunk).await.map_err(|e| {
+                anyhow::anyhow!("data channel failed during transfer of {name} (sent {sent}/{total}): {e}")
+            })?;
+            sent = end;
+        }
+        let _ = t.flush().await;
+        // File-end marker so the receiver finalizes + hashes the complete file.
+        // Must match the sid declared in the offer (0).
+        t.send_control(&crate::protocol::end_msg(&id, 0)).await
+            .map_err(|e| anyhow::anyhow!("failed to send file-end for {name}: {e}"))?;
+        ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, total));
+    }
+    if let Some(name) = remember {
+        // Not stored as known device — delegated is ephemeral
+        ui::say(&format!("  {} delegated devices are ephemeral (--remember for enrollment not stored)", ui::paint(ui::Tone::Dim, "·")));
+        let _ = name;
+    }
+    Ok(())
+}
+
+/// Enroll as delegated + open shell in one session.
+/// Same flow as enroll_and_send_cmd but opens an l2 shell instead of sending files.
+async fn enroll_and_netcat_cmd(
+    server: &str,
+    auth_key_path: String,
+    to_name: Option<String>,
+    rport: u16,
+    relay: bool,
+) -> Result<()> {
+    // Load auth key (same as enroll_and_send_cmd)
+    let v: serde_json::Value = {
+        let ak_str = if std::path::Path::new(&auth_key_path).exists() {
+            std::fs::read_to_string(&auth_key_path)?
+        } else {
+            auth_key_path.clone()
+        };
+        serde_json::from_str(&ak_str)?
+    };
+    let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
+        .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
+    let enroll_seed = v.get("enroll_private_key")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s).ok())
+        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
+    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
+    let mut dseed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+
+    ui::say(&format!("  {} enrolling as delegated (caps: {:?})",
+        ui::paint(ui::Tone::Dim, "->"),
+        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+
+    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    let my_uid = mk_uid("n");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.channels = vec![enroll_chan.clone()];
+    sess.room = Some(format!("enrollup-{}", fresh_secret()));
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
+
+    let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
+    crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
+
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move { let _ = tokio::signal::ctrl_c().await; let _ = tx.send(Ev::Interrupted); });
+    }
+
+    let started = Instant::now();
+    let deadline = Duration::from_secs(60);
+
+    loop {
+        if started.elapsed() >= deadline { bail!("enrollment timed out"); }
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let Ok(Some(ev)) = ev else {
+            if conn.active.is_some() { break; }
+            continue;
+        };
+        match ev {
+            Ev::Welcome(v) => {
+                // The owner daemon is already in the enroll room; the server hands
+                // us its roster here. Dial each peer (owner answers) so rendezvous
+                // does not depend on a later peer-joined we would otherwise miss.
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers { conn.maybe_adopt(p, true).await?; }
+                }
+            }
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
+            Ev::KnownPeer(v) => {
+                // Enroller drives: dial the owner daemon (present on the enroll
+                // channel) as the IMPOLITE offerer; the owner answers via
+                // ensure_responder. Server presence does not reliably notify the
+                // pre-existing owner of a late enroller, so we must initiate.
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str())
+                    && v["channel"].as_str() == Some(enroll_chan.as_str())
+                {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                        if conn.active.is_none() { conn.active = Some(pid); }
+                    }
+                }
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) { l.transport = Some(t.clone()); l.presence = Presence::Ready; }
+                if conn.active.is_none() { conn.active = Some(pid.clone()); }
+                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, dseed, device_pub, ak.clone());
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-request", "auth_key": ak.to_json()})).await;
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        let cert_val = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(&pid, nonce_arr, verifier_pub, &cert_val) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("identity-auth-key-enroll-ack") => {
+                    let dp_hex = v["device_pub"].as_str().unwrap_or("?");
+                    ui::say(&format!("  {} enrolled (device_pub: {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), &dp_hex[..16]));
+                    conn.active = Some(pid.clone());
+                    break;
+                }
+                Some("identity-auth-key-enroll-error") => {
+                    bail!("enrollment denied: {}", v["reason"].as_str().unwrap_or("unknown"));
+                }
+                _ => {}
+            },
+            Ev::Interrupted => bail!("interrupted"),
+            _ => {}
+        }
+    }
+
+    ui::say(&format!("  {} opening shell to port {}", ui::paint(ui::Tone::Dim, "->"), rport));
+    let active_pid = conn.active.as_ref().cloned().unwrap_or_default();
+    let t = conn.transport_of(&active_pid)
+        .ok_or_else(|| anyhow::anyhow!("no transport after enrollment"))?;
+    // Send l2-open request for shell on rport
+    let r = t.send_control(&json!({
+        "type": "l2-open",
+        "host": "127.0.0.1",
+        "rport": rport,
+    })).await;
+    match r {
+        Ok(()) => {
+            ui::say(&format!("  {} shell request sent", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            // Wait for l2-open-ack or close
+            let shell_start = Instant::now();
+            loop {
+                if shell_start.elapsed() >= Duration::from_secs(30) {
+                    bail!("shell request timed out (no response from owner)");
+                }
+                let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+                let Ok(Some(ev)) = ev else { continue; };
+                if let Ev::Control(ref pid, ref v) = ev {
+                    if pid == &active_pid {
+                        match v["type"].as_str() {
+                            Some("l2-open-ack") => {
+                                ui::say(&format!("  {} shell authorized (sid {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), v["sid"]));
+                                break;
+                            }
+                            Some("l2-close") => {
+                                bail!("shell refused: {}", v["err"].as_str().unwrap_or("not authorized"));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if matches!(ev, Ev::Interrupted) { bail!("interrupted"); }
+            }
+        }
+        Err(e) => bail!("failed to send shell request: {e}"),
+    }
+    Ok(())
+}
+
+/// Respond to an identity-auth-key-enroll-request with a nonce challenge.
+/// Step 1: rate-limit BEFORE expensive ops (anti-flood).
+/// Step 2: verify auth key against owner.
+/// Step 3: generate CSPRNG nonce, store, send challenge.
+async fn respond_to_auth_key_enroll_request(
+    conn: &mut Conn,
+    pid: String,
+    v: serde_json::Value,
+) {
+    let Some(t) = conn.transport_of(&pid) else { return };
+
+    // Rate-limit FIRST — keyed on pid, counts EVERY request including garbage.
+    // An attacker sending unparseable JSON is bounded here, before parse cycles.
+    if let Err(e) = crate::ephemeral::check_rate_limit(&pid) {
+        ui::debug(&format!("enroll request rate-limited: {e}"));
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+        return;
+    }
+
+    // Enroll-and-use is only COHERENT under authoritative capability enforcement:
+    // in shadow mode a delegated principal's ceiling does not gate the legacy
+    // path, so admitting one yields a hollow "enrolled" that then can't act (and
+    // could even be over-permitted). Refuse at this boundary with an explicit,
+    // non-oracle reason (config state, not key validity) so the operator knows
+    // exactly what to change, instead of a silent later decline.
+    if !crate::capability::cap_authoritative() {
+        ui::debug("enroll request declined: capability enforcement not authoritative (set FILAMENT_CAP_AUTHORITATIVE=1)");
+        let _ = t.send_control(&json!({
+            "type": "identity-auth-key-enroll-error",
+            "reason": "delegated principal: capability enforcement not authoritative"
+        })).await;
+        return;
+    }
+
+    let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
+        Some(ak) => ak,
+        None => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+
+    // Verify against our trusted owner
+    let owner_pub = match crate::identity::UserKey::load() {
+        Ok(Some(uk)) => uk.public_key_bytes(),
+        _ => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+    let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
+        Ok(pk) => pk,
+        Err(e) => {
+            ui::debug(&format!("enroll request overlay-key error: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+    if let Err(e) = ak.verify_against_owner(&owner_pub, &verifier_pub) {
+        ui::debug(&format!("enroll request auth-key rejected: {e}"));
+        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+        return;
+    }
+
+    // Generate nonce challenge — include daemon's device cert so the enroller
+    // can verify it chains to the auth key's issuer (mutual authentication).
+    let nonce = match crate::ephemeral::generate_nonce(&pid) {
+        Ok(n) => n,
+        Err(e) => {
+            ui::debug(&format!("enroll request nonce CSPRNG failure: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+    let cert_value = local_device_cert().map(|c| c.to_json());
+    let _ = t.send_control(&json!({
+        "type": "identity-auth-key-enroll-challenge",
+        "nonce": hex::encode(nonce),
+        "verifier_pub": hex::encode(verifier_pub),
+        "device_cert": cert_value,
+    })).await;
+}
+
+/// Handle the enrollment response from the enroller.
+/// Step 4 (burn only on SUCCESS): consume nonce, verify payload, admit as delegated.
+async fn handle_auth_key_enroll_response(
+    conn: &mut Conn,
+    pid: String,
+    v: serde_json::Value,
+) {
+    let Some(t) = conn.transport_of(&pid) else { return };
+    let payload = match crate::ephemeral::EnrollmentPayload::from_json(&v) {
+        Some(p) => p,
+        None => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+    let owner_pub = match crate::identity::UserKey::load() {
+        Ok(Some(uk)) => uk.public_key_bytes(),
+        _ => {
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+    let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
+        Ok(pk) => pk,
+        Err(e) => {
+            ui::debug(&format!("enroll response overlay-key error: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+
+    // Structural nonce consumption — daemon retrieves its OWN stored nonce,
+    // never trusts a nonce value echoed by the enroller.
+    let nonce = match crate::ephemeral::consume_latest_nonce(&pid) {
+        Ok(n) => n,
+        Err(e) => {
+            ui::debug(&format!("enroll response nonce consumption failed: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+            return;
+        }
+    };
+
+    // Verify payload with consumed nonce
+    match payload.verify(&owner_pub, &nonce, &verifier_pub) {
+        Ok((enroll_pub, device_pub, ak)) => {
+            // Burn ON SUCCESS only (never-reset counter)
+            if let Err(e) = crate::ephemeral::burn_auth_key(&enroll_pub, &ak.reuse) {
+                ui::debug(&format!("enroll response burn failed: {e}"));
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                return;
+            }
+            // Admit as Delegated principal — structurally, all four fields together
+            if let Some(link) = conn.link_mut(&pid) {
+                link.admit_delegated(owner_pub, device_pub, ak.expires, ak.caps.clone());
+            }
+            let _ = t.send_control(&json!({
+                "type": "identity-auth-key-enroll-ack",
+                "device_pub": hex::encode(device_pub),
+                "expires": ak.expires
+            })).await;
+            ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {:?})",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                ak.caps));
+        }
+        Err(e) => {
+            ui::debug(&format!("enroll response verify failed: {e}"));
+            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+        }
+    }
+}
+
 fn down_cmd() -> Result<()> {
     match daemon_alive() {
         Some(pid) => {
@@ -3855,6 +4734,9 @@ struct Link {
     identity_binding: crate::capability::BindingStrength,
     /// Identity cert expiry (unix seconds). None = no cert resolved.
     identity_cert_expires: Option<u64>,
+    /// Principal kind: OwnerDevice or Delegated { caps }. A Delegated
+    /// principal CANNOT exist without its ceiling — the compiler enforces it.
+    principal_kind: crate::capability::PrincipalKind,
 }
 
 impl Link {
@@ -3865,6 +4747,50 @@ impl Link {
     /// broadcast name is the fallback only for an unverified / unknown peer.
     fn shown(&self) -> &str {
         self.verified_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Admit this link as a delegated (auth-key-enrolled) principal.
+    /// Ensures caps are structurally tied to the Proven identity — a Delegated
+    /// principal CANNOT exist without its ceiling.
+    ///
+    /// NON-PERSISTENCE INVARIANT: a delegated principal's authority is conferred
+    /// by certain Link fields and bounded by others. All five MUST travel
+    /// together as in-memory Link state, and none may be persisted to devices.json:
+    ///
+    ///   CONFERS authority (owner-shortcut in evaluate() if bounding fields are absent):
+    ///   - identity_user_pub    (= owner_pub; triggers owner-derived authorize)
+    ///   - identity_device_pub  (enables device-targeted grants)
+    ///   - identity_binding     (Proven; satisfies cap_authorize_proven + trust floor)
+    ///
+    ///   BOUNDS authority (ceiling and expiry; if dropped, owner-shortcut is unbounded):
+    ///   - principal_kind       (Delegated{caps}; the ceiling; owner-shortcut bypasses it if absent)
+    ///   - identity_cert_expires (cap_authorize_expired; None => treated as expired => denies,
+    ///                           so it fails closed, but list it so a subset-persist is obviously dangerous)
+    ///
+    /// This is safe ONLY because Link is in-memory and never persisted.
+    ///
+    /// If identity_user_pub were ever persisted, or a delegated link were written
+    /// into devices.json, then on reconnect `resolve_peer_identity` would restore
+    /// `identity_user_pub = owner_pub` while `principal_kind` defaults to
+    /// `OwnerDevice`, `auth_key_caps()` returns `None`, the ceiling vanishes, and
+    /// the owner-shortcut in evaluate() authorizes everything — a full escalation.
+    /// SO: never persist a delegated link. The devices_json writer must exclude it.
+    fn admit_delegated(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
+        // A delegated principal acts UNDER the owner's user identity (the auth
+        // key issuer), so it presents user_pub = owner_pub. evaluate()'s owner
+        // shortcut then authorizes, but ONLY after the auth-key caps ceiling
+        // (checked first) has passed — so a transfer-only key gets transfer and
+        // is denied shell/mount. This is the delegation grant.
+        self.identity_user_pub = Some(owner_pub);
+        self.identity_device_pub = Some(device_pub);
+        self.identity_binding = crate::capability::BindingStrength::Proven;
+        self.identity_cert_expires = Some(expires);
+        self.principal_kind = crate::capability::PrincipalKind::Delegated { caps };
+        // NOTE: deliberately do NOT set self.trusted. binding=Proven satisfies
+        // cap_trust_floor under authoritative mode, and the auth-key caps ceiling
+        // (auth_key_caps ∩ owner_effective) bounds the principal. Setting trusted
+        // would leak into legacy_ok for gates that read it directly (e.g. mount),
+        // handing an ephemeral borrower an unbounded, un-ceilinged grant.
     }
 }
 
@@ -4974,6 +5900,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
+                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
         Ok(())
@@ -5404,6 +6331,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
+                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
         }
@@ -6292,6 +7220,7 @@ impl Conn {
                 identity_user_pub: None,
                 identity_binding: crate::capability::BindingStrength::None,
                 identity_cert_expires: None,
+                principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
     }
@@ -6391,10 +7320,18 @@ impl Conn {
     /// The roster entry is removed immediately (the sid truly left); only the
     /// LINK drop is deferred.
     fn on_peer_left(&mut self, v: &Value) -> bool {
-        let Some(pid) = v["id"].as_str() else { return false };
-        let pid = pid.to_string();
+        let Some(pid_val) = v["id"].as_str() else { return false };
+        let pid = pid_val.to_string();
         self.roster.remove(&pid);
         if !self.links.contains_key(&pid) {
+            return false;
+        }
+        // Delegated (ephemeral) devices are removed immediately on disconnect —
+        // not deferred, not rejoinable. They must re-enroll on reconnect.
+        if matches!(self.link(&pid).map(|l| &l.principal_kind), Some(crate::capability::PrincipalKind::Delegated { .. })) {
+            let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+            self.drop_link(&pid);
+            ui::debug(&format!("ephemeral device {name} disconnected, enrollment revoked"));
             return false;
         }
         // Defer the drop while the data channel is still moving bytes, unless
@@ -6679,6 +7616,10 @@ async fn handle_warm_req(
         // Reconfigure is handled inline in the daemon loop (it mutates loop state),
         // so it never reaches this dispatcher; answer defensively if it ever does.
         ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
+        ctl::ReqKind::Arm { key_id, expiry } => {
+            crate::ephemeral::arm(key_id.clone(), *expiry);
+            req.reply(&json!({ "ok": true })).await;
+        }
         // ReloadExpose is likewise handled inline in the daemon loop (it owns the
         // Exposer); answer defensively if it ever reaches here.
         ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
@@ -7344,8 +8285,12 @@ async fn main() -> Result<()> {
         return tour_cmd();
     };
     match cmd {
-        Cmd::Send { paths, code, word, room, to, name, remember } => {
-            send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
+        Cmd::Send { paths, code, word, room, to, name, remember, auth_key } => {
+            if let Some(ak_path) = auth_key {
+                enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
+            } else {
+                send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
+            }
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
             recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
@@ -7480,6 +8425,10 @@ async fn main() -> Result<()> {
                         }
                         None => {
                             let uk = identity::UserKey::generate()?;
+                            // Seed the owner's self genesis cap header at init so
+                            // authoritative capability enforcement works from the
+                            // start (also healed on daemon start for older keys).
+                            ensure_self_genesis_header(&crate::settings::config_dir(), &uk);
                             println!("  {} user identity created: fingerprint {}",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &uk.fingerprint()));
@@ -7694,7 +8643,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, relay).await,
+        Cmd::Netcat { peer, rport, auth_key } => {
+            if let Some(ak_path) = auth_key {
+                enroll_and_netcat_cmd(&server, ak_path, Some(peer), rport, relay).await
+            } else {
+                l2::netcat_cmd(&server, &peer, rport, relay).await
+            }
+        }
         Cmd::Dial { peer, port } => l2::dial_cmd(&peer, port).await,
         Cmd::Pty { peer, cmd } => l2::pty_cmd(&server, &peer, relay, cmd).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
@@ -7797,6 +8752,13 @@ async fn main() -> Result<()> {
                     };
                     hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
                     let mut hdr_json = hdr.to_json();
+                    // The header's signature is over the self-certifying resource id
+                    // (SHA-256(owner_pub||nonce)), but the STORED header has resource="self".
+                    // This signature is decorative: cap_authorize/evaluate never calls
+                    // verify_genesis/verify_sig on the stored header (those run only on
+                    // the grant-creation path, not the authorize path). Consistent with
+                    // Cmd::Grant which does the same. The header is trusted local state
+                    // in the owner's own caps.json, not a cross-verified object.
                     hdr_json["resource"] = serde_json::json!("self");
                     store.push(hdr_json);
                 }
@@ -8055,6 +9017,7 @@ async fn main() -> Result<()> {
         Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
         Cmd::CapStatus { json } => cap_status_cmd(json).await,
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
@@ -9165,6 +10128,33 @@ async fn send_cmd(
                         respond_to_identity_challenge(&t, &v).await;
                     }
                 }
+                // Enroller receives the daemon's nonce challenge — build
+                // EnrollmentPayload and send the response.
+                Some("identity-auth-key-enroll-challenge") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let nonce_hex = v["nonce"].as_str().unwrap_or_default();
+                        let verifier_hex = v["verifier_pub"].as_str().unwrap_or_default();
+                        if let (Ok(nonce_bytes), Ok(verifier_bytes)) = (hex::decode(nonce_hex), hex::decode(verifier_hex)) {
+                            if let (Ok(nonce_arr), Ok(verifier_pub)) = (
+                                nonce_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                                verifier_bytes.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            ) {
+                                let device_cert = v.get("device_cert").cloned().unwrap_or(serde_json::Value::Null);
+                                if let Some(response) = crate::ephemeral::build_enrollment_response(
+                                    &pid, nonce_arr, verifier_pub, &device_cert,
+                                ) {
+                                    let _ = t.send_control(&json!({
+                                        "type": "identity-auth-key-enroll-response",
+                                        "auth_key": response["auth_key"],
+                                        "device_pub": response["device_pub"],
+                                        "enroll_possession_sig": response["enroll_possession_sig"],
+                                        "device_possession_sig": response["device_possession_sig"],
+                                    })).await;
+                                }
+                            }
+                        }
+                    }
+                }
                 _ if !conn.is_active(&pid) => {}
                 Some("brb") => {
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
@@ -9883,6 +10873,66 @@ async fn apply_reconfigure(
     }
 }
 
+/// Idempotently seed the owner's `self` genesis capability header AND the
+/// per-owner ratchet.
+///
+/// Under authoritative enforcement `cap_authorize` returns `Unprovisioned`
+/// until the `self` header exists, and `evaluate()` then denies "ratchet
+/// uninitialized" until the per-owner monotonic ratchet exists — so BOTH are
+/// required for the capability layer to authorize anything on `self` (owner or
+/// delegated principal under its ceiling). Both are tautological: the owner
+/// asserts ownership of its OWN self-certifying resource and its own ratchet
+/// floor; they widen nothing. Mirrors the genesis block `Cmd::Grant` was the
+/// sole (accidental) seeder of. Each half is seeded independently so a store
+/// missing only one is healed. Returns true when the store changed. Persisted
+/// with `save_cap_store` (a plain write, no reconcile): seeding grants no ssh
+/// access and must not trigger the authorized_keys reconciler.
+fn ensure_self_genesis_header(
+    config_dir: &std::path::Path,
+    user_key: &crate::identity::UserKey,
+) -> bool {
+    let mut store = crate::capability::load_cap_store(config_dir);
+    let pk = user_key.public_key_bytes();
+    let owner_hex = hex::encode(pk);
+    let has_header = store.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+            && e["resource"].as_str() == Some("self")
+    });
+    let has_ratchet = store.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_ratchet")
+            && e["owner_pub"].as_str() == Some(owner_hex.as_str())
+    });
+    if has_header && has_ratchet {
+        return false;
+    }
+    let now = crate::capability::now_secs();
+    if !has_header {
+        let nonce = crate::capability::self_resource_nonce();
+        let resource = crate::capability::self_resource_id(&pk);
+        let mut hdr = crate::capability::CapHeader {
+            resource,
+            epoch: 0,
+            owner_pub: pk,
+            nonce,
+            floors: vec![],
+            issued_at: now,
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
+        };
+        hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
+        let mut hdr_json = hdr.to_json();
+        // Stored under the caller-facing resource id "self" (what cap_authorize
+        // looks up); the signature commits to the self-certifying derived id.
+        hdr_json["resource"] = serde_json::json!("self");
+        store.push(hdr_json);
+    }
+    if !has_ratchet && crate::capability::update_ratchet(&mut store, &pk, now).is_err() {
+        return false;
+    }
+    crate::capability::save_cap_store(config_dir, &store).is_ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recv_cmd(
     server: &str,
@@ -9903,6 +10953,18 @@ async fn recv_cmd(
     no_proxy_fallback: bool,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
+    // Daemon start: idempotently heal the owner's self genesis cap header.
+    // Identities created before this seeding existed have no header; seeding
+    // only at `identity init` would grandfather-trap them into permanent
+    // Unprovisioned. Healing on every daemon start makes old identities correct
+    // on next `up` and new ones born correct. Tautological; widens nothing.
+    if daemon {
+        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+            if ensure_self_genesis_header(&crate::settings::config_dir(), &uk) {
+                ui::debug("seeded owner self genesis capability header");
+            }
+        }
+    }
     // INTERACTIVE GATE (CLI `recv` only, never the daemon/`up`). With no code,
     // offer: type a code to connect to a specific person, or press Enter on an
     // empty buffer to use the local network (today's default). When the gate is
@@ -10027,21 +11089,28 @@ async fn recv_cmd(
             recv_pake_template = None; // no code claim, no ephemeral PAKE
             // C19: the daemon joins NO room. Presence-channel subscriptions
             // only, strangers can't see it, probe it, or offer to it.
-            // (We still `join` an unguessable solo room so the registry holds
-            // our meta for known-peer events, but nobody else can land there.)
+            // Enrollment rendezvous: subscribe to enroll_channel(owner_pub)
+            // when armed (outstanding non-expired auth key). Channel-based
+            // (not room) because the server supports 1 room/socket and we
+            // need the solo room for known-device discovery.
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
-            // C29: an interactive up can START empty and pair in-session.
-            // When shell (--shell / --shell-only) is enabled, the daemon
-            // explicitly accepts devices paired later, so do NOT bail just
-            // because the device list is empty at startup — the live-pairing
-            // scan (below) will pick them up from devices.json.
-            if devices.is_empty() && !std::io::stdin().is_terminal() && !shell_policy.enables_l2() {
-                bail!("no known devices, run `filament pair` once, or `filament up` in a terminal to pair interactively");
+            if crate::ephemeral::is_armed() {
+                ui::debug("enrollment armed: ephemeral devices may enroll");
+            } else {
+                ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-            sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+            let mut c = chans;
+            if crate::ephemeral::is_armed() {
+                if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    if !c.contains(&ek) { c.push(ek); }
+                }
+            }
+            sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
+            sess.channels = c;
             ui::say(&format!(
                 "  {} filament up, {} known device{} {} {}",
                 ui::paint(ui::Tone::Brand, "●"),
@@ -10633,6 +11702,7 @@ async fn recv_cmd(
                                     "ld_authorized": counts.ld_authorized,
                                     "ld_denied": counts.ld_denied,
                                     "ld_no_header": counts.ld_no_header,
+                                    "ceiling_denied": counts.ceiling_denied,
                                 },
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
@@ -10858,7 +11928,7 @@ async fn recv_cmd(
                                 let chans = sess.channels.clone();
                                 sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
                             }
-                            sess.tick(&sio).await;
+        sess.tick(&sio).await;
                             // optimistic: a clean connect proves reachability; let
                             // the welcome confirm it (which resets the counters).
                             last_signaling = Instant::now();
@@ -10875,6 +11945,24 @@ async fn recv_cmd(
                         }
                     }
                 }
+            }
+        }
+
+        // Arm-gate: toggle enrollment-channel subscription EVERY loop iteration
+        // based on the armed set. Channel-based (not room) because the server
+        // supports 1 room/socket. This MUST run at loop top-level, not nested in
+        // the signaling-reconnect Ok arm: a stable daemon (signaling never down)
+        // would otherwise never subscribe and no ephemeral device could enroll.
+        if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+            let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+            let armed = crate::ephemeral::is_armed();
+            let subscribed = sess.channels.contains(&ek);
+            if armed && !subscribed {
+                sess.channels.push(ek.clone());
+                let _ = sio.emit("subscribe", json!({ "channels": [ek] })).await;
+            } else if !armed && subscribed {
+                sess.channels.retain(|c| c != &ek);
+                let _ = sio.emit("channel-goodbye", json!({ "channels": [ek] })).await;
             }
         }
 
@@ -11370,6 +12458,18 @@ async fn recv_cmd(
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
                     }
+                } else if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    // Enrollment channel: an ephemeral device appeared on
+                    // enroll_channel(own_owner_pub). Dial it (channel-presence
+                    // path, no room-join) so the auth-key handshake can run.
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    if v["channel"].as_str() == Some(&ek) {
+                        let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                            ui::debug("enrollment peer appeared on channel, dialing");
+                        }
+                        conn.maybe_adopt(&v, true).await?;
+                    }
                 }
             }
             Ev::PeerJoined(v) => {
@@ -11854,6 +12954,15 @@ async fn recv_cmd(
                         let _ = tx.send(ports);
                     }
                 }
+                // Auth key enrollment (challenge/response flow)
+                Some("identity-auth-key-enroll-request") => {
+                    respond_to_auth_key_enroll_request(&mut conn, pid.clone(), v.clone()).await;
+                }
+                Some("identity-auth-key-enroll-response") => {
+                    // Daemon receives the enrollment response with possession proofs.
+                    // Must have a pending challenge nonce for this peer.
+                    handle_auth_key_enroll_response(&mut conn, pid.clone(), v.clone()).await;
+                }
                 _ if !conn.links.contains_key(&pid) => {}
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
                 // (a warm `open`) is connected end to end. Route it to the mux so
@@ -11906,25 +13015,21 @@ async fn recv_cmd(
                                 resolve_peer_identity(l);
                             }
                         }
-                        // Lazy-resolve peer identity from stored device cert
-                        {
-                            if let Some(l) = conn.link_mut(&pid) {
-                                resolve_peer_identity(l);
-                            }
-                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "shell",
                             idev,
                             iusr,
+                            ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires);
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -12065,14 +13170,16 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "shell",
                             idev,
                             iusr,
+                            ak_caps,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps)
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -12170,14 +13277,16 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "shell",
                             idev,
                             iusr,
+                            ak_caps,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps)
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -12324,21 +13433,24 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "mount",
                             idev,
                             iusr,
+                            ak_caps,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize mount (pair-proof vs device-key).
                         let outcome = crate::capability::cap_trust_floor(
                             &outcome,
                             trusted,
+                            binding,
                             crate::capability::cap_authoritative(),
                         );
-                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires)
+                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps)
                     };
                     if !authorized.allowed() {
                         let who = conn
@@ -12678,8 +13790,19 @@ async fn recv_cmd(
                                                                             ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
-                                                                        }
-                                                                    }
+                    }
+                } else if let Ok(Some(uk)) = crate::identity::UserKey::load() {
+                    // Enrollment channel: an ephemeral device is trying to enroll.
+                    // Recognize peers on enroll_channel(own_owner_pub) and dial them.
+                    let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                    if v["channel"].as_str() == Some(&ek) {
+                        let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        if !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                            ui::debug(&format!("enrollment peer appeared on channel, dialing"));
+                        }
+                        conn.maybe_adopt(&v, true).await?;
+                    }
+                }
                                                                 }
                                                             }
                                                         }
@@ -12768,6 +13891,14 @@ async fn recv_cmd(
                     // #30 GAP 2: honor the pending_proven hold. If a
                     // possession-sig challenge is still in flight for this peer
                     // (the adopt-time hold has not settled) and the binding is
+                    // PRE-ADMIT RACE: a file-offer can arrive before
+                    // admit_delegated sets identity_user_pub + principal_kind for
+                    // this link. The ordering is UNENFORCED. This is safe only
+                    // because the pre-admit link state is authority-free:
+                    // identity_user_pub=None + binding=None => denied under
+                    // authoritative; refusal under shadow. If an unadmitted link
+                    // ever gains a default authority, the race opens.
+                    //
                     // not yet Proven, do NOT decide on Inferred now: the
                     // identity-expose that flips us to Proven is a SEPARATE
                     // event this single-consumer loop must be free to process,
@@ -12827,21 +13958,24 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
                             "transfer",
                             idev,
                             iusr,
+                            ak_caps,
                         );
                         // Trust floor: under authoritative, an untrusted link
                         // must never authorize transfer (pair-proof vs device-key).
                         let outcome = crate::capability::cap_trust_floor(
                             &outcome,
                             link_trusted,
+                            binding,
                             crate::capability::cap_authoritative(),
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires);
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {
@@ -14392,5 +15526,53 @@ mod tests {
         let snapshot = reqs[0].status.clone();
         expire_requests(&mut reqs);
         assert_eq!(reqs[0].status, snapshot, "terminal status must not be re-expired");
+    }
+
+    /// Admitting a delegated principal MUST NOT persist anything to the device
+    /// store. A delegated link's authority comes from identity_user_pub=owner_pub
+    /// + principal_kind=Delegated{caps}; these are in-memory Link fields only.
+    /// If identity_user_pub were ever written to devices.json, then on reconnect
+    /// resolve_peer_identity would restore it while principal_kind defaults to
+    /// OwnerDevice (ak_caps=None), the ceiling vanishes, and the owner-shortcut
+    /// authorizes everything — a full escalation.
+    ///
+    /// The non-persistence invariant is enforced at the rig level: devices.json is
+    /// byte-identical before/after a successful enrollment. A unit test on
+    /// admit_delegated alone is vacuous (it has no device-store access); the rig
+    /// covers ANY write path including unanticipated ones.
+    #[test]
+    fn delegated_principal_never_written_to_device_store() {
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let cert = mk_cert(0xdd);
+        let mut arr: Vec<Value> = vec![];
+        // Simulate what the daemon does: store a device record via upsert_peer_record
+        upsert_peer_record(&mut arr, "delegated-peer", Some("secret123"), Some(&cert), None, None, None);
+        assert_eq!(arr.len(), 1);
+        let record = &arr[0];
+        // The device store record MUST NOT contain identity_user_pub or principal_kind
+        assert!(!record.get("identity_user_pub").is_some(),
+            "device store must not contain identity_user_pub — that is a Link-only field");
+        assert!(!record.get("principal_kind").is_some(),
+            "device store must not contain principal_kind — that is a Link-only field");
+        assert!(!record.get("identity_binding").is_some(),
+            "device store must not contain identity_binding — that is a Link-only field");
+        // The record should only have the fields the store actually uses:
+        // name, secret, caps, deviceCert, addedAt, userKey, identityScope, v
+        let allowed: std::collections::HashSet<&str> = [
+            "name", "secret", "caps", "deviceCert", "addedAt", "v",
+            "userKey", "identityScope",
+        ].iter().cloned().collect();
+        for key in record.as_object().unwrap().keys() {
+            assert!(allowed.contains(key.as_str()),
+                "unexpected device store field '{key}' — is a Link field leaking?");
+        }
     }
 }

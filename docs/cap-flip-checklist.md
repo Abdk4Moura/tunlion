@@ -55,10 +55,13 @@ the counters are process-global and a fresh CLI invocation reads zeros.
 
 ## Correctness corroboration (owed by capability.rs owner)
 
-- [ ] Self genesis header is valid by construction: its signature verifies as stored
-      (the `resource` field is overridden to "self" after signing) and its self-cert
-      / genesis check passes. `la_no_header == 0` on a provisioned node corroborates
-      this empirically, but confirm it structurally too.
+- [ ] Self genesis header is trusted local state: its signature is decorative (not
+      verified on the authorize path). The header's sig is over the self-certifying
+      resource id (SHA-256(owner_pub||nonce)), but the stored header has
+      resource="self" after signing. cap_authorize/evaluate never calls
+      verify_genesis/verify_sig on it (those run only on the grant-creation path).
+      Consistent with Cmd::Grant which does the same. `la_no_header == 0` on a
+      provisioned node corroborates this empirically, but confirm it structurally too.
 
 ## Authoritative-only restrictive gates (added, all purely restrictive)
 
