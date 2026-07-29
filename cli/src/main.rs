@@ -15261,7 +15261,8 @@ mod tests {
     #[test]
     fn path_within_bounds_the_share_root() {
         // Use temp directories that actually exist for canonicalize
-        let tmp = std::env::temp_dir().join(format!("fil-path-test-{}", std::process::id()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-path-test-{uid}"));
         let root = tmp.join("filament-share");
         let docs = root.join("docs");
         let secrets = tmp.join("secrets");
@@ -15288,7 +15289,8 @@ mod tests {
     /// Symlink escape: path_within_canonical must refuse a symlink pointing outside the share root.
     #[test]
     fn path_within_canonical_refuses_symlink_escape() {
-        let tmp = std::env::temp_dir().join(format!("fil-symlink-test-{}", std::process::id()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-symlink-test-{uid}"));
         let root = tmp.join("share");
         let etc = tmp.join("etc");
         std::fs::create_dir_all(&root).unwrap();
@@ -15313,7 +15315,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_part_refuses_symlink() {
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-symlink-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-create-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Plant a symlink at the .part path
@@ -15335,7 +15338,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_open_part_refuses_symlink() {
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-open-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-resume-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Create a regular .part file first
@@ -15361,7 +15365,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_resume_refuses_fifo() {
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-fifo-{}", std::process::id()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-fifo-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let part_path = tmp.join("data.tar.part");
@@ -15380,7 +15385,8 @@ mod tests {
     /// doesn't require the target to exist).
     #[test]
     fn transfer_nonexistent_landing_is_in_bounds() {
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-scope-{}", std::process::id()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-scope-{uid}"));
         let drop_dir = tmp.join("inbox");
         std::fs::create_dir_all(&drop_dir).unwrap();
 
@@ -15402,7 +15408,8 @@ mod tests {
     /// that is a symlink escaping the share root.
     #[test]
     fn mount_root_symlink_refused() {
-        let tmp = std::env::temp_dir().join(format!("fil-mount-root-{}", std::process::id()));
+        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-mount-root-{uid}"));
         let share = tmp.join("share");
         let etc = tmp.join("etc");
         std::fs::create_dir_all(&share).unwrap();

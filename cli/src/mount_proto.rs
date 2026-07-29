@@ -976,16 +976,17 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
                     let name_cstr = std::ffi::CString::new(name.to_str().unwrap_or(""))
                         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path component"))?;
 
-                    let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
+                    let mut walk_flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
                     if is_last {
-                        let accmode = flags & libc::O_ACCMODE;
-                        flags |= accmode;
+                        // Last component: OR in the caller's requested access mode
+                        // and creation flags so writes and creates work correctly.
+                        walk_flags |= flags & (libc::O_ACCMODE | libc::O_CREAT | libc::O_TRUNC | libc::O_EXCL | libc::O_APPEND);
                     } else {
-                        flags |= libc::O_DIRECTORY;
+                        walk_flags |= libc::O_DIRECTORY;
                     }
 
                     let fd = unsafe {
-                        libc::openat(current.as_raw_fd(), name_cstr.as_ptr(), flags, 0o644)
+                        libc::openat(current.as_raw_fd(), name_cstr.as_ptr(), walk_flags, 0o644)
                     };
                     if fd < 0 {
                         return Err(std::io::Error::last_os_error());
