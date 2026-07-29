@@ -11,9 +11,11 @@
 name = "filament-id"
 version = "0.1.0"
 edition = "2021"
-publish = false
 license = "MIT"
-description = "Multi-device user identity for Filament: user key over device certs, no CA."
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Multi-device identity: a user key signing device certs, no CA"
+keywords = ["identity", "ssh", "certificates", "cryptography", "authentication"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml.
@@ -30,4 +32,4 @@ hkdf = "0.12"
 [dev-dependencies]
 # The identity tests exercise the PAKE confirm-MAC / capability-digest helpers
 # (the CLI reaches them as `crate::pake::…`, an alias of this crate).
-filament-pair = { path = "../filament-pair" }
+filament-pair = { path = "../filament-pair", version = "0.1.0" }

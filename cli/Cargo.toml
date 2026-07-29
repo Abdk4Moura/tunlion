@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of filament.autumated.com."
 license = "MIT"
@@ -57,20 +57,20 @@ hkdf = "0.12"
 hmac = "0.12"
 spake2 = "=0.4.0"
 # PAKE first-pairing core, carved into its own crate (zero app coupling).
-filament-pair = { path = "../crates/filament-pair" }
+filament-pair = { path = "../crates/filament-pair", version = "0.1.0" }
 # Standalone atomic owner-only secret-file writer (chmod 0600 / icacls DACL),
 # re-exported as `crate::platform::SecretFile`.
-secret-write = { path = "../crates/secret-write" }
+secret-write = { path = "../crates/secret-write", version = "0.1.0" }
 # Filament-managed authorized_keys block + managed ssh keypair, decoupled from
 # the CLI's config-dir resolution. `crate::sshkeys` is a thin shim over this.
-authkeys-managed = { path = "../crates/authkeys-managed" }
+authkeys-managed = { path = "../crates/authkeys-managed", version = "0.1.0" }
 # Multi-device user identity (user key over device certs, no CA). Aliased as
 # `crate::identity`; key persistence is injected via `platform::PlatformKeyStore`.
-filament-id = { path = "../crates/filament-id" }
+filament-id = { path = "../crates/filament-id", version = "0.1.0" }
 # Capability primitives + pure authorization evaluation. `crate::capability` and
 # `crate::ephemeral` re-export it; the host-bound orchestration (store I/O, mode
 # flag, observability counters, DeviceCert-reading glue) stays in those modules.
-filament-cap = { path = "../crates/filament-cap" }
+filament-cap = { path = "../crates/filament-cap", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"

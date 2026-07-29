@@ -7,9 +7,11 @@
 name = "secret-write"
 version = "0.1.0"
 edition = "2021"
-publish = false
 license = "MIT"
-description = "Atomic owner-only secret file writer for Filament (chmod 0600 / icacls DACL)."
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Atomic, permission-restricted secret file writes (0600 / Windows ACL)"
+keywords = ["filesystem", "security", "atomic", "permissions", "secret"]
+categories = ["filesystem", "os"]
 
 [dependencies]
 # Version copied verbatim from cli/Cargo.toml. Currently only used for the

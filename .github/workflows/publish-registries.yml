@@ -51,13 +51,45 @@ jobs:
       - name: Authenticate to crates.io (Trusted Publishing / OIDC)
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
+      - name: cargo publish extracted crates (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # filament-cli depends on 5 extracted path-crates, each version-pinned so
+          # cargo resolves them by version on crates.io. They must be published
+          # BEFORE filament-cli, in dependency order: the three leaves first
+          # (secret-write, filament-pair, filament-cap), then the two that dep
+          # secret-write (authkeys-managed, filament-id). Each authenticates via the
+          # same OIDC token (a Trusted Publisher is configured per crate pointing at
+          # Abdk4Moura/filament + publish-registries.yml).
+          # --allow-dirty: the pinned-to-latest stable toolchain regenerates
+          # Cargo.lock on checkout, which trips cargo publish's clean-tree check
+          # even though the committed lock is valid.
+          publish_crate() {
+            name="$1"
+            echo "::group::cargo publish $name"
+            out=$(cd "crates/$name" && cargo publish --allow-dirty 2>&1) && { echo "$out"; echo "::endgroup::"; return 0; }
+            echo "$out"
+            if echo "$out" | grep -qiE "already (uploaded|exists)|crate version .* is already"; then
+              echo "::notice::$name already on crates.io — nothing to do"; echo "::endgroup::"; return 0
+            fi
+            echo "::endgroup::"; echo "::error::cargo publish $name failed"; return 1
+          }
+          # cargo publish waits for index availability, but sleep between crates as
+          # belt-and-suspenders so a dependent crate always sees its dep in the index.
+          for c in secret-write filament-pair filament-cap authkeys-managed filament-id; do
+            publish_crate "$c"
+            sleep 5
+          done
       - name: cargo publish filament-cli
         working-directory: cli
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           set -euo pipefail
-          # pake is inlined, so filament-cli has no unpublished path-deps.
+          # The 5 extracted crates are published first (in dep order) by the step
+          # above, so filament-cli's version-pinned path-deps resolve on crates.io.
           # --allow-dirty: the pinned-to-latest stable toolchain regenerates
           # Cargo.lock on checkout (format/re-resolve), which trips cargo
           # publish's clean-tree check even though the committed lock is valid.

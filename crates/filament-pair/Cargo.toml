@@ -10,9 +10,11 @@
 name = "filament-pair"
 version = "0.1.0"
 edition = "2021"
-publish = false
 license = "MIT"
-description = "Standalone SPAKE2 PAKE core for Filament first-pairing (CLI + browser)."
+repository = "https://github.com/Abdk4Moura/filament"
+description = "PAKE (SPAKE2) device pairing over a short human code"
+keywords = ["pake", "spake2", "pairing", "cryptography", "key-exchange"]
+categories = ["cryptography", "authentication"]
 
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml so the derived K / MAC / secret

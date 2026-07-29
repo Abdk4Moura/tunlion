@@ -24,9 +24,11 @@
 name = "filament-cap"
 version = "0.1.0"
 edition = "2021"
-publish = false
 license = "MIT"
-description = "Capability primitives + pure authorization evaluation for Filament (orchestration stays in the CLI)."
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Edge-local capability tokens: signed grants, delegation ceilings, offline verification"
+keywords = ["capability", "authorization", "tokens", "delegation", "security"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 # Versions copied verbatim from cli/Cargo.toml.
