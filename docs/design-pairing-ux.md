@@ -249,6 +249,83 @@ a leaked key or a decommissioned box **ages out** — no chasing 30 machines to 
 Interactive primary-approval is for phones/laptops; the auth-key is for headless/scripted
 fleets; the two paths coexist.
 
+## Recovery: loss vs theft (state this plainly)
+
+These are different problems and the recovery phrase only solves one. Stating it clearly
+is non-negotiable — the failure mode is a user *discovering* the limit mid-crisis instead
+of *choosing* the posture up front.
+
+- **Loss** (a device is gone, no attacker): the recovery phrase works. It reconstitutes
+  your user key on a new device; you carry on.
+- **Theft of a primary** (an attacker holds a device with the user key): the phrase does
+  **not** recover you. It reconstitutes the *same* key the thief holds, so both parties
+  hold identical authority. A succession you issue to rotate ownership is matched by the
+  thief's competing succession, and the equal-epoch fork rule **fails closed on
+  conflicting successors** → a *frozen* succession, not a recovery. Short-cert-expiry
+  doesn't bound the thief either: it holds the signing key, so it renews itself and its
+  rogue devices indefinitely. (Expiry only bounds a stolen **non**-primary, where the
+  defender still holds the key.)
+
+**Therefore, absent guardians (below), theft of a primary is TERMINAL for that identity.**
+This is a deliberate posture — the same knowingly-accepted stance as the Phase-1 cold-key
+model — not a gap. But `restore` and its docs must say "recovers from **loss**, not
+**theft**" in those words. Nothing may imply theft-recovery it cannot deliver.
+
+## Guardians: the only asymmetric recovery (next version)
+
+Guardians are the one component that holds authority the thief does not — the only thing
+that can break the symmetric standoff a theft creates. The load-bearing rule is a SPLIT
+of two authorities:
+
+> **Guardians can REVOKE a primary. Only the recovery phrase can INSTALL one.**
+
+- Thief: has the key, not the quorum.
+- Colluding guardians: have the quorum, not the phrase → contained to **denial** (they can
+  revoke, cannot install) — recoverable, not takeover.
+- Owner: the only party holding **both**.
+
+No single compromise completes a takeover. (A guardian set that could *install* a primary
+would be a takeover primitive, since installing a key can then grant everything — hence
+the split, not merely "guardians can only recover.")
+
+**Shape:** a **fixed, human-designated** guardian set, M-of-K (e.g. 2-of-3, mixing devices
+and people) — *never* the dynamic mesh (mesh size is Sybil-inverted; see below). Guardian
+signatures are **offline-collectable** — a revocation blob signed asynchronously and
+carried by any means, no liveness requirement (this removes most of the availability
+objection). **No connectivity gate** on routine ops (it adds a liveness dependency, is
+eclipse-able so an attacker can deny the legitimate user, and doesn't stop a thief who can
+also reach K members).
+
+## Rogue-signing detection: a transparency log (alert-only)
+
+Not consensus — consensus is ill-posed here (no membership denominator to count a quorum
+against, since membership is minted by the very key you're defending against; partition is
+indistinguishable from offline; no coordinator to break ties). Instead the **Certificate
+Transparency** shape:
+
+- Every device records the certs it has ever seen signed under the user key (device_pub +
+  issued_at) and gossips them opportunistically. **No voting, no quorum, no liveness.**
+- When a legitimate device eventually sees a cert the human never approved, that is
+  evidence of a rogue signing → it surfaces as an **alert**.
+- The inversion that makes this safe where reputation is not: in a reputation scheme,
+  minting *helps* the attacker; in a transparency scheme, every extra rogue cert the thief
+  mints makes the anomaly **more** visible. Same attacker action, opposite sign.
+- **Alert-only, human-in-the-loop. Never auto-freeze** — an autonomous freeze triggered by
+  an anomaly heuristic is a denial-of-service primitive an attacker will eventually
+  trigger. Alert the human; the human decides to freeze/revoke.
+
+Detection, not prevention; defense-in-depth. Cheap enough to ship before guardians.
+
+## Killed (do not re-propose)
+
+- **Mesh SIZE as reputation** — Sybil-*inverted*: the stolen signing capability is exactly
+  what mints the signal, so attacking harder looks *more* legitimate. Any weight on it
+  helps the thief.
+- **Autonomous device-consensus revocation** — ill-posed on a partition-tolerant,
+  coordinator-free, offline-capable mesh whose membership the attacked key can mint. There
+  is no denominator. (The state-hash survives only as the alert-only transparency log
+  above.)
+
 ## Open UX questions (next round)
 
 - **Inbox / share-root defaults.** Where is the default transfer inbox and the default
