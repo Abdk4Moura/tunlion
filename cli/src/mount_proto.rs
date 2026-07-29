@@ -900,7 +900,7 @@ fn open_file(path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::Fil
 /// On other Unix, uses a component-walk with O_NOFOLLOW. On non-Unix, falls back
 /// to canonicalize + starts_with (best-effort, no TOCTOU guarantee).
 #[cfg(unix)]
-fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // On Linux 5.6+, use openat2 with RESOLVE_BENEATH for strictest enforcement.
@@ -995,7 +995,7 @@ fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: 
 }
 
 #[cfg(not(unix))]
-fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
     // Non-Unix fallback: canonicalize + starts_with (no TOCTOU guarantee)
     let full = root.join(rel_path);
     let canonical = full.canonicalize()?;

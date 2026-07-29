@@ -2199,11 +2199,23 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// True when `path`, resolved (canonicalized), is within (or equal to) `root`.
-/// Used to bound a fleet mount to the share root. A relative or non-normalizable
-/// request fails closed (not within), so it falls through to explicit-grant.
-/// Uses canonicalize to resolve symlinks before the starts_with check.
+/// True when `path`, lexically normalized, is within (or equal to) `root`. Used
+/// to bound a fleet transfer landing path to the drop dir. A relative or
+/// non-normalizable request fails closed (not within), so it falls through to
+/// explicit-grant. LEXICAL is correct here because the landing path may not
+/// exist yet (file about to be received); the actual symlink protection lives
+/// in safe_create_part/safe_open_part (O_NOFOLLOW|O_EXCL) at the write site.
 fn path_within(root: &Path, path: &Path) -> bool {
+    let root_n = lexical_normalize(root);
+    let path_n = lexical_normalize(path);
+    !root_n.as_os_str().is_empty() && path_n.starts_with(&root_n)
+}
+
+/// True when `path`, canonicalized (symlinks resolved), is within `root`.
+/// Used to bound a fleet mount REQUEST to the share root. Both paths must
+/// exist on disk (canonicalize fails on non-existent paths). A symlink at
+/// the mount root or requested path escaping the share root is refused.
+fn path_within_canonical(root: &Path, path: &Path) -> bool {
     let Ok(root_c) = root.canonicalize() else {
         return false;
     };
@@ -10911,61 +10923,98 @@ async fn stream_one(
     Ok(())
 }
 
-// ------------------------------------------------------------------- recv --
+// ------------------------------------------------------------------- recv —
 
-/// Create a .part file with O_NOFOLLOW to prevent symlink attacks.
-/// If the file already exists as a symlink, REFUSES (does not follow or remove).
-/// This ensures transfers only ever write plain files inside the drop dir.
+/// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
+/// protects symlinked parents too), O_NOFOLLOW on other Unix, create_new
+/// (O_EXCL) on non-Unix. O_EXCL means "fail if exists" — correct for fresh,
+/// WRONG for resume (use safe_resume_part for that).
 #[cfg(unix)]
 async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+    // On Linux: use safe_open_beneath with O_CREAT|O_EXCL for one-primitive guarantee
+    #[cfg(target_os = "linux")]
+    {
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        let rel = path.strip_prefix(parent).unwrap_or(path);
+        crate::mount_proto::safe_open_beneath(parent, rel, (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as i32)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("safe create .part: {e}")))
+            .map(|f| tokio::fs::File::from_std(f))
+    }
+    // Non-Linux Unix: O_NOFOLLOW + O_EXCL (only protects final component)
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await
+    }
+}
 
-    // Check for existing symlink and refuse
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
+/// Resume an EXISTING .part file. NO O_EXCL (must open existing), but
+/// RESOLVE_BENEATH on Linux (or O_NOFOLLOW on other Unix) AND an explicit
+/// fstat check that what you opened is a REGULAR file — because O_NOFOLLOW
+/// alone will happily open a FIFO or device node someone dropped at that path.
+#[cfg(unix)]
+async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    // On Linux: use safe_open_beneath (RESOLVE_BENEATH)
+    #[cfg(target_os = "linux")]
+    {
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        let rel = path.strip_prefix(parent).unwrap_or(path);
+        let file = crate::mount_proto::safe_open_beneath(parent, rel, libc::O_WRONLY as i32)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("safe resume .part: {e}")))?;
+        // Verify what we opened is a regular file (not FIFO, device, etc.)
+        let meta = file.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to resume: .part is not a regular file (type: {:?})", meta.file_type()),
+            ));
+        }
+        Ok(tokio::fs::File::from_std(file))
+    }
+    // Non-Linux Unix: O_NOFOLLOW + metadata check
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Check what's at the path before opening
+        let meta = std::fs::symlink_metadata(path)?;
         if meta.file_type().is_symlink() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "refusing to create: path is a symlink",
+                "refusing to resume: .part is a symlink",
             ));
         }
+        if !meta.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("refusing to resume: .part is not a regular file (type: {:?})", meta.file_type()),
+            ));
+        }
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await
     }
-
-    // Create with O_NOFOLLOW|O_EXCL: fail if a symlink exists, don't follow
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)  // O_CREAT|O_EXCL: fail if exists
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .await
 }
 
-/// Open an existing .part file for resume with O_NOFOLLOW.
-#[cfg(unix)]
-async fn safe_open_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Verify it's not a symlink before opening
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to follow symlink for .part resume",
-        ));
-    }
-
+#[cfg(not(unix))]
+async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     tokio::fs::OpenOptions::new()
         .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .create_new(true)
         .open(path)
         .await
 }
 
 #[cfg(not(unix))]
-async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    // Non-Unix: use create_new (O_EXCL) which doesn't follow symlinks
+async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     tokio::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
         .open(path)
         .await
 }
@@ -13713,7 +13762,7 @@ async fn recv_cmd(
                     // (read-only, within the share root) is decided at the gate.
                     let root_encoded = v["root"].as_str().unwrap_or(".");
                     let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let within_share = crate::path_within(&crate::fleet_share_root(), &root_path);
+                    let within_share = crate::path_within_canonical(&crate::fleet_share_root(), &root_path);
                     // Capability layer for mount evaluated unconditionally (shadow
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
@@ -14457,8 +14506,9 @@ async fn recv_cmd(
                         ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
                         // Open with write mode (not append) so we can seek to any
                         // position for multi-stream out-of-order writes.
-                        // O_NOFOLLOW prevents following a symlink planted at the .part path.
-                        safe_open_part(&part_path).await?
+                        // safe_resume_part: RESOLVE_BENEATH on Linux, O_NOFOLLOW +
+                        // fstat regular-file check on other Unix. NO O_EXCL (resume).
+                        safe_resume_part(&part_path).await?
                     } else {
                         PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)?;
                         // O_NOFOLLOW prevents following a symlink planted at the .part path.
@@ -14575,7 +14625,7 @@ async fn recv_cmd(
                                 let f = inc.file.clone();
                                 let _ = tokio::task::spawn_blocking(move || { let _ = f.sync_all(); }).await;
                                 if req_offset == 0 {
-                                    if let Ok(f) = safe_open_part(&inc.part_path).await {
+                                    if let Ok(f) = safe_resume_part(&inc.part_path).await {
                                         inc.file = Arc::new(f.into_std().await);
                                     }
                                 }
@@ -14640,7 +14690,7 @@ async fn recv_cmd(
                                 let mut req_offset = inc.received.load(Ordering::Relaxed);
                                 if restart_from_zero {
                                     let _ = safe_create_part(&inc.part_path).await;
-                                    if let Ok(f) = safe_open_part(&inc.part_path).await {
+                                    if let Ok(f) = safe_resume_part(&inc.part_path).await {
                                         inc.file = Arc::new(f.into_std().await);
                                     }
                                     inc.received.store(0, Ordering::Relaxed);
@@ -15250,9 +15300,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Symlink escape: path_within must refuse a symlink pointing outside the share root.
+    /// Symlink escape: path_within_canonical must refuse a symlink pointing outside the share root.
     #[test]
-    fn path_within_refuses_symlink_escape() {
+    fn path_within_canonical_refuses_symlink_escape() {
         let tmp = std::env::temp_dir().join(format!("fil-symlink-test-{}", std::process::id()));
         let root = tmp.join("share");
         let etc = tmp.join("etc");
@@ -15267,8 +15317,8 @@ mod tests {
         // The symlink itself is lexically inside the root...
         // But canonicalize resolves it to /etc, which is outside
         #[cfg(unix)]
-        assert!(!path_within(&root, &evil_link),
-            "symlink escaping share root must be refused");
+        assert!(!path_within_canonical(&root, &evil_link),
+            "symlink escaping share root must be refused by canonical check");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -15278,7 +15328,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_part_refuses_symlink() {
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-symlink-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-symlink-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Plant a symlink at the .part path
@@ -15296,28 +15346,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Transfer resume: safe_open_part must refuse to open a symlink.
+    /// Transfer resume: safe_resume_part must refuse to open a symlink.
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_open_part_refuses_symlink() {
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-open-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-open-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Create a regular .part file first
         let part_path = tmp.join("data.tar.part");
         std::fs::write(&part_path, b"partial data").unwrap();
 
-        // Verify it opens normally
-        let result = safe_open_part(&part_path).await;
-        assert!(result.is_ok(), "regular file must open normally");
+        // Verify it opens normally for resume
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally for resume");
 
         // Now replace with a symlink
         std::fs::remove_file(&part_path).unwrap();
         std::os::unix::fs::symlink("/etc/passwd", &part_path).unwrap();
 
         // Must refuse
-        let result = safe_open_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to open a symlink for resume");
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a symlink");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Transfer resume: safe_resume_part must refuse a FIFO at the .part path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_resume_refuses_fifo() {
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let part_path = tmp.join("data.tar.part");
+        // Create a FIFO (named pipe) at the .part path
+        unsafe { libc::mkfifo(std::ffi::CString::new(part_path.to_str().unwrap()).unwrap().as_ptr(), 0o644); }
+
+        // Must refuse — FIFO is not a regular file
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a FIFO");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Transfer scope: a landing path inside the drop dir that does NOT yet
+    /// exist must still be recognized as in-bounds (path_within is lexical,
+    /// doesn't require the target to exist).
+    #[test]
+    fn transfer_nonexistent_landing_is_in_bounds() {
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-scope-{}", std::process::id()));
+        let drop_dir = tmp.join("inbox");
+        std::fs::create_dir_all(&drop_dir).unwrap();
+
+        // The landing path for a file about to be received — doesn't exist yet
+        let landing = drop_dir.join("photo.jpg");
+        assert!(!landing.exists(), "landing must not exist yet");
+        assert!(path_within(&drop_dir, &landing),
+            "non-existent landing inside drop dir must be in-bounds");
+
+        // A landing outside the drop dir must be out of bounds
+        let outside = tmp.join("evil.txt");
+        assert!(!path_within(&drop_dir, &outside),
+            "landing outside drop dir must be out-of-bounds");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Mount root as symlink: path_within_canonical must refuse a mount root
+    /// that is a symlink escaping the share root.
+    #[test]
+    fn mount_root_symlink_refused() {
+        let tmp = std::env::temp_dir().join(format!("fil-mount-root-{}", std::process::id()));
+        let share = tmp.join("share");
+        let etc = tmp.join("etc");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::create_dir_all(&etc).unwrap();
+
+        // Symlink inside share pointing to /etc
+        let evil = share.join("evil");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&etc, &evil).unwrap();
+
+        // path_within_canonical must refuse the symlink root
+        #[cfg(unix)]
+        assert!(!path_within_canonical(&share, &evil),
+            "mount root as symlink escaping share must be refused");
+
+        // The real directory must be accepted
+        assert!(path_within_canonical(&share, &share),
+            "real share root must be accepted");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
