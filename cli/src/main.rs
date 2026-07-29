@@ -1692,8 +1692,13 @@ fn resolve_peer_identity(link: &mut Link) {
 /// When a link becomes trusted, send a nonce challenge to the peer so it can
 /// prove device-key possession (0x02 possession_sig). When the response arrives
 /// in the event loop, the `identity-expose` handler upgrades the binding to
-/// Proven. MUST be called at LINK ADOPTION (DirectReady), NOT at individual
-/// open sites — so Proven settles once before any gated open decides.
+/// Proven. Called at LINK READINESS — from DirectReady for direct links (which
+/// holds ChannelReady until Proven) AND from ChannelReady itself for links that
+/// did not go through DirectReady (relay/DataChannel), so Proven is reached on
+/// EVERY connection, not only direct ones (#39). Both sites dedupe against
+/// pending_proven so a single link is never double-challenged. NOT called at
+/// individual open sites — Proven settles once at readiness, before gated opens
+/// decide (the gates additionally honor the pending_proven hold, #30 GAP 2).
 async fn send_identity_challenge(
     conn: &crate::Conn,
     pid: &str,
@@ -12993,6 +12998,58 @@ async fn recv_cmd(
                 conn.stash_upgrade_standby(&pid, t, route);
             }
             Ev::ChannelReady(pid, t) => {
+                // #39 (fleet-trust): make identity-expose UNIVERSAL. The possession
+                // challenge that settles binding=Proven previously fired ONLY from
+                // the DirectReady path, so a relay/DataChannel link that reaches
+                // ChannelReady without a direct adoption stayed Inferred forever — and
+                // fleet auto-trust (Proven-gated by design) then silently gave it
+                // NOTHING. That makes the product "your fleet just works at my desk,
+                // and falls back to grant-only at the airport", the worst failure mode
+                // for a trust feature. So issue the challenge HERE, the single
+                // convergence point every transport passes through, deduped against
+                // pending_proven so a direct link (which DirectReady already
+                // challenged + held) does not double-issue.
+                //
+                // Unlike DirectReady this does NOT hold ChannelReady (the transport is
+                // already live). Instead it inserts pending_proven SYNCHRONOUSLY, so
+                // the gate hold (#30 GAP 2, honored at the shell/transfer/mount gates)
+                // covers any gated open that races in before Proven settles, and a 3s
+                // timeout clears the entry. DEDUPE by deadline, not mere presence: a
+                // STALE hold left by a previous link that dropped mid-challenge would
+                // otherwise suppress the re-challenge on RECONNECT and strand the
+                // reconnected device at Inferred — so an expired entry counts as absent
+                // and is overwritten with a fresh challenge.
+                if crate::capability::cap_authoritative() {
+                    if let Some(l) = conn.link_mut(&pid) {
+                        resolve_peer_identity(l);
+                    }
+                    let needs_proven = conn.link(&pid).map(|l| {
+                        l.identity_device_pub.is_some()
+                            && l.identity_binding != crate::capability::BindingStrength::Proven
+                    }).unwrap_or(false);
+                    let should_challenge = needs_proven && {
+                        let pend = pending_proven.lock().unwrap();
+                        match pend.get(&pid) {
+                            None => true,
+                            Some((_, deadline)) => Instant::now() >= *deadline, // stale hold -> re-challenge
+                        }
+                    };
+                    if should_challenge {
+                        // Set the hold BEFORE the await so a gated open cannot slip in
+                        // between the challenge send and the hold. Overwrites any stale
+                        // entry with a fresh deadline (reconnect safety).
+                        pending_proven.lock().unwrap()
+                            .insert(pid.clone(), (t.clone(), Instant::now() + Duration::from_secs(3)));
+                        send_identity_challenge(&conn, &pid, &mut identity_nonces).await;
+                        ui::debug(&format!("  identity challenge sent to {pid} at channel-ready (universal expose), holding gated opens until Proven or 3s"));
+                        let hold_pending = pending_proven.clone();
+                        let hold_pid = pid.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            hold_pending.lock().unwrap().remove(&hold_pid);
+                        });
+                    }
+                }
                 // web-shell discovery: tell the peer whether this receiver offers a
                 // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
                 // shows its per-device shell button ONLY when this is true; the
