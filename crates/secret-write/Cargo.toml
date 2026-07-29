@@ -1,0 +1,18 @@
+# secret-write — the safe restricted-file writer, carved out of the CLI's
+# platform module. Atomic write (temp + fsync + rename) with owner-only
+# permissions: chmod 0600 on unix, an icacls per-user DACL on Windows. No app
+# coupling: pure std + Command, so the other trust crates (authkeys-managed,
+# filament-id) and the CLI all share one byte-identical secret writer.
+[package]
+name = "secret-write"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Atomic owner-only secret file writer for Filament (chmod 0600 / icacls DACL)."
+
+[dependencies]
+# Version copied verbatim from cli/Cargo.toml. Currently only used for the
+# public surface's error ergonomics; the Windows DACL path shells out to
+# `icacls` via std::process::Command, so no `windows` crate is required.
+anyhow = "1.0.102"

@@ -1155,6 +1155,7 @@ dependencies = [
  "ring",
  "rust_socketio",
  "rustls",
+ "secret-write",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3248,6 +3249,13 @@ dependencies = [
  "pkcs8",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "secret-write"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
