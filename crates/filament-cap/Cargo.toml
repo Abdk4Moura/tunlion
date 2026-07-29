@@ -1,0 +1,43 @@
+# filament-cap — capability primitives + pure evaluation, carved out of the CLI.
+#
+# This is a PARTIAL carve by design. The reusable, host-independent pieces live
+# here: the two owner-signed objects (CapOp / CapHeader), the tag bindings, the
+# single pure authorization fn (`evaluate`), the monotonic store-mutation logic
+# (apply_header / apply_cap_op / update_ratchet), the restrictive composers
+# (cap_authorize_proven / _expired / cap_trust_floor), preview / self-lockout,
+# the crypto primitives (sign_cap_op / sign_cap_header / hash_header /
+# make_resource_id / make_tag_target), and the ephemeral auth-key layer
+# (AuthKey / EnrollmentPayload / Reuse + the burn / nonce / armed statics).
+#
+# The ORCHESTRATION stays in the CLI, because it is bound to the host: store
+# file I/O (load_cap_store / save_cap_store over platform::SecretFile), the env
+# mode flag (cap_authoritative), the process-static observability counters that
+# `cap-status` reads (cap_shadow_counts / cap_action_counts), and the two glue
+# gates cap_authorize (loads the store) + cap_gate_effective (mutates the
+# counters). Those call INTO this crate; this crate never calls back, so there
+# is no cycle.
+#
+# NO filament-id dependency: DeviceCert is read only by CLI-side glue
+# (devices_with_shell_revoked, build_enrollment_response), both of which stay in
+# the CLI. This crate is pure w.r.t. identity.
+[package]
+name = "filament-cap"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Capability primitives + pure authorization evaluation for Filament (orchestration stays in the CLI)."
+
+[dependencies]
+# Versions copied verbatim from cli/Cargo.toml.
+anyhow = "1.0.102"
+ring = "0.17"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+hex = "0.4"
+# The CLI ships two sha2 majors. Capability digests (resource ids, header hash,
+# tag targets) use sha2 0.10 (the `sha2_pake` alias, matching the PAKE tree);
+# the ephemeral enroll-channel derivation uses sha2 0.11. Both are kept as real
+# dependencies of the moved code so hash output is byte-identical to the CLI's.
+sha2 = "0.11.0"
+sha2_pake = { package = "sha2", version = "0.10" }
