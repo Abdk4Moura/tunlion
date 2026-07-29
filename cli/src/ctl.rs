@@ -49,7 +49,8 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_ping, Req,
+    try_approve_request, try_arm, try_cap_status, try_deny_request, try_list_pending, try_ping,
+    Req,
 };
 
 // --------------------------------------------------------------- unix impl ----
@@ -788,6 +789,13 @@ mod stub {
     /// No control socket here, so there is no daemon consent queue to deny
     /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_deny_request(_id: u64) -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so there is no local daemon to arm for an
+    /// enrollment room. Callers treat `None` as "no local daemon" and degrade
+    /// gracefully. Present so the unconditional call site compiles on non-unix.
+    pub async fn try_arm(_key_id: String, _expiry: u64) -> Option<Value> {
         None
     }
 }
