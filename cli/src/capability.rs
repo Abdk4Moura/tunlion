@@ -287,10 +287,52 @@ pub fn cap_authorize(
     }
 }
 
+/// Fleet-gate inputs for `resource`/`action`, from ONE cached store read:
+///  - `own_user_pub`: the resource header's `owner_pub` — MY user key when the
+///    "self" resource is provisioned (the header is seeded from the user key), or
+///    `None` when unprovisioned. Fleet auto-trust compares the peer cert's
+///    `user_pub` against this to decide "is this me?".
+///  - `has_explicit_grant`: whether an explicit owner-signed grant authorizes
+///    `action` for this principal, computed WITHOUT the owner shortcut
+///    (`evaluate_grants_only`) — so a same-owner peer is NOT counted as granted
+///    merely for sharing the user key. This is what lets `cap_gate_effective`
+///    keep the deliberate tier grant-only for a fleet device.
+/// Both feed `cap_gate_effective`'s same-owner fleet branch.
+pub fn cap_fleet_inputs(
+    config_dir: &std::path::Path,
+    resource: &str,
+    action: &str,
+    principal_device_pub: Option<&[u8; 32]>,
+    principal_user_pub: Option<&[u8; 32]>,
+    auth_key_caps: Option<&[String]>,
+) -> (Option<[u8; 32]>, bool) {
+    let store = load_cap_store(config_dir);
+    let header = store
+        .iter()
+        .find(|e| {
+            e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                && e["resource"].as_str() == Some(resource)
+        })
+        .and_then(CapHeader::from_json);
+    let Some(hdr) = header else {
+        return (None, false);
+    };
+    let device_pub = principal_device_pub.copied().unwrap_or([0u8; 32]);
+    let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
+    let explicit = matches!(
+        evaluate_grants_only(
+            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(), auth_key_caps,
+        ),
+        Decision::Authorized
+    );
+    (Some(hdr.owner_pub), explicit)
+}
+
 /// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
 /// modes (so observability survives the flip), logs, and returns the effective gate
 /// decision. `binding` and `cert_expires` are transport/policy facts composed under
 /// authoritative (purely restrictive).
+#[allow(clippy::too_many_arguments)]
 pub fn cap_gate_effective(
     legacy_allowed: bool,
     outcome: &CapOutcome,
@@ -301,6 +343,9 @@ pub fn cap_gate_effective(
     binding: BindingStrength,
     cert_expires: Option<u64>,
     auth_key_caps: Option<&[String]>,
+    own_user_pub: Option<&[u8; 32]>,
+    scoped_in_bounds: bool,
+    has_explicit_grant: bool,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
 
@@ -333,14 +378,53 @@ pub fn cap_gate_effective(
         }
     }
 
+    // === Same-owner fleet trust (Proven-gated scoped defaults) =============
+    // A peer whose device cert chains to MY user key (`own_user_pub`) is a FLEET
+    // MEMBER, not the local primary. The owner shortcut inside
+    // cap_authorize/evaluate would blanket-authorize it for EVERYTHING (incl. the
+    // deliberate tier) just for sharing the user pubkey — the finding-#24 class.
+    // So for a same-owner peer we DISCARD that outcome and recompute from the
+    // fleet policy:
+    //   - a scoped default within its bounds + Proven  → auto-authorized (no grant)
+    //   - otherwise                                     → ONLY an explicit grant
+    //     (`has_explicit_grant`, computed WITHOUT the owner shortcut) authorizes.
+    // This keeps the deliberate tier (shell, write-mount, out-of-scope) grant-only
+    // and makes Inferred get nothing (fleet_auto_trust gates on Proven). A
+    // non-same-owner peer passes through unchanged (its owner shortcut never fires).
+    let peer_user = user_pub.copied().unwrap_or([0u8; 32]);
+    let same_owner = own_user_pub.map_or(false, |o| o == &peer_user) && peer_user != [0u8; 32];
+    let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds);
+    let base_outcome = if same_owner {
+        if fleet_ok || has_explicit_grant {
+            CapOutcome::Authorized
+        } else {
+            CapOutcome::Denied(
+                "fleet device: action needs an explicit grant (deliberate tier or out of scope)".into(),
+            )
+        }
+    } else {
+        outcome.clone()
+    };
+
     // Compose restrictive gates under authoritative (order-independent:
     // both are purely restrictive — Authorized→Denied or pass-through).
     let outcome = &cap_authorize_proven(
-        outcome, binding, authoritative,
+        &base_outcome, binding, authoritative,
     );
     let outcome = &cap_authorize_expired(
         outcome, cert_expires, authoritative,
     );
+
+    // Fleet force-allow: your own Proven device, within scope, gets the scoped
+    // default in BOTH shadow and authoritative — the whole point is your fleet
+    // just works regardless of the flag. It still respects cert expiry (the
+    // standard expiry composer is a no-op in shadow, so re-check it here) and,
+    // via fleet_auto_trust, the Proven binding.
+    let fleet_allow = fleet_ok
+        && matches!(
+            cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
+            CapOutcome::Authorized
+        );
 
     // Counters: recorded in BOTH modes so a flip does not blind us.
     // Per-action bucketing runs in parallel so the flip decision can cite
@@ -373,7 +457,9 @@ pub fn cap_gate_effective(
         }
     }
 
-    let effective = if authoritative {
+    let effective = if fleet_allow {
+        true
+    } else if authoritative {
         matches!(outcome, CapOutcome::Authorized)
     } else {
         legacy_allowed
@@ -672,12 +758,12 @@ mod tests {
         let uk = [0xaa; 32];
         // Legacy-allowed, cap denies (Unprovisioned) → la_no_header
         for action in ["shell", "mount"] {
-            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         // Legacy-denied, cap authorizes → ld_authorized (widening)
-        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
 
         let ac = cap_action_counts();
 
@@ -739,7 +825,7 @@ mod tests {
 
         // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -750,7 +836,7 @@ mod tests {
 
         // (legacy_allowed=true, Denied) -> LA_DENIED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
@@ -761,7 +847,7 @@ mod tests {
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -772,7 +858,7 @@ mod tests {
 
         // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -783,7 +869,7 @@ mod tests {
 
         // (legacy_allowed=false, Denied) -> LD_DENIED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -794,7 +880,7 @@ mod tests {
 
         // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -805,7 +891,7 @@ mod tests {
 
         // Same-bucket repeat proves no cross-contamination on a second call.
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -1029,5 +1115,94 @@ mod tests {
 
         let loaded = load_cap_store(&dir);
         assert_eq!(loaded.len(), 2, "cache must be invalidated after save, reflecting new grant");
+    }
+
+    // ----------------------------------------------------------------------
+    // Fleet auto-trust WIRED at the gate (cap_gate_effective). These are
+    // mode-INDEPENDENT: the ALLOW case relies on the fleet force-allow (fires
+    // in both shadow and authoritative), and every DENY case is asserted with
+    // legacy_allowed=false so the check proves fleet auto-trust did NOT fire
+    // (in shadow the effective decision would be legacy=false; in authoritative
+    // the recomputed outcome is Denied) — either way DENY. The `outcome`
+    // argument is a Denied sentinel to prove the same-owner branch recomputes
+    // from the fleet policy rather than trusting the (owner-shortcut-tainted)
+    // cap_authorize result.
+    #[test]
+    fn fleet_gate_allows_scoped_default_proven_in_scope_without_grant() {
+        let me = [0x11u8; 32];
+        // same-owner (peer user_pub == own_user_pub) + Proven + in-scope + NO grant
+        // → ALLOW, even though legacy denied and the passed outcome is Denied.
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("no grant".into()), "transfer", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+        );
+        assert!(d.allowed(), "same-owner Proven in-scope must ALLOW without a grant");
+    }
+
+    #[test]
+    fn fleet_gate_denies_deliberate_without_grant() {
+        let me = [0x22u8; 32];
+        // same-owner + Proven + DELIBERATE tier (scoped_in_bounds=false) + no grant
+        // → DENY (the deliberate tier is never auto-trusted).
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("x".into()), "shell", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false,
+        );
+        assert!(!d.allowed(), "same-owner Proven deliberate action without grant must DENY");
+    }
+
+    #[test]
+    fn fleet_gate_denies_inferred_binding() {
+        let me = [0x33u8; 32];
+        // same-owner + INFERRED (not Proven) + in-scope → NOTHING (the Proven gate).
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("x".into()), "transfer", "self",
+            None, Some(&me), BindingStrength::Inferred, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+        );
+        assert!(!d.allowed(), "same-owner INFERRED must get nothing, even in-scope");
+    }
+
+    #[test]
+    fn fleet_gate_denies_out_of_scope() {
+        let me = [0x44u8; 32];
+        // same-owner + Proven + a scoped-default action but OUT of its bounds
+        // (scoped_in_bounds=false: e.g. transfer to a non-inbox path, reach a
+        // non-exposed port, a write/broader mount) + no grant → DENY.
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("x".into()), "mount", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false,
+        );
+        assert!(!d.allowed(), "same-owner Proven out-of-scope must DENY");
+    }
+
+    #[test]
+    fn fleet_gate_denies_different_owner() {
+        let me = [0x55u8; 32];
+        let other = [0x66u8; 32];
+        // different owner (peer cert chains to a DIFFERENT user key) + Proven +
+        // in-scope → DENY (deny-by-default; not my fleet).
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("x".into()), "transfer", "self",
+            None, Some(&other), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+        );
+        assert!(!d.allowed(), "different-owner peer must be denied by default");
+    }
+
+    #[test]
+    fn fleet_gate_expired_cert_denies_even_in_scope() {
+        let me = [0x77u8; 32];
+        // same-owner + Proven + in-scope but EXPIRED cert → DENY: fleet force-allow
+        // still respects cert expiry (renewal is the only revocation bound).
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("x".into()), "transfer", "self",
+            None, Some(&me), BindingStrength::Proven, Some(0), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+        );
+        assert!(!d.allowed(), "expired cert must deny fleet auto-trust even in-scope");
     }
 }

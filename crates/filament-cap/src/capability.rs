@@ -380,6 +380,29 @@ pub fn evaluate(
     }
     let eval_time = std::cmp::max(now, ratchet.unwrap());
 
+    if scan_grants_authorizes(
+        store, header, principal_device_pub, principal_user_pub, resource, action, eval_time,
+    ) {
+        Decision::Authorized
+    } else {
+        Decision::Denied("not authorized".into())
+    }
+}
+
+/// Scan explicit owner-signed grants (User/Device/Tag targets) for one that
+/// authorizes `action` on `resource` for this principal at `eval_time`. This is
+/// the grant-matching core WITHOUT the owner shortcut, shared by `evaluate` (which
+/// applies the owner shortcut first) and `evaluate_grants_only` (which never does),
+/// so the two can never diverge on how a grant is matched.
+fn scan_grants_authorizes(
+    store: &[Value],
+    header: &CapHeader,
+    principal_device_pub: &[u8; 32],
+    principal_user_pub: &[u8; 32],
+    resource: &str,
+    action: &str,
+    eval_time: u64,
+) -> bool {
     for entry in store {
         if entry.get("type").and_then(|v| v.as_str()) != Some("cap_grant") {
             continue;
@@ -426,12 +449,80 @@ pub fn evaluate(
         // Check action is in permissions
         if let Some(perms) = entry["permissions"].as_array() {
             if perms.iter().any(|p| p.as_str() == Some(action)) {
-                return Decision::Authorized;
+                return true;
             }
         }
     }
+    false
+}
 
-    Decision::Denied("not authorized".into())
+/// Gate-facing authorization that NEVER applies the owner shortcut. A remote peer
+/// whose device cert merely chains to the owner user key (same `user_pub`) is a
+/// FLEET MEMBER, not the local primary: it must not inherit blanket owner
+/// authority just for sharing the user pubkey. Only an explicit owner-signed grant
+/// (or fleet auto-trust, layered above this at the gate) authorizes. This is the
+/// finding-#24 class fixed at the UX/gate layer.
+///
+/// For a principal that is NOT the owner, this is identical to `evaluate` (the
+/// owner shortcut never fires there anyway); it differs only for a same-owner peer,
+/// which is exactly the fleet case the gate must scope.
+pub fn evaluate_grants_only(
+    store: &[Value],
+    header: &CapHeader,
+    principal_device_pub: &[u8; 32],
+    principal_user_pub: &[u8; 32],
+    resource: &str,
+    action: &str,
+    now: u64,
+    auth_key_caps: Option<&[String]>,
+) -> Decision {
+    // Delegated-principal ceiling (mirrors evaluate; see the note there).
+    if let Some(caps) = auth_key_caps {
+        let action_lc = action.to_lowercase();
+        if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
+            return Decision::Denied("not in auth key caps".into());
+        }
+    }
+    let ratchet = ratchet_for(store, &header.owner_pub);
+    if ratchet.is_none() {
+        return Decision::Denied("ratchet uninitialized".into());
+    }
+    let eval_time = std::cmp::max(now, ratchet.unwrap());
+    if scan_grants_authorizes(
+        store, header, principal_device_pub, principal_user_pub, resource, action, eval_time,
+    ) {
+        Decision::Authorized
+    } else {
+        Decision::Denied("not authorized".into())
+    }
+}
+
+/// The scoped-default action set a same-owner Proven fleet device may exercise
+/// with NO explicit grant — each bounded to a scope the GATE enforces:
+///   - `transfer` → into the designated inbox directory (not arbitrary paths)
+///   - `reach`    → only ports the owner has explicitly exposed (`expose.json`)
+///   - `mount`    → READ-ONLY, of the explicit share root (never home)
+/// Deliberate-tier actions (`shell`, write-mount, reach-all-ports, mount of a
+/// broader root) are NEVER in this set and always require an explicit grant.
+/// (Note: the l2-open port-forward gate labels its cap action `shell`; the gate
+/// there passes `scoped_in_bounds` computed from `expose.json` directly rather
+/// than routing "reach" through this classifier — see cap_gate_effective callers.)
+pub fn is_scoped_default_action(action: &str) -> bool {
+    matches!(action, "transfer" | "reach" | "mount")
+}
+
+/// Same-owner fleet auto-trust decision, PROVEN-GATED. Grants a scoped default to
+/// a peer whose device cert chains to MY user key (`same_owner`) ONLY when the
+/// link binding proves device-key possession (`Proven`, never `Inferred`/`None`)
+/// AND the action is within its bounded scope (`scoped_in_bounds`, computed at the
+/// gate). It NEVER authorizes the deliberate tier (callers pass
+/// `scoped_in_bounds = false` there) and is unreachable on a non-Proven binding.
+pub fn fleet_auto_trust(
+    same_owner: bool,
+    binding: BindingStrength,
+    scoped_in_bounds: bool,
+) -> bool {
+    same_owner && binding == BindingStrength::Proven && scoped_in_bounds
 }
 
 // ---------------------------------------------------------------------------
@@ -2673,5 +2764,82 @@ mod tests {
         assert_eq!(cap_trust_floor(&auth, false, BindingStrength::Proven, true), CapOutcome::Authorized);
         // Denied + untrusted + authoritative → stays Denied
         assert_eq!(cap_trust_floor(&deny, false, inferred, true), deny);
+    }
+
+    // ----------------------------------------------------------------------
+    // Fleet auto-trust (same-owner Proven-gated scoped defaults)
+    // ----------------------------------------------------------------------
+
+    /// The scoped-default classifier: transfer/reach/mount are auto-grantable
+    /// to a same-owner Proven device; the deliberate tier is not.
+    #[test]
+    fn is_scoped_default_action_classifies_tiers() {
+        assert!(is_scoped_default_action("transfer"));
+        assert!(is_scoped_default_action("reach"));
+        assert!(is_scoped_default_action("mount"));
+        // Deliberate tier and unknowns are never auto.
+        assert!(!is_scoped_default_action("shell"));
+        assert!(!is_scoped_default_action("write-mount"));
+        assert!(!is_scoped_default_action("anything-else"));
+    }
+
+    /// The Proven-gate is the load-bearing rule: fleet auto-trust fires for a
+    /// same-owner device ONLY on Proven AND in-scope, and NEVER on Inferred/None,
+    /// out-of-scope, or a different owner.
+    #[test]
+    fn fleet_auto_trust_matrix() {
+        // same-owner Proven + in-scope → auto-trust
+        assert!(fleet_auto_trust(true, BindingStrength::Proven, true));
+        // same-owner Proven + OUT of scope → no auto-trust (deliberate/out-of-bounds)
+        assert!(!fleet_auto_trust(true, BindingStrength::Proven, false));
+        // same-owner INFERRED + in-scope → NOTHING (the Proven gate)
+        assert!(!fleet_auto_trust(true, BindingStrength::Inferred, true));
+        // same-owner None + in-scope → NOTHING
+        assert!(!fleet_auto_trust(true, BindingStrength::None, true));
+        // DIFFERENT owner + Proven + in-scope → deny-by-default (not my fleet)
+        assert!(!fleet_auto_trust(false, BindingStrength::Proven, true));
+    }
+
+    /// `evaluate_grants_only` must NOT apply the owner shortcut: a peer that
+    /// merely shares the owner user key gets NOTHING without an explicit grant,
+    /// where `evaluate` (with the shortcut) would authorize everything. This is
+    /// the finding-#24 fix that lets the gate deny the deliberate tier to a
+    /// same-owner device that has no grant.
+    #[test]
+    fn evaluate_grants_only_ignores_owner_shortcut() {
+        let owner = make_owner();
+        let owner_pk = owner_pub(&owner);
+        let nonce = [7u8; 32];
+        let header = make_genesis_header(&owner, &nonce, &[]);
+        let mut store = init_store(&header);
+        let resource = header.resource.clone();
+        let dev = [0xdd; 32];
+        let now = now_secs();
+
+        // Baseline: evaluate() applies the owner shortcut → same-owner authorized
+        // for a deliberate action even with no grant.
+        assert!(matches!(
+            evaluate(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
+            Decision::Authorized
+        ), "evaluate owner shortcut authorizes same-owner");
+
+        // evaluate_grants_only: same-owner, no grant → DENIED (shortcut skipped).
+        assert!(matches!(
+            evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
+            Decision::Denied(_)
+        ), "grants-only must not apply the owner shortcut");
+
+        // With an explicit device grant for transfer, grants-only authorizes
+        // transfer for that device but still NOT shell.
+        let grant = make_grant(&owner, CapTarget::Device(dev), &resource, &["transfer"], hlc_next(0, now_ms()), 86_400);
+        apply_cap_op(&mut store, &header, &grant, now).unwrap();
+        assert!(matches!(
+            evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "transfer", now, None),
+            Decision::Authorized
+        ), "explicit device grant authorizes transfer under grants-only");
+        assert!(matches!(
+            evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
+            Decision::Denied(_)
+        ), "no shell grant → grants-only denies shell for same-owner device");
     }
 }

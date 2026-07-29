@@ -2159,6 +2159,53 @@ pub(crate) fn default_drop_dir() -> PathBuf {
     PathBuf::from(home).join("Filament")
 }
 
+/// The designated transfer INBOX: where a fleet-auto-trusted `transfer` may land.
+/// It is the receiver's own drop directory (config `dir`, default `~/Filament`) —
+/// a bounded, dedicated directory the SENDER cannot redirect, so `transfer`
+/// carries its own scope by construction (the invariant: a default capability
+/// names a bounded resource, never an arbitrary path).
+pub(crate) fn fleet_inbox_dir() -> PathBuf {
+    drop_dir(None)
+}
+
+/// The read-only SHARE ROOT a same-owner fleet device may mount without an
+/// explicit grant. Config value `share` (a directory path); default a dedicated
+/// `~/filament-share`, never home. A mount whose requested root escapes this dir
+/// is out of scope (the deliberate tier) and needs an explicit grant.
+pub(crate) fn fleet_share_root() -> PathBuf {
+    config_get("share").map(PathBuf::from).unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join("filament-share")
+    })
+}
+
+/// Lexically normalize a path (resolve `.`/`..` without touching the FS) so a
+/// scope check can't be defeated by `share/../../etc`. Returns the normalized
+/// component vector.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        use std::path::Component::*;
+        match comp {
+            ParentDir => {
+                out.pop();
+            }
+            CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when `path`, lexically normalized, is within (or equal to) `root`. Used
+/// to bound a fleet mount to the share root. A relative or non-normalizable
+/// request fails closed (not within), so it falls through to explicit-grant.
+fn path_within(root: &Path, path: &Path) -> bool {
+    let root_n = lexical_normalize(root);
+    let path_n = lexical_normalize(path);
+    !root_n.as_os_str().is_empty() && path_n.starts_with(&root_n)
+}
+
 /// True when an `up` daemon is currently running (drives the "takes effect on
 /// next up" hint after a settings change).
 pub(crate) fn daemon_running() -> bool {
@@ -13175,7 +13222,17 @@ async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps);
+                        // Fleet scope for `reach`: a same-owner Proven device may
+                        // open an l2 forward WITHOUT a grant ONLY to a port the
+                        // owner has explicitly exposed (`expose.json`). A forward to
+                        // any other port is reach-all (deliberate) and needs a grant.
+                        let reach_port = v["rport"].as_u64().or_else(|| v["port"].as_u64()).unwrap_or(0) as u16;
+                        let scoped_in_bounds = reach_port != 0
+                            && crate::expose::load().iter().any(|b| b.port == reach_port);
+                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
+                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                        );
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -13325,7 +13382,15 @@ async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps)
+                        {
+                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
+                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                        );
+                        // Deliberate tier: `shell` is never a scoped default, so a
+                        // same-owner device gets it ONLY via an explicit grant
+                        // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        }
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -13432,7 +13497,15 @@ async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps)
+                        {
+                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
+                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                        );
+                        // Deliberate tier: `shell` is never a scoped default, so a
+                        // same-owner device gets it ONLY via an explicit grant
+                        // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        }
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -13564,10 +13637,15 @@ async fn recv_cmd(
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     if !l2::is_l2_sid(sid) { continue; }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    // Decode the requested root up front: the fleet mount scope
+                    // (read-only, within the share root) is decided at the gate.
+                    let root_encoded = v["root"].as_str().unwrap_or(".");
+                    let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let within_share = crate::path_within(&crate::fleet_share_root(), &root_path);
                     // Capability layer for mount evaluated unconditionally (shadow
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
-                    let authorized = {
+                    let (authorized, read_only) = {
                         // Lazy-resolve peer identity from stored device cert
                         {
                             if let Some(l) = conn.link_mut(&pid) {
@@ -13596,7 +13674,23 @@ async fn recv_cmd(
                             binding,
                             crate::capability::cap_authoritative(),
                         );
-                        crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps)
+                        // Fleet scope: a same-owner Proven device may mount WITHOUT a
+                        // grant ONLY read-only, within the share root (scoped_in_bounds
+                        // = within_share). An auto-trusted fleet mount is served
+                        // READ-ONLY; an explicit `mount` grant keeps its rw behavior.
+                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
+                            &crate::settings::config_dir(), "self", "mount", idev, iusr, ak_caps,
+                        );
+                        let same_owner = match (iusr, own_user.as_ref()) {
+                            (Some(u), Some(o)) => u == o,
+                            _ => false,
+                        };
+                        let read_only = same_owner
+                            && binding == crate::capability::BindingStrength::Proven
+                            && within_share
+                            && !has_grant;
+                        let d = crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), within_share, has_grant);
+                        (d, read_only)
                     };
                     if !authorized.allowed() {
                         let who = conn
@@ -13612,9 +13706,13 @@ async fn recv_cmd(
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
-                    let root_encoded = v["root"].as_str().unwrap_or(".");
-                    let root_path = mount_proto::path_decode(root_encoded).unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let caps = mount_proto::mount_caps_for_root(&root_path);
+                    let mut caps = mount_proto::mount_caps_for_root(&root_path);
+                    // A read-only fleet share advertises zero writable size so a
+                    // well-behaved client sees it is read-only; the server also
+                    // hard-rejects every write with EROFS regardless of the ack.
+                    if read_only {
+                        caps.max_write_size = 0;
+                    }
                     let mux = l2_muxes.entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();
@@ -13627,7 +13725,7 @@ async fn recv_cmd(
                     let transport = t.clone();
                     let spawn_sid = sid;
                     let proto_version = caps.protocol_version;
-                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version);
+                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version, read_only);
                 }
                 Some("pty-resize") if l2_enabled => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
@@ -14121,7 +14219,17 @@ async fn recv_cmd(
                             binding,
                             crate::capability::cap_authoritative(),
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps);
+                        // Fleet scope for `transfer`: bounded by construction. The
+                        // receiver always writes into its own inbox (`fleet_inbox_dir`,
+                        // the drop dir), never a sender-named path, so a same-owner
+                        // Proven device's transfer is always in-scope. Touch the inbox
+                        // path so the bound is explicit at the gate (and de-dead-coded).
+                        let _inbox = crate::fleet_inbox_dir();
+                        let scoped_in_bounds = true;
+                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
+                            &crate::settings::config_dir(), "self", "transfer", idev, iusr, ak_caps,
+                        );
+                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {
@@ -15016,6 +15124,25 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fleet mount scope: `path_within` bounds a mount to the share root and
+    /// resists `..` escapes. This is the SECURITY check that keeps an
+    /// auto-trusted mount inside the share root (never home/`/`).
+    #[test]
+    fn path_within_bounds_the_share_root() {
+        let root = std::path::Path::new("/home/me/filament-share");
+        // Exact root and a child are within.
+        assert!(path_within(root, std::path::Path::new("/home/me/filament-share")));
+        assert!(path_within(root, std::path::Path::new("/home/me/filament-share/docs/a.txt")));
+        // A sibling / home / root are NOT within.
+        assert!(!path_within(root, std::path::Path::new("/home/me")));
+        assert!(!path_within(root, std::path::Path::new("/home/me/secrets")));
+        assert!(!path_within(root, std::path::Path::new("/")));
+        // `..` escape is normalized away and rejected.
+        assert!(!path_within(root, std::path::Path::new("/home/me/filament-share/../../.ssh")));
+        // A relative request fails closed (not within an absolute root).
+        assert!(!path_within(root, std::path::Path::new("filament-share")));
+    }
 
     #[test]
     fn sanitize_device_name_strips_escape_junk() {

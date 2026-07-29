@@ -555,6 +555,7 @@ pub fn spawn_mount_server(
     sid: u32,
     mut rx: mpsc::Receiver<PipeItem>,
     proto_version: u32,
+    read_only: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut open_files: HashMap<u64, (std::fs::File, PathBuf)> = HashMap::new();
@@ -599,7 +600,7 @@ pub fn spawn_mount_server(
                     }
                 };
                 let (resp_body, resp_data) =
-                    handle_mount_request(&root, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2).await;
+                    handle_mount_request(&root, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2, read_only).await;
                 let mut resp_json = serde_json::to_vec(&resp_body).unwrap_or_default();
                 resp_json.push(b'\n');
                 let payload = if v2 {
@@ -632,7 +633,38 @@ async fn handle_mount_request(
     req: &MountRequest,
     write_data: Option<&[u8]>,
     v2: bool,
+    read_only: bool,
 ) -> (MountResponse, Option<Vec<u8>>) {
+    // Read-only enforcement (fleet-auto-trusted share mounts): reject every
+    // mutating op — and any Open that requests write access — with EROFS before
+    // it touches the filesystem. This is the SECURITY boundary for the scoped
+    // `mount` default: a same-owner fleet device gets a READ-ONLY view of the
+    // share root and can never write (write-mount is authority-equivalent, the
+    // deliberate tier). The server is the enforcement point, not the advertised
+    // caps, so a hostile client cannot regain writes by ignoring the ack.
+    if read_only {
+        let mutating = match &req.op {
+            MountOp::Write { .. }
+            | MountOp::Create { .. }
+            | MountOp::Unlink { .. }
+            | MountOp::MkDir { .. }
+            | MountOp::RmDir { .. }
+            | MountOp::Rename { .. }
+            | MountOp::Truncate { .. } => true,
+            MountOp::Open { flags, .. } => (flags & O_ACCMODE) != 0, // O_RDONLY == 0
+            _ => false,
+        };
+        if mutating {
+            return (
+                MountResponse {
+                    id: req.id,
+                    bin: None,
+                    result: MountResult::Err(MountError { code: EROFS, msg: "read-only fleet share".into() }),
+                },
+                None,
+            );
+        }
+    }
     let result = match &req.op {
         MountOp::GetAttr { path } => (do_getattr(root, path), None),
         MountOp::Open { path, flags } => (do_open(root, path, *flags, open_files, next_fh), None),
