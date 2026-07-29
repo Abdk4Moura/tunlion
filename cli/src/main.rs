@@ -13687,11 +13687,24 @@ async fn recv_cmd(
                             (Some(u), Some(o)) => u == o,
                             _ => false,
                         };
+                        // #42 HOLD-OUT (advisor call): the mount scoped-DEFAULT is not
+                        // shipped in this release. It is not drivable today (filament
+                        // mount has no --auth-key, and an OwnerDevice cannot reach
+                        // Proven), so its scope enforcement (within_share /
+                        // path_within_canonical + the read-only EROFS path) has NEVER
+                        // been exercised end-to-end — shipping it would make the first
+                        // real user its first test, and publish a capability no path can
+                        // reach. Until mount is auth-key-drivable AND rig-verified
+                        // (including a write attempt that MUST return EROFS), a fleet
+                        // mount requires an EXPLICIT grant (deliberate tier). `within_share`
+                        // stays computed so re-enabling #42 is a one-line flip back.
+                        let _ = within_share;
+                        let mount_scoped_default = false;
                         let read_only = same_owner
                             && binding == crate::capability::BindingStrength::Proven
-                            && within_share
+                            && mount_scoped_default
                             && !has_grant;
-                        let d = crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), within_share, has_grant);
+                        let d = crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant);
                         (d, read_only)
                     };
                     if !authorized.allowed() {
