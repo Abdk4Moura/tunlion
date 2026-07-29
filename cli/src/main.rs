@@ -2159,19 +2159,21 @@ pub(crate) fn default_drop_dir() -> PathBuf {
     PathBuf::from(home).join("Filament")
 }
 
-/// The designated transfer INBOX: where a fleet-auto-trusted `transfer` may land.
-/// It is the receiver's own drop directory (config `dir`, default `~/Filament`) —
-/// a bounded, dedicated directory the SENDER cannot redirect, so `transfer`
-/// carries its own scope by construction (the invariant: a default capability
-/// names a bounded resource, never an arbitrary path).
-pub(crate) fn fleet_inbox_dir() -> PathBuf {
-    drop_dir(None)
-}
-
 /// The read-only SHARE ROOT a same-owner fleet device may mount without an
 /// explicit grant. Config value `share` (a directory path); default a dedicated
 /// `~/filament-share`, never home. A mount whose requested root escapes this dir
 /// is out of scope (the deliberate tier) and needs an explicit grant.
+///
+/// COMPOSITION INVARIANT (load-bearing — do not break in a refactor): the
+/// transfer INBOX (`drop_dir`, default `~/Filament`) must NOT be inside this
+/// share root. Two scoped defaults compose dangerously if it is: `transfer`
+/// (write, auto-trusted) could place a file — or, absent plain-file-only write
+/// hardening, a symlink — that the read-only `mount` default then serves,
+/// turning two individually-correct defaults into arbitrary filesystem read.
+/// The defaults (`~/Filament` vs `~/filament-share`) are disjoint by
+/// construction; a user who points `dir` and `share` at overlapping paths
+/// re-opens this, so the mount server must additionally refuse to traverse
+/// out of the share root at open time (see the beneath-root hardening).
 pub(crate) fn fleet_share_root() -> PathBuf {
     config_get("share").map(PathBuf::from).unwrap_or_else(|| {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -14219,13 +14221,21 @@ async fn recv_cmd(
                             binding,
                             crate::capability::cap_authoritative(),
                         );
-                        // Fleet scope for `transfer`: bounded by construction. The
-                        // receiver always writes into its own inbox (`fleet_inbox_dir`,
-                        // the drop dir), never a sender-named path, so a same-owner
-                        // Proven device's transfer is always in-scope. Touch the inbox
-                        // path so the bound is explicit at the gate (and de-dead-coded).
-                        let _inbox = crate::fleet_inbox_dir();
-                        let scoped_in_bounds = true;
+                        // Fleet transfer scope, enforced by construction and VERIFIED
+                        // here (not hardcoded `true`, which asserted a bound nothing
+                        // checked). The offered name is basename-only (see ~14095:
+                        // `Path::new(raw).file_name()`, "never trust a remote name with
+                        // path separators") and lands in the receiver's OWN drop dir
+                        // `dir`, which the sender cannot redirect. Assert the landing
+                        // path is within `dir` so a future regression in the sanitizer
+                        // or in how `dir` is derived TRIPS the gate (fails closed to
+                        // grant-only) instead of silently widening scope. NOTE: this is
+                        // a LEXICAL check; a symlink planted at the final `.part` create
+                        // could still redirect the write — closed separately by the
+                        // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
+                        // a fleet-trust follow-up.
+                        let landing = dir.join(&name);
+                        let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
                             &crate::settings::config_dir(), "self", "transfer", idev, iusr, ak_caps,
                         );

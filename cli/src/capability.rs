@@ -394,6 +394,27 @@ pub fn cap_gate_effective(
     let peer_user = user_pub.copied().unwrap_or([0u8; 32]);
     let same_owner = own_user_pub.map_or(false, |o| o == &peer_user) && peer_user != [0u8; 32];
     let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds);
+    // Observability for the Proven-precondition — do NOT tighten blind. A
+    // same-owner peer authorized ONLY by an explicit grant while its binding is
+    // below Proven is EXACTLY the population that would lose access if
+    // `has_explicit_grant` were tightened to require Proven. Today the possession
+    // challenge that sets Proven fires only on direct-link adoption (see
+    // send_identity_challenge in the DirectReady path); a relay/DataChannel
+    // connection can settle at Inferred. So explicit grants are still honored on
+    // Inferred here, and we SURFACE that reliance (deduped per device+action) to
+    // measure it before requiring Proven for grants. Tightening without first
+    // making identity-expose universal is the 0.7.0 "worked yesterday, denied
+    // today" breakage in a new costume.
+    if same_owner && !fleet_ok && has_explicit_grant && binding != BindingStrength::Proven {
+        let dev = device_pub.copied().unwrap_or([0u8; 32]);
+        log_once(
+            format!("infgrant|{action}|{}", hex::encode(dev)),
+            &format!(
+                "CAP-INFERRED-GRANT: fleet device dev={} authorized '{action}' via an explicit grant on a {binding:?} (non-Proven) binding. Fleet auto-trust requires Proven; explicit grants are still honored on Inferred pending universal identity-expose. Measured so Proven can be required for grants without silently revoking established devices.",
+                hex::encode(dev),
+            ),
+        );
+    }
     let base_outcome = if same_owner {
         if fleet_ok || has_explicit_grant {
             CapOutcome::Authorized
@@ -527,6 +548,21 @@ pub fn cap_gate_effective(
 /// removed because the capability layer no longer authorizes `shell`.
 /// Returns petnames. Called by the shell-key reconciler on daemon start
 /// and on cap-store change. Idempotent — running it with no drift is a no-op.
+///
+/// Uses `evaluate_grants_only` (NOT `evaluate`) DELIBERATELY. `shell` is a
+/// deliberate-tier action: it is authorized only by an explicit owner-signed
+/// grant, never by the owner shortcut. A same-owner FLEET device shares the
+/// owner's `user_pub`, so plain `evaluate` would apply the owner shortcut and
+/// return Authorized for it unconditionally — the device would then NEVER appear
+/// in the revoked set, so the reconciler would NEVER strip its authorized_keys.
+/// Net effect of that bug: grant shell to a fleet device (key installs), revoke
+/// the grant, and the key STAYS — permanent SSH on the one surface that bypasses
+/// every filament gate. That is the exact revocation gap the reconciler exists to
+/// close (#24), reopened for fleet devices. `evaluate_grants_only` removes the
+/// owner shortcut so key presence tracks the explicit shell grant for fleet
+/// devices exactly as it does for external ones. (The live shell OPEN is gated
+/// separately at cap_gate_effective with scoped_in_bounds=false, i.e. grant-only;
+/// this keeps the KEY surface consistent with that gate.)
 pub fn devices_with_shell_revoked(config_dir: &std::path::Path) -> Vec<String> {
     let cap_store = load_cap_store(config_dir);
     let devices_path = config_dir.join("devices.json");
@@ -565,7 +601,7 @@ pub fn devices_with_shell_revoked(config_dir: &std::path::Path) -> Vec<String> {
             continue;
         };
 
-        let d = evaluate(
+        let d = evaluate_grants_only(
             &cap_store,
             &hdr,
             &cert.device_pub,
@@ -1087,6 +1123,77 @@ mod tests {
         let out_shadow = reconcile_shell_keys(&revoked, mock_ak, false);
         assert!(crate::sshkeys::has_block(&out_shadow, "bob"),
             "shadow: block must NOT be removed — report-only");
+    }
+
+    /// BLOCKER-1 regression: the shell-key reconciler must track the explicit
+    /// grant for a SAME-OWNER fleet device (device cert userPub == owner pubkey),
+    /// exactly as it does for an external device. With `evaluate` (owner shortcut)
+    /// a same-owner device was ALWAYS Authorized → NEVER in the revoked set → its
+    /// authorized_keys block was never stripped: grant shell, revoke it, key stays
+    /// forever. `evaluate_grants_only` fixes it. This test would PASS with the bug
+    /// present on the external-device tests above (different userPub) and FAIL only
+    /// for a same-owner device — which is the case the bug uniquely affected.
+    #[test]
+    fn fleet_device_shell_key_tracks_grant_not_owner_shortcut() {
+        let owner = make_owner();
+        let nonce = self_resource_nonce();
+        let pk = owner_pub(&owner);
+        let resource = self_resource_id(&pk);
+        let device_pub = [0xcc; 32];
+        let target = CapTarget::Device(device_pub);
+
+        let mut hdr = CapHeader {
+            resource: resource.clone(), epoch: 0, owner_pub: pk, nonce, floors: vec![],
+            issued_at: now_secs(), prev_owner_pub: None, prev_header_hash: None, sig: [0u8; 64],
+        };
+        hdr.sig = sign_cap_header(&hdr, &owner);
+        let store_hdr = CapHeader { resource: "self".to_string(), ..hdr.clone() };
+
+        // SAME-OWNER fleet device: its cert userPub IS the owner's pubkey.
+        let cert_json = serde_json::json!({
+            "devicePub": hex::encode(device_pub),
+            "userPub": hex::encode(pk),
+            "expires": now_secs() + 90 * 24 * 3600,
+            "issued": now_secs(),
+            "sig": hex::encode([0u8; 64]),
+        });
+        let devices = vec![serde_json::json!({
+            "name": "my-laptop",
+            "secret": "aa".repeat(32),
+            "v": 2,
+            "caps": ["transfer"],
+            "deviceCert": cert_json,
+            "userKey": hex::encode(pk),
+        })];
+
+        let tmp = std::env::temp_dir().join(format!("fil-fleet-recon-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
+
+        let mut hdr_json = hdr.to_json();
+        hdr_json["resource"] = serde_json::json!("self");
+
+        // (a) NO shell grant → a same-owner device MUST be revoked (this is the
+        //     assertion the owner-shortcut bug got wrong: it would exempt it).
+        let store_nogrant = vec![hdr_json.clone()];
+        std::fs::write(tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store_nogrant)).unwrap()).unwrap();
+        invalidate_cap_cache();
+        let revoked = devices_with_shell_revoked(&tmp);
+        assert!(revoked.contains(&"my-laptop".to_string()),
+            "same-owner fleet device with NO shell grant MUST be in the revoked set (owner shortcut must NOT exempt it)");
+
+        // (b) WITH an explicit shell grant → the same device MUST NOT be revoked.
+        let v1 = hlc_next(0, now_ms());
+        let grant = make_grant(&owner, target, "self", &["shell"], v1, 86400);
+        let mut store_grant = vec![hdr_json];
+        apply_cap_op(&mut store_grant, &store_hdr, &grant, now_secs()).unwrap();
+        std::fs::write(tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store_grant)).unwrap()).unwrap();
+        invalidate_cap_cache();
+        let revoked2 = devices_with_shell_revoked(&tmp);
+        assert!(!revoked2.contains(&"my-laptop".to_string()),
+            "same-owner fleet device WITH an explicit shell grant must NOT be revoked");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// Cache returns same result as uncached load for identical store.
