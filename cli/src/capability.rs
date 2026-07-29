@@ -889,8 +889,9 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
 /// fresh store immediately, never stale after a grant/revoke.
 pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> std::io::Result<()> {
     let p = config_dir.join("caps.json");
-    if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).ok(); }
-    std::fs::write(&p, serde_json::to_string_pretty(&serde_json::json!(store))?)?;
+    let data = serde_json::to_string_pretty(&serde_json::json!(store))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::platform::SecretFile::write_str(&p, &data)?;
     // Invalidate cache: next load_cap_store will see the new mtime and re-read.
     let cache = cache_init();
     if let Ok(mut c) = cache.lock() {
