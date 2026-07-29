@@ -361,11 +361,10 @@ pub fn evaluate(
     // both are retained DELIBERATELY: after the crate split, each is invisible
     // from the other side of the boundary, and removing either re-opens the
     // delegated-owner escalation. See the mirror comment on cap_gate_effective.
-    if let Some(caps) = auth_key_caps {
-        let action_lc = action.to_lowercase();
-        if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
-            return Decision::Denied("not in auth key caps".into());
-        }
+    // (Shared with evaluate_grants_only via auth_key_ceiling_denied so the two
+    // in-crate copies cannot diverge; the CLI copy stays independent by design.)
+    if let Some(denied) = auth_key_ceiling_denied(action, auth_key_caps) {
+        return denied;
     }
 
     // Owner is always authorized (derived, outside cap list)
@@ -456,6 +455,29 @@ fn scan_grants_authorizes(
     false
 }
 
+/// The delegated-principal ceiling, factored out so `evaluate` and
+/// `evaluate_grants_only` cannot DIVERGE on it (they already share the grant match
+/// via `scan_grants_authorizes`; this removes the last mirror between them). If
+/// `auth_key_caps` is present, the action must be within the auth key's stated
+/// caps — even the owner shortcut does not bypass it, which is what makes a
+/// delegated owner-shortcut safe. Returns `Some(Denied)` when the ceiling refuses,
+/// `None` when it passes or is not applicable.
+///
+/// DEFENSE-IN-DEPTH: a THIRD, deliberately INDEPENDENT copy of this ceiling lives
+/// at `cap_gate_effective` in the CLI (across the crate boundary), which does not
+/// trust this one's result — see the notes there. That copy is intentional
+/// redundancy (it is the ONLY ceiling enforcement in shadow mode) and is NOT part
+/// of this de-duplication.
+fn auth_key_ceiling_denied(action: &str, auth_key_caps: Option<&[String]>) -> Option<Decision> {
+    if let Some(caps) = auth_key_caps {
+        let action_lc = action.to_lowercase();
+        if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
+            return Some(Decision::Denied("not in auth key caps".into()));
+        }
+    }
+    None
+}
+
 /// Gate-facing authorization that NEVER applies the owner shortcut. A remote peer
 /// whose device cert merely chains to the owner user key (same `user_pub`) is a
 /// FLEET MEMBER, not the local primary: it must not inherit blanket owner
@@ -476,12 +498,10 @@ pub fn evaluate_grants_only(
     now: u64,
     auth_key_caps: Option<&[String]>,
 ) -> Decision {
-    // Delegated-principal ceiling (mirrors evaluate; see the note there).
-    if let Some(caps) = auth_key_caps {
-        let action_lc = action.to_lowercase();
-        if !caps.iter().any(|c| c.to_lowercase() == action_lc) {
-            return Decision::Denied("not in auth key caps".into());
-        }
+    // Delegated-principal ceiling — SHARED with evaluate via auth_key_ceiling_denied
+    // (no longer a mirror; the two cannot diverge on it).
+    if let Some(denied) = auth_key_ceiling_denied(action, auth_key_caps) {
+        return denied;
     }
     let ratchet = ratchet_for(store, &header.owner_pub);
     if ratchet.is_none() {
