@@ -736,7 +736,13 @@ fn do_getattr(root: &PathBuf, path: &str) -> Result<Value, MountError> {
 
 fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64, (std::fs::File, PathBuf)>, next_fh: &mut u64) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    let file = open_file(&resolved, flags).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    // Use safe_open_beneath to prevent symlink traversal out of the share root
+    let rel = match resolved.strip_prefix(root) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return Err(MountError { code: EACCES, msg: "path not beneath root".into() }),
+    };
+    let file = safe_open_beneath(root, &rel, flags)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     let fh = *next_fh;
     *next_fh += 1;
     open_files.insert(fh, (file, resolved));
@@ -745,12 +751,13 @@ fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64,
 
 fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut HashMap<u64, (std::fs::File, PathBuf)>, next_fh: &mut u64) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    // create implies write; also open for read unless the caller asked write-only.
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read((flags & O_ACCMODE) != O_WRONLY)
-        .open(&resolved)
+    // Use safe_open_beneath with O_CREAT to prevent symlink traversal
+    let rel = match resolved.strip_prefix(root) {
+        Ok(r) => r.to_path_buf(),
+        Err(_) => return Err(MountError { code: EACCES, msg: "path not beneath root".into() }),
+    };
+    let create_flags = flags | libc::O_CREAT | libc::O_EXCL;
+    let file = safe_open_beneath(root, &rel, create_flags)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     #[cfg(unix)]
     {
@@ -886,6 +893,120 @@ fn open_file(path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::Fil
         .read(rd)
         .write(wr)
         .open(path)
+}
+
+/// Open a file beneath a root directory, refusing to follow symlinks that
+/// escape the root. On Linux, uses openat2 with RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS.
+/// On other Unix, uses a component-walk with O_NOFOLLOW. On non-Unix, falls back
+/// to canonicalize + starts_with (best-effort, no TOCTOU guarantee).
+#[cfg(unix)]
+fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // On Linux 5.6+, use openat2 with RESOLVE_BENEATH for strictest enforcement.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let root_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(root)?;
+
+        // RESOLVE_BENEATH = 0x02: refuse to escape the root via symlinks/..
+        // RESOLVE_NO_MAGICLINKS = 0x04: refuse magic links (/proc/self/fd, etc.)
+        const RESOLVE_BENEATH: u64 = 0x02;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x04;
+
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (flags as u64) | libc::O_CLOEXEC as u64;
+        how.mode = 0;
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+
+        let rel_str = rel_path.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path")
+        })?;
+
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root_fd.as_raw_fd(),
+                rel_str.as_ptr(),
+                &how as *const _,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+
+        // Verify the opened file is NOT a symlink (defense in depth)
+        let meta = file.metadata()?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "symlink detected beneath share root",
+            ));
+        }
+
+        Ok(file)
+    }
+
+    // Fallback for non-Linux Unix: component-walk with O_NOFOLLOW
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut current = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root)?;
+
+        let components: Vec<_> = rel_path.components().collect();
+        for (i, comp) in components.iter().enumerate() {
+            use std::path::Component;
+            match comp {
+                Component::Normal(name) => {
+                    let is_last = i == components.len() - 1;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.read(true);
+                    if is_last {
+                        // Last component: open with the requested flags
+                        let accmode = flags & O_ACCMODE;
+                        opts.write(accmode == O_WRONLY || accmode == O_RDWR);
+                    } else {
+                        // Directory component: must be a directory, no follow
+                        opts.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+                    }
+                    current = opts.open(name)?;
+                }
+                Component::CurDir => {}
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "path component escapes root",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+}
+
+#[cfg(not(unix))]
+fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::File> {
+    // Non-Unix fallback: canonicalize + starts_with (no TOCTOU guarantee)
+    let full = root.join(rel_path);
+    let canonical = full.canonicalize()?;
+    let root_canonical = root.canonicalize()?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes share root",
+        ));
+    }
+    open_file(&canonical, flags)
 }
 
 fn file_ino(path: &std::path::Path) -> u64 {
