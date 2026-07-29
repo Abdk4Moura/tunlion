@@ -1723,6 +1723,29 @@ async fn send_identity_challenge(
     }
 }
 
+/// The shared "register the Proven hold, then issue the possession challenge"
+/// sequence, called by BOTH readiness sites (DirectReady adoption AND the daemon
+/// ChannelReady handler, #39) so the two cannot DIVERGE on ordering. HOLD-THEN-AWAIT:
+/// the pending_proven entry is inserted (fresh 3s deadline, overwriting any stale
+/// one so a reconnect re-challenges) BEFORE the challenge is awaited, so a gated
+/// open can never observe the link un-held in the window between send and hold.
+/// Today the single-consumer event loop makes that window unreachable; the ordering
+/// is belt-and-braces for a future concurrent loop, and — the point — it removes the
+/// asymmetry between the two call sites. The CALLER owns the release policy after:
+/// DirectReady holds ChannelReady and its timer RE-EMITS it; the ChannelReady site
+/// does not hold and its timer only CLEARS the entry (no re-emit → no cycle).
+async fn issue_proven_challenge_and_hold(
+    conn: &crate::Conn,
+    pid: &str,
+    t: &Arc<dyn Transport>,
+    pending_proven: &Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
+    identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) {
+    pending_proven.lock().unwrap()
+        .insert(pid.to_string(), (t.clone(), Instant::now() + Duration::from_secs(3)));
+    send_identity_challenge(conn, pid, identity_nonces).await;
+}
+
 /// Handle a possession-sig identity-expose response sent by a peer after we
 /// challenged it. Verifies the nonce (single-use), the possession_sig under
 /// the peer's device_pub, and reflection (not self). On success, upgrades the
@@ -12968,13 +12991,18 @@ async fn recv_cmd(
                     false
                 };
                 if needs_proven && crate::capability::cap_authoritative() {
-                    send_identity_challenge(&conn, &pid, &mut identity_nonces).await;
+                    // Shared issue-and-hold (hold-then-await; see the helper). This
+                    // registers the pending_proven hold BEFORE sending, identically to
+                    // the ChannelReady site, so the two sites cannot diverge on order.
+                    issue_proven_challenge_and_hold(&conn, &pid, &t, &pending_proven, &mut identity_nonces).await;
                     ui::say(&format!("  identity challenge sent to {pid}, holding until Proven or timeout"));
+                    // DirectReady-specific release policy: HOLD ChannelReady (do not
+                    // emit it here) and RE-EMIT it when the 3s hold expires, so a
+                    // direct link's gates never observe Inferred at all.
                     let hold_t = t.clone();
                     let hold_tx = tx.clone();
                     let hold_pending = pending_proven.clone();
                     let hold_pid = pid.clone();
-                    pending_proven.lock().unwrap().insert(pid.clone(), (t.clone(), Instant::now() + Duration::from_secs(3)));
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         if hold_pending.lock().unwrap().contains_key(&hold_pid) {
@@ -13035,13 +13063,13 @@ async fn recv_cmd(
                         }
                     };
                     if should_challenge {
-                        // Set the hold BEFORE the await so a gated open cannot slip in
-                        // between the challenge send and the hold. Overwrites any stale
-                        // entry with a fresh deadline (reconnect safety).
-                        pending_proven.lock().unwrap()
-                            .insert(pid.clone(), (t.clone(), Instant::now() + Duration::from_secs(3)));
-                        send_identity_challenge(&conn, &pid, &mut identity_nonces).await;
+                        // Same shared issue-and-hold as DirectReady (hold-then-await).
+                        issue_proven_challenge_and_hold(&conn, &pid, &t, &pending_proven, &mut identity_nonces).await;
                         ui::debug(&format!("  identity challenge sent to {pid} at channel-ready (universal expose), holding gated opens until Proven or 3s"));
+                        // ChannelReady-specific release policy: does NOT hold ChannelReady
+                        // (the transport is already live); the timer only CLEARS the
+                        // entry (no re-emit → no cycle). Gated opens in the window are
+                        // covered by the #30 GAP 2 gate-hold.
                         let hold_pending = pending_proven.clone();
                         let hold_pid = pid.clone();
                         tokio::spawn(async move {
