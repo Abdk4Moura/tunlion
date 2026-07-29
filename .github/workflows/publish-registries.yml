@@ -68,6 +68,14 @@ jobs:
           # even though the committed lock is valid.
           publish_crate() {
             name="$1"
+            ver=$(grep -m1 '^version' "crates/$name/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')
+            # Skip if this exact version is already on crates.io (bootstrap-published
+            # or a prior run). A skip avoids an upload attempt that would otherwise
+            # require a per-crate Trusted Publisher; filament-cli's own TP still gates
+            # its publish below. Correct for future too: never re-publish an unchanged crate.
+            if curl -fsS -A "filament-ci (release)" "https://crates.io/api/v1/crates/$name/$ver" >/dev/null 2>&1; then
+              echo "::notice::$name $ver already on crates.io — skipping"; return 0
+            fi
             echo "::group::cargo publish $name"
             out=$(cd "crates/$name" && cargo publish --allow-dirty 2>&1) && { echo "$out"; echo "::endgroup::"; return 0; }
             echo "$out"
