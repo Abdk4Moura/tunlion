@@ -60,6 +60,7 @@ mod sshd;
 mod sshkeys;
 mod local;
 mod ui;
+mod fleet_ui;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};

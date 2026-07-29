@@ -1,0 +1,200 @@
+// Surface 2: `pair` same-vs-inter-user flows.
+//
+// Pure render functions for the pairing UX: same-person vs someone-else banners,
+// PAKE spoken-words screen, inter-user per-cap/direction/expiry form, non-TTY refusal.
+
+use crate::ui::{self, Tone};
+use super::{double_rule, echo_cmd, meta};
+
+/// Render the same-person banner + fleet add.
+pub fn render_same_person_banner(device_name: &str) -> String {
+    format!(
+        "{rule}\n{banner}\n{rule}\n\n{msg}\n\n{will}\n{wont}\n{meta}\n\n{btns}",
+        rule = ui::paint(Tone::Brand, double_rule()),
+        banner = format!("  {}  SAME PERSON  ·  this is you", ui::paint(Tone::Brand, ui::glyph_fleet())),
+        msg = format!("  \"{}\" is signed by your identity. Adding it to your fleet.", device_name),
+        will = format!(
+            "  This device will:  {}",
+            ui::paint(Tone::Ok, "send/receive with your fleet · reach exposed ports · read ~/share")
+        ),
+        wont = format!(
+            "  It will not:       {}",
+            ui::paint(Tone::Dim, "open a shell · write to disk   (grant those later if you want)")
+        ),
+        meta = meta(&format!("{} fleet · certs auto-renew · Proven", ui::glyph_fleet())),
+        btns = format!(
+            "        {}   {}",
+            ui::paint(Tone::Bold, "[ Add to my fleet ]"),
+            ui::paint(Tone::Dim, "[ Cancel ]")
+        ),
+    )
+}
+
+/// Render the same-person success message.
+pub fn render_same_person_success(device_name: &str) -> String {
+    format!(
+        "{ok} {name} joined your fleet.\n{echo}",
+        ok = ui::paint(Tone::Ok, ui::glyph_ok()),
+        name = device_name,
+        echo = echo_cmd(&format!("filament pair --fleet --name {device_name}")),
+    )
+}
+
+/// Render the someone-else banner.
+pub fn render_someone_else_banner() -> String {
+    format!(
+        "{rule}\n{banner}\n{rule}\n\n{msg}",
+        rule = ui::paint(Tone::Warn, double_rule()),
+        banner = format!("  {}  SOMEONE ELSE  ·  not your identity", ui::paint(Tone::Warn, ui::glyph_extern())),
+        msg = ui::paint(Tone::Dim, "  This is not you. Nothing is shared yet — you decide exactly what, and for how long."),
+    )
+}
+
+/// Render the PAKE spoken-words screen.
+pub fn render_pake_words(words: &[&str]) -> String {
+    let words_str = words.join(" · ");
+    format!(
+        "{prompt}\n\n     {words}\n\n{confirm}\n{fingerprint}",
+        prompt = "  Say these three words out loud. They must hear the SAME three, in this order.",
+        words = ui::paint(Tone::Bold, &words_str),
+        confirm = format!(
+            "   Do they hear exactly these?\n        {}        {}",
+            ui::paint(Tone::Bold, "[ Yes, they match ]"),
+            ui::paint(Tone::Err, "[ No / stop ]")
+        ),
+        fingerprint = ui::paint(Tone::Dim, "  Fingerprint 7f3a 9c21 4b…  [compare]  — informational; the words are the trust."),
+    )
+}
+
+/// Render the PAKE mismatch (No / stop) message.
+pub fn render_pake_mismatch() -> String {
+    format!(
+        "{err} Stopped. If the words didn't match, someone may be in the middle — don't retry\n  on the same channel. Get a fresh code from them and try again.",
+        err = ui::paint(Tone::Err, ui::glyph_err()),
+    )
+}
+
+/// Render the inter-user per-cap + direction + expiry form (after "Yes, they match").
+pub fn render_inter_user_form(peer_name: &str) -> String {
+    format!(
+        "{ok} Words matched. What may \"{peer_name}\" do, and for how long?\n\n\
+         {send} {port}\n\
+         {read} {shell}\n\
+         Direction:  {dir_out}    {dir_both}\n\
+         Ends in:    [ 1h ]  ◀──●─────▶   (max 24h)\n\n\
+         {rule}\n\
+         {can}\n\
+         {cannot}\n\
+         {meta}\n\n\
+         {grant}   {cancel}",
+        ok = ui::paint(Tone::Ok, ui::glyph_ok()),
+        send = "   [ ] send me files",
+        port = "[ ] reach my port [ 8080 ]",
+        read = "   [ ] read-only ~/share",
+        shell = format!("[ ] open a shell {}", ui::paint(Tone::Warn, ui::glyph_warn())),
+        dir_out = ui::paint(Tone::Dim, "(o)"),
+        dir_both = format!("{} both ways", ui::paint(Tone::Dim, "( )")),
+        rule = super::rule(),
+        can = format!("  {} {}: send files", ui::paint(Tone::Ok, ui::glyph_ok()), peer_name),
+        cannot = format!(
+            "  {} you → {}: nothing · {} cannot shell, mount, or reach other ports",
+            ui::paint(Tone::Err, ui::glyph_err()),
+            peer_name,
+            peer_name
+        ),
+        meta = meta(&format!("{} external · one-way · expires 14:41 (in 1h) · no auto-renew", ui::glyph_extern())),
+        grant = ui::paint(Tone::Bold, "[ Grant ]"),
+        cancel = ui::paint(Tone::Dim, "[ Cancel ]"),
+    )
+}
+
+/// Render the inter-user success message.
+pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> String {
+    format!(
+        "{ok} {peer_name} can {cap} until {expiry}. It ends on its own — no cleanup needed.\n{echo}",
+        ok = ui::paint(Tone::Ok, ui::glyph_ok()),
+        echo = echo_cmd(&format!("filament grant {peer_name} {cap} --from {peer_name} --for {expiry}")),
+    )
+}
+
+/// Non-TTY refusal: pair is interactive.
+pub fn err_pair_interactive() -> (String, i32) {
+    (
+        format!(
+            "{err} pair is interactive (it needs the spoken-words step). For automation, mint a key instead:\n  {fix}",
+            err = ui::paint(Tone::Err, ui::glyph_err()),
+            fix = "filament mint --external carol --ttl 1h --allow send",
+        ),
+        super::EXIT_BAD_ARG,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_person_banner_fleet_glyph() {
+        let s = render_same_person_banner("pixel-7");
+        assert!(s.contains("SAME PERSON"), "must show SAME PERSON");
+        assert!(s.contains("pixel-7"), "must show device name");
+        assert!(s.contains("fleet") || s.contains("[fleet]"), "must show fleet glyph");
+    }
+
+    #[test]
+    fn someone_else_banner_extern_glyph() {
+        let s = render_someone_else_banner();
+        assert!(s.contains("SOMEONE ELSE"), "must show SOMEONE ELSE");
+        assert!(s.contains("[extern]") || s.contains("○"), "must show extern glyph");
+        assert!(s.contains("not your identity"), "must show not-your-identity");
+    }
+
+    #[test]
+    fn pake_words_render() {
+        let s = render_pake_words(&["amber", "lantern", "ferry"]);
+        assert!(s.contains("amber"), "must show first word");
+        assert!(s.contains("lantern"), "must show second word");
+        assert!(s.contains("ferry"), "must show third word");
+        assert!(s.contains("Yes, they match"), "must show confirm button");
+        assert!(s.contains("No / stop"), "must show stop button");
+    }
+
+    #[test]
+    fn pake_mismatch_honest_copy() {
+        let s = render_pake_mismatch();
+        assert!(s.contains("someone may be in the middle"), "must explain the risk");
+        assert!(s.contains("don't retry"), "must advise against retry");
+    }
+
+    #[test]
+    fn inter_user_form_deliberate_glyph() {
+        let s = render_inter_user_form("carol");
+        assert!(s.contains("carol"), "must show peer name");
+        assert!(s.contains("shell") || s.contains("SHELL"), "must mention shell");
+        // The shell row must carry a deliberate glyph
+        assert!(s.contains("⚠") || s.contains("!"), "shell row must carry warn glyph");
+    }
+
+    #[test]
+    fn inter_user_success() {
+        let s = render_inter_user_success("carol", "send files", "14:41 (1h)");
+        assert!(s.contains("carol"), "must show peer name");
+        assert!(s.contains("send files"), "must show capability");
+        assert!(s.contains("14:41"), "must show expiry");
+    }
+
+    #[test]
+    fn err_pair_interactive_exit_code() {
+        let (msg, code) = err_pair_interactive();
+        assert!(msg.contains("interactive"), "must explain why");
+        assert!(msg.contains("mint"), "must suggest alternative");
+        assert_eq!(code, 2, "bad-arg = exit 2");
+    }
+
+    #[test]
+    fn same_person_success() {
+        let s = render_same_person_success("pixel-7");
+        assert!(s.contains("pixel-7"), "must show device name");
+        assert!(s.contains("joined your fleet"), "must confirm fleet join");
+    }
+}

@@ -191,6 +191,24 @@ pub fn glyph_err() -> &'static str {
 pub fn glyph_arrow() -> &'static str {
     if caps().unicode { "→" } else { "->" }
 }
+pub fn glyph_fleet() -> &'static str {
+    if caps().unicode { "●" } else { "[fleet]" }
+}
+pub fn glyph_extern() -> &'static str {
+    if caps().unicode { "○" } else { "[extern]" }
+}
+pub fn glyph_review() -> &'static str {
+    if caps().unicode { "◐" } else { "[review]" }
+}
+pub fn glyph_warn() -> &'static str {
+    if caps().unicode { "⚠" } else { "!" }
+}
+pub fn glyph_deliberate() -> &'static str {
+    if caps().unicode { "⚠" } else { "!" }
+}
+pub fn glyph_echo() -> &'static str {
+    if caps().unicode { "↳" } else { "->" }
+}
 
 /// OSC 8 hyperlink (clickable in modern terminals); plain text elsewhere.
 pub fn link(url: &str, text: &str) -> String {
