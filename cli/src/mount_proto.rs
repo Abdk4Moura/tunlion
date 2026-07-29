@@ -956,8 +956,12 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
     }
 
     // Fallback for non-Linux Unix: component-walk with O_NOFOLLOW
+    // Uses openat(dirfd, component, ...) relative to the previous fd,
+    // NOT by reconstructed absolute path. Rejects `..` components explicitly.
     #[cfg(not(target_os = "linux"))]
     {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
         let mut current = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -969,19 +973,35 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
             match comp {
                 Component::Normal(name) => {
                     let is_last = i == components.len() - 1;
-                    let mut opts = std::fs::OpenOptions::new();
-                    opts.read(true);
+                    let name_cstr = std::ffi::CString::new(name.to_str().unwrap_or(""))
+                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path component"))?;
+
+                    let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
                     if is_last {
-                        // Last component: open with the requested flags
-                        let accmode = flags & O_ACCMODE;
-                        opts.write(accmode == O_WRONLY || accmode == O_RDWR);
+                        let accmode = flags & libc::O_ACCMODE;
+                        flags |= accmode;
                     } else {
-                        // Directory component: must be a directory, no follow
-                        opts.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+                        flags |= libc::O_DIRECTORY;
                     }
-                    current = opts.open(name)?;
+
+                    let fd = unsafe {
+                        libc::openat(current.as_raw_fd(), name_cstr.as_ptr(), flags, 0o644)
+                    };
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    current = unsafe { std::fs::File::from_raw_fd(fd) };
                 }
                 Component::CurDir => {}
+                // REJECT `..` explicitly — RESOLVE_BENEATH does this for free;
+                // the hand-rolled walk must do it manually to prevent climbing
+                // out of the share root without any symlink involved.
+                Component::ParentDir => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "path component '..' escapes root (RESOLVE_BENEATH equivalent)",
+                    ));
+                }
                 _ => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,

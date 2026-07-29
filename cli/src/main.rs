@@ -10976,29 +10976,27 @@ async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
         }
         Ok(tokio::fs::File::from_std(file))
     }
-    // Non-Linux Unix: O_NOFOLLOW + metadata check
+    // Non-Linux Unix: open with O_NOFOLLOW, then fstat the opened fd
+    // (not stat the path before open — that races a swap)
     #[cfg(not(target_os = "linux"))]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Check what's at the path before opening
-        let meta = std::fs::symlink_metadata(path)?;
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "refusing to resume: .part is a symlink",
-            ));
-        }
+        use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .await?;
+
+        // fstat on the opened fd — no TOCTOU
+        let meta = file.metadata().await?;
         if !meta.file_type().is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("refusing to resume: .part is not a regular file (type: {:?})", meta.file_type()),
             ));
         }
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .await
+        Ok(file)
     }
 }
 
