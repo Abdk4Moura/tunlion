@@ -22,7 +22,7 @@
 # the CLI. This crate is pure w.r.t. identity.
 [package]
 name = "filament-cap"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"

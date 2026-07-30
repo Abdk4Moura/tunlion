@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.7.2"
+version = "0.7.3"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of filament.autumated.com."
@@ -71,7 +71,7 @@ filament-id = { path = "../crates/filament-id", version = "0.1.0" }
 # Capability primitives + pure authorization evaluation. `crate::capability` and
 # `crate::ephemeral` re-export it; the host-bound orchestration (store I/O, mode
 # flag, observability counters, DeviceCert-reading glue) stays in those modules.
-filament-cap = { path = "../crates/filament-cap", version = "0.1.0" }
+filament-cap = { path = "../crates/filament-cap", version = "0.1.1" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"

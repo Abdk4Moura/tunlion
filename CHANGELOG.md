@@ -4,7 +4,27 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
-## [0.7.2] - 2026-07-30
+## [0.7.3] - 2026-07-30
+
+Release-engineering fixes for the 0.7.2 content. 0.7.2's release build failed on Windows
+and its crates.io publish failed, so no 0.7.2 binaries or crates shipped; 0.7.3 carries
+the same features and actually builds and publishes.
+
+### Fixed
+
+- **Windows build broke on the mount server.** `do_create` used `libc::O_CREAT | O_EXCL`
+  without a cfg gate (introduced by the 0.7.2 transfer/mount symlink hardening), which
+  does not compile on Windows where `libc` is absent. Gated the POSIX flags to Unix; the
+  non-Unix `safe_open_beneath` fallback is used on Windows.
+- **crates.io publish of the CLI failed to verify.** `filament-cap` gained new public API
+  in this release (fleet-trust: `fleet_auto_trust`, `evaluate_grants_only`,
+  `is_scoped_default_action`, and the shared delegated-ceiling helper) but was still
+  `0.1.0` on crates.io and got skipped as already-published, so the CLI's publish
+  verification built against a `filament-cap` that lacked those functions. Bumped
+  `filament-cap` to `0.1.1` and the CLI's dependency pin to match, so the crate
+  republishes and the CLI verifies against the API it actually uses.
+
+## [0.7.2] - 2026-07-30 (release build failed on Windows; superseded by 0.7.3)
 
 ### Added
 

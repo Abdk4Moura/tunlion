@@ -756,7 +756,15 @@ fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut
         Ok(r) => r.to_path_buf(),
         Err(_) => return Err(MountError { code: EACCES, msg: "path not beneath root".into() }),
     };
+    // O_CREAT|O_EXCL are POSIX (libc) flags. #40 added this libc use in do_create
+    // WITHOUT a cfg gate, which broke the Windows (msvc) release build — libc has no
+    // such module in scope there. Gate the constants; on non-Unix, safe_open_beneath's
+    // fallback does not consume POSIX creation flags (Windows mounts go through WinFsp,
+    // where this FUSE do_create path is not the create surface).
+    #[cfg(unix)]
     let create_flags = flags | libc::O_CREAT | libc::O_EXCL;
+    #[cfg(not(unix))]
+    let create_flags = flags;
     let file = safe_open_beneath(root, &rel, create_flags)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     #[cfg(unix)]
