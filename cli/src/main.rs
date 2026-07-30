@@ -1782,10 +1782,17 @@ fn handle_identity_expose(
     let receiver_dpub = own_dpub;
     let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
     if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_err() { return false; }
-    // Reflection: refuse self-cert
-    if let Ok(Some(own_uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-        if cert.user_pub == own_uk.public_key_bytes() { return false; }
-    }
+    // Anti-reflection, narrowed to device_pub (#41). A REFLECTION is my own message
+    // bounced back to me, which necessarily carries MY OWN device cert, so
+    // `cert.device_pub == own_device_pub` catches exactly that. The OLD check refused
+    // on `user_pub == own_user_pub`, which ALSO refused every legitimate same-owner
+    // FLEET device (a DIFFERENT device_pub under the same user key) — that was the bug
+    // that made OwnerDevice fleet unreachable. Narrowing keeps identical reflection
+    // coverage and admits real fleet members. `own_dpub` is THIS machine's LOCAL device
+    // pubkey (loaded above via overlay_pubkey_bytes), NEVER anything from the peer's
+    // payload. On this 0x02 path the possession_msg also binds receiver_dpub non-zero,
+    // so message binding is a second barrier here; on the 0x01 PAKE path it is not.
+    if cert.device_pub == own_dpub { return false; }
     // Store as provisional, then promote on link
     let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
     if let Some(l) = conn.link_mut(pid) {
@@ -4778,16 +4785,27 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                                                                                     0x01, &cmv_arr, scope, &caps_digest, &chash, &sender_pub, &receiver_zero
                                                                                 );
                                                                                 if identity::verify_possession_sig(&cert.device_pub, &possession_msg, &sig_arr).is_ok() {
-                                                                                    // Reflection check: cert.user_pub != own user_pub
-                                                                                    if let Some(own_uk) = identity::UserKey::load(&crate::platform::PlatformKeyStore).unwrap_or(None) {
-                                                                                        if cert.user_pub == own_uk.public_key_bytes() {
+                                                                                    // Anti-reflection, narrowed to device_pub (#41). LOAD-BEARING on this
+                                                                                    // 0x01 (PAKE) path: receiver_device_pub is ZEROED in the possession_msg
+                                                                                    // above (receiver_zero), so message binding does NOT carry the receiver
+                                                                                    // identity — THIS single comparison is the ONLY thing preventing a
+                                                                                    // reflection here. Do NOT remove it as "redundant with message binding";
+                                                                                    // on 0x01 it is not. Compare cert.device_pub against THIS machine's LOCAL
+                                                                                    // device pubkey (overlay), never the peer payload; fail closed if the
+                                                                                    // local key can't be obtained. A same-owner fleet device has a DIFFERENT
+                                                                                    // device_pub under the same user key, so it is correctly admitted (the old
+                                                                                    // user_pub check refused it — the OwnerDevice-fleet bug).
+                                                                                    match crate::overlay::overlay_pubkey_bytes() {
+                                                                                        Ok(own_dpub) if cert.device_pub == own_dpub => {
                                                                                             // reflection-to-self refused
-                                                                                        } else {
+                                                                                        }
+                                                                                        Ok(_) => {
                                                                                             peer_identity_cert = Some(cert);
                                                                                         }
-                                                                                    } else {
-                                                                                        peer_identity_cert = Some(cert);
-                }
+                                                                                        Err(_) => {
+                                                                                            // cannot obtain own device_pub -> cannot rule out reflection -> refuse
+                                                                                        }
+                                                                                    }
             }
                 }
             }
@@ -14234,9 +14252,15 @@ async fn recv_cmd(
                                                                 let receiver_dpub = own_dpub; // our own device_pub as receiver
                                                                 let msg = crate::identity::possession_msg(0x02, &nonce_arr, scope, &caps_d, &chash, &sender_dpub, &receiver_dpub);
                                                                 if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_ok() {
-                                                                    // Reflection check
-                                                                    if let Ok(Some(own_uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-                                                                        if cert.user_pub == own_uk.public_key_bytes() {
+                                                                    // Anti-reflection, narrowed to device_pub (#41). The outer `if let` is kept
+                                                                    // only to preserve the if/else-if chain with the enrollment branch below;
+                                                                    // the reflection test itself now compares cert.device_pub against own_dpub
+                                                                    // (this machine's LOCAL device pubkey, from the enclosing
+                                                                    // overlay_pubkey_bytes()), so a same-owner fleet device (different device_pub,
+                                                                    // same user key) is admitted instead of refused. This 0x02 path also binds
+                                                                    // receiver_dpub in the possession_msg, so device_pub here is defense-in-depth.
+                                                                    if let Ok(Some(_own_uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+                                                                        if cert.device_pub == own_dpub {
                                                                             // self, refuse
                                                                         } else {
                                                                             // Store as provisional, then promote at overlay after check
