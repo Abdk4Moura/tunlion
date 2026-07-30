@@ -5,12 +5,13 @@
 # filament-id) and the CLI all share one byte-identical secret writer.
 [package]
 name = "secret-write"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Abdk4Moura/filament"
 description = "Atomic, permission-restricted secret file writes (0600 / Windows ACL)"
+readme = "README.md"
 keywords = ["filesystem", "security", "atomic", "permissions", "secret"]
 categories = ["filesystem", "os"]
 

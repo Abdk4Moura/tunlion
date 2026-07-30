@@ -28,6 +28,7 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/Abdk4Moura/filament"
 description = "Edge-local capability tokens: signed grants, delegation ceilings, offline verification"
+readme = "README.md"
 keywords = ["capability", "authorization", "tokens", "delegation", "security"]
 categories = ["authentication", "cryptography"]
 

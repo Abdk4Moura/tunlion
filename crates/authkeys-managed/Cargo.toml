@@ -8,12 +8,13 @@
 # the CLI passes `crate::settings::config_dir()`).
 [package]
 name = "authkeys-managed"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Abdk4Moura/filament"
 description = "Safe cross-platform managed block in ~/.ssh/authorized_keys"
+readme = "README.md"
 keywords = ["ssh", "authorized-keys", "authentication", "keys"]
 categories = ["authentication", "os"]
 

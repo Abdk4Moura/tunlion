@@ -1,31 +1,41 @@
 name: publish-registries
 
-# Publish filament-cli to crates.io and npm on a CLI release tag.
+# Publish ONE package to crates.io (and, for the CLI, npm) per tag.
 #
-# Triggered by the `cli-v*` tag push directly (NOT workflow_run): OIDC Trusted
-# Publishing rejects the workflow_run event, and both registries publish from
-# source, so they don't need the built release assets. workflow_dispatch allows
-# manual backfill (also OIDC-compatible).
+# Each package has its own tag namespace, and a tag publishes ONLY that package:
+#   cli-v<ver>               -> filament-cli   (crates.io + npm)
+#   filament-cap-v<ver>      -> filament-cap   (crates.io)
+#   filament-id-v<ver>       -> filament-id    (crates.io)
+#   filament-pair-v<ver>     -> filament-pair  (crates.io)
+#   secret-write-v<ver>      -> secret-write   (crates.io)
+#   authkeys-managed-v<ver>  -> authkeys-managed (crates.io)
 #
-# Auth: both via OIDC Trusted Publishing, no long-lived tokens.
-#   crates.io: configure a Trusted Publisher for the `filament-cli` crate on
-#              crates.io (crate Settings, Trusted Publishing) pointing at
-#              Abdk4Moura/filament + publish-registries.yml.
-#   npm:       configure a Trusted Publisher for `@abdk4moura/filament-cli` on
-#              npmjs.com (package Settings, Trusted Publisher), same repo + workflow.
+# So bumping and releasing one crate does NOT attempt to publish the others. The
+# CLI depends on the extracted crates by version, so when a dependency changes,
+# publish IT first (push its <crate>-v<ver> tag) and THEN the CLI (cli-v<ver>);
+# the CLI's publish resolves its dependencies from crates.io, it does not publish
+# them.
+#
+# Auth: OIDC Trusted Publishing, no long-lived tokens. EACH crate needs its own
+# Trusted Publisher configured on crates.io (crate Settings -> Trusted Publishing)
+# pointing at Abdk4Moura/filament + publish-registries.yml (no environment). npm
+# needs a Trusted Publisher for @abdk4moura/filament-cli on npmjs.com, same repo +
+# workflow. A tag whose crate has no Trusted Publisher configured will fail the
+# publish step with a 403 — configure it, then re-run.
 
 on:
-  # Trigger on the tag push, NOT workflow_run: OIDC Trusted Publishing rejects the
-  # workflow_run event for security. crates.io publishes from source and npm
-  # publishes the package (the binary is fetched at install time), so neither
-  # needs the release assets to exist yet. (winget, which does need the assets and
-  # uses a PAT, stays on workflow_run in winget-publish.yml.)
   push:
-    tags: ["cli-v*"]
+    tags:
+      - "cli-v*"
+      - "filament-cap-v*"
+      - "filament-id-v*"
+      - "filament-pair-v*"
+      - "secret-write-v*"
+      - "authkeys-managed-v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (e.g. cli-v0.5.0)"
+        description: "Tag to publish (e.g. cli-v0.7.3 or filament-cap-v0.1.1)"
         required: true
 
 permissions:
@@ -33,9 +43,6 @@ permissions:
 
 jobs:
   crates-io:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.ref, 'refs/tags/cli-v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,74 +53,64 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Resolve which package this tag publishes
+        id: pkg
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          # <prefix>-v<version>. `cli` maps to the filament-cli crate in cli/;
+          # every other prefix is an extracted crate under crates/<name>.
+          case "$tag" in
+            cli-v*)              name="filament-cli";     dir="cli" ;;
+            filament-cap-v*)     name="filament-cap";     dir="crates/filament-cap" ;;
+            filament-id-v*)      name="filament-id";      dir="crates/filament-id" ;;
+            filament-pair-v*)    name="filament-pair";    dir="crates/filament-pair" ;;
+            secret-write-v*)     name="secret-write";     dir="crates/secret-write" ;;
+            authkeys-managed-v*) name="authkeys-managed"; dir="crates/authkeys-managed" ;;
+            *) echo "::error::tag '$tag' does not map to a known package"; exit 1 ;;
+          esac
+          # The tag version MUST match the crate's Cargo.toml version, so a tag can
+          # never publish a mismatched version.
+          tagver="${tag##*-v}"
+          crtver=$(grep -m1 '^version' "$dir/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tagver" != "$crtver" ]; then
+            echo "::error::tag version '$tagver' != $name Cargo.toml version '$crtver'"; exit 1
+          fi
+          echo "name=$name"   >> "$GITHUB_OUTPUT"
+          echo "dir=$dir"     >> "$GITHUB_OUTPUT"
+          echo "ver=$crtver"  >> "$GITHUB_OUTPUT"
       - name: Update Rust toolchain (edition 2024)
         run: rustup update stable && rustup default stable
       - name: Authenticate to crates.io (Trusted Publishing / OIDC)
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
-      - name: cargo publish extracted crates (dependency order)
+      - name: cargo publish ${{ steps.pkg.outputs.name }} ${{ steps.pkg.outputs.ver }}
+        working-directory: ${{ steps.pkg.outputs.dir }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          NAME: ${{ steps.pkg.outputs.name }}
+          VER: ${{ steps.pkg.outputs.ver }}
         run: |
           set -euo pipefail
-          # filament-cli depends on 5 extracted path-crates, each version-pinned so
-          # cargo resolves them by version on crates.io. They must be published
-          # BEFORE filament-cli, in dependency order: the three leaves first
-          # (secret-write, filament-pair, filament-cap), then the two that dep
-          # secret-write (authkeys-managed, filament-id). Each authenticates via the
-          # same OIDC token (a Trusted Publisher is configured per crate pointing at
-          # Abdk4Moura/filament + publish-registries.yml).
-          # --allow-dirty: the pinned-to-latest stable toolchain regenerates
-          # Cargo.lock on checkout, which trips cargo publish's clean-tree check
-          # even though the committed lock is valid.
-          publish_crate() {
-            name="$1"
-            ver=$(grep -m1 '^version' "crates/$name/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')
-            # Skip if this exact version is already on crates.io (bootstrap-published
-            # or a prior run). A skip avoids an upload attempt that would otherwise
-            # require a per-crate Trusted Publisher; filament-cli's own TP still gates
-            # its publish below. Correct for future too: never re-publish an unchanged crate.
-            if curl -fsS -A "filament-ci (release)" "https://crates.io/api/v1/crates/$name/$ver" >/dev/null 2>&1; then
-              echo "::notice::$name $ver already on crates.io — skipping"; return 0
-            fi
-            echo "::group::cargo publish $name"
-            out=$(cd "crates/$name" && cargo publish --allow-dirty 2>&1) && { echo "$out"; echo "::endgroup::"; return 0; }
-            echo "$out"
-            if echo "$out" | grep -qiE "already (uploaded|exists)|crate version .* is already"; then
-              echo "::notice::$name already on crates.io — nothing to do"; echo "::endgroup::"; return 0
-            fi
-            echo "::endgroup::"; echo "::error::cargo publish $name failed"; return 1
-          }
-          # cargo publish waits for index availability, but sleep between crates as
-          # belt-and-suspenders so a dependent crate always sees its dep in the index.
-          for c in secret-write filament-pair filament-cap authkeys-managed filament-id; do
-            publish_crate "$c"
-            sleep 5
-          done
-      - name: cargo publish filament-cli
-        working-directory: cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          set -euo pipefail
-          # The 5 extracted crates are published first (in dep order) by the step
-          # above, so filament-cli's version-pinned path-deps resolve on crates.io.
-          # --allow-dirty: the pinned-to-latest stable toolchain regenerates
-          # Cargo.lock on checkout (format/re-resolve), which trips cargo
-          # publish's clean-tree check even though the committed lock is valid.
-          # Tolerate an already-published version (re-runs/backfills), but fail
-          # loudly on any other error so it's visible.
+          # Idempotent: if this exact version is already on crates.io (a re-run or
+          # backfill), do nothing. --allow-dirty: the pinned-to-latest stable
+          # toolchain regenerates Cargo.lock on checkout, tripping the clean-tree
+          # check even though the committed lock is valid.
+          if curl -fsS -A "filament-ci (release)" "https://crates.io/api/v1/crates/$NAME/$VER" >/dev/null 2>&1; then
+            echo "::notice::$NAME $VER already on crates.io — nothing to do"; exit 0
+          fi
           out=$(cargo publish --allow-dirty 2>&1) && { echo "$out"; exit 0; }
           echo "$out"
           if echo "$out" | grep -qiE "already (uploaded|exists)|crate version .* is already"; then
-            echo "::notice::filament-cli $TAG already on crates.io — nothing to do"; exit 0
+            echo "::notice::$NAME $VER already on crates.io — nothing to do"; exit 0
           fi
-          echo "::error::cargo publish failed"; exit 1
+          echo "::error::cargo publish $NAME failed (is a Trusted Publisher configured for the '$NAME' crate on crates.io?)"; exit 1
 
   npm:
+    # Only the CLI has an npm package.
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      startsWith(github.ref, 'refs/tags/cli-v')
+      startsWith(github.ref, 'refs/tags/cli-v') ||
+      (github.event_name == 'workflow_dispatch' && startsWith(github.event.inputs.tag, 'cli-v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
