@@ -4,6 +4,20 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.7.5] - 2026-07-31
+
+The command surface, finished: a clean ~15-verb CLI with no legacy names.
+
+### Changed
+
+- **Legacy commands are deleted, not aliased.** With no external users yet, the old names
+  are simply gone (a deleted name errors with a "did you mean" suggestion): `ssh`/`pty` →
+  `shell`; `netcat`/`dial` → `reach` (`--socks` for a proxy); `unexpose` → `expose --off`;
+  `unmount` → `mount --off`; `cap-status`/`ping` → `status`/`doctor`; `get`/`unset` → `set`
+  (`set <key>` shows, `set <key> <val>` sets, `set <key> --unset` clears); `introduce` →
+  `devices vouch`; `serve-tun`/`tag-bind` removed. `filament --help` now lists exactly the
+  real verbs, grouped (Connect / Share / Devices / Identity / Mesh). ~360 lines removed.
+
 ## [0.7.4] - 2026-07-31
 
 Command-surface simplification and a genuinely useful `--help`, plus the
