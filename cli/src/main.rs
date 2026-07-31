@@ -440,7 +440,7 @@ EXAMPLES
   filament reach laptop:5432         tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
-  Run `filament <command> --help` for details. Old names (ssh, netcat, dial, unexpose, ...) still work.";
+  Run `filament <command> --help` for details.";
 
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
@@ -651,10 +651,6 @@ enum Cmd {
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
     Down,
-    /// Vouch between two known devices: mints a fresh secret and delivers it
-    /// to both over verified channels (run on the device that knows both)
-    #[command(hide = true)]
-    Introduce { a: String, b: String },
     /// Show or change settings (no args = show all).
     ///
     /// No args prints all settings with their value, scope, and where each came
@@ -705,63 +701,6 @@ enum Cmd {
         #[arg(long)]
         v4: bool,
     },
-    /// Read one setting's effective value (bare value on stdout, for scripts)
-    #[command(hide = true)]
-    Get {
-        /// Setting name
-        key: String,
-        /// Resolve as it applies to this device (per-peer settings)
-        #[arg(long, value_name = "DEVICE")]
-        peer: Option<String>,
-        /// Append where the value came from (env/peer/config/default)
-        #[arg(long)]
-        show_origin: bool,
-        /// Value to print if the setting is empty/unset
-        #[arg(long, value_name = "VALUE")]
-        default: Option<String>,
-        /// Machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-    },
-    /// Reset a setting to its default (remove the override)
-    #[command(hide = true)]
-    Unset {
-        /// Setting name
-        key: String,
-        /// Remove the per-peer override for one or more devices (comma-separated
-        /// or repeatable). Omit to clear the global value.
-        #[arg(long, value_name = "DEVICE", value_delimiter = ',')]
-        peer: Vec<String>,
-    },
-    /// L3 point-to-point overlay between two KNOWN endpoints, no signaling or
-    /// pairing (the WireGuard model): a TUN whose IP packets ride QUIC datagrams.
-    /// One side `--listen <bind>`, the other `--connect <host:port>`; both share
-    /// `--psk`. Linux-only. (The `up` daemon's `tun-addr` is the signaling-based
-    /// mesh; this is the static two-endpoint case the lab and simple VPNs use.)
-    #[command(hide = true)]
-    ServeTun {
-        /// This side's overlay address as IP/PREFIX, e.g. 10.9.0.1/24
-        #[arg(long, value_name = "CIDR")]
-        tun_addr: String,
-        /// Bind a listener here (e.g. 0.0.0.0:51820); the peer --connects to it
-        #[arg(long, value_name = "BIND", conflicts_with = "connect")]
-        listen: Option<String>,
-        /// Dial the peer's listener (e.g. 10.79.0.1:51820)
-        #[arg(long, value_name = "HOST:PORT")]
-        connect: Option<String>,
-        /// Shared secret both ends must match (channel-binding auth)
-        #[arg(long)]
-        psk: String,
-        /// TUN interface name
-        #[arg(long, default_value = "filament0")]
-        dev: String,
-        /// TUN MTU (under the link datagram size; ~1280 is safe)
-        #[arg(long, default_value_t = 1280)]
-        mtu: u32,
-        /// Kernel-WireGuard data plane (ADR-0001) instead of the QUIC-datagram pump.
-        #[arg(long)]
-        wireguard: bool,
-    },
     // ── Identity ────────────────────────────────────────────────────
     /// Manage your user identity (key + device certs)
     #[command(next_help_heading = "Identity")]
@@ -795,40 +734,6 @@ enum Cmd {
         /// Manual page: routing, or omit for the full man page
         page: Option<String>,
     },
-    /// Tunnel: wire stdio to one TCP stream on a known peer's localhost (the
-    /// ssh ProxyCommand primitive). Off by default; FILAMENT_L2=1 enables the
-    /// acceptor side in `up`/`recv`.
-    #[command(hide = true)]
-    Netcat {
-        /// Known device (petname) to tunnel through
-        peer: String,
-        /// Remote port on the peer's localhost
-        rport: u16,
-        /// Enroll as delegated principal using an auth key file before connecting
-        #[arg(long, hide = true)]
-        auth_key: Option<String>,
-    },
-    /// Connect stdio to a service a peer EXPOSED on its overlay address, over L3.
-    ///
-    /// The overlay-port counterpart of `netcat` (which reaches the peer's localhost):
-    /// `dial` reaches a port the peer published with `filament expose`, and is the
-    /// way a userspace node (no kernel route) reaches `<peer>.mesh:<port>`.
-    Dial {
-        /// Known device (petname) whose overlay service to reach
-        peer: String,
-        /// Port the peer exposed on its overlay address
-        port: u16,
-    },
-    /// Open a PTY shell on a known device and bridge it to this terminal (the CLI
-    /// sibling of the browser web-shell). The peer must run `up --shell` (or grant
-    /// shell). Off by default; FILAMENT_L2=1 / --shell enables the acceptor.
-    Pty {
-        /// Known device (petname) to open a shell on
-        peer: String,
-        /// Optional one-shot command to run and return (no interactive shell)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        cmd: Vec<String>,
-    },
     /// Forward a local port to a known peer's port.
     ///
     /// Local TCP listener; each connection becomes one stream to the peer's
@@ -847,8 +752,10 @@ enum Cmd {
     /// The daemon binds the overlay address (a private ULA, reachable only over
     /// the mesh) and forwards each connection to a local target. Needs L3 up
     /// (`filament set tun-addr auto`). Persists across restarts.
+    ///
+    /// Use `filament expose <port> --off` to stop exposing a port.
     Expose {
-        /// Port to publish on the overlay. Omit together with --list.
+        /// Port to publish on the overlay. Omit together with --list or --off.
         port: Option<u16>,
         /// Local target: host:port, a bare port (127.0.0.1:PORT), or a bare host
         /// (HOST:<port>). Default: 127.0.0.1:<port>.
@@ -860,65 +767,34 @@ enum Cmd {
         /// List exposed ports and exit.
         #[arg(long)]
         list: bool,
+        /// Stop exposing the given port (replaces `filament unexpose`).
+        #[arg(long)]
+        off: bool,
     },
-    /// Stop exposing a port (see `filament expose --list`).
-    Unexpose {
-        /// Port to stop exposing.
-        port: u16,
-    },
-    /// Reach mesh peers by name from any app - no TUN, no sudo. Runs a local SOCKS5
-    /// proxy; point a browser/curl at it and `<peer>.mesh:<port>` rides the mesh.
+    /// Reach a peer's localhost tunnel or mesh proxy.
     ///
-    /// The userspace path (like Tailscale's userspace mode): works in containers and
-    /// locked-down boxes with zero privilege. Non-.mesh hosts are dialed directly.
-    Proxy {
-        /// Port to listen on (SOCKS5).
+    /// `<dev>:<port>`: tunnels to the peer's localhost:<port> (the `reach` mental model).
+    /// `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
+    Reach {
+        /// Device:port to reach (e.g. laptop:5432)
+        dev_port: Option<String>,
+        /// Run a local SOCKS5 proxy instead
+        #[arg(long)]
+        socks: bool,
+        /// SOCKS5 proxy port (default: 1080)
         #[arg(long, default_value_t = 1080)]
         port: u16,
-        /// Address to bind (default: loopback only).
+        /// Proxy bind address (default: 127.0.0.1)
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
-        /// HTTP CONNECT proxy port (0 = disabled). Serves HTTP CONNECT tunnel
-        /// and PAC file at http://127.0.0.1:PORT/proxy.pac for browser config.
+        /// HTTP CONNECT proxy port (0 = disabled)
         #[arg(long, default_value_t = 0)]
         http_port: u16,
     },
-    /// SSH into a known device over filament.
-    ///
-    /// Runs your real `ssh` over the data channel via ProxyCommand (reuses your
-    /// keys, known_hosts, and ~/.ssh/config).
-    Ssh {
-        /// Known device (petname) to ssh into
-        peer: String,
-        /// Extra args passed through to ssh (user@host, commands, -p, ...)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Ping a known device: show the live route, RTT, and whether `ssh`/`pty`
-    /// will be instant. Like `tailscale ping`, plus what it can't show - warm vs
-    /// cold (is a link already held?) and verified identity (paired + proven).
-    /// A warm direct link reports quinn's RTT and the real remote IP:port; with no
-    /// live link it reports the cold establish cost instead.
-    #[command(hide = true)]
-    Ping {
-        /// Known device (petname) to ping
-        peer: String,
-        /// How many pings to send (a warm link is re-sampled each round)
-        #[arg(long, default_value_t = 1)]
-        count: u32,
-        /// Machine-readable JSON output (for scripting)
-        #[arg(long)]
-        json: bool,
-    },
     /// Diagnose connect health: where SSH/L2 establishment is slow or stalls.
     ///
-    /// With a device: run an "establish then drop" probe (the same bring-up a
-    /// real connect does, torn down immediately) and print the per-phase ladder
-    /// + a verdict. `--repeat N` / `--watch` run it many times and show a
-    /// distribution (the tool for the intermittent "fails on the first try"
-    /// case). With NO device: an environment preflight (signaling reachability,
-    /// one STUN binding, local interfaces) plus a history digest of past
-    /// connects. `--json` emits machine-readable output for scripting.
+    /// With a device: run an "establish then drop" probe and print the per-phase
+    /// ladder + verdict. Without a device: environment preflight.
     #[command(hide = true)]
     Doctor {
         /// Known device (petname) to probe; omit for environment preflight
@@ -933,19 +809,9 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Bind a tag to a device (owner-signed).
-    #[command(hide = true)]
-    TagBind {
-        /// Tag name
-        tag: String,
-        /// Device petname
-        device: String,
-    },
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
-    /// (Prefer `filament set shell on --peer <device>`.)
-    #[command(hide = true)]
     Grant {
         /// Known device (petname), or omit with --tag
         device: String,
@@ -1009,22 +875,9 @@ enum Cmd {
         /// Delete a saved mount profile
         #[arg(long, value_name = "NAME")]
         delete_profile: Option<String>,
-    },
-    /// Unmount a filament mount point.
-    Unmount {
-        /// Local mount point to unmount
-        path: String,
-    },
-    /// Print the daemon's live capability shadow counters.
-    ///
-    /// The counters accumulate in the running daemon (`filament up`) across live
-    /// opens. A fresh `filament cap-status` process queries the daemon over the
-    /// control socket; only the daemon sees real traffic, so this is the only
-    /// path to useful numbers.
-    CapStatus {
-        /// Output raw JSON instead of the summary line
-        #[arg(long)]
-        json: bool,
+        /// Unmount a filament mount point (replaces `filament unmount`).
+        #[arg(long, value_name = "PATH")]
+        off: Option<String>,
     },
     /// Sync files to/from a peer via rsync over the mesh.
     ///
@@ -1061,26 +914,6 @@ enum Cmd {
         /// Extra args passed through to ssh (user@host, commands, -p, ...)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-    },
-    /// Reach a peer's localhost port or overlay service (alias for netcat/dial).
-    ///
-    /// With `<dev>:<port>`: tunnels to the peer's localhost:<port> (like netcat).
-    /// With `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
-    Reach {
-        /// Device:port to reach (e.g. laptop:5432)
-        dev_port: Option<String>,
-        /// Run a local SOCKS5 proxy instead
-        #[arg(long)]
-        socks: bool,
-        /// SOCKS5 proxy port (default: 1080)
-        #[arg(long, default_value_t = 1080)]
-        port: u16,
-        /// Proxy bind address (default: 127.0.0.1)
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// HTTP CONNECT proxy port (0 = disabled)
-        #[arg(long, default_value_t = 0)]
-        http_port: u16,
     },
     /// List, approve, or deny pending consent requests from peers.
     Requests {
@@ -8638,12 +8471,6 @@ async fn main() -> Result<()> {
             ui_caps.yes,
             ui_caps.json || cli.json,
         ).await,
-        Cmd::Get { key, peer, show_origin, default, json } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                eprintln!("note: `filament get` is now `filament set {key}`. Same behavior.");
-            }
-            settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
-        }
         Cmd::Addr { device, v4 } => {
             if let Some(name) = device {
                 // Show a specific device's info.
@@ -8690,72 +8517,6 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(())
-        }
-        Cmd::Unset { key, peer } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                eprintln!("note: `filament unset` is now `filament set {key} --unset`. Same behavior.");
-            }
-            settings::run_unset(&key, &peer).await
-        },
-        Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu, wireguard } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                eprintln!("note: `filament serve-tun` is now `filament net serve-tun`. Same behavior.");
-            }
-            #[cfg(l3)]
-            {
-                let mut h = Sha256::new();
-                h.update(psk.as_bytes());
-                let secret: [u8; 32] = h.finalize().into();
-                let is_connector = connect.is_some();
-                let (conn, peer_ip) = match (listen, connect) {
-                    (Some(b), None) => {
-                        let bind: SocketAddr = b.parse().context("bad --listen address")?;
-                        ui::say(&format!("  serve-tun: listening on {b} (dev {dev}, {tun_addr})"));
-                        let c = direct::serve_tun_listen(bind, &secret).await?;
-                        let ip = c.remote_address().ip();
-                        (c, ip)
-                    }
-                    (None, Some(p)) => {
-                        let peer: SocketAddr = p.parse().context("bad --connect address")?;
-                        let ip = peer.ip();
-                        ui::say(&format!("  serve-tun: connecting to {p} (dev {dev}, {tun_addr})"));
-                        let c = direct::serve_tun_connect(peer, &secret).await?;
-                        (c, ip)
-                    }
-                    _ => bail!("serve-tun needs exactly one of --listen <bind> or --connect <host:port>"),
-                };
-                if wireguard {
-                    let (privk, pubk) = wg::gen_keypair().context("wg gen_keypair")?;
-                    let our_port = wg::create_iface(&dev, &privk).context("wg create_iface")?;
-                    let (peer_pub, peer_port) = wg::exchange(&conn, &pubk, our_port, is_connector).await?;
-                    wg::configure_peer(
-                        &dev,
-                        &peer_pub,
-                        &wg::network_cidr(&tun_addr)?,
-                        &wg::endpoint(peer_ip, peer_port),
-                        &tun_addr,
-                        mtu,
-                    )?;
-                    ui::say(&format!(
-                        "  {} serve-tun link up (wireguard) on {dev}",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                    ));
-                    tokio::select! {
-                        _ = conn.closed() => {},
-                        _ = tokio::signal::ctrl_c() => {},
-                    }
-                    wg::teardown(&dev);
-                    Ok(())
-                } else {
-                    ui::say(&format!("  {} serve-tun link up", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                    l3::run_point_to_point(conn, &dev, &tun_addr, mtu).await
-                }
-            }
-            #[cfg(not(l3))]
-            {
-                let _ = (tun_addr, listen, connect, psk, dev, mtu, wireguard);
-                bail!("serve-tun (L3) is Linux-only")
-            }
         }
         Cmd::Identity { action } => {
             match action {
@@ -8871,12 +8632,6 @@ async fn main() -> Result<()> {
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Introduce { a, b } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament devices vouch {a} {b}")));
-            }
-            introduce_cmd(&server, &a, &b, relay).await
-        },
         Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
         Cmd::Devices { action, json } => {
             match action {
@@ -8996,54 +8751,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Netcat { peer, rport, auth_key } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament reach {peer}:{rport}")));
-            }
-            if let Some(ak_path) = auth_key {
-                enroll_and_netcat_cmd(&server, ak_path, Some(peer), rport, relay).await
-            } else {
-                l2::netcat_cmd(&server, &peer, rport, relay).await
-            }
-        }
-        Cmd::Dial { peer, port } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament reach {peer}:{port}")));
-            }
-            l2::dial_cmd(&peer, port).await
-        },
-        Cmd::Pty { peer, cmd } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, "  ↳ filament shell <device>"));
-            }
-            l2::pty_cmd(&server, &peer, relay, cmd).await
-        },
-        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
-        Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
-        Cmd::Unexpose { port } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament expose {port} --off")));
-            }
-            ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await
-        },
-        Cmd::Proxy { port, bind, http_port } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, "  ↳ filament reach --socks"));
-            }
-            l2::proxy_cmd(&server, &bind, port, http_port, relay).await
-        },
-        Cmd::Ssh { peer, args } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament shell {peer}")));
-            }
-            l2::ssh_cmd(&server, &peer, &args, relay).await
-        },
         Cmd::Shell { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Reach { dev_port, socks, port, bind, http_port } => {
             if socks {
-                if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                    ui::say(&ui::paint(ui::Tone::Dim, "  filament reach --socks"));
-                }
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else if let Some(dp) = dev_port {
                 // Default: localhost tunnel (the "reach my device's port" mental model)
@@ -9059,44 +8769,21 @@ async fn main() -> Result<()> {
                 bail!("reach requires <device>:<port> or --socks. Run `filament reach --help` for usage.");
             }
         },
-        Cmd::Ping { peer, count, json } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                eprintln!("note: `filament ping` is now `filament status {peer}` or `filament doctor {peer}`. Same behavior.");
+        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
+        Cmd::Expose { port, to, peer, list, off } => {
+            if off {
+                if let Some(p) = port {
+                    ui_caps.confirm("unexpose a port")?;
+                    expose::unexpose_cmd(p).await
+                } else {
+                    bail!("expose --off requires a port number");
+                }
+            } else {
+                expose::expose_cmd(port, to, peer, list).await
             }
-            ping::ping_cmd(&server, &peer, count, json, relay).await
         },
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
-        }
-        Cmd::TagBind { tag, device } => {
-            let Some(user_key) = load_owner_key() else { bail!("identity not initialized; run `filament identity init` first"); };
-            let config_dir = crate::settings::config_dir();
-            let mut store = crate::capability::load_cap_store(&config_dir);
-            let pk = user_key.public_key_bytes();
-            let Some(cert) = device_cert_for(&device) else {
-                bail!("device '{device}' has no stored identity cert");
-            };
-            let tag_ref = crate::capability::make_tag_target(&pk, &tag);
-            let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
-            let mut binding = crate::capability::TagBindingObj {
-                tag_ref,
-                subject_kind: 0x01,
-                subject: cert.device_pub,
-                owner_pub: pk,
-                version: ver,
-                issued_at: crate::capability::now_secs(),
-                expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
-                sig: [0u8; 64],
-            };
-            let canon = binding.canonical_for_signing();
-            let sig = user_key.keypair().sign(&canon);
-            binding.sig.copy_from_slice(sig.as_ref());
-            crate::capability::apply_tag_binding(&mut store, &binding)
-                .context("create tag binding")?;
-            let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
-                .context("save cap store")?;
-            println!("bound tag '{tag}' to device '{device}'.");
-            Ok(())
         }
         Cmd::Grant { device, capability, tag } => {
             let config_dir = crate::settings::config_dir();
@@ -9344,8 +9031,11 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { peer, remote, local, read_only: _, options: _, foreground: _, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile } => {
-            if let Some(name) = save_profile {
+        Cmd::Mount { peer, remote, local, read_only: _, options: _, foreground: _, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile, off } => {
+            if let Some(path) = off {
+                ui_caps.confirm(&format!("unmount {path}"))?;
+                mount::unmount_cmd(&path)
+            } else if let Some(name) = save_profile {
                 mount::save_profile_cmd(&name)
             } else if let Some(name) = apply_profile {
                 mount::apply_profile_cmd(&name, &server, relay).await
@@ -9421,18 +9111,6 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         }
-        Cmd::Unmount { path } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament mount --off {path}")));
-            }
-            ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path)
-        },
-        Cmd::CapStatus { json } => {
-            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
-                eprintln!("note: `filament cap-status` is now `filament status`. Same behavior.");
-            }
-            cap_status_cmd(json).await
-        },
         Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
