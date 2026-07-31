@@ -440,7 +440,7 @@ EXAMPLES
   filament reach laptop:5432         tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
-  Run `filament <command> --help` for details. Old names (ssh, netcat, dial, unexpose, ...) still work.";
+  Run `filament <command> --help` for details.";
 
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
