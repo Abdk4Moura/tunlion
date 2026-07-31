@@ -89,15 +89,48 @@ use tokio::sync::{mpsc, oneshot};
 /// writer tasks for out-of-order multi-stream reassembly (no seek, atomic per
 /// call). Cross-platform: `FileExt::write_at` on Unix, `seek_write` on Windows —
 /// both write at `offset` without moving the shared handle's cursor.
+// MUST write the ENTIRE buffer. A positional write (pwrite/seek_write) is allowed to
+// write FEWER bytes than requested; the old code did `file.write_at(buf, offset)` and the
+// caller discarded the returned count, so a short write left a gap while `received`
+// advanced by the full length — a silent per-file corruption the whole-file digest then
+// caught as a failed transfer (measured ~44% on direct-QUIC, ~88% on DataChannel for large
+// files). Loop until the whole buffer lands; return Err on a real failure so the caller
+// can react instead of silently dropping bytes.
 #[cfg(unix)]
-fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    file.write_at(buf, offset)
+    let mut written = 0usize;
+    let mut iters = 0u32;
+    while written < buf.len() {
+        iters += 1;
+        match file.write_at(&buf[written..], offset + written as u64) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite wrote 0 bytes")),
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    // DIAG (temporary): prove whether short-writes actually happen. If corruption is
+    // short-write-caused this fires; if the re-rig shows zero of these AND corruption
+    // persists, the cause is the await-before-digest race, not the write. Remove after.
+    if iters > 1 {
+        eprintln!("[pwrite-diag] SHORT WRITE: {iters} iterations to write {} bytes @ off {offset}", buf.len());
+    }
+    Ok(())
 }
 #[cfg(windows)]
-fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
-    file.seek_write(buf, offset)
+    let mut written = 0usize;
+    while written < buf.len() {
+        match file.seek_write(&buf[written..], offset + written as u64) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "seek_write wrote 0 bytes")),
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
@@ -10817,6 +10850,24 @@ async fn stream_one(
 
 // ------------------------------------------------------------------- recv —
 
+/// Reduce a remote-supplied file name to a safe single path component: basename
+/// only (no path separators or `..`), with control characters (including NUL)
+/// stripped. A NUL in particular would fail the CString conversion in
+/// safe_open_beneath and abort the whole receive loop, so a peer must not be able
+/// to embed one. Empties / `.` / `..` fall back to a fixed name.
+fn safe_incoming_name(raw: &str) -> String {
+    let base = std::path::Path::new(raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".into());
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "file.bin".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
 /// protects symlinked parents too), O_NOFOLLOW on other Unix, create_new
 /// (O_EXCL) on non-Unix. O_EXCL means "fail if exists" — correct for fresh,
@@ -11008,6 +11059,24 @@ fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64
 fn record_range_total(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
     let (_delta, total) = record_range(ranges, pos, len);
     total
+}
+
+/// True iff the recorded ranges tile [0,size) with no gap (one contiguous interval).
+fn coverage_complete(ranges: &[(u64, u64)], size: u64) -> bool {
+    if size == 0 { return true; }
+    ranges.len() == 1 && ranges[0].0 == 0 && ranges[0].1 == size
+}
+
+/// First uncovered byte position in [0,size), or None if complete.
+fn first_gap(ranges: &[(u64, u64)], size: u64) -> Option<u64> {
+    if size == 0 { return None; }
+    let mut cursor = 0u64;
+    for &(s, e) in ranges {
+        if s > cursor { return Some(cursor); }
+        cursor = cursor.max(e);
+        if cursor >= size { return None; }
+    }
+    if cursor < size { Some(cursor) } else { None }
 }
 
 /// Build the live shell policy from the persistent settings (global `shell` +
@@ -14164,12 +14233,11 @@ async fn recv_cmd(
                     }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    // Never trust a remote name with path separators.
+                    // Never trust a remote name: reduce it to a safe single path
+                    // component (basename only, no path separators, no control
+                    // bytes). See safe_incoming_name.
                     let raw = v["name"].as_str().unwrap_or("file.bin");
-                    let name = Path::new(raw)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file.bin".into());
+                    let name = safe_incoming_name(raw);
                     let size = v["size"].as_u64().unwrap_or(0);
                     let offer_head = v["head"].as_str().map(|s| s.to_string());
                     // P4 (GAP-5): the sender's whole-file sha256 (absent for an old
@@ -14441,6 +14509,9 @@ async fn recv_cmd(
                     // P4: the digest to verify against on completion, the current
                     // offer's, else the one persisted with the partial (resume).
                     let effective_full = offer_full.clone().or(prior_full);
+                    // A per-file open failure DECLINES this one file (continue),
+                    // matching the other offer-accept declines. It must never unwind
+                    // the receive loop: that would kill every other in-flight transfer.
                     let file = if offset > 0 {
                         // DEBUG, resilience internal (receiver resuming from offset).
                         ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
@@ -14448,11 +14519,28 @@ async fn recv_cmd(
                         // position for multi-stream out-of-order writes.
                         // safe_resume_part: RESOLVE_BENEATH on Linux, O_NOFOLLOW +
                         // fstat regular-file check on other Unix. NO O_EXCL (resume).
-                        safe_resume_part(&part_path).await?
+                        match safe_resume_part(&part_path).await {
+                            Ok(f) => f,
+                            Err(e) => { ui::debug(&format!("{name}: cannot open .part to resume, declining: {e}")); continue; }
+                        }
                     } else {
-                        PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)?;
-                        // O_NOFOLLOW prevents following a symlink planted at the .part path.
-                        safe_create_part(&part_path).await?
+                        // Restart-from-0: a leftover .part of different content/size
+                        // (interrupted transfer, or a common filename from another
+                        // peer) must not block the fresh create. safe_create_part uses
+                        // O_EXCL to refuse a planted symlink, which EEXISTs on any
+                        // leftover .part; that Err used to unwind the whole loop. Remove
+                        // the stale partial first (unlinking a symlink drops the link,
+                        // not its target); a symlink planted in the gap still trips
+                        // O_EXCL and is declined below, not followed.
+                        let _ = std::fs::remove_file(&part_path);
+                        if let Err(e) = (PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)) {
+                            ui::debug(&format!("{name}: cannot write .part.meta, declining: {e}"));
+                            continue;
+                        }
+                        match safe_create_part(&part_path).await {
+                            Ok(f) => f,
+                            Err(e) => { ui::debug(&format!("{name}: cannot create .part, declining: {e}")); continue; }
+                        }
                     };
                     let bar = ui::Progress::new(&name, size);
                     let file = Arc::new(file.into_std().await);
@@ -14676,34 +14764,46 @@ async fn recv_cmd(
                     // --- TRACE recv path ---
                     let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
                     let t_recv_start = if trace { Some(std::time::Instant::now()) } else { None };
-                    // Determine the write position: absolute offset from
-                    // the sender (QUIC multi-stream) or current file end
-                    // (DataChannel, via the received counter).
-                    // FIX: Use fetch_add for DataChannel to avoid race where two chunks
-                    // get same pos if they arrive before first pwrite completes.
-                    // For QUIC, record_range immediately in event loop (not inside spawn)
-                    // so received is accurate for upgrade seam (WebRTC->QUIC).
-                    let pos: u64;
-                    if let Some(off) = offset {
-                        pos = off;
-                        // For QUIC, update ranges + received immediately
-                        let mut r = inc.ranges.lock().unwrap();
-                        let (_delta, total) = record_range(&mut *r, pos, data.len());
-                        inc.received.store(total, Ordering::Relaxed);
-                    } else {
-                        pos = inc.received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    // Determine the write position: absolute offset from the
+                    // sender. Both QUIC and DataChannel now frame the offset.
+                    // An offsetless frame is impossible under the new scheme.
+                    let pos: u64 = match offset {
+                        Some(off) => off,
+                        None => {
+                            dlog!("[recv] REFUSING offsetless chunk sid={sid}: transport must frame offset");
+                            continue;
+                        }
                     };
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
+                    let ranges = Arc::clone(&inc.ranges);
+                    let received = Arc::clone(&inc.received);
                     let tx = tx.clone();
                     let pid_c = pid.clone();
                     let data_len = data.len();
                     let trace_inner = trace;
                     tokio::task::spawn_blocking(move || {
                         let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
-                        let _ = pwrite_at(&file, &data, pos);
+                        if let Err(e) = pwrite_at(&file, &data, pos) {
+                            // Write failed: do NOT record coverage (leaves the gap).
+                            // The whole-file digest will fail and trigger a re-fetch.
+                            dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
+                        } else {
+                            // Write succeeded: record coverage AFTER bytes landed.
+                            let mut r = ranges.lock().unwrap();
+                            let (_delta, total) = record_range(&mut *r, pos, data_len);
+                            drop(r);
+                            // fetch_max, not store: writer tasks run concurrently, so
+                            // a task that locked earlier (lower union total) can reach
+                            // this line AFTER one that locked later (higher total). The
+                            // union total is monotonic, so max() keeps `received` from
+                            // regressing to a stale value (which would spuriously trip
+                            // the `recvd < size` gate in verify_incoming). Serialized in
+                            // the old event-loop path; this race is new to the writer.
+                            received.fetch_max(total, Ordering::Relaxed);
+                        }
                         let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                         if trace_inner && pwrite_us > 1000 {
                             dlog!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us", pos, data_len, pwrite_us);
@@ -15007,6 +15107,21 @@ async fn verify_incoming(inc: &IncomingFile) -> protocol::VerifyResult {
     if recvd < inc.size {
         return protocol::decide_verify(recvd, inc.size, None);
     }
+
+    // Contiguity guard: before hashing, verify coverage is one contiguous
+    // [0,size) interval. Any gap means the file has unwritten bytes even
+    // though received == size. Report WHERE the first gap is.
+    {
+        let r = inc.ranges.lock().unwrap();
+        if !coverage_complete(&r, inc.size) {
+            let gap = first_gap(&r, inc.size);
+            dlog!("[recv] INCOMPLETE at verify: {} ranges, received {}/{}, first gap at {:?}",
+                  r.len(), recvd, inc.size, gap);
+            drop(r);
+            return protocol::decide_verify(recvd, inc.size, None); // re-fetch, never a false Match
+        }
+    }
+
     let path = inc.part_path.clone();
     let got = tokio::task::spawn_blocking(move || full_hash(&path)).await.ok().flatten();
     protocol::decide_verify(recvd, inc.size, Some(got.as_deref() == Some(want.as_str())))
@@ -15339,6 +15454,41 @@ mod tests {
             Ok(Err(_)) => {} // Expected: error because FIFO is not a regular file
             Err(_) => panic!("safe_resume_part hung on a FIFO — O_NONBLOCK may be needed"),
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Restart-from-0: a leftover .part from an interrupted transfer (or a
+    /// common filename re-offered by another peer) must not wedge a fresh
+    /// receive. safe_create_part uses O_EXCL, so a create-alone EEXISTs on the
+    /// leftover; the restart path removes it first and then creates cleanly.
+    /// Regression guard for the "one stale .part aborts the whole receive loop"
+    /// bug (the offer-accept path used `?` on that Err instead of declining).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_restart_replaces_stale_part() {
+        let uid = format!("{}-restart-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"stale partial from a prior interrupted transfer").unwrap();
+
+        // create-alone must fail on the leftover (O_EXCL -> EEXIST). This is the
+        // Err the receive loop must NOT propagate out via `?`.
+        assert!(
+            safe_create_part(&part_path).await.is_err(),
+            "O_EXCL create must refuse a leftover .part"
+        );
+
+        // The restart-from-0 path removes the stale partial, then creates fresh.
+        let _ = std::fs::remove_file(&part_path);
+        let created = safe_create_part(&part_path).await;
+        assert!(created.is_ok(), "remove-then-create must succeed: {:?}", created.err());
+
+        // The restarted .part is empty (the stale bytes are gone).
+        let meta = std::fs::metadata(&part_path).unwrap();
+        assert_eq!(meta.len(), 0, "restarted .part must start empty");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -15733,12 +15883,18 @@ mod tests {
     #[test]
     fn filename_sanitization() {
         // the recv path strips directories from remote names
-        let evil = "../../etc/passwd";
-        let name = Path::new(evil).file_name().map(|n| n.to_string_lossy().into_owned());
-        assert_eq!(name.as_deref(), Some("passwd"));
-        let evil2 = "/absolute/path.bin";
-        let name2 = Path::new(evil2).file_name().map(|n| n.to_string_lossy().into_owned());
-        assert_eq!(name2.as_deref(), Some("path.bin"));
+        assert_eq!(safe_incoming_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_incoming_name("/absolute/path.bin"), "path.bin");
+        assert_eq!(safe_incoming_name("plain.bin"), "plain.bin");
+        // control bytes are stripped; a NUL in particular must NOT survive into a
+        // path (it would fail the CString conversion in safe_open_beneath and
+        // abort the receive loop). A remote peer must not be able to do that.
+        assert_eq!(safe_incoming_name("evil\0.bin"), "evil.bin");
+        assert_eq!(safe_incoming_name("with\ttab\nand\r.bin"), "withtaband.bin");
+        // a name that reduces to nothing (or . / ..) falls back to a fixed name
+        assert_eq!(safe_incoming_name("\0\0\0"), "file.bin");
+        assert_eq!(safe_incoming_name(".."), "file.bin");
+        assert_eq!(safe_incoming_name(""), "file.bin");
     }
 
     // Bug 1: `send --name X` is honored for a SINGLE regular file (offer name =

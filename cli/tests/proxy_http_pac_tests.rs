@@ -1,7 +1,8 @@
 //! Tests for HTTP CONNECT proxy and PAC file serving.
 //!
-//! These tests verify that `filament proxy --http-port` serves HTTP CONNECT
-//! tunneling and PAC file for browser config.
+//! These tests verify that `filament reach --socks --http-port` serves HTTP
+//! CONNECT tunneling and PAC file for browser config. (The old `proxy` command
+//! was folded into `reach --socks` in the 0.7.5 command-surface rework.)
 
 use std::process::Command;
 
@@ -14,13 +15,13 @@ fn filament_bin() -> std::path::PathBuf {
     path
 }
 
-/// Test that `filament proxy --help` shows the --http-port flag.
+/// Test that `filament reach --help` shows the --http-port flag.
 #[test]
 fn proxy_help_shows_http_port_flag() {
     let bin = filament_bin();
 
     let output = Command::new(&bin)
-        .arg("proxy")
+        .arg("reach")
         .arg("--help")
         .output()
         .expect("failed to execute filament");
@@ -34,7 +35,7 @@ fn proxy_help_shows_http_port_flag() {
     );
 }
 
-/// Test that `filament proxy --http-port 0` disables HTTP proxy.
+/// Test that `filament reach --socks --http-port 0` disables HTTP proxy.
 #[test]
 fn proxy_http_port_zero_disables() {
     let bin = filament_bin();
@@ -42,7 +43,8 @@ fn proxy_http_port_zero_disables() {
     // Start proxy with http-port=0 (disabled), then kill it after a moment
     let mut child = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-proxy-test-disabled"))
-        .arg("proxy")
+        .arg("reach")
+        .arg("--socks")
         .arg("--http-port")
         .arg("0")
         .arg("--port")
@@ -80,7 +82,8 @@ fn pac_file_returns_correct_socks_port() {
     // Start proxy with custom ports
     let mut child = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &config_dir)
-        .arg("proxy")
+        .arg("reach")
+        .arg("--socks")
         .arg("--port")
         .arg(socks_port.to_string())
         .arg("--http-port")

@@ -928,18 +928,29 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
 
         let mut how: libc::open_how = unsafe { std::mem::zeroed() };
         how.flags = (flags as u64) | libc::O_CLOEXEC as u64;
-        how.mode = 0;
+        // mode is meaningful ONLY with O_CREAT/O_TMPFILE; openat2 returns EINVAL if
+        // mode is non-zero without one of them. Set 0o644 for creates (matching the
+        // non-Linux fallback), 0 otherwise (e.g. the O_WRONLY resume open).
+        how.mode = if (flags & (libc::O_CREAT | libc::O_TMPFILE)) != 0 { 0o644 } else { 0 };
         how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
 
         let rel_str = rel_path.to_str().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF-8 path")
+        })?;
+        // openat2 takes a C string: the pathname must be NUL-terminated. Passing a
+        // bare &str's `.as_ptr()` makes the kernel read past the bytes into adjacent
+        // memory until a stray NUL, creating the file under a garbage-suffixed name
+        // (layout-dependent, so it corrupts transfers intermittently). CString adds
+        // the terminator (and rejects an interior NUL, which no real path contains).
+        let rel_c = std::ffi::CString::new(rel_str).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL byte")
         })?;
 
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_openat2,
                 root_fd.as_raw_fd(),
-                rel_str.as_ptr(),
+                rel_c.as_ptr(),
                 &how as *const _,
                 std::mem::size_of::<libc::open_how>(),
             )

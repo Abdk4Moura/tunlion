@@ -1,6 +1,6 @@
-//! Tests for warm one-shot pty behavior.
+//! Tests for warm one-shot shell (native PTY) behavior.
 //!
-//! These tests verify that `filament pty <peer> -- cmd` reuses the daemon's
+//! These tests verify that `filament shell <peer> -- cmd` reuses the daemon's
 //! held warm link and returns without redundant cold establish.
 
 use std::process::Command;
@@ -25,7 +25,7 @@ fn one_shot_pty_timeout_respects_env_var() {
     let output = Command::new(&bin)
         .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-timeout"))
-        .arg("pty")
+        .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
         .arg("echo")
@@ -64,7 +64,7 @@ fn one_shot_pty_instant_eof_cold_path() {
     let output = Command::new(&bin)
         .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-eof"))
-        .arg("pty")
+        .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
         .arg("echo")
@@ -111,7 +111,7 @@ fn one_shot_pty_stdin_forwarding() {
     let output = Command::new(&bin)
         .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-warm-one-shot-test-stdin"))
-        .arg("pty")
+        .arg("shell")
         .arg("definitely-unreachable-peer-12345")
         .arg("--")
         .arg("cat")

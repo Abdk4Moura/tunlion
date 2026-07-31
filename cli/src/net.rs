@@ -538,11 +538,12 @@ impl Transport for DataChannelTransport {
         Ok(())
     }
 
-    async fn send_frame(&self, sid: u32, _offset: u64, payload: &[u8]) -> Result<()> {
+    async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
         let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
         let t_frame = if trace { Some(std::time::Instant::now()) } else { None };
-        let mut framed = Vec::with_capacity(4 + payload.len());
+        let mut framed = Vec::with_capacity(4 + 8 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
+        framed.extend_from_slice(&offset.to_be_bytes());
         framed.extend_from_slice(payload);
         let frame_us = t_frame.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         // Event-driven backpressure (C8a): park on the buffered-amount-low
@@ -1808,7 +1809,7 @@ async fn wire_channel(
                                 }
                             }
                             Ok((n, false)) => {
-                                if n >= 4 && !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                                if n >= 12 && !closed.load(std::sync::atomic::Ordering::Relaxed) {
                                     // Inbound transfer bytes = link is flowing (#28
                                     // guard). Only data frames count, not control,
                                     // periodic acks/state pings must not keep an
@@ -1818,13 +1819,15 @@ async fn wire_channel(
                                     first_data
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                                    // DataChannel frames carry no offset; receiver
-                                    // appends sequentially (abs_offset = None).
+                                    let offset = u64::from_be_bytes([
+                                        buf[4], buf[5], buf[6], buf[7],
+                                        buf[8], buf[9], buf[10], buf[11],
+                                    ]);
                                     let _ = tx.send(Ev::Chunk(
                                         peer_id.clone(),
                                         sid,
-                                        None,
-                                        Bytes::copy_from_slice(&buf[4..n]),
+                                        Some(offset),
+                                        Bytes::copy_from_slice(&buf[12..n]),
                                     ));
                                 }
                             }
