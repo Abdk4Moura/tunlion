@@ -423,7 +423,7 @@ EXAMPLES:
     ping · doctor         diagnose a link; introduce · grant · serve-tun · netcat";
 
 #[derive(Parser)]
-#[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers, no upload, no account", after_help = EXAMPLES)]
+#[command(name = "filament", version = VERSION, about = "Peer-to-peer between your terminals and browsers: send files, open a shell, forward a port, mount a folder. No upload, no account \u{2014} your own devices form a fleet that just works.", after_help = EXAMPLES)]
 struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
     #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
