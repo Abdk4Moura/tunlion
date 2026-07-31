@@ -10987,6 +10987,24 @@ struct IncomingFile {
 /// Delta is the number of previously-unseen bytes added by this chunk.
 /// Total is the authoritative received count for multi-stream OOO reassembly.
 /// Optimized: binary search + incremental total via removed_total tracking.
+/// True iff the recorded ranges tile [0,size) with no gap (one contiguous interval).
+fn coverage_complete(ranges: &[(u64, u64)], size: u64) -> bool {
+    if size == 0 { return true; }
+    ranges.len() == 1 && ranges[0].0 == 0 && ranges[0].1 == size
+}
+
+/// First uncovered byte position in [0,size), or None if complete.
+fn first_gap(ranges: &[(u64, u64)], size: u64) -> Option<u64> {
+    if size == 0 { return None; }
+    let mut cursor = 0u64;
+    for &(s, e) in ranges {
+        if s > cursor { return Some(cursor); }
+        cursor = cursor.max(e);
+        if cursor >= size { return None; }
+    }
+    if cursor < size { Some(cursor) } else { None }
+}
+
 fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64) {
     let end = pos + len as u64;
     if ranges.is_empty() {
@@ -14700,27 +14718,22 @@ async fn recv_cmd(
                     // --- TRACE recv path ---
                     let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
                     let t_recv_start = if trace { Some(std::time::Instant::now()) } else { None };
-                    // Determine the write position: absolute offset from
-                    // the sender (QUIC multi-stream) or current file end
-                    // (DataChannel, via the received counter).
-                    // FIX: Use fetch_add for DataChannel to avoid race where two chunks
-                    // get same pos if they arrive before first pwrite completes.
-                    // For QUIC, record_range immediately in event loop (not inside spawn)
-                    // so received is accurate for upgrade seam (WebRTC->QUIC).
-                    let pos: u64;
-                    if let Some(off) = offset {
-                        pos = off;
-                        // For QUIC, update ranges + received immediately
-                        let mut r = inc.ranges.lock().unwrap();
-                        let (_delta, total) = record_range(&mut *r, pos, data.len());
-                        inc.received.store(total, Ordering::Relaxed);
-                    } else {
-                        pos = inc.received.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    // Determine the write position: absolute offset from the
+                    // sender. Both QUIC and DataChannel now frame the offset.
+                    // An offsetless frame is impossible under the new scheme.
+                    let pos: u64 = match offset {
+                        Some(off) => off,
+                        None => {
+                            dlog!("[recv] REFUSING offsetless chunk sid={sid}: transport must frame offset");
+                            continue;
+                        }
                     };
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
+                    let ranges = Arc::clone(&inc.ranges);
+                    let received = Arc::clone(&inc.received);
                     let tx = tx.clone();
                     let pid_c = pid.clone();
                     let data_len = data.len();
@@ -14728,12 +14741,15 @@ async fn recv_cmd(
                     tokio::task::spawn_blocking(move || {
                         let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
                         if let Err(e) = pwrite_at(&file, &data, pos) {
-                            // `received` already advanced for this range; a write that
-                            // never fully landed means the whole-file digest will fail and
-                            // trigger a re-fetch. Log loudly so this reliability path is
-                            // never silent (pwrite_at now writes the WHOLE buffer, so this
-                            // is a genuine I/O error — disk full, etc. — not a short write).
+                            // Write failed: do NOT record coverage (leaves the gap).
+                            // The whole-file digest will fail and trigger a re-fetch.
                             dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
+                        } else {
+                            // Write succeeded: record coverage AFTER bytes landed.
+                            let mut r = ranges.lock().unwrap();
+                            let (_delta, total) = record_range(&mut *r, pos, data_len);
+                            drop(r);
+                            received.store(total, Ordering::Relaxed);
                         }
                         let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                         if trace_inner && pwrite_us > 1000 {
@@ -15038,6 +15054,21 @@ async fn verify_incoming(inc: &IncomingFile) -> protocol::VerifyResult {
     if recvd < inc.size {
         return protocol::decide_verify(recvd, inc.size, None);
     }
+
+    // Contiguity guard: before hashing, verify coverage is one contiguous
+    // [0,size) interval. Any gap means the file has unwritten bytes even
+    // though received == size. Report WHERE the first gap is.
+    {
+        let r = inc.ranges.lock().unwrap();
+        if !coverage_complete(&r, inc.size) {
+            let gap = first_gap(&r, inc.size);
+            dlog!("[recv] INCOMPLETE at verify: {} ranges, received {}/{}, first gap at {:?}",
+                  r.len(), recvd, inc.size, gap);
+            drop(r);
+            return protocol::decide_verify(recvd, inc.size, None); // re-fetch, never a false Match
+        }
+    }
+
     let path = inc.part_path.clone();
     let got = tokio::task::spawn_blocking(move || full_hash(&path)).await.ok().flatten();
     protocol::decide_verify(recvd, inc.size, Some(got.as_deref() == Some(want.as_str())))
