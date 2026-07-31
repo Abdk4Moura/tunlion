@@ -483,12 +483,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    // ── Share ───────────────────────────────────────────────────────
     /// Send files or directories to a peer (browser or CLI).
-    ///
-    /// In a terminal with no --code/--word this offers to mint a shareable code
-    /// (or press enter for the local network). Scripts are safe by default: a
-    /// non-TTY uses the local network; under a TTY set FILAMENT_NONINTERACTIVE=1
-    /// or pass --no-interactive to skip the prompt.
+    #[command(next_help_heading = "Share")]
     Send {
         /// Files or directories to send; '-' reads stdin
         paths: Vec<String>,
@@ -545,14 +542,9 @@ enum Cmd {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
-    /// Remember a device (a pairing ceremony, no file transfer).
-    ///
-    /// Mints a code (or claims one) and exchanges the pair secret with consent on
-    /// both ends.
-    /// In a terminal with no code (or a malformed one) this opens a guided,
-    /// color-coded code entry. Scripts are safe by default: a non-TTY never
-    /// prompts; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass --no-interactive
-    /// to fail fast instead of prompting.
+    /// Remember a device (pairing ceremony, no file transfer).
+    /// Exchanges the pair secret with consent on both ends.
+    #[command(next_help_heading = "Connect")]
     Pair {
         /// A code from the other device; omit to mint one for them
         code: Option<String>,
@@ -565,7 +557,9 @@ enum Cmd {
         #[arg(long)]
         word: Option<String>,
     },
+    // ── Devices ─────────────────────────────────────────────────────
     /// List known devices (trusted for --to and auto-accept)
+    #[command(next_help_heading = "Devices")]
     Devices {
         #[command(subcommand)]
         action: Option<DevicesAction>,
@@ -631,6 +625,7 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
     Down,
     /// Vouch between two known devices: mints a fresh secret and delivers it
@@ -677,14 +672,9 @@ enum Cmd {
         #[arg(long, conflicts_with = "hard")]
         soft: bool,
     },
-    /// Show this machine's overlay address, or a device's info (addresses, caps, last seen).
-    ///
-    /// Derived from its Ed25519 overlay key; stable across restarts. Creates the
-    /// key on first use. `--v4` prints the dual-stack IPv4 overlay address instead
-    /// (also key-derived, in the reserved 198.18.0.0/15 range).
-    ///
-    /// With a device name: shows that device's overlay addresses, capabilities,
-    /// and last-seen time. Use `filament devices` to list all known devices.
+    // ── Mesh ────────────────────────────────────────────────────────
+    /// Show this machine's overlay address, or a device's info
+    #[command(next_help_heading = "Mesh")]
     Addr {
         /// Device name to show info for (omit for this machine's address).
         device: Option<String>,
@@ -749,7 +739,9 @@ enum Cmd {
         #[arg(long)]
         wireguard: bool,
     },
-    /// Manage your user identity (user key + device certs, SSH-CA model).
+    // ── Identity ────────────────────────────────────────────────────
+    /// Manage your user identity (key + device certs)
+    #[command(next_help_heading = "Identity")]
     Identity {
         #[command(subcommand)]
         action: IdentityAction,
@@ -8624,6 +8616,9 @@ async fn main() -> Result<()> {
             ui_caps.json || cli.json,
         ).await,
         Cmd::Get { key, peer, show_origin, default, json } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                eprintln!("note: `filament get` is now `filament set {key}`. Same behavior.");
+            }
             settings::run_get(&key, peer.as_deref(), show_origin, default.as_deref(), json)
         }
         Cmd::Addr { device, v4 } => {
@@ -8673,8 +8668,16 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Unset { key, peer } => settings::run_unset(&key, &peer).await,
+        Cmd::Unset { key, peer } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                eprintln!("note: `filament unset` is now `filament set {key} --unset`. Same behavior.");
+            }
+            settings::run_unset(&key, &peer).await
+        },
         Cmd::ServeTun { tun_addr, listen, connect, psk, dev, mtu, wireguard } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                eprintln!("note: `filament serve-tun` is now `filament net serve-tun`. Same behavior.");
+            }
             #[cfg(l3)]
             {
                 let mut h = Sha256::new();
@@ -9015,13 +9018,17 @@ async fn main() -> Result<()> {
         Cmd::Shell { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
         Cmd::Reach { dev_port, socks, port, bind, http_port } => {
             if socks {
+                if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  filament reach --socks"));
+                }
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else if let Some(dp) = dev_port {
+                // Default: localhost tunnel (the "reach my device's port" mental model)
                 let parts: Vec<&str> = dp.splitn(2, ':').collect();
                 if parts.len() == 2 {
                     let peer = parts[0].to_string();
-                    let port: u16 = parts[1].parse().map_err(|_| anyhow!("invalid port in '{}'", dp))?;
-                    l2::dial_cmd(&peer, port).await
+                    let rport: u16 = parts[1].parse().map_err(|_| anyhow!("invalid port in '{}'", dp))?;
+                    l2::netcat_cmd(&server, &peer, rport, relay).await
                 } else {
                     bail!("reach requires <device>:<port> format, e.g. `filament reach laptop:5432`");
                 }
@@ -9029,7 +9036,12 @@ async fn main() -> Result<()> {
                 bail!("reach requires <device>:<port> or --socks. Run `filament reach --help` for usage.");
             }
         },
-        Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
+        Cmd::Ping { peer, count, json } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                eprintln!("note: `filament ping` is now `filament status {peer}` or `filament doctor {peer}`. Same behavior.");
+            }
+            ping::ping_cmd(&server, &peer, count, json, relay).await
+        },
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
@@ -9392,7 +9404,12 @@ async fn main() -> Result<()> {
             }
             ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path)
         },
-        Cmd::CapStatus { json } => cap_status_cmd(json).await,
+        Cmd::CapStatus { json } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                eprintln!("note: `filament cap-status` is now `filament status`. Same behavior.");
+            }
+            cap_status_cmd(json).await
+        },
         Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
@@ -11125,11 +11142,12 @@ async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
 #[cfg(unix)]
 async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     // On Linux: use safe_open_beneath (RESOLVE_BENEATH)
+    // Add O_NONBLOCK to prevent blocking on FIFOs/special files
     #[cfg(target_os = "linux")]
     {
         let parent = path.parent().unwrap_or(std::path::Path::new("."));
         let rel = path.strip_prefix(parent).unwrap_or(path);
-        let file = crate::mount_proto::safe_open_beneath(parent, rel, libc::O_WRONLY as i32)
+        let file = crate::mount_proto::safe_open_beneath(parent, rel, libc::O_WRONLY | libc::O_NONBLOCK as i32)
             .map_err(|e| std::io::Error::new(e.kind(), format!("safe resume .part: {e}")))?;
         // Verify what we opened is a regular file (not FIFO, device, etc.)
         let meta = file.metadata()?;
@@ -15542,8 +15560,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_part_refuses_symlink() {
-        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-create-{uid}"));
+        let uid = format!("{}-create-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Plant a symlink at the .part path
@@ -15565,8 +15583,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn transfer_open_part_refuses_symlink() {
-        let uid = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-resume-{uid}"));
+        let uid = format!("{}-resume-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Create a regular .part file first
@@ -15600,9 +15618,17 @@ mod tests {
         // Create a FIFO (named pipe) at the .part path
         unsafe { libc::mkfifo(std::ffi::CString::new(part_path.to_str().unwrap()).unwrap().as_ptr(), 0o644); }
 
-        // Must refuse — FIFO is not a regular file
-        let result = safe_resume_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to resume through a FIFO");
+        // Must refuse — FIFO is not a regular file.
+        // Use timeout because opening a FIFO for write blocks until a reader opens it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            safe_resume_part(&part_path),
+        ).await;
+        match result {
+            Ok(Ok(_)) => panic!("must refuse to resume through a FIFO"),
+            Ok(Err(_)) => {} // Expected: error because FIFO is not a regular file
+            Err(_) => panic!("safe_resume_part hung on a FIFO — O_NONBLOCK may be needed"),
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
