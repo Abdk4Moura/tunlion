@@ -415,7 +415,7 @@ COMMANDS
   Share
     <file>  /  send        send files (mints a one-time code, or --to <device>)
     recv <code>            claim a code and receive
-    shell <device>         open a shell on a known device
+     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
     mount <device>:<dir>   mount a remote folder over the mesh
@@ -905,13 +905,18 @@ enum Cmd {
     },
     /// Open a shell on a known device (alias for ssh/pty).
     ///
-    /// Runs your real `ssh` over the data channel via ProxyCommand (reuses your
-    /// keys, known_hosts, and ~/.ssh/config). With no args, opens an interactive
-    /// PTY shell (the CLI sibling of the browser web-shell).
+    /// Open a shell on a device.
+    ///
+    /// Default: filament's own native PTY (the peer must run `up --shell`).
+    /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
+    /// (reuses your keys, known_hosts, and ~/.ssh/config).
     Shell {
         /// Known device (petname) to open a shell on
         peer: String,
-        /// Extra args passed through to ssh (user@host, commands, -p, ...)
+        /// Use real ssh (ProxyCommand over filament) instead of the native PTY
+        #[arg(long)]
+        ssh: bool,
+        /// Extra args passed through to ssh (only with --ssh)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -8751,7 +8756,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Shell { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
+        Cmd::Shell { peer, ssh, args } => {
+            if ssh {
+                l2::ssh_cmd(&server, &peer, &args, relay).await
+            } else {
+                l2::pty_cmd(&server, &peer, relay, args).await
+            }
+        },
         Cmd::Reach { dev_port, socks, port, bind, http_port } => {
             if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
