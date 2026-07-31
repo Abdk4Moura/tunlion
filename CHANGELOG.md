@@ -4,6 +4,50 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.7.6] - 2026-07-31
+
+`shell` defaults to a native PTY, and file transfers stop spuriously rejecting
+perfectly good files.
+
+### Changed
+
+- **`filament shell <device>` now opens filament's own native PTY by default**
+  (the peer must run `up --shell`). Use `filament shell <device> --ssh` to run
+  your real ssh over the data channel via ProxyCommand as before. The refined PTY
+  engine (warm-link reuse, resumable reconnect, single shared stdin reader) is
+  unchanged; only which command drives it changed.
+
+### Fixed
+
+- **Transfers no longer spuriously reject good files as "corrupt" (Linux).** The
+  intermittent "received all bytes but whole-file checksum FAILED, refusing to
+  accept a corrupt file" was never corrupted data: `safe_open_beneath` passed a
+  non-NUL-terminated `&str` as the `openat2` pathname, so the kernel read past the
+  name into adjacent memory and created the `.part` under a garbage-suffixed
+  filename (mode 000). Verification then hashed the clean intended path, found
+  nothing, and refused a byte-perfect file. Fixed by NUL-terminating the pathname
+  (and setting the file mode only when creating). A cross-machine rig confirms the
+  verify-failure rate drops from ~77% / ~89% to 0% on both transports, with the
+  received bytes byte-identical to source every time. This was also the cause of
+  intermittent `.part` symlink-refusal test flakiness.
+- **A single bad `.part` no longer takes down the whole receive session.** A
+  leftover `.part` from an interrupted transfer, or a common filename re-offered
+  by another peer, made the fresh `O_EXCL` create return `EEXIST`, and that error
+  unwound the entire receive loop, killing every other in-flight transfer.
+  Restart-from-zero now replaces a stale partial, and a per-file open failure
+  declines just that file instead of aborting the loop.
+- **Remote file names are stripped of control bytes** before becoming a path, so
+  a peer cannot embed a NUL (or other control characters) in an offered filename.
+
+### Internal
+
+- DataChannel now frames the absolute chunk offset like the QUIC transport, the
+  reassembly coverage map is written by the writer after the bytes land (not as
+  pre-write intent), completion gates on a contiguous byte range, and a contiguity
+  guard reports the exact gap on any future regression instead of a bare digest
+  mismatch. Concurrent coverage writers use `fetch_max` so a reordered store can
+  never regress the received count.
+
 ## [0.7.5] - 2026-07-31
 
 The command surface, finished: a clean ~15-verb CLI with no legacy names.

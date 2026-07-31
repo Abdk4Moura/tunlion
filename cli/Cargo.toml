@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.7.5"
+version = "0.7.6"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2024"
 description = "P2P file transfer between terminals and browsers, no upload, no account. The terminal end of filament.autumated.com."
@@ -136,6 +136,12 @@ wintun = "0.5"
 # Upgrade tracked as follow-up item.
 winfsp = { version = "=0.12.0", features = ["full", "windows-61"], optional = true }
 winfsp-sys = { version = "=0.3.0", optional = true }
+# Used for reparse-point (symlink/junction) refusal in safe_create_part /
+# safe_resume_part — closes the Windows half deferred in 0.7.2/0.7.3.
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
 
 [profile.release]
 lto = "thin"
