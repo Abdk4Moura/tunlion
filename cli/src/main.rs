@@ -828,7 +828,6 @@ enum Cmd {
     ///
     /// With a device: run an "establish then drop" probe and print the per-phase
     /// ladder + verdict. Without a device: environment preflight.
-    #[command(hide = true)]
     Doctor {
         /// Known device (petname) to probe; omit for environment preflight
         device: Option<String>,
