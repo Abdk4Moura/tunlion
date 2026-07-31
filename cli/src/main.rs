@@ -5384,9 +5384,119 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                                                                                         }
                                                                                         Err(_) => {
                                                                                             // cannot obtain own device_pub -> cannot rule out reflection -> refuse
-                                                                                        }
-                                                                                    }
-            }
+        }
+    }
+
+    // --- Windows reparse-point hardening tests (#43) ---
+    // These mirror the Unix transfer_part_refuses_symlink / transfer_open_part_refuses_symlink
+    // tests but use Windows directory junctions to exercise the reparse-point refusal.
+    // Junctions are created via `cmd /c mklink /J` (no privilege needed, unlike symlinks).
+    // Runtime behavior (does the junction actually get refused) needs a Windows runner,
+    // which we don't have yet — pending #34 (per-OS CI).
+
+    /// Helper: create a Windows directory junction via `cmd /c mklink /J`.
+    #[cfg(windows)]
+    fn create_junction(target: &std::path::Path, link: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_str().unwrap())
+            .arg(target.to_str().unwrap())
+            .status()
+            .expect("failed to run cmd /c mklink /J");
+        assert!(status.success(), "mklink /J failed: {status:?}");
+    }
+
+    /// Windows: safe_create_part must refuse to create through a junction.
+    /// Plants a junction at the .part path and verifies safe_create_part refuses.
+    /// The open itself may fail (junctions are directories, GENERIC_WRITE may
+    /// need FILE_FLAG_BACKUP_SEMANTICS) OR the post-open reparse-bit check
+    /// may reject — either outcome is a safe refusal.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_create_part_refuses_junction() {
+        let uid = format!("{}-win-create-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+
+        // Plant a junction at the .part path
+        let part_path = tmp.join("evil.tar.part");
+        create_junction(&junction_target, &part_path);
+
+        // safe_create_part must refuse — either the open fails (dir needs
+        // BACKUP_SEMANTICS) or the reparse-bit check rejects.
+        let result = safe_create_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to create through a junction: {:?}", result.err());
+
+        // Verify the junction still exists (not followed/deleted)
+        assert!(part_path.exists(), "junction must still exist after refusal");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows: safe_resume_part must refuse to open a junction.
+    /// Creates a regular .part, then replaces with a junction and verifies refusal.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_resume_part_refuses_junction() {
+        let uid = format!("{}-win-resume-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create a regular .part file first
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+
+        // Verify it opens normally for resume
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally for resume");
+        drop(result);
+
+        // Now replace with a junction
+        std::fs::remove_file(&part_path).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&junction_target, &part_path);
+
+        // Must refuse
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a junction: {:?}", result.err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows: safe_open_part must refuse to open a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_open_part_refuses_junction() {
+        let uid = format!("{}-win-open-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create a regular .part file
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+
+        // Verify it opens normally
+        let result = safe_open_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally");
+        drop(result);
+
+        // Replace with a junction
+        std::fs::remove_file(&part_path).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&junction_target, &part_path);
+
+        // Must refuse
+        let result = safe_open_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to open a junction: {:?}", result.err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
                 }
             }
                                                                     }
@@ -12047,6 +12157,10 @@ fn safe_incoming_name(raw: &str) -> String {
 /// protects symlinked parents too), O_NOFOLLOW on other Unix, create_new
 /// (O_EXCL) on non-Unix. O_EXCL means "fail if exists" — correct for fresh,
 /// WRONG for resume (use safe_resume_part for that).
+///
+/// Windows (since 0.7.3): opens with FILE_FLAG_OPEN_REPARSE_POINT so a
+/// symlink/junction at the .part path is NOT followed. Rejects reparse points
+/// after open. This closes the Windows half that 0.7.2/0.7.3 explicitly deferred.
 #[cfg(unix)]
 async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     // On Linux: use safe_open_beneath with O_CREAT|O_EXCL for one-primitive guarantee
@@ -12075,6 +12189,11 @@ async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
 /// RESOLVE_BENEATH on Linux (or O_NOFOLLOW on other Unix) AND an explicit
 /// fstat check that what you opened is a REGULAR file — because O_NOFOLLOW
 /// alone will happily open a FIFO or device node someone dropped at that path.
+///
+/// Windows (since 0.7.3): opens with FILE_FLAG_OPEN_REPARSE_POINT so a
+/// symlink/junction at the .part path is NOT followed. Rejects reparse points
+/// and non-regular files after open. This closes the Windows half that
+/// 0.7.2/0.7.3 explicitly deferred.
 #[cfg(unix)]
 async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
     // On Linux: use safe_open_beneath (RESOLVE_BENEATH)
@@ -12119,29 +12238,125 @@ async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
     }
 }
 
+/// Windows: create a FRESH .part file, refusing to follow symlinks/junctions.
+/// Opens with FILE_FLAG_OPEN_REPARSE_POINT so a reparse point at the path
+/// is NOT followed, then rejects if the opened file is a reparse point.
+/// FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction for the
+/// handle-based attribute check.
+/// This closes the Windows half deferred in 0.7.2/0.7.3.
 #[cfg(not(unix))]
 async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
+    use windows_sys::Win32::Storage::FileSystem as WinFs;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    // Open with FILE_FLAG_OPEN_REPARSE_POINT so CreateFile does NOT follow
+    // a symlink/junction at the path. CREATE_NEW = fail if exists.
+    // FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction.
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .custom_flags(WinFs::FILE_FLAG_OPEN_REPARSE_POINT | WinFs::FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .await
+        .await?;
+
+    // Post-open check via handle (fstat, not stat-the-path — no TOCTOU).
+    let handle = file.as_raw_handle();
+    let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { WinFs::GetFileInformationByHandle(handle as *mut _, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to create .part: path is a reparse point (symlink/junction)",
+        ));
+    }
+
+    Ok(file)
 }
 
+/// Windows: resume an EXISTING .part file, refusing symlinks/junctions and
+/// non-regular files. Opens with FILE_FLAG_OPEN_REPARSE_POINT so a reparse
+/// point at the path is NOT followed, then rejects reparse points and
+/// non-regular files after open.
+/// FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction for the
+/// handle-based attribute check.
+/// This closes the Windows half deferred in 0.7.2/0.7.3.
 #[cfg(not(unix))]
 async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
+    use windows_sys::Win32::Storage::FileSystem as WinFs;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    // Open with FILE_FLAG_OPEN_REPARSE_POINT so CreateFile does NOT follow
+    // a symlink/junction at the path. OPEN_EXISTING = must exist.
+    // FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction.
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
+        .custom_flags(WinFs::FILE_FLAG_OPEN_REPARSE_POINT | WinFs::FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .await
+        .await?;
+
+    // Post-open check via handle (fstat, not stat-the-path — no TOCTOU).
+    let handle = file.as_raw_handle();
+    let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { WinFs::GetFileInformationByHandle(handle as *mut _, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Reject reparse points (symlinks, junctions)
+    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to resume .part: path is a reparse point (symlink/junction)",
+        ));
+    }
+
+    // Reject non-regular files (directories, devices, etc.)
+    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_DIRECTORY) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to resume: .part is a directory (attrs: {:#x})", info.dwFileAttributes),
+        ));
+    }
+
+    Ok(file)
 }
 
+/// Windows: open an EXISTING .part file, refusing symlinks/junctions.
+/// Opens with FILE_FLAG_OPEN_REPARSE_POINT so a reparse point at the path
+/// is NOT followed, then rejects reparse points after open.
+/// FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction for the
+/// handle-based attribute check.
 #[cfg(not(unix))]
 async fn safe_open_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
+    use windows_sys::Win32::Storage::FileSystem as WinFs;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
+        .custom_flags(WinFs::FILE_FLAG_OPEN_REPARSE_POINT | WinFs::FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-        .await
+        .await?;
+
+    let handle = file.as_raw_handle();
+    let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { WinFs::GetFileInformationByHandle(handle as *mut _, &mut info) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to open .part: path is a reparse point (symlink/junction)",
+        ));
+    }
+
+    Ok(file)
 }
 
 struct IncomingFile {
