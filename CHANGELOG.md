@@ -4,6 +4,40 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.7.4] - 2026-07-31
+
+Command-surface simplification and a genuinely useful `--help`, plus the
+same-owner-devices "auto-detect" half of fleet trust.
+
+### Changed
+
+- **`filament --help` is now a grouped, curated command reference** (Connect / Share /
+  Devices / Identity / Mesh) instead of a flat dump of every subcommand with deprecated
+  and canonical names side by side. Each command still has its own `filament <cmd> --help`.
+- **Simpler verbs:** `filament shell <device>` (folds `ssh`/`pty`), `filament reach
+  <device>:<port>` (folds `netcat`/`dial`; `--socks` for a local proxy), `filament devices
+  vouch <a> <b>` (folds `introduce`). All 13 old names keep working as deprecation aliases
+  with a one-line note to stderr (suppress with `FILAMENT_NO_DEPRECATION=1`), so no
+  existing script or muscle memory breaks.
+
+### Added
+
+- **Same-owner device auto-recognition (opt-in enforcement).** A genuine second device of
+  your own (same user key, its own device key, your owner-signed cert) now reaches Proven
+  and gets scoped auto-trust over direct, relay, AND reconnect — not just at your desk.
+  Rig-verified cross-machine on all three paths. Enforcement stays opt-in
+  (`FILAMENT_CAP_AUTHORITATIVE=1`).
+
+### Fixed
+
+- The Linux transfer-resume path no longer hangs if a FIFO is planted at the `.part` path
+  (`O_NONBLOCK` on open; the non-regular-file refusal still applies).
+
+### Notes
+
+- Still landing (0.7.5): the `mint` wizard, `identity restore/rotate/guardians`,
+  `devices promote`, and the `expose --off` / `mount --off` / `status`-absorbing folds.
+
 ## [0.7.3] - 2026-07-30
 
 Release-engineering fixes for the 0.7.2 content. 0.7.2's release build failed on Windows
