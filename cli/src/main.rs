@@ -100,13 +100,21 @@ use tokio::sync::{mpsc, oneshot};
 fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let mut written = 0usize;
+    let mut iters = 0u32;
     while written < buf.len() {
+        iters += 1;
         match file.write_at(&buf[written..], offset + written as u64) {
             Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite wrote 0 bytes")),
             Ok(n) => written += n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
+    }
+    // DIAG (temporary): prove whether short-writes actually happen. If corruption is
+    // short-write-caused this fires; if the re-rig shows zero of these AND corruption
+    // persists, the cause is the await-before-digest race, not the write. Remove after.
+    if iters > 1 {
+        eprintln!("[pwrite-diag] SHORT WRITE: {iters} iterations to write {} bytes @ off {offset}", buf.len());
     }
     Ok(())
 }
