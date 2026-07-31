@@ -1741,8 +1741,25 @@ async fn issue_proven_challenge_and_hold(
     pending_proven: &Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
     identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) {
-    pending_proven.lock().unwrap()
-        .insert(pid.to_string(), (t.clone(), Instant::now() + Duration::from_secs(3)));
+    // IDEMPOTENT: if a challenge is already in flight for this pid (a live,
+    // non-expired hold), do NOT issue a second one. send_identity_challenge keys
+    // identity_nonces by pid, so a second challenge OVERWRITES the first nonce; a
+    // peer that answers the first challenge would then verify against the second
+    // nonce and never reach Proven. Both readiness sites (DirectReady and the
+    // pair-proof handler) call this, and a transient re-adoption can make even one
+    // site fire twice — so the dedupe MUST live here, not at the call sites, to be
+    // order-independent for any caller. A STALE (expired) entry is treated as
+    // absent so a reconnect re-challenges. Check-and-insert under ONE lock (dropped
+    // before the await — never hold a std Mutex across .await).
+    {
+        let mut pend = pending_proven.lock().unwrap();
+        if let Some((_, deadline)) = pend.get(pid) {
+            if Instant::now() < *deadline {
+                return; // challenge already in flight; do not clobber its nonce
+            }
+        }
+        pend.insert(pid.to_string(), (t.clone(), Instant::now() + Duration::from_secs(3)));
+    }
     send_identity_challenge(conn, pid, identity_nonces).await;
 }
 
@@ -13044,58 +13061,17 @@ async fn recv_cmd(
                 conn.stash_upgrade_standby(&pid, t, route);
             }
             Ev::ChannelReady(pid, t) => {
-                // #39 (fleet-trust): make identity-expose UNIVERSAL. The possession
-                // challenge that settles binding=Proven previously fired ONLY from
-                // the DirectReady path, so a relay/DataChannel link that reaches
-                // ChannelReady without a direct adoption stayed Inferred forever — and
-                // fleet auto-trust (Proven-gated by design) then silently gave it
-                // NOTHING. That makes the product "your fleet just works at my desk,
-                // and falls back to grant-only at the airport", the worst failure mode
-                // for a trust feature. So issue the challenge HERE, the single
-                // convergence point every transport passes through, deduped against
-                // pending_proven so a direct link (which DirectReady already
-                // challenged + held) does not double-issue.
-                //
-                // Unlike DirectReady this does NOT hold ChannelReady (the transport is
-                // already live). Instead it inserts pending_proven SYNCHRONOUSLY, so
-                // the gate hold (#30 GAP 2, honored at the shell/transfer/mount gates)
-                // covers any gated open that races in before Proven settles, and a 3s
-                // timeout clears the entry. DEDUPE by deadline, not mere presence: a
-                // STALE hold left by a previous link that dropped mid-challenge would
-                // otherwise suppress the re-challenge on RECONNECT and strand the
-                // reconnected device at Inferred — so an expired entry counts as absent
-                // and is overwritten with a fresh challenge.
-                if crate::capability::cap_authoritative() {
-                    if let Some(l) = conn.link_mut(&pid) {
-                        resolve_peer_identity(l);
-                    }
-                    let needs_proven = conn.link(&pid).map(|l| {
-                        l.identity_device_pub.is_some()
-                            && l.identity_binding != crate::capability::BindingStrength::Proven
-                    }).unwrap_or(false);
-                    let should_challenge = needs_proven && {
-                        let pend = pending_proven.lock().unwrap();
-                        match pend.get(&pid) {
-                            None => true,
-                            Some((_, deadline)) => Instant::now() >= *deadline, // stale hold -> re-challenge
-                        }
-                    };
-                    if should_challenge {
-                        // Same shared issue-and-hold as DirectReady (hold-then-await).
-                        issue_proven_challenge_and_hold(&conn, &pid, &t, &pending_proven, &mut identity_nonces).await;
-                        ui::debug(&format!("  identity challenge sent to {pid} at channel-ready (universal expose), holding gated opens until Proven or 3s"));
-                        // ChannelReady-specific release policy: does NOT hold ChannelReady
-                        // (the transport is already live); the timer only CLEARS the
-                        // entry (no re-emit → no cycle). Gated opens in the window are
-                        // covered by the #30 GAP 2 gate-hold.
-                        let hold_pending = pending_proven.clone();
-                        let hold_pid = pid.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            hold_pending.lock().unwrap().remove(&hold_pid);
-                        });
-                    }
-                }
+                // #39 (fleet-trust): the WebRTC/relay path's possession challenge is
+                // NOT issued here. At ChannelReady on the WebRTC path, verified_name is
+                // not set yet (the pair-proof round-trip sets it AFTER the channel opens),
+                // so resolve_peer_identity finds no identity, needs_proven is false, and
+                // the challenge would be skipped — the live rig caught exactly this. The
+                // challenge for the WebRTC/relay path is issued from the pair-proof
+                // handler, where verified_name is set and identity first RESOLVES on that
+                // path; the DirectReady path issues at adoption (identity already resolved
+                // by then). Both go through the now-idempotent issue_proven_challenge_and_hold,
+                // which dedupes by a live pending_proven entry so the two sites are
+                // order-independent and cannot clobber each other's nonce.
                 // web-shell discovery: tell the peer whether this receiver offers a
                 // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
                 // shows its per-device shell button ONLY when this is true; the
@@ -14118,6 +14094,33 @@ async fn recv_cmd(
                             l.trusted = true;
                             l.verified_name = Some(n.clone());
                             resolve_peer_identity(l);
+                        }
+                        // #39: identity just RESOLVED on the WebRTC/relay path — verified_name
+                        // is set above and resolve_peer_identity populated device_pub. This is
+                        // the resolution point for NON-direct links (ChannelReady fired before
+                        // this); the direct path resolves at DirectReady adoption instead. Issue
+                        // the possession challenge here so the link reaches Proven (fleet
+                        // auto-trust is Proven-gated), authoritative only. The helper is
+                        // idempotent — if DirectReady already challenged this pid the call is a
+                        // no-op and does not clobber the in-flight nonce. The transport exists by
+                        // construction (this handler was reached by a control message on it).
+                        if crate::capability::cap_authoritative() {
+                            let needs_proven = conn.link(&pid).map(|l| {
+                                l.identity_device_pub.is_some()
+                                    && l.identity_binding != crate::capability::BindingStrength::Proven
+                            }).unwrap_or(false);
+                            if needs_proven {
+                                if let Some(t) = conn.transport_of(&pid) {
+                                    issue_proven_challenge_and_hold(&conn, &pid, &t, &pending_proven, &mut identity_nonces).await;
+                                    ui::debug(&format!("  identity challenge sent to {pid} at pair-proof (universal expose, WebRTC/relay path)"));
+                                    let hold_pending = pending_proven.clone();
+                                    let hold_pid = pid.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(3)).await;
+                                        hold_pending.lock().unwrap().remove(&hold_pid);
+                                    });
+                                }
+                            }
                         }
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
                         true
