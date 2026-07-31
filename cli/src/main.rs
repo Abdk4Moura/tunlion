@@ -408,30 +408,53 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
 const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 
 const EXAMPLES: &str = "\
-EXAMPLES:
+COMMANDS
+  Connect
+    pair <name>            remember a device (run on both ends; exchanges the pair secret)
+    up [--install]         always-on receiver for your trusted devices
+  Share
+    <file>  /  send        send files (mints a one-time code, or --to <device>)
+    recv <code>            claim a code and receive
+    shell <device>         open a shell on a known device
+    reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
+    expose <port>          publish a local port on your mesh address
+    mount <device>:<dir>   mount a remote folder over the mesh
+  Devices
+    devices                list your known devices
+    requests               approve or deny access others asked for
+    grant / revoke         give or take a capability on a device
+    status                 what the daemon is doing / recently received
+  Identity
+    identity               manage your user key + device certs
+  Mesh
+    addr                   show your overlay address (or a device's)
+    doctor                 diagnose a link
+
+EXAMPLES
   filament video.mp4                 send it; mints a speakable one-time code + QR
   filament clever-lynx-63            claim a code and receive
-  filament recv <code> -o - | tar x  stream straight into a pipe
-  filament pair --name phone         remember a device (no file transfer)
   filament send big.iso --to laptop  send to a remembered device, no code
-  filament up --install              always-on drop target (trusted devices only)
+  filament pair --name phone         remember a device
+  filament up --install              always-on drop target
   filament shell laptop              open a shell on a known device
   filament reach laptop:5432         tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
-
-  More commands (run `filament <cmd> --help`):
-    forward · expose        port-forward / publish on mesh address
-    mount · devices         mount a folder / list trusted devices
-    requests                approve or deny access from others
-    identity                manage your user key + certs";
+  Run `filament <command> --help` for details. Old names (ssh, netcat, dial, unexpose, ...) still work.";
 
 #[derive(Parser)]
+// Custom help template: clap has no native grouping for SUBCOMMANDS
+// (next_help_heading groups args, not subcommands), so we omit the auto
+// {subcommands} list entirely and present a curated, GROUPED command reference in
+// the after-help (EXAMPLES). Every subcommand still exists, still works, and still
+// has its own `filament <cmd> --help`; the top-level help just stops being a flat
+// 27-item dump with deprecated + canonical names side by side.
 #[command(
     name = "filament",
     version = VERSION,
     about = "Peer-to-peer between your terminals and browsers: send files, open a shell, forward a port, mount a folder. No upload, no account \u{2014} your own devices form a fleet that just works.",
-    after_help = EXAMPLES
+    after_help = EXAMPLES,
+    help_template = "{about-with-newline}\n{usage-heading} {usage}\n\n{after-help}\n\nOptions:\n{options}"
 )]
 struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
