@@ -10841,6 +10841,24 @@ async fn stream_one(
 
 // ------------------------------------------------------------------- recv —
 
+/// Reduce a remote-supplied file name to a safe single path component: basename
+/// only (no path separators or `..`), with control characters (including NUL)
+/// stripped. A NUL in particular would fail the CString conversion in
+/// safe_open_beneath and abort the whole receive loop, so a peer must not be able
+/// to embed one. Empties / `.` / `..` fall back to a fixed name.
+fn safe_incoming_name(raw: &str) -> String {
+    let base = std::path::Path::new(raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file.bin".into());
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "file.bin".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
 /// protects symlinked parents too), O_NOFOLLOW on other Unix, create_new
 /// (O_EXCL) on non-Unix. O_EXCL means "fail if exists" — correct for fresh,
@@ -14206,12 +14224,11 @@ async fn recv_cmd(
                     }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    // Never trust a remote name with path separators.
+                    // Never trust a remote name: reduce it to a safe single path
+                    // component (basename only, no path separators, no control
+                    // bytes). See safe_incoming_name.
                     let raw = v["name"].as_str().unwrap_or("file.bin");
-                    let name = Path::new(raw)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file.bin".into());
+                    let name = safe_incoming_name(raw);
                     let size = v["size"].as_u64().unwrap_or(0);
                     let offer_head = v["head"].as_str().map(|s| s.to_string());
                     // P4 (GAP-5): the sender's whole-file sha256 (absent for an old
@@ -15802,12 +15819,18 @@ mod tests {
     #[test]
     fn filename_sanitization() {
         // the recv path strips directories from remote names
-        let evil = "../../etc/passwd";
-        let name = Path::new(evil).file_name().map(|n| n.to_string_lossy().into_owned());
-        assert_eq!(name.as_deref(), Some("passwd"));
-        let evil2 = "/absolute/path.bin";
-        let name2 = Path::new(evil2).file_name().map(|n| n.to_string_lossy().into_owned());
-        assert_eq!(name2.as_deref(), Some("path.bin"));
+        assert_eq!(safe_incoming_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_incoming_name("/absolute/path.bin"), "path.bin");
+        assert_eq!(safe_incoming_name("plain.bin"), "plain.bin");
+        // control bytes are stripped; a NUL in particular must NOT survive into a
+        // path (it would fail the CString conversion in safe_open_beneath and
+        // abort the receive loop). A remote peer must not be able to do that.
+        assert_eq!(safe_incoming_name("evil\0.bin"), "evil.bin");
+        assert_eq!(safe_incoming_name("with\ttab\nand\r.bin"), "withtaband.bin");
+        // a name that reduces to nothing (or . / ..) falls back to a fixed name
+        assert_eq!(safe_incoming_name("\0\0\0"), "file.bin");
+        assert_eq!(safe_incoming_name(".."), "file.bin");
+        assert_eq!(safe_incoming_name(""), "file.bin");
     }
 
     // Bug 1: `send --name X` is honored for a SINGLE regular file (offer name =
