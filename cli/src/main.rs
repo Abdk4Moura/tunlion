@@ -14500,6 +14500,9 @@ async fn recv_cmd(
                     // P4: the digest to verify against on completion, the current
                     // offer's, else the one persisted with the partial (resume).
                     let effective_full = offer_full.clone().or(prior_full);
+                    // A per-file open failure DECLINES this one file (continue),
+                    // matching the other offer-accept declines. It must never unwind
+                    // the receive loop: that would kill every other in-flight transfer.
                     let file = if offset > 0 {
                         // DEBUG, resilience internal (receiver resuming from offset).
                         ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
@@ -14507,11 +14510,28 @@ async fn recv_cmd(
                         // position for multi-stream out-of-order writes.
                         // safe_resume_part: RESOLVE_BENEATH on Linux, O_NOFOLLOW +
                         // fstat regular-file check on other Unix. NO O_EXCL (resume).
-                        safe_resume_part(&part_path).await?
+                        match safe_resume_part(&part_path).await {
+                            Ok(f) => f,
+                            Err(e) => { ui::debug(&format!("{name}: cannot open .part to resume, declining: {e}")); continue; }
+                        }
                     } else {
-                        PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)?;
-                        // O_NOFOLLOW prevents following a symlink planted at the .part path.
-                        safe_create_part(&part_path).await?
+                        // Restart-from-0: a leftover .part of different content/size
+                        // (interrupted transfer, or a common filename from another
+                        // peer) must not block the fresh create. safe_create_part uses
+                        // O_EXCL to refuse a planted symlink, which EEXISTs on any
+                        // leftover .part; that Err used to unwind the whole loop. Remove
+                        // the stale partial first (unlinking a symlink drops the link,
+                        // not its target); a symlink planted in the gap still trips
+                        // O_EXCL and is declined below, not followed.
+                        let _ = std::fs::remove_file(&part_path);
+                        if let Err(e) = (PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)) {
+                            ui::debug(&format!("{name}: cannot write .part.meta, declining: {e}"));
+                            continue;
+                        }
+                        match safe_create_part(&part_path).await {
+                            Ok(f) => f,
+                            Err(e) => { ui::debug(&format!("{name}: cannot create .part, declining: {e}")); continue; }
+                        }
                     };
                     let bar = ui::Progress::new(&name, size);
                     let file = Arc::new(file.into_std().await);
@@ -15425,6 +15445,41 @@ mod tests {
             Ok(Err(_)) => {} // Expected: error because FIFO is not a regular file
             Err(_) => panic!("safe_resume_part hung on a FIFO — O_NONBLOCK may be needed"),
         }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Restart-from-0: a leftover .part from an interrupted transfer (or a
+    /// common filename re-offered by another peer) must not wedge a fresh
+    /// receive. safe_create_part uses O_EXCL, so a create-alone EEXISTs on the
+    /// leftover; the restart path removes it first and then creates cleanly.
+    /// Regression guard for the "one stale .part aborts the whole receive loop"
+    /// bug (the offer-accept path used `?` on that Err instead of declining).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_restart_replaces_stale_part() {
+        let uid = format!("{}-restart-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"stale partial from a prior interrupted transfer").unwrap();
+
+        // create-alone must fail on the leftover (O_EXCL -> EEXIST). This is the
+        // Err the receive loop must NOT propagate out via `?`.
+        assert!(
+            safe_create_part(&part_path).await.is_err(),
+            "O_EXCL create must refuse a leftover .part"
+        );
+
+        // The restart-from-0 path removes the stale partial, then creates fresh.
+        let _ = std::fs::remove_file(&part_path);
+        let created = safe_create_part(&part_path).await;
+        assert!(created.is_ok(), "remove-then-create must succeed: {:?}", created.err());
+
+        // The restarted .part is empty (the stale bytes are gone).
+        let meta = std::fs::metadata(&part_path).unwrap();
+        assert_eq!(meta.len(), 0, "restarted .part must start empty");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
