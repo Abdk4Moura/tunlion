@@ -415,16 +415,24 @@ EXAMPLES:
   filament pair --name phone         remember a device (no file transfer)
   filament send big.iso --to laptop  send to a remembered device, no code
   filament up --install              always-on drop target (trusted devices only)
+  filament shell laptop              open a shell on a known device
+  filament reach laptop:5432         tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
 
   More commands (run `filament <cmd> --help`):
-    ssh · forward         remote shell / port-forward to a device
-    set tun-addr auto     join the encrypted L3 overlay mesh (`filament addr`)
-    ping · doctor         diagnose a link; introduce · grant · serve-tun · netcat";
+    forward · expose        port-forward / publish on mesh address
+    mount · devices         mount a folder / list trusted devices
+    requests                approve or deny access from others
+    identity                manage your user key + certs";
 
 #[derive(Parser)]
-#[command(name = "filament", version = VERSION, about = "Peer-to-peer between your terminals and browsers: send files, open a shell, forward a port, mount a folder. No upload, no account \u{2014} your own devices form a fleet that just works.", after_help = EXAMPLES)]
+#[command(
+    name = "filament",
+    version = VERSION,
+    about = "Peer-to-peer between your terminals and browsers: send files, open a shell, forward a port, mount a folder. No upload, no account \u{2014} your own devices form a fleet that just works.",
+    after_help = EXAMPLES
+)]
 struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
     #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
@@ -1027,6 +1035,38 @@ enum Cmd {
         #[arg(long)]
         options: Option<String>,
     },
+    /// Open a shell on a known device (alias for ssh/pty).
+    ///
+    /// Runs your real `ssh` over the data channel via ProxyCommand (reuses your
+    /// keys, known_hosts, and ~/.ssh/config). With no args, opens an interactive
+    /// PTY shell (the CLI sibling of the browser web-shell).
+    Shell {
+        /// Known device (petname) to open a shell on
+        peer: String,
+        /// Extra args passed through to ssh (user@host, commands, -p, ...)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Reach a peer's localhost port or overlay service (alias for netcat/dial).
+    ///
+    /// With `<dev>:<port>`: tunnels to the peer's localhost:<port> (like netcat).
+    /// With `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
+    Reach {
+        /// Device:port to reach (e.g. laptop:5432)
+        dev_port: Option<String>,
+        /// Run a local SOCKS5 proxy instead
+        #[arg(long)]
+        socks: bool,
+        /// SOCKS5 proxy port (default: 1080)
+        #[arg(long, default_value_t = 1080)]
+        port: u16,
+        /// Proxy bind address (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// HTTP CONNECT proxy port (0 = disabled)
+        #[arg(long, default_value_t = 0)]
+        http_port: u16,
+    },
     /// List, approve, or deny pending consent requests from peers.
     Requests {
         #[command(subcommand)]
@@ -1127,6 +1167,9 @@ enum DevicesAction {
     Forget { name: String },
     /// Rename your local alias (the other side is unaffected)
     Rename { old: String, new: String },
+    /// Vouch between two known devices: mints a fresh secret and delivers it
+    /// to both over verified channels (run on the device that knows both)
+    Vouch { a: String, b: String },
 }
 
 /// Looks like a speakable CODE of the shape `word-word-DIGITS` (3 segments: two
@@ -8802,7 +8845,12 @@ async fn main() -> Result<()> {
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, relay).await,
+        Cmd::Introduce { a, b } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament devices vouch {a} {b}")));
+            }
+            introduce_cmd(&server, &a, &b, relay).await
+        },
         Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
         Cmd::Devices { action, json } => {
             match action {
@@ -8883,6 +8931,9 @@ async fn main() -> Result<()> {
                     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
                     println!("renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)");
                 }
+                Some(DevicesAction::Vouch { a, b }) => {
+                    introduce_cmd(&server, &a, &b, relay).await?;
+                }
             }
             Ok(())
         }
@@ -8920,19 +8971,64 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Netcat { peer, rport, auth_key } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament reach {peer}:{rport}")));
+            }
             if let Some(ak_path) = auth_key {
                 enroll_and_netcat_cmd(&server, ak_path, Some(peer), rport, relay).await
             } else {
                 l2::netcat_cmd(&server, &peer, rport, relay).await
             }
         }
-        Cmd::Dial { peer, port } => l2::dial_cmd(&peer, port).await,
-        Cmd::Pty { peer, cmd } => l2::pty_cmd(&server, &peer, relay, cmd).await,
+        Cmd::Dial { peer, port } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament reach {peer}:{port}")));
+            }
+            l2::dial_cmd(&peer, port).await
+        },
+        Cmd::Pty { peer, cmd } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, "  ↳ filament shell <device>"));
+            }
+            l2::pty_cmd(&server, &peer, relay, cmd).await
+        },
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
         Cmd::Expose { port, to, peer, list } => expose::expose_cmd(port, to, peer, list).await,
-        Cmd::Unexpose { port } => { ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await },
-        Cmd::Proxy { port, bind, http_port } => l2::proxy_cmd(&server, &bind, port, http_port, relay).await,
-        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
+        Cmd::Unexpose { port } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament expose {port} --off")));
+            }
+            ui_caps.confirm("unexpose a port")?; expose::unexpose_cmd(port).await
+        },
+        Cmd::Proxy { port, bind, http_port } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, "  ↳ filament reach --socks"));
+            }
+            l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+        },
+        Cmd::Ssh { peer, args } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament shell {peer}")));
+            }
+            l2::ssh_cmd(&server, &peer, &args, relay).await
+        },
+        Cmd::Shell { peer, args } => l2::ssh_cmd(&server, &peer, &args, relay).await,
+        Cmd::Reach { dev_port, socks, port, bind, http_port } => {
+            if socks {
+                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+            } else if let Some(dp) = dev_port {
+                let parts: Vec<&str> = dp.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    let peer = parts[0].to_string();
+                    let port: u16 = parts[1].parse().map_err(|_| anyhow!("invalid port in '{}'", dp))?;
+                    l2::dial_cmd(&peer, port).await
+                } else {
+                    bail!("reach requires <device>:<port> format, e.g. `filament reach laptop:5432`");
+                }
+            } else {
+                bail!("reach requires <device>:<port> or --socks. Run `filament reach --help` for usage.");
+            }
+        },
         Cmd::Ping { peer, count, json } => ping::ping_cmd(&server, &peer, count, json, relay).await,
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
@@ -9290,7 +9386,12 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         }
-        Cmd::Unmount { path } => { ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path) },
+        Cmd::Unmount { path } => {
+            if std::env::var("FILAMENT_NO_DEPRECATION").is_err() {
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  ↳ filament mount --off {path}")));
+            }
+            ui_caps.confirm(&format!("unmount {path}"))?; mount::unmount_cmd(&path)
+        },
         Cmd::CapStatus { json } => cap_status_cmd(json).await,
         Cmd::Requests { action } => requests_cmd(action).await,
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
