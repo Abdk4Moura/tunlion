@@ -89,15 +89,40 @@ use tokio::sync::{mpsc, oneshot};
 /// writer tasks for out-of-order multi-stream reassembly (no seek, atomic per
 /// call). Cross-platform: `FileExt::write_at` on Unix, `seek_write` on Windows —
 /// both write at `offset` without moving the shared handle's cursor.
+// MUST write the ENTIRE buffer. A positional write (pwrite/seek_write) is allowed to
+// write FEWER bytes than requested; the old code did `file.write_at(buf, offset)` and the
+// caller discarded the returned count, so a short write left a gap while `received`
+// advanced by the full length — a silent per-file corruption the whole-file digest then
+// caught as a failed transfer (measured ~44% on direct-QUIC, ~88% on DataChannel for large
+// files). Loop until the whole buffer lands; return Err on a real failure so the caller
+// can react instead of silently dropping bytes.
 #[cfg(unix)]
-fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
-    file.write_at(buf, offset)
+    let mut written = 0usize;
+    while written < buf.len() {
+        match file.write_at(&buf[written..], offset + written as u64) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "pwrite wrote 0 bytes")),
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 #[cfg(windows)]
-fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
-    file.seek_write(buf, offset)
+    let mut written = 0usize;
+    while written < buf.len() {
+        match file.seek_write(&buf[written..], offset + written as u64) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "seek_write wrote 0 bytes")),
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
@@ -14694,7 +14719,14 @@ async fn recv_cmd(
                     let trace_inner = trace;
                     tokio::task::spawn_blocking(move || {
                         let t_pwrite = if trace_inner { Some(std::time::Instant::now()) } else { None };
-                        let _ = pwrite_at(&file, &data, pos);
+                        if let Err(e) = pwrite_at(&file, &data, pos) {
+                            // `received` already advanced for this range; a write that
+                            // never fully landed means the whole-file digest will fail and
+                            // trigger a re-fetch. Log loudly so this reliability path is
+                            // never silent (pwrite_at now writes the WHOLE buffer, so this
+                            // is a genuine I/O error — disk full, etc. — not a short write).
+                            dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
+                        }
                         let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                         if trace_inner && pwrite_us > 1000 {
                             dlog!("[TRACE recv spawn_blocking] pos={} len={} pwrite={}us", pos, data_len, pwrite_us);
