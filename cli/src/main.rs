@@ -10987,24 +10987,6 @@ struct IncomingFile {
 /// Delta is the number of previously-unseen bytes added by this chunk.
 /// Total is the authoritative received count for multi-stream OOO reassembly.
 /// Optimized: binary search + incremental total via removed_total tracking.
-/// True iff the recorded ranges tile [0,size) with no gap (one contiguous interval).
-fn coverage_complete(ranges: &[(u64, u64)], size: u64) -> bool {
-    if size == 0 { return true; }
-    ranges.len() == 1 && ranges[0].0 == 0 && ranges[0].1 == size
-}
-
-/// First uncovered byte position in [0,size), or None if complete.
-fn first_gap(ranges: &[(u64, u64)], size: u64) -> Option<u64> {
-    if size == 0 { return None; }
-    let mut cursor = 0u64;
-    for &(s, e) in ranges {
-        if s > cursor { return Some(cursor); }
-        cursor = cursor.max(e);
-        if cursor >= size { return None; }
-    }
-    if cursor < size { Some(cursor) } else { None }
-}
-
 fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64) {
     let end = pos + len as u64;
     if ranges.is_empty() {
@@ -11050,6 +11032,24 @@ fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64, u64
 fn record_range_total(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> u64 {
     let (_delta, total) = record_range(ranges, pos, len);
     total
+}
+
+/// True iff the recorded ranges tile [0,size) with no gap (one contiguous interval).
+fn coverage_complete(ranges: &[(u64, u64)], size: u64) -> bool {
+    if size == 0 { return true; }
+    ranges.len() == 1 && ranges[0].0 == 0 && ranges[0].1 == size
+}
+
+/// First uncovered byte position in [0,size), or None if complete.
+fn first_gap(ranges: &[(u64, u64)], size: u64) -> Option<u64> {
+    if size == 0 { return None; }
+    let mut cursor = 0u64;
+    for &(s, e) in ranges {
+        if s > cursor { return Some(cursor); }
+        cursor = cursor.max(e);
+        if cursor >= size { return None; }
+    }
+    if cursor < size { Some(cursor) } else { None }
 }
 
 /// Build the live shell policy from the persistent settings (global `shell` +
@@ -14749,7 +14749,14 @@ async fn recv_cmd(
                             let mut r = ranges.lock().unwrap();
                             let (_delta, total) = record_range(&mut *r, pos, data_len);
                             drop(r);
-                            received.store(total, Ordering::Relaxed);
+                            // fetch_max, not store: writer tasks run concurrently, so
+                            // a task that locked earlier (lower union total) can reach
+                            // this line AFTER one that locked later (higher total). The
+                            // union total is monotonic, so max() keeps `received` from
+                            // regressing to a stale value (which would spuriously trip
+                            // the `recvd < size` gate in verify_incoming). Serialized in
+                            // the old event-loop path; this race is new to the writer.
+                            received.fetch_max(total, Ordering::Relaxed);
                         }
                         let pwrite_us = t_pwrite.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                         if trace_inner && pwrite_us > 1000 {
