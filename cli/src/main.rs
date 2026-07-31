@@ -415,7 +415,7 @@ COMMANDS
   Share
     <file>  /  send        send files (mints a one-time code, or --to <device>)
     recv <code>            claim a code and receive
-     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
+    shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
     mount <device>:<dir>   mount a remote folder over the mesh
@@ -903,8 +903,6 @@ enum Cmd {
         #[arg(long)]
         options: Option<String>,
     },
-    /// Open a shell on a known device (alias for ssh/pty).
-    ///
     /// Open a shell on a device.
     ///
     /// Default: filament's own native PTY (the peer must run `up --shell`).
