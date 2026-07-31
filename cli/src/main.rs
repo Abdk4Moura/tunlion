@@ -13749,6 +13749,36 @@ async fn recv_cmd(
                                 resolve_peer_identity(l);
                             }
                         }
+                        // Honor the pending_proven hold. If a possession-sig challenge
+                        // is still in flight for this peer and the binding is not yet
+                        // Proven, do NOT decide on Inferred now: the identity-expose
+                        // that flips us to Proven is a SEPARATE event this
+                        // single-consumer loop must process, so blocking inline would
+                        // deadlock. Re-inject the mount-open shortly and let the loop
+                        // drain. The hold entry is removed on Proven OR at the 3s
+                        // deadline, so this self-terminates and the re-injected
+                        // mount-open is then decided for real.
+                        if crate::capability::cap_authoritative() {
+                            let challenge_in_flight =
+                                pending_proven.lock().unwrap().contains_key(&pid);
+                            let proven = conn
+                                .link(&pid)
+                                .map(|l| {
+                                    l.identity_binding
+                                        == crate::capability::BindingStrength::Proven
+                                })
+                                .unwrap_or(false);
+                            if challenge_in_flight && !proven {
+                                let rtx = tx.clone();
+                                let rpid = pid.clone();
+                                let rv = v.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(80)).await;
+                                    let _ = rtx.send(Ev::Control(rpid, rv));
+                                });
+                                continue;
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -13782,19 +13812,12 @@ async fn recv_cmd(
                             (Some(u), Some(o)) => u == o,
                             _ => false,
                         };
-                        // #42 HOLD-OUT (advisor call): the mount scoped-DEFAULT is not
-                        // shipped in this release. It is not drivable today (filament
-                        // mount has no --auth-key, and an OwnerDevice cannot reach
-                        // Proven), so its scope enforcement (within_share /
-                        // path_within_canonical + the read-only EROFS path) has NEVER
-                        // been exercised end-to-end — shipping it would make the first
-                        // real user its first test, and publish a capability no path can
-                        // reach. Until mount is auth-key-drivable AND rig-verified
-                        // (including a write attempt that MUST return EROFS), a fleet
-                        // mount requires an EXPLICIT grant (deliberate tier). `within_share`
-                        // stays computed so re-enabling #42 is a one-line flip back.
-                        let _ = within_share;
-                        let mount_scoped_default = false;
+                        // A same-owner Proven fleet device gets a scoped read-only
+                        // mount ONLY within the fleet share root. within_share
+                        // failing-closes the scoped-in-bounds check: a path outside
+                        // the share root is not in scope, so cap_gate_effective does
+                        // NOT engage the scoped default (grant-only).
+                        let mount_scoped_default = within_share;
                         let read_only = same_owner
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
