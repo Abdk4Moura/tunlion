@@ -603,7 +603,7 @@ fn pty_one_shot_exec_smoke() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pty", "test-b", "--", "echo", &nonce])
+        .args(["--server", &server, "shell", "test-b", "--", "echo", &nonce])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -771,7 +771,7 @@ fn shell_daemon_live_pairing_no_restart() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pty", "test-b", "--", "echo", &nonce])
+        .args(["--server", &server, "shell", "test-b", "--", "echo", &nonce])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -943,7 +943,7 @@ fn warm_all_makes_first_contact_warm() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "--json", "ping", "test-b"])
+        .args(["--server", &server, "reach", "test-b", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -974,7 +974,7 @@ fn warm_all_makes_first_contact_warm() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "--json", "ping", "test-b"])
+        .args(["--server", &server, "reach", "test-b", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1203,7 +1203,7 @@ fn warm_one_shot_pty_reuse() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pty", "test-b", "--", "echo", &nonce])
+        .args(["--server", &server, "shell", "test-b", "--", "echo", &nonce])
         .output()
         .expect("pty");
     let out_stdout = String::from_utf8_lossy(&out.stdout);
@@ -1372,7 +1372,7 @@ fn warm_one_shot_pty_instant_eof() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pty", "test-b", "--", "printf", &nonce])
+        .args(["--server", &server, "shell", "test-b", "--", "printf", &nonce])
         .stdin(Stdio::null())  // instant stdin-EOF
         .output()
         .expect("pty instant-eof");

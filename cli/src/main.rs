@@ -449,6 +449,7 @@ COMMANDS
     <file>  /  send        send files (mints a one-time code, or --to <device>)
     recv <code>            claim a code and receive
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
+    reach <device>         check if a device is reachable (direct/relay + rtt)
     reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
     mount <device>:<dir>   mount a remote folder over the mesh
@@ -470,6 +471,7 @@ EXAMPLES
   filament pair --name phone         remember a device
   filament up --install              always-on drop target
   filament shell laptop              open a shell on a known device
+  filament reach laptop              check if a device is reachable
   filament reach laptop:5432         tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
@@ -804,16 +806,20 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
-    /// Reach a peer's localhost tunnel or mesh proxy.
+    /// Reach a peer: check reachability, tunnel to a port, or run a mesh proxy.
     ///
+    /// `<dev>`: reachability probe (is the device reachable, and how: direct/relay + rtt).
     /// `<dev>:<port>`: tunnels to the peer's localhost:<port> (the `reach` mental model).
     /// `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
     Reach {
-        /// Device:port to reach (e.g. laptop:5432)
+        /// Device to probe (e.g. laptop) or device:port to tunnel (e.g. laptop:5432)
         dev_port: Option<String>,
         /// Run a local SOCKS5 proxy instead
         #[arg(long)]
         socks: bool,
+        /// Machine-readable JSON output (for the bare `<device>` reachability probe)
+        #[arg(long)]
+        json: bool,
         /// SOCKS5 proxy port (default: 1080)
         #[arg(long, default_value_t = 1080)]
         port: u16,
@@ -8793,21 +8799,22 @@ async fn main() -> Result<()> {
                 l2::pty_cmd(&server, &peer, relay, args).await
             }
         },
-        Cmd::Reach { dev_port, socks, port, bind, http_port } => {
+        Cmd::Reach { dev_port, socks, json, port, bind, http_port } => {
             if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else if let Some(dp) = dev_port {
-                // Default: localhost tunnel (the "reach my device's port" mental model)
                 let parts: Vec<&str> = dp.splitn(2, ':').collect();
                 if parts.len() == 2 {
+                    // `<device>:<port>`: localhost tunnel (the "reach my device's port" mental model)
                     let peer = parts[0].to_string();
                     let rport: u16 = parts[1].parse().map_err(|_| anyhow!("invalid port in '{}'", dp))?;
                     l2::netcat_cmd(&server, &peer, rport, relay).await
                 } else {
-                    bail!("reach requires <device>:<port> format, e.g. `filament reach laptop:5432`");
+                    // Bare `<device>`: reachability probe (warm-link check, cold fallback)
+                    crate::ping::ping_cmd(&server, &dp, 1, json, relay).await
                 }
             } else {
-                bail!("reach requires <device>:<port> or --socks. Run `filament reach --help` for usage.");
+                bail!("reach requires <device> or <device>:<port> or --socks. Run `filament reach --help` for usage.");
             }
         },
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
