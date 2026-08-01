@@ -43,12 +43,9 @@ pub const CAP_MOUNT: &str = "mount";
 
 pub const CANONICAL_CAPABILITIES: &[&str] = &[CAP_SHELL, CAP_TRANSFER, CAP_MOUNT];
 
-/// Scoped-default actions classified by the fleet gate.
-pub const SCOPED_DEFAULT_ACTIONS: &[&str] = &[CAP_TRANSFER, CAP_MOUNT];
-
 // Known residual: gate action parameters remain `&str`, so a future call site
 // can still pass an unregistered literal. A typed Action newtype is a follow-up
-// hardening task; current predicates and tests cover the declared vocabulary.
+// hardening task.
 
 /// Normalize and validate a capability name at an API boundary.
 pub fn canonical_capability(name: &str) -> Result<String> {
@@ -545,29 +542,6 @@ pub fn evaluate_grants_only(
     } else {
         Decision::Denied("not authorized".into())
     }
-}
-
-/// The scoped-default action set a same-owner Proven fleet device may exercise
-/// with NO explicit grant — each bounded to a scope the GATE enforces:
-///   - `transfer` → into the designated inbox directory (not arbitrary paths)
-///   - `mount`    → READ-ONLY, of the explicit share root (never home)
-/// Deliberate-tier actions (`shell`, write-mount, reach-all-ports, mount of a
-/// broader root) are NEVER in this set and always require an explicit grant.
-/// (Note: the l2-open port-forward gate labels its cap action `shell`; the gate
-/// there passes `scoped_in_bounds` computed from `expose.json` directly rather
-/// than routing port reach through this classifier — see cap_gate_effective callers.)
-pub fn is_scoped_default_action(action: &str) -> bool {
-    SCOPED_DEFAULT_ACTIONS.contains(&action)
-}
-
-/// Deliberate capability classified by the grant-only gate.
-pub fn is_deliberate_capability(action: &str) -> bool {
-    action == CAP_SHELL
-}
-
-/// True when an action is classified by one of the capability gate predicates.
-pub fn is_enforced_capability(action: &str) -> bool {
-    is_scoped_default_action(action) || is_deliberate_capability(action)
 }
 
 /// Same-owner fleet auto-trust decision, PROVEN-GATED. Grants a scoped default to
@@ -1452,15 +1426,6 @@ mod tests {
     #[test]
     fn canonical_capabilities_normalize_case_and_whitespace() {
         assert_eq!(canonical_capability(" SHELL ").unwrap(), "shell");
-    }
-
-    #[test]
-    fn gated_actions_are_canonical_and_canonical_actions_are_gated() {
-        for capability in CANONICAL_CAPABILITIES {
-            // This checks grantable vocabulary against declared classification, not enforcement.
-            // The CLI behavioral authorization test covers the latter for shell.
-            assert!(is_enforced_capability(capability), "canonical capability '{capability}' is not classified");
-        }
     }
 
     fn make_owner() -> Ed25519KeyPair {
@@ -2855,18 +2820,6 @@ mod tests {
     // ----------------------------------------------------------------------
     // Fleet auto-trust (same-owner Proven-gated scoped defaults)
     // ----------------------------------------------------------------------
-
-    /// The scoped-default classifier: transfer/mount are auto-grantable
-    /// to a same-owner Proven device; the deliberate tier is not.
-    #[test]
-    fn is_scoped_default_action_classifies_tiers() {
-        assert!(is_scoped_default_action("transfer"));
-        assert!(is_scoped_default_action("mount"));
-        // Deliberate tier and unknowns are never auto.
-        assert!(!is_scoped_default_action("shell"));
-        assert!(!is_scoped_default_action("write-mount"));
-        assert!(!is_scoped_default_action("anything-else"));
-    }
 
     /// The Proven-gate is the load-bearing rule: fleet auto-trust fires for a
     /// same-owner device ONLY on Proven AND in-scope, and NEVER on Inferred/None,
