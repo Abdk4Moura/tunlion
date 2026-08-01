@@ -372,7 +372,9 @@ fn extract_auth_km(tls: &TlsStream) -> Result<[u8; 32]> {
 /// `answerer` determines which half of the L2 sid space this end allocates from.
 ///
 /// Returns the transport, the channel binding, and the remote address.
-pub async fn dial_tls_tcp(
+/// NOTE: this does NOT authenticate. Use `race_connect_tls_tcp` for the
+/// authenticated path with pair-secret MAC verification.
+async fn dial_tls_tcp(
     addr: SocketAddr,
     answerer: bool,
 ) -> Result<(TlsTcpTransport, Vec<u8>, SocketAddr)> {
@@ -408,7 +410,9 @@ pub async fn dial_tls_tcp(
 /// `answerer` determines which half of the L2 sid space this end allocates from.
 ///
 /// Returns the transport, the channel binding, and the remote address.
-pub async fn accept_tls_tcp(
+/// NOTE: this does NOT authenticate. Use `race_connect_tls_tcp` for the
+/// authenticated path with pair-secret MAC verification.
+async fn accept_tls_tcp(
     tcp: TcpStream,
     answerer: bool,
 ) -> Result<(TlsTcpTransport, Vec<u8>, SocketAddr)> {
@@ -511,18 +515,25 @@ pub async fn bind_tls_tcp_listener(
 /// Both sides run the same race (accept + dial); the first to complete the TLS
 /// handshake AND pass the pair-secret MAC wins.
 ///
-/// `answerer` controls which L2 sid half this end allocates from (NOT the auth
-/// role — both ends authenticate symmetrically).
+/// The `answerer` bit (which L2 sid half this end allocates from) is derived
+/// deterministically via `net::polite_role` — both ends compute the same result,
+/// so their sid spaces are ALWAYS disjoint. No caller can get this wrong.
 pub async fn race_connect_tls_tcp(
     listener: tokio::net::TcpListener,
     peer_cands: Vec<String>,
     secret: &str,
+    my_uid: &str,
+    peer_uid: Option<&str>,
+    my_id: &str,
     peer_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &'static str,
-    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
     use crate::direct::{auth_tag, ct_eq, transport_key, DIRECT_BUDGET};
+
+    // Derive the answerer bit deterministically — opposite on the two ends by
+    // construction, so their L2 sid spaces never collide. Same logic as QUIC.
+    let answerer = crate::net::polite_role(my_uid, peer_uid, my_id, &peer_id);
 
     let tkey = transport_key(secret);
 
@@ -530,38 +541,69 @@ pub async fn race_connect_tls_tcp(
 
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = AuthResult> + Send>>> = Vec::new();
 
-    // Acceptor: accept one inbound TLS/TCP connection and authenticate.
+    // Acceptor: loop accepting inbound TLS/TCP connections, authenticating
+    // each in its own task with a short timeout. A peer that connects and
+    // sends nothing is discarded after 3s, NOT allowed to hold the accept
+    // slot for the full DIRECT_BUDGET (the DoS fix). The first connection
+    // that passes auth wins; losers are dropped silently.
     {
         let tkey = tkey;
+        let answerer = answerer;
         futs.push(Box::pin(async move {
-            let (tcp, _remote_addr) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                listener.accept(),
-            )
-            .await
-            .map_err(|_| anyhow!("tls-tcp accept timeout"))?
-            .map_err(|e| anyhow!("tls-tcp accept: {e}"))?;
+            loop {
+                let (tcp, _remote_addr) = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    listener.accept(),
+                )
+                .await
+                .map_err(|_| anyhow!("tls-tcp accept timeout"))?
+                .map_err(|e| anyhow!("tls-tcp accept: {e}"))?;
 
-            let (transport, cb, _) = accept_tls_tcp(tcp, answerer).await?;
-            // Authenticate: exchange tags over the raw TLS stream before
-            // handing it to the reader task. Uses a SEPARATE exporter label
-            // from the channel binding to avoid cross-context key reuse.
-            {
-                let tls = transport.tls.lock().await;
-                let auth_km = extract_auth_km(&*tls)?;
-                let my_tag = auth_tag(&tkey, &auth_km, "acceptor");
-                let their_expected = auth_tag(&tkey, &auth_km, "dialer");
-                drop(tls); // release lock before I/O
-                let mut tls = transport.tls.lock().await;
-                // Acceptor reads first, then sends (dialer sends first).
-                let mut peer_tag = [0u8; 32];
-                tls.read_exact(&mut peer_tag).await.map_err(|e| anyhow!("auth recv: {e}"))?;
-                if !ct_eq(&peer_tag, &their_expected) {
-                    bail!("TLS-TCP-AUTH-FAIL: pair-secret MAC mismatch, rejecting peer");
+                // Per-connection auth with a short timeout so a silent peer
+                // can't hold this slot. Spawn as a task so we can loop back
+                // to accept() immediately for the next connection.
+                let tkey = tkey;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    async move {
+                        let (transport, cb, _) = accept_tls_tcp(tcp, answerer).await?;
+                        {
+                            let tls = transport.tls.lock().await;
+                            let auth_km = extract_auth_km(&*tls)?;
+                            let my_tag = auth_tag(&tkey, &auth_km, "acceptor");
+                            let their_expected = auth_tag(&tkey, &auth_km, "dialer");
+                            drop(tls);
+                            let mut tls = transport.tls.lock().await;
+                            let mut peer_tag = [0u8; 32];
+                            tls.read_exact(&mut peer_tag).await.map_err(|e| anyhow!("auth recv: {e}"))?;
+                            if !ct_eq(&peer_tag, &their_expected) {
+                                bail!("TLS-TCP-AUTH-FAIL: pair-secret MAC mismatch, rejecting peer");
+                            }
+                            tls.write_all(&my_tag).await.map_err(|e| anyhow!("auth send: {e}"))?;
+                        }
+                        Ok((transport, cb))
+                    }
+                ).await;
+
+                match result {
+                    Ok(Ok(transport_cb)) => return Ok(transport_cb),
+                    Ok(Err(e)) => {
+                        // Auth failed or TLS error — log and accept next.
+                        let s = e.to_string();
+                        if s.contains("TLS-TCP-AUTH-FAIL") {
+                            crate::ui::trace(&format!("filament: {s}"));
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        // Per-connection timeout — silent peer, discard and
+                        // accept next. This is the DoS fix: we loop back to
+                        // listener.accept() immediately.
+                        crate::ui::trace("filament: tls-tcp accept conn timed out (silent peer), retrying");
+                        continue;
+                    }
                 }
-                tls.write_all(&my_tag).await.map_err(|e| anyhow!("auth send: {e}"))?;
             }
-            Ok((transport, cb))
         }));
     }
 

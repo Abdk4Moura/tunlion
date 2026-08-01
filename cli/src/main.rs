@@ -6395,6 +6395,11 @@ impl Conn {
         let tls_listener = p.tls_listener.take();
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
+        // Compute the answerer bit for TLS/TCP via polite_role — same as QUIC.
+        // Must be computed here (before the spawn) where we have access to self.
+        let my_uid = self.my_uid.clone();
+        let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str()).map(|s| s.to_string());
+        let my_id = self.my_id.clone();
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
             if is_probe {
                 Ev::DirectUpgradeReady(pid, t, route)
@@ -6446,10 +6451,12 @@ impl Conn {
                         listener,
                         peer_tls_cands,
                         &secret,
+                        &my_uid,
+                        peer_uid.as_deref(),
+                        &my_id,
                         pid_s.clone(),
                         tx.clone(),
                         "tls-tcp",
-                        true,
                     ).await {
                         let _ = tx.send(mk(pid_s, t, "tls-tcp"));
                         return;

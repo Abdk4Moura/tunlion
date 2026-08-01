@@ -1347,6 +1347,10 @@ async fn bring_up_to_known(
                         let secret = secret.clone();
                         let pid = v["from"].as_str().unwrap_or_default().to_string();
                         let tx = tx.clone();
+                        // Capture identity for TLS/TCP answerer derivation.
+                        let my_uid_s = my_uid.clone();
+                        let peer_uid_s = peer_uid.clone();
+                        let my_id_s = my_id.clone().unwrap_or_default();
                         tokio::spawn(async move {
                             // rung-1: QUIC race
                             if let Some(t) = crate::direct::race_connect_labeled(
@@ -1370,10 +1374,12 @@ async fn bring_up_to_known(
                                         listener,
                                         peer_tls_cands,
                                         &secret,
+                                        &my_uid_s,
+                                        peer_uid_s.as_deref(),
+                                        &my_id_s,
                                         pid.clone(),
                                         tx.clone(),
                                         "tls-tcp",
-                                        false,
                                     ).await {
                                         let _ = tx.send(Ev::DirectReady(pid, t, "tls-tcp"));
                                         return;
