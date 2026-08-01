@@ -8531,8 +8531,8 @@ async fn main() -> Result<()> {
                     // The token is both a file and a known device. Refuse to guess
                     // which the user meant; naming both readings lets them pick.
                     let send_cmd = format!("filament send {first}");
-                    let pty_cmd = format!("filament pty {first}");
-                    let width = send_cmd.len().max(pty_cmd.len());
+                    let shell_cmd = format!("filament shell {first}");
+                    let width = send_cmd.len().max(shell_cmd.len());
                     eprintln!(
                         "{} \"{first}\" is both a file here and a device you know. Say which:",
                         ui::paint(ui::Tone::Err, ui::glyph_err())
@@ -8543,7 +8543,7 @@ async fn main() -> Result<()> {
                     );
                     eprintln!(
                         "  {}  open a shell on the device",
-                        ui::paint(ui::Tone::Dim, &format!("{pty_cmd:width$}"))
+                        ui::paint(ui::Tone::Dim, &format!("{shell_cmd:width$}"))
                     );
                     std::process::exit(2);
                 }
