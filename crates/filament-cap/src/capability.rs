@@ -361,10 +361,15 @@ fn resolve_tag_match(
 ) -> bool {
     let bindings = find_tag_bindings(store, grantor, tag_hash);
     bindings.iter().any(|b| {
-        eval_time < b.expires
+        grant_active(b.expires, eval_time)
             && ((b.subject_kind == 0x00 && &b.subject == principal_user_pub)
                 || (b.subject_kind == 0x01 && &b.subject == principal_device_pub))
     })
+}
+
+/// The single expiry decision point shared by signed and legacy grants.
+pub fn grant_active(expires: u64, now: u64) -> bool {
+    now < expires
 }
 
 pub fn evaluate(
@@ -471,7 +476,7 @@ fn scan_grants_authorizes(
         // Check expiry: on expired grant, continue scanning (it must not
         // shadow a second matching grant that is still valid)
         let expires = entry["expires"].as_u64().unwrap_or(0);
-        if eval_time >= expires {
+        if !grant_active(expires, eval_time) {
             continue;
         }
 
