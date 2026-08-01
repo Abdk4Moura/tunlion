@@ -23,6 +23,7 @@ mod doctor;
 /// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
+mod fleet_enrollment;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
@@ -859,14 +860,16 @@ enum Cmd {
         #[arg(long)]
         tag: Option<String>,
     },
-    /// Revoke a capability from a known device. Revoking `shell` also strips the
-    /// device's filament-managed block from this machine's authorized_keys.
+    /// Revoke a capability or a fleet certificate from a known device.
     #[command(hide = true)]
     Revoke {
         /// Known device (petname)
         device: String,
         /// Capability to revoke (e.g. `shell`)
-        capability: String,
+        capability: Option<String>,
+        /// Revoke the device's local fleet certificate instead of a capability.
+        #[arg(long)]
+        certificate: bool,
     },
     /// Mount a remote directory over the mesh via sshfs.
     ///
@@ -9139,7 +9142,24 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Revoke { device, capability } => {
+        Cmd::Revoke { device, capability, certificate } => {
+            if certificate {
+                if capability.is_some() {
+                    bail!("choose either a capability or --certificate, not both");
+                }
+                ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
+                let cert = device_cert_for(&device)
+                    .ok_or_else(|| anyhow!("device '{device}' has no stored fleet certificate"))?;
+                let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
+                if cert.user_pub != owner.public_key_bytes() {
+                    bail!("device '{device}' certificate is not chained to this user identity");
+                }
+                set_device_cert_revoked(&device, true)?;
+                println!("revoked fleet certificate from '{device}'; fleet access is denied locally");
+                return Ok(());
+            }
+            let capability = capability
+                .ok_or_else(|| anyhow!("capability is required unless --certificate is set"))?;
             let capability = crate::capability::canonical_capability(&capability)?;
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false, None)?;
@@ -9229,9 +9249,17 @@ async fn main() -> Result<()> {
             }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
-                println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
+                if device_cert_for(&device).is_some() {
+                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
+                } else {
+                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
+                }
             } else {
-                println!("revoked '{capability}' from '{device}'.");
+                if device_cert_for(&device).is_some() {
+                    println!("revoked '{capability}' from '{device}'; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
+                } else {
+                    println!("revoked '{capability}' from '{device}'.");
+                }
             }
             Ok(())
         }
