@@ -4386,6 +4386,11 @@ fn cancelled() -> anyhow::Error {
 }
 
 async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
+    if code.is_none() && word.is_none() && !interactive_allowed() {
+        let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
+        eprintln!("{message}");
+        std::process::exit(exit_code);
+    }
     // INTERACTIVE GATE (scripts safe by default, see `interactive_allowed`).
     //   * `pair` with no code AND no --word -> guided CREATE entry. Empty submit
     //     falls back to today's auto-mint; typed words become the chosen password.
@@ -4621,7 +4626,21 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         }
                     }
                 } else {
+                let same_person = peer_identity_cert
+                    .as_ref()
+                    .and_then(|cert| load_owner_key().map(|owner| owner.public_key_bytes() == cert.user_pub))
+                    .unwrap_or(false);
+                // External pairs currently receive only the baseline transfer
+                // capability. Do not render render_someone_else_banner or
+                // render_inter_user_form: pair has no bounded per-cap grant
+                // contract, so those surfaces would claim choices it ignores.
+                // Do not render render_pake_words: the pair code is not a
+                // transcript-derived SAS; showing it as trust would invert the
+                // MITM check. A real SAS belongs in the crypto gate.
                 // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
+                if same_person {
+                    ui::say(&fleet_ui::pair_ui::render_same_person_banner(&n));
+                }
                 if peer_identity_cert.is_none() {
                     let p = devices_path();
                     if let Ok(raw) = std::fs::read_to_string(&p) {
@@ -4645,12 +4664,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     store_provisional_identity(&n, pcert)
                         .context("store provisional")?;
                 }
-                ui::say(&format!(
-                    "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
-                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                    ui::paint(ui::Tone::Bold, &n),
-                ));
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                if same_person {
+                    ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
+                } else {
+                    ui::say(&format!(
+                        "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        ui::paint(ui::Tone::Bold, &n),
+                    ));
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                }
                 tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                 let _ = sio.disconnect().await;
                 return Ok(());                } // close identity_exchange_window else
