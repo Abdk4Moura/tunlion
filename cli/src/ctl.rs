@@ -42,14 +42,14 @@ pub fn reuse_disabled() -> bool {
 #[cfg(unix)]
     pub use imp::{
         daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-        try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_mount,
+        try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
         try_arm, try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
         try_reload_expose, try_resize, try_unmount, Req, ReqKind,
     };
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_arm, try_cap_status, try_deny_request, try_list_pending, try_ping,
+    try_approve_request, try_arm, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
     Req,
 };
 
@@ -422,6 +422,25 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Snapshot warm links already held by the daemon. This never establishes a
+    /// link or probes a peer; a missing daemon simply returns None.
+    pub async fn try_list_warm() -> Option<Value> {
+        try_list_warm_at(&control_sock_path()).await
+    }
+
+    /// `try_list_warm` against an explicit socket path for hermetic tests.
+    pub async fn try_list_warm_at(path: &Path) -> Option<Value> {
+        let mut s = UnixStream::connect(path).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "list-warm" })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), read_line(&mut s, 16384))
+            .await.ok()?.ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     /// Ask the daemon to approve a pending request by id.
     pub async fn try_approve_request(id: u64) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
@@ -510,6 +529,8 @@ mod imp {
         MountHealth { target: String },
         /// Return the daemon's live capability shadow counters (synchronous).
         CapStatus,
+        /// Snapshot already-held warm links without probing peers.
+        ListWarm,
         /// List pending consent requests.
         ListPending,
         /// Approve a pending request by id.
@@ -666,6 +687,7 @@ mod imp {
                         ReqKind::MountHealth { target }
                     }
                     Some("cap-status") => ReqKind::CapStatus,
+                    Some("list-warm") => ReqKind::ListWarm,
                     Some("list-pending") => ReqKind::ListPending,
                     Some("approve-request") => {
                         let Some(id) = v["id"].as_u64() else { return };
@@ -730,6 +752,37 @@ mod imp {
         }
 
         #[tokio::test]
+        async fn list_warm_is_a_passive_snapshot_request() {
+            let dir = format!("/tmp/filament-ctl-warm-{}", std::process::id());
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = PathBuf::from(&dir).join("control.sock");
+            let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
+            let server = tokio::spawn(serve_at(path.clone(), tx));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let p = path.clone();
+            let client = tokio::spawn(async move { try_list_warm_at(&p).await });
+            let req = rx.recv().await.expect("snapshot request reached daemon");
+            assert!(matches!(&req.kind, ReqKind::ListWarm));
+            req.reply(&json!({
+                "ok": true,
+                "links": [{"name": "box", "warm": true, "direct": true, "route": "direct-quic"}]
+            })).await;
+            let reply = client.await.unwrap().expect("snapshot reply");
+            assert_eq!(reply["links"][0]["warm"], true);
+
+            server.abort();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn list_warm_without_daemon_returns_none() {
+            let path = PathBuf::from(format!("/tmp/filament-ctl-warm-missing-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            assert!(try_list_warm_at(&path).await.is_none());
+        }
+
+        #[tokio::test]
         async fn reject_makes_client_fall_back() {
             let dir = format!("/tmp/filament-ctl-rej-{}", std::process::id());
             std::fs::create_dir_all(&dir).unwrap();
@@ -777,6 +830,10 @@ mod stub {
     /// No control socket here, so there is no daemon consent queue to list.
     /// Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_list_pending() -> Option<Value> {
+        None
+    }
+
+    pub async fn try_list_warm() -> Option<Value> {
         None
     }
 
