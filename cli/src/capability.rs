@@ -346,6 +346,7 @@ pub fn cap_gate_effective(
     own_user_pub: Option<&[u8; 32]>,
     scoped_in_bounds: bool,
     has_explicit_grant: bool,
+    cert_revoked: bool,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
 
@@ -393,7 +394,7 @@ pub fn cap_gate_effective(
     // non-same-owner peer passes through unchanged (its owner shortcut never fires).
     let peer_user = user_pub.copied().unwrap_or([0u8; 32]);
     let same_owner = own_user_pub.map_or(false, |o| o == &peer_user) && peer_user != [0u8; 32];
-    let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds);
+    let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds, !cert_revoked);
     // Observability for the Proven-precondition — do NOT tighten blind. A
     // same-owner peer authorized ONLY by an explicit grant while its binding is
     // below Proven is EXACTLY the population that would lose access if
@@ -774,13 +775,11 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// TASK #15 known-bug regression pin: a same-owner, Proven, in-scope fleet
-    /// device is currently auto-authorized even with no explicit grants. This
-    /// fleet auto-trust bypass means revoking every capability from a lost
-    /// laptop still leaves transfer, reach, and mount access. Cert-revocation
-    /// work must flip this assertion to Deny, not replace this test.
+    /// Capability revocation alone does not remove certificate-derived fleet
+    /// trust. This is why certificate revocation is a separate operation and
+    /// why the CLI warns after a capability-only revoke.
     #[test]
-    fn known_bug_fleet_auto_trust_survives_capability_revoke() {
+    fn capability_revoke_alone_does_not_remove_fleet_trust() {
         let user_pub = [0xaa; 32];
         let device_pub = [0xcc; 32];
         let decision = cap_gate_effective(
@@ -796,9 +795,33 @@ mod tests {
             Some(&user_pub),
             true,
             false,
+            false,
         );
         assert!(matches!(decision, GateDecision::Allow),
-            "KNOWN BUG: revoking every capability leaves fleet auto-trust intact; this assertion documents current behavior and MUST invert to Denied when cert revocation lands");
+            "capability revocation alone must not remove live fleet certificate trust");
+    }
+
+    #[test]
+    fn cert_revoke_removes_fleet_trust() {
+        let user_pub = [0xaa; 32];
+        let device_pub = [0xcc; 32];
+        let decision = cap_gate_effective(
+            false,
+            &CapOutcome::Denied("all grants revoked".into()),
+            CAP_TRANSFER,
+            "self",
+            Some(&device_pub),
+            Some(&user_pub),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&user_pub),
+            true,
+            false,
+            true,
+        );
+        assert!(matches!(decision, GateDecision::Deny { .. }),
+            "certificate revocation must remove fleet trust");
     }
 
     /// Per-action shadow counters must bucket each action independently so
@@ -821,12 +844,12 @@ mod tests {
         let uk = [0xaa; 32];
         // Legacy-allowed, cap denies (Unprovisioned) → la_no_header
         for action in ["shell", "mount"] {
-            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         // Legacy-denied, cap authorizes → ld_authorized (widening)
-        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
 
         let ac = cap_action_counts();
 
@@ -888,7 +911,7 @@ mod tests {
 
         // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -899,7 +922,7 @@ mod tests {
 
         // (legacy_allowed=true, Denied) -> LA_DENIED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
@@ -910,7 +933,7 @@ mod tests {
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -921,7 +944,7 @@ mod tests {
 
         // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -932,7 +955,7 @@ mod tests {
 
         // (legacy_allowed=false, Denied) -> LD_DENIED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -943,7 +966,7 @@ mod tests {
 
         // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -954,7 +977,7 @@ mod tests {
 
         // Same-bucket repeat proves no cross-contamination on a second call.
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false);
+        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -1281,7 +1304,7 @@ mod tests {
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("no grant".into()), "transfer", "self",
             None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(d.allowed(), "same-owner Proven in-scope must ALLOW without a grant");
     }
@@ -1294,7 +1317,7 @@ mod tests {
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "shell", "self",
             None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false,
+             Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "same-owner Proven deliberate action without grant must DENY");
     }
@@ -1306,7 +1329,7 @@ mod tests {
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "transfer", "self",
             None, Some(&me), BindingStrength::Inferred, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "same-owner INFERRED must get nothing, even in-scope");
     }
@@ -1320,7 +1343,7 @@ mod tests {
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "mount", "self",
             None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false,
+             Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "same-owner Proven out-of-scope must DENY");
     }
@@ -1334,7 +1357,7 @@ mod tests {
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "transfer", "self",
             None, Some(&other), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "different-owner peer must be denied by default");
     }
@@ -1347,8 +1370,20 @@ mod tests {
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "transfer", "self",
             None, Some(&me), BindingStrength::Proven, Some(0), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false,
+             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "expired cert must deny fleet auto-trust even in-scope");
     }
+
+    #[test]
+    fn fleet_gate_revoked_cert_denies_scoped_default() {
+        let me = [0x88u8; 32];
+        let d = cap_gate_effective(
+            false, &CapOutcome::Denied("x".into()), "transfer", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), true, false, true,
+        );
+        assert!(!d.allowed(), "locally revoked cert must deny fleet auto-trust");
+    }
+
 }
