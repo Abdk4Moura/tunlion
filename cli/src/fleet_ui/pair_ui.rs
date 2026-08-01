@@ -5,6 +5,7 @@
 
 use crate::ui::{self, Tone};
 use super::{double_rule, echo_cmd, meta};
+use filament_pair::words::SpokenSas;
 
 /// Render the same-person banner + fleet add.
 pub fn render_same_person_banner(device_name: &str) -> String {
@@ -51,8 +52,14 @@ pub fn render_someone_else_banner() -> String {
 }
 
 /// Render the PAKE spoken-words screen.
-pub fn render_pake_words(words: &[&str]) -> String {
-    let words_str = words.join(" · ");
+///
+/// Takes a [`SpokenSas`], never a `&[&str]`, so the pairing code cannot be
+/// passed here. That type has no constructor: the only legitimate one derives
+/// from the completed transcript and has not been designed. So this function is
+/// currently uncallable BY CONSTRUCTION, which is the intent. The screen must
+/// not render until there is a real short authentication string behind it.
+pub fn render_pake_words(sas: &SpokenSas) -> String {
+    let words_str = sas.words().join(" · ");
     format!(
         "{prompt}\n\n     {words}\n\n{confirm}\n{fingerprint}",
         prompt = "  Say these three words out loud. They must hear the SAME three, in this order.",
@@ -149,15 +156,18 @@ mod tests {
         assert!(s.contains("not your identity"), "must show not-your-identity");
     }
 
-    #[test]
-    fn pake_words_render() {
-        let s = render_pake_words(&["amber", "lantern", "ferry"]);
-        assert!(s.contains("amber"), "must show first word");
-        assert!(s.contains("lantern"), "must show second word");
-        assert!(s.contains("ferry"), "must show third word");
-        assert!(s.contains("Yes, they match"), "must show confirm button");
-        assert!(s.contains("No / stop"), "must show stop button");
-    }
+    // The old `pake_words_render` test is deliberately gone rather than adapted.
+    //
+    // It built its input from a literal &[&str], which is precisely the shape
+    // that let a pairing code be passed here. Keeping it would have required
+    // either a public SpokenSas constructor, reopening the hole this change
+    // closes, or a test-only constructor, which would then be one `pub` away
+    // from the same hole.
+    //
+    // The property that replaced it is enforced by the compiler and asserted in
+    // filament-pair: SpokenSas has no constructor, so render_pake_words cannot
+    // be called at all. Restore a rendering test when the transcript derivation
+    // lands, and build its input from that derivation, never from a literal.
 
     #[test]
     fn pake_mismatch_honest_copy() {
@@ -198,3 +208,4 @@ mod tests {
         assert!(s.contains("joined your fleet"), "must confirm fleet join");
     }
 }
+

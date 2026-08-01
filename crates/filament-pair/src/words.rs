@@ -261,3 +261,75 @@ mod tests {
         assert!(validate_chosen_password("brave", "").is_err());
     }
 }
+
+// ── Word kinds that must never be confused ──────────────────────────────────
+//
+// This module mints PAIRING CODES: `adj-animal` plus a nameplate, e.g.
+// "brave-otter-42". They are transient SPAKE2 passwords. They are shared over
+// the channel being established, they authenticate nothing on their own, and
+// they are discarded once the handshake completes.
+//
+// Two other surfaces in this product also want words, and both are documented
+// in docs/ux-copy-final.md. Neither may be built from the vocabulary above:
+//
+//   SURFACE 2d  spoken words compared aloud AFTER the handshake, to detect a
+//               machine in the middle. The copy states "the words are the
+//               trust".
+//   SURFACE 4a  a 12-word recovery phrase, the copy's "only way back if you
+//               LOSE every device".
+//
+// Wiring either to `mint_words` produces something that looks right and is
+// catastrophic, so each gets a newtype with NO public constructor. Passing a
+// pairing code where one is expected is a type error, not a plausible screen.
+// The types are deliberately uninhabitable until the real derivations exist.
+
+/// Words spoken aloud after a completed handshake so two humans can detect a
+/// machine in the middle (docs/ux-copy-final.md SURFACE 2d).
+///
+/// NOT the pairing code. A pairing code renders IDENTICALLY on both sides under
+/// an attacker who knows it, because both sides ran their handshake against that
+/// attacker using the same password. Showing it here would have the user confirm
+/// a match the attacker guaranteed, under copy telling them those words are what
+/// protects them: an undetected MITM converted into a confirmed-safe one.
+///
+/// There is deliberately NO constructor. The only legitimate one derives from
+/// the completed transcript, and that derivation has not been designed. When it
+/// is, add `from_transcript(...)` here and nowhere else. Constraints recorded by
+/// the security reviewer: a dedicated derivation label rather than reusing
+/// `confirm_mac`'s output; direction-independent, since both honest sides must
+/// agree; bound to the PAKE key and both fingerprints; the wordlist SIZE stated
+/// in the spec, not only the word count, because the security parameter is the
+/// collision probability; and the wordlist VISIBLY DISTINCT from the pairing
+/// vocabulary, so a wrong wiring does not look identical to a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpokenSas(Vec<String>);
+
+impl SpokenSas {
+    /// The words, in the order they must be spoken.
+    pub fn words(&self) -> &[String] {
+        &self.0
+    }
+}
+
+/// The recovery phrase a user writes down (docs/ux-copy-final.md SURFACE 4a).
+///
+/// NOT a pairing code. The copy calls this "the only way back if you LOSE every
+/// device". A pairing code is a transient handshake password that is never
+/// persisted, so building this from `mint_words` hands the user a phrase that
+/// recovers nothing, is discovered only when they need it, and cannot be
+/// recovered from at that point.
+///
+/// There is deliberately NO constructor. Identity recovery does not exist yet:
+/// `IdentityAction` is Init, Show and Certify only, with no restore, rotate,
+/// revoke, guardians or freeze, and there is no phrase generator anywhere in the
+/// tree. This type exists BEFORE that surface so the nearest-function reflex
+/// fails at compile time rather than in production.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryPhrase(Vec<String>);
+
+impl RecoveryPhrase {
+    /// The phrase, in order.
+    pub fn words(&self) -> &[String] {
+        &self.0
+    }
+}
