@@ -8346,6 +8346,95 @@ fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
     pending.retain(|_, waiters| !waiters.is_empty());
 }
 
+/// Classification result for the bare-argument comfort router. Pure data, no side
+/// effects: the caller owns the argv rewrite and the user-visible error.
+#[derive(Debug, PartialEq, Eq)]
+enum BareTarget {
+    /// `help` is not a real subcommand on the un-built clap command, so rewrite
+    /// to `--help`.
+    Help,
+    /// An existing local path: `send <path> --code`.
+    Send,
+    /// A 4-digit nameplate looks like a pairing code (preserved muscle memory).
+    Pair,
+    /// A 2-3 digit nameplate looks like a legacy transfer code.
+    Recv,
+    /// `device:port` -> forward local-port device remote-port.
+    Forward { lport: String, peer: String, rport: String },
+    /// `device.mesh` or `device.mesh:port` -> reach.
+    Reach(String),
+    /// A bare known device name -> pty.
+    Pty,
+    /// The token is both a file and a device name; refuse to pick a side.
+    AmbiguousFileDevice,
+    /// Nothing recognized; the caller should print the did-you-mean path.
+    Unknown,
+}
+
+/// Pure classification for the bare-argument router. All environment access is
+/// injected through the closures so tests can pass fakes. The function does NOT
+/// touch capabilities, prompts, or authorizations: it is a router only.
+fn classify_bare_token(
+    token: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+    is_known_device: &dyn Fn(&str) -> bool,
+) -> BareTarget {
+    if token == "help" {
+        return BareTarget::Help;
+    }
+    // Preserve the existing path-first behavior, except when the same bare name
+    // is also a known device. A code-shaped filename is still a filename here.
+    let is_file = file_exists(token);
+    let is_device = is_known_device(token);
+    if is_file && is_device {
+        return BareTarget::AmbiguousFileDevice;
+    }
+    if is_file {
+        return BareTarget::Send;
+    }
+    // 4-digit nameplates are the pairing-code shape; keep routing them to `pair`
+    // because that is the long-standing bare-code behavior.
+    if looks_like_pake_code(token) {
+        return BareTarget::Pair;
+    }
+    // 2-3 digit nameplates are the legacy one-time transfer-code shape.
+    if regex_lite_code(token) {
+        return BareTarget::Recv;
+    }
+    // `device:port` -> forward (same port locally and remotely). The device part
+    // must be a known petname and the port must parse as a u16. If either fails,
+    // fall through to the did-you-mean path; do not guess.
+    if let Some((dev, port_str)) = token.rsplit_once(':') {
+        if !dev.is_empty()
+            && port_str.parse::<u16>().is_ok()
+            && is_known_device(dev)
+        {
+            let port = port_str.to_string();
+            return BareTarget::Forward {
+                lport: port.clone(),
+                peer: dev.to_string(),
+                rport: port,
+            };
+        }
+    }
+    // `device.mesh` or `device.mesh:port` -> reach. The reach command validates
+    // the address and reports unknown peers, so do not require a local petname
+    // here. Mesh addresses are not limited to the current device index.
+    if token.ends_with(".mesh")
+        || token
+            .split_once(".mesh:")
+            .is_some_and(|(dev, port)| !dev.is_empty() && !port.is_empty())
+    {
+        return BareTarget::Reach(token.to_string());
+    }
+    // A non-file known device opens a PTY. The router never escalates privilege,
+    // so the command path remains responsible for capability checks.
+    if is_device {
+        return BareTarget::Pty;
+    }
+    BareTarget::Unknown
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // F2: both ring (webrtc) and aws-lc (reqwest) end up in the dep tree;
@@ -8374,61 +8463,113 @@ async fn main() -> Result<()> {
             s
         };
         if !first.starts_with('-') && !cmd_names.contains(first.as_str()) {
-            if first == "help" {
-                // `help` / `help <sub>` as an alias for `--help`. clap's built-in
-                // `help` subcommand is not surfaced by `get_subcommands()` on the
-                // un-built command, so it never lands in `cmd_names` and the
-                // unknown-token guard below would otherwise reject it. Rewrite it
-                // to the long-help flag: `help` -> `--help`, `help ssh` ->
-                // `ssh --help`.
-                argv.remove(1); // drop the "help" token
-                argv.push("--help".into());
-            } else if std::path::Path::new(first).exists() {
-                argv.insert(1, "send".into());
-                argv.push("--code".into());
-            } else if looks_like_pake_code(first) {
-                // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
-                // the SAME ephemeral SPAKE2 ceremony whether the verb is `pair`
-                // or `recv`; a bare code is ambiguous. We keep routing it to
-                // `pair` (the long-standing bare-code behavior, 4-digit codes
-                // were always pairing codes), so existing muscle memory is
-                // preserved. To RECEIVE a transfer code, run `filament recv
-                // <code>` explicitly (the `send --code` output prints exactly
-                // that hint), or `filament pair <code>` to remember the device.
-                argv.insert(1, "pair".into());
-            } else if regex_lite_code(first) {
-                // A legacy `word-word-NNN` (2-3 digit) transfer code from an old
-                // sender, receive it (no v2 ceremony; the recv path fails loudly
-                // if the peer can't run the handshake).
-                argv.insert(1, "recv".into());
-            } else if devices_load().iter().any(|(n, _)| n == first) {
-                // Bare device name = shell in. `filament dovm` opens an interactive
-                // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
-                // (no sshd needed; the PTY protocol handles it).
-                argv.insert(1, "pty".into());
-            } else {
-                // Not a command, path, code, or paired device. Give a filament-native
-                // error with a did-you-mean over BOTH commands and device names,
-                // instead of clap's bare "unrecognized subcommand" (smart errors).
-                let first = first.clone();
-                let mut cands: Vec<String> = cmd_names.iter().cloned().collect();
-                cands.extend(devices_load().into_iter().map(|(n, _)| n));
-                let hint = cands
-                    .iter()
-                    .map(|c| (settings::levenshtein(&first, c), c))
-                    .filter(|(d, _)| *d <= 2)
-                    .min_by_key(|(d, _)| *d)
-                    .map(|(_, c)| c.clone());
-                eprintln!("filament: unknown command or device '{first}'");
-                if first == "init" {
-                    // There is no top-level `init`; the user almost certainly
-                    // wants to create the user identity key.
-                    eprintln!("  did you mean `filament identity init`?");
-                } else if let Some(h) = hint {
-                    eprintln!("  did you mean '{h}'?");
+            // The router is pure argv transformation: it never escalates
+            // privilege, prompts, or mutates capability state. It only decides what
+            // a bare token most likely means; the actual command enforces grants.
+            let first = first.clone();
+            match classify_bare_token(
+                &first,
+                &|t| std::path::Path::new(t).exists(),
+                &|t| devices_load().iter().any(|(n, _)| n == t),
+            ) {
+                BareTarget::Help => {
+                    // `help` / `help <sub>` as an alias for `--help`. clap's built-in
+                    // `help` subcommand is not surfaced by `get_subcommands()` on the
+                    // un-built command, so it never lands in `cmd_names` and the
+                    // unknown-token guard would otherwise reject it. Rewrite it
+                    // to the long-help flag: `help` -> `--help`, `help ssh` ->
+                    // `ssh --help`.
+                    argv.remove(1); // drop the "help" token
+                    argv.push("--help".into());
                 }
-                eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
-                std::process::exit(2);
+                BareTarget::Send => {
+                    // `filament <path>` mints a one-time code so the other side can
+                    // claim it without having been paired first.
+                    argv.insert(1, "send".into());
+                    argv.push("--code".into());
+                }
+                BareTarget::Pair => {
+                    // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
+                    // the SAME ephemeral SPAKE2 ceremony whether the verb is `pair`
+                    // or `recv`; a bare code is ambiguous. We keep routing it to
+                    // `pair` (the long-standing bare-code behavior, 4-digit codes
+                    // were always pairing codes), so existing muscle memory is
+                    // preserved. To RECEIVE a transfer code, run `filament recv
+                    // <code>` explicitly (the `send --code` output prints exactly
+                    // that hint), or `filament pair <code>` to remember the device.
+                    argv.insert(1, "pair".into());
+                }
+                BareTarget::Recv => {
+                    // A legacy `word-word-NNN` (2-3 digit) transfer code from an old
+                    // sender, receive it (no v2 ceremony; the recv path fails loudly
+                    // if the peer can't run the handshake).
+                    argv.insert(1, "recv".into());
+                }
+                BareTarget::Forward { lport, peer, rport } => {
+                    // `filament device:port` -> `filament forward lport peer rport`.
+                    // The local and remote ports are the same number.
+                    argv.remove(1);
+                    argv.insert(1, "forward".into());
+                    argv.insert(2, lport);
+                    argv.insert(3, peer);
+                    argv.insert(4, rport);
+                }
+                BareTarget::Reach(dev_port) => {
+                    // `filament device.mesh` or `filament device.mesh:port` ->
+                    // `filament reach <device>.mesh[:port]`.
+                    argv.remove(1);
+                    argv.insert(1, "reach".into());
+                    argv.insert(2, dev_port);
+                }
+                BareTarget::Pty => {
+                    // Bare device name = shell in. `filament dovm` opens an interactive
+                    // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
+                    // (no sshd needed; the PTY protocol handles it).
+                    argv.insert(1, "pty".into());
+                }
+                BareTarget::AmbiguousFileDevice => {
+                    // The token is both a file and a known device. Refuse to guess
+                    // which the user meant; naming both readings lets them pick.
+                    let send_cmd = format!("filament send {first}");
+                    let pty_cmd = format!("filament pty {first}");
+                    let width = send_cmd.len().max(pty_cmd.len());
+                    eprintln!(
+                        "{} \"{first}\" is both a file here and a device you know. Say which:",
+                        ui::paint(ui::Tone::Err, ui::glyph_err())
+                    );
+                    eprintln!(
+                        "  {}  send the file",
+                        ui::paint(ui::Tone::Dim, &format!("{send_cmd:width$}"))
+                    );
+                    eprintln!(
+                        "  {}  open a shell on the device",
+                        ui::paint(ui::Tone::Dim, &format!("{pty_cmd:width$}"))
+                    );
+                    std::process::exit(2);
+                }
+                BareTarget::Unknown => {
+                    // Not a command, path, code, or paired device. Give a filament-native
+                    // error with a did-you-mean over BOTH commands and device names,
+                    // instead of clap's bare "unrecognized subcommand" (smart errors).
+                    let mut cands: Vec<String> = cmd_names.iter().cloned().collect();
+                    cands.extend(devices_load().into_iter().map(|(n, _)| n));
+                    let hint = cands
+                        .iter()
+                        .map(|c| (settings::levenshtein(&first, c), c))
+                        .filter(|(d, _)| *d <= 2)
+                        .min_by_key(|(d, _)| *d)
+                        .map(|(_, c)| c.clone());
+                    eprintln!("filament: unknown command or device '{first}'");
+                    if first == "init" {
+                        // There is no top-level `init`; the user almost certainly
+                        // wants to create the user identity key.
+                        eprintln!("  did you mean `filament identity init`?");
+                    } else if let Some(h) = hint {
+                        eprintln!("  did you mean '{h}'?");
+                    }
+                    eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
+                    std::process::exit(2);
+                }
             }
         }
     }
@@ -16260,5 +16401,132 @@ mod tests {
             assert!(allowed.contains(key.as_str()),
                 "unexpected device store field '{key}' — is a Link field leaking?");
         }
+    }
+
+    // ------------------------------------------------- bare-arg router tests --
+
+    /// Bare existing path routes to `send <path> --code`.
+    #[test]
+    fn bare_existing_path_is_send() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token(
+                "report.pdf",
+                &|_| true,
+                &|t| known.contains(t),
+            ),
+            BareTarget::Send
+        );
+    }
+
+    #[test]
+    fn code_shaped_existing_path_stays_send() {
+        let known = std::collections::HashSet::<String>::new();
+        assert_eq!(
+            classify_bare_token("clever-lynx-1234", &|_| true, &|t| known.contains(t)),
+            BareTarget::Send
+        );
+    }
+
+    /// 4-digit nameplates stay pairing codes; 2-3 digit nameplates stay legacy
+    /// transfer codes. Collapsing both to `recv` would break this test.
+    #[test]
+    fn bare_code_width_decides_pair_vs_recv() {
+        let known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            classify_bare_token("clever-lynx-1234", &|_| false, &|t| known.contains(t)),
+            BareTarget::Pair
+        );
+        assert_eq!(
+            classify_bare_token("clever-lynx-123", &|_| false, &|t| known.contains(t)),
+            BareTarget::Recv
+        );
+        assert_eq!(
+            classify_bare_token("clever-lynx-12", &|_| false, &|t| known.contains(t)),
+            BareTarget::Recv
+        );
+    }
+
+    /// A bare known device name routes to pty.
+    #[test]
+    fn bare_known_device_is_pty() {
+        let known: std::collections::HashSet<String> = ["dovm"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("dovm", &|_| false, &|t| known.contains(t)),
+            BareTarget::Pty
+        );
+    }
+
+    /// `device:port` routes to forward, using the same port locally and remotely.
+    #[test]
+    fn device_colon_port_is_forward() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("laptop:5432", &|_| false, &|t| known.contains(t)),
+            BareTarget::Forward {
+                lport: "5432".into(),
+                peer: "laptop".into(),
+                rport: "5432".into(),
+            }
+        );
+    }
+
+    /// The forward rewrite produces the exact argv shape the `Forward` subcommand
+    /// expects: `filament forward <lport> <peer> <rport>`.
+    #[test]
+    fn forward_rewrite_argv_shape() {
+        let mut argv: Vec<String> = vec!["filament".into(), "laptop:5432".into()];
+        argv.remove(1);
+        argv.insert(1, "forward".into());
+        argv.insert(2, "5432".into());
+        argv.insert(3, "laptop".into());
+        argv.insert(4, "5432".into());
+        assert_eq!(argv, vec!["filament", "forward", "5432", "laptop", "5432"]);
+    }
+
+    /// A malformed port after the colon must NOT be treated as a forward.
+    #[test]
+    fn device_colon_notaport_is_not_forward() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        let t = classify_bare_token("laptop:notaport", &|_| false, &|t| known.contains(t));
+        assert!(
+            !matches!(t, BareTarget::Forward { .. }),
+            "laptop:notaport must not classify as forward, got {t:?}"
+        );
+    }
+
+    /// `device.mesh:port` routes to reach.
+    #[test]
+    fn device_mesh_port_is_reach() {
+        let known = std::collections::HashSet::<String>::new();
+        assert_eq!(
+            classify_bare_token("gpu.mesh:8080", &|_| false, &|t| known.contains(t)),
+            BareTarget::Reach("gpu.mesh:8080".into())
+        );
+        assert_eq!(
+            classify_bare_token("gpu.mesh", &|_| false, &|t| known.contains(t)),
+            BareTarget::Reach("gpu.mesh".into())
+        );
+    }
+
+    /// A bare token that is BOTH a file and a known device is ambiguous. The
+    /// router must refuse to pick a side instead of defaulting to send.
+    #[test]
+    fn file_and_device_is_ambiguous() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("laptop", &|_| true, &|t| known.contains(t)),
+            BareTarget::AmbiguousFileDevice
+        );
+    }
+
+    /// An unrecognized token reaches the did-you-mean path.
+    #[test]
+    fn unknown_token_is_unknown() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("xyzpdq", &|_| false, &|t| known.contains(t)),
+            BareTarget::Unknown
+        );
     }
 }
