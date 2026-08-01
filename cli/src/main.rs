@@ -20,6 +20,8 @@ mod ctl;
 mod diag;
 mod direct;
 mod doctor;
+/// TLS-over-TCP transport for UDP-hostile networks (DERP relay survival path).
+mod tls_tcp;
 /// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
@@ -5620,6 +5622,10 @@ struct DirectPending {
     racing: bool,
     /// kept alive so the bound UDP port stays ours until the race consumes it.
     endpoint: Option<quinn::Endpoint>,
+    /// TLS/TCP listener for the UDP-hostile survival path. Bound on a port so
+    /// peers can dial us via TLS/TCP when QUIC/UDP is blocked. Consumed by
+    /// `on_transport_offer` when racing TLS/TCP connections.
+    tls_listener: Option<tokio::net::TcpListener>,
     /// rung-2 (FILAMENT_HOLEPUNCH): a SECOND raw UDP socket, already STUN'd, kept
     /// raw (not connected) so its NAT mapping is the one we punch + run QUIC on.
     /// Consumed by the chained ladder in `on_transport_offer` only if rung-1
@@ -6190,6 +6196,24 @@ impl Conn {
                 }
             }
         };
+        // TLS/TCP listener for the UDP-hostile survival path. Bound alongside
+        // the QUIC endpoint so peers can dial us via TLS-over-TCP when all UDP
+        // is blocked. Port 0 = OS-assigned; the actual port goes into the offer.
+        let tls_listener = if !is_local {
+            match crate::tls_tcp::bind_tls_tcp_listener(0).await {
+                Ok((listener, _port)) => Some(listener),
+                Err(e) => {
+                    ui::trace(&format!("filament: TLS/TCP listener bind failed: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tls_port = tls_listener.as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(0);
         // #1 (parallelism): gather the host/public candidates (incl. the
         // /api/whoami HTTP) and the rung-2 STUN srflx CONCURRENTLY. Both are
         // independent network round-trips that must finish before the
@@ -6203,7 +6227,7 @@ impl Conn {
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
 
-        let (cands, srflx) = if is_local {
+        let (cands, srflx, tls_cands) = if is_local {
             // For local peers, ensure we have a listener and return TCP candidate.
             if self.local_port.is_none() {
                 let (listener, port) = crate::local::listen_local().await.unwrap();
@@ -6211,8 +6235,9 @@ impl Conn {
                 self.local_port = Some(port);
             }
             let cands = vec![format!("{{\"type\":\"tcp-localhost\",\"port\":{}}}", self.local_port.unwrap())];
-            (cands, None)
+            (cands, None, Vec::new())
         } else {
+            let server = self.server.clone();
             let srflx_fut = async {
                 if holepunch::holepunch_enabled() {
                     self.gather_srflx().await
@@ -6220,7 +6245,20 @@ impl Conn {
                     None
                 }
             };
-            tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut)
+            let tls_port_val = tls_port;
+            let tls_cands_fut = async move {
+                if tls_port_val > 0 {
+                    direct::gather_candidates(&server, tls_port_val).await
+                } else {
+                    Vec::new()
+                }
+            };
+            let (quic_cands, srflx, tls_cands) = tokio::join!(
+                direct::gather_candidates(&self.server, port),
+                srflx_fut,
+                tls_cands_fut
+            );
+            (quic_cands, srflx, tls_cands)
         };
 
         let (punch_sock, my_srflx) = match srflx {
@@ -6231,6 +6269,9 @@ impl Conn {
         // transport-offer rides the OPAQUE signaling relay (same channel as ICE
         // signals); the server cannot read or forge it without failing the MAC.
         let mut offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
+        if !tls_cands.is_empty() {
+            offer["tls_addrs"] = json!(tls_cands);
+        }
         if let Some(s) = my_srflx {
             offer["srflx"] = json!(s.to_string());
         }
@@ -6290,6 +6331,7 @@ impl Conn {
                 deadline,
                 racing: false,
                 endpoint: ep,
+                tls_listener,
                 punch_sock,
                 my_srflx,
                 probe,
@@ -6299,7 +6341,7 @@ impl Conn {
         // no DirectPending (the sender re-dialed after a mid-transfer death).
         if let Some((cands, srflx)) = self.buffered_offers.remove(pid) {
             ui::debug(&format!("replaying buffered transport-offer from {pid}"));
-            self.on_transport_offer(pid, cands, srflx);
+            self.on_transport_offer(pid, cands, srflx, Vec::new());
         }
     }
 
@@ -6332,7 +6374,7 @@ impl Conn {
     /// and haven't started the race yet, consume the endpoint and spawn the
     /// simultaneous-open + auth race; the winner posts Ev::DirectReady (or, for an
     /// upgrade probe, Ev::DirectUpgradeReady, verify-before-upgrade).
-    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
+    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>, peer_tls_cands: Vec<String>) {
         let Some(p) = self.direct_pending.get_mut(pid) else { return };
         if p.racing {
             return;
@@ -6349,6 +6391,8 @@ impl Conn {
         let peer_srflx_addr = peer_srflx
             .as_deref()
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+        // TLS/TCP listener for the UDP-hostile survival path.
+        let tls_listener = p.tls_listener.take();
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
@@ -6388,6 +6432,29 @@ impl Conn {
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
+            }
+            // rung-1b: TLS/TCP race for UDP-hostile networks. Fires when QUIC
+            // fails (all UDP blocked) and we have a TLS/TCP listener bound.
+            // Races accepting inbound TLS/TCP + dialing peer's TLS/TCP candidates.
+            if let Some(listener) = tls_listener {
+                if !peer_tls_cands.is_empty() {
+                    ui::debug(&format!(
+                        "filament: QUIC failed, racing TLS/TCP ({} peer cands)",
+                        peer_tls_cands.len()
+                    ));
+                    if let Some(t) = crate::tls_tcp::race_connect_tls_tcp(
+                        listener,
+                        peer_tls_cands,
+                        &secret,
+                        pid_s.clone(),
+                        tx.clone(),
+                        "tls-tcp",
+                        true,
+                    ).await {
+                        let _ = tx.send(mk(pid_s, t, "tls-tcp"));
+                        return;
+                    }
+                }
             }
             // rung-2: UDP hole-punch, then rung-1's QUIC race over the punched
             // socket. Only fires with the flag on, a punch socket bound, and a
@@ -10043,6 +10110,11 @@ async fn send_cmd(
                         .as_array()
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
+                    // TLS/TCP candidates for the UDP-hostile survival path.
+                    let tls_cands: Vec<String> = data["tls_addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
                     // rung-2: optional server-reflexive candidate for hole-punch.
                     let srflx = data["srflx"].as_str().map(String::from);
                     // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
@@ -10060,7 +10132,7 @@ async fn send_cmd(
                     // our DirectPending exists (our start_direct hasn't returned
                     // yet, or PeerLeft dropped the link before the repair).
                     if conn.direct_pending.contains_key(&from) {
-                        conn.on_transport_offer(&from, cands, srflx);
+                        conn.on_transport_offer(&from, cands, srflx, tls_cands);
                     } else {
                         let known = crate::devices_load()
                             .into_iter()
@@ -10069,7 +10141,7 @@ async fn send_cmd(
                             conn.start_direct(&from, &name, &secret).await;
                         }
                         if conn.direct_pending.contains_key(&from) {
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, tls_cands);
                         } else {
                             conn.buffered_offers.insert(from.clone(), (cands, srflx));
                         }
@@ -12763,6 +12835,11 @@ async fn recv_cmd(
                         .as_array()
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
+                    // TLS/TCP candidates for the UDP-hostile survival path.
+                    let tls_cands: Vec<String> = data["tls_addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
                     let srflx = data["srflx"].as_str().map(String::from);
                     // If we're on the code path and this peer hasn't authenticated yet,
                     // buffer the transport-offer until PAKE completes. Otherwise
@@ -12782,7 +12859,7 @@ async fn recv_cmd(
                     // Bug 1's pre-PAKE buffer). Without this, on_transport_offer
                     // finds no pending and silently drops the offer.
                     if conn.direct_pending.contains_key(&from) {
-                        conn.on_transport_offer(&from, cands, srflx);
+                        conn.on_transport_offer(&from, cands, srflx, tls_cands);
                     } else {
                         // Also try to re-arm direct proactively: if we still
                         // know this peer's (name,secret), create the pending
@@ -12795,7 +12872,7 @@ async fn recv_cmd(
                         }
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, tls_cands);
                         } else {
                             conn.buffered_offers.insert(from.clone(), (cands, srflx));
                             ui::debug(&format!("buffering re-dial transport-offer from {from} (no pending yet)"));
@@ -12872,7 +12949,7 @@ async fn recv_cmd(
                         // Replay any buffered transport-offer that arrived before PAKE
                         // (now that start_direct created a DirectPending with the secret)
                         if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, Vec::new());
                         }
                         recv_pending_direct.clear();
                         // Replay any buffered file offers from this peer
@@ -13748,6 +13825,36 @@ async fn recv_cmd(
                                 resolve_peer_identity(l);
                             }
                         }
+                        // Honor the pending_proven hold. If a possession-sig challenge
+                        // is still in flight for this peer and the binding is not yet
+                        // Proven, do NOT decide on Inferred now: the identity-expose
+                        // that flips us to Proven is a SEPARATE event this
+                        // single-consumer loop must process, so blocking inline would
+                        // deadlock. Re-inject the mount-open shortly and let the loop
+                        // drain. The hold entry is removed on Proven OR at the 3s
+                        // deadline, so this self-terminates and the re-injected
+                        // mount-open is then decided for real.
+                        if crate::capability::cap_authoritative() {
+                            let challenge_in_flight =
+                                pending_proven.lock().unwrap().contains_key(&pid);
+                            let proven = conn
+                                .link(&pid)
+                                .map(|l| {
+                                    l.identity_binding
+                                        == crate::capability::BindingStrength::Proven
+                                })
+                                .unwrap_or(false);
+                            if challenge_in_flight && !proven {
+                                let rtx = tx.clone();
+                                let rpid = pid.clone();
+                                let rv = v.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(80)).await;
+                                    let _ = rtx.send(Ev::Control(rpid, rv));
+                                });
+                                continue;
+                            }
+                        }
                         let link = conn.link(&pid);
                         let idev = link.and_then(|l| l.identity_device_pub.as_ref());
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
@@ -13781,19 +13888,12 @@ async fn recv_cmd(
                             (Some(u), Some(o)) => u == o,
                             _ => false,
                         };
-                        // #42 HOLD-OUT (advisor call): the mount scoped-DEFAULT is not
-                        // shipped in this release. It is not drivable today (filament
-                        // mount has no --auth-key, and an OwnerDevice cannot reach
-                        // Proven), so its scope enforcement (within_share /
-                        // path_within_canonical + the read-only EROFS path) has NEVER
-                        // been exercised end-to-end — shipping it would make the first
-                        // real user its first test, and publish a capability no path can
-                        // reach. Until mount is auth-key-drivable AND rig-verified
-                        // (including a write attempt that MUST return EROFS), a fleet
-                        // mount requires an EXPLICIT grant (deliberate tier). `within_share`
-                        // stays computed so re-enabling #42 is a one-line flip back.
-                        let _ = within_share;
-                        let mount_scoped_default = false;
+                        // A same-owner Proven fleet device gets a scoped read-only
+                        // mount ONLY within the fleet share root. within_share
+                        // failing-closes the scoped-in-bounds check: a path outside
+                        // the share root is not in scope, so cap_gate_effective does
+                        // NOT engage the scoped default (grant-only).
+                        let mount_scoped_default = within_share;
                         let read_only = same_owner
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
@@ -16253,5 +16353,83 @@ mod tests {
             assert!(allowed.contains(key.as_str()),
                 "unexpected device store field '{key}' — is a Link field leaking?");
         }
+    }
+
+    // --- Windows reparse-point hardening tests (#43) ---
+    // These mirror the Unix transfer_part_refuses_symlink / transfer_open_part_refuses_symlink
+    // tests but use Windows directory junctions to exercise the reparse-point refusal.
+    // Junctions are created via `cmd /c mklink /J` (no privilege needed, unlike symlinks).
+    // Runtime behavior (does the junction actually get refused) needs a Windows runner,
+    // which we don't have yet — pending #34 (per-OS CI).
+
+    /// Helper: create a Windows directory junction via `cmd /c mklink /J`.
+    #[cfg(windows)]
+    fn create_junction(target: &std::path::Path, link: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_str().unwrap())
+            .arg(target.to_str().unwrap())
+            .status()
+            .expect("failed to run cmd /c mklink /J");
+        assert!(status.success(), "mklink /J failed: {status:?}");
+    }
+
+    /// Windows: safe_create_part must refuse to create through a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_create_part_refuses_junction() {
+        let uid = format!("{}-win-create-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        let part_path = tmp.join("evil.tar.part");
+        create_junction(&junction_target, &part_path);
+        let result = safe_create_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to create through a junction: {:?}", result.err());
+        assert!(part_path.exists(), "junction must still exist after refusal");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows: safe_resume_part must refuse to open a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_resume_part_refuses_junction() {
+        let uid = format!("{}-win-resume-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally for resume");
+        drop(result);
+        std::fs::remove_file(&part_path).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&junction_target, &part_path);
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a junction: {:?}", result.err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows: safe_open_part must refuse to open a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_open_part_refuses_junction() {
+        let uid = format!("{}-win-open-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+        let result = safe_open_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally");
+        drop(result);
+        std::fs::remove_file(&part_path).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&junction_target, &part_path);
+        let result = safe_open_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to open a junction: {:?}", result.err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

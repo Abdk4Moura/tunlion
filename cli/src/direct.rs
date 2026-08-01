@@ -214,7 +214,8 @@ pub fn transport_key(secret: &str) -> [u8; 32] {
 
 /// Constant-time equality (no `subtle` dep). XOR-accumulate; the loop runs the
 /// full length regardless of where the first difference is.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Public so tls_tcp.rs can reuse it for TLS/TCP transport auth.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -756,7 +757,8 @@ fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
 
 /// Auth tag: HMAC(transport_key, keying_material || who). `who` direction-tags
 /// the tag so each side's tag differs and neither can be reflected back.
-fn auth_tag(tkey: &[u8; 32], km: &[u8; 32], who: &str) -> [u8; 32] {
+/// Public so tls_tcp.rs can reuse it for TLS/TCP transport auth.
+pub fn auth_tag(tkey: &[u8; 32], km: &[u8; 32], who: &str) -> [u8; 32] {
     let mut msg = Vec::with_capacity(32 + 16);
     msg.extend_from_slice(km);
     msg.push(b'|');

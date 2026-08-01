@@ -1095,6 +1095,10 @@ async fn bring_up_to_known(
     // candidate peer we rotate to (the endpoint accepts from any of them,
     // the QUIC race is pair-secret-authenticated either way).
     let mut direct_cands: Option<Vec<String>> = None;
+    // TLS/TCP listener for the UDP-hostile survival path. Bound alongside the
+    // QUIC endpoint so peers can dial us via TLS-over-TCP when all UDP is blocked.
+    let mut tls_listener: Option<tokio::net::TcpListener> = None;
+    let mut tls_cands: Option<Vec<String>> = None;
     // The acceptor re-sends its transport-offer (a late initiator can miss the
     // first). Race only the FIRST offer we get; later re-sends are duplicates.
     let mut direct_racing = false;
@@ -1186,6 +1190,18 @@ async fn bring_up_to_known(
                                 direct_cands =
                                     Some(crate::direct::gather_candidates(server, port).await);
                                 endpoint = Some(ep);
+                                // Also bind a TLS/TCP listener for the UDP-hostile path.
+                                match crate::tls_tcp::bind_tls_tcp_listener(0).await {
+                                    Ok((listener, tls_port)) => {
+                                        tls_cands = Some(
+                                            crate::direct::gather_candidates(server, tls_port).await
+                                        );
+                                        tls_listener = Some(listener);
+                                    }
+                                    Err(e) => {
+                                        crate::ui::trace(&format!("filament: TLS/TCP listener bind failed: {e}"));
+                                    }
+                                }
                                 // TRACE, direct-offer detail.
                                 crate::ui::trace(&format!("filament: DIRECT-OFFER sent to '{peer_name}', port {port}"));
                             }
@@ -1196,8 +1212,13 @@ async fn bring_up_to_known(
                     }
                     if endpoint.is_some() {
                         if let Some(c) = &direct_cands {
-                            let offer =
+                            let mut offer =
                                 json!({ "type": "transport-offer", "v": 1, "addrs": c });
+                            if let Some(tc) = &tls_cands {
+                                if !tc.is_empty() {
+                                    offer["tls_addrs"] = json!(tc);
+                                }
+                            }
                             sio.emit("signal", json!({ "to": pid, "data": offer })).await.ok();
                         }
                     }
@@ -1305,6 +1326,12 @@ async fn bring_up_to_known(
                     let ep = endpoint
                         .take()
                         .or_else(|| crate::direct::bind_endpoint().ok().map(|(ep, _)| ep));
+                    // Also take the TLS/TCP listener if we have one.
+                    let peer_tls_cands: Vec<String> = data["tls_addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let my_tls_listener = tls_listener.take();
                     if let Some(ep) = ep {
                         direct_racing = true;
                         let peer_cands: Vec<String> = data["addrs"]
@@ -1313,13 +1340,15 @@ async fn bring_up_to_known(
                             .unwrap_or_default();
                         // DEBUG, resilience/direct internal (racing a direct path).
                         crate::ui::debug(&format!(
-                            "filament: got transport-offer ({} cand), racing direct-quic",
-                            peer_cands.len()
+                            "filament: got transport-offer ({} cand, {} tls), racing direct-quic",
+                            peer_cands.len(),
+                            peer_tls_cands.len()
                         ));
                         let secret = secret.clone();
                         let pid = v["from"].as_str().unwrap_or_default().to_string();
                         let tx = tx.clone();
                         tokio::spawn(async move {
+                            // rung-1: QUIC race
                             if let Some(t) = crate::direct::race_connect_labeled(
                                 // answerer=false: this is bring_up (the connector
                                 // side), so it allocates the low L2 sid half.
@@ -1328,6 +1357,28 @@ async fn bring_up_to_known(
                             .await
                             {
                                 let _ = tx.send(Ev::DirectReady(pid, t, "direct-quic"));
+                                return;
+                            }
+                            // rung-1b: TLS/TCP race for UDP-hostile networks.
+                            if let Some(listener) = my_tls_listener {
+                                if !peer_tls_cands.is_empty() {
+                                    crate::ui::debug(&format!(
+                                        "filament: QUIC failed, racing TLS/TCP ({} peer cands)",
+                                        peer_tls_cands.len()
+                                    ));
+                                    if let Some(t) = crate::tls_tcp::race_connect_tls_tcp(
+                                        listener,
+                                        peer_tls_cands,
+                                        &secret,
+                                        pid.clone(),
+                                        tx.clone(),
+                                        "tls-tcp",
+                                        false,
+                                    ).await {
+                                        let _ = tx.send(Ev::DirectReady(pid, t, "tls-tcp"));
+                                        return;
+                                    }
+                                }
                             }
                             // On None the WebRTC path (Ev::ChannelReady) continues.
                         });

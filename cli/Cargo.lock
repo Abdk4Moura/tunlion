@@ -1190,6 +1190,7 @@ dependencies = [
  "spake2",
  "tar",
  "tokio",
+ "tokio-rustls",
  "webrtc",
  "windows-sys 0.59.0",
  "winfsp",
