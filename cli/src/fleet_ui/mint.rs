@@ -19,6 +19,7 @@ pub enum KeyType {
 pub struct MintCaps {
     pub shell: bool,
     pub write: bool,
+    pub all_ports: bool,
 }
 
 /// Capability names emitted by the mint form, derived from its actual toggles.
@@ -329,7 +330,7 @@ mod tests {
 
     #[test]
     fn fleet_summary_shell_on() {
-        let caps = MintCaps { shell: true, write: false };
+        let caps = MintCaps { shell: true, write: false, all_ports: false };
         let summary = render_summary(KeyType::Fleet, &caps);
         // Shell is deliberate, so should show ⚠ glyph
         assert!(summary.contains("open a shell — a real terminal"), "shell-on must show deliberate description");
@@ -337,7 +338,7 @@ mod tests {
 
     #[test]
     fn emitted_capabilities_are_enforcement_subset() {
-        for caps in [MintCaps { shell: false, write: false }, MintCaps { shell: true, write: true }] {
+        for caps in [MintCaps { shell: false, write: false, all_ports: false }, MintCaps { shell: true, write: true, all_ports: false }] {
             for capability in emitted_capabilities(&caps) {
                 assert!(
                     crate::capability::CANONICAL_CAPABILITIES.contains(&capability),
@@ -402,7 +403,7 @@ mod tests {
 
     #[test]
     fn completion_render() {
-        let caps = MintCaps { shell: true, write: false };
+        let caps = MintCaps { shell: true, write: false, all_ports: false };
         let lt = Lifetime { ttl: "1h".into(), reuse: Reuse::Once, max_ttl: "24h".into() };
         let s = render_completion("clever-lynx-63-brave-otter", KeyType::Fleet, &caps, &lt);
         assert!(s.contains("filament join clever-lynx-63-brave-otter"), "must show join command");
