@@ -775,6 +775,33 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// TASK #15 known-bug regression pin: a same-owner, Proven, in-scope fleet
+    /// device is currently auto-authorized even with no explicit grants. This
+    /// fleet auto-trust bypass means revoking every capability from a lost
+    /// laptop still leaves transfer, reach, and mount access. Cert-revocation
+    /// work must flip this assertion to Deny, not replace this test.
+    #[test]
+    fn known_bug_fleet_auto_trust_survives_capability_revoke() {
+        let user_pub = [0xaa; 32];
+        let device_pub = [0xcc; 32];
+        let decision = cap_gate_effective(
+            false,
+            &CapOutcome::Denied("all grants revoked".into()),
+            CAP_TRANSFER,
+            "self",
+            Some(&device_pub),
+            Some(&user_pub),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&user_pub),
+            true,
+            false,
+        );
+        assert!(matches!(decision, GateDecision::Allow),
+            "KNOWN BUG: revoking every capability leaves fleet auto-trust intact; this assertion documents current behavior and MUST invert to Denied when cert revocation lands");
+    }
+
     /// Per-action shadow counters must bucket each action independently so
     /// the flip decision can cite a coverage matrix, not just a total.
     /// One mis-bucketed counter could satisfy flip_ready silently.
