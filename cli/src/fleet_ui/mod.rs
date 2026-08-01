@@ -74,6 +74,12 @@ pub fn echo_cmd(cmd: &str) -> String {
     format!("{} {cmd}", ui::paint(Tone::Dim, ui::glyph_echo()))
 }
 
+/// Capabilities that require deliberate, bounded approval rather than a normal
+/// one-click grant. Keep this predicate canonical for every trust surface.
+pub fn is_deliberate_capability(capability: &str) -> bool {
+    matches!(capability, "shell" | "mount" | "all-ports")
+}
+
 /// Confirmation tokens (exact, as specified).
 pub const CONFIRM_SHELL: &str = "SHELL";
 pub const CONFIRM_WRITE: &str = "WRITE";
@@ -100,5 +106,13 @@ mod tests {
     fn exit_codes() {
         assert_eq!(EXIT_BAD_ARG, 2);
         assert_eq!(EXIT_REFUSED, 1);
+    }
+
+    #[test]
+    fn deliberate_capabilities_are_canonical() {
+        assert!(is_deliberate_capability("shell"));
+        assert!(is_deliberate_capability("mount"));
+        assert!(is_deliberate_capability("all-ports"));
+        assert!(!is_deliberate_capability("transfer"));
     }
 }

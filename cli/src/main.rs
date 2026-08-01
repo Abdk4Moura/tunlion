@@ -1040,6 +1040,12 @@ enum RequestsAction {
     Approve {
         /// Request id
         id: u64,
+        /// Capabilities to deliberately allow
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Bound deliberate access to this duration
+        #[arg(long = "for", value_name = "DURATION")]
+        for_duration: Option<String>,
     },
     /// Deny a pending request by id.
     Deny {
@@ -2956,67 +2962,80 @@ fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
     }
 }
 
+fn request_ago(timestamp: u64) -> String {
+    let ago = crate::capability::now_secs().saturating_sub(timestamp);
+    if ago < 60 {
+        format!("{ago}s ago")
+    } else if ago < 3600 {
+        format!("{}m ago", ago / 60)
+    } else {
+        format!("{}h ago", ago / 3600)
+    }
+}
+
+fn request_entry(value: &Value) -> Option<fleet_ui::requests::RequestEntry> {
+    let capability = value["capability"].as_str()?;
+    Some(fleet_ui::requests::RequestEntry {
+        id: value["id"].as_u64()?,
+        peer: value["peer"].as_str()?.to_string(),
+        capability: capability.to_string(),
+        ago: request_ago(value["timestamp"].as_u64().unwrap_or(0)),
+        // The request protocol does not carry provenance or a fingerprint.
+        via: None,
+        fingerprint: None,
+        is_deliberate: fleet_ui::is_deliberate_capability(capability),
+    })
+}
+
+fn request_entries(value: &Value, all: bool) -> Vec<fleet_ui::requests::RequestEntry> {
+    value
+        .get("requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|request| all || request["status"].as_str() == Some("pending"))
+        .filter_map(request_entry)
+        .collect()
+}
+
+fn local_request(id: u64) -> Option<PendingRequest> {
+    load_requests().into_iter().find(|request| request.id == id)
+}
+
 /// CLI handler for `filament requests`
 async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     match action {
         None | Some(RequestsAction::List { all: false }) => {
             let reply = crate::ctl::try_list_pending().await;
             match reply {
-                Some(v) => {
-                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
-                        if reqs.is_empty() {
-                            ui::say("  no pending requests");
-                        } else {
-                            for r in reqs {
-                                let id = r["id"].as_u64().unwrap_or(0);
-                                let peer = r["peer"].as_str().unwrap_or("?");
-                                let cap = r["capability"].as_str().unwrap_or("?");
-                                let status = r["status"].as_str().unwrap_or("?");
-                                let ts = r["timestamp"].as_u64().unwrap_or(0);
-                                let ago = crate::capability::now_secs().saturating_sub(ts);
-                                let when = if ago < 60 { format!("{ago}s ago") }
-                                    else if ago < 3600 { format!("{}m ago", ago/60) }
-                                    else { format!("{}h ago", ago/3600) };
-                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
-                            }
-                        }
-                    }
-                }
+                Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(&v, false))),
                 None => ui::say("  daemon not running; no pending request state"),
             }
         }
         Some(RequestsAction::List { all: true }) => {
             let reply = crate::ctl::try_list_pending().await;
             match reply {
-                Some(v) => {
-                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
-                        if reqs.is_empty() {
-                            ui::say("  no requests");
-                        } else {
-                            for r in reqs {
-                                let id = r["id"].as_u64().unwrap_or(0);
-                                let peer = r["peer"].as_str().unwrap_or("?");
-                                let cap = r["capability"].as_str().unwrap_or("?");
-                                let status = r["status"].as_str().unwrap_or("?");
-                                let ts = r["timestamp"].as_u64().unwrap_or(0);
-                                let ago = crate::capability::now_secs().saturating_sub(ts);
-                                let when = if ago < 60 { format!("{ago}s ago") }
-                                    else if ago < 3600 { format!("{}m ago", ago/60) }
-                                    else { format!("{}h ago", ago/3600) };
-                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
-                            }
-                        }
-                    }
-                }
+                Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(&v, true))),
                 None => ui::say("  daemon not running; no request state"),
             }
         }
-        Some(RequestsAction::Approve { id }) => {
+        Some(RequestsAction::Approve { id, allow: _, for_duration: _ }) => {
+            if let Some(request) = local_request(id) {
+                if request.status == "pending"
+                    && fleet_ui::is_deliberate_capability(&request.capability)
+                {
+                    ui::say(&fleet_ui::requests::render_approve_guard(id, &request.capability));
+                    return Ok(());
+                }
+            }
             let reply = crate::ctl::try_approve_request(id).await;
             match reply {
                 Some(v) => {
                     if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
                         if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
+                            // Do not call render_approve_success here. The capability
+                            // layer has no bounded-grant contract yet, so its expiry
+                            // would be false while device_set_cap persists access.
                             ui::say(&format!(
                                 "  {} approved {cap} for {peer}",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
@@ -3028,9 +3047,16 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
             }
         }
         Some(RequestsAction::Deny { id }) => {
+            let peer = local_request(id).map(|request| request.peer);
             let reply = crate::ctl::try_deny_request(id).await;
             match reply {
-                Some(_) => ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
+                Some(_) => {
+                    if let Some(peer) = peer {
+                        ui::say(&fleet_ui::requests::render_deny_success(&peer));
+                    } else {
+                        ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    }
+                }
                 None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
             }
         }
