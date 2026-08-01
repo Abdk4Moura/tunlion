@@ -73,7 +73,7 @@ pub fn render_key_type_picker() -> String {
 
 /// Render the "This key can / cannot" live summary.
 pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
-    let mut lines = vec![format!("  {}", ui::paint(Tone::Dim, rule()))];
+    let mut lines = vec![format!("  {}", ui::paint(Tone::Dim, "── This key can ──"))];
 
     match key_type {
         KeyType::Fleet => {
@@ -85,14 +85,19 @@ pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
             }
             if caps.write {
                 lines.push(can_line(true, true, "write to mounted dirs — can change or delete your files"));
-            } else {
+            } else if caps.all_ports {
                 lines.push(can_line(false, false, "write to disk"));
             }
             if caps.all_ports {
                 lines.push(can_line(true, true, "reach ALL ports — not just the ports you chose to expose"));
-            } else {
+            } else if caps.write {
                 lines.push(can_line(false, false, "join your mesh"));
+            } else {
+                lines.push(can_line(false, false, "write to disk · join your mesh"));
             }
+            // Deliberately omit the fleet meta line: this currently mints a
+            // delegated ephemeral principal, not a fleet certificate. Restore
+            // that claim only when fleet-cert enrollment exists.
         }
         KeyType::External => {
             lines.push(can_line(true, false, "send you files"));
@@ -171,7 +176,6 @@ pub fn render_lifetime(lifetime: &Lifetime) -> String {
     };
 
     let mut lines = vec![
-        format!("  {}", ui::paint(Tone::Dim, rule())),
         format!("  Expires in:  [ {} ]  ◀────●───────▶   (max {} for this key type)", lifetime.ttl, lifetime.max_ttl),
         format!("  Reuse:       {reuse_label}"),
     ];
@@ -305,12 +309,28 @@ mod tests {
     fn fleet_summary_defaults() {
         let caps = MintCaps::default();
         let summary = render_summary(KeyType::Fleet, &caps);
+        assert!(summary.contains("── This key can ──"), "summary must label capabilities");
         assert!(summary.contains("drop files in your inbox"), "fleet default must show can-drop-files");
         assert!(summary.contains("open a shell"), "must mention shell");
         assert!(summary.contains("write to disk"), "must mention write");
         assert!(summary.contains("join your mesh"), "must mention mesh");
         // Deliberate caps are OFF by default, so should show ✗ for shell/write/mesh
         // (the can_line function renders Err glyph for ok=false)
+    }
+
+    #[test]
+    fn fleet_summary_keeps_denials_on_one_row() {
+        let summary = render_summary(KeyType::Fleet, &MintCaps::default());
+        assert!(summary.contains("write to disk · join your mesh"), "denied capabilities should share a row");
+    }
+
+    #[test]
+    fn lifetime_does_not_repeat_summary_rule() {
+        let summary = render_summary(KeyType::Fleet, &MintCaps::default());
+        let lifetime = render_lifetime(&Lifetime { ttl: "1h".into(), reuse: Reuse::Once, max_ttl: "24h".into() });
+        let combined = format!("{summary}\n{lifetime}");
+        let rule_line = format!("  {}", rule());
+        assert_eq!(combined.matches(&rule_line).count(), 1, "stacked summary and lifetime must not duplicate rules");
     }
 
     #[test]
