@@ -3002,6 +3002,133 @@ fn local_request(id: u64) -> Option<PendingRequest> {
     load_requests().into_iter().find(|request| request.id == id)
 }
 
+fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
+    value
+        .and_then(|v| v.get("links"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|link| link["warm"].as_bool() == Some(true))
+        .filter_map(|link| link["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn pending_request_count(value: Option<&Value>) -> usize {
+    value
+        .and_then(|v| v.get("requests"))
+        .and_then(Value::as_array)
+        .map(|requests| {
+            requests
+                .iter()
+                .filter(|request| request["status"].as_str() == Some("pending"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
+    let Some(cert) = cert else {
+        return "promote to continue".to_string();
+    };
+    let now = identity::now_secs();
+    if cert.expires <= now {
+        let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
+            .map(|at| at.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "expired".to_string());
+        return match tier {
+            fleet_ui::devices::DeviceTier::Fleet => format!("renews until {date}"),
+            _ => format!("expired {date}"),
+        };
+    }
+    let minutes = (cert.expires - now).saturating_add(59) / 60;
+    match tier {
+        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {minutes}m"),
+        _ => format!("expires in {minutes}m"),
+    }
+}
+
+fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
+    let mut labels = Vec::new();
+    for cap in caps {
+        let label = match (tier, cap.as_str()) {
+            (fleet_ui::devices::DeviceTier::External, "transfer") => "send→you",
+            (_, "transfer") => "inbox",
+            (_, "shell") => "shell",
+            (_, "mount") => "mount",
+            (_, "send") => "send→you",
+            (_, "read") => "read ~/share",
+            _ => cap.as_str(),
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        "(none)".to_string()
+    } else {
+        labels.join(" ")
+    }
+}
+
+fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
+    let warm_names = warm_device_names(warm);
+    let owner = load_owner_key().map(|key| key.public_key_bytes());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    devices_load()
+        .into_iter()
+        .map(|(name, _secret)| {
+            let cert = device_cert_for(&name);
+            let tier = match cert.as_ref() {
+                None => fleet_ui::devices::DeviceTier::NeedsReview,
+                Some(cert) if owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
+                Some(_) => fleet_ui::devices::DeviceTier::External,
+            };
+            let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+            let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
+            let address = stored_v6.or(stored_v4);
+            let last_seen = (last_seen > 0).then(|| {
+                let ago = now.saturating_sub(last_seen);
+                if ago < 60 {
+                    "just now".to_string()
+                } else if ago < 3600 {
+                    format!("{}m ago", ago / 60)
+                } else if ago < 86400 {
+                    format!("{}h ago", ago / 3600)
+                } else {
+                    format!("{}d ago", ago / 86400)
+                }
+            });
+            let needs_promote = tier == fleet_ui::devices::DeviceTier::NeedsReview;
+            let caps_summary = if needs_promote {
+                "(full legacy trust)".to_string()
+            } else {
+                device_caps_summary(&caps, tier)
+            };
+            let caps_summary = match address {
+                Some(address) => format!("{caps_summary}  {address}"),
+                None => caps_summary,
+            };
+            fleet_ui::devices::DeviceEntry {
+                name: name.clone(),
+                tier,
+                online: warm_names.contains(&name),
+                caps_summary,
+                countdown: if needs_promote {
+                    "promote to continue".to_string()
+                } else {
+                    device_countdown(tier, cert.as_ref())
+                },
+                last_seen,
+                needs_promote,
+            }
+        })
+        .collect()
+}
+
 /// CLI handler for `filament requests`
 async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     match action {
@@ -8749,28 +8876,13 @@ async fn main() -> Result<()> {
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&arr)?);
                     } else {
-                        if all.is_empty() {
-                            println!("no known devices yet, run `filament pair` to add one");
-                        } else {
-                            let mut table = ui::Table::new(&["NAME", "ADDRESS", "GRANTED", "LAST SEEN"]);
-                            for (n, _) in &all {
-                                let (last_seen, v6, v4) = devices_info(n).unwrap_or((0, None, None));
-                                let addr = v6.as_deref().or(v4.as_deref()).unwrap_or("-");
-                                let caps = device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]);
-                                let last_seen_str = if last_seen == 0 {
-                                    "never".to_string()
-                                } else {
-                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                                    let ago = now.saturating_sub(last_seen);
-                                    if ago < 60 { "just now".to_string() }
-                                    else if ago < 3600 { format!("{}m ago", ago / 60) }
-                                    else if ago < 86400 { format!("{}h ago", ago / 3600) }
-                                    else { format!("{}d ago", ago / 86400) }
-                                };
-                                table.row(&[n, addr, &caps.join(", "), &last_seen_str]);
-                            }
-                            table.print();
-                        }
+                        let warm = ctl::try_list_warm().await;
+                        let pending = ctl::try_list_pending().await;
+                        let rendered = fleet_ui::devices::render_devices(
+                            &device_entries(warm.as_ref()),
+                            pending_request_count(pending.as_ref()),
+                        );
+                        println!("{rendered}");
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {

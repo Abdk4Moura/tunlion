@@ -77,7 +77,16 @@ pub fn echo_cmd(cmd: &str) -> String {
 /// Capabilities that require deliberate, bounded approval rather than a normal
 /// one-click grant. Keep this predicate canonical for every trust surface.
 pub fn is_deliberate_capability(capability: &str) -> bool {
-    matches!(capability, "shell" | "mount" | "all-ports")
+    matches!(
+        capability,
+        "shell"
+            // Reserved for the future port-scope capability; no enforcement
+            // layer currently stores or grants this value.
+            | "all-ports"
+            // Intentionally conservative until read-only and writable mounts
+            // have distinct capability names; this warns on both today.
+            | "mount"
+    )
 }
 
 /// Confirmation tokens (exact, as specified).
