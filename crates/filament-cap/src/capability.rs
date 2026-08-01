@@ -1457,7 +1457,9 @@ mod tests {
     #[test]
     fn gated_actions_are_canonical_and_canonical_actions_are_gated() {
         for capability in CANONICAL_CAPABILITIES {
-            assert!(is_enforced_capability(capability), "canonical capability '{capability}' has no gate");
+            // This checks grantable vocabulary against declared classification, not enforcement.
+            // The CLI behavioral authorization test covers the latter for shell.
+            assert!(is_enforced_capability(capability), "canonical capability '{capability}' is not classified");
         }
     }
 
