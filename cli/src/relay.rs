@@ -85,7 +85,8 @@ impl RelayTicket {
             bail!("relay ticket side must be 0 or 1");
         }
         let (_, k_mac) = relay_keys(k);
-        let mac = hmac_sha256(&k_mac, &mac_input(&pair_id, side, exp));
+        let prefix = wire_prefix(&pair_id, side, exp);
+        let mac = hmac_sha256(&k_mac, &prefix);
         Ok(Self { pair_id, side, exp, mac })
     }
 
@@ -103,18 +104,20 @@ impl RelayTicket {
     /// Verify offline at the relay. No signaling callback or payload access is
     /// needed; `k` is the relay's shared ticket-verification key.
     pub fn verify(&self, k: &[u8], now: u64) -> bool {
-        if self.side > 1 || now > self.exp.saturating_add(TICKET_SKEW_SECS) {
+        let latest = now.saturating_add(TICKET_TTL_SECS + TICKET_SKEW_SECS);
+        if self.side > 1
+            || now > self.exp.saturating_add(TICKET_SKEW_SECS)
+            || self.exp > latest
+        {
             return false;
         }
         let (_, k_mac) = relay_keys(k);
-        ct_eq(&self.mac, &hmac_sha256(&k_mac, &mac_input(&self.pair_id, self.side, self.exp)))
+        ct_eq(&self.mac, &hmac_sha256(&k_mac, &wire_prefix(&self.pair_id, self.side, self.exp)))
     }
 
     pub fn to_bytes(self) -> [u8; 73] {
         let mut out = [0u8; 73];
-        out[..32].copy_from_slice(&self.pair_id);
-        out[32] = self.side;
-        out[33..41].copy_from_slice(&self.exp.to_be_bytes());
+        out[..41].copy_from_slice(&wire_prefix(&self.pair_id, self.side, self.exp));
         out[41..].copy_from_slice(&self.mac);
         out
     }
@@ -133,7 +136,10 @@ impl RelayTicket {
     }
 }
 
-fn mac_input(pair_id: &[u8; 32], side: u8, exp: u64) -> [u8; 41] {
+/// Canonical serialized ticket prefix. The MAC covers this whole prefix by
+/// construction, so adding fields before `mac` requires serialization to add
+/// them here and automatically brings them under authentication.
+fn wire_prefix(pair_id: &[u8; 32], side: u8, exp: u64) -> [u8; 41] {
     let mut input = [0u8; 41];
     input[..32].copy_from_slice(pair_id);
     input[32] = side;
@@ -168,6 +174,15 @@ mod tests {
         assert!(ticket.verify(b"k", 1_004));
         assert!(!ticket.verify(b"k", 1_006));
         assert!(!ticket.verify(b"wrong", 1_000));
+        assert!(!ticket.verify(b"k", 1_031));
+        assert!(!RelayTicket::mint(
+            b"k",
+            [7; 32],
+            1,
+            1_000 + TICKET_TTL_SECS + TICKET_SKEW_SECS + 1,
+        )
+            .unwrap()
+            .verify(b"k", 1_000));
     }
 
     #[test]
@@ -176,6 +191,17 @@ mod tests {
         let mut ticket = RelayTicket::mint(b"k", [0; 32], 0, 100).unwrap();
         ticket.side = 1;
         assert!(!ticket.verify(b"k", 100));
+    }
+
+    #[test]
+    fn every_wire_prefix_field_is_mac_bound() {
+        let ticket = RelayTicket::mint(b"k", [0; 32], 0, 100).unwrap();
+        let mut pair_id = ticket;
+        pair_id.pair_id[0] ^= 1;
+        assert!(!pair_id.verify(b"k", 100));
+        let mut exp = ticket;
+        exp.exp += 1;
+        assert!(!exp.verify(b"k", 100));
     }
 
     #[test]
