@@ -552,15 +552,30 @@ pub async fn race_connect_tls_tcp(
         let answerer = answerer;
         futs.push(Box::pin(async move {
             let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<AuthResult>(4);
+            // Bound concurrent unauthenticated handshakes. `try_acquire_owned`
+            // is intentional: never stall accept while waiting for a permit.
+            const MAX_INBOUND_AUTH: usize = 64;
+            let auth_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_AUTH));
             loop {
                 tokio::select! {
                     res = listener.accept() => {
                         let (tcp, _remote_addr) = res.map_err(|e| anyhow!("tls-tcp accept: {e}"))?;
+                        let permit = match auth_slots.clone().try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                crate::ui::trace("filament: tls-tcp accept auth limit reached, dropping connection");
+                                drop(tcp);
+                                continue;
+                            }
+                        };
                         let tkey = tkey;
                         let done_tx = done_tx.clone();
                         // Spawn: this connection's auth runs concurrently with
                         // the next accept(). The 3s timeout is inside the task.
                         tokio::spawn(async move {
+                            // Hold the admission permit for the full auth task,
+                            // not merely until this accept-loop iteration ends.
+                            let _auth_slot = permit;
                             let result = tokio::time::timeout(
                                 std::time::Duration::from_secs(3),
                                 async move {

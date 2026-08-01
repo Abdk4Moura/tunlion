@@ -20,6 +20,8 @@ mod ctl;
 mod diag;
 mod direct;
 mod doctor;
+/// DERP-style WSS byte relay for UDP-hostile networks (rung d).
+mod relay;
 /// TLS-over-TCP transport for UDP-hostile networks (DERP relay survival path).
 mod tls_tcp;
 /// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
