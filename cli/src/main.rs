@@ -1549,14 +1549,15 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
 
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
-fn device_cert_revoked(name: &str) -> bool {
+fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return false };
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    let Ok(raw) = std::fs::read_to_string(&p) else { return true };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return true };
+    let key = hex::encode(device_pub);
     arr.iter()
-        .find(|d| d["name"].as_str() == Some(name))
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
         .and_then(|d| d["certRevoked"].as_bool())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Mark a stored device certificate revoked locally. The check path must
@@ -13511,10 +13512,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = link
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(device_cert_revoked)
-                            .unwrap_or(false);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13675,10 +13673,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = link
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(device_cert_revoked)
-                            .unwrap_or(false);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13794,10 +13789,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = link
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(device_cert_revoked)
-                            .unwrap_or(false);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13967,10 +13959,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = link
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(device_cert_revoked)
-                            .unwrap_or(false);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -14591,10 +14580,7 @@ async fn recv_cmd(
                         // could still redirect the write — closed separately by the
                         // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
                         // a fleet-trust follow-up.
-                        let cert_revoked = link
-                            .and_then(|l| l.verified_name.as_deref())
-                            .map(device_cert_revoked)
-                            .unwrap_or(false);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
