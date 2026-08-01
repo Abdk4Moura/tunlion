@@ -33,6 +33,36 @@ use anyhow::{anyhow, bail, Result};
 use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::Value;
 
+/// The only capability names understood by the enforcement layer.
+///
+/// Keep this list in the capability crate so command and UX layers cannot
+/// silently grow names that the gates do not enforce.
+pub const CAP_SHELL: &str = "shell";
+pub const CAP_TRANSFER: &str = "transfer";
+pub const CAP_MOUNT: &str = "mount";
+
+pub const CANONICAL_CAPABILITIES: &[&str] = &[CAP_SHELL, CAP_TRANSFER, CAP_MOUNT];
+
+/// Scoped-default actions classified by the fleet gate.
+pub const SCOPED_DEFAULT_ACTIONS: &[&str] = &[CAP_TRANSFER, CAP_MOUNT];
+
+// Known residual: gate action parameters remain `&str`, so a future call site
+// can still pass an unregistered literal. A typed Action newtype is a follow-up
+// hardening task; current predicates and tests cover the declared vocabulary.
+
+/// Normalize and validate a capability name at an API boundary.
+pub fn canonical_capability(name: &str) -> Result<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "send" | "inbox") {
+        bail!("capability '{normalized}' is not currently grantable; use 'transfer', which covers both directions")
+    }
+    if CANONICAL_CAPABILITIES.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        bail!("unknown capability '{name}' (valid: {})", CANONICAL_CAPABILITIES.join(", "))
+    }
+}
+
 /// Hybrid logical clock: version = max(wall_clock_ms, last_seen + 1).
 pub fn hlc_next(last_seen: u64, now_ms: u64) -> u64 {
     std::cmp::max(now_ms, last_seen.saturating_add(1))
@@ -520,15 +550,24 @@ pub fn evaluate_grants_only(
 /// The scoped-default action set a same-owner Proven fleet device may exercise
 /// with NO explicit grant — each bounded to a scope the GATE enforces:
 ///   - `transfer` → into the designated inbox directory (not arbitrary paths)
-///   - `reach`    → only ports the owner has explicitly exposed (`expose.json`)
 ///   - `mount`    → READ-ONLY, of the explicit share root (never home)
 /// Deliberate-tier actions (`shell`, write-mount, reach-all-ports, mount of a
 /// broader root) are NEVER in this set and always require an explicit grant.
 /// (Note: the l2-open port-forward gate labels its cap action `shell`; the gate
 /// there passes `scoped_in_bounds` computed from `expose.json` directly rather
-/// than routing "reach" through this classifier — see cap_gate_effective callers.)
+/// than routing port reach through this classifier — see cap_gate_effective callers.)
 pub fn is_scoped_default_action(action: &str) -> bool {
-    matches!(action, "transfer" | "reach" | "mount")
+    SCOPED_DEFAULT_ACTIONS.contains(&action)
+}
+
+/// Deliberate capability classified by the grant-only gate.
+pub fn is_deliberate_capability(action: &str) -> bool {
+    action == CAP_SHELL
+}
+
+/// True when an action is classified by one of the capability gate predicates.
+pub fn is_enforced_capability(action: &str) -> bool {
+    is_scoped_default_action(action) || is_deliberate_capability(action)
 }
 
 /// Same-owner fleet auto-trust decision, PROVEN-GATED. Grants a scoped default to
@@ -1396,6 +1435,33 @@ mod tests {
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
+
+    #[test]
+    fn canonical_capabilities_reject_unknown_names() {
+        for capability in CANONICAL_CAPABILITIES {
+            assert_eq!(canonical_capability(capability).unwrap(), *capability);
+        }
+        assert!(canonical_capability("all-ports").is_err());
+        assert!(canonical_capability("typo").is_err());
+        let send_err = canonical_capability("send").unwrap_err().to_string();
+        assert!(send_err.contains("not currently grantable"));
+        assert!(send_err.contains("covers both directions"));
+        assert!(canonical_capability("inbox").is_err());
+    }
+
+    #[test]
+    fn canonical_capabilities_normalize_case_and_whitespace() {
+        assert_eq!(canonical_capability(" SHELL ").unwrap(), "shell");
+    }
+
+    #[test]
+    fn gated_actions_are_canonical_and_canonical_actions_are_gated() {
+        for capability in CANONICAL_CAPABILITIES {
+            // This checks grantable vocabulary against declared classification, not enforcement.
+            // The CLI behavioral authorization test covers the latter for shell.
+            assert!(is_enforced_capability(capability), "canonical capability '{capability}' is not classified");
+        }
+    }
 
     fn make_owner() -> Ed25519KeyPair {
         let rng = SystemRandom::new();
@@ -2790,12 +2856,11 @@ mod tests {
     // Fleet auto-trust (same-owner Proven-gated scoped defaults)
     // ----------------------------------------------------------------------
 
-    /// The scoped-default classifier: transfer/reach/mount are auto-grantable
+    /// The scoped-default classifier: transfer/mount are auto-grantable
     /// to a same-owner Proven device; the deliberate tier is not.
     #[test]
     fn is_scoped_default_action_classifies_tiers() {
         assert!(is_scoped_default_action("transfer"));
-        assert!(is_scoped_default_action("reach"));
         assert!(is_scoped_default_action("mount"));
         // Deliberate tier and unknowns are never auto.
         assert!(!is_scoped_default_action("shell"));

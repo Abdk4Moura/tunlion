@@ -77,7 +77,6 @@ pub fn echo_cmd(cmd: &str) -> String {
 /// Confirmation tokens (exact, as specified).
 pub const CONFIRM_SHELL: &str = "SHELL";
 pub const CONFIRM_WRITE: &str = "WRITE";
-pub const CONFIRM_ALL_PORTS: &str = "ALL-PORTS";
 pub const CONFIRM_REUSE: &str = "REUSE";
 
 /// Exit codes.
@@ -92,7 +91,6 @@ mod tests {
     fn confirm_tokens_are_exact() {
         assert_eq!(CONFIRM_SHELL, "SHELL");
         assert_eq!(CONFIRM_WRITE, "WRITE");
-        assert_eq!(CONFIRM_ALL_PORTS, "ALL-PORTS");
         assert_eq!(CONFIRM_REUSE, "REUSE");
     }
 
@@ -101,4 +99,5 @@ mod tests {
         assert_eq!(EXIT_BAD_ARG, 2);
         assert_eq!(EXIT_REFUSED, 1);
     }
+
 }

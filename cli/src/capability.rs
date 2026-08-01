@@ -774,6 +774,33 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// TASK #15 known-bug regression pin: a same-owner, Proven, in-scope fleet
+    /// device is currently auto-authorized even with no explicit grants. This
+    /// fleet auto-trust bypass means revoking every capability from a lost
+    /// laptop still leaves transfer, reach, and mount access. Cert-revocation
+    /// work must flip this assertion to Deny, not replace this test.
+    #[test]
+    fn known_bug_fleet_auto_trust_survives_capability_revoke() {
+        let user_pub = [0xaa; 32];
+        let device_pub = [0xcc; 32];
+        let decision = cap_gate_effective(
+            false,
+            &CapOutcome::Denied("all grants revoked".into()),
+            CAP_TRANSFER,
+            "self",
+            Some(&device_pub),
+            Some(&user_pub),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&user_pub),
+            true,
+            false,
+        );
+        assert!(matches!(decision, GateDecision::Allow),
+            "KNOWN BUG: revoking every capability leaves fleet auto-trust intact; this assertion documents current behavior and MUST invert to Denied when cert revocation lands");
+    }
+
     /// Per-action shadow counters must bucket each action independently so
     /// the flip decision can cite a coverage matrix, not just a total.
     /// One mis-bucketed counter could satisfy flip_ready silently.
@@ -963,6 +990,7 @@ mod tests {
             resource: "self".to_string(),
             ..hdr.clone()
         };
+        let bob_user_pub = [0xaa; 32];
 
         // Grant shell (resource="self" matches the stored header)
         let v1 = hlc_next(0, now_ms());
@@ -973,10 +1001,19 @@ mod tests {
         hdr_json["resource"] = serde_json::json!("self");
         store.push(hdr_json);
         apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
+        let tmp = std::env::temp_dir().join(format!("fil-recon-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+
+        // The signed grant must reach the production authorization boundary.
+        let authorized = cap_authorize(
+            &tmp, "self", "shell", Some(&[0xcc; 32]), Some(&bob_user_pub), None,
+        );
+        assert_eq!(authorized, CapOutcome::Authorized,
+            "shell grant must authorize the device before revoke");
 
         // Write mock devices.json with cert for device "bob"
         // Use a distinct (non-owner) user_pub so the owner-always rule doesn't trigger
-        let bob_user_pub = [0xaa; 32];
         let cert_json = serde_json::json!({
             "devicePub": hex::encode([0xcc; 32]),
             "userPub": hex::encode(bob_user_pub),
@@ -993,9 +1030,6 @@ mod tests {
             "userKey": hex::encode(bob_user_pub),
         })];
 
-        let tmp = std::env::temp_dir().join(format!("fil-recon-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
         std::fs::write(&tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
 
         // Before revoke: device should NOT be in revoked list (has shell)
@@ -1007,6 +1041,11 @@ mod tests {
         let revoke = make_revoke(&owner, target, "self", v2, 86400);
         apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
         std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        let denied = cap_authorize(
+            &tmp, "self", "shell", Some(&[0xcc; 32]), Some(&bob_user_pub), None,
+        );
+        assert!(matches!(denied, CapOutcome::Denied(_)),
+            "shell revoke must deny the device after revoke");
 
         // After revoke: device MUST be in revoked list
         let after = devices_with_shell_revoked(&tmp);
