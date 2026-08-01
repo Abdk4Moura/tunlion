@@ -135,7 +135,7 @@ DERP by node key; we authenticate by the pairing signaling already performed):
 
 - When signaling matches two peers A and B (they are already exchanging offers), the
   signaling server issues each a short-lived **relay ticket**:
-  `ticket = { pair_id, side, exp, nonce, mac }` where
+  `ticket = { pair_id, side, exp, mac }` where
   - Two subkeys are derived from the shared key `k` with **domain separation** so no value
     can be reinterpreted across uses: `k_id = HKDF(k, "filament/relay/pair-id")` and
     `k_mac = HKDF(k, "filament/relay/ticket-mac")`. (Without this, `pair_id` and `mac` use
@@ -147,16 +147,56 @@ DERP by node key; we authenticate by the pairing signaling already performed):
     opaque to the relay beyond equality. `round_nonce` is fresh per pairing attempt.
   - `side` ∈ {0,1} so the relay pairs one of each and never joins two A's.
   - `exp` — a short expiry (target ~30s; must exceed expected attach latency, not more).
+    **Enforced at BOTH ends, and this duplication is deliberate.** The minter MUST clamp:
+    the issued `exp` is `min(requested, now + TTL)`, so an over-long ticket is never
+    created. The relay MUST independently reject any ticket whose `exp` exceeds
+    `now + TTL + skew`, regardless of MAC validity, so the bound holds even if signaling
+    is buggy or compromised. Each check is sufficient alone; neither may be removed on the
+    grounds that the other exists. (Same shape as the delegated ceiling enforced in both
+    `evaluate()` and `cap_gate_effective()`.) A declared TTL constant that nothing consults
+    is not enforcement: there MUST be a test that mints an over-long expiry and observes it
+    being clamped, and one that observes the relay refusing it.
     **Clock dependency:** signaling issues and the relay checks `exp`; if they are separate
     hosts they MUST share a clock source (NTP) or the relay MUST apply an explicit skew
     allowance, because a 30s window is small enough that a minute of drift makes every
-    ticket dead-on-arrival or valid far too long.
+    ticket dead-on-arrival or valid far too long. The skew allowance is MANDATORY, not
+    best-effort, and its value MUST be stated rather than left to the implementer.
   - `mac = HMAC_{k_mac}( pair_id || side || exp )` under the shared key `k` (verified by the
     relay offline; NOT a signaling callback — see §12). `round_nonce` is already committed
     inside `pair_id`, so the ticket carries no separate nonce.
+  - **MAC coverage is TOTAL BY CONSTRUCTION, not by enumeration.** The MAC is computed over
+    the canonical serialized ticket minus the MAC field itself, so adding a wire field
+    automatically extends coverage. Do not compute it from a hand-listed argument set: that
+    is a list which can silently fall out of step with the struct, leaving a field inside an
+    otherwise-authenticated structure that no reader will suspect is unauthenticated.
+  - **Encoding.** The MAC input above is fixed-width (32 + 1 + 8 = 41 bytes), so no framing
+    is needed there. Length prefixes belong where variable-length inputs actually occur:
+    inside the `pair_id` derivation, each session id and the nonce MUST be length-prefixed
+    before concatenation. Without that, distinct tuples collide on one HMAC input
+    (`("ab","c")` and `("a","bc")` are the same bytes).
 - Each peer presents its ticket in the `attach`. The relay verifies `mac`, checks `exp`,
   and pairs the two `attach`es that carry the same `pair_id` and opposite `side`. No valid
   ticket → no forwarding. Rate-limit ticket issuance per identity at the signaling server.
+
+**Key management: `k` is PER-RELAY, and rotatable.** This closes the two gaps left by
+"shared key with domain separation": which relay a ticket is valid at, and what happens when
+`k` must change.
+
+- **Per-relay keying.** The ticket binds a peer pair and an attempt, but nothing in it names
+  a relay. If several relays share one `k`, a ticket minted for one verifies at all of them.
+  The fix is deployment, not another MAC field: each relay gets its own `k`, so cross-relay
+  replay is impossible by construction rather than by a check someone must remember. Adding
+  a relay identifier to the ticket instead would be strictly worse, since it puts a value on
+  the wire that only matters if the check is performed.
+- **Rotation.** Tickets carry no key identifier, so rotating `k` today would invalidate
+  every in-flight ticket at the moment of the switch. Carry a small `kid` alongside `k` at
+  the relay and let it accept the current and immediately-previous key during an overlap
+  window at least as long as the ticket TTL. Signaling mints only under the current `kid`.
+  That makes rotation a rolling change rather than a flag day.
+- Until this section is implemented, do NOT invent a `kid` or version byte in the wire
+  format. An earlier reconstruction of this spec, written while the document itself was
+  unreachable, guessed at fields and had to be rebuilt; guessing a key-management format
+  would repeat that.
 - The ticket authorizes *forwarding between these two peers for this attempt only*. It is
   not a bearer credential for arbitrary relaying: it is pair-scoped, side-scoped, and
   short-lived. A leaked ticket buys ciphertext forwarding, not access (payload is
