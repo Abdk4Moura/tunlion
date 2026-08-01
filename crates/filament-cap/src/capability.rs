@@ -585,8 +585,9 @@ pub fn fleet_auto_trust(
     same_owner: bool,
     binding: BindingStrength,
     scoped_in_bounds: bool,
+    cert_not_revoked: bool,
 ) -> bool {
-    same_owner && binding == BindingStrength::Proven && scoped_in_bounds
+    same_owner && binding == BindingStrength::Proven && scoped_in_bounds && cert_not_revoked
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,15 +2880,17 @@ mod tests {
     #[test]
     fn fleet_auto_trust_matrix() {
         // same-owner Proven + in-scope → auto-trust
-        assert!(fleet_auto_trust(true, BindingStrength::Proven, true));
+        assert!(fleet_auto_trust(true, BindingStrength::Proven, true, true));
         // same-owner Proven + OUT of scope → no auto-trust (deliberate/out-of-bounds)
-        assert!(!fleet_auto_trust(true, BindingStrength::Proven, false));
+        assert!(!fleet_auto_trust(true, BindingStrength::Proven, false, true));
         // same-owner INFERRED + in-scope → NOTHING (the Proven gate)
-        assert!(!fleet_auto_trust(true, BindingStrength::Inferred, true));
+        assert!(!fleet_auto_trust(true, BindingStrength::Inferred, true, true));
         // same-owner None + in-scope → NOTHING
-        assert!(!fleet_auto_trust(true, BindingStrength::None, true));
+        assert!(!fleet_auto_trust(true, BindingStrength::None, true, true));
         // DIFFERENT owner + Proven + in-scope → deny-by-default (not my fleet)
-        assert!(!fleet_auto_trust(false, BindingStrength::Proven, true));
+        assert!(!fleet_auto_trust(false, BindingStrength::Proven, true, true));
+        // A local revocation must disable automatic fleet trust independently.
+        assert!(!fleet_auto_trust(true, BindingStrength::Proven, true, false));
     }
 
     /// `evaluate_grants_only` must NOT apply the owner shortcut: a peer that

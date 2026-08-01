@@ -1544,6 +1544,33 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     None
 }
 
+/// Local-only fleet certificate revocation marker. This deliberately lives
+/// beside the device record: no CRL or network dependency is introduced.
+fn device_cert_revoked(name: &str) -> bool {
+    let p = devices_path();
+    let Ok(raw) = std::fs::read_to_string(&p) else { return false };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    arr.iter()
+        .find(|d| d["name"].as_str() == Some(name))
+        .and_then(|d| d["certRevoked"].as_bool())
+        .unwrap_or(false)
+}
+
+/// Mark a stored device certificate revoked locally. The check path must
+/// consult this marker before granting fleet trust; expiry remains separate.
+fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p).unwrap_or_default();
+    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+        bail!("device '{name}' is not in the device store");
+    };
+    device["certRevoked"] = json!(revoked);
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
+        .context("atomic write devices.json")?;
+    Ok(())
+}
+
 fn load_owner_key() -> Option<crate::identity::UserKey> {
     crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten()
 }
@@ -13456,6 +13483,10 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = link
+                            .and_then(|l| l.verified_name.as_deref())
+                            .map(device_cert_revoked)
+                            .unwrap_or(false);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13475,7 +13506,7 @@ async fn recv_cmd(
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
                             &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
-                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
+                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant, cert_revoked);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -13616,6 +13647,10 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = link
+                            .and_then(|l| l.verified_name.as_deref())
+                            .map(device_cert_revoked)
+                            .unwrap_or(false);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13632,7 +13667,7 @@ async fn recv_cmd(
                         // Deliberate tier: `shell` is never a scoped default, so a
                         // same-owner device gets it ONLY via an explicit grant
                         // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant, cert_revoked)
                         }
                     };
                     if !granted.allowed() {
@@ -13731,6 +13766,10 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = link
+                            .and_then(|l| l.verified_name.as_deref())
+                            .map(device_cert_revoked)
+                            .unwrap_or(false);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13747,7 +13786,7 @@ async fn recv_cmd(
                         // Deliberate tier: `shell` is never a scoped default, so a
                         // same-owner device gets it ONLY via an explicit grant
                         // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant, cert_revoked)
                         }
                     };
                     if !granted.allowed() {
@@ -13900,6 +13939,10 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = link
+                            .and_then(|l| l.verified_name.as_deref())
+                            .map(device_cert_revoked)
+                            .unwrap_or(false);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -13945,7 +13988,7 @@ async fn recv_cmd(
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
-                         let d = crate::capability::cap_gate_effective(trusted, &outcome, crate::capability::CAP_MOUNT, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant);
+                         let d = crate::capability::cap_gate_effective(trusted, &outcome, crate::capability::CAP_MOUNT, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant, cert_revoked);
                         (d, read_only)
                     };
                     if !authorized.allowed() {
@@ -14520,12 +14563,16 @@ async fn recv_cmd(
                         // could still redirect the write — closed separately by the
                         // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
                         // a fleet-trust follow-up.
+                        let cert_revoked = link
+                            .and_then(|l| l.verified_name.as_deref())
+                            .map(device_cert_revoked)
+                            .unwrap_or(false);
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
                              &crate::settings::config_dir(), "self", crate::capability::CAP_TRANSFER, idev, iusr, ak_caps,
                         );
-                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_TRANSFER, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
+                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_TRANSFER, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant, cert_revoked);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {
