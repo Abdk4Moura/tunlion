@@ -516,8 +516,9 @@ pub async fn bind_tls_tcp_listener(
 /// handshake AND pass the pair-secret MAC wins.
 ///
 /// The `answerer` bit (which L2 sid half this end allocates from) is derived
-/// deterministically via `net::polite_role` — both ends compute the same result,
-/// so their sid spaces are ALWAYS disjoint. No caller can get this wrong.
+/// deterministically via `net::polite_role` — the two ends compute OPPOSITE
+/// bits, which is what keeps their L2 sid spaces disjoint. No caller can get
+/// this wrong.
 pub async fn race_connect_tls_tcp(
     listener: tokio::net::TcpListener,
     peer_cands: Vec<String>,
@@ -541,66 +542,64 @@ pub async fn race_connect_tls_tcp(
 
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = AuthResult> + Send>>> = Vec::new();
 
-    // Acceptor: loop accepting inbound TLS/TCP connections, authenticating
-    // each in its own task with a short timeout. A peer that connects and
-    // sends nothing is discarded after 3s, NOT allowed to hold the accept
-    // slot for the full DIRECT_BUDGET (the DoS fix). The first connection
-    // that passes auth wins; losers are dropped silently.
+    // Acceptor: loop accepting inbound TLS/TCP connections, spawning each
+    // connection's auth as a separate tokio task so we loop back to
+    // listener.accept() IMMEDIATELY. A silent peer holding a connection for
+    // 3s does NOT block the next accept — the attacker burns one task, not
+    // the accept slot. First task that passes auth sends the result back.
     {
         let tkey = tkey;
         let answerer = answerer;
         futs.push(Box::pin(async move {
+            let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<AuthResult>(4);
             loop {
-                let (tcp, _remote_addr) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    listener.accept(),
-                )
-                .await
-                .map_err(|_| anyhow!("tls-tcp accept timeout"))?
-                .map_err(|e| anyhow!("tls-tcp accept: {e}"))?;
+                tokio::select! {
+                    res = listener.accept() => {
+                        let (tcp, _remote_addr) = res.map_err(|e| anyhow!("tls-tcp accept: {e}"))?;
+                        let tkey = tkey;
+                        let done_tx = done_tx.clone();
+                        // Spawn: this connection's auth runs concurrently with
+                        // the next accept(). The 3s timeout is inside the task.
+                        tokio::spawn(async move {
+                            let result = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                async move {
+                                    let (transport, cb, _) = accept_tls_tcp(tcp, answerer).await?;
+                                    {
+                                        let tls = transport.tls.lock().await;
+                                        let auth_km = extract_auth_km(&*tls)?;
+                                        let my_tag = auth_tag(&tkey, &auth_km, "acceptor");
+                                        let their_expected = auth_tag(&tkey, &auth_km, "dialer");
+                                        drop(tls);
+                                        let mut tls = transport.tls.lock().await;
+                                        let mut peer_tag = [0u8; 32];
+                                        tls.read_exact(&mut peer_tag).await.map_err(|e| anyhow!("auth recv: {e}"))?;
+                                        if !ct_eq(&peer_tag, &their_expected) {
+                                            bail!("TLS-TCP-AUTH-FAIL: pair-secret MAC mismatch, rejecting peer");
+                                        }
+                                        tls.write_all(&my_tag).await.map_err(|e| anyhow!("auth send: {e}"))?;
+                                    }
+                                    Ok((transport, cb))
+                                }
+                            ).await;
 
-                // Per-connection auth with a short timeout so a silent peer
-                // can't hold this slot. Spawn as a task so we can loop back
-                // to accept() immediately for the next connection.
-                let tkey = tkey;
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    async move {
-                        let (transport, cb, _) = accept_tls_tcp(tcp, answerer).await?;
-                        {
-                            let tls = transport.tls.lock().await;
-                            let auth_km = extract_auth_km(&*tls)?;
-                            let my_tag = auth_tag(&tkey, &auth_km, "acceptor");
-                            let their_expected = auth_tag(&tkey, &auth_km, "dialer");
-                            drop(tls);
-                            let mut tls = transport.tls.lock().await;
-                            let mut peer_tag = [0u8; 32];
-                            tls.read_exact(&mut peer_tag).await.map_err(|e| anyhow!("auth recv: {e}"))?;
-                            if !ct_eq(&peer_tag, &their_expected) {
-                                bail!("TLS-TCP-AUTH-FAIL: pair-secret MAC mismatch, rejecting peer");
+                            match result {
+                                Ok(Ok(transport_cb)) => { let _ = done_tx.send(Ok(transport_cb)).await; }
+                                Ok(Err(e)) => {
+                                    let s = e.to_string();
+                                    if s.contains("TLS-TCP-AUTH-FAIL") {
+                                        crate::ui::trace(&format!("filament: {s}"));
+                                    }
+                                }
+                                Err(_) => {
+                                    crate::ui::trace("filament: tls-tcp accept conn timed out (silent peer), discarded");
+                                }
                             }
-                            tls.write_all(&my_tag).await.map_err(|e| anyhow!("auth send: {e}"))?;
-                        }
-                        Ok((transport, cb))
+                        });
                     }
-                ).await;
-
-                match result {
-                    Ok(Ok(transport_cb)) => return Ok(transport_cb),
-                    Ok(Err(e)) => {
-                        // Auth failed or TLS error — log and accept next.
-                        let s = e.to_string();
-                        if s.contains("TLS-TCP-AUTH-FAIL") {
-                            crate::ui::trace(&format!("filament: {s}"));
-                        }
-                        continue;
-                    }
-                    Err(_) => {
-                        // Per-connection timeout — silent peer, discard and
-                        // accept next. This is the DoS fix: we loop back to
-                        // listener.accept() immediately.
-                        crate::ui::trace("filament: tls-tcp accept conn timed out (silent peer), retrying");
-                        continue;
+                    Some(res) = done_rx.recv() => {
+                        // A spawned task completed auth successfully.
+                        return res;
                     }
                 }
             }
@@ -678,4 +677,93 @@ fn now_ms() -> u64 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+// ============================================================== tests ==
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that polite_role produces opposite answerer bits for two peers,
+    /// and that the resulting L2 sid spaces are disjoint. This is the actual
+    /// proof that the answerer-bit fix works — a single-stream test cannot
+    /// catch the collision because it only manifests when both ends allocate
+    /// L2 sids on the same link.
+    #[test]
+    fn sid_disjoint_both_ends_via_polite_role() {
+        // Simulate two peers with different uids and ids.
+        let uid_a = "user-alpha";
+        let uid_b = "user-beta";
+        let id_a = "device-aaa";
+        let id_b = "device-bbb";
+
+        // Both ends compute their answerer bit via polite_role.
+        let answerer_a = crate::net::polite_role(uid_a, Some(uid_b), id_a, id_b);
+        let answerer_b = crate::net::polite_role(uid_b, Some(uid_a), id_b, id_a);
+
+        // They MUST be opposite — that's the invariant polite_role guarantees.
+        assert_ne!(
+            answerer_a, answerer_b,
+            "polite_role must return opposite bits for the two ends"
+        );
+
+        // Simulate L2 sid allocation: each end generates sids in a loop.
+        // The role bit is 0x4000_0000 for the answerer, 0 for the dialer.
+        let role_a: u32 = if answerer_a { 0x4000_0000 } else { 0 };
+        let role_b: u32 = if answerer_b { 0x4000_0000 } else { 0 };
+
+        let mut sids_a = std::collections::HashSet::new();
+        let mut sids_b = std::collections::HashSet::new();
+        for i in 0..1000u32 {
+            sids_a.insert(role_a | i);
+            sids_b.insert(role_b | i);
+        }
+
+        // The two sets must be completely disjoint.
+        let overlap: Vec<_> = sids_a.intersection(&sids_b).collect();
+        assert!(
+            overlap.is_empty(),
+            "L2 sid spaces overlap! {} colliding sids, first: {:?}",
+            overlap.len(),
+            overlap.first()
+        );
+
+        // Also verify the specific sid_answerer() field matches.
+        // (We can't construct a real TlsTcpTransport without a TLS session,
+        // but we can verify the bit that feeds into sid_answerer().)
+        assert_eq!(role_a ^ role_b, 0x4000_0000, "roles must differ by exactly the answerer bit");
+    }
+
+    /// Edge case: same uid (two devices under one account) falls back to id comparison.
+    #[test]
+    fn sid_disjoint_same_uid_different_id() {
+        let uid = "shared-user";
+        let id_a = "device-aaa";
+        let id_b = "device-bbb";
+
+        let answerer_a = crate::net::polite_role(uid, Some(uid), id_a, id_b);
+        let answerer_b = crate::net::polite_role(uid, Some(uid), id_b, id_a);
+
+        assert_ne!(
+            answerer_a, answerer_b,
+            "same uid, different ids must still produce opposite bits"
+        );
+    }
+
+    /// Edge case: symmetric identity (swapped uids produce consistent results).
+    #[test]
+    fn sid_disjoint_symmetric() {
+        let uid_a = "alpha";
+        let uid_b = "beta";
+        let id_a = "s1";
+        let id_b = "s2";
+
+        // Run 100 times with swapped order to verify determinism.
+        for _ in 0..100 {
+            let a = crate::net::polite_role(uid_a, Some(uid_b), id_a, id_b);
+            let b = crate::net::polite_role(uid_b, Some(uid_a), id_b, id_a);
+            assert_ne!(a, b, "polite_role must be antisymmetric");
+        }
+    }
 }
