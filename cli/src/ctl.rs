@@ -442,9 +442,9 @@ mod imp {
     }
 
     /// Ask the daemon to approve a pending request by id.
-    pub async fn try_approve_request(id: u64) -> Option<Value> {
+    pub async fn try_approve_request(id: u64, allow: &str, expires: u64) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "approve-request", "id": id });
+        let req = json!({ "op": "approve-request", "id": id, "allow": allow, "expires": expires });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -534,7 +534,7 @@ mod imp {
         /// List pending consent requests.
         ListPending,
         /// Approve a pending request by id.
-        ApproveRequest { id: u64 },
+        ApproveRequest { id: u64, allow: String, expires: u64 },
         /// Deny a pending request by id.
         DenyRequest { id: u64 },
         /// Arm the daemon for enrollment: a minted auth key is outstanding.
@@ -691,7 +691,9 @@ mod imp {
                     Some("list-pending") => ReqKind::ListPending,
                     Some("approve-request") => {
                         let Some(id) = v["id"].as_u64() else { return };
-                        ReqKind::ApproveRequest { id }
+                        let Some(allow) = v["allow"].as_str().map(str::to_string) else { return };
+                        let Some(expires) = v["expires"].as_u64() else { return };
+                        ReqKind::ApproveRequest { id, allow, expires }
                     }
                     Some("deny-request") => {
                         let Some(id) = v["id"].as_u64() else { return };
