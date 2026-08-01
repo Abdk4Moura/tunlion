@@ -964,6 +964,33 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
+    /// Mint a scoped, expiring key for another machine to join.
+    Mint {
+        /// Mint a key for a device in your fleet.
+        #[arg(long)]
+        fleet: bool,
+        /// Mint a narrow key for this paired external device.
+        #[arg(long)]
+        external: Option<String>,
+        /// Mint a single-use CI/automation key.
+        #[arg(long)]
+        ci: bool,
+        /// Key lifetime, such as 1h or 15m.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Reuse policy: once, N(3), or reusable.
+        #[arg(long)]
+        reuse: Option<String>,
+        /// Capabilities to grant (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Paired audience name for a CI key.
+        #[arg(long)]
+        audience: Option<String>,
+        /// Do not prompt for deliberate choices.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Mint auth keys or enroll as an ephemeral delegated device.
     #[command(hide = true)]
     Ephemeral {
@@ -3087,58 +3114,187 @@ fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
     }
 }
 
+fn request_ago(timestamp: u64) -> String {
+    let ago = crate::capability::now_secs().saturating_sub(timestamp);
+    if ago < 60 {
+        format!("{ago}s ago")
+    } else if ago < 3600 {
+        format!("{}m ago", ago / 60)
+    } else {
+        format!("{}h ago", ago / 3600)
+    }
+}
+
+fn request_entry(value: &Value) -> Option<fleet_ui::requests::RequestEntry> {
+    let capability = value["capability"].as_str()?;
+    Some(fleet_ui::requests::RequestEntry {
+        id: value["id"].as_u64()?,
+        peer: value["peer"].as_str()?.to_string(),
+        capability: capability.to_string(),
+        ago: request_ago(value["timestamp"].as_u64().unwrap_or(0)),
+        // The request protocol does not carry provenance or a fingerprint.
+        via: None,
+        fingerprint: None,
+        is_deliberate: fleet_ui::is_deliberate_capability(capability),
+    })
+}
+
+fn request_entries(value: &Value, all: bool) -> Vec<fleet_ui::requests::RequestEntry> {
+    value
+        .get("requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|request| all || request["status"].as_str() == Some("pending"))
+        .filter_map(request_entry)
+        .collect()
+}
+
+fn local_request(id: u64) -> Option<PendingRequest> {
+    load_requests().into_iter().find(|request| request.id == id)
+}
+
+fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
+    value
+        .and_then(|v| v.get("links"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|link| link["warm"].as_bool() == Some(true))
+        .filter_map(|link| link["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn pending_request_count(value: Option<&Value>) -> usize {
+    value
+        .and_then(|v| v.get("requests"))
+        .and_then(Value::as_array)
+        .map(|requests| {
+            requests
+                .iter()
+                .filter(|request| request["status"].as_str() == Some("pending"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
+    let Some(cert) = cert else {
+        return "promote to continue".to_string();
+    };
+    let now = identity::now_secs();
+    if cert.expires <= now {
+        let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
+            .map(|at| at.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "expired".to_string());
+        return match tier {
+            fleet_ui::devices::DeviceTier::Fleet => format!("renews until {date}"),
+            _ => format!("expired {date}"),
+        };
+    }
+    let minutes = (cert.expires - now).saturating_add(59) / 60;
+    match tier {
+        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {minutes}m"),
+        _ => format!("expires in {minutes}m"),
+    }
+}
+
+fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
+    let mut labels = Vec::new();
+    for cap in caps {
+        let label = match (tier, cap.as_str()) {
+            (fleet_ui::devices::DeviceTier::External, "transfer") => "send→you",
+            (_, "transfer") => "inbox",
+            (_, "shell") => "shell",
+            (_, "mount") => "mount",
+            (_, "send") => "send→you",
+            (_, "read") => "read ~/share",
+            _ => cap.as_str(),
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        "(none)".to_string()
+    } else {
+        labels.join(" ")
+    }
+}
+
+fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
+    let warm_names = warm_device_names(warm);
+    let owner = load_owner_key().map(|key| key.public_key_bytes());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    devices_load()
+        .into_iter()
+        .map(|(name, _secret)| {
+            let cert = device_cert_for(&name);
+            let tier = match cert.as_ref() {
+                None => fleet_ui::devices::DeviceTier::NeedsReview,
+                Some(cert) if owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
+                Some(_) => fleet_ui::devices::DeviceTier::External,
+            };
+            let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+            let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
+            let address = stored_v6.or(stored_v4);
+            let last_seen = (last_seen > 0).then(|| {
+                let ago = now.saturating_sub(last_seen);
+                if ago < 60 {
+                    "just now".to_string()
+                } else if ago < 3600 {
+                    format!("{}m ago", ago / 60)
+                } else if ago < 86400 {
+                    format!("{}h ago", ago / 3600)
+                } else {
+                    format!("{}d ago", ago / 86400)
+                }
+            });
+            let needs_promote = tier == fleet_ui::devices::DeviceTier::NeedsReview;
+            let caps_summary = if needs_promote {
+                "(full legacy trust)".to_string()
+            } else {
+                device_caps_summary(&caps, tier)
+            };
+            let caps_summary = match address {
+                Some(address) => format!("{caps_summary}  {address}"),
+                None => caps_summary,
+            };
+            fleet_ui::devices::DeviceEntry {
+                name: name.clone(),
+                tier,
+                online: warm_names.contains(&name),
+                caps_summary,
+                countdown: if needs_promote {
+                    String::new()
+                } else {
+                    device_countdown(tier, cert.as_ref())
+                },
+                last_seen,
+                needs_promote,
+            }
+        })
+        .collect()
+}
+
 /// CLI handler for `filament requests`
 async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     match action {
         None | Some(RequestsAction::List { all: false }) => {
             let reply = crate::ctl::try_list_pending().await;
             match reply {
-                Some(v) => {
-                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
-                        if reqs.is_empty() {
-                            ui::say("  no pending requests");
-                        } else {
-                            for r in reqs {
-                                let id = r["id"].as_u64().unwrap_or(0);
-                                let peer = r["peer"].as_str().unwrap_or("?");
-                                let cap = r["capability"].as_str().unwrap_or("?");
-                                let status = r["status"].as_str().unwrap_or("?");
-                                let ts = r["timestamp"].as_u64().unwrap_or(0);
-                                let ago = crate::capability::now_secs().saturating_sub(ts);
-                                let when = if ago < 60 { format!("{ago}s ago") }
-                                    else if ago < 3600 { format!("{}m ago", ago/60) }
-                                    else { format!("{}h ago", ago/3600) };
-                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
-                            }
-                        }
-                    }
-                }
+                Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(&v, false))),
                 None => ui::say("  daemon not running; no pending request state"),
             }
         }
         Some(RequestsAction::List { all: true }) => {
             let reply = crate::ctl::try_list_pending().await;
             match reply {
-                Some(v) => {
-                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
-                        if reqs.is_empty() {
-                            ui::say("  no requests");
-                        } else {
-                            for r in reqs {
-                                let id = r["id"].as_u64().unwrap_or(0);
-                                let peer = r["peer"].as_str().unwrap_or("?");
-                                let cap = r["capability"].as_str().unwrap_or("?");
-                                let status = r["status"].as_str().unwrap_or("?");
-                                let ts = r["timestamp"].as_u64().unwrap_or(0);
-                                let ago = crate::capability::now_secs().saturating_sub(ts);
-                                let when = if ago < 60 { format!("{ago}s ago") }
-                                    else if ago < 3600 { format!("{}m ago", ago/60) }
-                                    else { format!("{}h ago", ago/3600) };
-                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
-                            }
-                        }
-                    }
-                }
+                Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(&v, true))),
                 None => ui::say("  daemon not running; no request state"),
             }
         }
@@ -3149,6 +3305,9 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                 Some(v) => {
                     if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
                         if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
+                            // Do not call render_approve_success here. The capability
+                            // layer has no bounded-grant contract yet, so its expiry
+                            // would be false while device_set_cap persists access.
                             ui::say(&format!(
                                 "  {} approved {cap} for {peer} until {expires}",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
@@ -3160,14 +3319,139 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
             }
         }
         Some(RequestsAction::Deny { id }) => {
+            let peer = local_request(id).map(|request| request.peer);
             let reply = crate::ctl::try_deny_request(id).await;
             match reply {
-                Some(_) => ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
+                Some(_) => {
+                    if let Some(peer) = peer {
+                        ui::say(&fleet_ui::requests::render_deny_success(&peer));
+                    } else {
+                        ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    }
+                }
                 None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
             }
         }
     }
     Ok(())
+}
+
+/// CLI handler for `filament ephemeral`
+fn parse_mint_ttl(raw: &str) -> Result<u64> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (number, unit) = raw.split_at(raw.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
+    let value: u64 = number.parse().map_err(|_| anyhow!("invalid --ttl '{raw}'"))?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("invalid --ttl '{raw}', use a duration such as 15m or 1h"),
+    };
+    Ok(value.saturating_mul(multiplier))
+}
+
+fn mint_capability(raw: &str) -> Result<String> {
+    match raw {
+        "send" => Ok("transfer".to_string()),
+        "write" => Ok("mount".to_string()),
+        "shell" | "mount" | "all-ports" | "transfer" => Ok(raw.to_string()),
+        "reuse" => bail!("reuse is a lifetime option, not a capability"),
+        "mesh" => {
+            let (message, _) = fleet_ui::mint::err_mesh_not_grantable();
+            bail!("{message}")
+        }
+        other => bail!("unsupported capability '{other}'"),
+    }
+}
+
+async fn mint_cmd(
+    server: &str,
+    fleet: bool,
+    external: Option<String>,
+    ci: bool,
+    ttl: Option<String>,
+    reuse: Option<String>,
+    allow: Vec<String>,
+    audience: Option<String>,
+    _yes: bool,
+    relay: bool,
+) -> Result<()> {
+    let is_external = external.is_some();
+    let selected = fleet as u8 + external.is_some() as u8 + ci as u8;
+    if selected != 1 {
+        let (message, _) = fleet_ui::mint::err_needs_key_type();
+        bail!("{message}");
+    }
+    let key_type = if fleet { fleet_ui::mint::KeyType::Fleet } else if ci { fleet_ui::mint::KeyType::CI } else { fleet_ui::mint::KeyType::External };
+    let default_ttl = if ci { "15m" } else { "1h" };
+    let ttl_text = ttl.as_deref().unwrap_or(default_ttl);
+    let ttl_secs = parse_mint_ttl(ttl_text)?;
+    if is_external && ttl_secs > 24 * 3600 {
+        let (message, _) = fleet_ui::mint::err_over_ttl();
+        bail!("{message}");
+    }
+
+    let mut caps = Vec::new();
+    for raw in &allow {
+        let cap = mint_capability(raw)?;
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    if is_external && caps.is_empty() {
+        bail!("external keys need at least one --allow capability");
+    }
+    if ci && audience.is_none() {
+        bail!("CI keys require --audience <paired-device>");
+    }
+    if caps.is_empty() {
+        caps.push("transfer".to_string());
+    }
+
+    let audience_name = external.or(audience);
+    let audience = audience_name
+        .map(|name| {
+            device_cert_for(&name)
+                .map(|cert| hex::encode(cert.device_pub))
+                .ok_or_else(|| anyhow!("no certified paired device named '{name}'"))
+        })
+        .transpose()?;
+    let lifetime = fleet_ui::mint::Lifetime {
+        ttl: ttl_text.to_string(),
+        reuse: match reuse.as_deref().unwrap_or("once").to_ascii_lowercase().as_str() {
+            "once" => fleet_ui::mint::Reuse::Once,
+            "reusable" => fleet_ui::mint::Reuse::Reusable,
+            value if value.starts_with("n(") && value.ends_with(')') => fleet_ui::mint::Reuse::Times(value[2..value.len() - 1].parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
+            value => fleet_ui::mint::Reuse::Times(value.parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
+        },
+        max_ttl: if ci { "15m".to_string() } else { "24h".to_string() },
+    };
+    let mint_caps = fleet_ui::mint::MintCaps {
+        shell: caps.iter().any(|cap| cap == "shell"),
+        write: caps.iter().any(|cap| cap == "mount"),
+        all_ports: caps.iter().any(|cap| cap == "all-ports"),
+    };
+    eprintln!("{}", fleet_ui::mint::render_header());
+    eprintln!("{}", fleet_ui::mint::render_summary(key_type, &mint_caps));
+    eprintln!("{}", fleet_ui::mint::render_lifetime(&lifetime));
+
+    ephemeral_cmd(
+        server,
+        EphemeralAction::Mint {
+            caps,
+            audience: audience.into_iter().collect(),
+            ttl: ttl_secs,
+            reuse: match lifetime.reuse {
+                fleet_ui::mint::Reuse::Once => "Once".to_string(),
+                fleet_ui::mint::Reuse::Times(n) => format!("N({n})"),
+                fleet_ui::mint::Reuse::Reusable => "Reusable".to_string(),
+            },
+            tag: if ci { "ci".to_string() } else if is_external { "external".to_string() } else { "fleet".to_string() },
+        },
+        relay,
+    )
+    .await
 }
 
 /// CLI handler for `filament ephemeral`
@@ -4365,6 +4649,11 @@ fn cancelled() -> anyhow::Error {
 }
 
 async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
+    if code.is_none() && word.is_none() && !interactive_allowed() {
+        let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
+        eprintln!("{message}");
+        std::process::exit(exit_code);
+    }
     // INTERACTIVE GATE (scripts safe by default, see `interactive_allowed`).
     //   * `pair` with no code AND no --word -> guided CREATE entry. Empty submit
     //     falls back to today's auto-mint; typed words become the chosen password.
@@ -4600,7 +4889,21 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         }
                     }
                 } else {
+                let same_person = peer_identity_cert
+                    .as_ref()
+                    .and_then(|cert| load_owner_key().map(|owner| owner.public_key_bytes() == cert.user_pub))
+                    .unwrap_or(false);
+                // External pairs currently receive only the baseline transfer
+                // capability. Do not render render_someone_else_banner or
+                // render_inter_user_form: pair has no bounded per-cap grant
+                // contract, so those surfaces would claim choices it ignores.
+                // Do not render render_pake_words: the pair code is not a
+                // transcript-derived SAS; showing it as trust would invert the
+                // MITM check. A real SAS belongs in the crypto gate.
                 // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
+                if same_person {
+                    ui::say(&fleet_ui::pair_ui::render_same_person_banner(&n));
+                }
                 if peer_identity_cert.is_none() {
                     let p = devices_path();
                     if let Ok(raw) = std::fs::read_to_string(&p) {
@@ -4624,12 +4927,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     store_provisional_identity(&n, pcert)
                         .context("store provisional")?;
                 }
-                ui::say(&format!(
-                    "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
-                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                    ui::paint(ui::Tone::Bold, &n),
-                ));
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                if same_person {
+                    ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
+                } else {
+                    ui::say(&format!(
+                        "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        ui::paint(ui::Tone::Bold, &n),
+                    ));
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                }
                 tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                 let _ = sio.disconnect().await;
                 return Ok(());                } // close identity_exchange_window else
@@ -8996,28 +9303,13 @@ async fn main() -> Result<()> {
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&arr)?);
                     } else {
-                        if all.is_empty() {
-                            println!("no known devices yet, run `filament pair` to add one");
-                        } else {
-                            let mut table = ui::Table::new(&["NAME", "ADDRESS", "GRANTED", "LAST SEEN"]);
-                            for (n, _) in &all {
-                                let (last_seen, v6, v4) = devices_info(n).unwrap_or((0, None, None));
-                                let addr = v6.as_deref().or(v4.as_deref()).unwrap_or("-");
-                                let caps = device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]);
-                                let last_seen_str = if last_seen == 0 {
-                                    "never".to_string()
-                                } else {
-                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                                    let ago = now.saturating_sub(last_seen);
-                                    if ago < 60 { "just now".to_string() }
-                                    else if ago < 3600 { format!("{}m ago", ago / 60) }
-                                    else if ago < 86400 { format!("{}h ago", ago / 3600) }
-                                    else { format!("{}d ago", ago / 86400) }
-                                };
-                                table.row(&[n, addr, &caps.join(", "), &last_seen_str]);
-                            }
-                            table.print();
-                        }
+                        let warm = ctl::try_list_warm().await;
+                        let pending = ctl::try_list_pending().await;
+                        let rendered = fleet_ui::devices::render_devices(
+                            &device_entries(warm.as_ref()),
+                            pending_request_count(pending.as_ref()),
+                        );
+                        println!("{rendered}");
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
@@ -9486,6 +9778,9 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Mint { fleet, external, ci, ttl, reuse, allow, audience, yes } => {
+            mint_cmd(&server, fleet, external, ci, ttl, reuse, allow, audience, yes, relay).await
+        }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
