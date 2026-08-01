@@ -21,6 +21,18 @@ pub struct MintCaps {
     pub write: bool,
 }
 
+/// Capability names emitted by the mint form, derived from its actual toggles.
+pub fn emitted_capabilities(caps: &MintCaps) -> Vec<&'static str> {
+    let mut names = vec!["transfer"];
+    if caps.shell {
+        names.push("shell");
+    }
+    if caps.write {
+        names.push("mount");
+    }
+    names
+}
+
 /// Reuse policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reuse {
@@ -187,12 +199,7 @@ pub fn render_completion(code: &str, key_type: KeyType, caps: &MintCaps, lifetim
         KeyType::CI => ui::paint(Tone::Dim, "CI key"),
     };
 
-    let caps_str = {
-        let mut parts = vec![];
-        if caps.shell { parts.push("shell"); }
-        if caps.write { parts.push("write"); }
-        if parts.is_empty() { String::new() } else { format!(" · {}", parts.join(", ")) }
-    };
+    let caps_str = format!(" · {}", emitted_capabilities(caps).join(", "));
 
     let reuse_str = match &lifetime.reuse {
         Reuse::Once => "once",
@@ -302,6 +309,18 @@ mod tests {
         let summary = render_summary(KeyType::Fleet, &caps);
         // Shell is deliberate, so should show ⚠ glyph
         assert!(summary.contains("open a shell — a real terminal"), "shell-on must show deliberate description");
+    }
+
+    #[test]
+    fn emitted_capabilities_are_enforcement_subset() {
+        for caps in [MintCaps { shell: false, write: false }, MintCaps { shell: true, write: true }] {
+            for capability in emitted_capabilities(&caps) {
+                assert!(
+                    crate::capability::CANONICAL_CAPABILITIES.contains(&capability),
+                    "mint emitted capability '{capability}' is not enforced"
+                );
+            }
+        }
     }
 
     #[test]

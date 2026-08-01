@@ -79,10 +79,6 @@ pub const CONFIRM_SHELL: &str = "SHELL";
 pub const CONFIRM_WRITE: &str = "WRITE";
 pub const CONFIRM_REUSE: &str = "REUSE";
 
-/// Capability names surfaced by the fleet UX. Keep this as a checked subset of
-/// the enforcement vocabulary, never as a second source of valid names.
-pub const UX_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "send", "inbox"];
-
 /// Exit codes.
 pub const EXIT_BAD_ARG: i32 = 2;
 pub const EXIT_REFUSED: i32 = 1;
@@ -104,13 +100,4 @@ mod tests {
         assert_eq!(EXIT_REFUSED, 1);
     }
 
-    #[test]
-    fn ux_capabilities_are_enforcement_subset() {
-        for capability in UX_CAPABILITIES {
-            assert!(
-                crate::capability::CANONICAL_CAPABILITIES.contains(capability),
-                "UX capability '{capability}' is missing from enforcement vocabulary"
-            );
-        }
-    }
 }

@@ -37,13 +37,22 @@ use serde_json::Value;
 ///
 /// Keep this list in the capability crate so command and UX layers cannot
 /// silently grow names that the gates do not enforce.
-pub const CANONICAL_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "send", "inbox"];
+pub const CANONICAL_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "reach"];
+
+/// Action names used by the capability gates. Keep this independent from the
+/// canonical list so tests catch both omitted gates and inert canonical names.
+pub const ENFORCED_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "reach"];
 
 /// Normalize and validate a capability name at an API boundary.
 pub fn canonical_capability(name: &str) -> Result<String> {
     let normalized = name.trim().to_ascii_lowercase();
-    if CANONICAL_CAPABILITIES.contains(&normalized.as_str()) {
-        Ok(normalized)
+    let canonical = match normalized.as_str() {
+        // User-facing grant vocabulary; both aliases mean the transfer action.
+        "send" | "inbox" => "transfer",
+        value => value,
+    };
+    if CANONICAL_CAPABILITIES.contains(&canonical) {
+        Ok(canonical.to_string())
     } else {
         bail!("unknown capability '{name}' (valid: {})", CANONICAL_CAPABILITIES.join(", "))
     }
@@ -1420,11 +1429,23 @@ mod tests {
         }
         assert!(canonical_capability("all-ports").is_err());
         assert!(canonical_capability("typo").is_err());
+        assert_eq!(canonical_capability("send").unwrap(), "transfer");
+        assert_eq!(canonical_capability("inbox").unwrap(), "transfer");
     }
 
     #[test]
     fn canonical_capabilities_normalize_case_and_whitespace() {
         assert_eq!(canonical_capability(" SHELL ").unwrap(), "shell");
+    }
+
+    #[test]
+    fn enforced_actions_are_canonical_and_canonical_actions_are_enforced() {
+        for action in ENFORCED_CAPABILITIES {
+            assert!(CANONICAL_CAPABILITIES.contains(action), "gated action '{action}' is not canonical");
+        }
+        for capability in CANONICAL_CAPABILITIES {
+            assert!(ENFORCED_CAPABILITIES.contains(capability), "canonical capability '{capability}' has no gate");
+        }
     }
 
     fn make_owner() -> Ed25519KeyPair {

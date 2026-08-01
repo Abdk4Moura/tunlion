@@ -986,7 +986,7 @@ enum Cmd {
 enum EphemeralAction {
     /// Mint a new auth key signed by your user identity key.
     Mint {
-        /// Capabilities to grant (comma-separated: shell,transfer,mount,send,inbox)
+        /// Capabilities to grant (shell, transfer, mount, reach; send/inbox alias transfer)
         #[arg(long, value_delimiter = ',')]
         caps: Vec<String>,
         /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
