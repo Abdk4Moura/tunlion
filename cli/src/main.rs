@@ -8363,8 +8363,8 @@ enum BareTarget {
     Forward { lport: String, peer: String, rport: String },
     /// `device.mesh` or `device.mesh:port` -> reach.
     Reach(String),
-    /// A bare known device name -> pty.
-    Pty,
+    /// A bare known device name -> shell.
+    Shell,
     /// The token is both a file and a device name; refuse to pick a side.
     AmbiguousFileDevice,
     /// Nothing recognized; the caller should print the did-you-mean path.
@@ -8430,7 +8430,7 @@ fn classify_bare_token(
     // A non-file known device opens a PTY. The router never escalates privilege,
     // so the command path remains responsible for capability checks.
     if is_device {
-        return BareTarget::Pty;
+        return BareTarget::Shell;
     }
     BareTarget::Unknown
 }
@@ -8521,11 +8521,11 @@ async fn main() -> Result<()> {
                     argv.insert(1, "reach".into());
                     argv.insert(2, dev_port);
                 }
-                BareTarget::Pty => {
+                BareTarget::Shell => {
                     // Bare device name = shell in. `filament dovm` opens an interactive
                     // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
                     // (no sshd needed; the PTY protocol handles it).
-                    argv.insert(1, "pty".into());
+                    argv.insert(1, "shell".into());
                 }
                 BareTarget::AmbiguousFileDevice => {
                     // The token is both a file and a known device. Refuse to guess
@@ -16449,11 +16449,11 @@ mod tests {
 
     /// A bare known device name routes to pty.
     #[test]
-    fn bare_known_device_is_pty() {
+    fn bare_known_device_is_shell() {
         let known: std::collections::HashSet<String> = ["dovm"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
             classify_bare_token("dovm", &|_| false, &|t| known.contains(t)),
-            BareTarget::Pty
+            BareTarget::Shell
         );
     }
 
