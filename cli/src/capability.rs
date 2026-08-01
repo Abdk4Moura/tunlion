@@ -1365,16 +1365,16 @@ mod tests {
     }
 
     #[test]
-    fn removing_caps_does_not_remove_live_fleet_cert_access() {
+    fn removing_caps_does_not_remove_revoked_fleet_cert_access() {
         let me = [0x99u8; 32];
-        // Deliberately retain scoped transfer access with no capability grant:
-        // removing grants is not certificate revocation and must not silently
-        // remove a live Proven fleet certificate's automatic access.
+        // A capability-only revoke must not be mistaken for certificate
+        // revocation: this deliberately supplies the revoked marker and proves
+        // the same fleet path now denies access.
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "transfer", "self",
             None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), true, false, false,
+            Some(&me), true, false, true,
         );
-        assert!(d.allowed(), "removing capabilities must not remove live fleet cert access");
+        assert!(!d.allowed(), "revoked fleet cert must deny access after capability removal");
     }
 }
