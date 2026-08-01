@@ -37,22 +37,28 @@ use serde_json::Value;
 ///
 /// Keep this list in the capability crate so command and UX layers cannot
 /// silently grow names that the gates do not enforce.
-pub const CANONICAL_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "reach"];
+pub const CAP_SHELL: &str = "shell";
+pub const CAP_TRANSFER: &str = "transfer";
+pub const CAP_MOUNT: &str = "mount";
+pub const CAP_REACH: &str = "reach";
 
-/// Action names used by the capability gates. Keep this independent from the
-/// canonical list so tests catch both omitted gates and inert canonical names.
-pub const ENFORCED_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "reach"];
+pub const CANONICAL_CAPABILITIES: &[&str] = &[CAP_SHELL, CAP_TRANSFER, CAP_MOUNT, CAP_REACH];
+
+/// Scoped-default actions classified by the fleet gate.
+pub const SCOPED_DEFAULT_ACTIONS: &[&str] = &[CAP_TRANSFER, CAP_REACH, CAP_MOUNT];
+
+// Known residual: gate action parameters remain `&str`, so a future call site
+// can still pass an unregistered literal. A typed Action newtype is a follow-up
+// hardening task; current predicates and tests cover the declared vocabulary.
 
 /// Normalize and validate a capability name at an API boundary.
 pub fn canonical_capability(name: &str) -> Result<String> {
     let normalized = name.trim().to_ascii_lowercase();
-    let canonical = match normalized.as_str() {
-        // User-facing grant vocabulary; both aliases mean the transfer action.
-        "send" | "inbox" => "transfer",
-        value => value,
-    };
-    if CANONICAL_CAPABILITIES.contains(&canonical) {
-        Ok(canonical.to_string())
+    if matches!(normalized.as_str(), "send" | "inbox") {
+        bail!("capability '{normalized}' is not currently grantable; use 'transfer', which covers both directions")
+    }
+    if CANONICAL_CAPABILITIES.contains(&normalized.as_str()) {
+        Ok(normalized)
     } else {
         bail!("unknown capability '{name}' (valid: {})", CANONICAL_CAPABILITIES.join(", "))
     }
@@ -553,7 +559,17 @@ pub fn evaluate_grants_only(
 /// there passes `scoped_in_bounds` computed from `expose.json` directly rather
 /// than routing "reach" through this classifier — see cap_gate_effective callers.)
 pub fn is_scoped_default_action(action: &str) -> bool {
-    matches!(action, "transfer" | "reach" | "mount")
+    SCOPED_DEFAULT_ACTIONS.contains(&action)
+}
+
+/// Deliberate capability classified by the grant-only gate.
+pub fn is_deliberate_capability(action: &str) -> bool {
+    action == CAP_SHELL
+}
+
+/// True when an action is classified by one of the capability gate predicates.
+pub fn is_enforced_capability(action: &str) -> bool {
+    is_scoped_default_action(action) || is_deliberate_capability(action)
 }
 
 /// Same-owner fleet auto-trust decision, PROVEN-GATED. Grants a scoped default to
@@ -1429,8 +1445,10 @@ mod tests {
         }
         assert!(canonical_capability("all-ports").is_err());
         assert!(canonical_capability("typo").is_err());
-        assert_eq!(canonical_capability("send").unwrap(), "transfer");
-        assert_eq!(canonical_capability("inbox").unwrap(), "transfer");
+        let send_err = canonical_capability("send").unwrap_err().to_string();
+        assert!(send_err.contains("not currently grantable"));
+        assert!(send_err.contains("covers both directions"));
+        assert!(canonical_capability("inbox").is_err());
     }
 
     #[test]
@@ -1439,12 +1457,13 @@ mod tests {
     }
 
     #[test]
-    fn enforced_actions_are_canonical_and_canonical_actions_are_enforced() {
-        for action in ENFORCED_CAPABILITIES {
+    fn gated_actions_are_canonical_and_canonical_actions_are_gated() {
+        for action in SCOPED_DEFAULT_ACTIONS {
             assert!(CANONICAL_CAPABILITIES.contains(action), "gated action '{action}' is not canonical");
         }
+        assert!(CANONICAL_CAPABILITIES.contains(&CAP_SHELL), "gated action 'shell' is not canonical");
         for capability in CANONICAL_CAPABILITIES {
-            assert!(ENFORCED_CAPABILITIES.contains(capability), "canonical capability '{capability}' has no gate");
+            assert!(is_enforced_capability(capability), "canonical capability '{capability}' has no gate");
         }
     }
 

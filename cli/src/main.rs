@@ -986,7 +986,7 @@ enum Cmd {
 enum EphemeralAction {
     /// Mint a new auth key signed by your user identity key.
     Mint {
-        /// Capabilities to grant (shell, transfer, mount, reach; send/inbox alias transfer)
+        /// Capabilities to grant (shell, transfer, mount, reach)
         #[arg(long, value_delimiter = ',')]
         caps: Vec<String>,
         /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
@@ -13323,7 +13323,7 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "shell",
+                            crate::capability::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
@@ -13336,9 +13336,9 @@ async fn recv_cmd(
                         let scoped_in_bounds = reach_port != 0
                             && crate::expose::load().iter().any(|b| b.port == reach_port);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
+                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -13483,19 +13483,19 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "shell",
+                             crate::capability::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         {
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
                         // Deliberate tier: `shell` is never a scoped default, so a
                         // same-owner device gets it ONLY via an explicit grant
                         // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
                         }
                     };
                     if !granted.allowed() {
@@ -13598,19 +13598,19 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "shell",
+                            crate::capability::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         {
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
                         // Deliberate tier: `shell` is never a scoped default, so a
                         // same-owner device gets it ONLY via an explicit grant
                         // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
                         }
                     };
                     if !granted.allowed() {
@@ -13767,7 +13767,7 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "mount",
+                            crate::capability::CAP_MOUNT,
                             idev,
                             iusr,
                             ak_caps,
@@ -13785,7 +13785,7 @@ async fn recv_cmd(
                         // = within_share). An auto-trusted fleet mount is served
                         // READ-ONLY; an explicit `mount` grant keeps its rw behavior.
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "mount", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_MOUNT, idev, iusr, ak_caps,
                         );
                         let same_owner = match (iusr, own_user.as_ref()) {
                             (Some(u), Some(o)) => u == o,
@@ -13808,7 +13808,7 @@ async fn recv_cmd(
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
-                        let d = crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant);
+                         let d = crate::capability::cap_gate_effective(trusted, &outcome, crate::capability::CAP_MOUNT, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant);
                         (d, read_only)
                     };
                     if !authorized.allowed() {
@@ -14357,7 +14357,7 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "transfer",
+                            crate::capability::CAP_TRANSFER,
                             idev,
                             iusr,
                             ak_caps,
@@ -14386,9 +14386,9 @@ async fn recv_cmd(
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "transfer", idev, iusr, ak_caps,
+                             &crate::settings::config_dir(), "self", crate::capability::CAP_TRANSFER, idev, iusr, ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
+                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_TRANSFER, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {
@@ -15582,6 +15582,7 @@ mod tests {
                 {"name": "empty",   "secret": sec, "v": 2, "caps": []},
                 {"name": "xfer",    "secret": sec, "v": 2, "caps": ["transfer"]},
                 {"name": "execcap", "secret": sec, "v": 2, "caps": ["transfer", "remote-exec"]},
+                {"name": "legacy-inbox", "secret": sec, "v": 2, "caps": ["inbox"]},
                 {"name": "legacy",  "secret": sec}  // v1 record: reads as ["transfer"]
             ]))
             .unwrap(),
@@ -15594,6 +15595,8 @@ mod tests {
         // A v1 record reads as caps:["transfer"] (back-compat, spec §8).
         assert_eq!(device_caps_at(&p, "legacy"), Some(vec!["transfer".to_string()]));
         assert!(device_allows_at(&p, "legacy", "transfer"));
+        // Legacy UX labels remain readable; validation only applies at writes.
+        assert_eq!(device_caps_at(&p, "legacy-inbox"), Some(vec!["inbox".to_string()]));
         // Deny-by-default: a gated future cap is REFUSED unless explicitly granted.
         assert!(!device_allows_at(&p, "empty", "remote-exec"), "empty caps must deny remote-exec");
         assert!(!device_allows_at(&p, "xfer", "remote-exec"), "transfer-only must deny remote-exec");
