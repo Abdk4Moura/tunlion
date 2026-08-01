@@ -33,6 +33,22 @@ use anyhow::{anyhow, bail, Result};
 use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::Value;
 
+/// The only capability names understood by the enforcement layer.
+///
+/// Keep this list in the capability crate so command and UX layers cannot
+/// silently grow names that the gates do not enforce.
+pub const CANONICAL_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "send", "inbox"];
+
+/// Normalize and validate a capability name at an API boundary.
+pub fn canonical_capability(name: &str) -> Result<String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    if CANONICAL_CAPABILITIES.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        bail!("unknown capability '{name}' (valid: {})", CANONICAL_CAPABILITIES.join(", "))
+    }
+}
+
 /// Hybrid logical clock: version = max(wall_clock_ms, last_seen + 1).
 pub fn hlc_next(last_seen: u64, now_ms: u64) -> u64 {
     std::cmp::max(now_ms, last_seen.saturating_add(1))
@@ -1396,6 +1412,20 @@ mod tests {
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
+
+    #[test]
+    fn canonical_capabilities_reject_unknown_names() {
+        for capability in CANONICAL_CAPABILITIES {
+            assert_eq!(canonical_capability(capability).unwrap(), *capability);
+        }
+        assert!(canonical_capability("all-ports").is_err());
+        assert!(canonical_capability("typo").is_err());
+    }
+
+    #[test]
+    fn canonical_capabilities_normalize_case_and_whitespace() {
+        assert_eq!(canonical_capability(" SHELL ").unwrap(), "shell");
+    }
 
     fn make_owner() -> Ed25519KeyPair {
         let rng = SystemRandom::new();

@@ -77,8 +77,11 @@ pub fn echo_cmd(cmd: &str) -> String {
 /// Confirmation tokens (exact, as specified).
 pub const CONFIRM_SHELL: &str = "SHELL";
 pub const CONFIRM_WRITE: &str = "WRITE";
-pub const CONFIRM_ALL_PORTS: &str = "ALL-PORTS";
 pub const CONFIRM_REUSE: &str = "REUSE";
+
+/// Capability names surfaced by the fleet UX. Keep this as a checked subset of
+/// the enforcement vocabulary, never as a second source of valid names.
+pub const UX_CAPABILITIES: &[&str] = &["shell", "transfer", "mount", "send", "inbox"];
 
 /// Exit codes.
 pub const EXIT_BAD_ARG: i32 = 2;
@@ -92,7 +95,6 @@ mod tests {
     fn confirm_tokens_are_exact() {
         assert_eq!(CONFIRM_SHELL, "SHELL");
         assert_eq!(CONFIRM_WRITE, "WRITE");
-        assert_eq!(CONFIRM_ALL_PORTS, "ALL-PORTS");
         assert_eq!(CONFIRM_REUSE, "REUSE");
     }
 
@@ -100,5 +102,15 @@ mod tests {
     fn exit_codes() {
         assert_eq!(EXIT_BAD_ARG, 2);
         assert_eq!(EXIT_REFUSED, 1);
+    }
+
+    #[test]
+    fn ux_capabilities_are_enforcement_subset() {
+        for capability in UX_CAPABILITIES {
+            assert!(
+                crate::capability::CANONICAL_CAPABILITIES.contains(capability),
+                "UX capability '{capability}' is missing from enforcement vocabulary"
+            );
+        }
     }
 }

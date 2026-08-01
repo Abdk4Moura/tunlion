@@ -986,7 +986,7 @@ enum Cmd {
 enum EphemeralAction {
     /// Mint a new auth key signed by your user identity key.
     Mint {
-        /// Capabilities to grant (comma-separated: shell,transfer,deploy,etc.)
+        /// Capabilities to grant (comma-separated: shell,transfer,mount,send,inbox)
         #[arg(long, value_delimiter = ',')]
         caps: Vec<String>,
         /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
@@ -2020,6 +2020,7 @@ fn device_allows(name: &str, capability: &str) -> bool {
 /// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
 /// Returns Err if the device is unknown (you can't grant a stranger a shell).
 fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
+    let capability = crate::capability::canonical_capability(capability)?;
     let p = devices_path();
     let raw = std::fs::read_to_string(&p)
         .map_err(|_| anyhow::anyhow!("no known device named '{name}', pair first"))?;
@@ -2038,7 +2039,7 @@ fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
             Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
             None => vec!["transfer".to_string()],
         };
-        caps.retain(|c| c != capability);
+        caps.retain(|c| c != &capability);
         if grant {
             caps.push(capability.to_string());
         }
@@ -8834,6 +8835,7 @@ async fn main() -> Result<()> {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
+            let capability = crate::capability::canonical_capability(&capability)?;
             let config_dir = crate::settings::config_dir();
             let mut store = crate::capability::load_cap_store(&config_dir);
 
@@ -8985,6 +8987,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Revoke { device, capability } => {
+            let capability = crate::capability::canonical_capability(&capability)?;
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false)?;
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so

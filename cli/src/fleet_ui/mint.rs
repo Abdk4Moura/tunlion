@@ -19,7 +19,6 @@ pub enum KeyType {
 pub struct MintCaps {
     pub shell: bool,
     pub write: bool,
-    pub all_ports: bool,
 }
 
 /// Reuse policy.
@@ -88,11 +87,7 @@ pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
             } else {
                 lines.push(can_line(false, false, "write to disk"));
             }
-            if caps.all_ports {
-                lines.push(can_line(true, true, "reach ALL ports — not just the ports you chose to expose"));
-            } else {
-                lines.push(can_line(false, false, "join your mesh"));
-            }
+            lines.push(can_line(false, false, "join your mesh"));
         }
         KeyType::External => {
             lines.push(can_line(true, false, "send you files"));
@@ -142,20 +137,9 @@ pub fn render_deliberate_access(caps: &MintCaps, pending_token: Option<&str>) ->
         "  │  [ ] write to mounted dirs can change or delete your files".to_string()
     };
 
-    let ports_row = if caps.all_ports {
-        format!(
-            "  │  {} reach ALL ports        type {} to keep it on:  [ {}▌ ]",
-            ui::paint(Tone::Warn, "[x]"),
-            ui::paint(Tone::Warn, "ALL-PORTS"),
-            pending_token.unwrap_or("")
-        )
-    } else {
-        "  │  [ ] reach ALL ports       not just the ports you chose to expose".to_string()
-    };
-
     let footer = format!("  └{}", ui::paint(Tone::Dim, rule()));
 
-    format!("{border}\n{shell_row}\n{write_row}\n{ports_row}\n{footer}")
+    format!("{border}\n{shell_row}\n{write_row}\n{footer}")
 }
 
 /// Render the lifetime block.
@@ -207,7 +191,6 @@ pub fn render_completion(code: &str, key_type: KeyType, caps: &MintCaps, lifetim
         let mut parts = vec![];
         if caps.shell { parts.push("shell"); }
         if caps.write { parts.push("write"); }
-        if caps.all_ports { parts.push("all-ports"); }
         if parts.is_empty() { String::new() } else { format!(" · {}", parts.join(", ")) }
     };
 
@@ -315,7 +298,7 @@ mod tests {
 
     #[test]
     fn fleet_summary_shell_on() {
-        let caps = MintCaps { shell: true, write: false, all_ports: false };
+        let caps = MintCaps { shell: true, write: false };
         let summary = render_summary(KeyType::Fleet, &caps);
         // Shell is deliberate, so should show ⚠ glyph
         assert!(summary.contains("open a shell — a real terminal"), "shell-on must show deliberate description");
@@ -376,7 +359,7 @@ mod tests {
 
     #[test]
     fn completion_render() {
-        let caps = MintCaps { shell: true, write: false, all_ports: false };
+        let caps = MintCaps { shell: true, write: false };
         let lt = Lifetime { ttl: "1h".into(), reuse: Reuse::Once, max_ttl: "24h".into() };
         let s = render_completion("clever-lynx-63-brave-otter", KeyType::Fleet, &caps, &lt);
         assert!(s.contains("filament join clever-lynx-63-brave-otter"), "must show join command");
