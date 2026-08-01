@@ -75,6 +75,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         ));
         for d in &review {
             lines.push(render_device_row(d));
+            lines.push(ui::paint(Tone::Dim, &format!("       ↳ filament devices promote {}", d.name)));
         }
         lines.push(String::new());
     }
@@ -89,7 +90,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
     }
 
     // Authoritative note
-    lines.push(ui::paint(Tone::Dim, "  Local index: NAME ADDRESS granted capabilities LAST SEEN. Each device's own list is authoritative."));
+    lines.push(ui::paint(Tone::Dim, "  This is a local index; each device's own capability list is authoritative."));
 
     lines.join("\n")
 }
@@ -121,7 +122,7 @@ fn render_device_row(d: &DeviceEntry) -> String {
 /// Render the empty devices list.
 pub fn render_empty() -> String {
     format!(
-        "No devices yet (no known devices).\n\
+        "No devices yet.\n\
          Add your own:     filament pair             (run on both, same identity)\n\
          Let someone in:   filament mint --external <them> --ttl 1h --allow <cap>"
     )

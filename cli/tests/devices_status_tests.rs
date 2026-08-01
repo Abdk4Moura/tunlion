@@ -14,7 +14,7 @@ fn filament_bin() -> std::path::PathBuf {
     path
 }
 
-/// Test that `filament devices` shows "no known devices" when empty.
+/// Test that `filament devices` shows the final empty-state copy.
 #[test]
 fn devices_empty_shows_message() {
     let bin = filament_bin();
@@ -28,13 +28,13 @@ fn devices_empty_shows_message() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        stdout.contains("no known devices"),
-        "Expected 'no known devices' message, got: {}",
+        stdout.contains("No devices yet."),
+        "Expected the empty devices message, got: {}",
         stdout
     );
 }
 
-/// Test that `filament devices` shows table headers when there are devices.
+/// Test that `filament devices` shows the tiered listing for legacy records.
 #[test]
 fn devices_shows_table_headers() {
     let bin = filament_bin();
@@ -60,10 +60,15 @@ fn devices_shows_table_headers() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Should contain table headers
     assert!(
-        stdout.contains("NAME") && stdout.contains("ADDRESS"),
-        "Expected table headers NAME and ADDRESS, got: {}",
+        stdout.contains("NEEDS REVIEW") && stdout.contains("promote to continue"),
+        "Expected the needs-review listing, got: {}",
+        stdout
+    );
+
+    assert!(
+        stdout.contains("filament devices promote test-device"),
+        "Expected the promote command hint, got: {}",
         stdout
     );
 
@@ -78,6 +83,12 @@ fn devices_shows_table_headers() {
     assert!(
         stdout.contains("fd00::1"),
         "Expected address 'fd00::1' in output, got: {}",
+        stdout
+    );
+
+    assert!(
+        stdout.contains("This is a local index; each device's own capability list is authoritative."),
+        "Expected the authoritative-list note, got: {}",
         stdout
     );
 

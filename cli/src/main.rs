@@ -3118,7 +3118,7 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                 online: warm_names.contains(&name),
                 caps_summary,
                 countdown: if needs_promote {
-                    "promote to continue".to_string()
+                    String::new()
                 } else {
                     device_countdown(tier, cert.as_ref())
                 },

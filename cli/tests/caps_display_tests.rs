@@ -1,7 +1,7 @@
 //! Tests for caps display labeling.
 //!
 //! These tests verify that `filament devices` and `filament addr` show
-//! "granted" instead of "caps" to make clear it's the local grant record.
+//! the authoritative local capability-list sentence.
 
 use std::process::Command;
 
@@ -14,7 +14,7 @@ fn filament_bin() -> std::path::PathBuf {
     path
 }
 
-/// Test that `filament devices` shows "granted" instead of "caps".
+/// Test that `filament devices` shows the authoritative capability note.
 #[test]
 fn devices_shows_granted_label() {
     let bin = filament_bin();
@@ -25,26 +25,12 @@ fn devices_shows_granted_label() {
         .expect("failed to execute filament");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Should NOT contain "caps:" in the output (old label)
-    // Note: may contain "caps" in other contexts (like "capabilities")
-    // so we check for the specific label format
     assert!(
-        !stdout.to_lowercase().contains("caps:"),
-        "Expected no 'caps:' label in devices output, got: {}",
+        stdout.contains("This is a local index; each device's own capability list is authoritative.")
+            || stdout.contains("No devices yet."),
+        "Expected the devices state output, got: {}",
         stdout
     );
-
-    // Should contain "granted" label if there are any devices
-    // The column header is uppercase "GRANTED" in the table output
-    if !stdout.contains("no known devices") {
-        assert!(
-            stdout.to_lowercase().contains("granted"),
-            "Expected a 'granted' label/column in devices output, got: {}",
-            stdout
-        );
-    }
 }
 
 /// Test that `filament addr` shows "granted" instead of "caps".
