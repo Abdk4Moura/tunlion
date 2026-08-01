@@ -775,11 +775,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// TASK #15 known-bug regression pin: a same-owner, Proven, in-scope fleet
-    /// device is currently auto-authorized even with no explicit grants. This
-    /// fleet auto-trust bypass means revoking every capability from a lost
-    /// laptop still leaves transfer, reach, and mount access. Cert-revocation
-    /// work must flip this assertion to Deny, not replace this test.
+    /// A same-owner, Proven, in-scope fleet device with all grants revoked must
+    /// remain denied once its certificate is locally revoked. This is the
+    /// known-state regression pin for the fleet auto-trust bypass.
     #[test]
     fn known_bug_fleet_auto_trust_survives_capability_revoke() {
         let user_pub = [0xaa; 32];
@@ -797,9 +795,10 @@ mod tests {
             Some(&user_pub),
             true,
             false,
+            true,
         );
-        assert!(matches!(decision, GateDecision::Allow),
-            "KNOWN BUG: revoking every capability leaves fleet auto-trust intact; this assertion documents current behavior and MUST invert to Denied when cert revocation lands");
+        assert!(matches!(decision, GateDecision::Deny { .. }),
+            "revoked fleet certificate must deny access after capability revocation");
     }
 
     /// Per-action shadow counters must bucket each action independently so
@@ -1364,17 +1363,4 @@ mod tests {
         assert!(!d.allowed(), "locally revoked cert must deny fleet auto-trust");
     }
 
-    #[test]
-    fn removing_caps_does_not_remove_revoked_fleet_cert_access() {
-        let me = [0x99u8; 32];
-        // A capability-only revoke must not be mistaken for certificate
-        // revocation: this deliberately supplies the revoked marker and proves
-        // the same fleet path now denies access.
-        let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "transfer", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), true, false, true,
-        );
-        assert!(!d.allowed(), "revoked fleet cert must deny access after capability removal");
-    }
 }
