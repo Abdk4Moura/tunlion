@@ -80,10 +80,23 @@ pub struct RelayTicket {
 }
 
 impl RelayTicket {
-    pub fn mint(k: &[u8], pair_id: [u8; 32], side: u8, exp: u64) -> Result<Self> {
+    pub fn mint(k: &[u8], pair_id: [u8; 32], side: u8, requested_exp: u64) -> Result<Self> {
+        let now = unix_now();
+        Self::mint_at(k, pair_id, side, requested_exp, now)
+    }
+
+    /// Mint with an explicit clock for deterministic callers and tests.
+    pub fn mint_at(
+        k: &[u8],
+        pair_id: [u8; 32],
+        side: u8,
+        requested_exp: u64,
+        now: u64,
+    ) -> Result<Self> {
         if side > 1 {
             bail!("relay ticket side must be 0 or 1");
         }
+        let exp = requested_exp.min(now.saturating_add(TICKET_TTL_SECS));
         let (_, k_mac) = relay_keys(k);
         let prefix = wire_prefix(&pair_id, side, exp);
         let mac = hmac_sha256(&k_mac, &prefix);
@@ -98,7 +111,8 @@ impl RelayTicket {
         side: u8,
         exp: u64,
     ) -> Result<Self> {
-        Self::mint(k, derive_pair_id(k, session_a, session_b, round_nonce), side, exp)
+        let now = unix_now();
+        Self::mint_at(k, derive_pair_id(k, session_a, session_b, round_nonce), side, exp, now)
     }
 
     /// Verify offline at the relay. No signaling callback or payload access is
@@ -156,6 +170,13 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,33 +190,41 @@ mod tests {
 
     #[test]
     fn ticket_roundtrip_and_verify() {
-        let ticket = RelayTicket::mint(b"k", [7; 32], 1, 1_000).unwrap();
+        let ticket = RelayTicket::mint_at(b"k", [7; 32], 1, 1_000, 900).unwrap();
         assert_eq!(RelayTicket::from_bytes(&ticket.to_bytes()).unwrap(), ticket);
-        assert!(ticket.verify(b"k", 1_004));
-        assert!(!ticket.verify(b"k", 1_006));
+        assert!(ticket.verify(b"k", 904));
+        assert!(!ticket.verify(b"k", 936));
         assert!(!ticket.verify(b"wrong", 1_000));
         assert!(!ticket.verify(b"k", 1_031));
-        assert!(!RelayTicket::mint(
+        assert!(!RelayTicket::mint_at(
             b"k",
             [7; 32],
             1,
-            1_000 + TICKET_TTL_SECS + TICKET_SKEW_SECS + 1,
+            2_000,
+            1_000,
         )
             .unwrap()
-            .verify(b"k", 1_000));
+            .verify(b"k", 0));
+    }
+
+    #[test]
+    fn mint_clamps_requested_expiry() {
+        let ticket = RelayTicket::mint_at(b"k", [7; 32], 1, u64::MAX, 1_000).unwrap();
+        assert_eq!(ticket.exp, 1_000 + TICKET_TTL_SECS);
+        assert!(ticket.verify(b"k", 1_000));
     }
 
     #[test]
     fn side_is_explicit_and_mac_bound() {
-        assert!(RelayTicket::mint(b"k", [0; 32], 2, 100).is_err());
-        let mut ticket = RelayTicket::mint(b"k", [0; 32], 0, 100).unwrap();
+        assert!(RelayTicket::mint_at(b"k", [0; 32], 2, 100, 100).is_err());
+        let mut ticket = RelayTicket::mint_at(b"k", [0; 32], 0, 100, 100).unwrap();
         ticket.side = 1;
         assert!(!ticket.verify(b"k", 100));
     }
 
     #[test]
     fn every_wire_prefix_field_is_mac_bound() {
-        let ticket = RelayTicket::mint(b"k", [0; 32], 0, 100).unwrap();
+        let ticket = RelayTicket::mint_at(b"k", [0; 32], 0, 100, 100).unwrap();
         let mut pair_id = ticket;
         pair_id.pair_id[0] ^= 1;
         assert!(!pair_id.verify(b"k", 100));
