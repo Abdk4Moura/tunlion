@@ -86,7 +86,7 @@ impl RelayTicket {
     }
 
     /// Mint with an explicit clock for deterministic callers and tests.
-    pub fn mint_at(
+    pub(crate) fn mint_at(
         k: &[u8],
         pair_id: [u8; 32],
         side: u8,
@@ -193,6 +193,7 @@ mod tests {
         let ticket = RelayTicket::mint_at(b"k", [7; 32], 1, 1_000, 900).unwrap();
         assert_eq!(RelayTicket::from_bytes(&ticket.to_bytes()).unwrap(), ticket);
         assert!(ticket.verify(b"k", 904));
+        assert!(ticket.verify(b"k", 935));
         assert!(!ticket.verify(b"k", 936));
         assert!(!ticket.verify(b"wrong", 1_000));
         assert!(!ticket.verify(b"k", 1_031));
