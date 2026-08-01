@@ -961,6 +961,33 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
+    /// Mint a scoped, expiring key for another machine to join.
+    Mint {
+        /// Mint a key for a device in your fleet.
+        #[arg(long)]
+        fleet: bool,
+        /// Mint a narrow key for this paired external device.
+        #[arg(long)]
+        external: Option<String>,
+        /// Mint a single-use CI/automation key.
+        #[arg(long)]
+        ci: bool,
+        /// Key lifetime, such as 1h or 15m.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Reuse policy: once, N(3), or reusable.
+        #[arg(long)]
+        reuse: Option<String>,
+        /// Capabilities to grant (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Paired audience name for a CI key.
+        #[arg(long)]
+        audience: Option<String>,
+        /// Do not prompt for deliberate choices.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Mint auth keys or enroll as an ephemeral delegated device.
     #[command(hide = true)]
     Ephemeral {
@@ -3189,6 +3216,124 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// CLI handler for `filament ephemeral`
+fn parse_mint_ttl(raw: &str) -> Result<u64> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (number, unit) = raw.split_at(raw.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
+    let value: u64 = number.parse().map_err(|_| anyhow!("invalid --ttl '{raw}'"))?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("invalid --ttl '{raw}', use a duration such as 15m or 1h"),
+    };
+    Ok(value.saturating_mul(multiplier))
+}
+
+fn mint_capability(raw: &str) -> Result<String> {
+    match raw {
+        "send" => Ok("transfer".to_string()),
+        "write" => Ok("mount".to_string()),
+        "shell" | "mount" | "all-ports" | "transfer" => Ok(raw.to_string()),
+        "reuse" => bail!("reuse is a lifetime option, not a capability"),
+        "mesh" => {
+            let (message, _) = fleet_ui::mint::err_mesh_not_grantable();
+            bail!("{message}")
+        }
+        other => bail!("unsupported capability '{other}'"),
+    }
+}
+
+async fn mint_cmd(
+    server: &str,
+    fleet: bool,
+    external: Option<String>,
+    ci: bool,
+    ttl: Option<String>,
+    reuse: Option<String>,
+    allow: Vec<String>,
+    audience: Option<String>,
+    _yes: bool,
+    relay: bool,
+) -> Result<()> {
+    let is_external = external.is_some();
+    let selected = fleet as u8 + external.is_some() as u8 + ci as u8;
+    if selected != 1 {
+        let (message, _) = fleet_ui::mint::err_needs_key_type();
+        bail!("{message}");
+    }
+    let key_type = if fleet { fleet_ui::mint::KeyType::Fleet } else if ci { fleet_ui::mint::KeyType::CI } else { fleet_ui::mint::KeyType::External };
+    let default_ttl = if ci { "15m" } else { "1h" };
+    let ttl_text = ttl.as_deref().unwrap_or(default_ttl);
+    let ttl_secs = parse_mint_ttl(ttl_text)?;
+    if is_external && ttl_secs > 24 * 3600 {
+        let (message, _) = fleet_ui::mint::err_over_ttl();
+        bail!("{message}");
+    }
+
+    let mut caps = Vec::new();
+    for raw in &allow {
+        let cap = mint_capability(raw)?;
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    if is_external && caps.is_empty() {
+        bail!("external keys need at least one --allow capability");
+    }
+    if ci && audience.is_none() {
+        bail!("CI keys require --audience <paired-device>");
+    }
+    if caps.is_empty() {
+        caps.push("transfer".to_string());
+    }
+
+    let audience_name = external.or(audience);
+    let audience = audience_name
+        .map(|name| {
+            device_cert_for(&name)
+                .map(|cert| hex::encode(cert.device_pub))
+                .ok_or_else(|| anyhow!("no certified paired device named '{name}'"))
+        })
+        .transpose()?;
+    let lifetime = fleet_ui::mint::Lifetime {
+        ttl: ttl_text.to_string(),
+        reuse: match reuse.as_deref().unwrap_or("once").to_ascii_lowercase().as_str() {
+            "once" => fleet_ui::mint::Reuse::Once,
+            "reusable" => fleet_ui::mint::Reuse::Reusable,
+            value if value.starts_with("n(") && value.ends_with(')') => fleet_ui::mint::Reuse::Times(value[2..value.len() - 1].parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
+            value => fleet_ui::mint::Reuse::Times(value.parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
+        },
+        max_ttl: if ci { "15m".to_string() } else { "24h".to_string() },
+    };
+    let mint_caps = fleet_ui::mint::MintCaps {
+        shell: caps.iter().any(|cap| cap == "shell"),
+        write: caps.iter().any(|cap| cap == "mount"),
+        all_ports: caps.iter().any(|cap| cap == "all-ports"),
+    };
+    eprintln!("{}", fleet_ui::mint::render_header());
+    eprintln!("{}", fleet_ui::mint::render_summary(key_type, &mint_caps));
+    eprintln!("{}", fleet_ui::mint::render_lifetime(&lifetime));
+
+    ephemeral_cmd(
+        server,
+        EphemeralAction::Mint {
+            caps,
+            audience: audience.into_iter().collect(),
+            ttl: ttl_secs,
+            reuse: match lifetime.reuse {
+                fleet_ui::mint::Reuse::Once => "Once".to_string(),
+                fleet_ui::mint::Reuse::Times(n) => format!("N({n})"),
+                fleet_ui::mint::Reuse::Reusable => "Reusable".to_string(),
+            },
+            tag: if ci { "ci".to_string() } else if is_external { "external".to_string() } else { "fleet".to_string() },
+        },
+        relay,
+    )
+    .await
 }
 
 /// CLI handler for `filament ephemeral`
@@ -9347,6 +9492,9 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Mint { fleet, external, ci, ttl, reuse, allow, audience, yes } => {
+            mint_cmd(&server, fleet, external, ci, ttl, reuse, allow, audience, yes, relay).await
+        }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
