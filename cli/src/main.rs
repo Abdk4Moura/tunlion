@@ -1574,6 +1574,29 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     None
 }
 
+fn fleet_certificate_warning(name: &str) -> Option<String> {
+    let cert = device_cert_for(name)?;
+    let owner = load_owner_key()?;
+    fleet_certificate_warning_for(name, &cert, owner.public_key_bytes(), identity::now_secs())
+}
+
+fn fleet_certificate_warning_for(
+    name: &str,
+    cert: &identity::DeviceCert,
+    owner_pub: [u8; 32],
+    now: u64,
+) -> Option<String> {
+    if cert.user_pub != owner_pub || cert.expires <= now {
+        return None;
+    }
+    Some(format!(
+        "{} {} still has fleet access via its certificate.\n  To remove it entirely: filament revoke {} --certificate",
+        ui::paint(ui::Tone::Warn, ui::glyph_warn()),
+        name,
+        name,
+    ))
+}
+
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
@@ -9683,17 +9706,12 @@ async fn main() -> Result<()> {
             }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
-                if device_cert_for(&device).is_some() {
-                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
-                } else {
-                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
-                }
+                println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
             } else {
-                if device_cert_for(&device).is_some() {
-                    println!("revoked '{capability}' from '{device}'; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
-                } else {
-                    println!("revoked '{capability}' from '{device}'.");
-                }
+                println!("revoked '{capability}' from '{device}'.");
+            }
+            if let Some(warning) = fleet_certificate_warning(&device) {
+                eprintln!("{warning}");
             }
             Ok(())
         }
@@ -17073,5 +17091,19 @@ mod tests {
             classify_bare_token("xyzpdq", &|_| false, &|t| known.contains(t)),
             BareTarget::Unknown
         );
+    #[test]
+    fn capability_revoke_warning_only_live_same_owner_cert() {
+        let cert = identity::DeviceCert::from_json(&serde_json::json!({
+            "devicePub": hex::encode([0x11u8; 32]),
+            "userPub": hex::encode([0x22u8; 32]),
+            "expires": 200,
+            "issued": 100,
+            "sig": hex::encode([0u8; 64]),
+        })).unwrap();
+        let warning = fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 150).unwrap();
+        assert!(warning.contains("laptop still has fleet access via its certificate"));
+        assert!(warning.contains("filament revoke laptop --certificate"));
+        assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
+        assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
     }
 }
