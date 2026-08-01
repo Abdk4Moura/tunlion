@@ -775,11 +775,34 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// A same-owner, Proven, in-scope fleet device with all grants revoked must
-    /// remain denied once its certificate is locally revoked. This is the
-    /// known-state regression pin for the fleet auto-trust bypass.
+    /// Capability revocation alone does not remove certificate-derived fleet
+    /// trust. This is why certificate revocation is a separate operation and
+    /// why the CLI warns after a capability-only revoke.
     #[test]
-    fn known_bug_fleet_auto_trust_survives_capability_revoke() {
+    fn capability_revoke_alone_does_not_remove_fleet_trust() {
+        let user_pub = [0xaa; 32];
+        let device_pub = [0xcc; 32];
+        let decision = cap_gate_effective(
+            false,
+            &CapOutcome::Denied("all grants revoked".into()),
+            CAP_TRANSFER,
+            "self",
+            Some(&device_pub),
+            Some(&user_pub),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&user_pub),
+            true,
+            false,
+            false,
+        );
+        assert!(matches!(decision, GateDecision::Allow),
+            "capability revocation alone must not remove live fleet certificate trust");
+    }
+
+    #[test]
+    fn cert_revoke_removes_fleet_trust() {
         let user_pub = [0xaa; 32];
         let device_pub = [0xcc; 32];
         let decision = cap_gate_effective(
@@ -798,7 +821,7 @@ mod tests {
             true,
         );
         assert!(matches!(decision, GateDecision::Deny { .. }),
-            "revoked fleet certificate must deny access after capability revocation");
+            "certificate revocation must remove fleet trust");
     }
 
     /// Per-action shadow counters must bucket each action independently so
