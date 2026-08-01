@@ -7817,6 +7817,7 @@ async fn handle_warm_req(
         ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
         ctl::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
+        ctl::ReqKind::ListWarm => req.reject("list-warm not handled here").await,
         ctl::ReqKind::ListPending => req.reject("list-pending not handled here").await,
         ctl::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
         ctl::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
@@ -8106,6 +8107,31 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
         "path": path,
     });
     req.reply(&reply).await;
+}
+
+/// Return only links the daemon already holds. This is deliberately passive:
+/// devices listing must never establish, ping, or otherwise wake a peer.
+#[cfg(unix)]
+async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
+    let links: Vec<Value> = conn.links.iter().filter_map(|(pid, link)| {
+        let name = link.verified_name.as_deref()?;
+        let transport = link.transport.as_ref()?;
+        if !link.trusted || !transport.is_alive() {
+            return None;
+        }
+        Some(json!({
+            "name": name,
+            "warm": true,
+            "direct": link.direct,
+            "route": if link.direct { link.direct_route } else { "relay" },
+            "remote_addr": transport.remote_addr().map(|a| a.to_string()),
+            "rtt_ms": transport.rtt_ms(),
+            "verified": name,
+            "path": Value::Null,
+            "pid": pid,
+        }))
+    }).collect();
+    req.reply(&json!({ "ok": true, "links": links })).await;
 }
 
 #[cfg(unix)]
@@ -11991,6 +12017,8 @@ async fn recv_cmd(
                                 "flip_ready": counts.flip_ready(),
                                 "summary": counts.summary(),
                             })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
+                            handle_list_warm(&conn, req).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListPending) {
                             let mut requests = load_requests();
                             expire_requests(&mut requests);
