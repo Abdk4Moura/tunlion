@@ -5387,115 +5387,6 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         }
     }
 
-    // --- Windows reparse-point hardening tests (#43) ---
-    // These mirror the Unix transfer_part_refuses_symlink / transfer_open_part_refuses_symlink
-    // tests but use Windows directory junctions to exercise the reparse-point refusal.
-    // Junctions are created via `cmd /c mklink /J` (no privilege needed, unlike symlinks).
-    // Runtime behavior (does the junction actually get refused) needs a Windows runner,
-    // which we don't have yet — pending #34 (per-OS CI).
-
-    /// Helper: create a Windows directory junction via `cmd /c mklink /J`.
-    #[cfg(windows)]
-    fn create_junction(target: &std::path::Path, link: &std::path::Path) {
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(link.to_str().unwrap())
-            .arg(target.to_str().unwrap())
-            .status()
-            .expect("failed to run cmd /c mklink /J");
-        assert!(status.success(), "mklink /J failed: {status:?}");
-    }
-
-    /// Windows: safe_create_part must refuse to create through a junction.
-    /// Plants a junction at the .part path and verifies safe_create_part refuses.
-    /// The open itself may fail (junctions are directories, GENERIC_WRITE may
-    /// need FILE_FLAG_BACKUP_SEMANTICS) OR the post-open reparse-bit check
-    /// may reject — either outcome is a safe refusal.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn win_safe_create_part_refuses_junction() {
-        let uid = format!("{}-win-create-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let junction_target = tmp.join("junction-target");
-        std::fs::create_dir_all(&junction_target).unwrap();
-
-        // Plant a junction at the .part path
-        let part_path = tmp.join("evil.tar.part");
-        create_junction(&junction_target, &part_path);
-
-        // safe_create_part must refuse — either the open fails (dir needs
-        // BACKUP_SEMANTICS) or the reparse-bit check rejects.
-        let result = safe_create_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to create through a junction: {:?}", result.err());
-
-        // Verify the junction still exists (not followed/deleted)
-        assert!(part_path.exists(), "junction must still exist after refusal");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// Windows: safe_resume_part must refuse to open a junction.
-    /// Creates a regular .part, then replaces with a junction and verifies refusal.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn win_safe_resume_part_refuses_junction() {
-        let uid = format!("{}-win-resume-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Create a regular .part file first
-        let part_path = tmp.join("data.tar.part");
-        std::fs::write(&part_path, b"partial data").unwrap();
-
-        // Verify it opens normally for resume
-        let result = safe_resume_part(&part_path).await;
-        assert!(result.is_ok(), "regular file must open normally for resume");
-        drop(result);
-
-        // Now replace with a junction
-        std::fs::remove_file(&part_path).unwrap();
-        let junction_target = tmp.join("junction-target");
-        std::fs::create_dir_all(&junction_target).unwrap();
-        create_junction(&junction_target, &part_path);
-
-        // Must refuse
-        let result = safe_resume_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to resume through a junction: {:?}", result.err());
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// Windows: safe_open_part must refuse to open a junction.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn win_safe_open_part_refuses_junction() {
-        let uid = format!("{}-win-open-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Create a regular .part file
-        let part_path = tmp.join("data.tar.part");
-        std::fs::write(&part_path, b"partial data").unwrap();
-
-        // Verify it opens normally
-        let result = safe_open_part(&part_path).await;
-        assert!(result.is_ok(), "regular file must open normally");
-        drop(result);
-
-        // Replace with a junction
-        std::fs::remove_file(&part_path).unwrap();
-        let junction_target = tmp.join("junction-target");
-        std::fs::create_dir_all(&junction_target).unwrap();
-        create_junction(&junction_target, &part_path);
-
-        // Must refuse
-        let result = safe_open_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to open a junction: {:?}", result.err());
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 }
                 }
             }
@@ -17983,5 +17874,81 @@ mod tests {
         assert!(warning.contains("filament revoke laptop --certificate"));
         assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
         assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
+    // --- Windows reparse-point hardening tests (#43) ---
+    // These mirror the Unix transfer_part_refuses_symlink / transfer_open_part_refuses_symlink
+    // tests but use Windows directory junctions to exercise the reparse-point refusal.
+    // Junctions are created via `cmd /c mklink /J` (no privilege needed, unlike symlinks).
+    // Runtime behavior (does the junction actually get refused) needs a Windows runner,
+    // which we don't have yet — pending #34 (per-OS CI).
+
+    /// Helper: create a Windows directory junction via `cmd /c mklink /J`.
+    #[cfg(windows)]
+    fn create_junction(target: &std::path::Path, link: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link.to_str().unwrap())
+            .arg(target.to_str().unwrap())
+            .status()
+            .expect("failed to run cmd /c mklink /J");
+        assert!(status.success(), "mklink /J failed: {status:?}");
+    }
+
+    /// Windows: safe_create_part must refuse to create through a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_create_part_refuses_junction() {
+        let uid = format!("{}-win-create-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        let part_path = tmp.join("evil.tar.part");
+        create_junction(&junction_target, &part_path);
+        let result = safe_create_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to create through a junction: {:?}", result.err());
+        assert!(part_path.exists(), "junction must still exist after refusal");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows: safe_resume_part must refuse to open a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_resume_part_refuses_junction() {
+        let uid = format!("{}-win-resume-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally for resume");
+        drop(result);
+        std::fs::remove_file(&part_path).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&junction_target, &part_path);
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a junction: {:?}", result.err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Windows: safe_open_part must refuse to open a junction.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win_safe_open_part_refuses_junction() {
+        let uid = format!("{}-win-open-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+        let result = safe_open_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally");
+        drop(result);
+        std::fs::remove_file(&part_path).unwrap();
+        let junction_target = tmp.join("junction-target");
+        std::fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&junction_target, &part_path);
+        let result = safe_open_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to open a junction: {:?}", result.err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
