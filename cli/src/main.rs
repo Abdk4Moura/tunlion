@@ -15597,6 +15597,7 @@ mod tests {
         assert!(device_allows_at(&p, "legacy", "transfer"));
         // Legacy UX labels remain readable; validation only applies at writes.
         assert_eq!(device_caps_at(&p, "legacy-inbox"), Some(vec!["inbox".to_string()]));
+        assert!(!device_allows_at(&p, "legacy-inbox", "reach"), "legacy inbox label must not authorize reach");
         // Deny-by-default: a gated future cap is REFUSED unless explicitly granted.
         assert!(!device_allows_at(&p, "empty", "remote-exec"), "empty caps must deny remote-exec");
         assert!(!device_allows_at(&p, "xfer", "remote-exec"), "transfer-only must deny remote-exec");
