@@ -29,7 +29,9 @@ use std::sync::{Mutex, OnceLock};
 // File-based store I/O  (thin wrappers, mirror update_peer_identity)
 // ---------------------------------------------------------------------------
 
-/// Cache cap store reads per config_dir, invalidated on every write.
+/// Cache cap store reads per config_dir. Writes by this process invalidate it
+/// explicitly via `save_cap_store`; writes by another process are detected only
+/// by the mtime+length comparison below, the cross-process invalidation channel.
 /// Hot path: load_cap_store is called on every gated open; without this cache
 /// each open re-reads + re-parses caps.json.
 // This is a size-and-timestamp cache key, not a content hash. A same-size rewrite
