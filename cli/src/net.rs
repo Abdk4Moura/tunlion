@@ -1130,10 +1130,26 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 /// order non-ASCII strings differently. Session IDs must differ whenever UIDs
 /// tie; an equal tuple is a protocol error, not a quiet role decision.
 pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+    ensure_ascii_uid(my_uid)?;
+    ensure_ascii_uid(peer_uid)?;
     if my_uid == peer_uid && my_id == peer_id {
         bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
     }
     Ok((my_uid, my_id) > (peer_uid, peer_id))
+}
+
+pub fn ensure_ascii_uid(uid: &str) -> Result<()> {
+    if uid.is_ascii() { Ok(()) } else { bail!("UID must be ASCII") }
+}
+
+/// Phase-1 compatibility path. It remains knowingly non-antisymmetric until
+/// phase 2 removes old-client skew; every use is attributed for measurement.
+pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str, source: &str) -> bool {
+    eprintln!("polite-role: legacy path source={source} peer_present=true uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
+    match peer_uid {
+        Some(p) if p != my_uid => my_uid > p,
+        _ => my_id > peer_id,
+    }
 }
 
 
@@ -1914,6 +1930,11 @@ mod tests {
     #[test]
     fn polite_role_rejects_equal_identity_tuple() {
         assert!(polite_role("same", "same", "sid", "sid").is_err());
+    }
+
+    #[test]
+    fn polite_role_rejects_non_ascii_uid() {
+        assert!(polite_role("uid-😀", "uid-a", "sid-a", "sid-b").is_err());
     }
 
     #[test]

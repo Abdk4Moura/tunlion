@@ -6495,7 +6495,7 @@ impl Conn {
             Some(value) => value,
             None => match peer_uid.as_deref() {
                 Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
-                None => bail!("peer {peer_id} is a pre-uid client; refusing role election"),
+                None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, "presence"),
             },
         };
         self.next_gen += 1;
@@ -7014,8 +7014,7 @@ impl Conn {
                 }
             },
             None => {
-                eprintln!("direct worker role election skipped for {pid}: pre-uid client");
-                return;
+                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, "presence")
             }
         };
         let count = k - 1;
@@ -8154,6 +8153,7 @@ impl Conn {
 
     async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
         if let Some(uid) = data["uid"].as_str() {
+            net::ensure_ascii_uid(uid)?;
             if let Some(info) = self.roster.get_mut(from) {
                 info["uid"] = json!(uid);
             } else {

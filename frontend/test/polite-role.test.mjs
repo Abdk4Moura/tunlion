@@ -30,6 +30,12 @@ test('politeRole rejects an identical identity tuple', () => {
   }), /identity tuple collision/)
 })
 
+test('politeRole rejects non-ASCII UIDs', () => {
+  assert.throws(() => politeRole({
+    myUid: 'uid-😀', peerUid: 'uid-a', myId: 'sid-a', peerId: 'sid-b',
+  }), /ASCII UIDs/)
+})
+
 test('politeRole rejects a missing UID for reloadable UX', () => {
   assert.throws(() => politeRole({
     myUid: 'uid-z', peerUid: null, myId: 'sid-b', peerId: 'sid-a',
