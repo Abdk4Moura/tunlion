@@ -314,7 +314,9 @@ export function useFilament() {
       try {
         polite = politeRole(roleArgs)
       } catch (error) {
-        const message = 'peer needs the current Filament client; reload this browser'
+        // The stale peer cannot receive this message because it is running the
+        // old bundle; only the current client can explain the compatibility gap.
+        const message = 'This peer is running an older Filament client and cannot connect. They need to reload their page.'
         console.warn(message, error)
         addPeer({ id, name, uid: uid || null, color: colorFor(id), status: message, route: null, lastSeen: 'now' })
         return null

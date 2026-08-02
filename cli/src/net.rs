@@ -1126,7 +1126,8 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 
 // --------------------------------------------------------------------- peer --
 
-/// Compare one shared identity tuple. Session IDs must differ whenever UIDs
+/// Compare one shared identity tuple. UIDs must be ASCII because Rust and JS
+/// order non-ASCII strings differently. Session IDs must differ whenever UIDs
 /// tie; an equal tuple is a protocol error, not a quiet role decision.
 pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
     if my_uid == peer_uid && my_id == peer_id {
