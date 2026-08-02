@@ -13900,9 +13900,9 @@ async fn recv_cmd(
                 // (which made every warm `forward` fall to a cold link). See
                 // l2::Mux::on_open_ack.
                 Some("l2-open-ack") if l2_enabled => {
-                    if let Some(sid) = v["sid"].as_u64() {
+                    if let Some(sid) = l2::wire_sid(&v) {
                         if let Some(mux) = l2_muxes.get(&pid) {
-                            mux.on_open_ack(sid as u32).await;
+                            mux.on_open_ack(sid).await;
                         }
                     }
                 }
@@ -13975,7 +13975,9 @@ async fn recv_cmd(
                         d.allowed()
                     };
                     if !authorized {
-                        let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                        // wire_sid (not a wrapping cast) so the l2-close we echo
+                        // back names the real sid; 0 only if absent/out-of-range.
+                        let sid = l2::wire_sid(&v).unwrap_or(0);
                         let diag = l2_deny_reason.as_deref().unwrap_or("device not granted shell");
                         ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
                         let _ = t
@@ -14199,7 +14201,9 @@ async fn recv_cmd(
                 // reuses the `shell` cap / --shell policy and requires `trusted`.
                 Some("pty-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
-                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    // wire_sid rejects a missing OR out-of-range sid instead of
+                    // defaulting to 0 / wrapping into a forged is_l2_sid value.
+                    let Some(sid) = l2::wire_sid(&v) else { continue };
                     if !l2::is_l2_sid(sid) {
                         continue;
                     }
@@ -14297,7 +14301,14 @@ async fn recv_cmd(
                             let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
                             continue;
                         }
-                        let rx = mux.register_stream(sid).await;
+                        // Collision-safe: if this sid is already live (peer reused
+                        // a live forward/pty/mount sid) register refuses; deny the
+                        // reattach rather than displacing the existing stream.
+                        let Some(rx) = mux.register_stream(sid).await else {
+                            ui::say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
+                            let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" })).await;
+                            continue;
+                        };
                         let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
                         mux.register_resizer(sid, rtx).await;
                         let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
@@ -14329,7 +14340,14 @@ async fn recv_cmd(
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
                         continue;
                     };
-                    let rx = mux.register_stream(sid).await; // before spawn (race fix)
+                    // before spawn (race fix). Collision-safe: refuse (don't
+                    // displace) if the peer named an already-live sid. `pty_guard`
+                    // drops on `continue`, freeing the global PTY slot it reserved.
+                    let Some(rx) = mux.register_stream(sid).await else {
+                        ui::say(&format!("l2: pty refused: sid {sid:#x} in use"));
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" })).await;
+                        continue;
+                    };
                     let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
                     // Resizer is owned by the mux so it is freed on EVERY teardown
                     // path (inbound l2-close, link death), H-1.
@@ -14372,7 +14390,9 @@ async fn recv_cmd(
                 }
                 Some("mount-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
-                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    // wire_sid rejects a missing OR out-of-range sid instead of
+                    // defaulting to 0 / wrapping into a forged is_l2_sid value.
+                    let Some(sid) = l2::wire_sid(&v) else { continue };
                     if !l2::is_l2_sid(sid) { continue; }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     // Decode the requested root up front: the fleet mount scope
@@ -14472,7 +14492,13 @@ async fn recv_cmd(
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
                         continue;
                     }
-                    let rx = mux.register_stream(sid).await;
+                    // Collision-safe: refuse (don't displace) if the peer named an
+                    // already-live sid; otherwise a forward's read pump would be
+                    // orphaned and its inbound frames redirected to this mount.
+                    let Some(rx) = mux.register_stream(sid).await else {
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" })).await;
+                        continue;
+                    };
                     let _ = t.send_control(&json!({ "type": "mount-open-ack", "sid": sid, "caps": caps })).await;
                     let transport = t.clone();
                     let spawn_sid = sid;
@@ -14480,7 +14506,7 @@ async fn recv_cmd(
                     mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version, read_only);
                 }
                 Some("pty-resize") if l2_enabled => {
-                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    let Some(sid) = l2::wire_sid(&v) else { continue };
                     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                     let rows = v["rows"].as_u64().unwrap_or(24) as u16;
                     // #4: resize the persistent session bound to this sid (not a

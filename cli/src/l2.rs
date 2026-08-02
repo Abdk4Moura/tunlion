@@ -48,6 +48,17 @@ pub fn is_l2_sid(sid: u32) -> bool {
     sid & L2_SID_BASE != 0
 }
 
+/// Parse a stream id from an inbound control message's `sid` field, REFUSING a
+/// value that does not fit in u32 instead of silently truncating it. A bare
+/// `as_u64().unwrap_or(0) as u32` cast both defaults a MISSING sid to 0 and
+/// WRAPS an oversized one (e.g. `0x1_8000_0000 as u32 == 0x8000_0000`), which
+/// would let a peer forge a value that passes `is_l2_sid` yet aliases a live
+/// sid. Returns `None` for a missing field OR an out-of-range value; every
+/// caller must deny/ignore the open in that case, never default to 0.
+pub fn wire_sid(v: &Value) -> Option<u32> {
+    u32::try_from(v["sid"].as_u64()?).ok()
+}
+
 /// Per-stream pipe item: `Some(bytes)` = data; `None` = clean half-close/EOF
 /// (an empty 4-byte data frame). A RST/abort is signalled out-of-band by
 /// dropping the whole stream entry (writer wakes on a closed channel), distinct
@@ -158,13 +169,25 @@ impl Mux {
 
     /// Register a stream's inbound pipe and return the receiver the socket-writer
     /// task drains. The read-pump handle is attached later via `set_read_pump`.
-    async fn register(&self, sid: u32) -> mpsc::Receiver<PipeItem> {
+    ///
+    /// COLLISION-SAFE: the sid is chosen by the PEER, so it can name a sid that
+    /// is ALREADY live (its own earlier forward, a pty, a mount, ...). A bare
+    /// `insert` would silently DISPLACE the existing `StreamHandle` and drop it;
+    /// dropping is NOT closing (the orphaned `read_pump` is dropped WITHOUT
+    /// `abort()`, so `socket_to_dc` stays parked in `rd.read()` leaking a
+    /// pump+socket, while `streams.len()` stays flat and defeats the H-1 stream
+    /// cap, and inbound frames for the sid are redirected to the new stream).
+    /// So this REFUSES a sid that is already present and returns `None`; a peer
+    /// reusing a live sid is a protocol error and the caller must deny the open.
+    /// This is the single structural chokepoint every stream type inherits.
+    async fn register(&self, sid: u32) -> Option<mpsc::Receiver<PipeItem>> {
+        let mut streams = self.streams.lock().await;
+        if streams.contains_key(&sid) {
+            return None; // sid already live: refuse, do NOT overwrite/drop
+        }
         let (tx, rx) = mpsc::channel::<PipeItem>(256);
-        self.streams
-            .lock()
-            .await
-            .insert(sid, StreamHandle { tx, read_pump: None });
-        rx
+        streams.insert(sid, StreamHandle { tx, read_pump: None });
+        Some(rx)
     }
 
     async fn set_read_pump(&self, sid: u32, h: AbortHandle) {
@@ -176,10 +199,12 @@ impl Mux {
         }
     }
 
-    /// Register a stream's inbound pipe (public, for the PTY acceptor which
-    /// registers BEFORE spawning the shell, same pre-registration race fix as
-    /// l2-open's dial path).
-    pub async fn register_stream(&self, sid: u32) -> mpsc::Receiver<PipeItem> {
+    /// Register a stream's inbound pipe (public, for the PTY/mount acceptors which
+    /// register BEFORE spawning the server, same pre-registration race fix as
+    /// l2-open's dial path). Returns `None` if the sid is already live (see
+    /// `register`): the caller MUST deny the open and must NOT proceed to set up
+    /// the stream, or the collision hole re-opens.
+    pub async fn register_stream(&self, sid: u32) -> Option<mpsc::Receiver<PipeItem>> {
         self.register(sid).await
     }
 
@@ -856,7 +881,9 @@ impl Mux {
     pub async fn accept_control(&self, v: &Value, trusted: bool, allow_nonloopback: bool) -> OpenVerdict {
         match v["type"].as_str() {
             Some("l2-open") => {
-                let Some(sid) = v["sid"].as_u64().map(|s| s as u32) else {
+                // Reject a missing OR out-of-range sid (wire_sid never truncates)
+                // rather than defaulting/wrapping into a forged is_l2_sid value.
+                let Some(sid) = wire_sid(v) else {
                     return OpenVerdict::Ignore;
                 };
                 if !is_l2_sid(sid) {
@@ -905,12 +932,20 @@ impl Mux {
                     self.accepted.lock().await.remove(&sid);
                     return OpenVerdict::Deny { sid, err: "too many streams" };
                 }
-                let rx = self.register(sid).await; // BEFORE the async dial
+                // Collision-safe register: if the peer named a sid already live
+                // on this link (its own forward/pty/mount), REFUSE rather than
+                // overwrite. Drop the `accepted` marker so the sid isn't wedged.
+                let Some(rx) = self.register(sid).await else {
+                    self.accepted.lock().await.remove(&sid);
+                    return OpenVerdict::Deny { sid, err: "sid in use" };
+                };
                 OpenVerdict::Accept { sid, host, port, rx }
             }
             Some("l2-close") => {
-                if let Some(sid) = v["sid"].as_u64() {
-                    self.on_close(sid as u32, v["err"].as_str()).await;
+                // wire_sid (not `as u32`): a wrapped/oversized close sid must not
+                // be truncated into a live sid and tear down the wrong stream.
+                if let Some(sid) = wire_sid(v) {
+                    self.on_close(sid, v["err"].as_str()).await;
                 }
                 OpenVerdict::Ignore
             }
@@ -1584,19 +1619,19 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
         match ev {
             Ev::Control(_pid, v) => match v["type"].as_str() {
                 Some("l2-close") => {
-                    if let Some(sid) = v["sid"].as_u64() {
-                        mux.on_close(sid as u32, v["err"].as_str()).await;
+                    if let Some(sid) = wire_sid(&v) {
+                        mux.on_close(sid, v["err"].as_str()).await;
                     }
                 }
                 Some("l2-open-ack") => {
-                    if let Some(sid) = v["sid"].as_u64() {
-                        mux.on_open_ack(sid as u32).await;
+                    if let Some(sid) = wire_sid(&v) {
+                        mux.on_open_ack(sid).await;
                     }
                 }
                 Some("mount-open-ack") => {
-                    if let Some(sid) = v["sid"].as_u64() {
+                    if let Some(sid) = wire_sid(&v) {
                         let mut ack_map = mux.mount_ack_tx.lock().await;
-                        if let Some(tx) = ack_map.remove(&(sid as u32)) {
+                        if let Some(tx) = ack_map.remove(&sid) {
                             let caps = v.get("caps").cloned().unwrap_or(serde_json::Value::Null);
                             let _ = tx.send(caps);
                         }
@@ -1623,7 +1658,13 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
 /// banner) can't lose bytes.
 pub(crate) async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
     let sid = mux.alloc_sid();
-    let rx = mux.register(sid).await;
+    // alloc_sid hands out a fresh sid, so register never collides here; guard
+    // anyway so a refusal can never be silently ignored (which would re-open the
+    // collision hole if this path ever shared sid space).
+    let rx = mux
+        .register(sid)
+        .await
+        .ok_or_else(|| anyhow!("l2 open: sid {sid:#x} already in use"))?;
     // The dial target is ALWAYS 127.0.0.1 in production (localhost-only is the
     // contract). FILAMENT_L2_DIALHOST is a TEST-ONLY override so the SSRF gate
     // can drive a non-loopback open and observe the acceptor refuse it.
@@ -1719,7 +1760,10 @@ pub(crate) async fn open_mount_stream(
     root: &str,
 ) -> Result<(u32, mpsc::Receiver<PipeItem>, crate::mount_proto::MountCaps)> {
     let sid = mux.alloc_sid();
-    let rx = mux.register(sid).await;
+    let rx = mux
+        .register(sid)
+        .await
+        .ok_or_else(|| anyhow!("mount open: sid {sid:#x} already in use"))?;
     let (tx, caps_rx) = tokio::sync::oneshot::channel();
     mux.mount_ack_tx.lock().await.insert(sid, tx);
     let encoded = crate::mount_proto::path_encode(std::path::Path::new(root));
@@ -1756,7 +1800,10 @@ pub(crate) async fn open_pty_stream(
     cmd: &str,
 ) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
     let sid = mux.alloc_sid();
-    let rx = mux.register(sid).await;
+    let rx = mux
+        .register(sid)
+        .await
+        .ok_or_else(|| anyhow!("pty open: sid {sid:#x} already in use"))?;
     let mut ctl = json!({
         "type": "pty-open", "sid": sid, "session": session, "cols": cols, "rows": rows, "term": term
     });
@@ -2178,7 +2225,10 @@ async fn pty_attach_once(
 
     diag.enter(crate::diag::Phase::L2Open);
     let sid = mux.alloc_sid();
-    let mut rx_pipe = mux.register(sid).await;
+    let mut rx_pipe = mux
+        .register(sid)
+        .await
+        .ok_or_else(|| anyhow!("pty open: sid {sid:#x} already in use"))?;
 
     // Real terminal: query the ACTUAL tty size (crossterm asks the tty via
     // ioctl), NOT the COLUMNS/LINES shell vars which are usually unexported and
@@ -3841,7 +3891,7 @@ mod h1_tests {
         for i in 0..n {
             let sid = L2_SID_BASE | (1000 + i);
             let guard = PtyGuard::try_acquire().expect("slot free");
-            let _rx = mux.register_stream(sid).await;
+            let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
             let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
             mux.register_resizer(sid, tx).await;
             assert_eq!(mux.live_streams().await, 1);
@@ -3857,7 +3907,7 @@ mod h1_tests {
         for i in 0..n {
             let sid = L2_SID_BASE | (2000 + i);
             let guard = PtyGuard::try_acquire().expect("slot free");
-            let _rx = mux.register_stream(sid).await;
+            let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
             let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
             mux.register_resizer(sid, tx).await;
             mux.drop_pty(sid).await; // a session task own exit path
@@ -3871,7 +3921,7 @@ mod h1_tests {
         for i in 0..n {
             let sid = L2_SID_BASE | (3000 + i);
             guards.push(PtyGuard::try_acquire().expect("slot free"));
-            let _rx = mux.register_stream(sid).await;
+            let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
             let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
             mux.register_resizer(sid, tx).await;
         }
@@ -3910,6 +3960,90 @@ mod h1_tests {
         assert_eq!(mux.live_streams().await, MAX_STREAMS_PER_LINK, "over-cap open must not register");
         // The denied sid is not stuck in `accepted` (can retry once room frees).
         assert!(!mux.accepted.lock().await.contains_key(&over));
+    }
+
+    /// SECURITY (sid collision): a second `register` for an ALREADY-LIVE sid must
+    /// be REFUSED (return None), NOT silently overwrite the existing StreamHandle.
+    /// An overwrite drops the first handle's read pump WITHOUT abort() (leaking a
+    /// parked socket) while `streams.len()` stays flat (defeating the H-1 cap) and
+    /// redirects the sid's inbound frames to the new stream. The peer chooses the
+    /// sid, so this is a peer-triggerable protocol error, and `register` is the
+    /// single structural chokepoint that refuses it.
+    #[tokio::test]
+    async fn register_refuses_duplicate_live_sid() {
+        let mux = Mux::new(MockTransport::new());
+        let sid = L2_SID_BASE | 42;
+        let mut rx1 = mux.register(sid).await.expect("first register succeeds");
+        assert_eq!(mux.live_streams().await, 1);
+
+        // Second register for the SAME live sid is refused (no new channel).
+        assert!(
+            mux.register(sid).await.is_none(),
+            "duplicate register on a live sid must be refused, not overwrite"
+        );
+        // Table unchanged: still exactly one stream for S.
+        assert_eq!(mux.live_streams().await, 1, "refused register must not change the table");
+
+        // The ORIGINAL handle is intact: an inbound frame for S still reaches rx1,
+        // proving its tx was NOT replaced by a second register's fresh channel.
+        mux.on_frame(sid, Bytes::from_static(b"hello")).await;
+        match rx1.recv().await {
+            Some(Some(bytes)) => assert_eq!(&bytes[..], b"hello"),
+            other => panic!("original stream channel broken after refused register: {other:?}"),
+        }
+    }
+
+    /// SECURITY (cross-stream collision): the exact shipped bug. A pty/mount open
+    /// registers a stream at sid S through the bare insert (bypassing the l2-open
+    /// `accepted` guard); a later `l2-open` naming the SAME S must be DENIED
+    /// ("sid in use") rather than displace the pre-existing stream. `register` is
+    /// now the chokepoint so every stream type inherits the protection.
+    #[tokio::test]
+    async fn accept_control_denies_open_on_live_foreign_sid() {
+        let mux = Mux::new(MockTransport::new());
+        let sid = L2_SID_BASE | 7;
+        // A pty/mount claims S via register_stream (a path that never touches the
+        // `accepted` map, so the l2-open acceptor cannot see it there).
+        let mut rx_orig = mux.register_stream(sid).await.expect("first claim succeeds");
+        assert_eq!(mux.live_streams().await, 1);
+
+        // A peer now opens an l2 forward naming the SAME sid.
+        match mux.accept_control(&open_msg(sid), true, false).await {
+            OpenVerdict::Deny { sid: dsid, err } => {
+                assert_eq!(dsid, sid);
+                assert_eq!(err, "sid in use");
+            }
+            other => panic!("expected Deny on live-sid reuse, got {:?}", std::mem::discriminant(&other)),
+        }
+        // Still exactly one stream, and the colliding open left no `accepted` wedge.
+        assert_eq!(mux.live_streams().await, 1, "collision must not add or replace a stream");
+        assert!(!mux.accepted.lock().await.contains_key(&sid), "denied open must not wedge `accepted`");
+        // The surviving stream is the ORIGINAL: an inbound frame still reaches rx_orig.
+        mux.on_frame(sid, Bytes::from_static(b"orig")).await;
+        match rx_orig.recv().await {
+            Some(Some(b)) => assert_eq!(&b[..], b"orig"),
+            other => panic!("original stream displaced by colliding open: {other:?}"),
+        }
+    }
+
+    /// SECURITY (sid truncation): a wire `sid` that does not fit in u32 must be
+    /// REJECTED by `wire_sid`, never truncated. `0x1_8000_0000 as u32 ==
+    /// 0x8000_0000` would otherwise pass `is_l2_sid` and alias a legit high-half
+    /// sid; a missing sid must be rejected too, never defaulted to 0.
+    #[test]
+    fn wire_sid_rejects_out_of_range_and_missing() {
+        // In range: parsed exactly.
+        assert_eq!(wire_sid(&json!({ "sid": 0x8000_0000u64 })), Some(0x8000_0000));
+        assert_eq!(wire_sid(&json!({ "sid": 0u64 })), Some(0));
+        assert_eq!(wire_sid(&json!({ "sid": u32::MAX as u64 })), Some(u32::MAX));
+        // The aliasing attack value: 0x1_8000_0000 must NOT become 0x8000_0000.
+        let attack = 0x1_8000_0000u64;
+        assert_eq!(attack as u32, 0x8000_0000, "precondition: a bare cast truncates");
+        assert_eq!(wire_sid(&json!({ "sid": attack })), None, "oversized sid must be refused, not wrapped");
+        // Just past the boundary is rejected, not wrapped to 0.
+        assert_eq!(wire_sid(&json!({ "sid": (u32::MAX as u64) + 1 })), None);
+        // Missing sid: rejected, NOT defaulted to 0.
+        assert_eq!(wire_sid(&json!({ "type": "l2-open" })), None);
     }
 
     /// H-1: the global PTY guard refuses acquisition once MAX_PTYS_GLOBAL slots
@@ -4029,7 +4163,7 @@ mod h1_tests {
         let t = KillableTransport::new();
         let mux = Mux::new(t.clone());
         let sid = L2_SID_BASE | 7;
-        let rx = mux.register(sid).await;
+        let rx = mux.register(sid).await.expect("fresh sid registers");
         // A duplex pair: one half is the bridge's "client socket", the other we keep
         // and NEVER write to, so the reader stays parked (the deadlock precondition).
         let (client, server_side) = tokio::io::duplex(1024);
