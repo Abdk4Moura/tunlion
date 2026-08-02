@@ -6491,9 +6491,13 @@ impl Conn {
         // every attempt, not just the first.
         let mut cfg = net::fetch_config(&self.server).await?;
         self.chunk_size = cfg.chunk_size;
-        let polite = force_polite.unwrap_or_else(|| {
-            net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id)
-        });
+        let polite = match force_polite {
+            Some(value) => value,
+            None => match peer_uid.as_deref() {
+                Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
+                None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id),
+            },
+        };
         self.next_gen += 1;
         let generation = self.next_gen;
         // P1 relay-fallback gate (test-only): FILAMENT_TEST_WEBRTC_RELAY_ONLY=1
@@ -7000,7 +7004,16 @@ impl Conn {
             return;
         }
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
-        let answerer = net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid);
+        let answerer = match peer_uid {
+            Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("direct worker role election failed for {pid}: {error}");
+                    return;
+                }
+            },
+            None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid),
+        };
         let count = k - 1;
         let pid = pid.to_string();
         let tx = self.tx.clone();
@@ -16468,15 +16481,17 @@ mod tests {
     #[test]
     fn polite_role_matches_browser() {
         // uid comparison wins, string-lexicographic, mirrors webrtc.js politeRole
-        assert!(net::polite_role("b", Some("a"), "x", "y")); // myUid > peerUid -> polite
-        assert!(!net::polite_role("a", Some("b"), "x", "y"));
-        // identical/missing uids fall back to sids
-        assert!(net::polite_role("a", Some("a"), "y", "x"));
-        assert!(!net::polite_role("a", None, "x", "y"));
+        assert!(net::polite_role("b", "a", "x", "y").unwrap()); // myUid > peerUid -> polite
+        assert!(!net::polite_role("a", "b", "x", "y").unwrap());
+        // Equal UIDs break ties by session ID within the same tuple comparison.
+        assert!(net::polite_role("a", "a", "y", "x").unwrap());
+        // Missing UIDs are knowingly legacy and cannot be made antisymmetric
+        // against an updated peer; this path is instrumented until phase 2.
+        assert!(!net::polite_role_legacy("a", None, "x", "y"));
         // exactly one side of any pair is impolite
         for (a, b) in [("a", "b"), ("cli-1", "cli-2"), ("zz", "aa")] {
-            let p1 = net::polite_role(a, Some(b), "s1", "s2");
-            let p2 = net::polite_role(b, Some(a), "s2", "s1");
+            let p1 = net::polite_role(a, b, "s1", "s2").unwrap();
+            let p2 = net::polite_role(b, a, "s2", "s1").unwrap();
             assert_ne!(p1, p2, "{a} vs {b} must disagree");
         }
     }

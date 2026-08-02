@@ -17,7 +17,7 @@ macro_rules! dlog {
 //   C4 transient 'disconnected'-> surfaced as PcState; main loop graces + retries
 //   C8a backpressure           -> event-driven via on_buffered_amount_low
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::FutureExt;
@@ -1126,8 +1126,22 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 
 // --------------------------------------------------------------------- peer --
 
-/// Mirror of webrtc.js politeRole(): prefer stable uids, fall back to sids.
-pub fn polite_role(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str) -> bool {
+/// Compare one shared identity tuple. Session IDs must differ whenever UIDs
+/// tie; an equal tuple is a protocol error, not a quiet role decision.
+pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+    if my_uid == peer_uid && my_id == peer_id {
+        bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
+    }
+    Ok((my_uid, my_id) > (peer_uid, peer_id))
+}
+
+/// Phase-1 compatibility path for peers that predate UID-in-handshake. It is
+/// knowingly not antisymmetric when only one side has learned the UID, and is
+/// instrumented so this path can be removed once skew is gone.
+pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str) -> bool {
+    if peer_uid.is_none() {
+        eprintln!("polite-role: legacy missing-peer-uid path my_uid={my_uid:?} my_id={my_id:?} peer_id={peer_id:?}");
+    }
     match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,
@@ -1878,38 +1892,38 @@ mod tests {
     #[test]
     fn polite_role_prefers_uid_then_sid() {
         // Distinct uids: lexical comparison of uids decides (mirrors webrtc.js).
-        assert!(polite_role("uid-z", Some("uid-a"), "s1", "s9"));
-        assert!(!polite_role("uid-a", Some("uid-z"), "s9", "s1"));
-        // Same/None uid: fall back to sid comparison.
-        assert!(polite_role("u", None, "s9", "s1"));
-        assert!(!polite_role("u", None, "s1", "s9"));
-        assert!(polite_role("u", Some("u"), "s9", "s1"));
+        assert!(polite_role("uid-z", "uid-a", "s1", "s9").unwrap());
+        assert!(!polite_role("uid-a", "uid-z", "s9", "s1").unwrap());
+        assert!(polite_role_legacy("u", None, "s9", "s1"));
+        assert!(!polite_role_legacy("u", None, "s1", "s9"));
+        assert!(polite_role("u", "u", "s9", "s1").unwrap());
     }
 
     #[test]
-    fn polite_role_is_antisymmetric_for_every_uid_knowledge_state() {
+    fn polite_role_is_antisymmetric_for_all_distinct_tuples() {
         let xor = |a: bool, b: bool| assert_ne!(a, b, "exactly one side must be polite");
 
-        // Both peers have the same UID view.
         xor(
-            polite_role("uid-a", Some("uid-b"), "sid-a", "sid-b"),
-            polite_role("uid-b", Some("uid-a"), "sid-b", "sid-a"),
+            polite_role("uid-a", "uid-b", "sid-a", "sid-b").unwrap(),
+            polite_role("uid-b", "uid-a", "sid-b", "sid-a").unwrap(),
         );
-        // Only A has learned B's UID.
         xor(
-            polite_role("uid-z", Some("uid-a"), "sid-a", "sid-b"),
-            polite_role("uid-a", None, "sid-b", "sid-a"),
+            polite_role("uid-z", "uid-a", "sid-a", "sid-b").unwrap(),
+            polite_role("uid-a", "uid-z", "sid-b", "sid-a").unwrap(),
         );
-        // Only B has learned A's UID.
         xor(
-            polite_role("uid-z", None, "sid-b", "sid-a"),
-            polite_role("uid-a", Some("uid-z"), "sid-a", "sid-b"),
+            polite_role("same-user", "same-user", "sid-a", "sid-b").unwrap(),
+            polite_role("same-user", "same-user", "sid-b", "sid-a").unwrap(),
         );
-        // Neither peer has learned the other's UID.
         xor(
-            polite_role("uid-a", None, "sid-a", "sid-b"),
-            polite_role("uid-b", None, "sid-b", "sid-a"),
+            polite_role("uid-a", "uid-b", "sid-z", "sid-a").unwrap(),
+            polite_role("uid-b", "uid-a", "sid-a", "sid-z").unwrap(),
         );
+    }
+
+    #[test]
+    fn polite_role_rejects_equal_identity_tuple() {
+        assert!(polite_role("same", "same", "sid", "sid").is_err());
     }
 
     #[test]
