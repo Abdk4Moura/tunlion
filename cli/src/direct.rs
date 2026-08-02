@@ -1579,7 +1579,7 @@ pub async fn accept_workers(
 
 // ============================================================== orchestrator ==
 
-fn answerer_for(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+fn answerer_for(my_uid: &str, peer_uid: &str, my_id: Option<&str>, peer_id: &str) -> Result<bool> {
     crate::net::polite_role(my_uid, peer_uid, my_id, peer_id)
 }
 
@@ -1598,7 +1598,7 @@ pub async fn race_connect(
     peer_id: String,
     my_uid: String,
     peer_uid: String,
-    my_id: String,
+    my_id: Option<String>,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
 ) -> Option<Arc<dyn Transport>> {
     race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic").await
@@ -1614,11 +1614,11 @@ pub async fn race_connect_labeled(
     peer_id: String,
     my_uid: String,
     peer_uid: String,
-    my_id: String,
+    my_id: Option<String>,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
 ) -> Option<Arc<dyn Transport>> {
-    let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
+    let answerer = match answerer_for(&my_uid, &peer_uid, my_id.as_deref(), &peer_id) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("direct role election failed for peer {peer_id}: {error}");
@@ -1742,8 +1742,8 @@ mod tests {
 
     #[test]
     fn answerer_role_is_opposite_for_both_quic_ends() {
-        let a = answerer_for("uid-a", "uid-b", "sid-a", "sid-b").unwrap();
-        let b = answerer_for("uid-b", "uid-a", "sid-b", "sid-a").unwrap();
+        let a = answerer_for("uid-a", "uid-b", Some("sid-a"), "sid-b").unwrap();
+        let b = answerer_for("uid-b", "uid-a", Some("sid-b"), "sid-a").unwrap();
         assert_ne!(a, b, "QUIC ends must allocate opposite sid halves");
     }
 

@@ -1129,13 +1129,17 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 /// Compare one shared identity tuple. UIDs must be ASCII because Rust and JS
 /// order non-ASCII strings differently. Session IDs must differ whenever UIDs
 /// tie; an equal tuple is a protocol error, not a quiet role decision.
-pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: Option<&str>, peer_id: &str) -> Result<bool> {
     ensure_ascii_uid(my_uid)?;
     ensure_ascii_uid(peer_uid)?;
-    if my_uid == peer_uid && my_id == peer_id {
+    if my_uid != peer_uid {
+        return Ok(my_uid > peer_uid);
+    }
+    let my_id = my_id.ok_or_else(|| anyhow!("polite-role requires local session ID when UIDs tie"))?;
+    if my_id == peer_id {
         bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
     }
-    Ok((my_uid, my_id) > (peer_uid, peer_id))
+    Ok(my_id > peer_id)
 }
 
 pub fn ensure_ascii_uid(uid: &str) -> Result<()> {
@@ -1900,9 +1904,9 @@ mod tests {
     #[test]
     fn polite_role_prefers_uid_then_sid() {
         // Distinct uids: lexical comparison of uids decides (mirrors webrtc.js).
-        assert!(polite_role("uid-z", "uid-a", "s1", "s9").unwrap());
-        assert!(!polite_role("uid-a", "uid-z", "s9", "s1").unwrap());
-        assert!(polite_role("u", "u", "s9", "s1").unwrap());
+        assert!(polite_role("uid-z", "uid-a", Some("s1"), "s9").unwrap());
+        assert!(!polite_role("uid-a", "uid-z", Some("s9"), "s1").unwrap());
+        assert!(polite_role("u", "u", Some("s9"), "s1").unwrap());
     }
 
     #[test]
@@ -1910,31 +1914,37 @@ mod tests {
         let xor = |a: bool, b: bool| assert_ne!(a, b, "exactly one side must be polite");
 
         xor(
-            polite_role("uid-a", "uid-b", "sid-a", "sid-b").unwrap(),
-            polite_role("uid-b", "uid-a", "sid-b", "sid-a").unwrap(),
+            polite_role("uid-a", "uid-b", Some("sid-a"), "sid-b").unwrap(),
+            polite_role("uid-b", "uid-a", Some("sid-b"), "sid-a").unwrap(),
         );
         xor(
-            polite_role("uid-z", "uid-a", "sid-a", "sid-b").unwrap(),
-            polite_role("uid-a", "uid-z", "sid-b", "sid-a").unwrap(),
+            polite_role("uid-z", "uid-a", Some("sid-a"), "sid-b").unwrap(),
+            polite_role("uid-a", "uid-z", Some("sid-b"), "sid-a").unwrap(),
         );
         xor(
-            polite_role("same-user", "same-user", "sid-a", "sid-b").unwrap(),
-            polite_role("same-user", "same-user", "sid-b", "sid-a").unwrap(),
+            polite_role("same-user", "same-user", Some("sid-a"), "sid-b").unwrap(),
+            polite_role("same-user", "same-user", Some("sid-b"), "sid-a").unwrap(),
         );
         xor(
-            polite_role("uid-a", "uid-b", "sid-z", "sid-a").unwrap(),
-            polite_role("uid-b", "uid-a", "sid-a", "sid-z").unwrap(),
+            polite_role("uid-a", "uid-b", Some("sid-z"), "sid-a").unwrap(),
+            polite_role("uid-b", "uid-a", Some("sid-a"), "sid-z").unwrap(),
         );
     }
 
     #[test]
     fn polite_role_rejects_equal_identity_tuple() {
-        assert!(polite_role("same", "same", "sid", "sid").is_err());
+        assert!(polite_role("same", "same", Some("sid"), "sid").is_err());
     }
 
     #[test]
     fn polite_role_rejects_non_ascii_uid() {
-        assert!(polite_role("uid-😀", "uid-a", "sid-a", "sid-b").is_err());
+        assert!(polite_role("uid-😀", "uid-a", Some("sid-a"), "sid-b").is_err());
+    }
+
+    #[test]
+    fn polite_role_only_requires_local_id_for_equal_uid() {
+        assert!(polite_role("uid-z", "uid-a", None, "sid-b").unwrap());
+        assert!(polite_role("same", "same", None, "sid-b").is_err());
     }
 
     #[test]

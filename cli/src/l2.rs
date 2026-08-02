@@ -1166,7 +1166,7 @@ async fn bring_up_to_known(
                     continue;
                 };
                 let polite = match uid.as_deref() {
-                    Some(peer_uid) => net::polite_role(&my_uid, peer_uid, &mine, &pid)?,
+                    Some(peer_uid) => net::polite_role(&my_uid, peer_uid, Some(&mine), &pid)?,
                     None => {
                         let source = if peer_present { "presence" } else { "absent-roster" };
                         net::polite_role_legacy(&my_uid, None, &mine, &pid, source, peer_present)
@@ -1345,7 +1345,7 @@ async fn bring_up_to_known(
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
                                 ep, peer_cands, &secret, pid.clone(), my_uid_for_race,
-                                peer_uid_for_race, my_id_for_race, tx.clone(), "direct-quic",
+                                peer_uid_for_race, Some(my_id_for_race), tx.clone(), "direct-quic",
                             )
                             .await
                             {

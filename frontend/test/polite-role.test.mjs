@@ -41,3 +41,12 @@ test('politeRole rejects a missing UID for reloadable UX', () => {
     myUid: 'uid-z', peerUid: null, myId: 'sid-b', peerId: 'sid-a',
   }), /requires peer and local UIDs/)
 })
+
+test('politeRole does not require local session ID when UIDs differ', () => {
+  assert.equal(politeRole({
+    myUid: 'uid-z', peerUid: 'uid-a', myId: null, peerId: 'sid-b',
+  }), true)
+  assert.throws(() => politeRole({
+    myUid: 'same', peerUid: 'same', myId: null, peerId: 'sid-b',
+  }), /requires local session ID when UIDs tie/)
+})

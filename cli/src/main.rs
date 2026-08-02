@@ -6191,7 +6191,7 @@ impl Conn {
         let polite = match force_polite {
             Some(value) => value,
             None => match peer_uid.as_deref() {
-                Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, my_id, &peer_id)?,
+                Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, Some(my_id), &peer_id)?,
                 None => {
                     let source = if peer_present { "presence" } else { "absent-roster" };
                     net::polite_role_legacy(&self.my_uid, None, my_id, &peer_id, source, peer_present)
@@ -6530,10 +6530,7 @@ impl Conn {
             return;
         };
         let my_uid = self.my_uid.clone();
-        let Some(my_id) = self.my_id.clone() else {
-            eprintln!("direct role election deferred for {pid}: local session ID unavailable");
-            return;
-        };
+        let my_id = self.my_id.clone();
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
             if is_probe {
                 Ev::DirectUpgradeReady(pid, t, route)
@@ -6722,7 +6719,7 @@ impl Conn {
             return;
         };
         let answerer = match peer_uid {
-            Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, my_id.as_str(), pid) {
+            Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, Some(my_id.as_str()), pid) {
                 Ok(value) => value,
                 Err(error) => {
                     eprintln!("direct worker role election failed for {pid}: {error}");
@@ -16054,14 +16051,14 @@ mod tests {
     #[test]
     fn polite_role_matches_browser() {
         // uid comparison wins, string-lexicographic, mirrors webrtc.js politeRole
-        assert!(net::polite_role("b", "a", "x", "y").unwrap()); // myUid > peerUid -> polite
-        assert!(!net::polite_role("a", "b", "x", "y").unwrap());
+        assert!(net::polite_role("b", "a", Some("x"), "y").unwrap()); // myUid > peerUid -> polite
+        assert!(!net::polite_role("a", "b", Some("x"), "y").unwrap());
         // Equal UIDs break ties by session ID within the same tuple comparison.
-        assert!(net::polite_role("a", "a", "y", "x").unwrap());
+        assert!(net::polite_role("a", "a", Some("y"), "x").unwrap());
         // exactly one side of any pair is impolite
         for (a, b) in [("a", "b"), ("cli-1", "cli-2"), ("zz", "aa")] {
-            let p1 = net::polite_role(a, b, "s1", "s2").unwrap();
-            let p2 = net::polite_role(b, a, "s2", "s1").unwrap();
+            let p1 = net::polite_role(a, b, Some("s1"), "s2").unwrap();
+            let p2 = net::polite_role(b, a, Some("s2"), "s1").unwrap();
             assert_ne!(p1, p2, "{a} vs {b} must disagree");
         }
     }

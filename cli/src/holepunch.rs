@@ -353,7 +353,7 @@ pub async fn connect(
     peer_id: String,
     my_uid: String,
     peer_uid: String,
-    my_id: String,
+    my_id: Option<String>,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
 ) -> Option<Arc<dyn Transport>> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.

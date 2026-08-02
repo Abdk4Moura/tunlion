@@ -311,16 +311,18 @@ async function blobHash(blob) {
 // both sides. UIDs must be ASCII because Rust and JS order non-ASCII strings
 // differently. Session IDs must differ whenever UIDs tie.
 export function politeRole({ myUid, peerUid, myId, peerId }) {
-  if (myUid == null || peerUid == null || myId == null || peerId == null) {
-    throw new Error('politeRole requires peer and local UIDs and session IDs')
+  if (myUid == null || peerUid == null || peerId == null) {
+    throw new Error('politeRole requires peer and local UIDs and peer session ID')
   }
   if (!/^[\x00-\x7F]*$/.test(myUid) || !/^[\x00-\x7F]*$/.test(peerUid)) {
     throw new Error('politeRole requires ASCII UIDs')
   }
-  if (myUid === peerUid && myId === peerId) {
+  if (myUid !== peerUid) return myUid > peerUid
+  if (myId == null) throw new Error('politeRole requires local session ID when UIDs tie')
+  if (myId === peerId) {
     throw new Error(`politeRole identity tuple collision: uid=${myUid} sid=${myId}`)
   }
-  return myUid > peerUid || (myUid === peerUid && myId > peerId)
+  return myId > peerId
 }
 
 // Phase-1 compatibility only. Mixed-version peers can still disagree here;
