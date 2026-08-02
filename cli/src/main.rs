@@ -6301,13 +6301,36 @@ impl Conn {
             // link has no WebRTC peer; dropping the Link drops its QUIC transport
             // (the keepalive task observes conn.closed() and tears down).
             if let Some(p) = old.peer.clone() {
+                ui::debug(&format!("filament: DROP transport peer={pid} reason=drop_link webrtc_peer=true"));
                 p.mark_closed();
                 tokio::spawn(async move { p.close().await });
+            }
+            if let Some(t) = old.transport.as_ref() {
+                t.note_drop_reason("drop_link");
+                ui::debug(&format!("filament: DROP transport peer={pid} reason=drop_link direct={}", old.direct));
+            }
+            for t in &old.workers {
+                t.note_drop_reason("drop_link worker");
+                ui::debug(&format!("filament: DROP transport peer={pid} reason=drop_link worker direct={}", old.direct));
             }
         }
         if self.is_active(pid) {
             self.active = None;
         }
+    }
+
+    /// Release a pending direct attempt with an explicit lifetime reason. This
+    /// is diagnostic only; removing the entry still drops its endpoint/socket.
+    fn drop_direct_pending(&mut self, pid: &str, reason: &'static str) -> Option<DirectPending> {
+        let pending = self.direct_pending.remove(pid);
+        if let Some(p) = pending.as_ref() {
+            ui::debug(&format!(
+                "filament: DROP direct-pending peer={pid} reason={reason} endpoint={} punch_sock={}",
+                p.endpoint.is_some(),
+                p.punch_sock.is_some(),
+            ));
+        }
+        pending
     }
 
     // --- WARM-HOLD: proactive connection management ---
@@ -6604,7 +6627,7 @@ impl Conn {
             .map(|l| l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true) && l.workers.iter().all(|w| w.is_dead()))
             .unwrap_or(false);
         if link_dead {
-            self.direct_pending.remove(pid);
+            self.drop_direct_pending(pid, "dead link cleanup");
             self.drop_link(pid);
         }
         let link_alive = self.has_live_transport(pid);
@@ -6888,7 +6911,7 @@ impl Conn {
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
     /// proved identity, at least as strong as the DTLS pair-proof it replaces).
     fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
-        let pend = self.direct_pending.remove(pid);
+        let pend = self.drop_direct_pending(pid, "authenticated direct won race");
         let (name, secret) = match pend {
             Some(p) => p.secret,
             None => ("peer".to_string(), String::new()),
@@ -6913,7 +6936,13 @@ impl Conn {
         // Workers stay intact; only the primary transport is swapped.
         let _existing_generation = self.links.get(pid).map(|l| l.generation).unwrap_or(0);
         if let Some(existing) = self.links.get_mut(pid) {
-            if existing.transport.as_ref().map(|t2| t2.is_dead()).unwrap_or(true) { existing.transport = Some(t); }
+            if existing.transport.as_ref().map(|t2| t2.is_dead()).unwrap_or(true) {
+                if let Some(old) = existing.transport.as_ref() {
+                    old.note_drop_reason("superseded dead primary");
+                    ui::debug(&format!("filament: DROP transport peer={pid} reason=superseded dead primary"));
+                }
+                existing.transport = Some(t);
+            }
             existing.direct = true;
             existing.direct_route = route;
             existing.generation = generation;
@@ -7049,7 +7078,7 @@ impl Conn {
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in expired_probes {
-            self.direct_pending.remove(&pid);
+            self.drop_direct_pending(&pid, "upgrade probe budget expired");
             // DEBUG, resilience internal (upgrade probe found no path).
             ui::debug(&format!("filament: UPGRADE-PROBE for {pid} found no direct path in budget, staying on relay"));
             self.mark_probe_failed(&pid);
@@ -7061,7 +7090,7 @@ impl Conn {
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in expired {
-            if let Some(p) = self.direct_pending.remove(&pid) {
+            if let Some(p) = self.drop_direct_pending(&pid, "direct budget expired; WebRTC fallback") {
                 let info = self
                     .roster
                     .get(&pid)
@@ -7087,7 +7116,7 @@ impl Conn {
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in linked {
-            self.direct_pending.remove(&pid);
+            self.drop_direct_pending(&pid, "link established by another route");
         }
         fell_back
     }
@@ -7527,7 +7556,7 @@ impl Conn {
         // Clear any stray pending direct attempt so `establish` (which early-
         // returns while a direct attempt owns the peer, to keep the ladder
         // sequential) is never suppressed for the relay re-establish.
-        self.direct_pending.remove(pid);
+        self.drop_direct_pending(pid, "relay escalation");
         // Carry the proven identity into the fresh relay link so the post-channel
         // pair-proof still binds to the same device (set after establish creates
         // the Link below).
@@ -7589,6 +7618,10 @@ impl Conn {
     fn mark_probe_failed(&mut self, pid: &str) {
         let Some(up) = self.resil.upgrade_probe.get_mut(pid) else { return };
         up.attempt = up.attempt.saturating_add(1);
+        if let Some(t) = up.standby.as_ref() {
+            t.note_drop_reason("upgrade probe failed verification");
+            ui::debug(&format!("filament: DROP transport peer={pid} reason=upgrade probe failed verification"));
+        }
         up.standby = None;
         up.verify_started = None;
         up.verify_last_idle = u64::MAX;
@@ -7642,7 +7675,7 @@ impl Conn {
             // shouldn't be probed; drop its entry.
             if !self.resil.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
                 self.resil.upgrade_probe.remove(&pid);
-                self.direct_pending.remove(&pid);
+                self.drop_direct_pending(&pid, "upgrade probe no longer owned");
                 continue;
             }
             // VERIFYING: a standby connected, judge it before scheduling anything.
@@ -7747,7 +7780,7 @@ impl Conn {
                 ui::Tone::Warn,
                 "  direct path connected but didn't hold, staying on relay (no flap)",
             ));
-            self.direct_pending.remove(pid);
+            self.drop_direct_pending(pid, "upgrade standby rejected");
             self.mark_probe_failed(pid);
             return;
         }
@@ -7775,7 +7808,7 @@ impl Conn {
         self.resil.relay_committed.remove(pid);
         self.relay_only = false;
         self.resil.upgrade_probe.remove(pid);
-        self.direct_pending.remove(pid);
+        self.drop_direct_pending(pid, "upgrade cutover");
         // Swap the verified direct transport into the link, dropping the relay
         // link/transport (drop_link tears down the WebRTC peer). adopt the new
         // transport via the same direct-link shape adopt_direct builds, but reusing
@@ -7856,12 +7889,16 @@ impl Conn {
     fn stash_upgrade_standby(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
         // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
         // out from under the verify (the race already won).
-        self.direct_pending.remove(pid);
+        self.drop_direct_pending(pid, "upgrade standby won race");
         let Some(up) = self.resil.upgrade_probe.get_mut(pid) else {
             // No armed probe, the transport is unowned; dropping it tears it down.
+            t.note_drop_reason("unowned upgrade standby");
+            ui::debug(&format!("filament: DROP transport peer={pid} reason=unowned upgrade standby"));
             return;
         };
         if up.standby.is_some() {
+            t.note_drop_reason("duplicate upgrade standby");
+            ui::debug(&format!("filament: DROP transport peer={pid} reason=duplicate upgrade standby"));
             return; // already verifying a standby; ignore the duplicate.
         }
         up.standby = Some(t);

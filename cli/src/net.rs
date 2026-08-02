@@ -422,6 +422,9 @@ pub trait Transport: Send + Sync {
     /// so the peer can clean up its link. Called before drop_link purges the
     /// corpse, preventing the keepalive from leaking a zombie connection.
     fn force_close(&self) {}
+    /// Record why the owner is about to release this transport. Diagnostic only;
+    /// implementations that do not expose a reasoned drop can ignore it.
+    fn note_drop_reason(&self, _reason: &'static str) {}
     /// If the transport rides an existing QUIC connection, open a new
     /// bidirectional stream on it (mesh reuse) and return the streams plus
     /// a clone of the underlying connection handle. Returns None when the

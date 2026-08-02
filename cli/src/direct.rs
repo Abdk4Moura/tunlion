@@ -39,7 +39,7 @@ use rustls::SignatureScheme;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -880,7 +880,7 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
         c.closed().await;
         #[cfg(debug_assertions)]
         #[cfg(debug_assertions)]
-        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
+        eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} reason=connection closed, dropping endpoint");
         drop(ep);
     });
 }
@@ -902,6 +902,7 @@ pub struct DirectTransport {
     /// The deterministic `polite` role for this link (opposite on the two ends);
     /// selects this end's L2 sid half so the two ends never collide.
     answerer: bool,
+    drop_reason: StdMutex<&'static str>,
     /// The endpoint that created this transport. WORKER transports own their
     /// own endpoint (one per worker). The PRIMARY transport does NOT own the
     /// endpoint (it is shared). When the worker transport is dropped (via
@@ -934,8 +935,8 @@ impl Drop for DirectTransport {
         let ep_info = self.ep.as_ref().map(|e| format!("ep={:?}", e.local_addr())).unwrap_or_else(|| "ep=None".to_string());
         #[cfg(debug_assertions)]
         #[cfg(debug_assertions)]
-        eprintln!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} close_reason={:?}",
-            self.conn.stable_id(), self.answerer, self.conn.close_reason());
+        eprintln!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} reason={} close_reason={:?}",
+            self.conn.stable_id(), self.answerer, *self.drop_reason.lock().unwrap(), self.conn.close_reason());
     }
 }
 
@@ -1218,6 +1219,10 @@ impl Transport for DirectTransport {
         self.conn.close(0u32.into(), b"dropped");
     }
 
+    fn note_drop_reason(&self, reason: &'static str) {
+        *self.drop_reason.lock().unwrap() = reason;
+    }
+
     async fn open_stream(&self) -> Option<(quinn::SendStream, quinn::RecvStream, quinn::Connection)> {
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return None;
@@ -1415,6 +1420,7 @@ pub fn make_transport(
         last_activity,
         dead,
         answerer,
+        drop_reason: StdMutex::new("owner release without annotated site"),
         ep,
         #[cfg(feature = "test-hooks")]
         sent_data: std::sync::atomic::AtomicU64::new(0),
@@ -1624,6 +1630,7 @@ pub async fn race_connect_labeled(
         // endpoint and let the budget expire so WebRTC takes over.
         eprintln!("filament: DIRECT-BLOCKED (test), forcing WebRTC fallback");
         tokio::time::sleep(DIRECT_BUDGET).await;
+        eprintln!("filament: DROP endpoint reason=test block");
         endpoint.close(0u32.into(), b"test-block");
         return None;
     }
@@ -1680,6 +1687,10 @@ pub async fn race_connect_labeled(
                     if s.contains("DIRECT-AUTH-FAIL") {
                         crate::ui::trace(&format!("filament: {s}"));
                     }
+                    crate::ui::debug(&format!(
+                        "filament: DROP direct race attempt peer={} route={} answerer={} reason=attempt error: {}",
+                        peer_id, route, answerer, s
+                    ));
                     continue;
                 }
             }
@@ -1690,12 +1701,17 @@ pub async fn race_connect_labeled(
     let winner = match tokio::time::timeout(DIRECT_BUDGET, race).await {
         Ok(Some(w)) => w,
         _ => {
+            eprintln!("filament: DROP direct race endpoint reason=budget expired route={route} peer={peer_id} answerer={answerer}");
             endpoint.close(0u32.into(), b"direct-timeout");
             return None;
         }
     };
 
     let (conn, send, recv) = winner;
+    eprintln!(
+        "filament: DIRECT-RACE winner conn_stable={} route={} peer={} answerer={} reason=other race attempts dropped",
+        conn.stable_id(), route, peer_id, answerer
+    );
     // DEBUG, direct-connect diagnostic (the user-facing route label is the
     // `route:` line emitted in main.rs; this is the internal detail).
     crate::ui::debug(&format!(
