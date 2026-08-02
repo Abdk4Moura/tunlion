@@ -6495,7 +6495,7 @@ impl Conn {
             Some(value) => value,
             None => match peer_uid.as_deref() {
                 Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
-                None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id),
+                None => bail!("peer {peer_id} has no UID; refusing role election"),
             },
         };
         self.next_gen += 1;
@@ -7013,7 +7013,10 @@ impl Conn {
                     return;
                 }
             },
-            None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid),
+            None => {
+                eprintln!("direct worker role election skipped for {pid}: peer has no UID");
+                return;
+            }
         };
         let count = k - 1;
         let pid = pid.to_string();
@@ -16493,9 +16496,6 @@ mod tests {
         assert!(!net::polite_role("a", "b", "x", "y").unwrap());
         // Equal UIDs break ties by session ID within the same tuple comparison.
         assert!(net::polite_role("a", "a", "y", "x").unwrap());
-        // Missing UIDs are knowingly legacy and cannot be made antisymmetric
-        // against an updated peer; this path is instrumented until phase 2.
-        assert!(!net::polite_role_legacy("a", None, "x", "y"));
         // exactly one side of any pair is impolite
         for (a, b) in [("a", "b"), ("cli-1", "cli-2"), ("zz", "aa")] {
             let p1 = net::polite_role(a, b, "s1", "s2").unwrap();

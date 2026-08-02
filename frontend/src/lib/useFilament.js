@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
 import { createSession } from './session.js'
-import { PeerLink, politeRole, legacyPoliteRole } from './webrtc.js'
+import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
@@ -306,11 +306,19 @@ export function useFilament() {
           }
         }
       }
-      // Perfect-negotiation role (#1): exactly one of each pair is impolite and
-      // owns the offer. Compared by the STABLE uid when known (so a stale sid
-      // on one side can't produce a both-polite deadlock), else by sid.
+      // Perfect-negotiation role: both sides must advertise their UID before
+      // election. Old clients are rejected loudly rather than entering a
+      // divergent legacy election; reload to receive the current client.
       const roleArgs = { myUid: uidRef.current, peerUid: uid, myId: myIdRef.current, peerId: id }
-      const polite = uid == null ? legacyPoliteRole(roleArgs) : politeRole(roleArgs)
+      let polite
+      try {
+        polite = politeRole(roleArgs)
+      } catch (error) {
+        const message = 'peer needs the current Filament client; reload this browser'
+        console.warn(message, error)
+        addPeer({ id, name, uid: uid || null, color: colorFor(id), status: message, route: null, lastSeen: 'now' })
+        return null
+      }
       addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
