@@ -241,6 +241,7 @@ mod tests {
         let s = render_approve_success("carol", "send files", "15:12 (1h)");
         assert!(s.contains("carol"), "must show peer name");
         assert!(s.contains("send files"), "must show capability");
+        assert!(s.contains("15:12 (1h)"), "must show the granted expiry");
     }
 
     #[test]

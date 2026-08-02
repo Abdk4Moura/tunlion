@@ -3178,6 +3178,16 @@ fn pending_request_count(value: Option<&Value>) -> usize {
         .unwrap_or(0)
 }
 
+fn format_approval_expiry(expires: u64) -> String {
+    chrono::DateTime::from_timestamp(expires as i64, 0)
+        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| expires.to_string())
+}
+
+fn permanent_grant_notice(revoke: &str) -> String {
+    format!("This grant does not expire. {revoke}")
+}
+
 fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
     let Some(cert) = cert else {
         return "promote to continue".to_string();
@@ -3305,13 +3315,15 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                 Some(v) => {
                     if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
                         if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
-                            // Do not call render_approve_success here. The capability
-                            // layer has no bounded-grant contract yet, so its expiry
-                            // would be false while device_set_cap persists access.
-                            ui::say(&format!(
-                                "  {} approved {cap} for {peer} until {expires}",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                            ));
+                            if let Some(granted_expires) = v.get("expires").and_then(|v| v.as_u64()) {
+                                let expiry = format_approval_expiry(granted_expires);
+                                ui::say(&fleet_ui::requests::render_approve_success(peer, cap, &expiry));
+                            } else {
+                                ui::say(&format!(
+                                    "  {} approval succeeded but the grant expiry was missing",
+                                    ui::paint(ui::Tone::Err, ui::glyph_err()),
+                                ));
+                            }
                         }
                     }
                 }
@@ -9563,7 +9575,10 @@ async fn main() -> Result<()> {
                 store.push(op.to_json());
                 let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
                     .context("save cap store")?;
-                println!("granted '{capability}' to tag '{t}'.");
+                println!(
+                    "granted '{capability}' to tag '{t}'. {}",
+                    permanent_grant_notice("Remove the tag grant to revoke it.")
+                );
                 return Ok(());
             }
             // Original device grant path (unchanged)
@@ -9676,13 +9691,14 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            let detail = if capability == "shell" {
+                "They can now `filament ssh` into this machine (their key is installed on first connect)."
+            } else {
+                ""
+            };
             println!(
-                "granted '{capability}' to '{device}'. {}",
-                if capability == "shell" {
-                    "they can now `filament ssh` into this machine (their key is installed on first connect)."
-                } else {
-                    ""
-                }
+                "granted '{capability}' to '{device}'. {detail} {}",
+                permanent_grant_notice(&format!("Revoke it with `filament revoke {device} {capability}`."))
             );
             Ok(())
         }
@@ -12856,7 +12872,7 @@ async fn recv_cmd(
                                     r.status = "approved".to_string();
                                     r.granted_at = Some(crate::capability::now_secs());
                                     save_requests(&requests);
-                                    req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap })).await;
+                                    req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap, "expires": expires })).await;
                                 }
                             } else {
                                 req.reject(&format!("request {id} not found or not pending")).await;
@@ -17288,5 +17304,17 @@ mod tests {
             classify_bare_token("xyzpdq", &|_| false, &|t| known.contains(t)),
             BareTarget::Unknown
         );
+    }
+
+    #[test]
+    fn approval_expiry_uses_actual_granted_timestamp() {
+        assert_eq!(format_approval_expiry(1_700_000_000), "2023-11-14 22:13 UTC");
+    }
+
+    #[test]
+    fn permanent_grant_notice_states_no_expiry_and_revoke() {
+        let notice = permanent_grant_notice("Revoke it with `filament revoke laptop shell`.");
+        assert!(notice.contains("does not expire"));
+        assert!(notice.contains("filament revoke laptop shell"));
     }
 }
