@@ -17,7 +17,6 @@
 pub mod devices;
 pub mod mint;
 pub mod pair_ui;
-pub mod recovery;
 pub mod requests;
 
 use crate::ui::{self, Tone};
