@@ -308,7 +308,8 @@ async function blobHash(blob) {
 }
 
 // Deterministic negotiation roles: compare the same (uid, session-id) tuple on
-// both sides. Session IDs must differ whenever UIDs tie.
+// both sides. UIDs must be ASCII because Rust and JS order non-ASCII strings
+// differently. Session IDs must differ whenever UIDs tie.
 export function politeRole({ myUid, peerUid, myId, peerId }) {
   if (myUid == null || peerUid == null || myId == null || peerId == null) {
     throw new Error('politeRole requires peer and local UIDs and session IDs')

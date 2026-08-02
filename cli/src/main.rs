@@ -6188,7 +6188,7 @@ impl Conn {
             Some(value) => value,
             None => match peer_uid.as_deref() {
                 Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
-                None => bail!("peer {peer_id} has no UID; refusing role election"),
+                None => bail!("peer {peer_id} is a pre-uid client; refusing role election"),
             },
         };
         self.next_gen += 1;
@@ -6707,7 +6707,7 @@ impl Conn {
                 }
             },
             None => {
-                eprintln!("direct worker role election skipped for {pid}: peer has no UID");
+                eprintln!("direct worker role election skipped for {pid}: pre-uid client");
                 return;
             }
         };

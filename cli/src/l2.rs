@@ -1162,7 +1162,7 @@ async fn bring_up_to_known(
                 let mine = my_id.clone().unwrap_or_default();
                 let polite = match uid.as_deref() {
                     Some(peer_uid) => net::polite_role(&my_uid, peer_uid, &mine, &pid)?,
-                    None => anyhow::bail!("peer {pid} has no UID; refusing role election"),
+                    None => anyhow::bail!("peer {pid} is a pre-uid client; refusing role election"),
                 };
                 generation += 1;
                 spawn_timer(pid.clone(), generation);
