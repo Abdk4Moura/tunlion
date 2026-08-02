@@ -1733,6 +1733,17 @@ pub async fn race_connect_labeled(
     #[cfg(debug_assertions)]
     #[cfg(debug_assertions)]
     eprintln!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}");
+    // Debug-only: the race runs an acceptor AND dialers on BOTH ends, and each
+    // end independently keeps the first connection to pass the MAC. Nothing makes
+    // the two ends agree on WHICH. If they disagree, each drops the connection the
+    // other kept, which is what ApplicationClosed(0) on both sides looks like.
+    // Log the winner's 4-tuple so the next run can compare the two ends directly.
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[WINNER-TUPLE] conn_stable={conn_id} answerer={answerer} local={:?} remote={}",
+        ep_for_transport.local_addr(),
+        conn.remote_address()
+    );
     Some(make_transport(peer_id, conn, send, recv, tx, answerer, Some(ep_for_transport)))
 }
 
