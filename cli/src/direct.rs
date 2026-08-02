@@ -1687,6 +1687,9 @@ pub async fn race_connect_labeled(
         // Prefer the connection dialed by the non-answerer. If both directions
         // authenticate, both ends see and choose that same connection. If only
         // one direction exists, both ends fall back to that sole connection.
+        // The fallback is unique because mutual authentication plus this
+        // single accept bounds successful connections to one per direction;
+        // changing accept into a loop would require a new winner rule.
         // Give the preferred direction a quarter of the existing direct budget
         // to arrive after a non-preferred auth. This is bounded by a derived
         // transport timeout, not a new magic latency, and only matters when the
