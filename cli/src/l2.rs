@@ -1364,7 +1364,10 @@ async fn bring_up_to_known(
                             }
                         };
                         let my_uid_for_race = my_uid.clone();
-                        let my_id_for_race = my_id.clone().unwrap_or_default();
+                        let Some(my_id_for_race) = my_id.clone() else {
+                            eprintln!("direct role election deferred for {pid}: local session ID unavailable");
+                            continue;
+                        };
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
