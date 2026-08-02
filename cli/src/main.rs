@@ -6188,7 +6188,7 @@ impl Conn {
             Some(value) => value,
             None => match peer_uid.as_deref() {
                 Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
-                None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, "presence"),
+                None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, "presence", true),
             },
         };
         self.next_gen += 1;
@@ -6707,7 +6707,7 @@ impl Conn {
                 }
             },
             None => {
-                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, "presence")
+                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, "presence", true)
             }
         };
         let count = k - 1;

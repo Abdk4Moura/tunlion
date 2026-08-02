@@ -68,6 +68,7 @@ function tabUid() {
       u = (crypto.randomUUID && crypto.randomUUID()) || Math.random().toString(36).slice(2) + Date.now().toString(36)
       sessionStorage.setItem('filament.uid', u)
     }
+    if (!/^[\x00-\x7F]*$/.test(u)) throw new Error('Filament UID must be ASCII')
     return u
   } catch {
     return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -291,6 +292,11 @@ export function useFilament() {
   const makeLink = useCallback(
     ({ id, name, uid, relayOnly }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
+      if (uid != null && !/^[\x00-\x7F]*$/.test(uid)) {
+        console.warn('peer UID is not ASCII; refusing role election', { id })
+        addPeer({ id, name, uid, color: colorFor(id), status: 'peer identity is invalid; reload this page', route: null, lastSeen: 'now' })
+        return null
+      }
       // Supersede (#10): a tab has exactly ONE live connection. If we already
       // show a tile for this uid under an older sid (zombie registry entry, or
       // peer-joined arriving before peer-left during a reconnect), replace it,
