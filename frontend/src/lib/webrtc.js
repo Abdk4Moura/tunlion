@@ -321,7 +321,7 @@ export function politeRole({ myUid, peerUid, myId, peerId }) {
 
 // Phase-1 compatibility only. An old browser may not send a UID; this path is
 // knowingly not antisymmetric against an updated peer and is instrumented for
-// removal once the additive UID rollout has completed.
+// removal in #44 phase 2 once the additive UID rollout has completed.
 export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
   if (peerUid == null) console.warn('politeRole: legacy missing-peer-uid path', { myUid, myId, peerId })
   if (myUid && peerUid && myUid !== peerUid) return myUid > peerUid
