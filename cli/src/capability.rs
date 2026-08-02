@@ -1026,7 +1026,7 @@ mod tests {
         apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
         let tmp = std::env::temp_dir().join(format!("fil-recon-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        save_cap_store(&tmp, &store).unwrap();
 
         // The signed grant must reach the production authorization boundary.
         let authorized = cap_authorize(
@@ -1063,7 +1063,7 @@ mod tests {
         let v2 = hlc_next(v1, now_ms());
         let revoke = make_revoke(&owner, target, "self", v2, 86400);
         apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        save_cap_store(&tmp, &store).unwrap();
         let denied = cap_authorize(
             &tmp, "self", "shell", Some(&[0xcc; 32]), Some(&bob_user_pub), None,
         );
@@ -1126,7 +1126,7 @@ mod tests {
         hdr_json["resource"] = serde_json::json!("self");
         store.push(hdr_json);
         apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        save_cap_store(&tmp, &store).unwrap();
 
         let devices = vec![serde_json::json!({
             "name": "bob",
@@ -1146,7 +1146,7 @@ mod tests {
 
         // 3. Apply revoke, save caps.json
         apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        save_cap_store(&tmp, &store).unwrap();
 
         // 4. Reconciler pipeline: devices_with_shell_revoked → strip_block → block gone
         let revoked = devices_with_shell_revoked(&tmp);
@@ -1238,7 +1238,7 @@ mod tests {
         // (a) NO shell grant → a same-owner device MUST be revoked (this is the
         //     assertion the owner-shortcut bug got wrong: it would exempt it).
         let store_nogrant = vec![hdr_json.clone()];
-        std::fs::write(tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store_nogrant)).unwrap()).unwrap();
+        save_cap_store(&tmp, &store_nogrant).unwrap();
         invalidate_cap_cache();
         let revoked = devices_with_shell_revoked(&tmp);
         assert!(revoked.contains(&"my-laptop".to_string()),
@@ -1249,7 +1249,7 @@ mod tests {
         let grant = make_grant(&owner, target, "self", &["shell"], v1, 86400);
         let mut store_grant = vec![hdr_json];
         apply_cap_op(&mut store_grant, &store_hdr, &grant, now_secs()).unwrap();
-        std::fs::write(tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store_grant)).unwrap()).unwrap();
+        save_cap_store(&tmp, &store_grant).unwrap();
         invalidate_cap_cache();
         let revoked2 = devices_with_shell_revoked(&tmp);
         assert!(!revoked2.contains(&"my-laptop".to_string()),
