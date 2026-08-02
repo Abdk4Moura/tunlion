@@ -1130,22 +1130,22 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 /// order non-ASCII strings differently. Session IDs must differ whenever UIDs
 /// tie; an equal tuple is a protocol error, not a quiet role decision.
 pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: Option<&str>, peer_id: &str) -> Result<bool> {
-    ensure_ascii_uid(my_uid)?;
-    ensure_ascii_uid(peer_uid)?;
+    ensure_ascii_identifier(my_uid)?;
+    ensure_ascii_identifier(peer_uid)?;
     if my_uid != peer_uid {
         return Ok(my_uid > peer_uid);
     }
     let my_id = my_id.ok_or_else(|| anyhow!("polite-role requires local session ID when UIDs tie"))?;
-    ensure_ascii_uid(my_id)?;
-    ensure_ascii_uid(peer_id)?;
+    ensure_ascii_identifier(my_id)?;
+    ensure_ascii_identifier(peer_id)?;
     if my_id == peer_id {
         bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
     }
     Ok(my_id > peer_id)
 }
 
-pub fn ensure_ascii_uid(uid: &str) -> Result<()> {
-    if uid.is_ascii() { Ok(()) } else { bail!("UID must be ASCII") }
+pub fn ensure_ascii_identifier(value: &str) -> Result<()> {
+    if value.is_ascii() { Ok(()) } else { bail!("role-comparison identifier must be ASCII") }
 }
 
 /// Phase-1 compatibility path. It remains knowingly non-antisymmetric until

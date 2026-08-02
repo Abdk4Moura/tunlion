@@ -65,6 +65,15 @@ Firebase mode mirrors these exact events client-side via Firestore.
 
 Convention: the **newer** peer always initiates the WebRTC offer.
 
+### Role-election input invariant
+
+Every value participating in native/browser role comparison must be ASCII. Rust
+orders UTF-8 bytes while JavaScript orders UTF-16 code units; constraining the
+comparison domain is what keeps both implementations antisymmetric. The shared
+role tuple is `(uid, session_id)`: differing UIDs decide on the first value;
+equal UIDs require distinct session IDs as the tiebreak. Missing or identical
+values are protocol errors, never implicit defaults.
+
 ### Rooms / discovery (REST)
 - `GET /api/room` → `{ room, network: "ipv4"|"ipv6"|"raw", scope: "auto" }` —
   the **auto** room: everyone on the same network lands here automatically

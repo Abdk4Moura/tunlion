@@ -33,7 +33,7 @@ test('politeRole rejects an identical identity tuple', () => {
 test('politeRole rejects non-ASCII UIDs', () => {
   assert.throws(() => politeRole({
     myUid: 'uid-😀', peerUid: 'uid-a', myId: 'sid-a', peerId: 'sid-b',
-  }), /ASCII UIDs/)
+  }), /ASCII/)
 })
 
 test('politeRole rejects a missing UID for reloadable UX', () => {
@@ -54,5 +54,5 @@ test('politeRole does not require local session ID when UIDs differ', () => {
 test('politeRole rejects non-ASCII tiebreak session IDs', () => {
   assert.throws(() => politeRole({
     myUid: 'same', peerUid: 'same', myId: 'sid-😀', peerId: 'sid-b',
-  }), /ASCII session IDs/)
+  }), /ASCII/)
 })

@@ -7867,7 +7867,7 @@ impl Conn {
 
     async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
         if let Some(uid) = data["uid"].as_str() {
-            net::ensure_ascii_uid(uid)?;
+            net::ensure_ascii_identifier(uid)?;
             if let Some(info) = self.roster.get_mut(from) {
                 info["uid"] = json!(uid);
             } else {
