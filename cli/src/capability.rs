@@ -32,6 +32,9 @@ use std::sync::{Mutex, OnceLock};
 /// Cache cap store reads per config_dir. Writes by this process invalidate it
 /// explicitly via `save_cap_store`; writes by another process are detected only
 /// by the mtime+length comparison below, the cross-process invalidation channel.
+/// If this needs strengthening, prefer explicit notification over a stronger
+/// fingerprint: `filament revoke` should notify a running daemon via ctl. Reopen
+/// this when config sync, restore, or management tools become supported writers.
 /// Hot path: load_cap_store is called on every gated open; without this cache
 /// each open re-reads + re-parses caps.json.
 // This is a size-and-timestamp cache key, not a content hash. A same-size rewrite
