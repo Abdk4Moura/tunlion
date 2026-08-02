@@ -6519,6 +6519,7 @@ impl Conn {
         }
         let peer = Peer::connect(
             peer_id.clone(),
+            self.my_uid.clone(),
             polite,
             cfg.ice_servers,
             relay_ice,
@@ -8149,6 +8150,13 @@ impl Conn {
     }
 
     async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
+        if let Some(uid) = data["uid"].as_str() {
+            if let Some(info) = self.roster.get_mut(from) {
+                info["uid"] = json!(uid);
+            } else {
+                self.roster.insert(from.to_string(), json!({ "id": from, "uid": uid }));
+            }
+        }
         if self.links.contains_key(from) {
             return Ok(());
         }

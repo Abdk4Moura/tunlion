@@ -1202,7 +1202,7 @@ async fn bring_up_to_known(
                 generation += 1;
                 spawn_timer(pid.clone(), generation);
                 let p = Peer::connect(
-                    pid.clone(), polite, cfg.ice_servers.clone(), relay,
+                    pid.clone(), my_uid.clone(), polite, cfg.ice_servers.clone(), relay,
                     sio.clone(), tx.clone(), generation,
                 )
                 .await?;
@@ -1392,7 +1392,7 @@ async fn bring_up_to_known(
                         generation += 1;
                         spawn_timer(pid.clone(), generation);
                         let p = Peer::connect(
-                            pid, true, cfg.ice_servers.clone(), relay,
+                            pid, my_uid.clone(), true, cfg.ice_servers.clone(), relay,
                             sio.clone(), tx.clone(), generation,
                         )
                         .await?;

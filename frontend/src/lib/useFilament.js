@@ -321,6 +321,7 @@ export function useFilament() {
         relayOnly: !!relayOnly,
         chunkSize: cfgRef.current.chunkSize,
         polite,
+        myUid: uidRef.current,
         peerUid: uid || null,
         stores: { partials: partialsRef.current, outgoing: outgoingRef.current },
         sendSignal: (data) => sigRef.current.signal(id, data),
