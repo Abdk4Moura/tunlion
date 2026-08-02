@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { politeRole, legacyPoliteRole } from '../src/lib/webrtc.js'
+import { politeRole } from '../src/lib/webrtc.js'
 
 const pair = (a, b) => {
   assert.notEqual(a, b, 'exactly one side must be polite')
@@ -30,6 +30,8 @@ test('politeRole rejects an identical identity tuple', () => {
   }), /identity tuple collision/)
 })
 
-test('legacy missing-UID path is explicit compatibility only', () => {
-  assert.equal(legacyPoliteRole({ myUid: 'uid-z', peerUid: null, myId: 'sid-b', peerId: 'sid-a' }), true)
+test('politeRole rejects a missing UID for reloadable UX', () => {
+  assert.throws(() => politeRole({
+    myUid: 'uid-z', peerUid: null, myId: 'sid-b', peerId: 'sid-a',
+  }), /requires peer and local UIDs/)
 })
