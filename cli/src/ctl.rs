@@ -841,7 +841,13 @@ mod stub {
 
     /// No control socket here, so there is no daemon consent queue to approve
     /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
-    pub async fn try_approve_request(_id: u64) -> Option<Value> {
+    ///
+    /// The signature must track the `#[cfg(unix)]` one above, including the
+    /// bounded-grant arguments, or this target stops compiling the moment a
+    /// caller passes them. That is exactly how this drifted: the unix side
+    /// gained `allow` and `expires` and this stub did not, so linux was green
+    /// and windows failed to build.
+    pub async fn try_approve_request(_id: u64, _allow: &str, _expires: u64) -> Option<Value> {
         None
     }
 
