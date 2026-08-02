@@ -1136,6 +1136,8 @@ pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: Option<&str>, peer_id: &
         return Ok(my_uid > peer_uid);
     }
     let my_id = my_id.ok_or_else(|| anyhow!("polite-role requires local session ID when UIDs tie"))?;
+    ensure_ascii_uid(my_id)?;
+    ensure_ascii_uid(peer_id)?;
     if my_id == peer_id {
         bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
     }
@@ -1945,6 +1947,11 @@ mod tests {
     fn polite_role_only_requires_local_id_for_equal_uid() {
         assert!(polite_role("uid-z", "uid-a", None, "sid-b").unwrap());
         assert!(polite_role("same", "same", None, "sid-b").is_err());
+    }
+
+    #[test]
+    fn polite_role_rejects_non_ascii_tiebreak_id() {
+        assert!(polite_role("same", "same", Some("sid-😀"), "sid-b").is_err());
     }
 
     #[test]

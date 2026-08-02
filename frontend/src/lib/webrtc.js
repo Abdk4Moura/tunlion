@@ -319,6 +319,9 @@ export function politeRole({ myUid, peerUid, myId, peerId }) {
   }
   if (myUid !== peerUid) return myUid > peerUid
   if (myId == null) throw new Error('politeRole requires local session ID when UIDs tie')
+  if (!/^[\x00-\x7F]*$/.test(myId) || !/^[\x00-\x7F]*$/.test(peerId)) {
+    throw new Error('politeRole requires ASCII session IDs')
+  }
   if (myId === peerId) {
     throw new Error(`politeRole identity tuple collision: uid=${myUid} sid=${myId}`)
   }

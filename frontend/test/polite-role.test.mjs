@@ -50,3 +50,9 @@ test('politeRole does not require local session ID when UIDs differ', () => {
     myUid: 'same', peerUid: 'same', myId: null, peerId: 'sid-b',
   }), /requires local session ID when UIDs tie/)
 })
+
+test('politeRole rejects non-ASCII tiebreak session IDs', () => {
+  assert.throws(() => politeRole({
+    myUid: 'same', peerUid: 'same', myId: 'sid-😀', peerId: 'sid-b',
+  }), /ASCII session IDs/)
+})
