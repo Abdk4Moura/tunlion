@@ -4,6 +4,14 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## Unreleased
+
+- **Capability grants are now time-bounded by default.** Bare `filament grant`
+  uses the configurable `grant-duration` setting (90 days by default), and
+  `--for` selects an explicit duration. Use `--forever` to request the former
+  unbounded behavior explicitly. The setting supports global and per-peer
+  overrides; `filament unset grant-duration` restores the 90-day default.
+
 ## [0.7.6] - 2026-07-31
 
 `shell` defaults to a native PTY, and file transfers stop spuriously rejecting

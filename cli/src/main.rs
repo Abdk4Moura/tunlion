@@ -856,6 +856,12 @@ enum Cmd {
         device: String,
         /// Capability to grant (e.g. `shell`)
         capability: String,
+        /// Bound this grant to a duration such as 1h or 7d
+        #[arg(long = "for")]
+        duration: Option<String>,
+        /// Grant without an expiry (must be explicit)
+        #[arg(long)]
+        forever: bool,
         /// Target a tag instead of a device
         #[arg(long)]
         tag: Option<String>,
@@ -2067,6 +2073,29 @@ fn device_caps_at_time(path: &Path, name: &str, now: u64) -> Option<Vec<String>>
     None
 }
 
+fn expired_device_cap(name: &str, capability: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let records = serde_json::from_str::<Value>(&raw).ok()?.as_array()?.clone();
+    records.iter()
+        .find(|record| record["name"].as_str() == Some(name))?
+        .get("capExpires")?.get(capability)?.as_u64()
+        .filter(|expiry| *expiry <= crate::capability::now_secs())
+}
+
+fn capability_denial_reason(name: &str, capability: &str, fallback: &str) -> String {
+    if let Some(expiry) = expired_device_cap(name, capability) {
+        return expired_capability_message(name, capability, expiry);
+    }
+    fallback.to_string()
+}
+
+fn expired_capability_message(name: &str, capability: &str, expiry: u64) -> String {
+    format!(
+        "{capability} grant for {name} expired at {}; restore it with `filament grant {name} {capability} --for 90d`",
+        format_approval_expiry(expiry)
+    )
+}
+
 /// Path-explicit deny-by-default check (testable).
 #[allow(dead_code)]
 fn device_allows_at(path: &Path, name: &str, capability: &str) -> bool {
@@ -2197,6 +2226,21 @@ fn issue_signed_bounded_grant(device: &str, capability: &str, expires: u64) -> R
     crate::capability::update_ratchet(&mut store, &pk, op.issued_at)?;
     crate::capability::save_and_list_revoked(&store, &config_dir)?;
     Ok(true)
+}
+
+/// Write a device grant and its signed capability record as one operation.
+/// Both records receive the same expiry, so shadow and authoritative modes
+/// cannot silently diverge for a grant created through this path.
+fn grant_device_cap(device: &str, capability: &str, expires: u64) -> Result<bool> {
+    device_set_cap(device, capability, true, Some(expires))?;
+    if let Ok(Some(_)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+        let signed = issue_signed_bounded_grant(device, capability, expires)?;
+        if !signed {
+            bail!("peer identity for '{device}' is not available; pair with the peer first");
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn devices_remove(name: &str) -> Result<()> {
@@ -3184,8 +3228,15 @@ fn format_approval_expiry(expires: u64) -> String {
         .unwrap_or_else(|| expires.to_string())
 }
 
-fn permanent_grant_notice(revoke: &str) -> String {
-    format!("This grant does not expire. {revoke}")
+fn resolve_grant_expiry(duration: Option<&str>, forever: bool, default: &str, now: u64) -> Result<u64> {
+    if forever {
+        if duration.is_some() {
+            bail!("choose either --for or --forever, not both");
+        }
+        return Ok(u64::MAX);
+    }
+    let value = duration.unwrap_or(default);
+    Ok(now.saturating_add(parse_duration_secs(value)?))
 }
 
 fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
@@ -9546,8 +9597,13 @@ async fn main() -> Result<()> {
         Cmd::Doctor { device, watch, repeat, json } => {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
-        Cmd::Grant { device, capability, tag } => {
+        Cmd::Grant { device, capability, duration, forever, tag } => {
             let capability = crate::capability::canonical_capability(&capability)?;
+            let default_duration = settings::get_str("grant-duration", Some(&device))
+                .unwrap_or_else(|| "90d".to_string());
+            let grant_expires = Some(resolve_grant_expiry(
+                duration.as_deref(), forever, &default_duration, crate::capability::now_secs(),
+            )?);
             let config_dir = crate::settings::config_dir();
             let mut store = crate::capability::load_cap_store(&config_dir);
 
@@ -9566,7 +9622,7 @@ async fn main() -> Result<()> {
                     target: target_bytes,
                     resource: "self".to_string(),
                     permissions: vec![capability.clone()],
-                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                    expires: grant_expires.unwrap_or(u64::MAX),
                     issued_at: crate::capability::now_secs(),
                     version: ver,
                     sig: [0u8; 64],
@@ -9576,130 +9632,23 @@ async fn main() -> Result<()> {
                 let _ = crate::capability::save_and_list_revoked(&store, &config_dir)
                     .context("save cap store")?;
                 println!(
-                    "granted '{capability}' to tag '{t}'. {}",
-                    permanent_grant_notice("Remove the tag grant to revoke it.")
+                    "granted '{capability}' to tag '{t}'.{}",
+                    if forever { " This grant does not expire.".to_string() } else {
+                        format!(" Expires {}.", format_approval_expiry(grant_expires.unwrap()))
+                    }
                 );
                 return Ok(());
             }
-            // Original device grant path (unchanged)
-            device_set_cap(&device, &capability, true, None)?;
-            // If identity layer is active, also issue an owner-signed CapOp
-            if let Ok(Some(user_key)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-                let config_dir = crate::settings::config_dir();
-                let mut store = crate::capability::load_cap_store(&config_dir);
-                let pk = user_key.public_key_bytes();
-
-                // Ensure a genesis header exists for resource "self"
-                let has_header = store.iter().any(|e| {
-                    e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                        && e["resource"].as_str() == Some("self")
-                });
-                if !has_header {
-                    let pk = user_key.public_key_bytes();
-                    let nonce = crate::capability::self_resource_nonce();
-                    let resource = crate::capability::self_resource_id(&pk);
-                    let mut hdr = crate::capability::CapHeader {
-                        resource,
-                        epoch: 0,
-                        owner_pub: pk,
-                        nonce,
-                        floors: vec![],
-                        issued_at: crate::capability::now_secs(),
-                        prev_owner_pub: None,
-                        prev_header_hash: None,
-                        sig: [0u8; 64],
-                    };
-                    hdr.sig = crate::capability::sign_cap_header(&hdr, &user_key.keypair());
-                    let mut hdr_json = hdr.to_json();
-                    // The header's signature is over the self-certifying resource id
-                    // (SHA-256(owner_pub||nonce)), but the STORED header has resource="self".
-                    // This signature is decorative: cap_authorize/evaluate never calls
-                    // verify_genesis/verify_sig on the stored header (those run only on
-                    // the grant-creation path, not the authorize path). Consistent with
-                    // Cmd::Grant which does the same. The header is trusted local state
-                    // in the owner's own caps.json, not a cross-verified object.
-                    hdr_json["resource"] = serde_json::json!("self");
-                    store.push(hdr_json);
-                }
-
-                // Create CapOp: target the peer's real user_pub from their
-                // stored device cert (not SHA-256 of the device name, which
-                // never matches evaluate()'s principal_user_pub comparison).
-                // Requires the peer to have a certified identity (paired +
-                // identity-expose completed).
-                let Some(peer_cert) = device_cert_for(&device) else {
-                    return Err(anyhow!(
-                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known user key to target"
-                    ));
-                };
-                if peer_cert.verify(crate::identity::now_secs()).is_err() {
-                    return Err(anyhow!("peer identity cert for '{device}' is expired; re-pair to refresh it"));
-                }
-                let target_arr = peer_cert.user_pub;
-
-                let v = crate::capability::hlc_next(0, crate::capability::now_ms());
-                let mut op = crate::capability::CapOp {
-                    op: crate::capability::CapOpKind::Grant,
-                    grantor: pk,
-                    target_kind: 0x00, // User
-                    target: target_arr,
-                    resource: "self".to_string(),
-                    permissions: vec![capability.clone()],
-                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
-                    issued_at: crate::capability::now_secs(),
-                    version: v,
-                    sig: [0u8; 64],
-                };
-                op.sig = crate::capability::sign_cap_op(&op, &user_key.keypair());
-                let mut hdr_json = serde_json::json!({
-                    "type": "cap_grant",
-                });
-                let mut op_json = op.to_json();
-                op_json["type"] = serde_json::json!("cap_grant");
-                store.push(op_json);
-                // Grant must initialize the per-owner ratchet so evaluate()
-                // does not hit "ratchet uninitialized". apply_cap_op normally
-                // does this, but the grant command constructs CapOp JSON
-                // directly. On failure the grant did NOT take (evaluate()
-                // will deny forever), so fail the command instead of printing
-                // a misleading "granted" line.
-                // TODO: route grant through apply_cap_op so there is one
-                // validated op-creation path (sig-verify + floor + monotonic
-                // + ratchet), not two.
-                crate::capability::update_ratchet(&mut store, &pk, op.issued_at)
-                    .context("capability grant created but ratchet initialization failed; the grant will not be effective. Re-run the grant command")?;
-                // save_and_list_revoked: persist THEN reconcile (reconciliation
-                // is a property of the write). GATED on authoritative: in shadow
-                // only REPORT what would be removed.
-                let revoked = crate::capability::save_and_list_revoked(&store, &config_dir)
-                    .context("save cap store")?;
-                {
-                    let authoritative = crate::capability::cap_authoritative();
-                    let ak_path = sshkeys::authorized_keys_path();
-                    let ak_content = std::fs::read_to_string(&ak_path).unwrap_or_default();
-                    // Emit per-device shadow logs for actual-block devices.
-                    for device in &revoked {
-                        if sshkeys::has_block(&ak_content, device) && !authoritative {
-                            eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
-                        }
-                    }
-                    let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
-                    if new_ak != ak_content {
-                        if let Err(e) = crate::platform::SecretFile::write_str(&ak_path, &new_ak) {
-                            eprintln!("shell-key reconcile: failed to write authorized_keys: {e}");
-                        }
-                    }
-                }
-            }
+            grant_device_cap(&device, &capability, grant_expires.unwrap())?;
             let detail = if capability == "shell" {
                 "They can now `filament ssh` into this machine (their key is installed on first connect)."
             } else {
                 ""
             };
-            println!(
-                "granted '{capability}' to '{device}'. {detail} {}",
-                permanent_grant_notice(&format!("Revoke it with `filament revoke {device} {capability}`."))
-            );
+            println!("granted '{capability}' to '{device}'. {detail}{}",
+                if forever { " This grant does not expire.".to_string() } else {
+                    format!(" Expires {}.", format_approval_expiry(grant_expires.unwrap()))
+                });
             Ok(())
         }
         Cmd::Revoke { device, capability, certificate } => {
@@ -12862,12 +12811,10 @@ async fn recv_cmd(
                                     req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
                                 } else if !crate::capability::grant_active(expires, crate::capability::now_secs()) {
                                     req.reject("grant expiry must be in the future").await;
-                                } else if let Err(e) = device_set_cap(&peer, &cap, true, Some(expires)) {
-                                    req.reject(&format!("grant failed: {e}")).await;
-                                } else if let Err(e) = issue_signed_bounded_grant(&peer, &cap, expires).and_then(|signed| {
+                                } else if let Err(e) = grant_device_cap(&peer, &cap, expires).and_then(|signed| {
                                     if signed { mark_bounded_cap_source(&peer, &cap, "signed") } else { Ok(()) }
                                 }) {
-                                    req.reject(&format!("signed grant failed: {e}")).await;
+                                    req.reject(&format!("grant failed: {e}")).await;
                                 } else {
                                     r.status = "approved".to_string();
                                     r.granted_at = Some(crate::capability::now_secs());
@@ -14364,7 +14311,12 @@ async fn recv_cmd(
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!("l2: shell bootstrap refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
+                        let reason = if who == "<unverified>" {
+                            granted.deny_reason("no shell cap / untrusted").to_string()
+                        } else {
+                            capability_denial_reason(who, "shell", granted.deny_reason("no shell cap / untrusted"))
+                        };
+                        ui::say(&format!("l2: shell bootstrap refused: {who}: {reason}"));
                         enqueue_if_requestable(who, "shell");
                         let _ = t
                             .send_control(&json!({
@@ -14482,7 +14434,12 @@ async fn recv_cmd(
                     };
                     if !granted.allowed() {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
+                        let reason = if who == "<unverified>" {
+                            granted.deny_reason("no shell cap / untrusted").to_string()
+                        } else {
+                            capability_denial_reason(who, "shell", granted.deny_reason("no shell cap / untrusted"))
+                        };
+                        ui::say(&format!("l2: pty refused: {who}: {reason}"));
                         enqueue_if_requestable(who, "shell");
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
@@ -14704,7 +14661,12 @@ async fn recv_cmd(
                         // is never invisible on the default (shadow) path and never
                         // reads as a transport failure. The peer-facing string stays a
                         // coarse category and leaks no authz internals.
-                        ui::say(&format!("mount: refused for '{who}': {}", authorized.deny_reason("not authorized (mount capability required)")));
+                         let reason = capability_denial_reason(
+                             &who,
+                             "mount",
+                             authorized.deny_reason("not authorized (mount capability required)"),
+                         );
+                         ui::say(&format!("mount: refused for '{who}': {reason}"));
                         enqueue_if_requestable(&who, "mount");
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
@@ -15293,6 +15255,7 @@ async fn recv_cmd(
                         &xfer_gate,
                         crate::capability::cap_authoritative(),
                     ) {
+                        let reason = capability_denial_reason(&sender_name, "transfer", &reason);
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({reason})",
                         )));
@@ -15315,9 +15278,17 @@ async fn recv_cmd(
                             }
                             continue; // decision arrives later via StdinLine
                         }
+                        let reason = if daemon {
+                            capability_denial_reason(
+                                &sender_name,
+                                "transfer",
+                                xfer_deny_reason.as_deref().unwrap_or("unverified peer"),
+                            )
+                        } else {
+                            "no tty, use -y to auto-accept".to_string()
+                        };
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
-                            "  declined {name} from {sender_name} ({})",
-                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") } else { "no tty, use -y to auto-accept" }
+                            "  declined {name} from {sender_name} ({reason})",
                         )));
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
@@ -17312,9 +17283,18 @@ mod tests {
     }
 
     #[test]
-    fn permanent_grant_notice_states_no_expiry_and_revoke() {
-        let notice = permanent_grant_notice("Revoke it with `filament revoke laptop shell`.");
-        assert!(notice.contains("does not expire"));
-        assert!(notice.contains("filament revoke laptop shell"));
+    fn grant_expiry_precedence_is_forever_then_explicit_then_default() {
+        assert_eq!(resolve_grant_expiry(None, false, "7d", 100).unwrap(), 100 + 7 * 86400);
+        assert_eq!(resolve_grant_expiry(Some("1h"), false, "7d", 100).unwrap(), 100 + 3600);
+        assert_eq!(resolve_grant_expiry(None, true, "7d", 100).unwrap(), u64::MAX);
+        assert!(resolve_grant_expiry(Some("1h"), true, "7d", 100).is_err());
     }
+
+    #[test]
+    fn expired_grant_denial_names_expiry_and_restore_command() {
+        let message = expired_capability_message("laptop", "shell", 1_700_000_000);
+        assert!(message.contains("shell grant for laptop expired at 2023-11-14 22:13 UTC"));
+        assert!(message.contains("filament grant laptop shell --for 90d"));
+    }
+
 }

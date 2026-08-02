@@ -278,6 +278,17 @@ pub fn registry() -> &'static [Setting] {
             help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `filament set auto-proxy off`.",
         },
         Setting {
+            key: "grant-duration",
+            aliases: &[],
+            store: "grant-duration",
+            kind: Kind::Str,
+            default: "90d",
+            scope: ScopeKind::GlobalOrPeer,
+            env: Some("FILAMENT_GRANT_DURATION"),
+            daemon: false,
+            help: "Default capability grant lifetime (for example 90d); per-peer overrides are supported",
+        },
+        Setting {
             key: "verbosity",
             aliases: &[],
             store: "verbosity",
@@ -1345,6 +1356,21 @@ mod tests {
             global_put("shell", "on").unwrap();
             assert!(matches!(resolve(s, None).1, Origin::Global));
             assert_eq!(resolve(s, None).0, "on");
+        });
+    }
+
+    #[test]
+    fn grant_duration_defaults_to_90d_and_supports_peer_override() {
+        with_tmp_cfg(|| {
+            let devs = config_dir().join("devices.json");
+            std::fs::write(&devs, r#"[{"name":"laptop","secret":"x"}]"#).unwrap();
+            let s = find("grant-duration").unwrap();
+            assert_eq!(resolve(s, None).0, "90d");
+            set("grant-duration", "14d", Some("laptop")).unwrap();
+            assert_eq!(get_str("grant-duration", Some("laptop")).as_deref(), Some("14d"));
+            assert_eq!(get_str("grant-duration", Some("phone")).as_deref(), Some("90d"));
+            unset("grant-duration", Some("laptop")).unwrap();
+            assert_eq!(get_str("grant-duration", Some("laptop")).as_deref(), Some("90d"));
         });
     }
 
