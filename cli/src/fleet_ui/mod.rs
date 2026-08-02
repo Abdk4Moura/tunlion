@@ -74,10 +74,24 @@ pub fn echo_cmd(cmd: &str) -> String {
     format!("{} {cmd}", ui::paint(Tone::Dim, ui::glyph_echo()))
 }
 
+/// Capabilities that require deliberate, bounded approval rather than a normal
+/// one-click grant. Keep this predicate canonical for every trust surface.
+pub fn is_deliberate_capability(capability: &str) -> bool {
+    matches!(
+        capability,
+        "shell"
+            // Reserved for the future port-scope capability; no enforcement
+            // layer currently stores or grants this value.
+            | "all-ports"
+            // Intentionally conservative until read-only and writable mounts
+            // have distinct capability names; this warns on both today.
+            | "mount"
+    )
+}
+
 /// Confirmation tokens (exact, as specified).
 pub const CONFIRM_SHELL: &str = "SHELL";
 pub const CONFIRM_WRITE: &str = "WRITE";
-pub const CONFIRM_ALL_PORTS: &str = "ALL-PORTS";
 pub const CONFIRM_REUSE: &str = "REUSE";
 
 /// Exit codes.
@@ -92,7 +106,6 @@ mod tests {
     fn confirm_tokens_are_exact() {
         assert_eq!(CONFIRM_SHELL, "SHELL");
         assert_eq!(CONFIRM_WRITE, "WRITE");
-        assert_eq!(CONFIRM_ALL_PORTS, "ALL-PORTS");
         assert_eq!(CONFIRM_REUSE, "REUSE");
     }
 
@@ -100,5 +113,13 @@ mod tests {
     fn exit_codes() {
         assert_eq!(EXIT_BAD_ARG, 2);
         assert_eq!(EXIT_REFUSED, 1);
+    }
+
+    #[test]
+    fn deliberate_capabilities_are_canonical() {
+        assert!(is_deliberate_capability("shell"));
+        assert!(is_deliberate_capability("mount"));
+        assert!(is_deliberate_capability("all-ports"));
+        assert!(!is_deliberate_capability("transfer"));
     }
 }

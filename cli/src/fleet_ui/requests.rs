@@ -3,7 +3,6 @@
 // Pure render functions for the consent request listing.
 
 use crate::ui::{self, Tone};
-use super::{echo_cmd, meta, rule};
 
 /// A pending request entry for rendering.
 #[derive(Debug, Clone)]
@@ -12,7 +11,7 @@ pub struct RequestEntry {
     pub peer: String,
     pub capability: String,
     pub ago: String,           // e.g. "3m ago"
-    pub via: String,           // e.g. "via one-time word \"amber-lantern-ferry\""
+    pub via: Option<String>,   // omitted when request provenance is unavailable
     pub fingerprint: Option<String>,
     pub is_deliberate: bool,
 }
@@ -37,9 +36,9 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
     for (i, r) in requests.iter().enumerate() {
         let idx = i + 1;
         let cap_display = if r.is_deliberate {
-            format!("{} {}", r.capability, ui::paint(Tone::Warn, ui::glyph_warn()))
+            format!("{} {}", capability_label(&r.capability), ui::paint(Tone::Warn, ui::glyph_warn()))
         } else {
-            r.capability.clone()
+            capability_label(&r.capability).to_string()
         };
 
         lines.push(format!(
@@ -47,7 +46,11 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
             ui::paint(Tone::Warn, ui::glyph_extern()),
             ui::paint(Tone::Warn, &r.peer),
         ));
-        lines.push(format!("         asked {} · {}", r.ago, r.via));
+        if let Some(via) = r.via.as_deref().filter(|via| !via.is_empty()) {
+            lines.push(format!("         asked {} · {}", r.ago, via));
+        } else {
+            lines.push(format!("         asked {}", r.ago));
+        }
 
         if let Some(ref fp) = r.fingerprint {
             lines.push(format!("         fingerprint {fp} [compare]"));
@@ -55,8 +58,9 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
 
         if r.is_deliberate {
             lines.push(format!(
-                "         {} this is deliberate access — a real terminal on this machine",
-                ui::paint(Tone::Warn, ui::glyph_warn())
+                "         {} {}",
+                ui::paint(Tone::Warn, ui::glyph_warn()),
+                deliberate_explanation(&r.capability),
             ));
             lines.push(format!(
                 "         [ {} ]   [ {} ]",
@@ -77,6 +81,25 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
     lines.push(ui::paint(Tone::Dim, "    filament requests --notify 'notify-send %s'   (also: webhook, email)"));
 
     lines.join("\n")
+}
+
+fn capability_label(capability: &str) -> &str {
+    match capability {
+        "transfer" => "send you files",
+        "shell" => "open a shell",
+        "mount" => "write to mounted dirs",
+        "all-ports" => "reach ALL ports",
+        other => other,
+    }
+}
+
+fn deliberate_explanation(capability: &str) -> &str {
+    match capability {
+        "shell" => "this is deliberate access — a real terminal on this machine",
+        "mount" => "this is deliberate access — can change or delete your files",
+        "all-ports" => "this is deliberate access — reaches ports beyond those exposed",
+        _ => "this is deliberate access",
+    }
 }
 
 /// Render the empty requests list.
@@ -128,7 +151,7 @@ mod tests {
                 peer: "carol".into(),
                 capability: "send files".into(),
                 ago: "3m ago".into(),
-                via: "via one-time word \"amber-lantern-ferry\"".into(),
+                via: Some("via one-time word \"amber-lantern-ferry\"".into()),
                 fingerprint: Some("7f3a 9c21...".into()),
                 is_deliberate: false,
             },
@@ -137,7 +160,7 @@ mod tests {
                 peer: "dave".into(),
                 capability: "open a shell".into(),
                 ago: "18m ago".into(),
-                via: "introduced by carol".into(),
+                via: Some("introduced by carol".into()),
                 fingerprint: None,
                 is_deliberate: true,
             },
@@ -159,7 +182,7 @@ mod tests {
                 peer: "carol".into(),
                 capability: "send files".into(),
                 ago: "3m ago".into(),
-                via: "via one-time word".into(),
+                via: None,
                 fingerprint: Some("7f3a 9c21...".into()),
                 is_deliberate: false,
             },
@@ -177,7 +200,7 @@ mod tests {
                 peer: "dave".into(),
                 capability: "shell".into(),
                 ago: "18m ago".into(),
-                via: "introduced by carol".into(),
+                via: Some("introduced by carol".into()),
                 fingerprint: None,
                 is_deliberate: true,
             },
@@ -186,6 +209,22 @@ mod tests {
         assert!(s.contains("deliberate access"), "must flag deliberate");
         assert!(s.contains("real terminal"), "must explain what shell means");
         assert!(s.contains("--allow shell"), "must show --allow in approve command");
+    }
+
+    #[test]
+    fn non_deliberate_request_has_no_warning() {
+        let requests = vec![RequestEntry {
+            id: 1,
+            peer: "carol".into(),
+            capability: "transfer".into(),
+            ago: "3m ago".into(),
+            via: None,
+            fingerprint: None,
+            is_deliberate: false,
+        }];
+        let s = render_requests(&requests);
+        assert!(!s.contains("deliberate access"), "transfer must not render deliberate warning");
+        assert!(!s.contains("⚠"), "transfer must not render warning glyph");
     }
 
     #[test]

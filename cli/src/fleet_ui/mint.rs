@@ -22,6 +22,18 @@ pub struct MintCaps {
     pub all_ports: bool,
 }
 
+/// Capability names emitted by the mint form, derived from its actual toggles.
+pub fn emitted_capabilities(caps: &MintCaps) -> Vec<&'static str> {
+    let mut names = vec!["transfer"];
+    if caps.shell {
+        names.push("shell");
+    }
+    if caps.write {
+        names.push("mount");
+    }
+    names
+}
+
 /// Reuse policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reuse {
@@ -73,7 +85,7 @@ pub fn render_key_type_picker() -> String {
 
 /// Render the "This key can / cannot" live summary.
 pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
-    let mut lines = vec![format!("  {}", ui::paint(Tone::Dim, rule()))];
+    let mut lines = vec![format!("  {}", ui::paint(Tone::Dim, "── This key can ──"))];
 
     match key_type {
         KeyType::Fleet => {
@@ -85,14 +97,19 @@ pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
             }
             if caps.write {
                 lines.push(can_line(true, true, "write to mounted dirs — can change or delete your files"));
-            } else {
+            } else if caps.all_ports {
                 lines.push(can_line(false, false, "write to disk"));
             }
             if caps.all_ports {
                 lines.push(can_line(true, true, "reach ALL ports — not just the ports you chose to expose"));
-            } else {
+            } else if caps.write {
                 lines.push(can_line(false, false, "join your mesh"));
+            } else {
+                lines.push(can_line(false, false, "write to disk · join your mesh"));
             }
+            // Deliberately omit the fleet meta line: this currently mints a
+            // delegated ephemeral principal, not a fleet certificate. Restore
+            // that claim only when fleet-cert enrollment exists.
         }
         KeyType::External => {
             lines.push(can_line(true, false, "send you files"));
@@ -142,20 +159,9 @@ pub fn render_deliberate_access(caps: &MintCaps, pending_token: Option<&str>) ->
         "  │  [ ] write to mounted dirs can change or delete your files".to_string()
     };
 
-    let ports_row = if caps.all_ports {
-        format!(
-            "  │  {} reach ALL ports        type {} to keep it on:  [ {}▌ ]",
-            ui::paint(Tone::Warn, "[x]"),
-            ui::paint(Tone::Warn, "ALL-PORTS"),
-            pending_token.unwrap_or("")
-        )
-    } else {
-        "  │  [ ] reach ALL ports       not just the ports you chose to expose".to_string()
-    };
-
     let footer = format!("  └{}", ui::paint(Tone::Dim, rule()));
 
-    format!("{border}\n{shell_row}\n{write_row}\n{ports_row}\n{footer}")
+    format!("{border}\n{shell_row}\n{write_row}\n{footer}")
 }
 
 /// Render the lifetime block.
@@ -171,7 +177,6 @@ pub fn render_lifetime(lifetime: &Lifetime) -> String {
     };
 
     let mut lines = vec![
-        format!("  {}", ui::paint(Tone::Dim, rule())),
         format!("  Expires in:  [ {} ]  ◀────●───────▶   (max {} for this key type)", lifetime.ttl, lifetime.max_ttl),
         format!("  Reuse:       {reuse_label}"),
     ];
@@ -203,13 +208,7 @@ pub fn render_completion(code: &str, key_type: KeyType, caps: &MintCaps, lifetim
         KeyType::CI => ui::paint(Tone::Dim, "CI key"),
     };
 
-    let caps_str = {
-        let mut parts = vec![];
-        if caps.shell { parts.push("shell"); }
-        if caps.write { parts.push("write"); }
-        if caps.all_ports { parts.push("all-ports"); }
-        if parts.is_empty() { String::new() } else { format!(" · {}", parts.join(", ")) }
-    };
+    let caps_str = format!(" · {}", emitted_capabilities(caps).join(", "));
 
     let reuse_str = match &lifetime.reuse {
         Reuse::Once => "once",
@@ -305,6 +304,7 @@ mod tests {
     fn fleet_summary_defaults() {
         let caps = MintCaps::default();
         let summary = render_summary(KeyType::Fleet, &caps);
+        assert!(summary.contains("── This key can ──"), "summary must label capabilities");
         assert!(summary.contains("drop files in your inbox"), "fleet default must show can-drop-files");
         assert!(summary.contains("open a shell"), "must mention shell");
         assert!(summary.contains("write to disk"), "must mention write");
@@ -314,11 +314,38 @@ mod tests {
     }
 
     #[test]
+    fn fleet_summary_keeps_denials_on_one_row() {
+        let summary = render_summary(KeyType::Fleet, &MintCaps::default());
+        assert!(summary.contains("write to disk · join your mesh"), "denied capabilities should share a row");
+    }
+
+    #[test]
+    fn lifetime_does_not_repeat_summary_rule() {
+        let summary = render_summary(KeyType::Fleet, &MintCaps::default());
+        let lifetime = render_lifetime(&Lifetime { ttl: "1h".into(), reuse: Reuse::Once, max_ttl: "24h".into() });
+        let combined = format!("{summary}\n{lifetime}");
+        let rule_line = format!("  {}", rule());
+        assert_eq!(combined.matches(&rule_line).count(), 1, "stacked summary and lifetime must not duplicate rules");
+    }
+
+    #[test]
     fn fleet_summary_shell_on() {
         let caps = MintCaps { shell: true, write: false, all_ports: false };
         let summary = render_summary(KeyType::Fleet, &caps);
         // Shell is deliberate, so should show ⚠ glyph
         assert!(summary.contains("open a shell — a real terminal"), "shell-on must show deliberate description");
+    }
+
+    #[test]
+    fn emitted_capabilities_are_enforcement_subset() {
+        for caps in [MintCaps { shell: false, write: false, all_ports: false }, MintCaps { shell: true, write: true, all_ports: false }] {
+            for capability in emitted_capabilities(&caps) {
+                assert!(
+                    crate::capability::CANONICAL_CAPABILITIES.contains(&capability),
+                    "mint emitted capability '{capability}' is not enforced"
+                );
+            }
+        }
     }
 
     #[test]

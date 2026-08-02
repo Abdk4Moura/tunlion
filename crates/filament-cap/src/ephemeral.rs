@@ -143,6 +143,10 @@ impl AuthKey {
         reuse: Reuse,
         tag: String,
     ) -> Result<Self> {
+        let caps: Vec<String> = caps
+            .iter()
+            .map(|cap| super::capability::canonical_capability(cap))
+            .collect::<Result<_>>()?;
         if tag.len() > MAX_CAP_LEN {
             bail!("tag too long (max {} bytes)", MAX_CAP_LEN);
         }
@@ -762,27 +766,19 @@ mod tests {
     // ── Finding 2: Mesh case-bypass ────────────────────────────────────
 
     #[test]
-    fn mesh_refused_normalized_lowercase() {
+    fn mesh_rejected_at_mint() {
         let owner = gen_keypair();
         let enroll = gen_keypair();
         let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
-        let verifier_pub: [u8; 32] = [0xAB; 32];
-        let ak = AuthKey::mint(&owner, enroll_pub, vec!["mesh".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        assert_eq!(ak.caps, vec!["mesh"]); // normalized
-        let op = owner_pub(&owner);
-        assert!(ak.verify_against_owner(&op, &verifier_pub).is_err());
+        assert!(AuthKey::mint(&owner, enroll_pub, vec!["mesh".into()], vec![], 3600, Reuse::Once, "test".into()).is_err());
     }
 
     #[test]
-    fn mesh_refused_case_bypass_defeated() {
+    fn mesh_case_bypass_rejected_at_mint() {
         let owner = gen_keypair();
         let enroll = gen_keypair();
         let enroll_pub: [u8; 32] = enroll.public_key().as_ref().try_into().unwrap();
-        let verifier_pub: [u8; 32] = [0xAB; 32];
-        let ak = AuthKey::mint(&owner, enroll_pub, vec!["MESH".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        assert_eq!(ak.caps, vec!["mesh"]); // normalized at mint
-        let op = owner_pub(&owner);
-        assert!(ak.verify_against_owner(&op, &verifier_pub).is_err());
+        assert!(AuthKey::mint(&owner, enroll_pub, vec!["MESH".into()], vec![], 3600, Reuse::Once, "test".into()).is_err());
     }
 
     #[test]
