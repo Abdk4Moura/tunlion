@@ -1190,6 +1190,7 @@ impl Peer {
     /// ignored by the main loop (C3).
     pub async fn connect(
         peer_id: String,
+        my_uid: String,
         polite: bool,
         ice_servers: Vec<RTCIceServer>,
         relay_only: bool,
@@ -1248,9 +1249,11 @@ impl Peer {
         {
             let sio = sio.clone();
             let to = peer_id.clone();
+            let uid = my_uid.clone();
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let sio = sio.clone();
                 let to = to.clone();
+                let uid = uid.clone();
                 Box::pin(async move {
                     if let Some(ref c) = c {
                         let typ = c.typ.to_string();
@@ -1261,7 +1264,7 @@ impl Peer {
                             let _ = sio
                                 .emit(
                                     "signal",
-                                    json!({ "to": to, "data": { "type": "candidate", "candidate": init } }),
+                                    json!({ "to": to, "data": { "type": "candidate", "uid": uid.clone(), "candidate": init } }),
                                 )
                                 .await;
                         }
@@ -1296,7 +1299,7 @@ impl Peer {
                 .ok_or_else(|| anyhow!("no local description"))?;
             sio.emit(
                 "signal",
-                json!({ "to": peer_id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
+                json!({ "to": peer_id, "data": { "type": "description", "uid": my_uid.clone(), "description": advertise_max_message_size(&ld) } }),
             )
             .await
             .ok();

@@ -341,8 +341,9 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, relayOnly, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
+  constructor({ id, name, iceServers, relayOnly, chunkSize, polite, myUid, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
     this.id = id
+    this.myUid = myUid
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
     this.sendSignal = sendSignal
@@ -459,7 +460,7 @@ export class PeerLink {
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
         rlog.trace('ice candidate', this.id.slice(-6), e.candidate.candidate)
-        this.sendSignal({ type: 'candidate', candidate: e.candidate })
+        this.sendSignal({ type: 'candidate', uid: this.myUid, candidate: e.candidate })
       }
     }
     // All (re)negotiation funnels through here, we never hand-roll offers.
@@ -470,7 +471,7 @@ export class PeerLink {
         this._makingOffer = true
         const offer = await this.pc.createOffer()
         await this.pc.setLocalDescription(offer)
-        this.sendSignal({ type: 'description', description: this.pc.localDescription })
+        this.sendSignal({ type: 'description', uid: this.myUid, description: this.pc.localDescription })
       } catch (err) {
         rlog.error('negotiation failed', this.id.slice(-6), err)
       } finally {
@@ -566,7 +567,7 @@ export class PeerLink {
       if (description.type === 'offer') {
         const answer = await this.pc.createAnswer() // explicit, for older Safari
         await this.pc.setLocalDescription(answer)
-        this.sendSignal({ type: 'description', description: this.pc.localDescription })
+        this.sendSignal({ type: 'description', uid: this.myUid, description: this.pc.localDescription })
       }
     } else if (data.type === 'candidate') {
       // Hold candidates until there's a remote description to attach them to.
