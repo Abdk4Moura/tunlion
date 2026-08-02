@@ -32,7 +32,7 @@ use std::sync::{Mutex, OnceLock};
 /// Cache cap store reads per config_dir, invalidated on every write.
 /// Hot path: load_cap_store is called on every gated open; without this cache
 /// each open re-reads + re-parses caps.json.
-type CachedStore = (std::path::PathBuf, u128, Vec<Value>); // (path, mtime_nanos, parsed)
+type CachedStore = (std::path::PathBuf, u128, u64, Vec<Value>); // (path, mtime_nanos, len, parsed)
 static CAP_CACHE: OnceLock<Mutex<Option<CachedStore>>> = OnceLock::new();
 
 fn cache_init() -> &'static Mutex<Option<CachedStore>> {
@@ -44,19 +44,19 @@ fn cache_init() -> &'static Mutex<Option<CachedStore>> {
 pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
     let p = config_dir.join("caps.json");
 
-    // Check mtime of the file for cache invalidation. NANOSECOND precision:
-    // seconds-only mtime would serve stale data for two writes in the same second
-    // (a direct file rewrite that bypasses save_cap_store's explicit invalidation).
-    let mtime = std::fs::metadata(&p)
-        .ok()
+    // Check mtime and length for cache invalidation. Windows can retain the same
+    // timestamp across rapid writes, while a revoke changes the JSON length.
+    let metadata = std::fs::metadata(&p).ok();
+    let mtime = metadata.as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos());
+    let len = metadata.as_ref().map(|m| m.len());
 
-    if let Some(mtime_val) = mtime {
+    if let (Some(mtime_val), Some(len_val)) = (mtime, len) {
         let cache = cache_init().lock().unwrap();
-        if let Some((cached_path, cached_mtime, cached_store)) = cache.as_ref() {
-            if cached_path == &p && *cached_mtime == mtime_val {
+        if let Some((cached_path, cached_mtime, cached_len, cached_store)) = cache.as_ref() {
+            if cached_path == &p && *cached_mtime == mtime_val && *cached_len == len_val {
                 return cached_store.clone();
             }
         }
@@ -70,9 +70,9 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
         .unwrap_or_default();
 
     // Cache store with mtime
-    if let Some(mtime_val) = mtime {
+    if let (Some(mtime_val), Some(len_val)) = (mtime, len) {
         let mut cache = cache_init().lock().unwrap();
-        *cache = Some((p, mtime_val, store.clone()));
+        *cache = Some((p, mtime_val, len_val, store.clone()));
     }
 
     store
@@ -1026,7 +1026,7 @@ mod tests {
         apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
         let tmp = std::env::temp_dir().join(format!("fil-recon-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        save_cap_store(&tmp, &store).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
 
         // The signed grant must reach the production authorization boundary.
         let authorized = cap_authorize(
@@ -1063,7 +1063,7 @@ mod tests {
         let v2 = hlc_next(v1, now_ms());
         let revoke = make_revoke(&owner, target, "self", v2, 86400);
         apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
-        save_cap_store(&tmp, &store).unwrap();
+        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
         let denied = cap_authorize(
             &tmp, "self", "shell", Some(&[0xcc; 32]), Some(&bob_user_pub), None,
         );
@@ -1075,6 +1075,20 @@ mod tests {
         assert_eq!(after, vec!["bob".to_string()],
             "device must appear in revoked list after shell revoke (authorized_keys block still exists — reconciler needed)");
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn cap_cache_key_includes_file_length() {
+        let tmp = std::env::temp_dir().join(format!("fil-cap-cache-len-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("caps.json");
+        let first = serde_json::json!([{"type": "cap_header"}]);
+        let second = serde_json::json!([{"type": "cap_header", "padding": "changed-length"}]);
+        std::fs::write(&path, first.to_string()).unwrap();
+        assert_eq!(load_cap_store(&tmp), first.as_array().unwrap().clone());
+        std::fs::write(&path, second.to_string()).unwrap();
+        assert_eq!(load_cap_store(&tmp), second.as_array().unwrap().clone());
         std::fs::remove_dir_all(&tmp).ok();
     }
 
