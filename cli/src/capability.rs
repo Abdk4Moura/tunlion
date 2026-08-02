@@ -32,6 +32,8 @@ use std::sync::{Mutex, OnceLock};
 /// Cache cap store reads per config_dir, invalidated on every write.
 /// Hot path: load_cap_store is called on every gated open; without this cache
 /// each open re-reads + re-parses caps.json.
+// This is a size-and-timestamp cache key, not a content hash. A same-size rewrite
+// that also collides on mtime can still require hashing if that case matters.
 type CachedStore = (std::path::PathBuf, u128, u64, Vec<Value>); // (path, mtime_nanos, len, parsed)
 static CAP_CACHE: OnceLock<Mutex<Option<CachedStore>>> = OnceLock::new();
 
@@ -40,7 +42,7 @@ fn cache_init() -> &'static Mutex<Option<CachedStore>> {
 }
 
 /// Load the capability store from `caps.json` in the filament config dir.
-/// Cached: subsequent calls with unchanged mtime return the cached store.
+/// Cached: subsequent calls with unchanged mtime and file length return the cached store.
 pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
     let p = config_dir.join("caps.json");
 
@@ -69,7 +71,7 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    // Cache store with mtime
+    // Cache store with the size-and-timestamp key.
     if let (Some(mtime_val), Some(len_val)) = (mtime, len) {
         let mut cache = cache_init().lock().unwrap();
         *cache = Some((p, mtime_val, len_val, store.clone()));
