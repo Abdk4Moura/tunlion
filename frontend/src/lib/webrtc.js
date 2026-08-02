@@ -314,10 +314,22 @@ export function politeRole({ myUid, peerUid, myId, peerId }) {
   if (myUid == null || peerUid == null || myId == null || peerId == null) {
     throw new Error('politeRole requires peer and local UIDs and session IDs')
   }
+  if (!/^[\x00-\x7F]*$/.test(myUid) || !/^[\x00-\x7F]*$/.test(peerUid)) {
+    throw new Error('politeRole requires ASCII UIDs')
+  }
   if (myUid === peerUid && myId === peerId) {
     throw new Error(`politeRole identity tuple collision: uid=${myUid} sid=${myId}`)
   }
   return myUid > peerUid || (myUid === peerUid && myId > peerId)
+}
+
+// Phase-1 compatibility only. Mixed-version peers can still disagree here;
+// this path is measured and must be removed in phase 2.
+export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
+  console.warn('politeRole: legacy path', { peerPresent: true, uidAvailable: peerUid != null, myId, peerId })
+  if (myUid && peerUid && myUid !== peerUid) return myUid > peerUid
+  if (myId && peerId) return myId > peerId
+  return true
 }
 
 

@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
 import { createSession } from './session.js'
-import { PeerLink, politeRole } from './webrtc.js'
+import { PeerLink, politeRole, legacyPoliteRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
@@ -306,21 +306,10 @@ export function useFilament() {
           }
         }
       }
-      // Perfect-negotiation role: both sides must advertise their UID before
-      // election. Old clients are rejected loudly rather than entering a
-      // divergent legacy election; reload to receive the current client.
+      // Phase 1: tolerate peers without a UID while measuring the legacy path.
+      // Phase 2 removes this branch once stale records and old clients are gone.
       const roleArgs = { myUid: uidRef.current, peerUid: uid, myId: myIdRef.current, peerId: id }
-      let polite
-      try {
-        polite = politeRole(roleArgs)
-      } catch (error) {
-        // The stale peer cannot receive this message because it is running the
-        // old bundle; only the current client can explain the compatibility gap.
-        const message = 'This peer is running an older Filament client and cannot connect. They need to reload their page.'
-        console.warn(message, error)
-        addPeer({ id, name, uid: uid || null, color: colorFor(id), status: message, route: null, lastSeen: 'now' })
-        return null
-      }
+      const polite = uid == null ? legacyPoliteRole(roleArgs) : politeRole(roleArgs)
       addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
