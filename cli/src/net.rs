@@ -1137,7 +1137,7 @@ pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> 
 
 /// Phase-1 compatibility path for peers that predate UID-in-handshake. It is
 /// knowingly not antisymmetric when only one side has learned the UID, and is
-/// instrumented so this path can be removed once skew is gone.
+/// instrumented so this path can be removed in #44 phase 2 once skew is gone.
 pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str) -> bool {
     if peer_uid.is_none() {
         eprintln!("polite-role: legacy missing-peer-uid path my_uid={my_uid:?} my_id={my_id:?} peer_id={peer_id:?}");
