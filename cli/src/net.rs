@@ -82,9 +82,8 @@ pub fn stall_ms() -> u64 {
 /// a "stall" makes the watchdog tear the link down and rebuild it, and the
 /// rebuild's setup ALSO exceeds 6 s, so it loops forever and zero bytes ever
 /// land (the exact "stuck at N%" the watchdog was meant to PREVENT). So until a
-/// link moves its first data byte (`Transport::has_flowed`) we give it this much
-/// larger grace; once bytes flow, the tight `stall_ms` applies. Each fresh
-/// transport (e.g. after a repair) re-earns the grace. Overridable via
+/// link exposes a tracked activity clock we use the tight `stall_ms`; otherwise
+/// it receives this larger grace. Overridable via
 /// `FILAMENT_ESTABLISH_GRACE_MS`.
 pub const ESTABLISH_GRACE_MS_DEFAULT: u64 = 45_000;
 
@@ -391,6 +390,11 @@ pub trait Transport: Send + Sync {
     fn idle_ms(&self) -> u64 {
         u64::MAX
     }
+    /// Idle time when the transport tracks activity. `None` means the value is
+    /// unknown; liveness is checked separately with `is_alive()`.
+    fn idle_ms_tracked(&self) -> Option<u64> {
+        (self.idle_ms() != u64::MAX).then_some(self.idle_ms())
+    }
     /// Best-effort liveness: `false` if the underlying connection is known closed.
     /// Default `true` (untracked transports are assumed live). Warm-link reuse
     /// consults this so it never opens a stream over a dead/zombie link (and falls
@@ -471,14 +475,6 @@ pub trait Transport: Send + Sync {
     fn local_ip(&self) -> Option<std::net::IpAddr> {
         None
     }
-    /// Has this transport ever moved a DATA byte (not just control)? Backs the
-    /// before-first-byte establishment grace (`establish_grace_ms`): a link still
-    /// awaiting its first chunk is establishing, not stalled. Default `true`
-    /// (untracked transports use the normal threshold); the DataChannel transport
-    /// reports its real first-data flag.
-    fn has_flowed(&self) -> bool {
-        true
-    }
 }
 
 // The channel is DETACHED (SettingEngine::detach_data_channels): webrtc-rs's
@@ -510,10 +506,6 @@ pub struct DataChannelTransport {
     // signaling reconnect must not supersede a link whose data channel, which
     // is independent of the socket, is still flowing.
     last_activity: Arc<std::sync::atomic::AtomicU64>,
-    // Flips true the first time a DATA frame moves in either direction. Backs the
-    // before-first-byte establishment grace (a link awaiting its first chunk over
-    // a high-RTT relay is establishing, not stalled).
-    first_data: Arc<std::sync::atomic::AtomicBool>,
     // The `polite` role for this link (opposite on the two ends). Selects which
     // half of the L2 sid space this end allocates from, so the two ends never
     // collide (Transport::sid_answerer).
@@ -585,8 +577,6 @@ impl Transport for DataChannelTransport {
         // that lets the supersede proceed for frozen-alive but not for flowing.
         self.last_activity
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-        self.first_data
-            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -615,10 +605,6 @@ impl Transport for DataChannelTransport {
             return u64::MAX;
         }
         now_ms().saturating_sub(self.last_activity.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    fn has_flowed(&self) -> bool {
-        self.first_data.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Real liveness for a DataChannel/relay link (the base trait defaults to
@@ -1767,7 +1753,6 @@ async fn wire_channel(
             // Seed activity at open so a link mid-handshake (no bytes yet) is
             // never falsely treated as idle/supersedable (#28 guard).
             let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
-            let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // C8a: one persistent buffered-amount-low subscription wakes all
             // parked senders.
@@ -1790,7 +1775,6 @@ async fn wire_channel(
                 let dead = dead.clone();
                 let drained = drained.clone();
                 let last_activity = last_activity.clone();
-                let first_data = first_data.clone();
                 let peer_id = peer_id.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; READ_BUF];
@@ -1816,8 +1800,6 @@ async fn wire_channel(
                                     // otherwise-idle link looking active.
                                     last_activity
                                         .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
-                                    first_data
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                                     let offset = u64::from_be_bytes([
                                         buf[4], buf[5], buf[6], buf[7],
@@ -1864,7 +1846,7 @@ async fn wire_channel(
                     });
                 }
                 let transport: Arc<dyn Transport> =
-                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity, first_data, answerer: polite });
+                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity, answerer: polite });
                 let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
             }
         })

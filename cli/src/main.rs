@@ -7173,6 +7173,38 @@ impl Conn {
     // bytes, the "stuck at 0%" hang, and drives the least-disruptive
     // correction. Run from the main event loop's tick (no new concurrency: F8).
 
+    /// Build the detector's transport observation without treating presence or
+    /// an idle sentinel as proof of liveness. Dead transports are excluded from
+    /// the activity sample, and the maximum idle age prevents a worker from
+    /// masking a stalled primary.
+    pub(crate) fn stall_observation(
+        transport: Option<&dyn Transport>,
+        workers: &[Arc<dyn Transport>],
+    ) -> (bool, bool, u64) {
+        let mut transport_up = false;
+        let mut flowed = false;
+        let mut idle_ms: Option<u64> = None;
+
+        let mut observe = |t: &dyn Transport| {
+            if !t.is_alive() {
+                return;
+            }
+            transport_up = true;
+            if let Some(idle) = t.idle_ms_tracked() {
+                flowed = true;
+                idle_ms = Some(idle_ms.map_or(idle, |current| current.max(idle)));
+            }
+        };
+        if let Some(t) = transport {
+            observe(t);
+        }
+        for worker in workers {
+            observe(worker.as_ref());
+        }
+
+        (transport_up, flowed, idle_ms.unwrap_or(u64::MAX))
+    }
+
     /// Per-tick check: if a transfer is in flight (`in_flight`) on a link whose
     /// `idle_ms()` has crossed the stall threshold, return its (pid, idle_ms) so
     /// the loop can emit `Ev::TransferStalled`. Returns `None` for a flowing or
@@ -7190,17 +7222,14 @@ impl Conn {
         // See docs/transfer-state-machine.md.
         // Aggregate across primary + worker transports: during multi-stream
         // transfers data rides the workers, so the primary can appear idle.
-        // Liveness is measured by the MOST recently active transport.
+        // Do not infer liveness from presence or idle sentinels.
         let link = self.links.get(pid);
         let transport = link.and_then(|l| l.transport.as_ref());
         let workers: Vec<Arc<dyn Transport>> = link.map(|l| l.workers.clone()).unwrap_or_default();
-        let transport_up = transport.is_some() || !workers.is_empty();
-        let flowed = transport.map(|t| t.has_flowed()).unwrap_or(false)
-            || workers.iter().any(|w| w.has_flowed());
-        let idle_ms = transport.map(|t| t.idle_ms()).into_iter()
-            .chain(workers.iter().map(|w| w.idle_ms()))
-            .min()
-            .unwrap_or(u64::MAX);
+        let (transport_up, flowed, idle_ms) = Self::stall_observation(
+            transport.map(|t| t.as_ref()),
+            &workers,
+        );
         #[cfg(debug_assertions)]
         eprintln!("[STALL] pid={pid} in_flight={in_flight} transport_up={transport_up} flowed={flowed} idle_ms={idle_ms} workers={} cluster={:?}",
             workers.len(),
