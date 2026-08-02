@@ -1618,6 +1618,14 @@ pub async fn race_connect_labeled(
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
 ) -> Option<Arc<dyn Transport>> {
+    // Debug-only: the acceptance run on 925a333 reported answerer=true on BOTH
+    // ends across all 57 observations, which a single derivation from a swapped
+    // tuple cannot produce. Log the INPUTS so the next run measures why instead
+    // of us reasoning about it.
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[ELECT-IN] my_uid={my_uid:?} peer_uid={peer_uid:?} my_id={my_id:?} peer_id={peer_id:?}"
+    );
     let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
         Ok(value) => value,
         Err(error) => {
