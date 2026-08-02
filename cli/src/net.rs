@@ -1887,6 +1887,32 @@ mod tests {
     }
 
     #[test]
+    fn polite_role_is_antisymmetric_for_every_uid_knowledge_state() {
+        let xor = |a: bool, b: bool| assert_ne!(a, b, "exactly one side must be polite");
+
+        // Both peers have the same UID view.
+        xor(
+            polite_role("uid-a", Some("uid-b"), "sid-a", "sid-b"),
+            polite_role("uid-b", Some("uid-a"), "sid-b", "sid-a"),
+        );
+        // Only A has learned B's UID.
+        xor(
+            polite_role("uid-z", Some("uid-a"), "sid-a", "sid-b"),
+            polite_role("uid-a", None, "sid-b", "sid-a"),
+        );
+        // Only B has learned A's UID.
+        xor(
+            polite_role("uid-z", None, "sid-b", "sid-a"),
+            polite_role("uid-a", Some("uid-z"), "sid-a", "sid-b"),
+        );
+        // Neither peer has learned the other's UID.
+        xor(
+            polite_role("uid-a", None, "sid-a", "sid-b"),
+            polite_role("uid-b", None, "sid-b", "sid-a"),
+        );
+    }
+
+    #[test]
     fn roster_from_ack_extracts_present_peers() {
         // A real subscribe ACK: {ok, n, peers:[...]}. Every roster entry is
         // shaped like a known-peer push and must be forwarded.
