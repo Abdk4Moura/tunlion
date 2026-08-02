@@ -3334,7 +3334,7 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
 
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, false).await?;
@@ -3525,7 +3525,7 @@ async fn enroll_and_send_cmd(
                 // The owner daemon is already in the enroll room; the server hands
                 // us its roster here. Dial each peer (owner answers) so rendezvous
                 // does not depend on a later peer-joined we would otherwise miss.
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers { conn.maybe_adopt(p, true).await?; }
                 }
@@ -3751,7 +3751,7 @@ async fn enroll_and_netcat_cmd(
                 // The owner daemon is already in the enroll room; the server hands
                 // us its roster here. Dial each peer (owner answers) so rendezvous
                 // does not depend on a later peer-joined we would otherwise miss.
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers { conn.maybe_adopt(p, true).await?; }
                 }
@@ -4222,7 +4222,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 // C30 (dissolves the C28 belt): fresh sid, re-assert via session.
                 sess.invalidate();
             }
@@ -4755,7 +4755,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         };
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, true).await?;
@@ -10185,7 +10185,7 @@ async fn send_cmd(
 
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 // P5 (GAP-6): a fresh signaling welcome (reconnect) is a moment a
                 // new direct path may have appeared, re-probe immediately for any
                 // relay-committed peer rather than waiting out the backoff.
@@ -12924,7 +12924,7 @@ async fn recv_cmd(
                 ));
             }
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 // P5 (GAP-6): a fresh welcome (signaling reconnect) may mean the
                 // network just changed under us, re-probe relay-committed peers for
                 // a direct path immediately instead of waiting out the backoff.

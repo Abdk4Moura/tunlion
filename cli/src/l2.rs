@@ -1054,6 +1054,7 @@ async fn bring_up_to_known(
     let mut my_id: Option<String> = None;
     let mut peer: Option<Arc<Peer>> = None;
     let mut peer_uid: Option<String> = None;
+    let mut peer_present = false;
     let mut generation: u32 = 0;
     // Ghost tolerance: the channel can hold DEAD sids (a SIGKILL'd process
     // lingers until the server's ping-timeout) and WRONG peers (our own up
@@ -1061,7 +1062,7 @@ async fn bring_up_to_known(
     // forever was the dominant stall. Instead: one candidate AT A TIME (a
     // parallel race glares, proven, see multicandidate-attempt.patch), a
     // short per-candidate timer, and rotation through everything seen.
-    let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
+    let mut queue: VecDeque<(String, Option<String>, bool)> = VecDeque::new();
     // Per-candidate establish budget for the INTERACTIVE L2/ssh path: how long a
     // single candidate gets to complete (WebRTC + direct-QUIC race) before it is
     // declared Stuck and we rotate to the next. This is a TIMEOUT, not the
@@ -1151,7 +1152,8 @@ async fn bring_up_to_known(
     loop {
         // One candidate at a time: start the next attempt whenever idle.
         if peer.is_none() {
-            if let Some((pid, uid)) = queue.pop_front() {
+            if let Some((pid, uid, candidate_present)) = queue.pop_front() {
+                peer_present = candidate_present;
                 // A candidate appeared and we are dialing it: presence is done,
                 // we are now in the Establishing (WebRTC + direct-QUIC race)
                 // phase. Latched so re-dials of later candidates don't re-emit.
@@ -1159,10 +1161,16 @@ async fn bring_up_to_known(
                     diag.enter(crate::diag::Phase::Establishing);
                     entered_establishing = true;
                 }
-                let mine = my_id.clone().unwrap_or_default();
+                let Some(mine) = my_id.clone() else {
+                    eprintln!("role election deferred for {pid}: local session ID unavailable");
+                    continue;
+                };
                 let polite = match uid.as_deref() {
                     Some(peer_uid) => net::polite_role(&my_uid, peer_uid, &mine, &pid)?,
-                    None => net::polite_role_legacy(&my_uid, None, &mine, &pid, "presence", true),
+                    None => {
+                        let source = if peer_present { "presence" } else { "absent-roster" };
+                        net::polite_role_legacy(&my_uid, None, &mine, &pid, source, peer_present)
+                    },
                 };
                 generation += 1;
                 spawn_timer(pid.clone(), generation);
@@ -1280,11 +1288,11 @@ async fn bring_up_to_known(
                 }
                 // Queue every distinct sid; the loop top rotates through them.
                 if peer.as_ref().is_some_and(|p| p.id == pid)
-                    || queue.iter().any(|(q, _)| *q == pid)
+                    || queue.iter().any(|(q, _, _)| *q == pid)
                 {
                     continue;
                 }
-                queue.push_back((pid, v["uid"].as_str().map(|s| s.to_string())));
+                queue.push_back((pid, v["uid"].as_str().map(|s| s.to_string()), true));
             }
             Ev::Signal(v) => {
                 let data = v["data"].clone();
@@ -1418,7 +1426,7 @@ async fn bring_up_to_known(
                     // then succeeds on retry" signal we are hunting).
                     diag.stall(crate::diag::Phase::Establishing, candidate_secs * 1000);
                     crate::ui::debug("filament: candidate unresponsive, rotating");
-                    queue.push_back((pid, peer_uid.take()));
+                    queue.push_back((pid, peer_uid.take(), peer_present));
                 }
             }
             Ev::ChannelReady(pid, t) if peer.as_ref().is_some_and(|p| p.id == pid) => {
@@ -1453,7 +1461,7 @@ async fn bring_up_to_known(
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
                     crate::ui::debug(&format!("filament: connection {s}, rotating"));
-                    queue.push_back((pid, peer_uid.take()));
+                    queue.push_back((pid, peer_uid.take(), peer_present));
                 }
             }
             _ => {}
