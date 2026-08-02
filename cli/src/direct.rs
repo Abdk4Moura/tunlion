@@ -1579,6 +1579,10 @@ pub async fn accept_workers(
 
 // ============================================================== orchestrator ==
 
+fn answerer_for(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+    crate::net::polite_role(my_uid, peer_uid, my_id, peer_id)
+}
+
 /// The simultaneous-open race: run the acceptor AND dial every peer candidate
 /// concurrently; the FIRST connection to pass the pair-secret MAC wins, the
 /// rest are dropped. Returns an authenticated `Arc<dyn Transport>` or None
@@ -1614,7 +1618,7 @@ pub async fn race_connect_labeled(
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
 ) -> Option<Arc<dyn Transport>> {
-    let answerer = match crate::net::polite_role(&my_uid, &peer_uid, &my_id, &peer_id) {
+    let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("direct role election failed for peer {peer_id}: {error}");
@@ -1735,6 +1739,13 @@ pub async fn race_connect_labeled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answerer_role_is_opposite_for_both_quic_ends() {
+        let a = answerer_for("uid-a", "uid-b", "sid-a", "sid-b").unwrap();
+        let b = answerer_for("uid-b", "uid-a", "sid-b", "sid-a").unwrap();
+        assert_ne!(a, b, "QUIC ends must allocate opposite sid halves");
+    }
 
     #[test]
     fn hkdf_is_deterministic_and_independent() {
