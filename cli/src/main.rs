@@ -6828,6 +6828,13 @@ impl Conn {
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
+        let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str()).map(str::to_owned);
+        let Some(peer_uid) = peer_uid else {
+            eprintln!("direct role election deferred for {pid}: no peer UID");
+            return;
+        };
+        let my_uid = self.my_uid.clone();
+        let my_id = self.my_id.clone();
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
             if is_probe {
                 Ev::DirectUpgradeReady(pid, t, route)
@@ -6861,7 +6868,7 @@ impl Conn {
             // it allocates from the high L2 sid half (the connector side uses the
             // low half) - keeps the two ends' sids disjoint.
             if let Some(t) =
-                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone(), true).await
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone()).await
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
@@ -6879,8 +6886,10 @@ impl Conn {
                         peer_srflx,
                         &secret,
                         pid_s.clone(),
+                        my_uid.clone(),
+                        peer_uid.clone(),
+                        my_id.clone(),
                         tx.clone(),
-                        true, // answerer (same on_transport_offer/acceptor side)
                     )
                     .await
                     {

@@ -1070,7 +1070,7 @@ async fn bring_up_to_known(
     // actually find the known device (same as `--to` identity mode).
     let solo = format!("l2-{}", crate::fresh_secret());
     let join_payload =
-        json!({ "room": solo, "uid": my_uid, "name": crate::display_name() });
+        json!({ "room": solo, "uid": my_uid.clone(), "name": crate::display_name() });
     sio.emit("join", join_payload.clone()).await.ok();
     // NOTE: subscribe is emitted on Ev::Welcome (below), not here, `welcome` is
     // the proof the socket.io connection is fully established, so the subscribe
@@ -1356,12 +1356,20 @@ async fn bring_up_to_known(
                         ));
                         let secret = secret.clone();
                         let pid = v["from"].as_str().unwrap_or_default().to_string();
+                        let peer_uid_for_race = match peer_uid.clone() {
+                            Some(value) => value,
+                            None => {
+                                eprintln!("direct role election deferred for {pid}: no peer UID");
+                                continue;
+                            }
+                        };
+                        let my_uid_for_race = my_uid.clone();
+                        let my_id_for_race = my_id.clone().unwrap_or_default();
                         let tx = tx.clone();
                         tokio::spawn(async move {
                             if let Some(t) = crate::direct::race_connect_labeled(
-                                // answerer=false: this is bring_up (the connector
-                                // side), so it allocates the low L2 sid half.
-                                ep, peer_cands, &secret, pid.clone(), tx.clone(), "direct-quic", false,
+                                ep, peer_cands, &secret, pid.clone(), my_uid_for_race,
+                                peer_uid_for_race, my_id_for_race, tx.clone(), "direct-quic",
                             )
                             .await
                             {

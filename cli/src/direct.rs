@@ -1592,10 +1592,12 @@ pub async fn race_connect(
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
+    my_uid: String,
+    peer_uid: String,
+    my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
-    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
-    race_connect_labeled(endpoint, peer_cands, secret, peer_id, tx, "direct-quic", answerer).await
+    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic").await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -1606,16 +1608,19 @@ pub async fn race_connect_labeled(
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
+    my_uid: String,
+    peer_uid: String,
+    my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
-    // Which L2 sid half THIS end allocates from (Transport::sid_answerer). It is
-    // the application-level role, NOT the QUIC race outcome (simultaneous open can
-    // let both ends win as dialer): the side that ran the command (`bring_up`,
-    // connector) passes false; the side whose daemon received the transport-offer
-    // (`on_transport_offer`, acceptor) passes true. Opposite on the two ends, so
-    // their sids never collide.
-    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
+    let answerer = match crate::net::polite_role(&my_uid, &peer_uid, &my_id, &peer_id) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("direct role election failed for peer {peer_id}: {error}");
+            return None;
+        }
+    };
     // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
     // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2, a
     // hole-punch race carries a distinct label.
