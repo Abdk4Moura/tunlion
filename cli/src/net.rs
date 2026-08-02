@@ -1144,8 +1144,8 @@ pub fn ensure_ascii_uid(uid: &str) -> Result<()> {
 
 /// Phase-1 compatibility path. It remains knowingly non-antisymmetric until
 /// phase 2 removes old-client skew; every use is attributed for measurement.
-pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str, source: &str) -> bool {
-    eprintln!("polite-role: legacy path source={source} peer_present=true uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
+pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str, source: &str, peer_present: bool) -> bool {
+    eprintln!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
     match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,
