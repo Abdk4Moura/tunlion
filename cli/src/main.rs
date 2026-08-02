@@ -6486,6 +6486,7 @@ impl Conn {
         }
         self.drop_link(&peer_id); // re-establish replaces any same-sid link
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
+        let peer_present = self.roster.contains_key(&peer_id);
         let name = info["name"].as_str().unwrap_or("peer").to_string();
         // C5: fresh ICE config (TURN creds are expiry-stamped HMACs) for
         // every attempt, not just the first.
@@ -6495,7 +6496,10 @@ impl Conn {
             Some(value) => value,
             None => match peer_uid.as_deref() {
                 Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
-                None => net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, "presence", true),
+                None => {
+                    let source = if peer_present { "presence" } else { "absent-roster" };
+                    net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, source, peer_present)
+                },
             },
         };
         self.next_gen += 1;
@@ -7005,6 +7009,7 @@ impl Conn {
             return;
         }
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
+        let peer_present = self.roster.contains_key(pid);
         let answerer = match peer_uid {
             Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid) {
                 Ok(value) => value,
@@ -7014,7 +7019,8 @@ impl Conn {
                 }
             },
             None => {
-                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, "presence", true)
+                let source = if peer_present { "presence" } else { "absent-roster" };
+                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, source, peer_present)
             }
         };
         let count = k - 1;
