@@ -1658,6 +1658,14 @@ pub async fn race_connect_labeled(
         futs.push(Box::pin(async move {
             let incoming = ep.accept().await.ok_or_else(|| anyhow!("endpoint closed"))?;
             let conn = incoming.await.context("accept handshake")?;
+            // Debug-only: BOTH ends run this acceptor AND the dialers below, all
+            // on ONE endpoint, so A-dials-B and B-dials-A share the same address
+            // pair. The 4-tuple therefore CANNOT distinguish them and the earlier
+            // WINNER-TUPLE run was inconclusive rather than a refutation. Origin
+            // is the bit that separates the two connections: if both ends report
+            // origin=accept for their winner, they are holding different ones.
+            #[cfg(debug_assertions)]
+            eprintln!("[CAND] origin=accept conn_stable={}", conn.stable_id());
             auth_conn(conn, tkey, false).await
         }));
     }
@@ -1672,6 +1680,8 @@ pub async fn race_connect_labeled(
                 .connect(addr, "filament-direct")
                 .context("connect")?;
             let conn = connecting.await.context("dial handshake")?;
+            #[cfg(debug_assertions)]
+            eprintln!("[CAND] origin=dial conn_stable={}", conn.stable_id());
             auth_conn(conn, tkey, true).await
         }));
     }
