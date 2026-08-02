@@ -391,6 +391,12 @@ pub trait Transport: Send + Sync {
     fn idle_ms(&self) -> u64 {
         u64::MAX
     }
+    /// Idle time when the transport tracks activity. `None` means the value is
+    /// unknown; liveness is checked separately with `is_alive()`.
+    fn idle_ms_tracked(&self) -> Option<u64> {
+        let idle_ms = self.idle_ms();
+        (idle_ms != u64::MAX).then_some(idle_ms)
+    }
     /// Best-effort liveness: `false` if the underlying connection is known closed.
     /// Default `true` (untracked transports are assumed live). Warm-link reuse
     /// consults this so it never opens a stream over a dead/zombie link (and falls
