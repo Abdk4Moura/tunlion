@@ -3,7 +3,6 @@
 // Pure render functions for the device listing surfaces.
 
 use crate::ui::{self, Tone};
-use super::{echo_cmd, meta, rule};
 
 /// A device entry for rendering.
 #[derive(Debug, Clone)]
@@ -76,6 +75,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         ));
         for d in &review {
             lines.push(render_device_row(d));
+            lines.push(ui::paint(Tone::Dim, &format!("       ↳ filament devices promote {}", d.name)));
         }
         lines.push(String::new());
     }

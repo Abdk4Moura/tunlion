@@ -23,6 +23,7 @@ mod doctor;
 /// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
+mod fleet_enrollment;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
@@ -859,14 +860,16 @@ enum Cmd {
         #[arg(long)]
         tag: Option<String>,
     },
-    /// Revoke a capability from a known device. Revoking `shell` also strips the
-    /// device's filament-managed block from this machine's authorized_keys.
+    /// Revoke a capability or a fleet certificate from a known device.
     #[command(hide = true)]
     Revoke {
         /// Known device (petname)
         device: String,
         /// Capability to revoke (e.g. `shell`)
-        capability: String,
+        capability: Option<String>,
+        /// Revoke the device's local fleet certificate instead of a capability.
+        #[arg(long)]
+        certificate: bool,
     },
     /// Mount a remote directory over the mesh via sshfs.
     ///
@@ -961,6 +964,33 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
+    /// Mint a scoped, expiring key for another machine to join.
+    Mint {
+        /// Mint a key for a device in your fleet.
+        #[arg(long)]
+        fleet: bool,
+        /// Mint a narrow key for this paired external device.
+        #[arg(long)]
+        external: Option<String>,
+        /// Mint a single-use CI/automation key.
+        #[arg(long)]
+        ci: bool,
+        /// Key lifetime, such as 1h or 15m.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Reuse policy: once, N(3), or reusable.
+        #[arg(long)]
+        reuse: Option<String>,
+        /// Capabilities to grant (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Paired audience name for a CI key.
+        #[arg(long)]
+        audience: Option<String>,
+        /// Do not prompt for deliberate choices.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Mint auth keys or enroll as an ephemeral delegated device.
     #[command(hide = true)]
     Ephemeral {
@@ -986,7 +1016,7 @@ enum Cmd {
 enum EphemeralAction {
     /// Mint a new auth key signed by your user identity key.
     Mint {
-        /// Capabilities to grant (comma-separated: shell,transfer,deploy,etc.)
+        /// Capabilities to grant (shell, transfer, mount, reach)
         #[arg(long, value_delimiter = ',')]
         caps: Vec<String>,
         /// Peer device_pub(s) that may enroll this key (hex, comma-separated). Empty = any.
@@ -1040,6 +1070,12 @@ enum RequestsAction {
     Approve {
         /// Request id
         id: u64,
+        /// Capability requested by the peer
+        #[arg(long)]
+        allow: String,
+        /// Duration, for example 1h, 30m, or 1d
+        #[arg(long = "for")]
+        duration: String,
     },
     /// Deny a pending request by id.
     Deny {
@@ -1538,6 +1574,34 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     None
 }
 
+/// Local-only fleet certificate revocation marker. This deliberately lives
+/// beside the device record: no CRL or network dependency is introduced.
+fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
+    let p = devices_path();
+    let Ok(raw) = std::fs::read_to_string(&p) else { return true };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return true };
+    let key = hex::encode(device_pub);
+    arr.iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+        .and_then(|d| d["certRevoked"].as_bool())
+        .unwrap_or(true)
+}
+
+/// Mark a stored device certificate revoked locally. The check path must
+/// consult this marker before granting fleet trust; expiry remains separate.
+fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p).unwrap_or_default();
+    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+        bail!("device '{name}' is not in the device store");
+    };
+    device["certRevoked"] = json!(revoked);
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
+        .context("atomic write devices.json")?;
+    Ok(())
+}
+
 fn load_owner_key() -> Option<crate::identity::UserKey> {
     crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten()
 }
@@ -1980,14 +2044,24 @@ fn device_caps(name: &str) -> Option<Vec<String>> {
 /// config-dir env var).
 #[allow(dead_code)]
 fn device_caps_at(path: &Path, name: &str) -> Option<Vec<String>> {
+    device_caps_at_time(path, name, crate::capability::now_secs())
+}
+
+fn device_caps_at_time(path: &Path, name: &str, now: u64) -> Option<Vec<String>> {
     let raw = std::fs::read_to_string(path).ok()?;
     let arr = serde_json::from_str::<Value>(&raw).ok()?;
     for d in arr.as_array()? {
         if d["name"].as_str() == Some(name) {
-            return Some(match d.get("caps").and_then(|c| c.as_array()) {
+            let mut caps = match d.get("caps").and_then(|c| c.as_array()) {
                 Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
                 None => vec!["transfer".to_string()], // v1 record
-            });
+            };
+            if let Some(expiries) = d.get("capExpires").and_then(|v| v.as_object()) {
+                caps.retain(|cap| expiries.get(cap).and_then(|v| v.as_u64())
+                    .map(|expiry| crate::capability::grant_active(expiry, now))
+                    .unwrap_or(true));
+            }
+            return Some(caps);
         }
     }
     None
@@ -1999,7 +2073,8 @@ fn device_allows_at(path: &Path, name: &str, capability: &str) -> bool {
     if capability == "transfer" {
         return true; // L0 baseline, never gated (spec §8)
     }
-    device_caps_at(path, name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
+    device_caps_at_time(path, name, crate::capability::now_secs())
+        .map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
 }
 
 /// L1-a (spec §8 / gate 5): deny-by-default capability enforcement hook. A
@@ -2019,7 +2094,8 @@ fn device_allows(name: &str, capability: &str) -> bool {
 /// back-compat baseline `["transfer"]` first, so granting `shell` never silently
 /// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
 /// Returns Err if the device is unknown (you can't grant a stranger a shell).
-fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
+fn device_set_cap(name: &str, capability: &str, grant: bool, expires: Option<u64>) -> Result<()> {
+    let capability = crate::capability::canonical_capability(capability)?;
     let p = devices_path();
     let raw = std::fs::read_to_string(&p)
         .map_err(|_| anyhow::anyhow!("no known device named '{name}', pair first"))?;
@@ -2038,13 +2114,31 @@ fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
             Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
             None => vec!["transfer".to_string()],
         };
-        caps.retain(|c| c != capability);
+        caps.retain(|c| c != &capability);
         if grant {
             caps.push(capability.to_string());
         }
         if let Some(obj) = d.as_object_mut() {
             obj.insert("v".into(), json!(2));
             obj.insert("caps".into(), json!(caps));
+            let mut cap_expires = obj.get("capExpires").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            if grant {
+                if let Some(expiry) = expires {
+                    cap_expires.insert(capability.to_string(), json!(expiry));
+                } else {
+                    cap_expires.remove(&capability);
+                }
+            } else {
+                cap_expires.remove(&capability);
+            }
+            obj.insert("capExpires".into(), json!(cap_expires));
+            let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            if grant && expires.is_some() {
+                sources.insert(capability.to_string(), json!("legacy"));
+            } else {
+                sources.remove(&capability);
+            }
+            obj.insert("capSources".into(), json!(sources));
         }
     }
     if !found {
@@ -2054,6 +2148,55 @@ fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
     }
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
     Ok(())
+}
+
+fn mark_bounded_cap_source(name: &str, capability: &str, source: &str) -> Result<()> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p)?;
+    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else { bail!("unknown device '{name}'") };
+    let obj = device.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid device record"))?;
+    let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    sources.insert(capability.to_string(), json!(source));
+    obj.insert("capSources".into(), json!(sources));
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+    Ok(())
+}
+
+/// Add the authoritative owner-signed bounded grant when the peer is certified.
+/// Uncertified peers intentionally retain the legacy `capExpires` fallback.
+fn issue_signed_bounded_grant(device: &str, capability: &str, expires: u64) -> Result<bool> {
+    let Some(user_key) = load_owner_key() else { return Ok(false) };
+    let Some(peer_cert) = device_cert_for(device) else { return Ok(false) };
+    peer_cert.verify(crate::identity::now_secs()).map_err(|_| anyhow::anyhow!("peer identity cert for '{device}' is expired; re-pair to refresh it"))?;
+    let config_dir = crate::settings::config_dir();
+    let mut store = crate::capability::load_cap_store(&config_dir);
+    let pk = user_key.public_key_bytes();
+    if !store.iter().any(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_header") && e["resource"].as_str() == Some("self")) {
+        let mut hdr = crate::capability::CapHeader {
+            resource: crate::capability::self_resource_id(&pk), epoch: 0, owner_pub: pk,
+            nonce: crate::capability::self_resource_nonce(), floors: vec![],
+            issued_at: crate::capability::now_secs(), prev_owner_pub: None,
+            prev_header_hash: None, sig: [0; 64],
+        };
+        hdr.sig = crate::capability::sign_cap_header(&hdr, user_key.keypair());
+        let mut value = hdr.to_json();
+        value["resource"] = json!("self");
+        store.push(value);
+    }
+    let mut op = crate::capability::CapOp {
+        op: crate::capability::CapOpKind::Grant, grantor: pk, target_kind: 0x00,
+        target: peer_cert.user_pub, resource: "self".into(), permissions: vec![capability.into()],
+        expires, issued_at: crate::capability::now_secs(),
+        version: crate::capability::hlc_next(0, crate::capability::now_ms()), sig: [0; 64],
+    };
+    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
+    let mut value = op.to_json();
+    value["type"] = json!("cap_grant");
+    store.push(value);
+    crate::capability::update_ratchet(&mut store, &pk, op.issued_at)?;
+    crate::capability::save_and_list_revoked(&store, &config_dir)?;
+    Ok(true)
 }
 
 fn devices_remove(name: &str) -> Result<()> {
@@ -2936,6 +3079,21 @@ fn expire_requests(requests: &mut Vec<PendingRequest>) {
     }
 }
 
+fn parse_duration_secs(input: &str) -> Result<u64> {
+    let (number, unit) = input.trim().split_at(input.trim().len().saturating_sub(1));
+    let value: u64 = number.parse().map_err(|_| anyhow::anyhow!("invalid duration '{input}'"))?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("invalid duration '{input}', use e.g. 30m, 1h, or 1d"),
+    };
+    let seconds = value.checked_mul(multiplier).ok_or_else(|| anyhow::anyhow!("duration too large"))?;
+    if seconds == 0 { bail!("duration must be greater than zero"); }
+    Ok(seconds)
+}
+
 /// Enqueue a consent request for a denied action from an identified peer.
 /// No-op if the peer is unidentified, the cap is not requestable, or a
 /// duplicate (same peer+cap) is already pending (dedup).
@@ -2956,69 +3114,202 @@ fn enqueue_if_requestable(dev_petname: &str, cap: &str) {
     }
 }
 
+fn request_ago(timestamp: u64) -> String {
+    let ago = crate::capability::now_secs().saturating_sub(timestamp);
+    if ago < 60 {
+        format!("{ago}s ago")
+    } else if ago < 3600 {
+        format!("{}m ago", ago / 60)
+    } else {
+        format!("{}h ago", ago / 3600)
+    }
+}
+
+fn request_entry(value: &Value) -> Option<fleet_ui::requests::RequestEntry> {
+    let capability = value["capability"].as_str()?;
+    Some(fleet_ui::requests::RequestEntry {
+        id: value["id"].as_u64()?,
+        peer: value["peer"].as_str()?.to_string(),
+        capability: capability.to_string(),
+        ago: request_ago(value["timestamp"].as_u64().unwrap_or(0)),
+        // The request protocol does not carry provenance or a fingerprint.
+        via: None,
+        fingerprint: None,
+        is_deliberate: fleet_ui::is_deliberate_capability(capability),
+    })
+}
+
+fn request_entries(value: &Value, all: bool) -> Vec<fleet_ui::requests::RequestEntry> {
+    value
+        .get("requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|request| all || request["status"].as_str() == Some("pending"))
+        .filter_map(request_entry)
+        .collect()
+}
+
+fn local_request(id: u64) -> Option<PendingRequest> {
+    load_requests().into_iter().find(|request| request.id == id)
+}
+
+fn warm_device_names(value: Option<&Value>) -> HashSet<String> {
+    value
+        .and_then(|v| v.get("links"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|link| link["warm"].as_bool() == Some(true))
+        .filter_map(|link| link["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+fn pending_request_count(value: Option<&Value>) -> usize {
+    value
+        .and_then(|v| v.get("requests"))
+        .and_then(Value::as_array)
+        .map(|requests| {
+            requests
+                .iter()
+                .filter(|request| request["status"].as_str() == Some("pending"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
+    let Some(cert) = cert else {
+        return "promote to continue".to_string();
+    };
+    let now = identity::now_secs();
+    if cert.expires <= now {
+        let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
+            .map(|at| at.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "expired".to_string());
+        return match tier {
+            fleet_ui::devices::DeviceTier::Fleet => format!("renews until {date}"),
+            _ => format!("expired {date}"),
+        };
+    }
+    let minutes = (cert.expires - now).saturating_add(59) / 60;
+    match tier {
+        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {minutes}m"),
+        _ => format!("expires in {minutes}m"),
+    }
+}
+
+fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
+    let mut labels = Vec::new();
+    for cap in caps {
+        let label = match (tier, cap.as_str()) {
+            (fleet_ui::devices::DeviceTier::External, "transfer") => "send→you",
+            (_, "transfer") => "inbox",
+            (_, "shell") => "shell",
+            (_, "mount") => "mount",
+            (_, "send") => "send→you",
+            (_, "read") => "read ~/share",
+            _ => cap.as_str(),
+        };
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    if labels.is_empty() {
+        "(none)".to_string()
+    } else {
+        labels.join(" ")
+    }
+}
+
+fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
+    let warm_names = warm_device_names(warm);
+    let owner = load_owner_key().map(|key| key.public_key_bytes());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    devices_load()
+        .into_iter()
+        .map(|(name, _secret)| {
+            let cert = device_cert_for(&name);
+            let tier = match cert.as_ref() {
+                None => fleet_ui::devices::DeviceTier::NeedsReview,
+                Some(cert) if owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
+                Some(_) => fleet_ui::devices::DeviceTier::External,
+            };
+            let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+            let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
+            let address = stored_v6.or(stored_v4);
+            let last_seen = (last_seen > 0).then(|| {
+                let ago = now.saturating_sub(last_seen);
+                if ago < 60 {
+                    "just now".to_string()
+                } else if ago < 3600 {
+                    format!("{}m ago", ago / 60)
+                } else if ago < 86400 {
+                    format!("{}h ago", ago / 3600)
+                } else {
+                    format!("{}d ago", ago / 86400)
+                }
+            });
+            let needs_promote = tier == fleet_ui::devices::DeviceTier::NeedsReview;
+            let caps_summary = if needs_promote {
+                "(full legacy trust)".to_string()
+            } else {
+                device_caps_summary(&caps, tier)
+            };
+            let caps_summary = match address {
+                Some(address) => format!("{caps_summary}  {address}"),
+                None => caps_summary,
+            };
+            fleet_ui::devices::DeviceEntry {
+                name: name.clone(),
+                tier,
+                online: warm_names.contains(&name),
+                caps_summary,
+                countdown: if needs_promote {
+                    String::new()
+                } else {
+                    device_countdown(tier, cert.as_ref())
+                },
+                last_seen,
+                needs_promote,
+            }
+        })
+        .collect()
+}
+
 /// CLI handler for `filament requests`
 async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     match action {
         None | Some(RequestsAction::List { all: false }) => {
             let reply = crate::ctl::try_list_pending().await;
             match reply {
-                Some(v) => {
-                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
-                        if reqs.is_empty() {
-                            ui::say("  no pending requests");
-                        } else {
-                            for r in reqs {
-                                let id = r["id"].as_u64().unwrap_or(0);
-                                let peer = r["peer"].as_str().unwrap_or("?");
-                                let cap = r["capability"].as_str().unwrap_or("?");
-                                let status = r["status"].as_str().unwrap_or("?");
-                                let ts = r["timestamp"].as_u64().unwrap_or(0);
-                                let ago = crate::capability::now_secs().saturating_sub(ts);
-                                let when = if ago < 60 { format!("{ago}s ago") }
-                                    else if ago < 3600 { format!("{}m ago", ago/60) }
-                                    else { format!("{}h ago", ago/3600) };
-                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
-                            }
-                        }
-                    }
-                }
+                Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(&v, false))),
                 None => ui::say("  daemon not running; no pending request state"),
             }
         }
         Some(RequestsAction::List { all: true }) => {
             let reply = crate::ctl::try_list_pending().await;
             match reply {
-                Some(v) => {
-                    if let Some(reqs) = v.get("requests").and_then(|v| v.as_array()) {
-                        if reqs.is_empty() {
-                            ui::say("  no requests");
-                        } else {
-                            for r in reqs {
-                                let id = r["id"].as_u64().unwrap_or(0);
-                                let peer = r["peer"].as_str().unwrap_or("?");
-                                let cap = r["capability"].as_str().unwrap_or("?");
-                                let status = r["status"].as_str().unwrap_or("?");
-                                let ts = r["timestamp"].as_u64().unwrap_or(0);
-                                let ago = crate::capability::now_secs().saturating_sub(ts);
-                                let when = if ago < 60 { format!("{ago}s ago") }
-                                    else if ago < 3600 { format!("{}m ago", ago/60) }
-                                    else { format!("{}h ago", ago/3600) };
-                                ui::say(&format!("  #{id} {when:>8}  {peer:>16}  {cap:>10}  {status}"));
-                            }
-                        }
-                    }
-                }
+                Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(&v, true))),
                 None => ui::say("  daemon not running; no request state"),
             }
         }
-        Some(RequestsAction::Approve { id }) => {
-            let reply = crate::ctl::try_approve_request(id).await;
+        Some(RequestsAction::Approve { id, allow, duration }) => {
+            let expires = crate::capability::now_secs().saturating_add(parse_duration_secs(&duration)?);
+            let reply = crate::ctl::try_approve_request(id, &allow, expires).await;
             match reply {
                 Some(v) => {
                     if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
                         if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
+                            // Do not call render_approve_success here. The capability
+                            // layer has no bounded-grant contract yet, so its expiry
+                            // would be false while device_set_cap persists access.
                             ui::say(&format!(
-                                "  {} approved {cap} for {peer}",
+                                "  {} approved {cap} for {peer} until {expires}",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                             ));
                         }
@@ -3028,14 +3319,139 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
             }
         }
         Some(RequestsAction::Deny { id }) => {
+            let peer = local_request(id).map(|request| request.peer);
             let reply = crate::ctl::try_deny_request(id).await;
             match reply {
-                Some(_) => ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
+                Some(_) => {
+                    if let Some(peer) = peer {
+                        ui::say(&fleet_ui::requests::render_deny_success(&peer));
+                    } else {
+                        ui::say(&format!("  {} request {id} denied", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    }
+                }
                 None => ui::say(&format!("  {} request {id} not found or daemon not running", ui::paint(ui::Tone::Warn, "x"))),
             }
         }
     }
     Ok(())
+}
+
+/// CLI handler for `filament ephemeral`
+fn parse_mint_ttl(raw: &str) -> Result<u64> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (number, unit) = raw.split_at(raw.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
+    let value: u64 = number.parse().map_err(|_| anyhow!("invalid --ttl '{raw}'"))?;
+    let multiplier = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("invalid --ttl '{raw}', use a duration such as 15m or 1h"),
+    };
+    Ok(value.saturating_mul(multiplier))
+}
+
+fn mint_capability(raw: &str) -> Result<String> {
+    match raw {
+        "send" => Ok("transfer".to_string()),
+        "write" => Ok("mount".to_string()),
+        "shell" | "mount" | "all-ports" | "transfer" => Ok(raw.to_string()),
+        "reuse" => bail!("reuse is a lifetime option, not a capability"),
+        "mesh" => {
+            let (message, _) = fleet_ui::mint::err_mesh_not_grantable();
+            bail!("{message}")
+        }
+        other => bail!("unsupported capability '{other}'"),
+    }
+}
+
+async fn mint_cmd(
+    server: &str,
+    fleet: bool,
+    external: Option<String>,
+    ci: bool,
+    ttl: Option<String>,
+    reuse: Option<String>,
+    allow: Vec<String>,
+    audience: Option<String>,
+    _yes: bool,
+    relay: bool,
+) -> Result<()> {
+    let is_external = external.is_some();
+    let selected = fleet as u8 + external.is_some() as u8 + ci as u8;
+    if selected != 1 {
+        let (message, _) = fleet_ui::mint::err_needs_key_type();
+        bail!("{message}");
+    }
+    let key_type = if fleet { fleet_ui::mint::KeyType::Fleet } else if ci { fleet_ui::mint::KeyType::CI } else { fleet_ui::mint::KeyType::External };
+    let default_ttl = if ci { "15m" } else { "1h" };
+    let ttl_text = ttl.as_deref().unwrap_or(default_ttl);
+    let ttl_secs = parse_mint_ttl(ttl_text)?;
+    if is_external && ttl_secs > 24 * 3600 {
+        let (message, _) = fleet_ui::mint::err_over_ttl();
+        bail!("{message}");
+    }
+
+    let mut caps = Vec::new();
+    for raw in &allow {
+        let cap = mint_capability(raw)?;
+        if !caps.contains(&cap) {
+            caps.push(cap);
+        }
+    }
+    if is_external && caps.is_empty() {
+        bail!("external keys need at least one --allow capability");
+    }
+    if ci && audience.is_none() {
+        bail!("CI keys require --audience <paired-device>");
+    }
+    if caps.is_empty() {
+        caps.push("transfer".to_string());
+    }
+
+    let audience_name = external.or(audience);
+    let audience = audience_name
+        .map(|name| {
+            device_cert_for(&name)
+                .map(|cert| hex::encode(cert.device_pub))
+                .ok_or_else(|| anyhow!("no certified paired device named '{name}'"))
+        })
+        .transpose()?;
+    let lifetime = fleet_ui::mint::Lifetime {
+        ttl: ttl_text.to_string(),
+        reuse: match reuse.as_deref().unwrap_or("once").to_ascii_lowercase().as_str() {
+            "once" => fleet_ui::mint::Reuse::Once,
+            "reusable" => fleet_ui::mint::Reuse::Reusable,
+            value if value.starts_with("n(") && value.ends_with(')') => fleet_ui::mint::Reuse::Times(value[2..value.len() - 1].parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
+            value => fleet_ui::mint::Reuse::Times(value.parse().map_err(|_| anyhow!("invalid --reuse '{value}'"))?),
+        },
+        max_ttl: if ci { "15m".to_string() } else { "24h".to_string() },
+    };
+    let mint_caps = fleet_ui::mint::MintCaps {
+        shell: caps.iter().any(|cap| cap == "shell"),
+        write: caps.iter().any(|cap| cap == "mount"),
+        all_ports: caps.iter().any(|cap| cap == "all-ports"),
+    };
+    eprintln!("{}", fleet_ui::mint::render_header());
+    eprintln!("{}", fleet_ui::mint::render_summary(key_type, &mint_caps));
+    eprintln!("{}", fleet_ui::mint::render_lifetime(&lifetime));
+
+    ephemeral_cmd(
+        server,
+        EphemeralAction::Mint {
+            caps,
+            audience: audience.into_iter().collect(),
+            ttl: ttl_secs,
+            reuse: match lifetime.reuse {
+                fleet_ui::mint::Reuse::Once => "Once".to_string(),
+                fleet_ui::mint::Reuse::Times(n) => format!("N({n})"),
+                fleet_ui::mint::Reuse::Reusable => "Reusable".to_string(),
+            },
+            tag: if ci { "ci".to_string() } else if is_external { "external".to_string() } else { "fleet".to_string() },
+        },
+        relay,
+    )
+    .await
 }
 
 /// CLI handler for `filament ephemeral`
@@ -4233,6 +4649,11 @@ fn cancelled() -> anyhow::Error {
 }
 
 async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
+    if code.is_none() && word.is_none() && !interactive_allowed() {
+        let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
+        eprintln!("{message}");
+        std::process::exit(exit_code);
+    }
     // INTERACTIVE GATE (scripts safe by default, see `interactive_allowed`).
     //   * `pair` with no code AND no --word -> guided CREATE entry. Empty submit
     //     falls back to today's auto-mint; typed words become the chosen password.
@@ -4468,7 +4889,21 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         }
                     }
                 } else {
+                let same_person = peer_identity_cert
+                    .as_ref()
+                    .and_then(|cert| load_owner_key().map(|owner| owner.public_key_bytes() == cert.user_pub))
+                    .unwrap_or(false);
+                // External pairs currently receive only the baseline transfer
+                // capability. Do not render render_someone_else_banner or
+                // render_inter_user_form: pair has no bounded per-cap grant
+                // contract, so those surfaces would claim choices it ignores.
+                // Do not render render_pake_words: the pair code is not a
+                // transcript-derived SAS; showing it as trust would invert the
+                // MITM check. A real SAS belongs in the crypto gate.
                 // Fail-closed: check BEFORE any write if peer previously had identity and now does NOT expose
+                if same_person {
+                    ui::say(&fleet_ui::pair_ui::render_same_person_banner(&n));
+                }
                 if peer_identity_cert.is_none() {
                     let p = devices_path();
                     if let Ok(raw) = std::fs::read_to_string(&p) {
@@ -4492,12 +4927,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     store_provisional_identity(&n, pcert)
                         .context("store provisional")?;
                 }
-                ui::say(&format!(
-                    "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
-                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                    ui::paint(ui::Tone::Bold, &n),
-                ));
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                if same_person {
+                    ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
+                } else {
+                    ui::say(&format!(
+                        "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        ui::paint(ui::Tone::Bold, &n),
+                    ));
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                }
                 tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
                 let _ = sio.disconnect().await;
                 return Ok(());                } // close identity_exchange_window else
@@ -7816,6 +8255,7 @@ async fn handle_warm_req(
         ctl::ReqKind::ListMounts => req.reject("list-mounts not handled here").await,
         ctl::ReqKind::MountHealth { .. } => req.reject("mount-health not handled here").await,
         ctl::ReqKind::CapStatus => req.reject("cap-status not handled here").await,
+        ctl::ReqKind::ListWarm => req.reject("list-warm not handled here").await,
         ctl::ReqKind::ListPending => req.reject("list-pending not handled here").await,
         ctl::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
         ctl::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
@@ -8107,6 +8547,31 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     req.reply(&reply).await;
 }
 
+/// Return only links the daemon already holds. This is deliberately passive:
+/// devices listing must never establish, ping, or otherwise wake a peer.
+#[cfg(unix)]
+async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
+    let links: Vec<Value> = conn.links.iter().filter_map(|(pid, link)| {
+        let name = link.verified_name.as_deref()?;
+        let transport = link.transport.as_ref()?;
+        if !link.trusted || !transport.is_alive() {
+            return None;
+        }
+        Some(json!({
+            "name": name,
+            "warm": true,
+            "direct": link.direct,
+            "route": if link.direct { link.direct_route } else { "relay" },
+            "remote_addr": transport.remote_addr().map(|a| a.to_string()),
+            "rtt_ms": transport.rtt_ms(),
+            "verified": name,
+            "path": Value::Null,
+            "pid": pid,
+        }))
+    }).collect();
+    req.reply(&json!({ "ok": true, "links": links })).await;
+}
+
 #[cfg(unix)]
 /// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
 /// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
@@ -8346,6 +8811,95 @@ fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
     pending.retain(|_, waiters| !waiters.is_empty());
 }
 
+/// Classification result for the bare-argument comfort router. Pure data, no side
+/// effects: the caller owns the argv rewrite and the user-visible error.
+#[derive(Debug, PartialEq, Eq)]
+enum BareTarget {
+    /// `help` is not a real subcommand on the un-built clap command, so rewrite
+    /// to `--help`.
+    Help,
+    /// An existing local path: `send <path> --code`.
+    Send,
+    /// A 4-digit nameplate looks like a pairing code (preserved muscle memory).
+    Pair,
+    /// A 2-3 digit nameplate looks like a legacy transfer code.
+    Recv,
+    /// `device:port` -> forward local-port device remote-port.
+    Forward { lport: String, peer: String, rport: String },
+    /// `device.mesh` or `device.mesh:port` -> reach.
+    Reach(String),
+    /// A bare known device name -> shell.
+    Shell,
+    /// The token is both a file and a device name; refuse to pick a side.
+    AmbiguousFileDevice,
+    /// Nothing recognized; the caller should print the did-you-mean path.
+    Unknown,
+}
+
+/// Pure classification for the bare-argument router. All environment access is
+/// injected through the closures so tests can pass fakes. The function does NOT
+/// touch capabilities, prompts, or authorizations: it is a router only.
+fn classify_bare_token(
+    token: &str,
+    file_exists: &dyn Fn(&str) -> bool,
+    is_known_device: &dyn Fn(&str) -> bool,
+) -> BareTarget {
+    if token == "help" {
+        return BareTarget::Help;
+    }
+    // Preserve the existing path-first behavior, except when the same bare name
+    // is also a known device. A code-shaped filename is still a filename here.
+    let is_file = file_exists(token);
+    let is_device = is_known_device(token);
+    if is_file && is_device {
+        return BareTarget::AmbiguousFileDevice;
+    }
+    if is_file {
+        return BareTarget::Send;
+    }
+    // 4-digit nameplates are the pairing-code shape; keep routing them to `pair`
+    // because that is the long-standing bare-code behavior.
+    if looks_like_pake_code(token) {
+        return BareTarget::Pair;
+    }
+    // 2-3 digit nameplates are the legacy one-time transfer-code shape.
+    if regex_lite_code(token) {
+        return BareTarget::Recv;
+    }
+    // `device:port` -> forward (same port locally and remotely). The device part
+    // must be a known petname and the port must parse as a u16. If either fails,
+    // fall through to the did-you-mean path; do not guess.
+    if let Some((dev, port_str)) = token.rsplit_once(':') {
+        if !dev.is_empty()
+            && port_str.parse::<u16>().is_ok()
+            && is_known_device(dev)
+        {
+            let port = port_str.to_string();
+            return BareTarget::Forward {
+                lport: port.clone(),
+                peer: dev.to_string(),
+                rport: port,
+            };
+        }
+    }
+    // `device.mesh` or `device.mesh:port` -> reach. The reach command validates
+    // the address and reports unknown peers, so do not require a local petname
+    // here. Mesh addresses are not limited to the current device index.
+    if token.ends_with(".mesh")
+        || token
+            .split_once(".mesh:")
+            .is_some_and(|(dev, port)| !dev.is_empty() && !port.is_empty())
+    {
+        return BareTarget::Reach(token.to_string());
+    }
+    // A non-file known device opens a PTY. The router never escalates privilege,
+    // so the command path remains responsible for capability checks.
+    if is_device {
+        return BareTarget::Shell;
+    }
+    BareTarget::Unknown
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // F2: both ring (webrtc) and aws-lc (reqwest) end up in the dep tree;
@@ -8374,61 +8928,113 @@ async fn main() -> Result<()> {
             s
         };
         if !first.starts_with('-') && !cmd_names.contains(first.as_str()) {
-            if first == "help" {
-                // `help` / `help <sub>` as an alias for `--help`. clap's built-in
-                // `help` subcommand is not surfaced by `get_subcommands()` on the
-                // un-built command, so it never lands in `cmd_names` and the
-                // unknown-token guard below would otherwise reject it. Rewrite it
-                // to the long-help flag: `help` -> `--help`, `help ssh` ->
-                // `ssh --help`.
-                argv.remove(1); // drop the "help" token
-                argv.push("--help".into());
-            } else if std::path::Path::new(first).exists() {
-                argv.insert(1, "send".into());
-                argv.push("--code".into());
-            } else if looks_like_pake_code(first) {
-                // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
-                // the SAME ephemeral SPAKE2 ceremony whether the verb is `pair`
-                // or `recv`; a bare code is ambiguous. We keep routing it to
-                // `pair` (the long-standing bare-code behavior, 4-digit codes
-                // were always pairing codes), so existing muscle memory is
-                // preserved. To RECEIVE a transfer code, run `filament recv
-                // <code>` explicitly (the `send --code` output prints exactly
-                // that hint), or `filament pair <code>` to remember the device.
-                argv.insert(1, "pair".into());
-            } else if regex_lite_code(first) {
-                // A legacy `word-word-NNN` (2-3 digit) transfer code from an old
-                // sender, receive it (no v2 ceremony; the recv path fails loudly
-                // if the peer can't run the handshake).
-                argv.insert(1, "recv".into());
-            } else if devices_load().iter().any(|(n, _)| n == first) {
-                // Bare device name = shell in. `filament dovm` opens an interactive
-                // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
-                // (no sshd needed; the PTY protocol handles it).
-                argv.insert(1, "pty".into());
-            } else {
-                // Not a command, path, code, or paired device. Give a filament-native
-                // error with a did-you-mean over BOTH commands and device names,
-                // instead of clap's bare "unrecognized subcommand" (smart errors).
-                let first = first.clone();
-                let mut cands: Vec<String> = cmd_names.iter().cloned().collect();
-                cands.extend(devices_load().into_iter().map(|(n, _)| n));
-                let hint = cands
-                    .iter()
-                    .map(|c| (settings::levenshtein(&first, c), c))
-                    .filter(|(d, _)| *d <= 2)
-                    .min_by_key(|(d, _)| *d)
-                    .map(|(_, c)| c.clone());
-                eprintln!("filament: unknown command or device '{first}'");
-                if first == "init" {
-                    // There is no top-level `init`; the user almost certainly
-                    // wants to create the user identity key.
-                    eprintln!("  did you mean `filament identity init`?");
-                } else if let Some(h) = hint {
-                    eprintln!("  did you mean '{h}'?");
+            // The router is pure argv transformation: it never escalates
+            // privilege, prompts, or mutates capability state. It only decides what
+            // a bare token most likely means; the actual command enforces grants.
+            let first = first.clone();
+            match classify_bare_token(
+                &first,
+                &|t| std::path::Path::new(t).exists(),
+                &|t| devices_load().iter().any(|(n, _)| n == t),
+            ) {
+                BareTarget::Help => {
+                    // `help` / `help <sub>` as an alias for `--help`. clap's built-in
+                    // `help` subcommand is not surfaced by `get_subcommands()` on the
+                    // un-built command, so it never lands in `cmd_names` and the
+                    // unknown-token guard would otherwise reject it. Rewrite it
+                    // to the long-help flag: `help` -> `--help`, `help ssh` ->
+                    // `ssh --help`.
+                    argv.remove(1); // drop the "help" token
+                    argv.push("--help".into());
                 }
-                eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
-                std::process::exit(2);
+                BareTarget::Send => {
+                    // `filament <path>` mints a one-time code so the other side can
+                    // claim it without having been paired first.
+                    argv.insert(1, "send".into());
+                    argv.push("--code".into());
+                }
+                BareTarget::Pair => {
+                    // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
+                    // the SAME ephemeral SPAKE2 ceremony whether the verb is `pair`
+                    // or `recv`; a bare code is ambiguous. We keep routing it to
+                    // `pair` (the long-standing bare-code behavior, 4-digit codes
+                    // were always pairing codes), so existing muscle memory is
+                    // preserved. To RECEIVE a transfer code, run `filament recv
+                    // <code>` explicitly (the `send --code` output prints exactly
+                    // that hint), or `filament pair <code>` to remember the device.
+                    argv.insert(1, "pair".into());
+                }
+                BareTarget::Recv => {
+                    // A legacy `word-word-NNN` (2-3 digit) transfer code from an old
+                    // sender, receive it (no v2 ceremony; the recv path fails loudly
+                    // if the peer can't run the handshake).
+                    argv.insert(1, "recv".into());
+                }
+                BareTarget::Forward { lport, peer, rport } => {
+                    // `filament device:port` -> `filament forward lport peer rport`.
+                    // The local and remote ports are the same number.
+                    argv.remove(1);
+                    argv.insert(1, "forward".into());
+                    argv.insert(2, lport);
+                    argv.insert(3, peer);
+                    argv.insert(4, rport);
+                }
+                BareTarget::Reach(dev_port) => {
+                    // `filament device.mesh` or `filament device.mesh:port` ->
+                    // `filament reach <device>.mesh[:port]`.
+                    argv.remove(1);
+                    argv.insert(1, "reach".into());
+                    argv.insert(2, dev_port);
+                }
+                BareTarget::Shell => {
+                    // Bare device name = shell in. `filament dovm` opens an interactive
+                    // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
+                    // (no sshd needed; the PTY protocol handles it).
+                    argv.insert(1, "shell".into());
+                }
+                BareTarget::AmbiguousFileDevice => {
+                    // The token is both a file and a known device. Refuse to guess
+                    // which the user meant; naming both readings lets them pick.
+                    let send_cmd = format!("filament send {first}");
+                    let shell_cmd = format!("filament shell {first}");
+                    let width = send_cmd.len().max(shell_cmd.len());
+                    eprintln!(
+                        "{} \"{first}\" is both a file here and a device you know. Say which:",
+                        ui::paint(ui::Tone::Err, ui::glyph_err())
+                    );
+                    eprintln!(
+                        "  {}  send the file",
+                        ui::paint(ui::Tone::Dim, &format!("{send_cmd:width$}"))
+                    );
+                    eprintln!(
+                        "  {}  open a shell on the device",
+                        ui::paint(ui::Tone::Dim, &format!("{shell_cmd:width$}"))
+                    );
+                    std::process::exit(2);
+                }
+                BareTarget::Unknown => {
+                    // Not a command, path, code, or paired device. Give a filament-native
+                    // error with a did-you-mean over BOTH commands and device names,
+                    // instead of clap's bare "unrecognized subcommand" (smart errors).
+                    let mut cands: Vec<String> = cmd_names.iter().cloned().collect();
+                    cands.extend(devices_load().into_iter().map(|(n, _)| n));
+                    let hint = cands
+                        .iter()
+                        .map(|c| (settings::levenshtein(&first, c), c))
+                        .filter(|(d, _)| *d <= 2)
+                        .min_by_key(|(d, _)| *d)
+                        .map(|(_, c)| c.clone());
+                    eprintln!("filament: unknown command or device '{first}'");
+                    if first == "init" {
+                        // There is no top-level `init`; the user almost certainly
+                        // wants to create the user identity key.
+                        eprintln!("  did you mean `filament identity init`?");
+                    } else if let Some(h) = hint {
+                        eprintln!("  did you mean '{h}'?");
+                    }
+                    eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
+                    std::process::exit(2);
+                }
             }
         }
     }
@@ -8697,28 +9303,13 @@ async fn main() -> Result<()> {
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&arr)?);
                     } else {
-                        if all.is_empty() {
-                            println!("no known devices yet, run `filament pair` to add one");
-                        } else {
-                            let mut table = ui::Table::new(&["NAME", "ADDRESS", "GRANTED", "LAST SEEN"]);
-                            for (n, _) in &all {
-                                let (last_seen, v6, v4) = devices_info(n).unwrap_or((0, None, None));
-                                let addr = v6.as_deref().or(v4.as_deref()).unwrap_or("-");
-                                let caps = device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]);
-                                let last_seen_str = if last_seen == 0 {
-                                    "never".to_string()
-                                } else {
-                                    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                                    let ago = now.saturating_sub(last_seen);
-                                    if ago < 60 { "just now".to_string() }
-                                    else if ago < 3600 { format!("{}m ago", ago / 60) }
-                                    else if ago < 86400 { format!("{}h ago", ago / 3600) }
-                                    else { format!("{}d ago", ago / 86400) }
-                                };
-                                table.row(&[n, addr, &caps.join(", "), &last_seen_str]);
-                            }
-                            table.print();
-                        }
+                        let warm = ctl::try_list_warm().await;
+                        let pending = ctl::try_list_pending().await;
+                        let rendered = fleet_ui::devices::render_devices(
+                            &device_entries(warm.as_ref()),
+                            pending_request_count(pending.as_ref()),
+                        );
+                        println!("{rendered}");
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
@@ -8834,6 +9425,7 @@ async fn main() -> Result<()> {
             doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
+            let capability = crate::capability::canonical_capability(&capability)?;
             let config_dir = crate::settings::config_dir();
             let mut store = crate::capability::load_cap_store(&config_dir);
 
@@ -8865,7 +9457,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             // Original device grant path (unchanged)
-            device_set_cap(&device, &capability, true)?;
+            device_set_cap(&device, &capability, true, None)?;
             // If identity layer is active, also issue an owner-signed CapOp
             if let Ok(Some(user_key)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                 let config_dir = crate::settings::config_dir();
@@ -8984,9 +9576,27 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Revoke { device, capability } => {
+        Cmd::Revoke { device, capability, certificate } => {
+            if certificate {
+                if capability.is_some() {
+                    bail!("choose either a capability or --certificate, not both");
+                }
+                ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
+                let cert = device_cert_for(&device)
+                    .ok_or_else(|| anyhow!("device '{device}' has no stored fleet certificate"))?;
+                let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
+                if cert.user_pub != owner.public_key_bytes() {
+                    bail!("device '{device}' certificate is not chained to this user identity");
+                }
+                set_device_cert_revoked(&device, true)?;
+                println!("revoked fleet certificate from '{device}'; fleet access is denied locally");
+                return Ok(());
+            }
+            let capability = capability
+                .ok_or_else(|| anyhow!("capability is required unless --certificate is set"))?;
+            let capability = crate::capability::canonical_capability(&capability)?;
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
-            device_set_cap(&device, &capability, false)?;
+            device_set_cap(&device, &capability, false, None)?;
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so
             // the AUTHORITATIVE capability gate actually denies. The legacy
             // device_set_cap(false) only clears devices.json; it leaves the cap
@@ -9073,9 +9683,17 @@ async fn main() -> Result<()> {
             }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
-                println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
+                if device_cert_for(&device).is_some() {
+                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
+                } else {
+                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
+                }
             } else {
-                println!("revoked '{capability}' from '{device}'.");
+                if device_cert_for(&device).is_some() {
+                    println!("revoked '{capability}' from '{device}'; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
+                } else {
+                    println!("revoked '{capability}' from '{device}'.");
+                }
             }
             Ok(())
         }
@@ -9160,6 +9778,9 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Mint { fleet, external, ci, ttl, reuse, allow, audience, yes } => {
+            mint_cmd(&server, fleet, external, ci, ttl, reuse, allow, audience, yes, relay).await
+        }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
@@ -11988,6 +12609,8 @@ async fn recv_cmd(
                                 "flip_ready": counts.flip_ready(),
                                 "summary": counts.summary(),
                             })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
+                            handle_list_warm(&conn, req).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListPending) {
                             let mut requests = load_requests();
                             expire_requests(&mut requests);
@@ -11995,20 +12618,29 @@ async fn recv_cmd(
                                 "ok": true,
                                 "requests": requests,
                             })).await;
-                        } else if let ctl::ReqKind::ApproveRequest { id } = &req.kind {
+                        } else if let ctl::ReqKind::ApproveRequest { id, allow, expires } = &req.kind {
                             let id = *id;
+                            let allow = allow.clone();
+                            let expires = *expires;
                             let mut requests = load_requests();
                             expire_requests(&mut requests);
                             if let Some(r) = requests.iter_mut().find(|r| r.id == id && r.status == "pending") {
-                                r.status = "approved".to_string();
-                                r.granted_at = Some(crate::capability::now_secs());
                                 let peer = r.peer.clone();
                                 let cap = r.capability.clone();
-                                save_requests(&requests);
-                                // Route through the existing grant path
-                                if let Err(e) = device_set_cap(&peer, &cap, true) {
+                                if cap != allow {
+                                    req.reject(&format!("request {id} is for '{cap}', not '{allow}'")).await;
+                                } else if !crate::capability::grant_active(expires, crate::capability::now_secs()) {
+                                    req.reject("grant expiry must be in the future").await;
+                                } else if let Err(e) = device_set_cap(&peer, &cap, true, Some(expires)) {
                                     req.reject(&format!("grant failed: {e}")).await;
+                                } else if let Err(e) = issue_signed_bounded_grant(&peer, &cap, expires).and_then(|signed| {
+                                    if signed { mark_bounded_cap_source(&peer, &cap, "signed") } else { Ok(()) }
+                                }) {
+                                    req.reject(&format!("signed grant failed: {e}")).await;
                                 } else {
+                                    r.status = "approved".to_string();
+                                    r.granted_at = Some(crate::capability::now_secs());
+                                    save_requests(&requests);
                                     req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap })).await;
                                 }
                             } else {
@@ -13316,11 +13948,12 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "shell",
+                            crate::capability::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
@@ -13333,9 +13966,9 @@ async fn recv_cmd(
                         let scoped_in_bounds = reach_port != 0
                             && crate::expose::load().iter().any(|b| b.port == reach_port);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
+                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant, cert_revoked);
                         if let crate::capability::GateDecision::Deny { cap_reason: Some(r) } = &d {
                             l2_deny_reason = Some(r.clone());
                         }
@@ -13476,23 +14109,24 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "shell",
+                             crate::capability::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         {
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
                         // Deliberate tier: `shell` is never a scoped default, so a
                         // same-owner device gets it ONLY via an explicit grant
                         // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant, cert_revoked)
                         }
                     };
                     if !granted.allowed() {
@@ -13591,23 +14225,24 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "shell",
+                            crate::capability::CAP_SHELL,
                             idev,
                             iusr,
                             ak_caps,
                         );
                         {
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "shell", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_SHELL, idev, iusr, ak_caps,
                         );
                         // Deliberate tier: `shell` is never a scoped default, so a
                         // same-owner device gets it ONLY via an explicit grant
                         // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                        crate::capability::cap_gate_effective(legacy_ok, &outcome, "shell", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant)
+                        crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_SHELL, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), false, has_grant, cert_revoked)
                         }
                     };
                     if !granted.allowed() {
@@ -13760,11 +14395,12 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "mount",
+                            crate::capability::CAP_MOUNT,
                             idev,
                             iusr,
                             ak_caps,
@@ -13782,7 +14418,7 @@ async fn recv_cmd(
                         // = within_share). An auto-trusted fleet mount is served
                         // READ-ONLY; an explicit `mount` grant keeps its rw behavior.
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "mount", idev, iusr, ak_caps,
+                            &crate::settings::config_dir(), "self", crate::capability::CAP_MOUNT, idev, iusr, ak_caps,
                         );
                         let same_owner = match (iusr, own_user.as_ref()) {
                             (Some(u), Some(o)) => u == o,
@@ -13805,7 +14441,7 @@ async fn recv_cmd(
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
-                        let d = crate::capability::cap_gate_effective(trusted, &outcome, "mount", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant);
+                         let d = crate::capability::cap_gate_effective(trusted, &outcome, crate::capability::CAP_MOUNT, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), mount_scoped_default, has_grant, cert_revoked);
                         (d, read_only)
                     };
                     if !authorized.allowed() {
@@ -14354,7 +14990,7 @@ async fn recv_cmd(
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
                             "self",
-                            "transfer",
+                            crate::capability::CAP_TRANSFER,
                             idev,
                             iusr,
                             ak_caps,
@@ -14380,12 +15016,13 @@ async fn recv_cmd(
                         // could still redirect the write — closed separately by the
                         // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
                         // a fleet-trust follow-up.
+                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(), "self", "transfer", idev, iusr, ak_caps,
+                             &crate::settings::config_dir(), "self", crate::capability::CAP_TRANSFER, idev, iusr, ak_caps,
                         );
-                        let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, "transfer", "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant);
+                         let d = crate::capability::cap_gate_effective(legacy_ok, &outcome, crate::capability::CAP_TRANSFER, "self", idev, iusr, binding, expires, ak_caps, own_user.as_ref(), scoped_in_bounds, has_grant, cert_revoked);
                         let reason = if let crate::capability::GateDecision::Deny { cap_reason } = &d {
                             cap_reason.clone()
                         } else {
@@ -15579,6 +16216,7 @@ mod tests {
                 {"name": "empty",   "secret": sec, "v": 2, "caps": []},
                 {"name": "xfer",    "secret": sec, "v": 2, "caps": ["transfer"]},
                 {"name": "execcap", "secret": sec, "v": 2, "caps": ["transfer", "remote-exec"]},
+                {"name": "legacy-inbox", "secret": sec, "v": 2, "caps": ["inbox"]},
                 {"name": "legacy",  "secret": sec}  // v1 record: reads as ["transfer"]
             ]))
             .unwrap(),
@@ -15591,6 +16229,16 @@ mod tests {
         // A v1 record reads as caps:["transfer"] (back-compat, spec §8).
         assert_eq!(device_caps_at(&p, "legacy"), Some(vec!["transfer".to_string()]));
         assert!(device_allows_at(&p, "legacy", "transfer"));
+        // Legacy UX labels remain readable; validation only applies at writes.
+        assert_eq!(device_caps_at(&p, "legacy-inbox"), Some(vec!["inbox".to_string()]));
+        for capability in crate::capability::CANONICAL_CAPABILITIES {
+            assert_eq!(
+                device_allows_at(&p, "legacy-inbox", capability),
+                device_allows_at(&p, "empty", capability),
+                "stale label 'inbox' must confer nothing beyond an empty record"
+            );
+        }
+        assert!(!device_allows_at(&p, "legacy-inbox", "shell"), "legacy inbox label must not authorize shell");
         // Deny-by-default: a gated future cap is REFUSED unless explicitly granted.
         assert!(!device_allows_at(&p, "empty", "remote-exec"), "empty caps must deny remote-exec");
         assert!(!device_allows_at(&p, "xfer", "remote-exec"), "transfer-only must deny remote-exec");
@@ -16260,5 +16908,144 @@ mod tests {
             assert!(allowed.contains(key.as_str()),
                 "unexpected device store field '{key}' — is a Link field leaking?");
         }
+    }
+
+    #[test]
+    fn legacy_bounded_cap_is_denied_after_expiry() {
+        let path = std::env::temp_dir().join(format!("filament-bounded-cap-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!([{
+            "name": "peer", "caps": ["transfer", "shell"],
+            "capExpires": {"shell": 10}
+        }])).unwrap()).unwrap();
+        assert!(device_caps_at_time(&path, "peer", 9).unwrap().contains(&"shell".to_string()));
+        assert!(!device_caps_at_time(&path, "peer", 10).unwrap().contains(&"shell".to_string()));
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ------------------------------------------------- bare-arg router tests --
+
+    /// Bare existing path routes to `send <path> --code`.
+    #[test]
+    fn bare_existing_path_is_send() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token(
+                "report.pdf",
+                &|_| true,
+                &|t| known.contains(t),
+            ),
+            BareTarget::Send
+        );
+    }
+
+    #[test]
+    fn code_shaped_existing_path_stays_send() {
+        let known = std::collections::HashSet::<String>::new();
+        assert_eq!(
+            classify_bare_token("clever-lynx-1234", &|_| true, &|t| known.contains(t)),
+            BareTarget::Send
+        );
+    }
+
+    /// 4-digit nameplates stay pairing codes; 2-3 digit nameplates stay legacy
+    /// transfer codes. Collapsing both to `recv` would break this test.
+    #[test]
+    fn bare_code_width_decides_pair_vs_recv() {
+        let known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            classify_bare_token("clever-lynx-1234", &|_| false, &|t| known.contains(t)),
+            BareTarget::Pair
+        );
+        assert_eq!(
+            classify_bare_token("clever-lynx-123", &|_| false, &|t| known.contains(t)),
+            BareTarget::Recv
+        );
+        assert_eq!(
+            classify_bare_token("clever-lynx-12", &|_| false, &|t| known.contains(t)),
+            BareTarget::Recv
+        );
+    }
+
+    /// A bare known device name routes to pty.
+    #[test]
+    fn bare_known_device_is_shell() {
+        let known: std::collections::HashSet<String> = ["dovm"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("dovm", &|_| false, &|t| known.contains(t)),
+            BareTarget::Shell
+        );
+    }
+
+    /// `device:port` routes to forward, using the same port locally and remotely.
+    #[test]
+    fn device_colon_port_is_forward() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("laptop:5432", &|_| false, &|t| known.contains(t)),
+            BareTarget::Forward {
+                lport: "5432".into(),
+                peer: "laptop".into(),
+                rport: "5432".into(),
+            }
+        );
+    }
+
+    /// The forward rewrite produces the exact argv shape the `Forward` subcommand
+    /// expects: `filament forward <lport> <peer> <rport>`.
+    #[test]
+    fn forward_rewrite_argv_shape() {
+        let mut argv: Vec<String> = vec!["filament".into(), "laptop:5432".into()];
+        argv.remove(1);
+        argv.insert(1, "forward".into());
+        argv.insert(2, "5432".into());
+        argv.insert(3, "laptop".into());
+        argv.insert(4, "5432".into());
+        assert_eq!(argv, vec!["filament", "forward", "5432", "laptop", "5432"]);
+    }
+
+    /// A malformed port after the colon must NOT be treated as a forward.
+    #[test]
+    fn device_colon_notaport_is_not_forward() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        let t = classify_bare_token("laptop:notaport", &|_| false, &|t| known.contains(t));
+        assert!(
+            !matches!(t, BareTarget::Forward { .. }),
+            "laptop:notaport must not classify as forward, got {t:?}"
+        );
+    }
+
+    /// `device.mesh:port` routes to reach.
+    #[test]
+    fn device_mesh_port_is_reach() {
+        let known = std::collections::HashSet::<String>::new();
+        assert_eq!(
+            classify_bare_token("gpu.mesh:8080", &|_| false, &|t| known.contains(t)),
+            BareTarget::Reach("gpu.mesh:8080".into())
+        );
+        assert_eq!(
+            classify_bare_token("gpu.mesh", &|_| false, &|t| known.contains(t)),
+            BareTarget::Reach("gpu.mesh".into())
+        );
+    }
+
+    /// A bare token that is BOTH a file and a known device is ambiguous. The
+    /// router must refuse to pick a side instead of defaulting to send.
+    #[test]
+    fn file_and_device_is_ambiguous() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("laptop", &|_| true, &|t| known.contains(t)),
+            BareTarget::AmbiguousFileDevice
+        );
+    }
+
+    /// An unrecognized token reaches the did-you-mean path.
+    #[test]
+    fn unknown_token_is_unknown() {
+        let known: std::collections::HashSet<String> = ["laptop"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            classify_bare_token("xyzpdq", &|_| false, &|t| known.contains(t)),
+            BareTarget::Unknown
+        );
     }
 }
