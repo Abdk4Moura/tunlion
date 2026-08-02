@@ -1655,7 +1655,9 @@ pub async fn race_connect_labeled(
 
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(quinn::Connection, SendStream, RecvStream, bool)>> + Send>>> = Vec::new();
 
-    // Acceptor side: accept inbound, then auth as acceptor.
+    // Acceptor side: accept exactly one inbound, then auth as acceptor. The
+    // deterministic winner fallback below depends on this bound; an accept
+    // loop requires a new selection rule.
     {
         let ep = endpoint.clone();
         let tkey = tkey;
