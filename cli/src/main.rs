@@ -3334,7 +3334,7 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
 
         match ev {
             Ev::Welcome(v) => {
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, false).await?;
@@ -3525,7 +3525,7 @@ async fn enroll_and_send_cmd(
                 // The owner daemon is already in the enroll room; the server hands
                 // us its roster here. Dial each peer (owner answers) so rendezvous
                 // does not depend on a later peer-joined we would otherwise miss.
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers { conn.maybe_adopt(p, true).await?; }
                 }
@@ -3751,7 +3751,7 @@ async fn enroll_and_netcat_cmd(
                 // The owner daemon is already in the enroll room; the server hands
                 // us its roster here. Dial each peer (owner answers) so rendezvous
                 // does not depend on a later peer-joined we would otherwise miss.
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers { conn.maybe_adopt(p, true).await?; }
                 }
@@ -4175,7 +4175,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         sio: sio.clone(),
         tx: tx.clone(),
         my_uid: my_uid.clone(),
-        my_id: String::new(),
+        my_id: None,
         relay_only: relay,
         to_filter: None,
         links: HashMap::new(),
@@ -4222,7 +4222,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
         match ev {
             Ev::Welcome(v) => {
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 // C30 (dissolves the C28 belt): fresh sid, re-assert via session.
                 sess.invalidate();
             }
@@ -4755,7 +4755,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         };
         match ev {
             Ev::Welcome(v) => {
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, true).await?;
@@ -5608,7 +5608,7 @@ struct Conn {
     sio: rust_socketio::asynchronous::Client,
     tx: mpsc::UnboundedSender<Ev>,
     my_uid: String,
-    my_id: String,
+    my_id: Option<String>,
     relay_only: bool,
     to_filter: Option<String>,
     links: HashMap<String, Link>,
@@ -5823,7 +5823,7 @@ impl Conn {
             sio,
             tx,
             my_uid,
-            my_id: String::new(),
+            my_id: None,
             relay_only,
             to_filter,
             links: HashMap::new(),
@@ -5928,7 +5928,7 @@ impl Conn {
         let peer_id = v["id"].as_str().unwrap_or_default().to_string();
         let peer_uid = v["uid"].as_str().map(|s| s.to_string());
         let name = v["name"].as_str().unwrap_or("peer").to_string();
-        if peer_id.is_empty() || peer_id == self.my_id {
+        if peer_id.is_empty() || self.my_id.as_deref() == Some(peer_id.as_str()) {
             return Ok(false);
         }
         // NOTE: same-install peers (our own daemon) are filtered at the
@@ -6185,13 +6185,16 @@ impl Conn {
         // every attempt, not just the first.
         let mut cfg = net::fetch_config(&self.server).await?;
         self.chunk_size = cfg.chunk_size;
+        let Some(my_id) = self.my_id.as_deref() else {
+            bail!("local session ID unavailable; deferring role election");
+        };
         let polite = match force_polite {
             Some(value) => value,
             None => match peer_uid.as_deref() {
-                Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
+                Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, my_id, &peer_id)?,
                 None => {
                     let source = if peer_present { "presence" } else { "absent-roster" };
-                    net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, source, peer_present)
+                    net::polite_role_legacy(&self.my_uid, None, my_id, &peer_id, source, peer_present)
                 },
             },
         };
@@ -6527,7 +6530,10 @@ impl Conn {
             return;
         };
         let my_uid = self.my_uid.clone();
-        let my_id = self.my_id.clone();
+        let Some(my_id) = self.my_id.clone() else {
+            eprintln!("direct role election deferred for {pid}: local session ID unavailable");
+            return;
+        };
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
             if is_probe {
                 Ev::DirectUpgradeReady(pid, t, route)
@@ -6711,8 +6717,12 @@ impl Conn {
         }
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
         let peer_present = self.roster.contains_key(pid);
+        let Some(my_id) = self.my_id.clone() else {
+            eprintln!("direct worker role election deferred for {pid}: local session ID unavailable");
+            return;
+        };
         let answerer = match peer_uid {
-            Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid) {
+            Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, my_id.as_str(), pid) {
                 Ok(value) => value,
                 Err(error) => {
                     eprintln!("direct worker role election failed for {pid}: {error}");
@@ -6721,7 +6731,7 @@ impl Conn {
             },
             None => {
                 let source = if peer_present { "presence" } else { "absent-roster" };
-                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, source, peer_present)
+                net::polite_role_legacy(&self.my_uid, None, my_id.as_str(), pid, source, peer_present)
             }
         };
         let count = k - 1;
@@ -10184,7 +10194,7 @@ async fn send_cmd(
 
         match ev {
             Ev::Welcome(v) => {
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 // P5 (GAP-6): a fresh signaling welcome (reconnect) is a moment a
                 // new direct path may have appeared, re-probe immediately for any
                 // relay-committed peer rather than waiting out the backoff.
@@ -12923,7 +12933,7 @@ async fn recv_cmd(
                 ));
             }
             Ev::Welcome(v) => {
-                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(id) = v["id"].as_str() { conn.my_id = Some(id.to_string()); }
                 // P5 (GAP-6): a fresh welcome (signaling reconnect) may mean the
                 // network just changed under us, re-probe relay-committed peers for
                 // a direct path immediately instead of waiting out the backoff.
