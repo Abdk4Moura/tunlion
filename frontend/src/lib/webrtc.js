@@ -307,11 +307,23 @@ async function blobHash(blob) {
   }
 }
 
-// Deterministic negotiation roles (#1, hardened in #8/#10): prefer the stable
-// per-tab uid, it survives reconnects, so both sides always compare the SAME
-// pair even when one of them holds a stale sid. Fall back to sids, then to
-// polite (wait for the offer) when we know nothing yet.
+// Deterministic negotiation roles: compare the same (uid, session-id) tuple on
+// both sides. Session IDs must differ whenever UIDs tie.
 export function politeRole({ myUid, peerUid, myId, peerId }) {
+  if (myUid == null || peerUid == null || myId == null || peerId == null) {
+    throw new Error('politeRole requires peer and local UIDs and session IDs')
+  }
+  if (myUid === peerUid && myId === peerId) {
+    throw new Error(`politeRole identity tuple collision: uid=${myUid} sid=${myId}`)
+  }
+  return myUid > peerUid || (myUid === peerUid && myId > peerId)
+}
+
+// Phase-1 compatibility only. An old browser may not send a UID; this path is
+// knowingly not antisymmetric against an updated peer and is instrumented for
+// removal once the additive UID rollout has completed.
+export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
+  if (peerUid == null) console.warn('politeRole: legacy missing-peer-uid path', { myUid, myId, peerId })
   if (myUid && peerUid && myUid !== peerUid) return myUid > peerUid
   if (myId && peerId) return myId > peerId
   return true

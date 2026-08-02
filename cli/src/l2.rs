@@ -1160,7 +1160,10 @@ async fn bring_up_to_known(
                     entered_establishing = true;
                 }
                 let mine = my_id.clone().unwrap_or_default();
-                let polite = net::polite_role(&my_uid, uid.as_deref(), &mine, &pid);
+                let polite = match uid.as_deref() {
+                    Some(peer_uid) => net::polite_role(&my_uid, peer_uid, &mine, &pid)?,
+                    None => net::polite_role_legacy(&my_uid, None, &mine, &pid),
+                };
                 generation += 1;
                 spawn_timer(pid.clone(), generation);
                 let p = Peer::connect(
