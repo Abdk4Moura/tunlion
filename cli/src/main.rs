@@ -17128,6 +17128,7 @@ mod tests {
             classify_bare_token("xyzpdq", &|_| false, &|t| known.contains(t)),
             BareTarget::Unknown
         );
+    }
     #[test]
     fn capability_revoke_warning_only_live_same_owner_cert() {
         let cert = identity::DeviceCert::from_json(&serde_json::json!({
