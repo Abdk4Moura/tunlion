@@ -91,7 +91,7 @@ pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
         KeyType::Fleet => {
             lines.push(can_line(true, false, "drop files in your inbox · reach your exposed ports · read ~/share"));
             if caps.shell {
-                lines.push(can_line(true, true, "open a shell — a real terminal on this machine, running as you"));
+                lines.push(can_line(true, true, "OWNER-EQUIVALENT — act as you through a shell on this machine"));
             } else {
                 lines.push(can_line(false, false, "open a shell"));
             }
@@ -139,13 +139,13 @@ pub fn render_deliberate_access(caps: &MintCaps, pending_token: Option<&str>) ->
 
     let shell_row = if caps.shell {
         format!(
-            "  │  {} open a shell          type {} to keep it on:  [ {}▌ ]",
+            "  │  {} OWNER-EQUIVALENT shell  type {} to keep it on:  [ {}▌ ]",
             ui::paint(Tone::Warn, "[x]"),
             ui::paint(Tone::Warn, "SHELL"),
             pending_token.unwrap_or("")
         )
     } else {
-        "  │  [ ] open a shell          a real terminal on this machine, running as you".to_string()
+        "  │  [ ] OWNER-EQUIVALENT shell  a real terminal on this machine, running as you".to_string()
     };
 
     let write_row = if caps.write {
@@ -208,7 +208,9 @@ pub fn render_completion(code: &str, key_type: KeyType, caps: &MintCaps, lifetim
         KeyType::CI => ui::paint(Tone::Dim, "CI key"),
     };
 
-    let caps_str = format!(" · {}", emitted_capabilities(caps).join(", "));
+    let caps_str = format!(" · {}", emitted_capabilities(caps).into_iter().map(|cap| {
+        if cap == "shell" { "OWNER-EQUIVALENT shell (can act as you)" } else { cap }
+    }).collect::<Vec<_>>().join(", "));
 
     let reuse_str = match &lifetime.reuse {
         Reuse::Once => "once",
@@ -333,7 +335,7 @@ mod tests {
         let caps = MintCaps { shell: true, write: false, all_ports: false };
         let summary = render_summary(KeyType::Fleet, &caps);
         // Shell is deliberate, so should show ⚠ glyph
-        assert!(summary.contains("open a shell — a real terminal"), "shell-on must show deliberate description");
+        assert!(summary.contains("OWNER-EQUIVALENT"), "shell-on must show owner-equivalent warning");
     }
 
     #[test]

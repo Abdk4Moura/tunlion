@@ -86,7 +86,7 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
 fn capability_label(capability: &str) -> &str {
     match capability {
         "transfer" => "send you files",
-        "shell" => "open a shell",
+        "shell" => "OWNER-EQUIVALENT shell",
         "mount" => "write to mounted dirs",
         "all-ports" => "reach ALL ports",
         other => other,
@@ -95,7 +95,7 @@ fn capability_label(capability: &str) -> &str {
 
 fn deliberate_explanation(capability: &str) -> &str {
     match capability {
-        "shell" => "this is deliberate access — a real terminal on this machine",
+        "shell" => "this is deliberate access, owner-equivalent: a real terminal that can act as you on this machine",
         "mount" => "this is deliberate access — can change or delete your files",
         "all-ports" => "this is deliberate access — reaches ports beyond those exposed",
         _ => "this is deliberate access",
@@ -109,8 +109,13 @@ pub fn render_empty() -> String {
 
 /// Render the approve guard for deliberate access.
 pub fn render_approve_guard(request_id: u64, cap: &str) -> String {
+    let label = if cap == "shell" {
+        "OWNER-EQUIVALENT shell (can act as you)"
+    } else {
+        cap
+    };
     format!(
-        "{err} request {request_id} asks for {cap} — deliberate access. Name it and bound it:\n  {fix}",
+        "{err} request {request_id} asks for {label} — deliberate access. Name it and bound it:\n  {fix}",
         err = ui::paint(Tone::Err, ui::glyph_err()),
         fix = format!("filament requests approve {request_id}"),
     )
@@ -118,8 +123,13 @@ pub fn render_approve_guard(request_id: u64, cap: &str) -> String {
 
 /// Render the approve success message.
 pub fn render_approve_success(peer_name: &str, cap: &str, expiry: &str) -> String {
+    let label = if cap == "shell" {
+        "act as you through a shell (OWNER-EQUIVALENT)"
+    } else {
+        cap
+    };
     format!(
-        "{ok} {peer_name} can {cap} until {expiry}.",
+        "{ok} {peer_name} can {label} until {expiry}.",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
     )
 }

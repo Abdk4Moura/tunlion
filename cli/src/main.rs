@@ -3250,7 +3250,7 @@ fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> 
         let label = match (tier, cap.as_str()) {
             (fleet_ui::devices::DeviceTier::External, "transfer") => "send→you",
             (_, "transfer") => "inbox",
-            (_, "shell") => "shell",
+            (_, "shell") => "OWNER-EQUIVALENT shell",
             (_, "mount") => "mount",
             (_, "send") => "send→you",
             (_, "read") => "read ~/share",
@@ -3265,6 +3265,16 @@ fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> 
     } else {
         labels.join(" ")
     }
+}
+
+fn capability_list_summary(caps: &[String]) -> String {
+    caps.iter()
+        .map(|cap| match cap.as_str() {
+            "shell" => "OWNER-EQUIVALENT shell (can act as you)".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
@@ -3581,9 +3591,9 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
 
-    ui::say(&format!("{} auth key loaded (caps: {:?}, issuer: {})",
+    ui::say(&format!("{} auth key loaded (caps: {}, issuer: {})",
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        capability_list_summary(&ak.caps),
         hex::encode(&ak.issuer[..4])));
 
     let my_uid = mk_uid("e");
@@ -3802,9 +3812,9 @@ async fn enroll_and_send_cmd(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
 
-    ui::say(&format!("  {} enrolling as delegated (caps: {:?})",
+    ui::say(&format!("  {} enrolling as delegated (caps: {})",
         ui::paint(ui::Tone::Dim, "->"),
-        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+        capability_list_summary(&ak.caps)));
 
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let my_uid = mk_uid("a");
@@ -4050,9 +4060,9 @@ async fn enroll_and_netcat_cmd(
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
 
-    ui::say(&format!("  {} enrolling as delegated (caps: {:?})",
+    ui::say(&format!("  {} enrolling as delegated (caps: {})",
         ui::paint(ui::Tone::Dim, "->"),
-        ak.caps.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+        capability_list_summary(&ak.caps)));
 
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
     let my_uid = mk_uid("n");
@@ -4365,9 +4375,9 @@ async fn handle_auth_key_enroll_response(
                 "device_pub": hex::encode(device_pub),
                 "expires": ak.expires
             })).await;
-            ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {:?})",
+            ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                ak.caps));
+                capability_list_summary(&ak.caps)));
         }
         Err(e) => {
             ui::debug(&format!("enroll response verify failed: {e}"));
@@ -9605,7 +9615,7 @@ async fn main() -> Result<()> {
                 }
                 // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
                 // (what THIS machine authorized the peer to do), NOT what the peer offers.
-                println!("  granted:  {}", caps.join(", "));
+                 println!("  granted:  {}", capability_list_summary(&caps));
                 println!("  last seen: {last_seen_str}");
             } else {
                 // Show this machine's address.
@@ -10026,7 +10036,7 @@ async fn main() -> Result<()> {
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
-                    "they can now `filament ssh` into this machine (their key is installed on first connect)."
+                    "OWNER-EQUIVALENT: they can act as you through `filament ssh` (their key is installed on first connect)."
                 } else {
                     ""
                 }

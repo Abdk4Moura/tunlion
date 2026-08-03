@@ -10,7 +10,7 @@ pub struct DeviceEntry {
     pub name: String,
     pub tier: DeviceTier,
     pub online: bool,
-    pub caps_summary: String,    // e.g. "shell reach:8080 inbox"
+    pub caps_summary: String,    // e.g. "OWNER-EQUIVALENT shell reach:8080 inbox"
     pub countdown: String,       // e.g. "renews in 9m" or "expires in 4m"
     pub last_seen: Option<String>, // e.g. "2h ago"
     pub needs_promote: bool,
@@ -207,7 +207,7 @@ mod tests {
                 name: "pixel-7".into(),
                 tier: DeviceTier::Fleet,
                 online: true,
-                caps_summary: "shell reach:8080 inbox".into(),
+                caps_summary: "OWNER-EQUIVALENT shell reach:8080 inbox".into(),
                 countdown: "renews in 9m".into(),
                 last_seen: None,
                 needs_promote: false,

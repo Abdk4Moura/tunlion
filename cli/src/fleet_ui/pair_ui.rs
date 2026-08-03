@@ -20,7 +20,7 @@ pub fn render_same_person_banner(device_name: &str) -> String {
         ),
         wont = format!(
             "  It will not:       {}",
-            ui::paint(Tone::Dim, "open a shell · write to disk   (grant those later if you want)")
+            ui::paint(Tone::Dim, "owner-equivalent shell · write to disk   (grant those later if you want)")
         ),
         meta = meta(&format!("{} fleet · certs auto-renew · Proven", ui::glyph_fleet())),
         btns = format!(
@@ -98,7 +98,7 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
         send = "   [ ] send me files",
         port = "[ ] reach my port [ 8080 ]",
         read = "   [ ] read-only ~/share",
-        shell = format!("[ ] open a shell {}", ui::paint(Tone::Warn, ui::glyph_warn())),
+         shell = format!("[ ] OWNER-EQUIVALENT shell (can act as you) {}", ui::paint(Tone::Warn, ui::glyph_warn())),
         dir_out = ui::paint(Tone::Dim, "(o)"),
         dir_both = format!("{} both ways", ui::paint(Tone::Dim, "( )")),
         rule = super::rule(),
@@ -124,8 +124,9 @@ pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> St
         _ => String::new(),
     };
     format!(
-        "{ok} {peer_name} can {cap} until {expiry}. It ends on its own; no cleanup needed.\n{echo}",
+        "{ok} {peer_name} can {cap_label} until {expiry}. It ends on its own; no cleanup needed.\n{echo}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
+        cap_label = if cap == "shell" { "act as you through a shell (OWNER-EQUIVALENT)" } else { cap },
         echo = echo,
     )
 }
