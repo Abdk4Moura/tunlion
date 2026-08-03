@@ -47,6 +47,35 @@ Firebase mode mirrors these exact events client-side via Firestore.
   Phase 2: the digest also carries `peers` (welcome-shaped roster of the
   caller's room, excluding self, sorted by sid, capped 32; only on ok:true)
   — clients reconcile it so missed peer-joined/left self-correct.
+
+  **This reconciliation carries a TRANSPORT-RECOVERY obligation it was not
+  designed for. Read this before changing its cadence or its adopt path.**
+
+  The *designed* transport fallback is `expired_direct` → `establish()`. That
+  path buys exactly ONE fallible, unretried attempt: `establish()` performs a
+  `fetch_config` network round trip, and on failure `main.rs` logs it and the
+  loop moves on. `expired_direct` has already reaped the pending, so the
+  trigger is consumed and no successor exists. What actually recovers the
+  transfer at that point is roster re-adoption — a mechanism added to fix a
+  *signaling* defect (a client discarding this digest roster), never tuned,
+  measured or documented as transport recovery.
+
+  Two ways to break transport recovery without touching transport code:
+  tune the sync interval for signaling reasons and you silently change
+  transport-recovery latency; optimise the adopt path to skip redundant work
+  and you can delete transport recovery outright. Neither change would have
+  any reason to look at the transport layer.
+
+  So: changes here must be evaluated against **I-GAP** (*no live path, and no
+  armed successor*) in `proofs/transport_upgrade_model.py`, not only against
+  signaling correctness. That model scores the current design clean in 4 of 8
+  environments, and all four of the broken ones are precisely the ones where
+  this reconciliation is unavailable.
+
+  Note that re-adoption is gated on the link being ABSENT, so it cannot fire
+  for a peer whose link was never dropped, and it cannot fire at all for a
+  peer known only via `channel` unless the digest's `channel_peers` reaches
+  the adopt path. Both gaps are load-bearing, not incidental.
 - DataChannel control `{ type:"state", v:1, transfers:{id:bytes}, trusted,
   away }` — C30 phase 3, sent every ~10 s per open link by both ends.
   Receivers correct divergence: re-offer (resume) a "complete" transfer the
