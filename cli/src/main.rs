@@ -3639,13 +3639,13 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt(p, false).await?;
+                        conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?;
                     }
                     for p in &roster.channel_peers {
                         if p["channel"].as_str() == Some(enroll_chan.as_str())
                             && !is_self_uid(&conn.my_uid, p["uid"].as_str())
                         {
-                            conn.maybe_adopt(p, false).await?;
+                            conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?;
                         }
                     }
                 }
@@ -3840,13 +3840,13 @@ async fn enroll_and_send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt(p, true).await?;
+                        conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                     }
                     for p in &roster.channel_peers {
                         if p["channel"].as_str() == Some(enroll_chan.as_str())
                             && !is_self_uid(&conn.my_uid, p["uid"].as_str())
                         {
-                            conn.maybe_adopt(p, true).await?;
+                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                         }
                     }
                 }
@@ -4080,13 +4080,13 @@ async fn enroll_and_netcat_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt(p, true).await?;
+                        conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                     }
                     for p in &roster.channel_peers {
                         if p["channel"].as_str() == Some(enroll_chan.as_str())
                             && !is_self_uid(&conn.my_uid, p["uid"].as_str())
                         {
-                            conn.maybe_adopt(p, true).await?;
+                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                         }
                     }
                 }
@@ -4514,6 +4514,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         to_filter: None,
         links: HashMap::new(),
         roster: HashMap::new(),
+        suppressed_digest_adoptions: HashSet::new(),
         active: None,
         next_gen: 0,
         rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
@@ -4567,7 +4568,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt(p, false).await?;
+                        conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?;
                     }
                     for p in &roster.channel_peers {
                         if is_self_uid(&conn.my_uid, p["uid"].as_str()) {
@@ -4582,7 +4583,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                             continue;
                         };
                         let pid = p["id"].as_str().unwrap_or_default().to_string();
-                        conn.maybe_adopt(p, false).await?;
+                        conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?;
                         if let Some(l) = conn.link_mut(&pid) {
                             l.expected_secret = Some((name.clone(), secret.clone()));
                         }
@@ -5178,7 +5179,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt(p, true).await?;
+                        conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                     }
                 }
             }
@@ -6066,6 +6067,25 @@ mod warm_hold_tests {
     }
 }
 
+/// Why a roster entry is being adopted. Contact is the safe default for new
+/// call sites; Digest is reserved for roster reconciliation, which must not
+/// undo an exhausted give-up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdoptSource {
+    Contact,
+    Digest,
+}
+
+fn match_adoption_source(suppressed: &mut HashSet<String>, peer_id: &str, source: AdoptSource) -> bool {
+    match source {
+        AdoptSource::Contact => {
+            suppressed.remove(peer_id);
+            true
+        }
+        AdoptSource::Digest => !suppressed.contains(peer_id),
+    }
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -6076,6 +6096,9 @@ struct Conn {
     to_filter: Option<String>,
     links: HashMap<String, Link>,
     roster: HashMap<String, Value>, // sid -> {id,name,uid} from welcome/peer-joined
+    /// Peer IDs whose exhausted stall ladder deliberately gave up. Contact
+    /// clears these; digest reconciliation skips them.
+    suppressed_digest_adoptions: HashSet<String>,
     active: Option<String>,        // the transfer-target sid (send side)
     next_gen: u32,
     /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
@@ -6291,6 +6314,7 @@ impl Conn {
             to_filter,
             links: HashMap::new(),
             roster: HashMap::new(),
+            suppressed_digest_adoptions: HashSet::new(),
             active: None,
             next_gen: 0,
             rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
@@ -6371,14 +6395,25 @@ impl Conn {
         true
     }
 
+    fn adoption_allowed(&mut self, peer_id: &str, source: AdoptSource) -> bool {
+        match_adoption_source(&mut self.suppressed_digest_adoptions, peer_id, source)
+    }
+
     /// Track a roster entry and (re)connect to it. `want_active` marks it as
     /// the intended transfer target if it passes the target filters and no
     /// target exists yet. Returns true if this peer is (now) the active one.
     async fn maybe_adopt(&mut self, v: &Value, want_active: bool) -> Result<bool> {
+        self.maybe_adopt_from(v, want_active, AdoptSource::Contact).await
+    }
+
+    async fn maybe_adopt_from(&mut self, v: &Value, want_active: bool, source: AdoptSource) -> Result<bool> {
         let peer_id = v["id"].as_str().unwrap_or_default().to_string();
         let peer_uid = v["uid"].as_str().map(|s| s.to_string());
         let name = v["name"].as_str().unwrap_or("peer").to_string();
         if peer_id.is_empty() || peer_id == self.my_id {
+            return Ok(false);
+        }
+        if !self.adoption_allowed(&peer_id, source) {
             return Ok(false);
         }
         // NOTE: same-install peers (our own daemon) are filtered at the
@@ -7499,6 +7534,7 @@ impl Conn {
         if attempts >= MAX_ATTEMPTS {
             let was_active = self.is_active(pid);
             ui::debug(&ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after {attempts} attempts)")));
+            self.suppressed_digest_adoptions.insert(pid.to_string());
             self.drop_link(pid);
             return Ok(was_active);
         }
@@ -10966,7 +11002,7 @@ async fn send_cmd(
             Ev::Synced(v) => {
                 if let Some(roster) = sess.on_synced(&v) {
                     for p in &roster.peers {
-                        conn.maybe_adopt(p, code_used).await?;
+                        conn.maybe_adopt_from(p, code_used, AdoptSource::Digest).await?;
                     }
                     if let Some((name, secret)) = &known_target {
                         let channel = channel_of(secret);
@@ -10999,7 +11035,7 @@ async fn send_cmd(
                             }
                             let pid = p["id"].as_str().unwrap_or_default().to_string();
                             conn.start_direct(&pid, name, secret).await;
-                            conn.maybe_adopt(p, true).await?;
+                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name.clone(), secret.clone()));
                             }
@@ -13686,6 +13722,8 @@ async fn recv_cmd(
                             let pid = p["id"].as_str().unwrap_or_default().to_string();
                             let (name, secret) = (name.clone(), secret.clone());
                             conn.start_direct(&pid, &name, &secret).await;
+                            // Channel-digest recovery remains intentionally outside
+                            // the room give-up suppression scope.
                             conn.maybe_adopt(p, true).await?;
                             if let Some(l) = conn.link_mut(&pid) {
                                 l.expected_secret = Some((name, secret));
@@ -13729,7 +13767,7 @@ async fn recv_cmd(
                         let id = p["id"].as_str().unwrap_or_default();
                         if !id.is_empty() && !conn.links.contains_key(id) {
                             ui::debug(&ui::paint(ui::Tone::Dim, "  (digest: adopting a peer we never heard join)"));
-                            conn.maybe_adopt(p, true).await?;
+                            conn.maybe_adopt_from(p, true, AdoptSource::Digest).await?;
                         }
                     }
                     // known room-sourced link absent ×2 → a peer-left we
@@ -16509,6 +16547,30 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_giveup_then_digest_does_not_recreate_link() {
+        let mut suppressed = HashSet::new();
+        let mut link_present = true;
+        let mut attempts = MAX_ATTEMPTS;
+
+        // Model the exhausted on_stuck transition: dropping the Link loses the
+        // counter, so only the out-of-Link suppression mark carries the give-up.
+        if attempts >= MAX_ATTEMPTS {
+            link_present = false;
+            attempts = 0;
+            suppressed.insert("peer-sid".to_string());
+        }
+        assert!(!link_present);
+        assert_eq!(attempts, 0);
+        assert!(!match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
+
+        // A real contact is evidence the peer is reachable and clears only the
+        // digest suppression, allowing the next adoption.
+        assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Contact));
+        assert!(!suppressed.contains("peer-sid"));
+        assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
+    }
 
     /// Fleet mount scope: `path_within` bounds a mount to the share root and
     /// resists `..` escapes. This is the SECURITY check that keeps an
