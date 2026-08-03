@@ -3201,6 +3201,12 @@ fn pending_request_count(value: Option<&Value>) -> usize {
         .unwrap_or(0)
 }
 
+fn format_approval_expiry(expires: u64) -> String {
+    chrono::DateTime::from_timestamp(expires as i64, 0)
+        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| expires.to_string())
+}
+
 fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
     let Some(cert) = cert else {
         return "promote to continue".to_string();
@@ -3328,13 +3334,15 @@ async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                 Some(v) => {
                     if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
                         if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
-                            // Do not call render_approve_success here. The capability
-                            // layer has no bounded-grant contract yet, so its expiry
-                            // would be false while device_set_cap persists access.
-                            ui::say(&format!(
-                                "  {} approved {cap} for {peer} until {expires}",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                            ));
+                            if let Some(granted_expires) = v.get("expires").and_then(|v| v.as_u64()) {
+                                let expiry = format_approval_expiry(granted_expires);
+                                ui::say(&fleet_ui::requests::render_approve_success(peer, cap, &expiry));
+                            } else {
+                                ui::say(&format!(
+                                    "  {} approval succeeded but the grant expiry was missing",
+                                    ui::paint(ui::Tone::Err, ui::glyph_err()),
+                                ));
+                            }
                         }
                     }
                 }
@@ -13061,7 +13069,7 @@ async fn recv_cmd(
                                     r.status = "approved".to_string();
                                     r.granted_at = Some(crate::capability::now_secs());
                                     save_requests(&requests);
-                                    req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap })).await;
+                                    req.reply(&json!({ "ok": true, "id": id, "peer": peer, "capability": cap, "expires": expires })).await;
                                 }
                             } else {
                                 req.reject(&format!("request {id} not found or not pending")).await;
