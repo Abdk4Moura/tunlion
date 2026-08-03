@@ -268,5 +268,52 @@ produces results actually ran.*
 - **An invariant maintained by convention at N call sites will be missed at
   call site N+1**, and no test that gives each daemon its own config dir can
   ever catch a same-install filter. Put it in the type or in the signature.
+- **A claim about CALL SITES expires the moment someone adds one. A claim about
+  PRODUCERS OF THE ARTEFACT survives.** Asked whether a dangerous function was
+  unused; the better answer checked every producer of the thing the attack needs
+  (every `certify` call site), and found all live ones certify this machine's own
+  key. Prefer the second shape.
+- **A finding is not recorded until a person who does not already know it can
+  find it from where they will be standing.** Four fragmentations in one day: the
+  handoff doc on a feature branch and not main, a design spec surviving only in a
+  stash, a blocking ceiling ruling existing as fragments across two docs and a
+  comment, and a capability-ceiling change living in one unpushed worktree while
+  the reviewer who ruled on it could not see it.
+- **Testing the fixed path is not testing the deployed state.** `--shell-user`
+  was verified effective using scratch files, which are 0600 *because the fixed
+  writer had just created them*. The real `caps.json` was 0644 and would have
+  stayed so indefinitely, because it is only rewritten when grants change.
+- **A test needs the assertion that separates the right failure from a
+  convenient one.** The best test written that day had three: nonzero exit, the
+  specific message, and *the daemon never reached socket.io connect*. It points
+  at an unusable port, so it would fail anyway; only the third proves the gate
+  fired rather than the connection.
+- **Report scope, not counts.** "365 tests plus all integration suites" was true
+  and excluded the harness, which cannot compile without `--features test-hooks`.
+  Say the feature flags and the platform; the count is the least informative part.
+- **An unreferenced test cannot report its own death.** Nothing went red when a
+  NAT lab was deleted, because no workflow ran the test that needed it.
 - The recurring error shape, in one line: **a query narrower than the claim it
   supports, where the narrowing is invisible in the result.**
+
+## 10. The 2026-08-03 pattern, in one place
+
+Nine mechanisms that CLAIMED something nothing ENFORCED, found in one day, none
+visible from a diff or a green board:
+
+| where | claim | reality |
+|---|---|---|
+| offer site | "the Signal handler re-emits ChannelReady" | it never did; a teardown stood in for the dispatch. This was the macOS wedge. |
+| `on_synced` | roster reconciliation repairs missed peers | `channel_peers` never reached `maybe_adopt` |
+| `l3.rs` | "monotonic seq so a peer can ignore a stale re-announce" | signed on every announce, compared by nobody |
+| `pair_ui` | no-constructor property "asserted in filament-pair" | no such assertion existed |
+| `admit_delegated` | "the devices_json writer must exclude it" | no exclusion; a schema limitation was doing a guard's job |
+| `transport-gates.sh` | a fallback gate driving a live hook | referenced by no workflow, never ran |
+| `data_freeze_test.sh` | the stall-measurement instrument | unreferenced and stale |
+| `holepunch-gates.sh` | the only NAT coverage | its lab was never committed and is gone |
+| cap surfaces | `shell` listed as one bounded permission | owner-equivalent; the ceiling is decorative for it |
+
+The through-line: **a bound that is described rather than enforced survives
+indefinitely, because nothing it protects ever fails.** Each was found by reading
+a specific claim and asking what enforces it. None would have been found by
+another CI run.
