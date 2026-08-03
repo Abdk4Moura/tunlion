@@ -245,6 +245,27 @@ both sides store `{name, secret}` (CLI: `devices.json`; browser: localStorage
 remembered". `--name` sets the local petname (a local alias; the secret is the
 identity).
 
+### Transport eligibility and first contact
+
+Direct QUIC is an authenticated transport, not discovery or trust bootstrap.
+Its key is derived from the mutually remembered pair secret. The signaling relay
+may carry direct candidates, but it never supplies that secret.
+
+- An unknown peer, including a one-time code pairing, has no shared secret before
+  the connection. WebRTC therefore carries the PAKE ceremony and its DTLS-bound
+  confirmation first. After confirmation, the newly derived secret may promote
+  the link to direct QUIC where both peers are CLIs.
+- A known CLI peer already has a stored pair secret. Known-peer discovery can
+  start the authenticated direct-QUIC race before WebRTC, with WebRTC retained as
+  the fallback. This is the normal second-and-later contact path, even when it is
+  the first connection in a fresh process session.
+- If either peer is a browser, WebRTC remains the transport because browser peers
+  cannot participate in the CLI direct-QUIC handshake.
+
+Thus "first contact rides WebRTC" is correct for first contact with an unknown
+peer, and is required by the authentication order. It is not a statement that
+every connection or every platform always starts on WebRTC.
+
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side
