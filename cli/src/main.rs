@@ -3628,6 +3628,20 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
             Ev::PeerJoined(v) => {
                 conn.maybe_adopt(&v, false).await?;
             }
+            Ev::Synced(v) => {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers {
+                        conn.maybe_adopt(p, false).await?;
+                    }
+                    for p in &roster.channel_peers {
+                        if p["channel"].as_str() == Some(enroll_chan.as_str())
+                            && !is_self_uid(&conn.my_uid, p["uid"].as_str())
+                        {
+                            conn.maybe_adopt(p, false).await?;
+                        }
+                    }
+                }
+            }
             Ev::KnownPeer(v) => {
                 // The owner daemon is present on the enroll channel. DIAL it as
                 // the IMPOLITE peer (offerer): the owner answers via
@@ -3815,6 +3829,20 @@ async fn enroll_and_send_cmd(
                 }
             }
             Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
+            Ev::Synced(v) => {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers {
+                        conn.maybe_adopt(p, true).await?;
+                    }
+                    for p in &roster.channel_peers {
+                        if p["channel"].as_str() == Some(enroll_chan.as_str())
+                            && !is_self_uid(&conn.my_uid, p["uid"].as_str())
+                        {
+                            conn.maybe_adopt(p, true).await?;
+                        }
+                    }
+                }
+            }
             Ev::KnownPeer(v) => {
                 // Enroller drives: dial the owner daemon (present on the enroll
                 // channel) as the IMPOLITE offerer; the owner answers via
@@ -4041,6 +4069,20 @@ async fn enroll_and_netcat_cmd(
                 }
             }
             Ev::PeerJoined(v) => { conn.maybe_adopt(&v, true).await?; }
+            Ev::Synced(v) => {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers {
+                        conn.maybe_adopt(p, true).await?;
+                    }
+                    for p in &roster.channel_peers {
+                        if p["channel"].as_str() == Some(enroll_chan.as_str())
+                            && !is_self_uid(&conn.my_uid, p["uid"].as_str())
+                        {
+                            conn.maybe_adopt(p, true).await?;
+                        }
+                    }
+                }
+            }
             Ev::KnownPeer(v) => {
                 // Enroller drives: dial the owner daemon (present on the enroll
                 // channel) as the IMPOLITE offerer; the owner answers via
@@ -4492,6 +4534,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     let mut sent: [bool; 2] = [false, false];
     let fresh = fresh_secret();
     let deadline = Instant::now() + Duration::from_secs(120);
+    let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
 
     loop {
         if Instant::now() > deadline {
@@ -4514,9 +4557,51 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
             // `welcome`/`peer-joined` self-corrects instead of stranding this
             // wait. `introduce` waits on room presence, so it is class S.
             Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
-                    for p in &peers {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers {
                         conn.maybe_adopt(p, false).await?;
+                    }
+                    for p in &roster.channel_peers {
+                        if is_self_uid(&conn.my_uid, p["uid"].as_str()) {
+                            continue;
+                        }
+                        let ch = p["channel"].as_str().unwrap_or_default();
+                        let (is_b, secret, name) = if ch == channel_of(&a_sec) {
+                            (false, &a_sec, &a_name)
+                        } else if ch == channel_of(&b_sec) {
+                            (true, &b_sec, &b_name)
+                        } else {
+                            continue;
+                        };
+                        let pid = p["id"].as_str().unwrap_or_default().to_string();
+                        conn.maybe_adopt(p, false).await?;
+                        if let Some(l) = conn.link_mut(&pid) {
+                            l.expected_secret = Some((name.clone(), secret.clone()));
+                        }
+                        who.insert(pid, is_b);
+                    }
+                    let present: std::collections::HashSet<String> = roster.channel_peers
+                        .iter()
+                        .filter_map(|p| p["id"].as_str().map(String::from))
+                        .collect();
+                    let channels = [channel_of(&a_sec), channel_of(&b_sec)];
+                    let mut gone = Vec::new();
+                    for (pid, link) in &conn.links {
+                        let tracked = link.expected_secret.as_ref().map(|(_, secret)| {
+                            channels.iter().any(|ch| ch == &channel_of(secret))
+                        }).unwrap_or(false);
+                        if tracked && !present.contains(pid) {
+                            let count = channel_digest_absent.entry(pid.clone()).or_insert(0);
+                            *count += 1;
+                            if *count >= 2 { gone.push(pid.clone()); }
+                        } else {
+                            channel_digest_absent.remove(pid);
+                        }
+                    }
+                    for pid in gone {
+                        channel_digest_absent.remove(&pid);
+                        conn.drop_link(&pid);
+                        who.remove(&pid);
                     }
                 }
             }
@@ -5083,8 +5168,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // waits on the peer arriving in the room, so a dropped `peer-joined`
             // would otherwise strand the ceremony until the deadline.
             Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
-                    for p in &peers {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers {
                         conn.maybe_adopt(p, true).await?;
                     }
                 }
@@ -10425,6 +10510,7 @@ async fn send_cmd(
     // subscribe to its presence channel and wait for known-peer.
     let known_target: Option<(String, String)> =
         to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
+    let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
     // L1-a: `send --code` now mints a v2 nameplate (client-minted words, the
     // server allocates ONLY the numeric nameplate) and runs the SAME ephemeral
     // SPAKE2 ceremony as `pair` before any byte flows, then DISCARDS the secret
@@ -10716,9 +10802,46 @@ async fn send_cmd(
             // receiver recovers via this same digest (it already reconciles),
             // the sender never did because it discarded the roster.
             Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
-                    for p in &peers {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers {
                         conn.maybe_adopt(p, code_used).await?;
+                    }
+                    if let Some((name, secret)) = &known_target {
+                        let channel = channel_of(secret);
+                        let present: std::collections::HashSet<String> = roster.channel_peers
+                            .iter()
+                            .filter_map(|p| p["id"].as_str().map(String::from))
+                            .collect();
+                        let stale: Vec<String> = conn.links.iter().filter_map(|(pid, link)| {
+                            let matches = link.expected_secret.as_ref()
+                                .map(|(_, s)| channel_of(s) == channel)
+                                .unwrap_or(false);
+                            if matches && !present.contains(pid) {
+                                let count = channel_digest_absent.entry(pid.clone()).or_insert(0);
+                                *count += 1;
+                                (*count >= 2).then(|| pid.clone())
+                            } else {
+                                channel_digest_absent.remove(pid);
+                                None
+                            }
+                        }).collect();
+                        for pid in stale {
+                            channel_digest_absent.remove(&pid);
+                            conn.drop_link(&pid);
+                        }
+                        for p in &roster.channel_peers {
+                            if p["channel"].as_str() != Some(channel.as_str())
+                                || is_self_uid(&conn.my_uid, p["uid"].as_str())
+                            {
+                                continue;
+                            }
+                            let pid = p["id"].as_str().unwrap_or_default().to_string();
+                            conn.start_direct(&pid, name, secret).await;
+                            conn.maybe_adopt(p, true).await?;
+                            if let Some(l) = conn.link_mut(&pid) {
+                                l.expected_secret = Some((name.clone(), secret.clone()));
+                            }
+                        }
                     }
                 }
             }
@@ -12497,6 +12620,7 @@ async fn recv_cmd(
     // peer-joined/left self-corrects. Absence must hold for TWO consecutive
     // digests before a drop (one digest can race a join in flight).
     let mut digest_absent: HashMap<String, u8> = HashMap::new();
+    let mut channel_digest_absent: HashMap<String, u8> = HashMap::new();
     let mut digest_alone = false;
     // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
@@ -13375,7 +13499,58 @@ async fn recv_cmd(
             // C30: server confirmed our session digest. Phase 2: reconcile
             // the roster it carries, missed peer-joined/left self-correct.
             Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
+                if let Some(roster) = sess.on_synced(&v) {
+                    let channel_peers = roster.channel_peers;
+                    let channel_present: std::collections::HashSet<String> = channel_peers
+                        .iter()
+                        .filter_map(|p| p["id"].as_str().map(String::from))
+                        .collect();
+                    // Channel subscriptions are independent of room membership.
+                    // Re-adopt missed known-peer pushes and reap known links that
+                    // remain absent from two consecutive channel rosters.
+                    for p in &channel_peers {
+                        if is_self_uid(&conn.my_uid, p["uid"].as_str()) {
+                            continue;
+                        }
+                        if let Some((name, secret)) = devices.iter().find(|(_, s)| {
+                            channel_of(s) == p["channel"].as_str().unwrap_or_default()
+                        }) {
+                            let pid = p["id"].as_str().unwrap_or_default().to_string();
+                            let (name, secret) = (name.clone(), secret.clone());
+                            conn.start_direct(&pid, &name, &secret).await;
+                            conn.maybe_adopt(p, true).await?;
+                            if let Some(l) = conn.link_mut(&pid) {
+                                l.expected_secret = Some((name, secret));
+                            }
+                        } else if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+                            let enroll_channel = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
+                            if p["channel"].as_str() == Some(enroll_channel.as_str()) {
+                                conn.maybe_adopt(p, true).await?;
+                            }
+                        }
+                    }
+                    let mut channel_gone = Vec::new();
+                    for (pid, link) in &conn.links {
+                        let channel_link = link.expected_secret.as_ref().map(|(_, secret)| {
+                            sess.channels.iter().any(|ch| ch == &channel_of(secret))
+                        }).unwrap_or(false);
+                        if channel_link && !channel_present.contains(pid) {
+                            let count = channel_digest_absent.entry(pid.clone()).or_insert(0);
+                            *count += 1;
+                            if *count >= 2 {
+                                channel_gone.push(pid.clone());
+                            }
+                        } else {
+                            channel_digest_absent.remove(pid);
+                        }
+                    }
+                    for pid in channel_gone {
+                        channel_digest_absent.remove(&pid);
+                        let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        conn.drop_link(&pid);
+                        ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left (channel digest reconcile), still listening", &name));
+                    }
+                    let peers = roster.peers;
                     digest_alone = peers.is_empty();
                     let present: std::collections::HashSet<String> = peers
                         .iter()

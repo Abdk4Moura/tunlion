@@ -35,6 +35,15 @@ pub struct Session {
     loss: f64,
 }
 
+/// The server's confirmed view of both discovery surfaces. Room membership and
+/// channel subscriptions have different lifetimes, so callers must reconcile
+/// them independently.
+#[derive(Debug, Default, Clone)]
+pub struct SyncedRoster {
+    pub peers: Vec<Value>,
+    pub channel_peers: Vec<Value>,
+}
+
 /// gate L (`FILAMENT_TEST_EMIT_LOSS` + `_SEED`): the loss-shim parameters. These
 /// are env-gated test injectors compiled in ONLY under `--features test-hooks`.
 /// The `not` twin returns the production no-loss defaults (loss 0.0, fixed seed),
@@ -118,22 +127,27 @@ impl Session {
     /// what we sent, so a later desire change diffs against it correctly.
     /// Phase 2: the digest may carry the server's roster (`peers`), the
     /// loops reconcile against it (missed peer-joined/left self-correct).
-    /// The returned roster is the RECOVERY CHANNEL for every class-S push
-    /// (`welcome`, `peer-joined`, `peer-left`): a consumer that misses one
-    /// re-derives it here. `#[must_use]` because three call sites silently
+    /// Adoption is intent-agnostic: local intent is private, while the confirmed
+    /// roster is authoritative shared state. Reconcile to the roster even after
+    /// a deliberate local drop, then let the lifecycle policy decide reaping.
+    /// The returned rosters are the RECOVERY CHANNEL for every class-S push
+    /// (`welcome`, `peer-joined`, `peer-left`, `known-peer`, `known-peer-left`):
+    /// a consumer that misses one re-derives it here. `#[must_use]` because call sites silently
     /// discarded it with a bare `sess.on_synced(&v);`, which is how a sender
     /// that missed a `peer-joined` waited out its full claim deadline while
     /// the peer could see it. Discarding must now be deliberate and explained,
     /// never accidental.
-    #[must_use = "the digest roster is how a missed peer-joined/peer-left is \
-                  recovered; reconcile it, or explain in a comment why this \
-                  command cannot miss one"]
-    pub fn on_synced(&mut self, v: &Value) -> Option<Vec<Value>> {
+    #[must_use = "the digest rosters recover missed room and channel presence pushes; \
+                  reconcile them, or explain why this command cannot miss one"]
+    pub fn on_synced(&mut self, v: &Value) -> Option<SyncedRoster> {
         if v["ok"].as_bool() != Some(true) {
             return None; // error digests carry no roster (server contract)
         }
         self.confirmed = Some((self.desired_digest(), Instant::now()));
-        v["peers"].as_array().cloned()
+        Some(SyncedRoster {
+            peers: v["peers"].as_array().cloned().unwrap_or_default(),
+            channel_peers: v["channel_peers"].as_array().cloned().unwrap_or_default(),
+        })
     }
 
     /// Any local change to desire invalidates confirmation timing so the next
@@ -223,5 +237,18 @@ mod tests {
         let ra: Vec<u64> = (0..8).map(|_| (a.roll() * 1e9) as u64).collect();
         let rb: Vec<u64> = (0..8).map(|_| (b.roll() * 1e9) as u64).collect();
         assert_eq!(ra, rb, "same seed must replay the same drop pattern");
+    }
+
+    #[test]
+    fn synced_returns_room_and_channel_rosters() {
+        let mut s = Session::new("n", "u");
+        let digest = json!({
+            "ok": true,
+            "peers": [{"id": "room-peer"}],
+            "channel_peers": [{"id": "channel-peer", "channel": "c"}],
+        });
+        let roster = s.on_synced(&digest).expect("successful digest has rosters");
+        assert_eq!(roster.peers[0]["id"], "room-peer");
+        assert_eq!(roster.channel_peers[0]["id"], "channel-peer");
     }
 }
