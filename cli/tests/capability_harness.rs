@@ -252,6 +252,9 @@ fn spawn_daemon_inner(
         .arg("up")
         .arg("--userspace")
         .arg("--shell")
+        // This hermetic harness deliberately exercises the owner-equivalent shell
+        // path. Its config dir and paired peers are throwaway test state.
+        .arg("--i-know")
         .arg("--server")
         .arg(server)
         .arg("--relay")
@@ -808,6 +811,25 @@ fn pty_one_shot_exec_smoke() {
 }
 
 #[test]
+fn shell_owner_gate_refuses_real_spawn() {
+    let root = std::env::temp_dir().join(format!("filament-shell-gate-{}", std::process::id()));
+    let drops = root.join("drops");
+    let out = Command::new(env!("CARGO_BIN_EXE_filament"))
+        .env("FILAMENT_CONFIG_DIR", &root)
+        .args([
+            "up", "--userspace", "--shell", "--server", "http://127.0.0.1:1", "--dir",
+            drops.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn shell gate probe");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "ungated shell spawn unexpectedly succeeded: {stderr}");
+    assert!(stderr.contains("owner's authority"), "missing owner-equivalence refusal: {stderr}");
+    assert!(!stderr.contains("socket.io connect"), "shell gate did not fire before signaling: {stderr}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_daemon_live_pairing_no_restart() {
     // Proves the fix for main.rs:8381 — a `--shell` daemon started with
     // no known devices in a non-interactive context must NOT bail, AND the
@@ -1195,6 +1217,9 @@ fn warm_all_makes_first_contact_warm() {
         .arg("up")
         .arg("--userspace")
         .arg("--shell")
+        // This hermetic harness deliberately exercises the owner-equivalent shell
+        // path. Its config dir and paired peers are throwaway test state.
+        .arg("--i-know")
         .arg("--server")
         .arg(&server)
         .arg("--relay")
@@ -1588,4 +1613,3 @@ fn warm_one_shot_pty_instant_eof() {
         "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
     );
 }
-

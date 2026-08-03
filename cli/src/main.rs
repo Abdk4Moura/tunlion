@@ -669,6 +669,9 @@ enum Cmd {
         /// (often root). Requires `up` to run as root (runuser is setuid).
         #[arg(long, value_name = "USER")]
         shell_user: Option<String>,
+        /// Acknowledge that serving shell without --shell-user grants owner authority.
+        #[arg(long)]
+        i_know: bool,
         /// Internal: re-invoked after elevation to do the system-level install.
         #[arg(long, hide = true)]
         install_system: bool,
@@ -2512,6 +2515,23 @@ impl ShellPolicy {
     }
 }
 
+fn shell_root_note() -> &'static str {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            return " This process is root, so the shell can control the whole machine.";
+        }
+    }
+    ""
+}
+
+fn require_shell_owner_ack(shell_enabled: bool, shell_user: Option<&str>, i_know: bool) -> Result<()> {
+    if shell_enabled && shell_user.is_none() && !i_know {
+        bail!("serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{} Pass --shell-user or --i-know to continue.", shell_root_note());
+    }
+    Ok(())
+}
+
 /// Install a SYSTEM systemd unit that receives CAP_NET_ADMIN from systemd
 /// (`AmbientCapabilities`), so the overlay's kernel TUN needs NO file capability on
 /// the binary. That is what kills the recurring sudo: a file cap is lost when
@@ -2522,7 +2542,7 @@ impl ShellPolicy {
 /// the privileged steps (a single interactive prompt, NOT a per-update one). If it
 /// cannot elevate, it prints the exact unit + commands to run by hand.
 #[cfg(target_os = "linux")]
-fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: &Option<String>) -> Result<()> {
+fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: &Option<String>, i_know: bool) -> Result<()> {
     let exe = std::env::current_exe()?.display().to_string();
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -2538,6 +2558,9 @@ fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: 
     }
     if let Some(u) = shell_user {
         up_args.push_str(&format!(" --shell-user {u}"));
+    }
+    if i_know {
+        up_args.push_str(" --i-know");
     }
 
     let unit = format!(
@@ -2683,7 +2706,7 @@ fn install_system_service(shell: bool, shell_only: &Option<String>, shell_user: 
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_system_service(_shell: bool, _shell_only: &Option<String>, _shell_user: &Option<String>) -> Result<()> {
+fn install_system_service(_shell: bool, _shell_only: &Option<String>, _shell_user: &Option<String>, _i_know: bool) -> Result<()> {
     let hint = platform::ServiceHost::detect().install_instructions();
     bail!("--install --system (ambient-cap system service) is not supported on this platform. {hint}");
 }
@@ -2698,9 +2721,12 @@ async fn up_cmd(
     shell_only: Option<String>,
     shell_program: Option<String>,
     shell_user: Option<String>,
+    i_know: bool,
     install_system_flag: bool,
     no_proxy_fallback: bool,
 ) -> Result<()> {
+    let shell_enabled = shell || shell_only.is_some();
+    require_shell_owner_ack(shell_enabled, shell_user.as_deref(), i_know)?;
     // Internal: re-invoked after elevation. Do the system-level install directly
     // and return. The privileged backend registers the service/daemon/task and exits.
     if install_system_flag {
@@ -2715,6 +2741,9 @@ async fn up_cmd(
         }
         if let Some(u) = &shell_user {
             up_args.push_str(&format!(" --shell-user {u}"));
+        }
+        if i_know {
+            up_args.push_str(" --i-know");
         }
         host.install_system(&exe, &up_args)?;
         return Ok(());
@@ -2748,7 +2777,7 @@ async fn up_cmd(
         ));
     }
     if install && system {
-        return install_system_service(shell, &shell_only, &shell_user);
+        return install_system_service(shell, &shell_only, &shell_user, i_know);
     }
     if install {
         // Gate --install on a detected service manager.
@@ -2767,6 +2796,9 @@ async fn up_cmd(
         }
         if let Some(u) = &shell_user {
             up_args.push_str(&format!(" --shell-user {u}"));
+        }
+        if i_know {
+            up_args.push_str(" --i-know");
         }
         // Try privileged system install (elevation popup). On decline, fall
         // back to user-level autostart. Never fail hard.
@@ -2812,14 +2844,15 @@ async fn up_cmd(
         }
         ShellPolicy::Granted => {}
     }
-    // M-1: warn loudly when a shell policy is active but the PTY is NOT dropped to
-    // a non-root account. The granted device would get a shell as the up-process
-    // user (often root on a server). `--shell-user <name>` de-fangs this.
-    if shell_policy.enables_l2() && shell_user.is_none() {
-        ui::say(&format!(
-            "  {} shell PTYs run as THIS user (root if the daemon is root), pass `--shell-user <name>` to drop to a non-root account",
-            ui::paint(ui::Tone::Warn, "!"),
-        ));
+    // Shell without a dropped account is owner-equivalent at any uid. A dropped
+    // account is only safer if it cannot read FILAMENT_CONFIG_DIR.
+    if shell_policy.enables_l2() {
+        let warning = if let Some(user) = shell_user.as_deref() {
+            format!("  note: shell PTYs run as {user}; verify this account cannot read FILAMENT_CONFIG_DIR or the drop is cosmetic")
+        } else {
+            format!("  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{}", ui::paint(ui::Tone::Warn, "!"), shell_root_note())
+        };
+        ui::say(&warning);
     }
     // Pre-resolve our public IP off the critical path so the FIRST incoming
     // connect answers the transport-offer without an inline `/api/whoami` round
@@ -9723,7 +9756,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, install_system, no_proxy_fallback } => {
+        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -9741,7 +9774,7 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, install_system, no_proxy_fallback).await
+            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback).await
         }
         Cmd::Status { json } => status_cmd(json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
@@ -16990,6 +17023,15 @@ mod tests {
         assert!(o.auto_allows("popos") && o.auto_allows("laptop"));
         assert!(!o.auto_allows("stranger"), "shell-only must not auto-shell unlisted devices");
         assert!(o.enables_l2());
+    }
+
+    #[test]
+    fn shell_owner_ack_is_required_without_user_drop() {
+        let denied = require_shell_owner_ack(true, None, false).unwrap_err().to_string();
+        assert!(denied.contains("owner's authority"));
+        assert!(require_shell_owner_ack(true, None, true).is_ok());
+        assert!(require_shell_owner_ack(true, Some("filament-shell"), false).is_ok());
+        assert!(require_shell_owner_ack(false, None, false).is_ok());
     }
 
     #[test]

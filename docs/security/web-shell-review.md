@@ -275,13 +275,13 @@ The shell runs as the (often root) up user. **STATUS: FIXED (implemented).**
 account via `runuser -l <user>` (threaded through `up_cmd` → `recv_cmd` →
 `shell_argv` → `serve_pty`, alongside the existing `--shell` plumbing, and carried
 into the systemd unit on `--install`). When a shell policy is active WITHOUT
-`--shell-user`, `up` prints a loud banner that PTYs run as the up-process user
-(root if the daemon is root) and urges `--shell-user`. **Residual (accepted):**
-the no-flag default still runs the PTY as the up user — operators on a root daemon
-must pass `--shell-user`. `runuser` requires the daemon itself to be root (it is a
-setuid login wrapper with no password prompt), which is exactly the case the flag
-de-fangs. TODO(future): refuse a root PTY entirely unless an explicit
-`--shell-allow-root` is passed.
+`--shell-user`, `up` refuses to start unless the operator passes `--i-know`.
+This is owner-equivalence at any uid because the PTY runs as the up-process user
+and can read the config directory; root additionally makes the shell machine-wide.
+With `--shell-user`, `up` prints a note that the dropped account must not be able
+to read `FILAMENT_CONFIG_DIR`, or the drop is cosmetic. `runuser` requires the
+daemon itself to be root (it is a setuid login wrapper with no password prompt),
+which is exactly the case the flag de-fangs.
 
 **M-2 — `--shell` over-grants to all paired + future devices.** `main.rs:818`,
 `main.rs:840`, `main.rs:4409` (pair-intro adds devices later). `ShellPolicy::All`
@@ -349,7 +349,7 @@ build cfg or an explicit `FILAMENT_TEST=1`, and never let it neutralize
 documented — the trust gate and channel bindings themselves are sound.**
 
 **UPDATE (hardening pass applied):** H-1 and M-3 are FIXED with regression tests;
-M-1 is IMPLEMENTED (`--shell-user` privilege-drop + a root-PTY warning banner)
-with the no-flag root default left as a documented accepted-risk; M-2 is
+M-1 is IMPLEMENTED (`--shell-user` privilege-drop plus the mandatory
+owner-equivalence gate, with `--i-know` as the explicit override); M-2 is
 DOCUMENTED as intentional (code comment + banner + this doc). `cargo test
 --release` green. The Low findings (L-1..L-4) and M-4 are unchanged.
