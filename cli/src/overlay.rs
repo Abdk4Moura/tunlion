@@ -104,6 +104,72 @@ fn key_path() -> PathBuf {
     crate::platform::Paths::config_path("overlay.ed25519")
 }
 
+fn seq_path() -> PathBuf {
+    crate::platform::Paths::config_path("overlay.announce-seq")
+}
+
+/// The next announce sequence number, PERSISTED beside the identity key.
+///
+/// It has to be persisted, and the reason is the whole point of the field.
+/// An in-process counter restarts at zero, so a peer that restarts announces
+/// 0, 1, 2 while its peers still hold a last-seen of (say) 47. A receiver that
+/// rejects `seq <= last_seen` would then lock that peer out PERMANENTLY, and
+/// the failure is silent, per-peer, and looks exactly like a network problem.
+/// That is a worse bug than the replay this counter exists to stop, and it is
+/// the obvious implementation.
+///
+/// Persisting the counter beside the key keeps it monotonic across restarts,
+/// which is the property the receiver check actually depends on. A timestamp
+/// would also survive restarts and is deliberately NOT used: it imports clock
+/// skew into a security check and hands an adversary a knob.
+///
+/// The new value is written BEFORE it is returned, so a crash can only ever
+/// skip numbers, never reuse one. Gaps are fine; the receiver requires
+/// strictly-increasing, not contiguous.
+///
+/// On a read error we start from the current time in seconds rather than 0.
+/// A fresh identity has no peers holding a last-seen, so any start works; but
+/// if the file is lost on an EXISTING identity, restarting at 0 would be the
+/// permanent lock-out above. Seconds-since-epoch is far above any plausible
+/// announce count and keeps us monotonic in practice without the value being
+/// load-bearing as a clock.
+pub fn next_announce_seq() -> u64 {
+    next_announce_seq_at(&seq_path())
+}
+
+/// Path-taking form, so the persistence behaviour is testable without mutating
+/// the process environment (which races under parallel test execution).
+pub fn next_announce_seq_at(path: &std::path::Path) -> u64 {
+    let current = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(1)
+        });
+    let next = current.saturating_add(1);
+    // Best-effort persist. If this fails we still return a value the receiver
+    // will accept for this session; the next restart falls back to the branch
+    // above rather than to zero.
+    let _ = std::fs::write(path, next.to_string());
+    next
+}
+
+/// Is `seq` fresh, given the highest previously accepted value from that
+/// identity? Strictly increasing, NOT contiguous: the persisted counter can
+/// skip numbers after a crash and that must not lock a peer out.
+///
+/// A free function so the rule can be tested directly, rather than only
+/// through an `L3` that needs a netstack to construct.
+pub fn seq_is_fresh(last_seen: Option<u64>, seq: u64) -> bool {
+    match last_seen {
+        Some(last) => seq > last,
+        None => true,
+    }
+}
+
 /// This device's overlay identity: the Ed25519 keypair + its cached pubkey/addr.
 pub struct Identity {
     keypair: Ed25519KeyPair,
@@ -318,6 +384,75 @@ fn unb64(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- announce sequence: replay rejection AND restart survival ----------
+    //
+    // The restart cases are the point. A replay-only test passes for a BROKEN
+    // implementation (an in-process counter starting at zero), which is the
+    // obvious implementation and locks every restarted peer out permanently,
+    // silently and per-peer. So the counter's persistence is tested directly.
+
+    #[test]
+    fn seq_rejects_a_replayed_announce() {
+        // P announced 3, then moved and announced 5; add_peer installed the new
+        // address. A replayed seq-3 announce must not roll it back.
+        assert!(super::seq_is_fresh(None, 3), "first announce is always fresh");
+        assert!(super::seq_is_fresh(Some(3), 5), "a newer announce is accepted");
+        assert!(!super::seq_is_fresh(Some(5), 3), "the replayed seq-3 is REJECTED");
+        assert!(!super::seq_is_fresh(Some(5), 5), "an exact duplicate is rejected");
+    }
+
+    #[test]
+    fn seq_allows_gaps_so_a_crash_does_not_lock_a_peer_out() {
+        // The persisted counter can skip numbers after a crash. Requiring
+        // contiguity would reject a peer that merely restarted.
+        assert!(super::seq_is_fresh(Some(5), 900), "gaps are fine");
+    }
+
+    #[test]
+    fn announce_seq_survives_a_restart() {
+        // THE trap this guards: an in-process AtomicU64 restarts at zero, so a
+        // restarted peer announces 0,1,2 while its peers hold last_seen=47 and
+        // is rejected forever. Each call here reads from disk, which is exactly
+        // what a fresh process does, so consecutive calls model restarts.
+        let dir = std::env::temp_dir().join(format!("fil-seq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("announce-seq");
+        let _ = std::fs::remove_file(&path);
+
+        // The DECISIVE assertion. Three in-process calls returning 1,2,3 would
+        // satisfy a mere "is it increasing" check, so an in-process counter
+        // would pass that and still be broken. What distinguishes the two is
+        // whether a value ALREADY ON DISK is respected: that is the state a
+        // fresh process inherits, and the one a reset counter ignores.
+        std::fs::write(&path, "47").unwrap();
+        let after_restart = super::next_announce_seq_at(&path);
+        assert!(
+            after_restart > 47,
+            "a restarted peer must continue past the persisted value, not reset. \
+             got {after_restart}, which a peer holding last_seen=47 would REJECT \
+             forever. This is what an in-process counter does."
+        );
+
+        // And it keeps advancing from there.
+        let next = super::next_announce_seq_at(&path);
+        assert!(next > after_restart, "still monotonic: {next} !> {after_restart}");
+        assert!(super::seq_is_fresh(Some(after_restart), next));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn announce_seq_does_not_restart_at_zero_when_the_file_is_lost() {
+        // If the counter file is lost on an EXISTING identity, restarting at 0
+        // would be the permanent lock-out. The fallback must be large.
+        let dir = std::env::temp_dir().join(format!("fil-seq-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("announce-seq");
+        let _ = std::fs::remove_file(&path);
+        let v = super::next_announce_seq_at(&path);
+        assert!(v > 1_000_000, "must not restart near zero, got {v}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn ident() -> Identity {

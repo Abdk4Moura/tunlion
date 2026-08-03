@@ -14103,11 +14103,24 @@ async fn recv_cmd(
                         }
                         if let Some(pending) = l3_seen.get(&pid) {
                             if let Ok(ip) = pending.verify(&cb) {
-                                let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
-                                let v4 = pending.addr_v4();
-                                l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
-                                // Store overlay addresses for `filament addr <device>`
-                                devices_touch(&who, Some(ip), Some(v4));
+                                // Seq check AFTER verify, never before, so an
+                                // unauthenticated message cannot poison the
+                                // last-seen map. verify() proves the key, the
+                                // channel binding and possession; none of those
+                                // stop a genuine announce being replayed onto
+                                // the SAME channel later.
+                                if l3.accept_seq(&pending.pubkey, pending.seq).await {
+                                    let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
+                                    let v4 = pending.addr_v4();
+                                    l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
+                                    // Store overlay addresses for `filament addr <device>`
+                                    devices_touch(&who, Some(ip), Some(v4));
+                                } else {
+                                    ui::debug(&format!(
+                                        "  l3-announce from {pid} ignored: stale sequence {}",
+                                        pending.seq
+                                    ));
+                                }
                             }
                         }
                     }
@@ -14257,6 +14270,20 @@ async fn recv_cmd(
                                 match conn.transport_of(&pid).and_then(|t| t.channel_binding().map(|cb| (t, cb))) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
+                                            // Seq check AFTER verify, never before, so an
+                                            // unauthenticated message cannot poison the
+                                            // last-seen map. verify() proves address-is-key,
+                                            // channel binding and possession; none of those
+                                            // stop a GENUINE announce captured on this
+                                            // channel from being replayed onto it later,
+                                            // which is an address rollback (see accept_seq).
+                                            if !l3.accept_seq(&ann.pubkey, ann.seq).await {
+                                                ui::debug(&format!(
+                                                    "  l3-announce from {pid} ignored: stale sequence {}",
+                                                    ann.seq
+                                                ));
+                                                continue;
+                                            }
                                             let who = conn.link(&pid).map(|l| l.shown()).unwrap_or_default();
                                             // Verify-order fix: overlay key vs pinned cert check happens HERE at overlay establishment,
                                             // not at expose time. Possession-proven key already committed at expose time (provisional).

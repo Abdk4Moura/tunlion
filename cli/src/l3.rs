@@ -131,8 +131,13 @@ pub struct L3 {
     /// This node's overlay identity (crypto mode) for signing announces; `None` in
     /// manual/PSK addressing mode (no announce, routes added out of band).
     identity: Option<Identity>,
-    /// Monotonic announce sequence so a peer can ignore a stale re-announce.
-    seq: AtomicU64,
+    /// Highest announce sequence ACCEPTED from each peer identity, so a stale
+    /// announce cannot roll an address back. Keyed by the announcing PUBKEY,
+    /// not by pid: pid is a session artefact, and the signature binds the key.
+    ///
+    /// Populated only AFTER `Announce::verify` succeeds, so an unauthenticated
+    /// message can never poison the map.
+    seen_seq: Mutex<HashMap<[u8; 32], u64>>,
     /// MagicDNS: pid -> (petname, v6 overlay addr, optional v4 overlay addr) for
     /// VERIFIED peers, mirrored into a managed block in /etc/hosts so native tools
     /// resolve `<petname>` / `<petname>.mesh` (both AAAA and A records).
@@ -200,7 +205,7 @@ impl L3 {
             readers: Mutex::new(HashMap::new()),
             by_pid: Mutex::new(HashMap::new()),
             identity,
-            seq: AtomicU64::new(1),
+            seen_seq: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             netstack,
         });
@@ -322,7 +327,36 @@ impl L3 {
     /// `None` in manual mode (no identity to sign with).
     pub fn make_announce(&self, cb: &[u8]) -> Option<Announce> {
         let id = self.identity.as_ref()?;
-        Some(id.announce(self.seq.fetch_add(1, Ordering::Relaxed), cb))
+        // PERSISTED, not an in-process counter. See overlay::next_announce_seq
+        // for why: a counter that restarts at zero gets a restarted peer
+        // rejected forever by the very check below.
+        Some(id.announce(crate::overlay::next_announce_seq(), cb))
+    }
+
+    /// Accept an announce's sequence number, or reject it as stale.
+    ///
+    /// MUST be called only AFTER `Announce::verify` has passed. Verify proves
+    /// address-is-key, channel binding and possession; none of those stop a
+    /// GENUINE announce being captured and replayed onto the SAME channel
+    /// later, because the binding still matches. This is what stops that.
+    ///
+    /// The attack it closes: peer P announces address X (seq 3), then moves and
+    /// announces Y (seq 5), and `add_peer` retires X and installs Y. An
+    /// adversary on the channel replays the captured seq-3 announce; signature
+    /// verifies, binding matches, and `add_peer` retires Y and reinstalls X.
+    /// That is an address ROLLBACK, and it lands precisely because add_peer is
+    /// idempotent for identical content and DESTRUCTIVE for stale content. The
+    /// sequence is the only field that distinguishes the two.
+    ///
+    /// Strictly increasing, not contiguous: the persisted counter may skip
+    /// numbers after a crash and that is fine.
+    pub async fn accept_seq(&self, pubkey: &[u8; 32], seq: u64) -> bool {
+        let mut seen = self.seen_seq.lock().await;
+        if !crate::overlay::seq_is_fresh(seen.get(pubkey).copied(), seq) {
+            return false;
+        }
+        seen.insert(*pubkey, seq);
+        true
     }
 
     /// Attach a VERIFIED peer to the overlay: route its overlay addresses (already
@@ -792,7 +826,7 @@ mod tests {
             readers: tokio::sync::Mutex::new(HashMap::new()),
             by_pid: tokio::sync::Mutex::new(HashMap::new()),
             identity: None,
-            seq: std::sync::atomic::AtomicU64::new(1),
+            seen_seq: Mutex::new(HashMap::new()),
             names: tokio::sync::Mutex::new(HashMap::new()),
             netstack: Some(ns),
         })
