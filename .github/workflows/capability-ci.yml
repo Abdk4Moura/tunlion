@@ -126,6 +126,12 @@ jobs:
           FILAMENT_WORKTREE: ${{ github.workspace }}
           RUST_MIN_STACK: 8388608
           FILAMENT_LOG: trace
+          # Forwarded by capability_harness as FILAMENT_DIRECT to each spawned
+          # daemon. 0 on macOS means direct-QUIC is OFF there, so every macOS
+          # transfer rides WebRTC and rung-1 has NO coverage on that platform.
+          # That is a workaround for a webrtc-rs limitation (see the job comment
+          # above), not a statement about QUIC. Tracked: macOS needs real
+          # direct-QUIC coverage.
           FILAMENT_DIRECT_PER_OS: ${{ runner.os == 'macOS' && '0' || '1' }}
           FILAMENT_DIRECT_LOOPBACK_ONLY: ${{ runner.os == 'macOS' && '0' || '1' }}   # macOS ARM64 webrtc-rs gathers no loopback host candidates; allow all interfaces so the runner's bridge IP provides a candidate
           CMAKE_C_COMPILER_LAUNCHER: ${{ runner.os != 'Windows' && 'sccache' || '' }}
