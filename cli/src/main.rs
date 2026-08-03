@@ -6731,7 +6731,7 @@ impl Conn {
                 Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
                 None => {
                     let source = if peer_present { "presence" } else { "absent-roster" };
-                    net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, source, peer_present)
+                    net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, source, peer_present)?
                 },
             },
         };
@@ -7337,7 +7337,13 @@ impl Conn {
             },
             None => {
                 let source = if peer_present { "presence" } else { "absent-roster" };
-                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, source, peer_present)
+                match net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, source, peer_present) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("worker role election failed for peer {pid}: {error}");
+                        return;
+                    }
+                }
             }
         };
         let count = k - 1;

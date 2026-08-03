@@ -1138,6 +1138,8 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
     ensure_ascii_uid(my_uid)?;
     ensure_ascii_uid(peer_uid)?;
+    ensure_ascii_session_id(my_id)?;
+    ensure_ascii_session_id(peer_id)?;
     if my_uid == peer_uid && my_id == peer_id {
         bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
     }
@@ -1148,14 +1150,24 @@ pub fn ensure_ascii_uid(uid: &str) -> Result<()> {
     if uid.is_ascii() { Ok(()) } else { bail!("UID must be ASCII") }
 }
 
+pub fn ensure_ascii_session_id(id: &str) -> Result<()> {
+    if id.is_ascii() { Ok(()) } else { bail!("session ID must be ASCII") }
+}
+
 /// Phase-1 compatibility path. It remains knowingly non-antisymmetric until
 /// phase 2 removes old-client skew; every use is attributed for measurement.
-pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str, source: &str, peer_present: bool) -> bool {
+pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str, source: &str, peer_present: bool) -> Result<bool> {
+    ensure_ascii_uid(my_uid)?;
+    if let Some(peer_uid) = peer_uid {
+        ensure_ascii_uid(peer_uid)?;
+    }
+    ensure_ascii_session_id(my_id)?;
+    ensure_ascii_session_id(peer_id)?;
     eprintln!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
-    match peer_uid {
+    Ok(match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,
-    }
+    })
 }
 
 
@@ -1941,6 +1953,18 @@ mod tests {
     #[test]
     fn polite_role_rejects_non_ascii_uid() {
         assert!(polite_role("uid-😀", "uid-a", "sid-a", "sid-b").is_err());
+    }
+
+    #[test]
+    fn polite_role_rejects_non_ascii_session_id() {
+        assert!(polite_role("uid-a", "uid-b", "sid-😀", "sid-b").is_err());
+        assert!(polite_role("uid-a", "uid-b", "sid-a", "sid-😀").is_err());
+    }
+
+    #[test]
+    fn polite_role_legacy_rejects_non_ascii_session_id() {
+        assert!(polite_role_legacy("uid-a", None, "sid-😀", "sid-b", "test", false).is_err());
+        assert!(polite_role_legacy("uid-a", None, "sid-a", "sid-😀", "test", false).is_err());
     }
 
     #[test]

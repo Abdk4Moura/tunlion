@@ -1204,7 +1204,7 @@ async fn bring_up_to_known(
                     Some(peer_uid) => net::polite_role(&my_uid, peer_uid, &mine, &pid)?,
                     None => {
                         let source = if peer_present { "presence" } else { "absent-roster" };
-                        net::polite_role_legacy(&my_uid, None, &mine, &pid, source, peer_present)
+                        net::polite_role_legacy(&my_uid, None, &mine, &pid, source, peer_present)?
                     },
                 };
                 generation += 1;

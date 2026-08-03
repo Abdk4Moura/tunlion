@@ -1580,6 +1580,8 @@ pub async fn accept_workers(
 // ============================================================== orchestrator ==
 
 fn answerer_for(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+    crate::net::ensure_ascii_session_id(my_id)?;
+    crate::net::ensure_ascii_session_id(peer_id)?;
     crate::net::polite_role(my_uid, peer_uid, my_id, peer_id)
 }
 
@@ -1773,6 +1775,11 @@ mod tests {
         let a = answerer_for("uid-a", "uid-b", "sid-a", "sid-b").unwrap();
         let b = answerer_for("uid-b", "uid-a", "sid-b", "sid-a").unwrap();
         assert_ne!(a, b, "QUIC ends must allocate opposite sid halves");
+    }
+
+    #[test]
+    fn answerer_role_rejects_non_ascii_session_id() {
+        assert!(answerer_for("uid-a", "uid-b", "sid-😀", "sid-b").is_err());
     }
 
     #[test]
