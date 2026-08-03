@@ -4510,16 +4510,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 // C30 (dissolves the C28 belt): fresh sid, re-assert via session.
                 sess.invalidate();
             }
-            // C30 phase 2: reconcile the roster the digest carries so a missed
-            // `welcome`/`peer-joined` self-corrects instead of stranding this
-            // wait. `introduce` waits on room presence, so it is class S.
-            Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
-                    for p in &peers {
-                        conn.maybe_adopt(p, false).await?;
-                    }
-                }
-            }
+            Ev::Synced(v) => { sess.on_synced(&v); }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own processes share these channels
@@ -5079,16 +5070,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 }
                 sess.invalidate(); // C30: fresh sid, re-assert next tick
             }
-            // C30 phase 2: same reconciliation as the Welcome arm above. Pairing
-            // waits on the peer arriving in the room, so a dropped `peer-joined`
-            // would otherwise strand the ceremony until the deadline.
-            Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
-                    for p in &peers {
-                        conn.maybe_adopt(p, true).await?;
-                    }
-                }
-            }
+            Ev::Synced(v) => { sess.on_synced(&v); }
             Ev::PairOk(_v) => {
                 // L1-a: the server allocated our nameplate. Display the FULL code
                 // from OUR OWN local mint (the server never echoed any words).
@@ -10743,20 +10725,8 @@ async fn send_cmd(
                 // sid-keyed is gone; invalidate and let the session re-assert.
                 sess.invalidate();
             }
-            // C30: server confirmed our session digest. Phase 2: reconcile the
-            // roster it carries, so a `welcome` or `peer-joined` we never
-            // received self-corrects. Without this the sender waits out the
-            // full 600s claim deadline while the peer can see it, which is the
-            // one-directional presence failure the macOS smoke job hits: the
-            // receiver recovers via this same digest (it already reconciles),
-            // the sender never did because it discarded the roster.
-            Ev::Synced(v) => {
-                if let Some(peers) = sess.on_synced(&v) {
-                    for p in &peers {
-                        conn.maybe_adopt(p, code_used).await?;
-                    }
-                }
-            }
+            // C30: server confirmed our session digest.
+            Ev::Synced(v) => { sess.on_synced(&v); }
             // L1-a: the server allocated our v2 nameplate. Display the FULL
             // `words-nameplate` code assembled from OUR OWN local mint (the
             // server never echoes any words). The receiver runs the SAME
