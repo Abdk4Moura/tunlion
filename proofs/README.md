@@ -55,7 +55,70 @@ three fixes as independent booleans and checks all 2³ combinations, proving:
   becomes *independently* necessary; all fixes on → self-heals in bounded steps.
 
 The design write-up is [`docs/transport-lifecycle-state-machine.md`](../docs/transport-lifecycle-state-machine.md).
-Both proofs are required CI gates (`.github/workflows/proof.yml`).
+
+## Companion: the transport-upgrade proof
+
+`transport_upgrade_model.py` covers the layer the other two structurally cannot
+see. Both of them model a **single** transport slot, so the upgrade — two paths,
+one destroyed in order to try the other — is not representable in either. They
+stayed green through every defect below, and a clean run from an instrument that
+cannot represent the fault is not evidence.
+
+After the PAKE ceremony the code drops the authenticated WebRTC link and races a
+direct-QUIC dial ("Option A"). Six separate fixes over three days were each a way
+of making the resulting gap smaller: reordering `establish()`, carrying
+`expected_secret` across the rebuild, `DirectIntent::Promote`, the
+`direct_pending` removal that precedes a `bind_endpoint` failure, sync-digest
+roster reconciliation, and the macOS regression. They are one defect. This model
+makes it a state predicate:
+
+> **I-GAP** — no live path, and no armed successor.
+
+It checks three designs (`EAGER` = main, `LATE` = the promote-intent branches,
+`PATHSET` = build-alongside-then-promote) across 2⁴ environments, and refuses to
+report anything until it first reproduces the four outcomes CI actually produced
+on 2026-08-03. Results:
+
+- **T3/T4** `PATHSET` dominates **only** when the post-PAKE link can attach a data
+  plane on its own. While it cannot, destroying the link is the *only* route to a
+  live transport, so `PATHSET` is clean in 0/8 against `EAGER`'s 4/8. The obvious
+  first-principles redesign would be **strictly worse than main** if adopted
+  first. Data-plane attachment must be fixed *before* the redesign.
+- **T5** `LATE` (1/8) is strictly worse than `EAGER` (4/8) under the same
+  condition, which is the regression PRs #78/#79 shipped, derived rather than
+  guessed from a red check.
+- **T6** roster reconciliation is **load-bearing**: all four environments where
+  `EAGER` breaks have it off. It must not be removed. Given the `D_BURNT`
+  correction it is also the only thing standing between a failed fallback attempt
+  and I-GAP, so it is *more* load-bearing than the first version of this model
+  said, not less.
+
+Two corrections from `claude-advisor` are folded in, and both made `main` look
+worse rather than better. `D_FAILED` buys exactly **one fallible, unretried**
+recovery attempt (`main.rs:7608` logs the `establish()` failure and moves on),
+not an armed successor, so a `D_BURNT` state was added; and a pending can be
+**cancelled** rather than expired by the `link_dead` branch, which reaches the
+same gap by a second route. Together they cost `EAGER` an environment (5/8 → 4/8)
+and `LATE` one (2/8 → 1/8).
+
+`ctrl_carries` — *can a transfer **complete** over the post-PAKE link without that
+link first being destroyed and rebuilt?* — is a free parameter rather than an
+assumption. Gate 0 derives it: `False` is the only value reproducing all four
+observed outcomes (2/4 with it `True`). Four points against one free bit is a fit
+as much as a derivation, so the falsification test carried the weight, and it has
+now **run**: the green `main` macOS artifact (run 30825113095, job 91724637129)
+shows the drop at `main.rs:10871`, ICE closing, a second gather on a new host
+port, and sha256 delivery success only *after* the rebuild. The green path rides
+a rebuilt link. Confirmed by artifact, not by fit.
+
+The definition is deliberately **observational**. Two readings still fit and this
+model does not distinguish them: (A) the retained link genuinely cannot carry
+data, or (B) the link is fine and the sender never progresses because it waits on
+a transition only a rebuild emits. They imply different fixes, so nothing here
+should be read as asserting A. The discriminator is whether the sender ever
+*attempted* to send file data on the retained link.
+
+All three proofs are required CI gates (`.github/workflows/proof.yml`).
 
 ## The properties
 

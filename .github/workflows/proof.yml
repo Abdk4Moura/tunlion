@@ -35,3 +35,5 @@ jobs:
         run: python3 proofs/establishment_model.py
       - name: Model-check transport lifecycle (corpse / ack-loss / role; GoodNet + Degraded)
         run: python3 proofs/transport_lifecycle_model.py
+      - name: Model-check transport upgrade (destroy-then-race vs build-alongside)
+        run: python3 proofs/transport_upgrade_model.py
