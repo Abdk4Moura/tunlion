@@ -6676,9 +6676,8 @@ impl Conn {
             self.direct_pending.remove(pid);
             self.drop_link(pid);
         }
-        let link_alive = self.has_live_transport(pid);
-        if self.direct_pending.contains_key(pid) || (!probe && link_alive) {
-            return; // already trying, or already linked via a live transport
+        if self.direct_pending.contains_key(pid) {
+            return; // already trying
         }
 
         // Check if target is same-machine peer (local transport).
@@ -6699,19 +6698,11 @@ impl Conn {
                     (Some(v.0), v.1)
                 }
                 Err(e) => {
-                    // This return happens AFTER Option A has already dropped the
-                    // WebRTC link, and BEFORE anything is registered in
-                    // `direct_pending`. So `expired_direct` has nothing to expire,
-                    // `establish` is never called, and the link is destroyed with
-                    // no scheduled rebuild: the sender then waits out its full
-                    // claim deadline. Logged at DEBUG, not trace, because a
-                    // failure that silently destroys a working link must be
-                    // visible at the level CI actually captures. The failing
-                    // macOS job carried exactly one `filament:` line, so this
-                    // diagnostic could not have appeared even if it fired.
+                    // Keep the existing WebRTC link: direct_pending is not
+                    // registered yet, so the fallback reaper has nothing to
+                    // expire. The caller must retain a working path on failure.
                     ui::debug(&format!(
-                        "filament: direct disabled (endpoint bind failed: {e}); \
-                         WebRTC link already dropped and no fallback is pending"
+                        "filament: direct disabled (endpoint bind failed: {e}); WebRTC retained"
                     ));
                     return;
                 }
@@ -6822,6 +6813,12 @@ impl Conn {
                 probe,
             },
         );
+        // Replace the serving WebRTC link only after all fallible setup has
+        // completed and the fallback reaper has a pending attempt to expire.
+        // Upgrade probes retain their serving relay link by design.
+        if !probe {
+            self.drop_link(pid);
+        }
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
         if let Some((cands, srflx)) = self.buffered_offers.remove(pid) {
@@ -10834,11 +10831,11 @@ async fn send_cmd(
                                     if !pake_done {
                                         pake_done = true;
                                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, sending"));
-                                        // Option A: drop WebRTC link and race direct-quic FIRST.
+                                        // Option A: race direct-quic FIRST; start_direct
+                                        // replaces WebRTC only after pending registration.
                                         // If direct wins: transfer rides QUIC (130+ MB/s).
                                         // If direct fails: expired_direct → establish → WebRTC fallback
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        conn.drop_link(&from);
                                         conn.start_direct(&from, &from, &sec).await;
                                         if conn.active.is_none() {
                                             conn.active = Some(from.clone());
@@ -13614,8 +13611,8 @@ async fn recv_cmd(
                         recv_cers.clear();
                         recv_deadlines.clear();
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
-                        // Option A: drop WebRTC link, start direct-QUIC race.
-                        conn.drop_link(&from);
+                        // Option A: start the direct-QUIC race. start_direct owns
+                        // replacement after all fallible setup and pending registration.
                         conn.start_direct(&from, &from, &sec).await;
                         if conn.active.is_none() {
                             conn.active = Some(from.clone());
