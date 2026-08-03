@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
 import { createSession } from './session.js'
-import { PeerLink, politeRole } from './webrtc.js'
+import { PeerLink, politeRole, legacyPoliteRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import * as linkdiag from './linkdiag.js'
@@ -68,6 +68,7 @@ function tabUid() {
       u = (crypto.randomUUID && crypto.randomUUID()) || Math.random().toString(36).slice(2) + Date.now().toString(36)
       sessionStorage.setItem('filament.uid', u)
     }
+    if (!/^[\x00-\x7F]*$/.test(u)) throw new Error('Filament UID must be ASCII')
     return u
   } catch {
     return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -291,6 +292,11 @@ export function useFilament() {
   const makeLink = useCallback(
     ({ id, name, uid, relayOnly }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
+      if (uid != null && !/^[\x00-\x7F]*$/.test(uid)) {
+        console.warn('peer UID is not ASCII; refusing role election', { id })
+        addPeer({ id, name, uid, color: colorFor(id), status: 'peer identity is invalid; reload this page', route: null, lastSeen: 'now' })
+        return null
+      }
       // Supersede (#10): a tab has exactly ONE live connection. If we already
       // show a tile for this uid under an older sid (zombie registry entry, or
       // peer-joined arriving before peer-left during a reconnect), replace it,
@@ -306,10 +312,10 @@ export function useFilament() {
           }
         }
       }
-      // Perfect-negotiation role (#1): exactly one of each pair is impolite and
-      // owns the offer. Compared by the STABLE uid when known (so a stale sid
-      // on one side can't produce a both-polite deadlock), else by sid.
-      const polite = politeRole({ myUid: uidRef.current, peerUid: uid, myId: myIdRef.current, peerId: id })
+      // Phase 1: tolerate peers without a UID while measuring the legacy path.
+      // Phase 2 removes this branch once stale records and old clients are gone.
+      const roleArgs = { myUid: uidRef.current, peerUid: uid, myId: myIdRef.current, peerId: id }
+      const polite = uid == null ? legacyPoliteRole(roleArgs) : politeRole(roleArgs)
       addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
@@ -320,6 +326,7 @@ export function useFilament() {
         relayOnly: !!relayOnly,
         chunkSize: cfgRef.current.chunkSize,
         polite,
+        myUid: uidRef.current,
         peerUid: uid || null,
         stores: { partials: partialsRef.current, outgoing: outgoingRef.current },
         sendSignal: (data) => sigRef.current.signal(id, data),

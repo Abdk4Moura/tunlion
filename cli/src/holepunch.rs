@@ -351,8 +351,10 @@ pub async fn connect(
     peer_srflx: SocketAddr,
     secret: &str,
     peer_id: String,
+    my_uid: String,
+    peer_uid: String,
+    my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
-    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
     // Punch on a blocking thread (blocking UDP I/O), reclaim the socket.
     let punch_result = tokio::task::spawn_blocking(move || {
@@ -383,9 +385,11 @@ pub async fn connect(
         vec![peer_srflx.to_string()],
         secret,
         peer_id,
+        my_uid,
+        peer_uid,
+        my_id,
         tx,
         "holepunched",
-        answerer,
     )
     .await
 }

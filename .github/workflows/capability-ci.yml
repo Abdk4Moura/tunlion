@@ -72,6 +72,52 @@ jobs:
       - name: Install Python deps
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 
+      # direct::bind_endpoint asks for SO_RCVBUF at 8 MiB, then 4, then 1, and
+      # returns Err if all three fail. Option A has already dropped the WebRTC
+      # link by the time that Err propagates, so a platform that refuses all
+      # three sizes loses the fast path AND its fallback. macOS caps socket
+      # buffers via kern.ipc.maxsockbuf far below what Linux grants by default,
+      # which makes it the platform where this can actually fire.
+      #
+      # Reported on the runner image that exhibits the failure, which is better
+      # evidence than any developer machine. Never fails the job: this is a
+      # measurement, not a gate.
+      - name: Probe UDP socket buffer limits (diagnostic)
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "--- kernel socket buffer ceiling ---"
+          sysctl kern.ipc.maxsockbuf 2>/dev/null \
+            || cat /proc/sys/net/core/rmem_max 2>/dev/null \
+            || echo "(no ceiling reported on this platform)"
+          echo "--- what SO_RCVBUF actually grants, the sizes bind_endpoint tries ---"
+          python3 - <<'PY'
+          import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          for mib in (8, 4, 1):
+              want = mib * 1024 * 1024
+              try:
+                  s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, want)
+                  got = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+                  print(f"{mib} MiB: OK (kernel granted {got} bytes)")
+              except OSError as e:
+                  print(f"{mib} MiB: FAILED {e}")
+          s.close()
+          PY
+
+      # direct-QUIC candidates EXCLUDE loopback (direct.rs:433 filters
+      # is_loopback), so two peers on one host must reach each other via the
+      # host's OWN interface address: a UDP hairpin. The local-tcp path does not
+      # need this, it dials 127.0.0.1 explicitly, which is a candidate mechanism
+      # for macOS completing transfers over "direct over lo" while never once
+      # completing direct-QUIC.
+      #
+      # Linux baseline, measured: hairpin works, so this is not the blocker there.
+      - name: Probe same-host UDP hairpin (diagnostic)
+        continue-on-error: true
+        shell: bash
+        run: python3 experiments/py/hairpin_probe.py
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:

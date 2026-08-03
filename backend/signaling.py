@@ -28,6 +28,29 @@ from flask_socketio import emit, join_room, leave_room
 # has been removed (Decision #1: v2-only cutover).
 
 
+# Test-only adversary (gate P): drop named SERVER->CLIENT pushes so a client's
+# ability to RECOVER from a missed push can be tested directly, instead of
+# waiting for a platform to drop one by accident.
+#
+# Every push the client can miss must be recoverable from the `sync` digest,
+# which carries the full roster (C30 phase 2). This makes that property
+# testable: drop `peer-joined`, and a correct client still converges on the
+# next sync. A client that discards the digest roster waits out its full
+# claim deadline instead, which is the macOS smoke failure.
+#
+# FILAMENT_TEST_DROP_PUSH="peer-joined,welcome"   (unset in production)
+_DROP_PUSH = {
+    e.strip() for e in os.environ.get("FILAMENT_TEST_DROP_PUSH", "").split(",") if e.strip()
+}
+
+
+def _push(event, payload, **kw):
+    """emit(), minus any event gate P is configured to swallow."""
+    if event in _DROP_PUSH:
+        return
+    emit(event, payload, **kw)
+
+
 def _norm_code(raw):
     """Normalize a spoken keyword: lowercase, spaces→dashes, strip noise."""
     if not isinstance(raw, str):
@@ -388,8 +411,8 @@ def register(socketio, registry):
         # Tell the joiner who's already here (they initiate offers); tell the
         # room someone arrived. With the Redis message queue these reach peers
         # on every instance.
-        emit("welcome", {"id": sid, "peers": peers})
-        emit("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
+        _push("welcome", {"id": sid, "peers": peers})
+        _push("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
 
     @socketio.on("join")
     def on_join(data):

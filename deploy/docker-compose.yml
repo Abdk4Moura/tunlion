@@ -36,6 +36,23 @@ services:
       - "8000" # internal only — cloudflared reaches it as http://api:8000
     depends_on:
       - redis
+    # OOM shield. This box runs agent workloads alongside production, and on
+    # 2026-08-03 the kernel OOM killer took a systemd process and a 1.17 GB
+    # rustc while production sat at oom_score ~668 with rustc at 712. A
+    # forty-four point margin was the only thing that made a build die instead
+    # of the signaling server, and that was luck.
+    #
+    # -800 puts these last in line rather than near the front. Applied here
+    # rather than by hand, because a live `echo -800 > /proc/PID/oom_score_adj`
+    # does NOT survive container recreation and nothing reports its absence:
+    # the protection would silently lapse on the next `docker compose up -d`.
+    #
+    # NOTE: this covers every process in the container, including children.
+    # A hand-applied shield that used `docker inspect .State.Pid` reached only
+    # the gunicorn MASTER and left the single `-w 1` worker exposed, which is
+    # worse than no shield: the master respawns, the container never exits,
+    # `docker ps` says Up, and every live socket.io connection dies anyway.
+    oom_score_adj: -800
     mem_limit: ${API_MEM:-220m}
     cpus: ${API_CPUS:-0.40}
     pids_limit: 256
@@ -45,6 +62,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    oom_score_adj: -800  # see the api service for why; -800 = last in line
     command:
       - redis-server
       - --save
@@ -61,6 +79,7 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
+    oom_score_adj: -800  # see the api service for why; -800 = last in line
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
@@ -72,6 +91,7 @@ services:
   coturn:
     image: coturn/coturn:latest
     restart: unless-stopped
+    oom_score_adj: -800  # see the api service for why; -800 = last in line
     # Host networking so coturn can hand out its UDP relay port range directly.
     network_mode: host
     volumes:

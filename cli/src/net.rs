@@ -17,7 +17,7 @@ macro_rules! dlog {
 //   C4 transient 'disconnected'-> surfaced as PcState; main loop graces + retries
 //   C8a backpressure           -> event-driven via on_buffered_amount_low
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::FutureExt;
@@ -390,6 +390,12 @@ pub trait Transport: Send + Sync {
     /// transport never blocks a supersede. Backs the #28 data-flow guard.
     fn idle_ms(&self) -> u64 {
         u64::MAX
+    }
+    /// Idle time when the transport tracks activity. `None` means the value is
+    /// unknown; liveness is checked separately with `is_alive()`.
+    fn idle_ms_tracked(&self) -> Option<u64> {
+        let idle_ms = self.idle_ms();
+        (idle_ms != u64::MAX).then_some(idle_ms)
     }
     /// Best-effort liveness: `false` if the underlying connection is known closed.
     /// Default `true` (untracked transports are assumed live). Warm-link reuse
@@ -1126,13 +1132,32 @@ fn roster_from_ack(vals: &[Value]) -> Vec<Value> {
 
 // --------------------------------------------------------------------- peer --
 
-/// Mirror of webrtc.js politeRole(): prefer stable uids, fall back to sids.
-pub fn polite_role(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str) -> bool {
+/// Compare one shared identity tuple. UIDs must be ASCII because Rust and JS
+/// order non-ASCII strings differently. Session IDs must differ whenever UIDs
+/// tie; an equal tuple is a protocol error, not a quiet role decision.
+pub fn polite_role(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+    ensure_ascii_uid(my_uid)?;
+    ensure_ascii_uid(peer_uid)?;
+    if my_uid == peer_uid && my_id == peer_id {
+        bail!("polite-role identity tuple collision: uid={my_uid:?} sid={my_id:?}");
+    }
+    Ok((my_uid, my_id) > (peer_uid, peer_id))
+}
+
+pub fn ensure_ascii_uid(uid: &str) -> Result<()> {
+    if uid.is_ascii() { Ok(()) } else { bail!("UID must be ASCII") }
+}
+
+/// Phase-1 compatibility path. It remains knowingly non-antisymmetric until
+/// phase 2 removes old-client skew; every use is attributed for measurement.
+pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str, source: &str, peer_present: bool) -> bool {
+    eprintln!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
     match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,
     }
 }
+
 
 pub struct Peer {
     pub id: String,
@@ -1176,6 +1201,7 @@ impl Peer {
     /// ignored by the main loop (C3).
     pub async fn connect(
         peer_id: String,
+        my_uid: String,
         polite: bool,
         ice_servers: Vec<RTCIceServer>,
         relay_only: bool,
@@ -1234,9 +1260,11 @@ impl Peer {
         {
             let sio = sio.clone();
             let to = peer_id.clone();
+            let uid = my_uid.clone();
             pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
                 let sio = sio.clone();
                 let to = to.clone();
+                let uid = uid.clone();
                 Box::pin(async move {
                     if let Some(ref c) = c {
                         let typ = c.typ.to_string();
@@ -1247,7 +1275,7 @@ impl Peer {
                             let _ = sio
                                 .emit(
                                     "signal",
-                                    json!({ "to": to, "data": { "type": "candidate", "candidate": init } }),
+                                    json!({ "to": to, "data": { "type": "candidate", "uid": uid.clone(), "candidate": init } }),
                                 )
                                 .await;
                         }
@@ -1282,7 +1310,7 @@ impl Peer {
                 .ok_or_else(|| anyhow!("no local description"))?;
             sio.emit(
                 "signal",
-                json!({ "to": peer_id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
+                json!({ "to": peer_id, "data": { "type": "description", "uid": my_uid.clone(), "description": advertise_max_message_size(&ld) } }),
             )
             .await
             .ok();
@@ -1878,12 +1906,41 @@ mod tests {
     #[test]
     fn polite_role_prefers_uid_then_sid() {
         // Distinct uids: lexical comparison of uids decides (mirrors webrtc.js).
-        assert!(polite_role("uid-z", Some("uid-a"), "s1", "s9"));
-        assert!(!polite_role("uid-a", Some("uid-z"), "s9", "s1"));
-        // Same/None uid: fall back to sid comparison.
-        assert!(polite_role("u", None, "s9", "s1"));
-        assert!(!polite_role("u", None, "s1", "s9"));
-        assert!(polite_role("u", Some("u"), "s9", "s1"));
+        assert!(polite_role("uid-z", "uid-a", "s1", "s9").unwrap());
+        assert!(!polite_role("uid-a", "uid-z", "s9", "s1").unwrap());
+        assert!(polite_role("u", "u", "s9", "s1").unwrap());
+    }
+
+    #[test]
+    fn polite_role_is_antisymmetric_for_all_distinct_tuples() {
+        let xor = |a: bool, b: bool| assert_ne!(a, b, "exactly one side must be polite");
+
+        xor(
+            polite_role("uid-a", "uid-b", "sid-a", "sid-b").unwrap(),
+            polite_role("uid-b", "uid-a", "sid-b", "sid-a").unwrap(),
+        );
+        xor(
+            polite_role("uid-z", "uid-a", "sid-a", "sid-b").unwrap(),
+            polite_role("uid-a", "uid-z", "sid-b", "sid-a").unwrap(),
+        );
+        xor(
+            polite_role("same-user", "same-user", "sid-a", "sid-b").unwrap(),
+            polite_role("same-user", "same-user", "sid-b", "sid-a").unwrap(),
+        );
+        xor(
+            polite_role("uid-a", "uid-b", "sid-z", "sid-a").unwrap(),
+            polite_role("uid-b", "uid-a", "sid-a", "sid-z").unwrap(),
+        );
+    }
+
+    #[test]
+    fn polite_role_rejects_equal_identity_tuple() {
+        assert!(polite_role("same", "same", "sid", "sid").is_err());
+    }
+
+    #[test]
+    fn polite_role_rejects_non_ascii_uid() {
+        assert!(polite_role("uid-😀", "uid-a", "sid-a", "sid-b").is_err());
     }
 
     #[test]

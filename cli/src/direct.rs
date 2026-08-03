@@ -1579,6 +1579,14 @@ pub async fn accept_workers(
 
 // ============================================================== orchestrator ==
 
+fn answerer_for(my_uid: &str, peer_uid: &str, my_id: &str, peer_id: &str) -> Result<bool> {
+    crate::net::polite_role(my_uid, peer_uid, my_id, peer_id)
+}
+
+fn preferred_connection(is_dialer: bool, answerer: bool) -> bool {
+    is_dialer == !answerer
+}
+
 /// The simultaneous-open race: run the acceptor AND dial every peer candidate
 /// concurrently; the FIRST connection to pass the pair-secret MAC wins, the
 /// rest are dropped. Returns an authenticated `Arc<dyn Transport>` or None
@@ -1592,10 +1600,12 @@ pub async fn race_connect(
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
+    my_uid: String,
+    peer_uid: String,
+    my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
-    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
-    race_connect_labeled(endpoint, peer_cands, secret, peer_id, tx, "direct-quic", answerer).await
+    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic").await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
@@ -1606,16 +1616,19 @@ pub async fn race_connect_labeled(
     peer_cands: Vec<String>,
     secret: &str,
     peer_id: String,
+    my_uid: String,
+    peer_uid: String,
+    my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
-    // Which L2 sid half THIS end allocates from (Transport::sid_answerer). It is
-    // the application-level role, NOT the QUIC race outcome (simultaneous open can
-    // let both ends win as dialer): the side that ran the command (`bring_up`,
-    // connector) passes false; the side whose daemon received the transport-offer
-    // (`on_transport_offer`, acceptor) passes true. Opposite on the two ends, so
-    // their sids never collide.
-    answerer: bool,
 ) -> Option<Arc<dyn Transport>> {
+    let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("direct role election failed for peer {peer_id}: {error}");
+            return None;
+        }
+    };
     // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
     // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2, a
     // hole-punch race carries a distinct label.
@@ -1635,14 +1648,16 @@ pub async fn race_connect_labeled(
         conn: quinn::Connection,
         tkey: [u8; 32],
         is_dialer: bool,
-    ) -> Result<(quinn::Connection, SendStream, RecvStream)> {
+    ) -> Result<(quinn::Connection, SendStream, RecvStream, bool)> {
         let (s, r) = authenticate(&conn, &tkey, is_dialer).await?;
-        Ok((conn, s, r))
+        Ok((conn, s, r, is_dialer))
     }
 
-    let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(quinn::Connection, SendStream, RecvStream)>> + Send>>> = Vec::new();
+    let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(quinn::Connection, SendStream, RecvStream, bool)>> + Send>>> = Vec::new();
 
-    // Acceptor side: accept inbound, then auth as acceptor.
+    // Acceptor side: accept exactly one inbound, then auth as acceptor. The
+    // deterministic winner fallback below depends on this bound; an accept
+    // loop requires a new selection rule.
     {
         let ep = endpoint.clone();
         let tkey = tkey;
@@ -1670,9 +1685,31 @@ pub async fn race_connect_labeled(
     let race = async {
         use futures_util::stream::{FuturesUnordered, StreamExt};
         let mut set: FuturesUnordered<_> = futs.into_iter().collect();
-        while let Some(res) = set.next().await {
+        let mut fallback = None;
+        // Prefer the connection dialed by the non-answerer. If both directions
+        // authenticate, both ends see and choose that same connection. If only
+        // one direction exists, both ends fall back to that sole connection.
+        // The fallback is unique because mutual authentication plus this
+        // single accept bounds successful connections to one per direction;
+        // changing accept into a loop would require a new winner rule.
+        // Give the preferred direction a quarter of the existing direct budget
+        // to arrive after a non-preferred auth. This is bounded by a derived
+        // transport timeout, not a new magic latency, and only matters when the
+        // answerer authenticated its own dial first.
+        let preferred_deadline = tokio::time::Instant::now() + DIRECT_BUDGET / 4;
+        loop {
+            let next = tokio::time::timeout_at(preferred_deadline, set.next()).await;
+            let Some(res) = (match next {
+                Ok(value) => value,
+                Err(_) => return fallback,
+            }) else { return fallback };
             match res {
-                Ok((conn, send, recv)) => return Some((conn, send, recv)),
+                Ok((conn, send, recv, is_dialer)) => {
+                    if preferred_connection(is_dialer, answerer) {
+                        return Some((conn, send, recv, is_dialer));
+                    }
+                    fallback = Some((conn, send, recv, is_dialer));
+                }
                 Err(e) => {
                     // Auth failures are the negative-gate signal, make them
                     // greppable. Dial failures (unreachable candidate) are noise.
@@ -1684,7 +1721,7 @@ pub async fn race_connect_labeled(
                 }
             }
         }
-        None
+        
     };
 
     let winner = match tokio::time::timeout(DIRECT_BUDGET, race).await {
@@ -1695,7 +1732,7 @@ pub async fn race_connect_labeled(
         }
     };
 
-    let (conn, send, recv) = winner;
+    let (conn, send, recv, _is_dialer) = winner;
     // DEBUG, direct-connect diagnostic (the user-facing route label is the
     // `route:` line emitted in main.rs; this is the internal detail).
     crate::ui::debug(&format!(
@@ -1730,6 +1767,13 @@ pub async fn race_connect_labeled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answerer_role_is_opposite_for_both_quic_ends() {
+        let a = answerer_for("uid-a", "uid-b", "sid-a", "sid-b").unwrap();
+        let b = answerer_for("uid-b", "uid-a", "sid-b", "sid-a").unwrap();
+        assert_ne!(a, b, "QUIC ends must allocate opposite sid halves");
+    }
 
     #[test]
     fn hkdf_is_deterministic_and_independent() {
@@ -1775,5 +1819,13 @@ mod tests {
         assert_ne!(dialer, acceptor, "direction-tagged tags differ");
         // Wrong secret -> wrong tag (the negative-auth property).
         assert_ne!(auth_tag(&k2, &km, "dialer"), dialer);
+    }
+
+    #[test]
+    fn preferred_connection_matches_on_both_ends() {
+        assert!(preferred_connection(true, false));
+        assert!(!preferred_connection(true, true));
+        assert!(!preferred_connection(false, false));
+        assert!(preferred_connection(false, true));
     }
 }

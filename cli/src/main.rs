@@ -1574,6 +1574,29 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     None
 }
 
+fn fleet_certificate_warning(name: &str) -> Option<String> {
+    let cert = device_cert_for(name)?;
+    let owner = load_owner_key()?;
+    fleet_certificate_warning_for(name, &cert, owner.public_key_bytes(), identity::now_secs())
+}
+
+fn fleet_certificate_warning_for(
+    name: &str,
+    cert: &identity::DeviceCert,
+    owner_pub: [u8; 32],
+    now: u64,
+) -> Option<String> {
+    if cert.user_pub != owner_pub || cert.expires <= now {
+        return None;
+    }
+    Some(format!(
+        "{} {} still has fleet access via its certificate.\n  To remove it entirely: filament revoke {} --certificate",
+        ui::paint(ui::Tone::Warn, ui::glyph_warn()),
+        name,
+        name,
+    ))
+}
+
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
@@ -3595,7 +3618,7 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
 
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, false).await?;
@@ -3786,7 +3809,7 @@ async fn enroll_and_send_cmd(
                 // The owner daemon is already in the enroll room; the server hands
                 // us its roster here. Dial each peer (owner answers) so rendezvous
                 // does not depend on a later peer-joined we would otherwise miss.
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers { conn.maybe_adopt(p, true).await?; }
                 }
@@ -4012,7 +4035,7 @@ async fn enroll_and_netcat_cmd(
                 // The owner daemon is already in the enroll room; the server hands
                 // us its roster here. Dial each peer (owner answers) so rendezvous
                 // does not depend on a later peer-joined we would otherwise miss.
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers { conn.maybe_adopt(p, true).await?; }
                 }
@@ -4483,11 +4506,20 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 // C30 (dissolves the C28 belt): fresh sid, re-assert via session.
                 sess.invalidate();
             }
-            Ev::Synced(v) => { sess.on_synced(&v); }
+            // C30 phase 2: reconcile the roster the digest carries so a missed
+            // `welcome`/`peer-joined` self-corrects instead of stranding this
+            // wait. `introduce` waits on room presence, so it is class S.
+            Ev::Synced(v) => {
+                if let Some(peers) = sess.on_synced(&v) {
+                    for p in &peers {
+                        conn.maybe_adopt(p, false).await?;
+                    }
+                }
+            }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own processes share these channels
@@ -5039,7 +5071,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         };
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, true).await?;
@@ -5047,7 +5079,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 }
                 sess.invalidate(); // C30: fresh sid, re-assert next tick
             }
-            Ev::Synced(v) => { sess.on_synced(&v); }
+            // C30 phase 2: same reconciliation as the Welcome arm above. Pairing
+            // waits on the peer arriving in the room, so a dropped `peer-joined`
+            // would otherwise strand the ceremony until the deadline.
+            Ev::Synced(v) => {
+                if let Some(peers) = sess.on_synced(&v) {
+                    for p in &peers {
+                        conn.maybe_adopt(p, true).await?;
+                    }
+                }
+            }
             Ev::PairOk(_v) => {
                 // L1-a: the server allocated our nameplate. Display the FULL code
                 // from OUR OWN local mint (the server never echoed any words).
@@ -6289,7 +6330,19 @@ impl Conn {
         Ok(self.is_active(&peer_id))
     }
 
+    /// `#[track_caller]` so a teardown NAMES the path that ordered it. There are
+    /// 17 call sites, and a link that dies 40ms after authenticating leaves a
+    /// `timed out waiting for a peer` whose guard cannot distinguish "no peer
+    /// ever arrived" from "the peer's link died". Two of us built root-cause
+    /// narratives out of that ambiguity before noticing the instrument was
+    /// missing. This is that instrument: no runtime cost, and it cannot drift
+    /// from the call sites the way a manual audit does.
+    #[track_caller]
     fn drop_link(&mut self, pid: &str) {
+        ui::debug(&format!(
+            "  drop_link({pid}) ordered by {}",
+            std::panic::Location::caller()
+        ));
         // #28: dropping a link also discharges any deferred peer-left for it,
         // so a supersede (maybe_adopt) of a deferred same-uid sid can't leave a
         // stale entry blocking adoption. Invariant: deferred_left only ever
@@ -6461,16 +6514,44 @@ impl Conn {
         if self.resil.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
             return Ok(());
         }
-        self.drop_link(&peer_id); // re-establish replaces any same-sid link
+        // Build the replacement BEFORE destroying what we have. The drop used to
+        // happen here, ahead of `fetch_config` and the peer construction below,
+        // both of which are fallible and one of which is a network round trip to
+        // the signaling server. On any error this returned Err with the link
+        // already gone, and three call sites discard that Err, so a transient
+        // failure silently converted a working link into no link at all. That is
+        // the fallback path: `expired_direct` -> `establish` is what Option A
+        // promises when a direct race loses, so a fallback that can destroy
+        // without rebuilding is worse than no fast path.
+        //
+        // Carry the pair-secret forward too. `expected_secret` is what binds the
+        // post-channel pair-proof to the SAME device, and the designed fallback
+        // at the expiry site saves and restores it by hand. Any other path that
+        // rebuilt a link, including roster adoption, silently produced a link
+        // with `expected_secret: None`: no re-dial of direct, and no device
+        // binding. Preserving it here fixes every rebuild path at once instead
+        // of asking each caller to remember.
+        let carried_secret = self
+            .links
+            .get(&peer_id)
+            .and_then(|l| l.expected_secret.clone());
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
+        let peer_present = self.roster.contains_key(&peer_id);
         let name = info["name"].as_str().unwrap_or("peer").to_string();
         // C5: fresh ICE config (TURN creds are expiry-stamped HMACs) for
         // every attempt, not just the first.
         let mut cfg = net::fetch_config(&self.server).await?;
         self.chunk_size = cfg.chunk_size;
-        let polite = force_polite.unwrap_or_else(|| {
-            net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id)
-        });
+        let polite = match force_polite {
+            Some(value) => value,
+            None => match peer_uid.as_deref() {
+                Some(peer_uid) => net::polite_role(&self.my_uid, peer_uid, &self.my_id, &peer_id)?,
+                None => {
+                    let source = if peer_present { "presence" } else { "absent-roster" };
+                    net::polite_role_legacy(&self.my_uid, None, &self.my_id, &peer_id, source, peer_present)
+                },
+            },
+        };
         self.next_gen += 1;
         let generation = self.next_gen;
         // P1 relay-fallback gate (test-only): FILAMENT_TEST_WEBRTC_RELAY_ONLY=1
@@ -6492,6 +6573,7 @@ impl Conn {
         }
         let peer = Peer::connect(
             peer_id.clone(),
+            self.my_uid.clone(),
             polite,
             cfg.ice_servers,
             relay_ice,
@@ -6500,6 +6582,9 @@ impl Conn {
             generation,
         )
         .await?;
+        // Everything fallible is done: NOW replace. Until this point the old link
+        // was still serving, so an early return above leaves it untouched.
+        self.drop_link(&peer_id);
         self.links.insert(
             peer_id,
             Link {
@@ -6512,7 +6597,7 @@ impl Conn {
                 generation,
                 attempts: 0,
                 trusted: false,
-                expected_secret: None,
+                expected_secret: carried_secret,
                 verified_name: None,
                 presence: Presence::Connecting,
                 direct: false,
@@ -6594,7 +6679,9 @@ impl Conn {
             // never touches `links`, so it cannot disturb the relay path.
             if !self.links.contains_key(pid) {
                 let info = json!({ "id": pid, "name": name });
-                let _ = self.establish(info).await;
+                if let Err(e) = self.establish(info).await {
+                    ui::debug(&format!("  re-establish for {pid} failed: {e}"));
+                }
             }
             return;
         }
@@ -6630,7 +6717,20 @@ impl Conn {
                     (Some(v.0), v.1)
                 }
                 Err(e) => {
-                    ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e})"));
+                    // This return happens AFTER Option A has already dropped the
+                    // WebRTC link, and BEFORE anything is registered in
+                    // `direct_pending`. So `expired_direct` has nothing to expire,
+                    // `establish` is never called, and the link is destroyed with
+                    // no scheduled rebuild: the sender then waits out its full
+                    // claim deadline. Logged at DEBUG, not trace, because a
+                    // failure that silently destroys a working link must be
+                    // visible at the level CI actually captures. The failing
+                    // macOS job carried exactly one `filament:` line, so this
+                    // diagnostic could not have appeared even if it fired.
+                    ui::debug(&format!(
+                        "filament: direct disabled (endpoint bind failed: {e}); \
+                         WebRTC link already dropped and no fallback is pending"
+                    ));
                     return;
                 }
             }
@@ -6796,6 +6896,13 @@ impl Conn {
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
+        let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str()).map(str::to_owned);
+        let Some(peer_uid) = peer_uid else {
+            eprintln!("direct role election deferred for {pid}: no peer UID");
+            return;
+        };
+        let my_uid = self.my_uid.clone();
+        let my_id = self.my_id.clone();
         let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
             if is_probe {
                 Ev::DirectUpgradeReady(pid, t, route)
@@ -6824,12 +6931,11 @@ impl Conn {
                     }
                 }
             }
-            // rung-1: direct-dial QUIC over host candidates. answerer=true: this
-            // is on_transport_offer (the side whose daemon received the offer), so
-            // it allocates from the high L2 sid half (the connector side uses the
-            // low half) - keeps the two ends' sids disjoint.
+            // rung-1: direct-dial QUIC over host candidates. The answerer role is
+            // derived inside the race from both endpoint identity tuples, so the
+            // connector and offer-receiver cannot drift via caller literals.
             if let Some(t) =
-                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone(), true).await
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone()).await
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
@@ -6847,8 +6953,10 @@ impl Conn {
                         peer_srflx,
                         &secret,
                         pid_s.clone(),
+                        my_uid.clone(),
+                        peer_uid.clone(),
+                        my_id.clone(),
                         tx.clone(),
-                        true, // answerer (same on_transport_offer/acceptor side)
                     )
                     .await
                     {
@@ -6977,7 +7085,20 @@ impl Conn {
             return;
         }
         let peer_uid = self.roster.get(pid).and_then(|i| i["uid"].as_str());
-        let answerer = net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid);
+        let peer_present = self.roster.contains_key(pid);
+        let answerer = match peer_uid {
+            Some(peer_uid) => match net::polite_role(&self.my_uid, peer_uid, &self.my_id, pid) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("direct worker role election failed for {pid}: {error}");
+                    return;
+                }
+            },
+            None => {
+                let source = if peer_present { "presence" } else { "absent-roster" };
+                net::polite_role_legacy(&self.my_uid, None, &self.my_id, pid, source, peer_present)
+            }
+        };
         let count = k - 1;
         let pid = pid.to_string();
         let tx = self.tx.clone();
@@ -7482,7 +7603,11 @@ impl Conn {
             } else {
                 // No stored secret to re-dial direct, fall back to a WebRTC
                 // re-establish under the session (still preserves the partial).
-                let _ = self.establish(info).await;
+                // This IS the fallback: swallowing its failure is how a lost
+                // direct race became a transfer with no link and no diagnostic.
+                if let Err(e) = self.establish(info).await {
+                    ui::debug(&format!("  WebRTC fallback for {pid} failed: {e}"));
+                }
                 if was_active {
                     self.active = Some(pid.to_string());
                 }
@@ -7531,7 +7656,9 @@ impl Conn {
         // Carry the proven identity into the fresh relay link so the post-channel
         // pair-proof still binds to the same device (set after establish creates
         // the Link below).
-        let _ = self.establish(info).await;
+        if let Err(e) = self.establish(info).await {
+            ui::debug(&format!("  relay-only re-establish for {pid} failed: {e}"));
+        }
         if let (Some(l), Some(ks)) = (self.links.get_mut(pid), known) {
             l.expected_secret = Some(ks);
         }
@@ -8113,6 +8240,14 @@ impl Conn {
     }
 
     async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
+        if let Some(uid) = data["uid"].as_str() {
+            net::ensure_ascii_uid(uid)?;
+            if let Some(info) = self.roster.get_mut(from) {
+                info["uid"] = json!(uid);
+            } else {
+                self.roster.insert(from.to_string(), json!({ "id": from, "uid": uid }));
+            }
+        }
         if self.links.contains_key(from) {
             return Ok(());
         }
@@ -9683,17 +9818,12 @@ async fn main() -> Result<()> {
             }
             if capability == "shell" {
                 sshkeys::remove_authorized_key(&device)?;
-                if device_cert_for(&device).is_some() {
-                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
-                } else {
-                    println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
-                }
+                println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
             } else {
-                if device_cert_for(&device).is_some() {
-                    println!("revoked '{capability}' from '{device}'; this device still has fleet access via its certificate. To remove it entirely: filament revoke {device} --certificate");
-                } else {
-                    println!("revoked '{capability}' from '{device}'.");
-                }
+                println!("revoked '{capability}' from '{device}'.");
+            }
+            if let Some(warning) = fleet_certificate_warning(&device) {
+                eprintln!("{warning}");
             }
             Ok(())
         }
@@ -10564,7 +10694,7 @@ async fn send_cmd(
 
         match ev {
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 // P5 (GAP-6): a fresh signaling welcome (reconnect) is a moment a
                 // new direct path may have appeared, re-probe immediately for any
                 // relay-committed peer rather than waiting out the backoff.
@@ -10578,8 +10708,20 @@ async fn send_cmd(
                 // sid-keyed is gone; invalidate and let the session re-assert.
                 sess.invalidate();
             }
-            // C30: server confirmed our session digest.
-            Ev::Synced(v) => { sess.on_synced(&v); }
+            // C30: server confirmed our session digest. Phase 2: reconcile the
+            // roster it carries, so a `welcome` or `peer-joined` we never
+            // received self-corrects. Without this the sender waits out the
+            // full 600s claim deadline while the peer can see it, which is the
+            // one-directional presence failure the macOS smoke job hits: the
+            // receiver recovers via this same digest (it already reconciles),
+            // the sender never did because it discarded the roster.
+            Ev::Synced(v) => {
+                if let Some(peers) = sess.on_synced(&v) {
+                    for p in &peers {
+                        conn.maybe_adopt(p, code_used).await?;
+                    }
+                }
+            }
             // L1-a: the server allocated our v2 nameplate. Display the FULL
             // `words-nameplate` code assembled from OUR OWN local mint (the
             // server never echoes any words). The receiver runs the SAME
@@ -13303,7 +13445,7 @@ async fn recv_cmd(
                 ));
             }
             Ev::Welcome(v) => {
-                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
                 // P5 (GAP-6): a fresh welcome (signaling reconnect) may mean the
                 // network just changed under us, re-probe relay-committed peers for
                 // a direct path immediately instead of waiting out the backoff.
@@ -16450,15 +16592,14 @@ mod tests {
     #[test]
     fn polite_role_matches_browser() {
         // uid comparison wins, string-lexicographic, mirrors webrtc.js politeRole
-        assert!(net::polite_role("b", Some("a"), "x", "y")); // myUid > peerUid -> polite
-        assert!(!net::polite_role("a", Some("b"), "x", "y"));
-        // identical/missing uids fall back to sids
-        assert!(net::polite_role("a", Some("a"), "y", "x"));
-        assert!(!net::polite_role("a", None, "x", "y"));
+        assert!(net::polite_role("b", "a", "x", "y").unwrap()); // myUid > peerUid -> polite
+        assert!(!net::polite_role("a", "b", "x", "y").unwrap());
+        // Equal UIDs break ties by session ID within the same tuple comparison.
+        assert!(net::polite_role("a", "a", "y", "x").unwrap());
         // exactly one side of any pair is impolite
         for (a, b) in [("a", "b"), ("cli-1", "cli-2"), ("zz", "aa")] {
-            let p1 = net::polite_role(a, Some(b), "s1", "s2");
-            let p2 = net::polite_role(b, Some(a), "s2", "s1");
+            let p1 = net::polite_role(a, b, "s1", "s2").unwrap();
+            let p2 = net::polite_role(b, a, "s2", "s1").unwrap();
             assert_ne!(p1, p2, "{a} vs {b} must disagree");
         }
     }
@@ -17073,5 +17214,20 @@ mod tests {
             classify_bare_token("xyzpdq", &|_| false, &|t| known.contains(t)),
             BareTarget::Unknown
         );
+    }
+    #[test]
+    fn capability_revoke_warning_only_live_same_owner_cert() {
+        let cert = identity::DeviceCert::from_json(&serde_json::json!({
+            "devicePub": hex::encode([0x11u8; 32]),
+            "userPub": hex::encode([0x22u8; 32]),
+            "expires": 200,
+            "issued": 100,
+            "sig": hex::encode([0u8; 64]),
+        })).unwrap();
+        let warning = fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 150).unwrap();
+        assert!(warning.contains("laptop still has fleet access via its certificate"));
+        assert!(warning.contains("filament revoke laptop --certificate"));
+        assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
+        assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
     }
 }

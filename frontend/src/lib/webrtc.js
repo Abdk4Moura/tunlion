@@ -307,15 +307,31 @@ async function blobHash(blob) {
   }
 }
 
-// Deterministic negotiation roles (#1, hardened in #8/#10): prefer the stable
-// per-tab uid, it survives reconnects, so both sides always compare the SAME
-// pair even when one of them holds a stale sid. Fall back to sids, then to
-// polite (wait for the offer) when we know nothing yet.
+// Deterministic negotiation roles: compare the same (uid, session-id) tuple on
+// both sides. UIDs must be ASCII because Rust and JS order non-ASCII strings
+// differently. Session IDs must differ whenever UIDs tie.
 export function politeRole({ myUid, peerUid, myId, peerId }) {
+  if (myUid == null || peerUid == null || myId == null || peerId == null) {
+    throw new Error('politeRole requires peer and local UIDs and session IDs')
+  }
+  if (!/^[\x00-\x7F]*$/.test(myUid) || !/^[\x00-\x7F]*$/.test(peerUid)) {
+    throw new Error('politeRole requires ASCII UIDs')
+  }
+  if (myUid === peerUid && myId === peerId) {
+    throw new Error(`politeRole identity tuple collision: uid=${myUid} sid=${myId}`)
+  }
+  return myUid > peerUid || (myUid === peerUid && myId > peerId)
+}
+
+// Phase-1 compatibility only. Mixed-version peers can still disagree here;
+// this path is measured and must be removed in phase 2.
+export function legacyPoliteRole({ myUid, peerUid, myId, peerId }) {
+  console.warn('politeRole: legacy path', { peerPresent: true, uidAvailable: peerUid != null, myId, peerId })
   if (myUid && peerUid && myUid !== peerUid) return myUid > peerUid
   if (myId && peerId) return myId > peerId
   return true
 }
+
 
 export class PeerLink {
   /**
@@ -329,8 +345,9 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, relayOnly, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
+  constructor({ id, name, iceServers, relayOnly, chunkSize, polite, myUid, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
     this.id = id
+    this.myUid = myUid
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
     this.sendSignal = sendSignal
@@ -447,7 +464,7 @@ export class PeerLink {
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
         rlog.trace('ice candidate', this.id.slice(-6), e.candidate.candidate)
-        this.sendSignal({ type: 'candidate', candidate: e.candidate })
+        this.sendSignal({ type: 'candidate', uid: this.myUid, candidate: e.candidate })
       }
     }
     // All (re)negotiation funnels through here, we never hand-roll offers.
@@ -458,7 +475,7 @@ export class PeerLink {
         this._makingOffer = true
         const offer = await this.pc.createOffer()
         await this.pc.setLocalDescription(offer)
-        this.sendSignal({ type: 'description', description: this.pc.localDescription })
+        this.sendSignal({ type: 'description', uid: this.myUid, description: this.pc.localDescription })
       } catch (err) {
         rlog.error('negotiation failed', this.id.slice(-6), err)
       } finally {
@@ -554,7 +571,7 @@ export class PeerLink {
       if (description.type === 'offer') {
         const answer = await this.pc.createAnswer() // explicit, for older Safari
         await this.pc.setLocalDescription(answer)
-        this.sendSignal({ type: 'description', description: this.pc.localDescription })
+        this.sendSignal({ type: 'description', uid: this.myUid, description: this.pc.localDescription })
       }
     } else if (data.type === 'candidate') {
       // Hold candidates until there's a remote description to attach them to.
