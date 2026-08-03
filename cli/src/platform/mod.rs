@@ -39,6 +39,13 @@ impl Paths {
         Self::config_dir().join(relative)
     }
 
+    /// Repair permissions on sensitive state left by older releases. This is
+    /// intentionally separate from SecretFile::write: an unchanged legacy
+    /// file is otherwise never rewritten and never gets its mode repaired.
+    pub fn repair_sensitive_permissions() -> std::io::Result<usize> {
+        repair_sensitive_permissions_in(&Self::config_dir())
+    }
+
     /// Migrate state from a legacy cwd-relative `.config/filament` directory
     /// (the broken Windows fallback when HOME was unset). Best-effort, safe
     /// to call repeatedly.
@@ -143,6 +150,73 @@ impl Paths {
         {
             "/bin/sh".into()
         }
+    }
+}
+
+fn repair_sensitive_permissions_in(dir: &Path) -> std::io::Result<usize> {
+    let mut repaired = 0;
+    for name in [
+        "caps.json",
+        "devices.json",
+        "device.id",
+        "peerconf",
+        "identity.ed25519",
+        "overlay.ed25519",
+        "diag.jsonl",
+    ] {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        if path.is_dir() {
+            repaired += repair_sensitive_dir(&path)?;
+        } else if repair_sensitive_file(&path)? {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
+fn repair_sensitive_dir(dir: &Path) -> std::io::Result<usize> {
+    let mut repaired = 0;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(dir)?.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            repaired += 1;
+        }
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_file() && repair_sensitive_file(&path)? {
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
+}
+
+fn repair_sensitive_file(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path)?.permissions().mode() & 0o777 == 0o600 {
+            return Ok(false);
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    {
+        // Reassert the owner-only ACL on existing files. APPDATA is already
+        // user-scoped, but old files may predate the SecretFile writer.
+        SecretFile::restrict(path)?;
+        return Ok(true);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(false)
     }
 }
 
@@ -780,5 +854,25 @@ mod tests {
         assert_eq!(args[0], "bash");
         assert_eq!(args[1], "-c");
         assert_eq!(args[2], "echo x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repairs_preexisting_world_readable_caps_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("filament-perm-repair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let caps = dir.join("caps.json");
+        std::fs::write(&caps, "[]").unwrap();
+        std::fs::set_permissions(&caps, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777, 0o644);
+
+        let repaired = repair_sensitive_permissions_in(&dir).unwrap();
+
+        assert_eq!(repaired, 1);
+        assert_eq!(std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

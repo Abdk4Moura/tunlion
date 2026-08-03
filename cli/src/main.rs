@@ -9327,6 +9327,13 @@ async fn main() -> Result<()> {
     // Migrate state from legacy cwd-relative .config/filament (the broken
     // Windows fallback when HOME was unset) to the platform-correct path.
     platform::Paths::migrate_legacy();
+    match platform::Paths::repair_sensitive_permissions() {
+        Ok(repaired) if repaired > 0 => {
+            eprintln!("filament: repaired permissions on {repaired} sensitive config path(s)");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("filament: sensitive config permission repair failed: {e}"),
+    }
     // Bare-arg comfort dispatch: `filament <path>` sends it with a code;
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
