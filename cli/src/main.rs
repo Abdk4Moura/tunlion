@@ -6898,20 +6898,35 @@ impl Conn {
             .map(|l| l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true) && l.workers.iter().all(|w| w.is_dead()))
             .unwrap_or(false);
         if link_dead {
-            self.direct_pending.remove(pid);
+            // The link is already dead, so destroying it loses nothing. Its
+            // PENDING is a different matter, see `supersede`.
             self.drop_link(pid);
         }
-        if self.direct_pending.contains_key(pid) {
-            if intent != DirectIntent::Promote {
-                return; // already trying
-            }
-            // A PROMOTION SUPERSEDES an in-flight attempt. Any pending started
-            // before PAKE completed was dialled without the shared secret and
-            // therefore cannot authenticate; letting it block the promotion is
-            // how Option A silently never runs, leaving the transfer to sit
-            // until the job times out. Drop the stale attempt and re-register
-            // below with the secret we now have.
-            self.direct_pending.remove(pid);
+        // A stale pending must not BLOCK a fresh attempt, but REMOVING it here
+        // would disarm the fallback, and the two are not the same thing.
+        //
+        // `expired_direct` reaps a pending in order to fire the WebRTC
+        // re-establish, so a pending removed now and not replaced is a recovery
+        // trigger that can never fire. `bind_endpoint` is ~24 lines below and
+        // returns ~100 lines BEFORE the re-insert, so a box where bind fails
+        // (which is exactly a box where the previous attempt died and left a
+        // dead link, so the two conditions co-occur by construction rather than
+        // by coincidence) ends with no link, no pending, and nothing armed.
+        //
+        // That is the same destroy-without-a-successor shape as the teardown
+        // bug this file already fixed, one level up: not the link this time,
+        // the recovery trigger. The rule is identical. Do not remove the
+        // pending until you are certain you can replace it.
+        //
+        // So the decision to supersede is made WITHOUT mutating. The insert
+        // below replaces the entry, and that is the first point at which we are
+        // certain a replacement exists. A promotion supersedes for its own
+        // reason: any pending started before PAKE completed was dialled without
+        // the shared secret and cannot authenticate, so letting it block the
+        // promotion is how Option A silently never runs.
+        let supersede = link_dead || intent == DirectIntent::Promote;
+        if self.direct_pending.contains_key(pid) && !supersede {
+            return; // already trying
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
         // promotion. Promotion is the one caller that intends to replace it.
