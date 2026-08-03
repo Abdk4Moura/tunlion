@@ -107,6 +107,7 @@ Faithfulness -- state <-> code:
 from collections import deque, namedtuple
 from itertools import product
 import os
+import re
 import sys
 
 # design x the four environment/config axes
@@ -235,10 +236,10 @@ def successors(s, cfg):
     # replacement is certain), so that transition is now unreachable in the code
     # and has been deleted here rather than left describing a fixed defect.
     #
-    # HONEST LIMITATION: the expiry check above tracks `ctrl_carries` only. It
-    # would NOT have caught this drift, because the transitions are a second
-    # staleness axis with no detector. If you change start_direct_inner's
-    # ordering, this file is on you.
+    # NO LONGER UNWATCHED: this deletion is registered in DELETED_TRANSITIONS
+    # with the code fact that justifies it, and gate 0 asserts that fact against
+    # the tree. Reintroduce the removal and the model says so, instead of
+    # quietly describing a defect the code has re-grown.
 
     # PATHSET retires the old path only once the new one is LIVE, and only after
     # it is actually carrying the transfer. Modeled as legal but never required.
@@ -578,6 +579,61 @@ if __name__ == '__main__':
         print(f'    4. set CALIBRATED_FOR = "{tree_state}" in this file')
         print("  Do NOT delete this check to clear it. Step 4 is the remedy.")
         sys.exit(1)
+
+    # ---------------------------------------------- deleted-transition guard
+    # The expiry above tracks ONE derived parameter. The model's TRANSITIONS are
+    # a second staleness axis, and this file previously said so and left it
+    # unwatched. claude-advisor's point: a transition deleted because the CODE
+    # made it unreachable rests on a fact about the code, and that fact is as
+    # readable from the tree as `fn rearm_channel_ready` was.
+    #
+    # So each such deletion records the fact that justified it, and the fact is
+    # asserted. If someone reintroduces the shape, the model says a transition
+    # it deleted is reachable again, instead of quietly describing a defect the
+    # code has re-grown.
+    #
+    # Bounded on purpose: only transitions deleted for CODE reasons, which is a
+    # handful, not every transition in the model.
+    #
+    # Brittle to renames, and deliberately so: a rename gives a false alarm, not
+    # silent staleness. A spurious red on a proof costs one commit; the failure
+    # it guards costs a subsystem.
+    def start_direct_inner_body(tree_src):
+        """The body of start_direct_inner, or None if it cannot be located."""
+        try:
+            i = tree_src.index("async fn start_direct_inner")
+        except ValueError:
+            return None
+        m = re.search(r"\n    (?:pub )?(?:async )?fn ", tree_src[i + 10:])
+        return tree_src[i:i + 10 + m.start()] if m else tree_src[i:]
+
+    DELETED_TRANSITIONS = [
+        (
+            "pending_cancelled_then_bind_fails",
+            "#85 (e0864ec) made the supersede decision without mutating, so a "
+            "pending is never cancelled ahead of a bind failure that returns "
+            "before the re-insert",
+            "start_direct_inner must not remove a direct_pending at all",
+            lambda body: "direct_pending.remove" not in body,
+        ),
+    ]
+
+    body = start_direct_inner_body(tree)
+    if body is None:
+        print("\n  TRANSITION GUARD UNVERIFIABLE: cannot locate start_direct_inner.")
+        print("  Failing to run is not passing. Fix the locator or the guard.")
+        sys.exit(1)
+    for name, why, fact, holds in DELETED_TRANSITIONS:
+        if not holds(body):
+            print(f"\n  DELETED TRANSITION IS REACHABLE AGAIN: {name}")
+            print(f"  deleted because: {why}")
+            print(f"  the fact that justified it: {fact}")
+            print("  That fact no longer holds, so this model is describing a")
+            print("  defect the code has re-grown. Restore the transition and")
+            print("  re-run the matrix, or fix the code back.")
+            sys.exit(1)
+    print(f"  transition guard: {len(DELETED_TRANSITIONS)}/{len(DELETED_TRANSITIONS)} "
+          "code facts behind deleted transitions still hold.")
 
     print(f"  calibration current: tree is {tree_state}, calibrated for")
     print(f"  {CALIBRATED_FOR}. Fails LOUD on drift; cleared by re-deriving and")
