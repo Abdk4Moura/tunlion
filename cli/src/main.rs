@@ -6514,7 +6514,27 @@ impl Conn {
         if self.resil.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
             return Ok(());
         }
-        self.drop_link(&peer_id); // re-establish replaces any same-sid link
+        // Build the replacement BEFORE destroying what we have. The drop used to
+        // happen here, ahead of `fetch_config` and the peer construction below,
+        // both of which are fallible and one of which is a network round trip to
+        // the signaling server. On any error this returned Err with the link
+        // already gone, and three call sites discard that Err, so a transient
+        // failure silently converted a working link into no link at all. That is
+        // the fallback path: `expired_direct` -> `establish` is what Option A
+        // promises when a direct race loses, so a fallback that can destroy
+        // without rebuilding is worse than no fast path.
+        //
+        // Carry the pair-secret forward too. `expected_secret` is what binds the
+        // post-channel pair-proof to the SAME device, and the designed fallback
+        // at the expiry site saves and restores it by hand. Any other path that
+        // rebuilt a link, including roster adoption, silently produced a link
+        // with `expected_secret: None`: no re-dial of direct, and no device
+        // binding. Preserving it here fixes every rebuild path at once instead
+        // of asking each caller to remember.
+        let carried_secret = self
+            .links
+            .get(&peer_id)
+            .and_then(|l| l.expected_secret.clone());
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
         let peer_present = self.roster.contains_key(&peer_id);
         let name = info["name"].as_str().unwrap_or("peer").to_string();
@@ -6562,6 +6582,9 @@ impl Conn {
             generation,
         )
         .await?;
+        // Everything fallible is done: NOW replace. Until this point the old link
+        // was still serving, so an early return above leaves it untouched.
+        self.drop_link(&peer_id);
         self.links.insert(
             peer_id,
             Link {
@@ -6574,7 +6597,7 @@ impl Conn {
                 generation,
                 attempts: 0,
                 trusted: false,
-                expected_secret: None,
+                expected_secret: carried_secret,
                 verified_name: None,
                 presence: Presence::Connecting,
                 direct: false,
@@ -6656,7 +6679,9 @@ impl Conn {
             // never touches `links`, so it cannot disturb the relay path.
             if !self.links.contains_key(pid) {
                 let info = json!({ "id": pid, "name": name });
-                let _ = self.establish(info).await;
+                if let Err(e) = self.establish(info).await {
+                    ui::debug(&format!("  re-establish for {pid} failed: {e}"));
+                }
             }
             return;
         }
@@ -7578,7 +7603,11 @@ impl Conn {
             } else {
                 // No stored secret to re-dial direct, fall back to a WebRTC
                 // re-establish under the session (still preserves the partial).
-                let _ = self.establish(info).await;
+                // This IS the fallback: swallowing its failure is how a lost
+                // direct race became a transfer with no link and no diagnostic.
+                if let Err(e) = self.establish(info).await {
+                    ui::debug(&format!("  WebRTC fallback for {pid} failed: {e}"));
+                }
                 if was_active {
                     self.active = Some(pid.to_string());
                 }
@@ -7627,7 +7656,9 @@ impl Conn {
         // Carry the proven identity into the fresh relay link so the post-channel
         // pair-proof still binds to the same device (set after establish creates
         // the Link below).
-        let _ = self.establish(info).await;
+        if let Err(e) = self.establish(info).await {
+            ui::debug(&format!("  relay-only re-establish for {pid} failed: {e}"));
+        }
         if let (Some(l), Some(ks)) = (self.links.get_mut(pid), known) {
             l.expected_secret = Some(ks);
         }
