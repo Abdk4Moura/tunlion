@@ -336,6 +336,11 @@ fn pair_and_transfer_smoke() {
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
 
+    // FILAMENT_DIRECT_PER_OS is the CI knob; it is forwarded to every spawned
+    // daemon as FILAMENT_DIRECT. Named for the workflow's per-OS matrix, but it
+    // reads as inert from cli/src because nothing there mentions it: the only
+    // consumer is this harness. macOS CI sets it to 0, so direct-QUIC is OFF
+    // there and every transfer rides WebRTC.
     let direct_flag = std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
 
     // Spawn send; drain stderr continuously in background to avoid SIGPIPE.
