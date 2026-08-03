@@ -242,11 +242,13 @@ for them. Requirements:
   needs elevation.
 - **Add the inbound firewall rule** during install (netsh on Windows) so direct
   QUIC is not silently blocked.
-- **Security:** a privileged always-on daemon plus `--shell` spawns shells as
-  LocalSystem/root. Keep `--shell` opt-in (it is) and require `--shell-user` for a
-  drop-to-account. That flag needs a real Windows implementation; it currently
-  only warns. Default `--install` is networking-only; shell stays a deliberate
-  extra step so default-on is never a footgun.
+- **Security:** a privileged always-on daemon plus `--shell` can spawn an
+  owner-equivalent shell. Shell-enabled startup requires `--shell-user` or the
+  explicit `--i-know` acknowledgement, enforced by `require_shell_owner_ack`.
+  `--shell-user` has a real Unix permission boundary; Windows does not support
+  another-user execution and remains explicitly unsupported. The acknowledgement
+  does not make shell bounded, and root adds machine-wide reach. Default
+  `--install` is networking-only; shell stays a deliberate extra step.
 
 ### Non-elevated: userspace overlay plus a proxy, zero install
 

@@ -94,14 +94,19 @@ rather than silently expose the file world-readably.
 - Ordinary user `alice` plus `--shell-user bob`: effective for the keys. Bob
   cannot read Alice-owned `0600` files, even when a custom config directory is
   `0755` and listable.
-- Root `up` plus no `--shell-user`: no privilege boundary. The PTY runs as root,
-  as the warning in `cli/src/main.rs:2799-2805` states.
+- Root `up` plus no `--shell-user`: the PTY would run as root and is
+  owner-equivalent, but startup now refuses unless the operator passes
+  `--i-know`; the gate is `require_shell_owner_ack` in `cli/src/main.rs`.
+- Any non-root `up` plus no `--shell-user`: the PTY still runs as that real user
+  and is owner-equivalent for that account, so the same `--i-know` acknowledgement
+  applies. Root is additionally machine-wide.
 - Windows: `--shell-user` is unsupported. The platform code returns the normal
   shell argv and reports that another-user execution requires credentials or an
   elevated process (`cli/src/platform/mod.rs:95-121`). The Unix permission
   conclusion must not be presented as a Windows guarantee.
 
 The mitigation is therefore genuine on Unix for current secret files, while
-the broader shell grant remains a separate authorization decision. Operators
-must still use shell capability scoping and should not expose a custom config
-directory's non-secret metadata as if it were protected.
+the broader shell grant remains a separate authorization decision. The
+acknowledgement gate does not bound shell authority. Operators must still use
+shell capability scoping and should not expose a custom config directory's
+non-secret metadata as if it were protected.

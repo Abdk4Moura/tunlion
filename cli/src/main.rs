@@ -2435,14 +2435,11 @@ fn daemon_alive() -> Option<u32> {
 
 /// The argv for a web-shell PTY.
 ///
-/// M-1 (privilege-drop): when `--shell-user <name>` is set, drop the PTY to that
-/// account via `runuser -l <user>` (a clean setuid+login-shell wrapper available
-/// on every systemd distro). `runuser` does no PAM password prompt, so it only
-/// works when `up` itself runs as root, which is exactly the case the flag is
-/// meant to de-fang (a root daemon should hand out a NON-root shell). Without the
-/// flag the PTY runs as the up-process user (often root on a server); this is an
-/// ACCEPTED RISK documented in docs/security/web-shell-review.md (M-1) and in the
-/// `up --shell` help. Operators are urged to pass `--shell-user`.
+/// M-1 (owner-equivalence gate): when `--shell-user <name>` is set, drop the PTY
+/// to that account via `runuser -l <user>`. Without it, the PTY runs as the
+/// up-process user and is owner-equivalent at any uid. Startup requires the
+/// explicit `--i-know` acknowledgement in `require_shell_owner_ack`; root also
+/// makes the shell machine-wide. See docs/security/web-shell-review.md.
 fn shell_argv(shell_program: Option<&str>, shell_user: Option<&str>) -> Vec<String> {
     let shell_config = settings::get_str("shell-program", None);
     let (argv, _can_user) = platform::Paths::shell_argv(shell_program, shell_config.as_deref(), shell_user);

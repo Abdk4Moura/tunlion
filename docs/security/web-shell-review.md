@@ -29,7 +29,8 @@ holds the `shell` cap) and **hardening gaps**, not gate bypasses. The two that
 should be fixed before shipping a public terminal are the **unbounded PTY/stream
 resource exhaustion** (no concurrency cap, `pty_resizers` leak) and the
 **multi-line pubkey injection** in `shell-bootstrap`. The **root-by-default PTY
-with no privilege-drop** is an accepted-risk that must be documented loudly.
+with no privilege-drop** is owner-equivalent authority. It is gated by explicit
+acknowledgement, but remains a capability that must be documented loudly.
 
 **Findings:** Critical 0 · High 1 · Medium 4 · Low 4
 
@@ -174,23 +175,24 @@ leg gets a different exporter value, so the tag can't be forwarded
 
 ---
 
-## 6. PTY runs as the `up` user (often root) — acceptable? privilege-drop?
+## 6. PTY runs as the `up` user (often root) — gated owner-equivalence
 
-`shell_argv()` spawns the up-process user's login shell with no UID change
-(main.rs:794–799; the doc comment explicitly defers privilege-drop to a future
-`--shell-user`). `serve_pty` inherits the daemon's full environment and spawns the
-shell directly (l2.rs:271–285). If `filament up` runs as root (the documented
-`--install` systemd service runs as the invoking user, frequently root on a
-server), **every granted device gets an interactive root shell** with no audit
-beyond an `eprintln!`.
+`shell_argv()` spawns the up-process user's login shell unless `--shell-user`
+selects a Unix `runuser -l <user>` boundary (main.rs:2433–2447;
+platform/mod.rs:107–113). `serve_pty` inherits the daemon's full environment and
+spawns the shell directly (l2.rs:271–285). A shell grant is therefore
+**OWNER-EQUIVALENT at any uid**: the PTY runs as a real account and can act as
+that account, including reading its Filament configuration. If `filament up`
+runs as root, root additionally gives the shell machine-wide reach.
 
-Given the gate (proof + `shell` cap), this is *defensible* for an explicitly
-granted device, but it is a sharp edge that pairs badly with **`--shell` granting
-all devices** (§2) and the **unbounded fan-out** (§8). This is **Finding M-1**:
-ship `--shell-user` (drop to a named non-root account via `setuid`/`CommandBuilder`
-before exec, and refuse to spawn a root PTY unless an explicit
-`--shell-allow-root` is passed), and document the root risk in the `up --shell`
-help text. Until then the risk must be stated loudly in user-facing docs.
+The gate is enforced before daemon startup by `require_shell_owner_ack` in
+`cli/src/main.rs` (introduced with `--i-know`): any shell-enabled policy without
+`--shell-user` refuses unless the operator explicitly passes `--i-know`. The
+runtime banner repeats the same truth. `--shell-user` bounds file access only
+when the selected account cannot read `FILAMENT_CONFIG_DIR`; the PTY still runs
+as that real account and is not a bounded capability. This gate closes the
+accepted-risk posture, but it does not make shell safe or equivalent to a
+limited transfer or mount permission.
 
 ---
 
@@ -269,19 +271,21 @@ and `global_pty_cap_is_enforced` cover the caps.
 
 ### Medium
 
-**M-1 — Root PTY with no privilege-drop.** `main.rs:shell_argv`, `l2.rs:serve_pty`.
-The shell runs as the (often root) up user. **STATUS: FIXED (implemented).**
-`up --shell-user <name>` now drops the web-shell/ssh PTY to a named non-root
-account via `runuser -l <user>` (threaded through `up_cmd` → `recv_cmd` →
-`shell_argv` → `serve_pty`, alongside the existing `--shell` plumbing, and carried
-into the systemd unit on `--install`). When a shell policy is active WITHOUT
-`--shell-user`, `up` refuses to start unless the operator passes `--i-know`.
-This is owner-equivalence at any uid because the PTY runs as the up-process user
-and can read the config directory; root additionally makes the shell machine-wide.
-With `--shell-user`, `up` prints a note that the dropped account must not be able
-to read `FILAMENT_CONFIG_DIR`, or the drop is cosmetic. `runuser` requires the
-daemon itself to be root (it is a setuid login wrapper with no password prompt),
-which is exactly the case the flag de-fangs.
+**M-1 — Owner-equivalent shell authority.** `main.rs:shell_argv`,
+`l2.rs:serve_pty`. **STATUS: GATED, not bounded.** The gate is
+`require_shell_owner_ack` in `cli/src/main.rs`, and
+`shell_owner_gate_refuses_real_spawn` in `cli/tests/capability_harness.rs` proves
+that refusal happens before signaling. `up --shell-user <name>`
+drops the web-shell/ssh PTY to a named account via `runuser -l <user>`. Without
+that flag, `require_shell_owner_ack` refuses any shell-enabled startup unless
+the operator passes `--i-know`. This applies at **any uid** because the PTY runs
+as a real account and can act as that account, including reading its Filament
+configuration. When the daemon is root, the shell additionally has machine-wide
+reach. With `--shell-user`, file access is bounded only when the selected account
+cannot read `FILAMENT_CONFIG_DIR`; the PTY remains a real-account shell, not a
+bounded permission. `runuser` requires the daemon itself to be root (it is a
+setuid login wrapper with no password prompt). The acknowledgement makes the
+operator accept owner-equivalence; it does not make shell safe or limited.
 
 **M-2 — `--shell` over-grants to all paired + future devices.** `main.rs:818`,
 `main.rs:840`, `main.rs:4409` (pair-intro adds devices later). `ShellPolicy::All`
@@ -346,10 +350,11 @@ build cfg or an explicit `FILAMENT_TEST=1`, and never let it neutralize
 ## Ship-readiness verdict
 
 **Ship-blocked on H-1 and M-3; ship-ready once those are fixed and M-1/M-2 are
-documented — the trust gate and channel bindings themselves are sound.**
+documented and acknowledged — the trust gate and channel bindings themselves
+are sound.**
 
 **UPDATE (hardening pass applied):** H-1 and M-3 are FIXED with regression tests;
-M-1 is IMPLEMENTED (`--shell-user` privilege-drop plus the mandatory
-owner-equivalence gate, with `--i-know` as the explicit override); M-2 is
+M-1 is GATED (`--i-know` acknowledgement plus `--shell-user` privilege-drop)
+while shell remains owner-equivalent; M-2 is
 DOCUMENTED as intentional (code comment + banner + this doc). `cargo test
 --release` green. The Low findings (L-1..L-4) and M-4 are unchanged.
