@@ -6179,19 +6179,6 @@ impl Conn {
         self.links.get(pid).and_then(|l| l.transport.clone())
     }
 
-    /// Whether this link has ANY live transport (primary or workers) that can
-    /// actually carry bytes. False when the link entry exists but all transports
-    /// are dead — the "corpse" state the liveness guard must purge.
-    fn has_live_transport(&self, pid: &str) -> bool {
-        self.links.get(pid)
-            .map(|l| {
-                let primary_ok = l.transport.as_ref().map(|t| !t.is_dead()).unwrap_or(false);
-                let workers_ok = l.workers.iter().any(|w| !w.is_dead());
-                primary_ok || workers_ok
-            })
-            .unwrap_or(false)
-    }
-
     /// #28: is the link keyed by `pid` actively moving transfer bytes right now?
     /// The data channel is independent of the signaling socket, so when a
     /// same-uid reconnect arrives as a new sid, superseding must NOT tear down
