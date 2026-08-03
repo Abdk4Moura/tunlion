@@ -118,6 +118,16 @@ impl Session {
     /// what we sent, so a later desire change diffs against it correctly.
     /// Phase 2: the digest may carry the server's roster (`peers`), the
     /// loops reconcile against it (missed peer-joined/left self-correct).
+    /// The returned roster is the RECOVERY CHANNEL for every class-S push
+    /// (`welcome`, `peer-joined`, `peer-left`): a consumer that misses one
+    /// re-derives it here. `#[must_use]` because three call sites silently
+    /// discarded it with a bare `sess.on_synced(&v);`, which is how a sender
+    /// that missed a `peer-joined` waited out its full claim deadline while
+    /// the peer could see it. Discarding must now be deliberate and explained,
+    /// never accidental.
+    #[must_use = "the digest roster is how a missed peer-joined/peer-left is \
+                  recovered; reconcile it, or explain in a comment why this \
+                  command cannot miss one"]
     pub fn on_synced(&mut self, v: &Value) -> Option<Vec<Value>> {
         if v["ok"].as_bool() != Some(true) {
             return None; // error digests carry no roster (server contract)

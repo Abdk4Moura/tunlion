@@ -4510,7 +4510,16 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 // C30 (dissolves the C28 belt): fresh sid, re-assert via session.
                 sess.invalidate();
             }
-            Ev::Synced(v) => { sess.on_synced(&v); }
+            // C30 phase 2: reconcile the roster the digest carries so a missed
+            // `welcome`/`peer-joined` self-corrects instead of stranding this
+            // wait. `introduce` waits on room presence, so it is class S.
+            Ev::Synced(v) => {
+                if let Some(peers) = sess.on_synced(&v) {
+                    for p in &peers {
+                        conn.maybe_adopt(p, false).await?;
+                    }
+                }
+            }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own processes share these channels
@@ -5070,7 +5079,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 }
                 sess.invalidate(); // C30: fresh sid, re-assert next tick
             }
-            Ev::Synced(v) => { sess.on_synced(&v); }
+            // C30 phase 2: same reconciliation as the Welcome arm above. Pairing
+            // waits on the peer arriving in the room, so a dropped `peer-joined`
+            // would otherwise strand the ceremony until the deadline.
+            Ev::Synced(v) => {
+                if let Some(peers) = sess.on_synced(&v) {
+                    for p in &peers {
+                        conn.maybe_adopt(p, true).await?;
+                    }
+                }
+            }
             Ev::PairOk(_v) => {
                 // L1-a: the server allocated our nameplate. Display the FULL code
                 // from OUR OWN local mint (the server never echoed any words).
