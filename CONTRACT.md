@@ -83,7 +83,15 @@ Firebase mode mirrors these exact events client-side via Firestore.
   state ping (frozen peers can't ping). Additive — unknown types ignored.
 
 **server → client**
-- `welcome`     `{ id, peers: [{ id, name }] }` — your id + who's already here
+- `welcome`     `{ id, peers: [{ id, name }] }` — your id + who's already here.
+  `id` is mandatory. The Flask relay always emits the Socket.IO sid at
+  `backend/signaling.py:391`, and the Firebase adapter always emits its local
+  id at `frontend/src/lib/signaling.js:161`; there is no supported welcome
+  variant without it. Rust's `as_str().map(...)` handling in
+  `cli/src/l2.rs:1247` and the browser's destructuring in
+  `frontend/src/lib/useFilament.js:586` are defensive tolerance for malformed
+  input, not protocol permission to omit the field. Implementations must send
+  the id and clients may treat a welcome without one as malformed.
 - `peer-joined` `{ id, name }`
 - `peer-left`   `{ id }`
 - `signal`      `{ from, data }`
