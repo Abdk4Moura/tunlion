@@ -24,24 +24,48 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CODE_WORD: &str = "gigantic-element-tango";
 
 // ---------------------------------------------------------------- helpers ---
 
 fn binary() -> PathBuf {
-    // Try release first (Windows CI builds --release to avoid stack overflow)
-    let release = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target").join("release").join("filament");
-    if release.exists() {
-        return release;
-    }
+    // #34: honour CARGO_TARGET_DIR. Hardcoding <manifest>/target made correct
+    // results depend on the operator knowing to symlink, and a run with a
+    // custom target dir fails with a bare "No such file or directory" that
+    // names nothing. Worse, a STALE binary at the hardcoded path would be
+    // silently tested instead of the one just built, which is how a shared
+    // target dir voided a measurement run this week.
+    //
+    // Windows appends .exe; the extension is not part of the profile search.
+    let exe = if cfg!(windows) { "filament.exe" } else { "filament" };
+    let roots: Vec<PathBuf> = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(d) => vec![PathBuf::from(d)],
+        None => vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")],
+    };
+
+    // Release first: Windows CI builds --release to avoid a stack overflow.
+    let mut tried = Vec::new();
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join(profile)
-        .join("filament")
+    for root in &roots {
+        for p in ["release", profile] {
+            let cand = root.join(p).join(exe);
+            if cand.exists() {
+                return cand;
+            }
+            tried.push(cand);
+        }
+    }
+
+    // Never return a path we know is absent: the caller would spawn it and get
+    // an errno with no context. Name what was searched instead.
+    panic!(
+        "filament binary not found. Searched:\n{}\n\
+         Build it first (cargo build --features test-hooks [--release]), and if \
+         you set CARGO_TARGET_DIR, this honours it.",
+        tried.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
+    );
 }
 
 fn find_backend_app() -> PathBuf {
@@ -444,6 +468,163 @@ fn pair_and_transfer_smoke() {
         received_data[1], 0x0A,
         "byte 1 = 0x0A lost (LF)"
     );
+}
+
+/// The case the WebRTC fallback EXISTS for: direct-QUIC enabled, direct-QUIC
+/// FAILS, and the transfer must still complete over WebRTC, promptly.
+///
+/// This gate was written before, in `cli/tests/transport-gates.sh` (GATE 3), and
+/// it is referenced by no workflow. It has never run in CI. A gate that exists
+/// on disk and never executes is not coverage, and the hook it drives
+/// (`FILAMENT_DIRECT_TEST_BLOCK`, wired at direct.rs `race_connect_labeled`) was
+/// therefore exercised by nothing.
+///
+/// Three assertions, and the second and third are the ones that make it mean
+/// something:
+///
+///   1. the transfer completes byte-exact
+///   2. the block ACTUALLY ENGAGED. Without this, a pass is unclassified: on a
+///      platform where direct never starts, nothing is blocked, nothing falls
+///      back, and the test would go green having tested nothing. Absence of a
+///      failure is not evidence that recovery happened.
+///   3. it completed FAST ENOUGH to have been the designed fallback.
+///
+/// (3) is the one that separates this from the existing smoke test. The
+/// designed path is `DIRECT_BUDGET` (5s) then an immediate WebRTC re-establish,
+/// so ~7-10s end to end. The ACCIDENTAL path that carried macOS for weeks was
+/// roster reconciliation on the sync digest, which fires on a ~30s interval. A
+/// test asserting only completion passes on BOTH and cannot tell a designed
+/// fallback from a slow repair. The bound below is deliberately between them.
+#[test]
+fn direct_blocked_falls_back_to_webrtc_promptly() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let test_file = h.work_dir.join("fallback_payload.bin");
+    let payload: Vec<u8> = (0u16..4096).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&test_file, &payload).expect("write test file");
+    let expected_hash = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&payload).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    // DIRECT IS FORCED ON, deliberately ignoring FILAMENT_DIRECT_PER_OS. The
+    // whole point is direct-enabled-and-failing; running this with direct off
+    // would test the disabled path, which the smoke test already covers.
+    // LOOPBACK_ONLY still honours the per-OS knob, because that one is about
+    // WebRTC candidate gathering, which the fallback depends on.
+    let loopback = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    let mut send_proc = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
+        .env("FILAMENT_DIRECT", "1")
+        .env("FILAMENT_DIRECT_TEST_BLOCK", "1")
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .arg("send").arg(&test_file)
+        .arg("--word").arg(CODE_WORD)
+        .arg("--server").arg(&server)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("send");
+
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    let send_log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sl = send_log.clone();
+    let stderr = send_proc.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap_or_default();
+            eprintln!("[send] {line}");
+            sl.lock().unwrap().push(line.clone());
+            let lower = line.to_lowercase();
+            if let Some(start) = lower.find(&CODE_WORD.to_lowercase()) {
+                let rest = &line[start..];
+                let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                let _ = code_tx.send(line[start..start + end].to_lowercase());
+            }
+        }
+    });
+
+    let full_code = code_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("send did not mint a code within 30s");
+
+    let recv_dir = h.b_dir.join("received_fallback");
+    std::fs::create_dir_all(&recv_dir).expect("create recv dir");
+
+    // The clock starts once the receiver is dialling, so it excludes the
+    // operator typing a code. It still INCLUDES the receiver's own pairing and
+    // PAKE before the block can even engage, so it is an upper bound on the
+    // fallback rather than an isolation of it. Observed ~13s locally against a
+    // 25s bound; if CI shows that margin is too thin, tighten by timestamping
+    // the DIRECT-BLOCKED marker rather than by loosening the bound, which would
+    // walk it into sync-interval territory and cost the discrimination.
+    let started = Instant::now();
+    let recv_out = Command::new(&bin)
+        .env("FILAMENT_CAP_AUTHORITATIVE", "0")
+        .env("FILAMENT_DIRECT", "1")
+        .env("FILAMENT_DIRECT_TEST_BLOCK", "1")
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("FILAMENT_L3_USERSPACE", "1")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .arg("recv").arg(&full_code)
+        .arg("--yes")
+        .arg("--dir").arg(&recv_dir)
+        .arg("--server").arg(&server)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("recv result");
+    let elapsed = started.elapsed();
+
+    let recv_all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&recv_out.stdout),
+        String::from_utf8_lossy(&recv_out.stderr)
+    );
+    eprintln!("recv:\n{recv_all}");
+    let send_all = send_log.lock().unwrap().join("\n");
+    let both = format!("{send_all}\n{recv_all}");
+
+    // 1. byte-exact
+    let received_file = recv_dir.join("fallback_payload.bin");
+    assert!(received_file.exists(), "received file missing: {}", received_file.display());
+    let got = std::fs::read(&received_file).expect("read received file");
+    let got_hash = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&got).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    assert_eq!(expected_hash, got_hash, "sha256 mismatch after fallback");
+
+    // 2. the instrument engaged. A green run without this line tested nothing.
+    assert!(
+        both.contains("DIRECT-BLOCKED") || both.contains("DIRECT-FALLBACK"),
+        "no DIRECT-BLOCKED/DIRECT-FALLBACK marker: the block never engaged, so \
+         this run did not exercise the fallback and its pass is UNCLASSIFIED"
+    );
+
+    // 3. it did not secretly ride direct anyway.
+    assert!(
+        !both.contains("DIRECT-CONNECT ok"),
+        "direct connected despite the block; this did not test the fallback"
+    );
+
+    // 4. prompt enough to be the DESIGNED fallback, not a slow repair.
+    // DIRECT_BUDGET is 5s and the re-establish follows immediately, so the
+    // designed path is well under 25s even on a loaded CI runner. Roster
+    // reconciliation, the accidental path, runs on a ~30s sync interval and
+    // would blow this bound. That gap is the whole discriminating power here.
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "fallback took {elapsed:?}, which is past the designed 5s budget plus \
+         re-establish and into sync-interval territory. Completion alone is not \
+         the property; a transfer rescued 30s later by roster reconciliation is \
+         a slow repair, not the fallback this path promises."
+    );
+    eprintln!("fallback completed in {elapsed:?}");
 }
 
 #[test]
