@@ -6307,6 +6307,20 @@ impl Conn {
     /// missing. This is that instrument: no runtime cost, and it cannot drift
     /// from the call sites the way a manual audit does.
     #[track_caller]
+    /// A link is "live" if its primary transport or any worker is still alive.
+    /// Restored: the pending-only guard made it briefly dead, but promotion
+    /// intent needs it back. Every caller EXCEPT a deliberate promotion must
+    /// leave a live link alone, which is what warm-hold depends on.
+    fn has_live_transport(&self, pid: &str) -> bool {
+        self.links.get(pid)
+            .map(|l| {
+                let primary_ok = l.transport.as_ref().map(|t| !t.is_dead()).unwrap_or(false);
+                let workers_ok = l.workers.iter().any(|w| !w.is_dead());
+                primary_ok || workers_ok
+            })
+            .unwrap_or(false)
+    }
+
     fn drop_link(&mut self, pid: &str) {
         ui::debug(&format!(
             "  drop_link({pid}) ordered by {}",
@@ -6597,7 +6611,16 @@ impl Conn {
     /// peer (a second call while pending is a no-op). The peer's own
     /// transport-offer (Ev::TransportOffer) drives the race.
     async fn start_direct(&mut self, pid: &str, name: &str, secret: &str) {
-        self.start_direct_inner(pid, name, secret, false).await
+        self.start_direct_inner(pid, name, secret, false, false).await
+    }
+
+    /// Option A: replace the serving WebRTC link with direct after PAKE. This
+    /// is the ONLY caller permitted to tear down a live link, and the teardown
+    /// happens inside `start_direct_inner` AFTER `direct_pending` is registered,
+    /// so a failure anywhere in setup leaves WebRTC serving and the fallback
+    /// reaper has an attempt to expire.
+    async fn start_direct_promote(&mut self, pid: &str, name: &str, secret: &str) {
+        self.start_direct_inner(pid, name, secret, false, true).await
     }
 
     /// P5 (GAP-6): arm a relay->direct UPGRADE probe, a direct dial run
@@ -6612,7 +6635,7 @@ impl Conn {
         if self.direct_pending.contains_key(pid) {
             return;
         }
-        self.start_direct_inner(pid, name, secret, true).await
+        self.start_direct_inner(pid, name, secret, true, false).await
     }
 
     /// Ensure we have a TCP listener for local connections.
@@ -6626,7 +6649,21 @@ impl Conn {
         port
     }
 
-    async fn start_direct_inner(&mut self, pid: &str, name: &str, secret: &str, probe: bool) {
+    /// `promote`: this call is REPLACING a serving WebRTC link with direct
+    /// (Option A after PAKE). Only then may a live link be torn down, and only
+    /// after `direct_pending` is registered so the fallback reaper has an
+    /// attempt to expire. Every other caller (known-peer appeared, warm-hold,
+    /// re-dial) must leave a healthy link alone: dropping it there is what broke
+    /// `warm_all_makes_first_contact_warm`, because warm-hold's whole job is to
+    /// have a link already up when first contact arrives.
+    async fn start_direct_inner(
+        &mut self,
+        pid: &str,
+        name: &str,
+        secret: &str,
+        probe: bool,
+        promote: bool,
+    ) {
         // Gate on the per-session flag, not the bare env check: the L2/ssh
         // acceptor (`up --shell`) sets `direct_ok` true even with the env unset,
         // so it answers the initiator's transport-offer (rung-1 direct-QUIC over
@@ -6665,6 +6702,11 @@ impl Conn {
         }
         if self.direct_pending.contains_key(pid) {
             return; // already trying
+        }
+        // A live link is a REASON TO STOP for everyone except a deliberate
+        // promotion. Promotion is the one caller that intends to replace it.
+        if !probe && !promote && self.has_live_transport(pid) {
+            return; // already linked via a live transport
         }
 
         // Check if target is same-machine peer (local transport).
@@ -6803,7 +6845,7 @@ impl Conn {
         // Replace the serving WebRTC link only after all fallible setup has
         // completed and the fallback reaper has a pending attempt to expire.
         // Upgrade probes retain their serving relay link by design.
-        if !probe {
+        if promote {
             self.drop_link(pid);
         }
         // Bug 2: replay any transport-offers that were buffered while we had
@@ -10823,7 +10865,7 @@ async fn send_cmd(
                                         // If direct wins: transfer rides QUIC (130+ MB/s).
                                         // If direct fails: expired_direct → establish → WebRTC fallback
                                         //   (bounded ~5s gap for NAT-blocked peers, then WebRTC reconnects).
-                                        conn.start_direct(&from, &from, &sec).await;
+                                        conn.start_direct_promote(&from, &from, &sec).await;
                                         if conn.active.is_none() {
                                             conn.active = Some(from.clone());
                                         }
@@ -13600,7 +13642,7 @@ async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
-                        conn.start_direct(&from, &from, &sec).await;
+                        conn.start_direct_promote(&from, &from, &sec).await;
                         if conn.active.is_none() {
                             conn.active = Some(from.clone());
                         }
