@@ -220,13 +220,13 @@ Mismatch (`No / stop`) — `Err` glyph, calm:
 Shell row reuses the type-`SHELL`-to-confirm interaction from 1d. Success:
 ```
   ✓ carol can send you files until 14:41 (1h). It ends on its own — no cleanup needed.  [Ok]
-  ↳ filament grant carol send --from carol --for 1h                                       [Dim]
+   (No replay command: this is a directional transfer permission.)
 ```
 
 ### 2f. Non-TTY `pair` (must not open a form)
 ```
 ✗ pair is interactive (it needs the spoken-words step). For automation, mint a key instead:
-  filament mint --external carol --ttl 1h --allow send
+  filament mint --external carol --ttl 1h --allow transfer
 ```
 
 ---
@@ -256,7 +256,7 @@ Shell row reuses the type-`SHELL`-to-confirm interaction from 1d. Success:
 ```
   No devices yet.
   Add your own:     filament pair             (run on both, same identity)
-  Let someone in:   filament mint --external <them> --ttl 1h --allow <cap>
+   Let someone in:   filament mint --external <them> --ttl 1h --allow transfer
 ```
 
 ### 3c. `devices` — degraded / no-primary-online (calm + dated)
@@ -300,7 +300,7 @@ Once lapsed (dimmed "left" line, not deleted, for one listing):
   2   ○ dave   wants to  open a shell ⚠                                          [Warn on the cap]
          asked 18m ago · introduced by carol
          ⚠ this is deliberate access — a real terminal on this machine           [Warn]
-         [ filament requests approve 2 --allow shell --for 1h ]   [ deny 2 ]
+          [ filament requests approve 2 ]   [ deny 2 ]
 
   Nothing pushes to you yet — check `filament requests`, or wire a hook:          [Dim]
     filament requests --notify 'notify-send %s'   (also: webhook, email)
@@ -314,7 +314,7 @@ Once lapsed (dimmed "left" line, not deleted, for one listing):
 ### 3h. `requests approve` — deliberate guard
 ```
 ✗ request 2 asks for shell — deliberate access. Name it and bound it:
-  filament requests approve 2 --allow shell --for 1h
+  filament requests approve 2
 ```
 Safe approve success:
 ```

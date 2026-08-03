@@ -117,10 +117,16 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
 
 /// Render the inter-user success message.
 pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> String {
+    let echo = match cap {
+        "shell" | "transfer" | "mount" => {
+            echo_cmd(&format!("filament grant {peer_name} {cap} --for {expiry}"))
+        }
+        _ => String::new(),
+    };
     format!(
-        "{ok} {peer_name} can {cap} until {expiry}. It ends on its own — no cleanup needed.\n{echo}",
+        "{ok} {peer_name} can {cap} until {expiry}. It ends on its own; no cleanup needed.\n{echo}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
-        echo = echo_cmd(&format!("filament grant {peer_name} {cap} --from {peer_name} --for {expiry}")),
+        echo = echo,
     )
 }
 
@@ -130,7 +136,7 @@ pub fn err_pair_interactive() -> (String, i32) {
         format!(
             "{err} pair is interactive (it needs the spoken-words step). For automation, mint a key instead:\n  {fix}",
             err = ui::paint(Tone::Err, ui::glyph_err()),
-            fix = "filament mint --external carol --ttl 1h --allow send",
+            fix = "filament mint --external carol --ttl 1h --allow transfer",
         ),
         super::EXIT_BAD_ARG,
     )
@@ -208,4 +214,3 @@ mod tests {
         assert!(s.contains("joined your fleet"), "must confirm fleet join");
     }
 }
-

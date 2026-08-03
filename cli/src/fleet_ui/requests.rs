@@ -64,7 +64,7 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
             ));
             lines.push(format!(
                 "         [ {} ]   [ {} ]",
-                ui::paint(Tone::Bold, &format!("filament requests approve {} --allow {} --for 1h", r.id, r.capability)),
+                ui::paint(Tone::Bold, &format!("filament requests approve {}", r.id)),
                 ui::paint(Tone::Dim, &format!("deny {}", r.id)),
             ));
         } else {
@@ -112,7 +112,7 @@ pub fn render_approve_guard(request_id: u64, cap: &str) -> String {
     format!(
         "{err} request {request_id} asks for {cap} — deliberate access. Name it and bound it:\n  {fix}",
         err = ui::paint(Tone::Err, ui::glyph_err()),
-        fix = format!("filament requests approve {request_id} --allow {cap} --for 1h"),
+        fix = format!("filament requests approve {request_id}"),
     )
 }
 
@@ -208,7 +208,7 @@ mod tests {
         let s = render_requests(&requests);
         assert!(s.contains("deliberate access"), "must flag deliberate");
         assert!(s.contains("real terminal"), "must explain what shell means");
-        assert!(s.contains("--allow shell"), "must show --allow in approve command");
+        assert!(s.contains("requests approve 2"), "must show the parseable approve command");
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         assert!(s.contains("request 2"), "must show request id");
         assert!(s.contains("shell"), "must show capability");
         assert!(s.contains("deliberate"), "must flag deliberate");
-        assert!(s.contains("--for 1h"), "must require --for");
+        assert!(s.contains("requests approve 2"), "must show the parseable approve command");
     }
 
     #[test]

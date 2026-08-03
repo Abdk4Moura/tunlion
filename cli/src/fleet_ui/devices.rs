@@ -124,7 +124,7 @@ pub fn render_empty() -> String {
     format!(
         "No devices yet.\n\
          Add your own:     filament pair             (run on both, same identity)\n\
-         Let someone in:   filament mint --external <them> --ttl 1h --allow <cap>"
+         Let someone in:   filament mint --external <them> --ttl 1h --allow transfer"
     )
 }
 
@@ -197,7 +197,7 @@ mod tests {
         let s = render_empty();
         assert!(s.contains("No devices yet"), "must show empty message");
         assert!(s.contains("filament pair"), "must suggest pair");
-        assert!(s.contains("filament mint"), "must suggest mint");
+        assert!(s.contains("filament mint --external"), "must suggest mint");
     }
 
     #[test]

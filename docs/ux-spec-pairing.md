@@ -139,7 +139,7 @@ ceremony.
 ```
   2 waiting
   1  ○ carol wants to send you files       [ approve 1 ] [ deny 1 ]
-  2  ○ dave  wants to open a shell ⚠        [ approve 2 --allow shell --for 1h ] [ deny 2 ]
+  2  ○ dave  wants to open a shell ⚠        [ filament requests approve 2 ] [ deny 2 ]
   Nothing pushes to you yet — check `filament requests`, or wire a hook:
     filament requests --notify 'notify-send %s'
 ```
