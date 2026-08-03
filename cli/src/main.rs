@@ -6692,7 +6692,20 @@ impl Conn {
                     (Some(v.0), v.1)
                 }
                 Err(e) => {
-                    ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e})"));
+                    // This return happens AFTER Option A has already dropped the
+                    // WebRTC link, and BEFORE anything is registered in
+                    // `direct_pending`. So `expired_direct` has nothing to expire,
+                    // `establish` is never called, and the link is destroyed with
+                    // no scheduled rebuild: the sender then waits out its full
+                    // claim deadline. Logged at DEBUG, not trace, because a
+                    // failure that silently destroys a working link must be
+                    // visible at the level CI actually captures. The failing
+                    // macOS job carried exactly one `filament:` line, so this
+                    // diagnostic could not have appeared even if it fired.
+                    ui::debug(&format!(
+                        "filament: direct disabled (endpoint bind failed: {e}); \
+                         WebRTC link already dropped and no fallback is pending"
+                    ));
                     return;
                 }
             }
