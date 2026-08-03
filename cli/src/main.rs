@@ -6335,14 +6335,6 @@ impl Conn {
         Ok(self.is_active(&peer_id))
     }
 
-    /// `#[track_caller]` so a teardown NAMES the path that ordered it. There are
-    /// 17 call sites, and a link that dies 40ms after authenticating leaves a
-    /// `timed out waiting for a peer` whose guard cannot distinguish "no peer
-    /// ever arrived" from "the peer's link died". Two of us built root-cause
-    /// narratives out of that ambiguity before noticing the instrument was
-    /// missing. This is that instrument: no runtime cost, and it cannot drift
-    /// from the call sites the way a manual audit does.
-    #[track_caller]
     /// A link is "live" if its primary transport or any worker is still alive.
     /// Restored: the pending-only guard made it briefly dead, but promotion
     /// intent needs it back. Every caller EXCEPT a deliberate promotion must
@@ -6357,6 +6349,14 @@ impl Conn {
             .unwrap_or(false)
     }
 
+    /// `#[track_caller]` so a teardown NAMES the path that ordered it. There are
+    /// 17 call sites, and a link that dies 40ms after authenticating leaves a
+    /// `timed out waiting for a peer` whose guard cannot distinguish "no peer
+    /// ever arrived" from "the peer's link died". Two of us built root-cause
+    /// narratives out of that ambiguity before noticing the instrument was
+    /// missing. This is that instrument: no runtime cost, and it cannot drift
+    /// from the call sites the way a manual audit does.
+    #[track_caller]
     fn drop_link(&mut self, pid: &str) {
         ui::debug(&format!(
             "  drop_link({pid}) ordered by {}",
