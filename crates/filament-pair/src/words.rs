@@ -260,6 +260,106 @@ mod tests {
     fn password_gate_rejects_single_word() {
         assert!(validate_chosen_password("brave", "").is_err());
     }
+    /// The file MINUS this test module.
+    ///
+    /// `include_str!` pulls in the whole file, tests included, so a guard that
+    /// scans it matches its own assertion strings and its own explanatory
+    /// comments. Both tests below failed on their first run for exactly that
+    /// reason: one reported "something constructs a SpokenSas" and quoted a
+    /// COMMENT of its own, the other reported the field had become pub because
+    /// its own error message contains the pattern it searches for.
+    ///
+    /// That is the same self-matching defect as a `pgrep -f` pattern matching
+    /// the command line of the pgrep that ran it. A detector whose input
+    /// contains the detector will report itself.
+    fn production_source() -> String {
+        let src = include_str!("words.rs");
+        let start = src
+            .find("#[cfg(test)]")
+            .expect("test module marker moved; this guard would scan itself");
+        // The module ends at the next top-level closing brace. Everything AFTER
+        // it is production too: SpokenSas is DEFINED below this module, which is
+        // why an earlier version of this helper truncated at the marker and
+        // discarded the very type it guards.
+        let rel = src[start..]
+            .find("\n}\n")
+            .expect("test module has no top-level close; guard cannot delimit itself");
+        format!("{}{}", &src[..start], &src[start + rel + 3..])
+    }
+
+    // ---- the no-constructor property, ASSERTED rather than merely intended ---
+    //
+    // cli/src/fleet_ui/pair_ui.rs states that render_pake_words cannot be called
+    // because SpokenSas has no constructor, and describes that property as
+    // "enforced by the compiler and asserted in filament-pair". The compiler
+    // half was true. The assertion did not exist. This is it.
+    //
+    // Why it matters more than its size: render_pake_words shows three words and
+    // tells the user their peer must hear the SAME three. If a SpokenSas could be
+    // built from the PAIRING CODE, the screen would present a shared handshake
+    // password as if it were a transcript-derived short authentication string,
+    // and a middleman who knows the code passes the check. That INVERTS the MITM
+    // guard rather than weakening it: the user is told they verified when they
+    // did not.
+    //
+    // The field is private, so today only this crate can construct one, and
+    // nothing here does. But `pub fn new`, a `pub` on the field, or a derive that
+    // synthesizes construction would each silently reopen it, and the type system
+    // cannot warn about a constructor that does not exist yet.
+    //
+    // So this reads the source and fails when one appears. Brittle to renames,
+    // deliberately: a rename produces a loud false alarm, never silent erosion of
+    // a security guard. Same shape as the deleted-transition guard in
+    // proofs/transport_upgrade_model.py.
+    #[test]
+    fn spoken_sas_has_no_constructor() {
+        let src = production_source();
+        let src = src.as_str();
+        let start = src.find("pub struct SpokenSas").expect("SpokenSas moved or was renamed");
+        let end = src[start..].find("\n}").map(|o| start + o).unwrap_or(src.len());
+        let block_start = src[..start].rfind("\n\n").unwrap_or(0);
+        let region = &src[block_start..end];
+
+        assert!(
+            !region.contains("pub struct SpokenSas(pub "),
+            "SpokenSas field became pub: the pairing code can now be rendered as a \
+             transcript SAS, which INVERTS the MITM check"
+        );
+
+        // The impl block: `words()` is the only method that may exist.
+        let impl_start = src.find("impl SpokenSas {").expect("impl SpokenSas moved");
+        let impl_end = src[impl_start..].find("\n}").map(|o| impl_start + o).unwrap_or(src.len());
+        let imp = &src[impl_start..impl_end];
+        for forbidden in ["pub fn new", "pub fn from", "pub const fn", "pub fn try_"] {
+            assert!(
+                !imp.contains(forbidden),
+                "SpokenSas gained a public constructor ({forbidden}). render_pake_words \
+                 becomes callable, and if its input can be built from the pairing code \
+                 the MITM check is inverted. Derive the SAS from the completed PAKE \
+                 transcript, or leave this type unconstructible."
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_in_this_crate_constructs_a_spoken_sas() {
+        // Even a private constructor inside this crate is enough: the field is
+        // crate-visible, so `SpokenSas(v)` compiles anywhere in filament-pair.
+        // mint_words() returns exactly the shape that would be wrong to pass.
+        let src = production_source();
+        let src = src.as_str();
+        let uses: Vec<&str> = src
+            .lines()
+            .filter(|l| l.contains("SpokenSas(") && !l.contains("pub struct"))
+            .collect();
+        assert!(
+            uses.is_empty(),
+            "something constructs a SpokenSas: {uses:?}. If this is the transcript \
+             derivation finally landing, delete this test and add one that asserts \
+             the input comes from the transcript, never from mint_words."
+        );
+    }
+
 }
 
 // ── Word kinds that must never be confused ──────────────────────────────────
