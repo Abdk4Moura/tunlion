@@ -1707,6 +1707,22 @@ fn resolve_peer_identity(link: &mut Link) {
     link.identity_user_pub = Some(cert.user_pub);
     link.identity_binding = crate::capability::BindingStrength::Inferred;
     link.identity_cert_expires = Some(cert.expires);
+    // SET THE CEILING EXPLICITLY, even though this is the constructor default.
+    //
+    // A DeviceCert carries no principal kind and no ceiling, so resolving one
+    // decides the ceiling by OMISSION: whatever `Link` was built with survives.
+    // That is correct today because every persisted cert is an owner device, but
+    // the decision is invisible at the exact site where identity is restored
+    // from a cert, which is where a future implementer of delegated certs will
+    // be standing when they need to handle it.
+    //
+    // Writing it here makes the currently-correct behaviour legible instead of
+    // accidental, and turns "add Delegated support" into an edit to a line that
+    // exists rather than a line someone has to know to add.
+    //
+    // If you are adding delegated certs: this line is the one to change, and see
+    // admit_delegated for why persisting a delegated link is an escalation.
+    link.principal_kind = crate::capability::PrincipalKind::OwnerDevice;
 }
 
 /// When a link becomes trusted, send a nonce challenge to the peer so it can
@@ -5576,7 +5592,23 @@ impl Link {
     /// `identity_user_pub = owner_pub` while `principal_kind` defaults to
     /// `OwnerDevice`, `auth_key_caps()` returns `None`, the ceiling vanishes, and
     /// the owner-shortcut in evaluate() authorizes everything — a full escalation.
-    /// SO: never persist a delegated link. The devices_json writer must exclude it.
+    /// SO: never persist a delegated link.
+    ///
+    /// WHAT ACTUALLY PROTECTS US, corrected 2026-08-03 by claude-advisor. An
+    /// earlier version of this line said "the devices_json writer must exclude
+    /// it", which describes an active exclusion. THERE IS NONE.
+    /// `devices_upsert_atomic` (via update_device_cert) persists name, secret,
+    /// cert and user_pub, and performs no delegated-link check, because
+    /// devices.json HAS NO FIELD for a ceiling or a principal kind. There is
+    /// nothing for it to exclude.
+    ///
+    /// So the protection is a SCHEMA LIMITATION, not a guard: the format cannot
+    /// REPRESENT a delegated principal, so none get written. Safe today, and
+    /// safe for a reason that evaporates silently. The moment anyone adds a
+    /// principal_kind field to devices.json, or persists link-derived state,
+    /// there is no check to stop them, and the old comment would have told them
+    /// one existed. If you are adding such a field, the writer-side exclusion
+    /// has to be written at the same time; it does not exist yet.
     fn admit_delegated(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
         // A delegated principal acts UNDER the owner's user identity (the auth
         // key issuer), so it presents user_pub = owner_pub. evaluate()'s owner
