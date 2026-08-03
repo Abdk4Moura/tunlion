@@ -1,4 +1,43 @@
 #!/usr/bin/env bash
+#
+# ############################################################################
+# # THIS SCRIPT CANNOT RUN. IT IS NOT COVERAGE. DO NOT CITE IT AS NAT TESTING.
+# ############################################################################
+#
+# It sources a stress-lab that was NEVER COMMITTED to this repository and no
+# longer exists on any machine we have:
+#
+#     LAB=/root/wt-stress/cli/tests/transport-lab   lib.sh, the netns topology
+#     natprobe.py                                   the NAT-type prober
+#     PY=/root/.claude/jobs/330c2366/tmp/venv/...   a JOB-SCOPED venv, ephemeral
+#                                                   by construction
+#
+# Verified 2026-08-03, three ways:
+#     git log --all -- '*transport-lab*' '*natprobe*'   never on any branch
+#     find /root -name natprobe.py -o -name transport-lab   nothing on disk
+#     ls -d /root/wt-stress                            does not exist
+#
+# So the project's ONLY checked-in NAT test is unrunnable, and has been for long
+# enough that nobody noticed. It is also referenced by no workflow, which is why
+# nothing went red when its lab disappeared.
+#
+# This matters more than one dead script. filament's entire value is transfer
+# across real networks, and two peers behind separate NATs is the case that
+# matters most. Every green board this project has ever produced was produced
+# without exercising it. See the coverage map for what else is uncovered.
+#
+# The logic below is still worth reading: the two-gate design is right, and the
+# insistence that each gate PROVE the NAT type with natprobe before asserting a
+# route is the part to preserve in any replacement. A route assertion without a
+# proven topology is not honest, which is exactly the discipline that was applied
+# here and then lost with the lab.
+#
+# DO NOT wire this into CI. It would add a permanently red job that tests
+# nothing. A replacement must be SELF-CONTAINED: the lab in-tree, no absolute
+# paths outside the repo, no job-scoped anything.
+#
+# ############################################################################
+#
 # Filament — rung-2 UDP HOLE-PUNCH gates (FILAMENT_HOLEPUNCH=1).
 #
 # Validates rung-2 against REAL NAT in the stress-lab netns topology (NOT
