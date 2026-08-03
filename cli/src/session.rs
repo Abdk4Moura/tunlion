@@ -118,6 +118,8 @@ impl Session {
     /// what we sent, so a later desire change diffs against it correctly.
     /// Phase 2: the digest may carry the server's roster (`peers`), the
     /// loops reconcile against it (missed peer-joined/left self-correct).
+    /// The returned roster is the recovery channel for missed room pushes.
+    #[must_use = "reconcile the digest roster or explain why this waiter cannot miss one"]
     pub fn on_synced(&mut self, v: &Value) -> Option<Vec<Value>> {
         if v["ok"].as_bool() != Some(true) {
             return None; // error digests carry no roster (server contract)
