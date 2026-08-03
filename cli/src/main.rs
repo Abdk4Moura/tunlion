@@ -6719,7 +6719,16 @@ impl Conn {
             self.drop_link(pid);
         }
         if self.direct_pending.contains_key(pid) {
-            return; // already trying
+            if !promote {
+                return; // already trying
+            }
+            // A PROMOTION SUPERSEDES an in-flight attempt. Any pending started
+            // before PAKE completed was dialled without the shared secret and
+            // therefore cannot authenticate; letting it block the promotion is
+            // how Option A silently never runs, leaving the transfer to sit
+            // until the job times out. Drop the stale attempt and re-register
+            // below with the secret we now have.
+            self.direct_pending.remove(pid);
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
         // promotion. Promotion is the one caller that intends to replace it.
