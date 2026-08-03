@@ -5350,6 +5350,24 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
 // fresh ICE config per attempt (C5), uid supersede on rejoin (C6), and a
 // rejoin window when the peer's socket dies entirely.
 
+/// Why a direct attempt is being started. A bool pair gave four states, three
+/// meaningful and one nonsense (`probe && promote` = "a test dial that tears
+/// down a serving link", exactly what the guard exists to prevent), with
+/// nothing rejecting it. Every expensive defect this week was a boolean-ish
+/// value legal in the type system and wrong in the domain: a hardcoded
+/// `answerer: true`, `has_flowed() -> true`, `expected_secret: None`. This
+/// makes the meaningless combination unrepresentable instead of merely
+/// unreachable-by-convention.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DirectIntent {
+    /// Never disturb a live link.
+    Normal,
+    /// Upgrade probe: bypass the live-link guard, but never drop.
+    Probe,
+    /// Option A: the ONLY intent permitted to replace a serving link.
+    Promote,
+}
+
 struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
     /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
@@ -6629,7 +6647,7 @@ impl Conn {
     /// peer (a second call while pending is a no-op). The peer's own
     /// transport-offer (Ev::TransportOffer) drives the race.
     async fn start_direct(&mut self, pid: &str, name: &str, secret: &str) {
-        self.start_direct_inner(pid, name, secret, false, false).await
+        self.start_direct_inner(pid, name, secret, DirectIntent::Normal).await
     }
 
     /// Option A: replace the serving WebRTC link with direct after PAKE. This
@@ -6638,7 +6656,7 @@ impl Conn {
     /// so a failure anywhere in setup leaves WebRTC serving and the fallback
     /// reaper has an attempt to expire.
     async fn start_direct_promote(&mut self, pid: &str, name: &str, secret: &str) {
-        self.start_direct_inner(pid, name, secret, false, true).await
+        self.start_direct_inner(pid, name, secret, DirectIntent::Promote).await
     }
 
     /// P5 (GAP-6): arm a relay->direct UPGRADE probe, a direct dial run
@@ -6653,7 +6671,7 @@ impl Conn {
         if self.direct_pending.contains_key(pid) {
             return;
         }
-        self.start_direct_inner(pid, name, secret, true, false).await
+        self.start_direct_inner(pid, name, secret, DirectIntent::Probe).await
     }
 
     /// Ensure we have a TCP listener for local connections.
@@ -6679,9 +6697,9 @@ impl Conn {
         pid: &str,
         name: &str,
         secret: &str,
-        probe: bool,
-        promote: bool,
+        intent: DirectIntent,
     ) {
+        let probe = intent == DirectIntent::Probe;
         // Gate on the per-session flag, not the bare env check: the L2/ssh
         // acceptor (`up --shell`) sets `direct_ok` true even with the env unset,
         // so it answers the initiator's transport-offer (rung-1 direct-QUIC over
@@ -6719,7 +6737,7 @@ impl Conn {
             self.drop_link(pid);
         }
         if self.direct_pending.contains_key(pid) {
-            if !promote {
+            if intent != DirectIntent::Promote {
                 return; // already trying
             }
             // A PROMOTION SUPERSEDES an in-flight attempt. Any pending started
@@ -6732,7 +6750,7 @@ impl Conn {
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
         // promotion. Promotion is the one caller that intends to replace it.
-        if !probe && !promote && self.has_live_transport(pid) {
+        if intent == DirectIntent::Normal && self.has_live_transport(pid) {
             return; // already linked via a live transport
         }
 
@@ -6872,7 +6890,7 @@ impl Conn {
         // Replace the serving WebRTC link only after all fallible setup has
         // completed and the fallback reaper has a pending attempt to expire.
         // Upgrade probes retain their serving relay link by design.
-        if promote {
+        if intent == DirectIntent::Promote {
             self.drop_link(pid);
         }
         // Bug 2: replay any transport-offers that were buffered while we had
