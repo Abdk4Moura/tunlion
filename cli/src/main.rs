@@ -6330,7 +6330,19 @@ impl Conn {
         Ok(self.is_active(&peer_id))
     }
 
+    /// `#[track_caller]` so a teardown NAMES the path that ordered it. There are
+    /// 17 call sites, and a link that dies 40ms after authenticating leaves a
+    /// `timed out waiting for a peer` whose guard cannot distinguish "no peer
+    /// ever arrived" from "the peer's link died". Two of us built root-cause
+    /// narratives out of that ambiguity before noticing the instrument was
+    /// missing. This is that instrument: no runtime cost, and it cannot drift
+    /// from the call sites the way a manual audit does.
+    #[track_caller]
     fn drop_link(&mut self, pid: &str) {
+        ui::debug(&format!(
+            "  drop_link({pid}) ordered by {}",
+            std::panic::Location::caller()
+        ));
         // #28: dropping a link also discharges any deferred peer-left for it,
         // so a supersede (maybe_adopt) of a deferred same-uid sid can't leave a
         // stale entry blocking adoption. Invariant: deferred_left only ever
