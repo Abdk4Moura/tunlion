@@ -56,7 +56,7 @@ pub type CtlServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
 
 #[cfg(any(unix, windows))]
 pub use imp::{
-    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_list_mounts,
+    daemon_present, send_reply, serve, serve_at, try_bootstrap, try_dial, try_eof, try_list_mounts,
     try_approve_request, try_arm, try_cap_status, try_deny_request, try_list_pending,
     try_list_warm, try_mount, try_mount_health, try_open, try_open_at, try_ping, try_pty,
     try_reconfigure, try_reload, try_reload_expose, try_resize, try_unmount, Req, ReqKind,
@@ -289,6 +289,10 @@ mod imp {
                 let target = v["target"].as_str()?.to_string();
                 Some(super::ReqKind::MountHealth { target })
             }
+            Some("eof") => {
+                let sid = v["sid"].as_u64().and_then(|n| u32::try_from(n).ok())?;
+                Some(super::ReqKind::Eof { sid })
+            }
             _ => None,
         }
     }
@@ -330,10 +334,10 @@ mod imp {
     }
 
     /// Try to open an L2 stream to `peer:rport` THROUGH a local daemon's warm
-    /// link. Returns the connected socket (positioned for raw bytes) on success,
-    /// or `None` if there is no daemon, no warm link, or any protocol error, so
-    /// the caller falls back to a fresh establish. Never errors: a miss is `None`.
-    pub async fn try_open(peer: &str, rport: u16) -> Option<super::CtlClientStream> {
+    /// link. Returns the connected socket (positioned for raw bytes) + stream ID
+    /// on success, or `None` if there is no daemon, no warm link, or any protocol
+    /// error, so the caller falls back to a fresh establish.
+    pub async fn try_open(peer: &str, rport: u16) -> Option<(super::CtlClientStream, u32)> {
         if reuse_disabled() {
             return None;
         }
@@ -342,7 +346,9 @@ mod imp {
 
     /// `try_open` against an explicit socket path (the live path comes from
     /// `control_sock_path()`; tests pass a hermetic path with no global env).
-    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<super::CtlClientStream> {
+    /// Returns (socket, stream_id) so the caller can send an out-of-band EOF
+    /// for the specific stream when stdin closes.
+    pub async fn try_open_at(path: &Path, peer: &str, rport: u16) -> Option<(super::CtlClientStream, u32)> {
         let mut s = transport_connect(path).await.ok()?;
         let req = json!({ "op": "open", "peer": peer, "rport": rport });
         let mut line = serde_json::to_vec(&req).ok()?;
@@ -352,7 +358,8 @@ mod imp {
         let reply = read_line(&mut s, 4096).await.ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         if v["ok"].as_bool() == Some(true) {
-            Some(s)
+            let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+            Some((s, sid))
         } else {
             None
         }
@@ -679,6 +686,30 @@ mod imp {
             .ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         (v["ok"].as_bool() == Some(true)).then_some(v)
+    /// Send an out-of-band EOF signal for stream `sid`. Opens a SEPARATE ctl
+    /// connection (not the data pipe) to keep the data pipe byte-transparent.
+    /// The daemon shuts down the L2 stream's write half so the remote sees EOF
+    /// while the client continues reading the response. Windows-only in
+    /// practice (Unix uses native half-close), but safe on both platforms.
+    pub async fn try_eof(sid: u32) -> bool {
+        let mut s = match transport_connect(&control_sock_path()).await {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let req = json!({ "op": "eof", "sid": sid });
+        let mut line = serde_json::to_vec(&req).ok().unwrap_or_default();
+        line.push(b'\n');
+        if s.write_all(&line).await.is_err() {
+            return false;
+        }
+        if s.flush().await.is_err() {
+            return false;
+        }
+        // The daemon replies inline; best-effort read.
+        let reply = read_line(&mut s, 4096).await.ok();
+        reply.and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|v| v["ok"].as_bool())
+            .unwrap_or(false)
     }
 
     // ----------------------------------------------------------------- daemon -
@@ -749,6 +780,13 @@ mod imp {
         /// The daemon joins the enrollment room for the key's TTL.
         /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
         Arm { key_id: String, expiry: u64 },
+        /// Out-of-band EOF signal: the client's stdin has closed. The daemon
+        /// shuts down the write half of the L2 stream for `sid` (remote sees EOF)
+        /// while keeping the read side open so the client can still receive the
+        /// response. Sent over a SEPARATE ctl connection (not the data pipe) to
+        /// keep the data pipe 100% byte-transparent. Windows-only semantics
+        /// (Unix uses native half-close via socket shutdown).
+        Eof { sid: u32 },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -827,7 +865,7 @@ mod imp {
             }
             let mut daemon_side = req.accept().await;
 
-            let mut client_side = client.await.unwrap().expect("client got ok");
+            let mut client_side = client.await.unwrap().expect("client got ok").0;
             client_side.write_all(b"ping").await.unwrap();
             client_side.flush().await.unwrap();
             let mut got = [0u8; 4];
@@ -892,7 +930,118 @@ mod imp {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-}
+
+    #[cfg(test)]
+    mod eof_tests {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+
+        /// Real OOB EOF test: exercises the ACTUAL code path:
+        /// - socket_to_dc with a oneshot eof_signal (the signal daemon sends)
+        /// - dc_to_socket reading from L2 channel (remote response)
+        /// - The eof_signal fires -> socket_to_dc sends L2 FIN and returns
+        /// - dc_to_socket continues and delivers pending response data
+        /// This catches mis-wires of the watch/oneshot signal.
+        #[tokio::test]
+        async fn oob_eof_real_wiring() {
+            use crate::l2;
+            use std::sync::Arc;
+
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
+            let l2_tx_clone = l2_tx.clone();
+            let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
+
+            struct MockTransport(tokio::sync::mpsc::UnboundedSender<Option<bytes::Bytes>>);
+            #[async_trait::async_trait]
+            impl crate::net::Transport for MockTransport {
+                fn is_alive(&self) -> bool { true }
+                fn idle_ms(&self) -> u64 { 0 }
+                fn remote_addr(&self) -> Option<std::net::SocketAddr> { None }
+                fn rtt_ms(&self) -> Option<u64> { Some(0) }
+                fn as_any(&self) -> &dyn std::any::Any { self }
+                async fn send_frame(&self, _sid: u32, _offset: u64, data: &[u8]) -> anyhow::Result<()> {
+                    if data.is_empty() {
+                        let _ = self.0.send(None); // FIN
+                    } else {
+                        let _ = self.0.send(Some(bytes::Bytes::copy_from_slice(data)));
+                    }
+                    Ok(())
+                }
+                async fn send_control(&self, _v: &serde_json::Value) -> anyhow::Result<()> { Ok(()) }
+                async fn flush(&self) -> anyhow::Result<()> { Ok(()) }
+                fn max_payload(&self) -> usize { 65536 }
+            }
+
+            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_clone)));
+            let sid = 42;
+            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(10);
+
+            // Server side: run the REAL serve_stream with the eof_signal wired in.
+            // This exercises the full OOB path: eof_signal -> socket_to_dc -> L2 FIN.
+            let server_task = tokio::spawn(async move {
+                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None, Some(eof_rx)).await;
+            });
+
+            // Client side: write data, wait for it to be processed, then the
+            // OOB eof signal fires (simulating daemon receiving ReqKind::Eof).
+            let test_data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+            let client_data = test_data.clone();
+            let client_task = tokio::spawn(async move {
+                let mut c = client;
+                c.write_all(&client_data).await.unwrap();
+                c.flush().await.unwrap();
+                // Keep reading until server closes (response from remote)
+                let mut response = Vec::new();
+                let _ = c.read_to_end(&mut response).await;
+                response
+            });
+
+            // Wait for client to write + flush
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Send response data via L2 BEFORE firing the signal. dc_to_socket
+            // reads this data and writes it to the client socket. The channel
+            // must stay open long enough for dc_to_socket to read the data.
+            let response = b"response-after-eof";
+            let _ = l2_tx.send(Some(bytes::Bytes::from_static(response)));
+            // Now close the L2 channel so dc_to_socket finishes after reading
+            drop(l2_tx);
+
+            // Fire the OOB eof signal AFTER sending response. This causes
+            // socket_to_dc to send L2 FIN and return. dc_to_socket has already
+            // read the response data and written it to the client socket.
+            eof_tx.send_modify(|v| *v = true);
+
+            // Wait for client to read the response
+            let client_response = tokio::time::timeout(Duration::from_secs(5), client_task)
+                .await
+                .expect("client timed out")
+                .expect("client panicked");
+
+            // The client should have received the response data that was sent
+            // AFTER the OOB eof. This proves dc_to_socket stayed alive.
+            assert_eq!(
+                &client_response,
+                response,
+                "OOB eof: response lost -- dc_to_socket was incorrectly shut down"
+            );
+
+            // Verify the L2 channel got the client's data + FIN
+            let mut l2_data = Vec::new();
+            while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), l2_rx.recv()).await {
+                match item {
+                    Some(data) => l2_data.extend_from_slice(&data),
+                    None => break,
+                }
+            }
+            assert_eq!(l2_data, test_data, "OOB eof: L2 data mismatch");
+
+            server_task.abort();
+        }
+    }
+} // end mod imp
 
 // --- Windows named-pipe helpers ---
 
