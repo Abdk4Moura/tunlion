@@ -132,6 +132,21 @@ else
   bad "gate2: no live mount to write into"
 fi
 
+# ===================================================================== symlink ==
+say symlink
+SYMLINK_TARGET="$SERVED/symlink-target.txt"
+printf 'symlink-target-original\n' > "$SYMLINK_TARGET"
+if ln -s "$SYMLINK_TARGET" "$MNT/symlink.part" 2>"$WORK/symlink.err"; then
+  echo "-- symlink.err --"; cat "$WORK/symlink.err"
+  bad "symlink: creation unexpectedly succeeded; mount symlinks would make the non-unix safe_open_beneath race remotely reachable"
+elif [ -L "$MNT/symlink.part" ]; then
+  echo "-- symlink.err --"; cat "$WORK/symlink.err"
+  bad "symlink: command refused but a symlink appeared; refusal is not pinned"
+else
+  ok "symlink: creation refused; this refusal pins the setup step for the non-unix safe_open_beneath race"
+fi
+cat "$WORK/symlink.err" 2>/dev/null || true
+
 # ===================================================================== gate 3 ==
 # non-UTF-8 name: the 0xFF-byte filename must be visible AND byte-exact readable
 # through the mount (spec rule 2: names are raw bytes, never lossy).
