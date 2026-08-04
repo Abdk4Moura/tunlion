@@ -4858,7 +4858,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         match (&code, malformed) {
             // No code at all -> CREATE entry.
             (None, _) => {
-                let auto_np = crate::pake::words::mint_nameplate();
+                let auto_np = crate::pake::words::mint_pair_nameplate();
                 match codeentry::run("  pair · choose words  ", codeentry::Mode::Create, "", &auto_np)? {
                     codeentry::Outcome::Submitted(words) => {
                         word = Some(words);
@@ -4957,7 +4957,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // the created code matches what the user saw; otherwise mint fresh.
             my_nameplate = preview_nameplate
                 .clone()
-                .unwrap_or_else(crate::pake::words::mint_nameplate);
+                .unwrap_or_else(crate::pake::words::mint_pair_nameplate);
             // STEERING: echo the normalized code we're about to create so the
             // creator sees EXACTLY what their peer must type (== what SPAKE2 hashes).
             if custom_words.is_some() {
@@ -5278,7 +5278,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     if custom_words.is_none() {
                         my_words = crate::pake::words::mint_words();
                     }
-                    my_nameplate = crate::pake::words::mint_nameplate();
+                    my_nameplate = crate::pake::words::mint_pair_nameplate();
                     cer.restart(&my_words, &my_nameplate);
                     sio.emit("pair-create", json!({ "nameplate": my_nameplate, "v": 2 })).await.ok();
                     continue;
@@ -17297,6 +17297,21 @@ mod tests {
         assert!(!regex_lite_code("a-b-c-d"));               // 4 segments
         assert!(!regex_lite_code("brave-otter-ruby-3141")); // 4 segments (old shape)
         assert!(!looks_like_pake_code("Brave-otter-3141")); // uppercase
+    }
+
+    #[test]
+    fn minted_pair_nameplate_round_trips_through_pairing_router() {
+        for _ in 0..100 {
+            let code = format!(
+                "{}-{}",
+                crate::pake::words::mint_words(),
+                crate::pake::words::mint_pair_nameplate(),
+            );
+            assert!(
+                looks_like_pake_code(&code),
+                "pair minted code rejected by pairing classifier: {code}"
+            );
+        }
     }
 
     // STEERING floor: --word must contain >= 2 word tokens (letter-runs >= 2).

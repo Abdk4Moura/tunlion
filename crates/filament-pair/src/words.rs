@@ -114,6 +114,13 @@ pub fn mint_nameplate() -> String {
     format!("{}", 100 + (rng.next_u32() % 900))
 }
 
+/// Mint the four-digit nameplate used by pairing codes. Transfer codes use
+/// `mint_nameplate` and must retain their three-digit routing shape.
+pub fn mint_pair_nameplate() -> String {
+    let mut rng = super::os_rng();
+    format!("{}", 1000 + (rng.next_u32() % 9000))
+}
+
 /// Assemble the full spoken code the user reads aloud: `<words>-<nameplate>`.
 pub fn mint_spoken_code() -> String {
     format!("{}-{}", mint_words(), mint_nameplate())
@@ -217,6 +224,15 @@ mod tests {
             let np = mint_nameplate();
             assert!(np.len() == 3, "nameplate not 3 digits: {np}");
             assert!(np.parse::<u32>().unwrap() >= 100);
+        }
+    }
+
+    #[test]
+    fn pair_nameplate_is_4_digits() {
+        for _ in 0..100 {
+            let np = mint_pair_nameplate();
+            assert_eq!(np.len(), 4, "pair nameplate not 4 digits: {np}");
+            assert!(np.parse::<u32>().unwrap() >= 1000);
         }
     }
 
