@@ -121,11 +121,6 @@ pub fn mint_pair_nameplate() -> String {
     format!("{}", 1000 + (rng.next_u32() % 9000))
 }
 
-/// Assemble the full spoken code the user reads aloud: `<words>-<nameplate>`.
-pub fn mint_spoken_code() -> String {
-    format!("{}-{}", mint_words(), mint_nameplate())
-}
-
 /// Validate a user-chosen password (Decision #3). Rejects if:
 ///   - Fewer than 2 words (needs at least `adj-animal` shape)
 ///   - Both words are identical (e.g., "test-test")
@@ -241,8 +236,6 @@ mod tests {
         let w = mint_words();
         let parts: Vec<&str> = w.split('-').collect();
         assert_eq!(parts.len(), 2, "adj-animal");
-        let full = mint_spoken_code();
-        assert_eq!(full.split('-').count(), 3, "adj-animal-NNN");
     }
 
     #[test]
