@@ -39,7 +39,7 @@ HEALTH_URL = SERVER.rstrip("/") + "/api/health"
 STATE_FILE = os.environ.get(
     "MONITOR_STATE", os.path.expanduser("~/.cache/filament-signaling-monitor.json")
 )
-ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "cadaynstudio@gmail.com")
+ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "pro.kaiserlautern@gmail.com")
 ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Filament Monitor <monitor@send.autumated.com>")
 RESEND_KEY_FILE = os.environ.get("RESEND_KEY_FILE", os.path.expanduser("~/secret_keys/resend_api_key"))
 # Consecutive failed checks before declaring DOWN (debounce transient blips).
@@ -88,7 +88,17 @@ def send_alert(subject, text):
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=payload,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            # Required. Without an explicit User-Agent, urllib sends
+            # "Python-urllib/3.x", which Cloudflare rejects in front of the
+            # Resend API with a 403 (error 1010) before the request ever
+            # reaches Resend. Every alert this monitor tried to send was
+            # dropped there. check_health already sets one, which is why
+            # probing worked while alerting silently did not.
+            "User-Agent": "filament-monitor/1",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
