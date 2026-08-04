@@ -2440,10 +2440,9 @@ fn daemon_alive() -> Option<u32> {
 /// up-process user and is owner-equivalent at any uid. Startup requires the
 /// explicit `--i-know` acknowledgement in `require_shell_owner_ack`; root also
 /// makes the shell machine-wide. See docs/security/web-shell-review.md.
-fn shell_argv(shell_program: Option<&str>, shell_user: Option<&str>) -> Vec<String> {
+fn shell_argv(shell_program: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
     let shell_config = settings::get_str("shell-program", None);
-    let (argv, _can_user) = platform::Paths::shell_argv(shell_program, shell_config.as_deref(), shell_user);
-    argv
+    platform::Paths::shell_argv(shell_program, shell_config.as_deref(), shell_user)
 }
 
 /// Dev-debug logging: dlog! expands to eprintln! only under debug-logs feature.
@@ -2522,7 +2521,10 @@ fn shell_root_note() -> &'static str {
     ""
 }
 
-fn require_shell_owner_ack(shell_enabled: bool, shell_user: Option<&str>, i_know: bool) -> Result<()> {
+fn require_shell_owner_ack(shell_enabled: bool, shell_user: Option<&str>, can_use_user: bool, i_know: bool) -> Result<()> {
+    if shell_enabled && shell_user.is_some() && !can_use_user && !i_know {
+        bail!("--shell-user is unsupported on this platform; the PTY would run as this process's user and retain the owner's authority. Pass --i-know to deliberately serve an owner-equivalent shell.");
+    }
     if shell_enabled && shell_user.is_none() && !i_know {
         bail!("serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{} Pass --shell-user or --i-know to continue.", shell_root_note());
     }
@@ -2723,7 +2725,9 @@ async fn up_cmd(
     no_proxy_fallback: bool,
 ) -> Result<()> {
     let shell_enabled = shell || shell_only.is_some();
-    require_shell_owner_ack(shell_enabled, shell_user.as_deref(), i_know)?;
+    let shell_config = settings::get_str("shell-program", None);
+    let can_use_user = platform::Paths::shell_argv(None, shell_config.as_deref(), shell_user.as_deref()).1;
+    require_shell_owner_ack(shell_enabled, shell_user.as_deref(), can_use_user, i_know)?;
     // Internal: re-invoked after elevation. Do the system-level install directly
     // and return. The privileged backend registers the service/daemon/task and exits.
     if install_system_flag {
@@ -2844,10 +2848,16 @@ async fn up_cmd(
     // Shell without a dropped account is owner-equivalent at any uid. A dropped
     // account is only safer if it cannot read FILAMENT_CONFIG_DIR.
     if shell_policy.enables_l2() {
-        let warning = if let Some(user) = shell_user.as_deref() {
-            format!("  note: shell PTYs run as {user}; verify this account cannot read FILAMENT_CONFIG_DIR or the drop is cosmetic")
-        } else {
-            format!("  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{}", ui::paint(ui::Tone::Warn, "!"), shell_root_note())
+        let warning = match shell_user.as_deref() {
+            Some(user) if can_use_user => {
+                format!("  note: shell PTYs run as {user}; verify this account cannot read FILAMENT_CONFIG_DIR or the drop is cosmetic")
+            }
+            Some(user) => {
+                format!("  {} --shell-user {user} is unsupported on this platform; the PTY runs as this process's user and has the owner's authority.", ui::paint(ui::Tone::Warn, "!"))
+            }
+            None => {
+                format!("  {} serving shell without --shell-user grants the peer the owner's authority because the PTY runs as this process's user and can read the config directory.{}", ui::paint(ui::Tone::Warn, "!"), shell_root_note())
+            }
         };
         ui::say(&warning);
     }
@@ -15161,7 +15171,7 @@ async fn recv_cmd(
                     // not a link-bound serve_pty. It outlives this link; a drop
                     // detaches it, a reconnect reattaches above.
                     // Resolve the shell and build interactive or one-shot argv.
-                    let shell_argv = shell_argv(None, shell_user.as_deref());
+                    let (shell_argv, _can_use_user) = shell_argv(None, shell_user.as_deref());
                     let host = platform::ShellHost::new(&shell_argv);
                     let argv = if pty_cmd.is_empty() {
                         host.interactive_args()
@@ -17195,11 +17205,19 @@ mod tests {
 
     #[test]
     fn shell_owner_ack_is_required_without_user_drop() {
-        let denied = require_shell_owner_ack(true, None, false).unwrap_err().to_string();
+        let denied = require_shell_owner_ack(true, None, true, false).unwrap_err().to_string();
         assert!(denied.contains("owner's authority"));
-        assert!(require_shell_owner_ack(true, None, true).is_ok());
-        assert!(require_shell_owner_ack(true, Some("filament-shell"), false).is_ok());
-        assert!(require_shell_owner_ack(false, None, false).is_ok());
+        assert!(require_shell_owner_ack(true, None, true, true).is_ok());
+        assert!(require_shell_owner_ack(true, Some("filament-shell"), true, false).is_ok());
+        assert!(require_shell_owner_ack(false, None, false, false).is_ok());
+    }
+
+    #[test]
+    fn shell_user_unsupported_requires_owner_ack() {
+        let denied = require_shell_owner_ack(true, Some("alice"), false, false).unwrap_err().to_string();
+        assert!(denied.contains("--shell-user is unsupported"));
+        assert!(denied.contains("owner-equivalent shell"));
+        assert!(require_shell_owner_ack(true, Some("alice"), false, true).is_ok());
     }
 
     #[test]
