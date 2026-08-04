@@ -46,7 +46,23 @@ verify() {
     fi
     # Armed means systemd has an actual next-elapse for it, not just that the
     # unit loaded. A timer can be enabled and still never fire if its unit is
-    # malformed, and `is-enabled` will not tell you that.
+    # malformed, and `is-enabled` will not tell you that. This check has caught
+    # exactly that state twice, on both occasions it has run against a fresh
+    # install; a `daemon-reload` clears it.
+    #
+    # USE `list-timers`, NOT A PROPERTY QUERY. It is deliberate and it matters.
+    # `systemctl show -p NextElapseUSecRealtime` returns a CLEAN EMPTY VALUE for
+    # these timers, because they are MONOTONIC (`OnUnitActiveSec=`) and their
+    # next elapse lives in `NextElapseUSecMonotonic`. Realtime is for calendar
+    # timers (`OnCalendar=`). Querying the wrong property does not error, it
+    # returns nothing, and nothing is indistinguishable from an unscheduled
+    # timer. On 2026-08-04 that mistake nearly reported all three working safety
+    # timers as dead, and it would have been believed, because it produces
+    # exactly the failure this line exists to detect.
+    #
+    # `list-timers` is shape-agnostic and shows both kinds. If you "improve"
+    # this to a property query, you must branch on the timer's schedule type,
+    # and you will reintroduce a false alarm that looks like a real finding.
     if ! systemctl list-timers --all --no-pager 2>/dev/null | grep -q "$t"; then
       echo "install-timers: ENABLED BUT NOT SCHEDULED: $t"; bad=1; continue
     fi
