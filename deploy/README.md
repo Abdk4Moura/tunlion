@@ -110,6 +110,34 @@ the Redis groundwork here makes the api ready for it.
    with your `turn:` URL + a username/credential from `/api/config` should yield
    a `relay` candidate.
 
+## 7. Monitors (one-time, on the droplet)
+```bash
+sudo deploy/monitor/install-timers.sh          # install + enable + verify
+deploy/monitor/install-timers.sh verify        # check only, any time
+```
+Two systemd timers:
+
+| timer | every | what it catches |
+|---|---|---|
+| `filament-monitor.timer` | 3 min | signaling `/api/health` down or recovered |
+| `filament-oom-shield.timer` | 5 min | production running without `oom_score_adj=-800` |
+
+Both email via Resend (send-only key in `~/secret_keys/resend_api_key`).
+
+**Run the installer, do not assume it ran.** The signaling units were added on
+2026-06-27 and were still not installed on the droplet on 2026-08-04: no unit
+file, nothing in `systemctl list-timers`, no cron entry, and a state file last
+written by a hand-run. Being in the repo and being armed on the host are two
+different facts and only one of them shows up in a diff. Same shape as the OOM
+shield itself, where `oom_score_adj: -800` sat in `docker-compose.yml` while
+every running container reported 0. `install-timers.sh verify` is the check; it
+also catches the case where a timer is enabled and active but has no scheduled
+next elapse, which `is-enabled` reports as fine.
+
+The OOM monitor auto-applies `-800` when it finds production unshielded, and
+alerts every time it has to. The fix only lasts as long as those processes: the
+alert exists to ask why the shield went missing, not to announce that it is back.
+
 ## TURN reachability
 Clients are handed the **raw droplet IP** for TURN (not the `turn.` hostname —
 it's orange-clouded behind Cloudflare, which can't proxy TURN). coturn listens

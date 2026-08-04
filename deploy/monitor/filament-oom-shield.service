@@ -1,0 +1,16 @@
+[Unit]
+Description=Assert the production OOM shield is in effect (one-shot; driven by filament-oom-shield.timer)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# Must run as root: reading and writing /proc/PID/oom_score_adj for another
+# user's processes needs it, and so does lowering the value at all.
+User=root
+ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/oom-shield-monitor.py
+# Exit 1 (unshielded) and 2 (unverifiable) are reported by the script's own
+# alert, not by systemd. SuccessExitStatus keeps `systemctl status` from turning
+# a working detection into a unit failure that hides the real message.
+SuccessExitStatus=0 1 2
+# Alerts go out via Resend; the send-only key is read from ~/secret_keys.

@@ -2,8 +2,18 @@
 """Filament signaling monitor.
 
 Polls the signaling server's liveness endpoint and emails an alert (via Resend)
-when it transitions DOWN or recovers. Run by a systemd timer (see the .timer /
-.service in this directory) every few minutes.
+when it transitions DOWN or recovers. Driven every few minutes by
+filament-monitor.timer, which must be INSTALLED on the host by
+`deploy/monitor/install-timers.sh` before any of that is true.
+
+That sentence used to say "Run by a systemd timer (see the .timer / .service in
+this directory)" with no installer and no check. On 2026-08-04 the host was
+inspected for the first time and no such timer existed: no unit under
+/etc/systemd/system, nothing in `systemctl list-timers`, no cron entry. The
+state file below had last been written by a hand-run on 2026-07-31, and that run
+had recorded a real DOWN and recovery. The monitor worked; nothing ran it.
+Confirm with `deploy/monitor/install-timers.sh verify` rather than by reading
+this comment.
 
 Why /api/health and not / : `GET /` on the api returns 503 by design (the SPA
 fallback route, since the React build is served by Cloudflare Pages, not this

@@ -1,0 +1,14 @@
+[Unit]
+Description=Check the production OOM shield every 5 minutes
+
+# The drift this catches is created by container RECREATION, which is a deploy
+# event, so the useful cadence is minutes, not hours. On 2026-08-03 the shield
+# was absent for hours and nothing reported it.
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
