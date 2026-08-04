@@ -2380,7 +2380,7 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// non-normalizable request fails closed (not within), so it falls through to
 /// explicit-grant. LEXICAL is correct here because the landing path may not
 /// exist yet (file about to be received); the actual symlink protection lives
-/// in safe_create_part/safe_open_part (O_NOFOLLOW|O_EXCL) at the write site.
+/// in safe_create_part/safe_resume_part (O_NOFOLLOW|O_EXCL) at the write site.
 fn path_within(root: &Path, path: &Path) -> bool {
     let root_n = lexical_normalize(root);
     let path_n = lexical_normalize(path);
@@ -12295,39 +12295,6 @@ async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
     Ok(file)
 }
 
-/// Windows: open an EXISTING .part file, refusing symlinks/junctions.
-/// Opens with FILE_FLAG_OPEN_REPARSE_POINT so a reparse point at the path
-/// is NOT followed, then rejects reparse points after open.
-/// FILE_FLAG_BACKUP_SEMANTICS allows opening a directory junction for the
-/// handle-based attribute check.
-#[cfg(not(unix))]
-async fn safe_open_part(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
-    use windows_sys::Win32::Storage::FileSystem as WinFs;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(WinFs::FILE_FLAG_OPEN_REPARSE_POINT | WinFs::FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .await?;
-
-    let handle = file.as_raw_handle();
-    let mut info: WinFs::BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe { WinFs::GetFileInformationByHandle(handle as *mut _, &mut info) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if (info.dwFileAttributes & WinFs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to open .part: path is a reparse point (symlink/junction)",
-        ));
-    }
-
-    Ok(file)
-}
-
 struct IncomingFile {
     id: String,
     name: String,
@@ -18044,31 +18011,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Windows: safe_open_part must refuse a file symlink and leave its target untouched.
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn win_safe_open_part_refuses_symlink() {
-        let uid = format!("{}-win-open-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let part_path = tmp.join("data.tar.part");
-        std::fs::write(&part_path, b"partial data").unwrap();
-        let result = safe_open_part(&part_path).await;
-        assert!(result.is_ok(), "regular file must open normally");
-        drop(result);
-        std::fs::remove_file(&part_path).unwrap();
-        let outside = std::env::temp_dir().join(format!("fil-xfer-outside-{uid}"));
-        std::fs::create_dir_all(&outside).unwrap();
-        let target = outside.join("target.part");
-        std::fs::write(&target, b"outside data").unwrap();
-        create_file_symlink(&target, &part_path);
-        let result = safe_open_part(&part_path).await;
-        let err = result.expect_err("must refuse to open through a symlink");
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains("reparse point"), "unexpected error: {err}");
-        assert_eq!(std::fs::read(&target).unwrap(), b"outside data");
-        let _ = std::fs::remove_file(&part_path);
-        let _ = std::fs::remove_dir_all(&outside);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
 }
