@@ -6493,6 +6493,9 @@ impl Conn {
         // between two processes of one machine (loopback self-send is the
         // first thing every new user tries).
         self.roster.insert(peer_id.clone(), v.clone());
+        ui::debug(&format!(
+            "filament: ADOPT peer={peer_id} source={source:?} want_active={want_active}"
+        ));
 
         // C6: same device on a NEW sid, supersede the stale link.
         let stale: Option<String> = self
@@ -6515,7 +6518,7 @@ impl Conn {
             let was_active = self.is_active(&old_sid);
             let secret = self.links.get(&old_sid).and_then(|l| l.expected_secret.clone());
             self.drop_link(&old_sid);
-            self.establish(v.clone()).await?;
+            self.establish_as(v.clone(), None).await?;
             if let Some(l) = self.links.get_mut(&peer_id) {
                 l.expected_secret = secret;
             }
@@ -6529,7 +6532,7 @@ impl Conn {
             if self.links.len() >= MAX_LINKS {
                 return Ok(false);
             }
-            self.establish(v.clone()).await?;
+            self.establish_as(v.clone(), None).await?;
         }
         // #28: a deferred-active slot is claimable. When the active link got a
         // peer-left but is still flowing, we keep `active` pointing at it (so a
@@ -6755,7 +6758,7 @@ impl Conn {
                 let info = info.clone();
                 let _peer_id = info["id"].as_str().unwrap_or_default().to_string();
                 // Try to establish connection
-                match self.establish(info).await {
+                match self.establish_as(info, None).await {
                     Ok(()) => {
                         self.warm_hold.note_success(&peer);
                         ui::debug(&format!("warm-hold: established connection to '{peer}'"));
@@ -6776,16 +6779,27 @@ impl Conn {
         self.warm_hold.resume(peer);
     }
 
-    async fn establish(&mut self, info: Value) -> Result<()> {
-        self.establish_as(info, None).await
-    }
-
     /// `force_polite: Some(true)` builds a pure responder link (no local offer)
     /// regardless of uid comparison, required when the link exists to ANSWER
     /// an incoming offer (ensure_responder / glare rebuild). The uid-based role
     /// can come out impolite there (especially on the bare `{id}` roster-miss
     /// fallback, which compares sids), making the "responder" offer too: glare.
-    async fn establish_as(&mut self, info: Value, force_polite: Option<bool>) -> Result<()> {
+    #[track_caller]
+    fn establish_as(
+        &mut self,
+        info: Value,
+        force_polite: Option<bool>,
+    ) -> impl std::future::Future<Output = Result<()>> + '_ {
+        let caller = std::panic::Location::caller();
+        async move { self.establish_as_inner(info, force_polite, caller).await }
+    }
+
+    async fn establish_as_inner(
+        &mut self,
+        info: Value,
+        force_polite: Option<bool>,
+        caller: &'static std::panic::Location<'static>,
+    ) -> Result<()> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
         // rung-1: a direct-QUIC attempt owns this peer until its budget expires.
         // Suppress the WebRTC offer so the path stays SEQUENTIAL (no two
@@ -6876,7 +6890,7 @@ impl Conn {
         // was still serving, so an early return above leaves it untouched.
         self.drop_link(&peer_id);
         self.links.insert(
-            peer_id,
+            peer_id.clone(),
             Link {
                 peer: Some(peer),
                 info,
@@ -6900,6 +6914,9 @@ impl Conn {
                 principal_kind: crate::capability::PrincipalKind::OwnerDevice,
             },
         );
+        ui::debug(&format!(
+            "filament: ESTABLISH peer={peer_id} caller={caller}"
+        ));
         Ok(())
     }
 
@@ -7001,7 +7018,7 @@ impl Conn {
             // never touches `links`, so it cannot disturb the relay path.
             if !self.links.contains_key(pid) {
                 let info = json!({ "id": pid, "name": name });
-                if let Err(e) = self.establish(info).await {
+                if let Err(e) = self.establish_as(info, None).await {
                     ui::debug(&format!("  re-establish for {pid} failed: {e}"));
                 }
             }
@@ -7605,6 +7622,9 @@ impl Conn {
         let attempts = l.attempts + 1;
         if attempts >= MAX_ATTEMPTS {
             let was_active = self.is_active(pid);
+            ui::debug(&format!(
+                "filament: STALL-LADDER-EXHAUSTED peer={pid} attempts={attempts} reason={why}"
+            ));
             ui::debug(&ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after {attempts} attempts)")));
             self.suppressed_digest_adoptions.insert(pid.to_string());
             self.drop_link(pid);
@@ -7627,7 +7647,7 @@ impl Conn {
             Duration::from_secs(10),
         );
         tokio::time::sleep(backoff).await;
-        self.establish(info).await?;
+        self.establish_as(info, None).await?;
         if let Some(nl) = self.links.get_mut(pid) {
             nl.attempts = attempts;
             nl.expected_secret = secret;
@@ -7960,7 +7980,7 @@ impl Conn {
                 // re-establish under the session (still preserves the partial).
                 // This IS the fallback: swallowing its failure is how a lost
                 // direct race became a transfer with no link and no diagnostic.
-                if let Err(e) = self.establish(info).await {
+                if let Err(e) = self.establish_as(info, None).await {
                     ui::debug(&format!("  WebRTC fallback for {pid} failed: {e}"));
                 }
                 if was_active {
@@ -8011,7 +8031,7 @@ impl Conn {
         // Carry the proven identity into the fresh relay link so the post-channel
         // pair-proof still binds to the same device (set after establish creates
         // the Link below).
-        if let Err(e) = self.establish(info).await {
+        if let Err(e) = self.establish_as(info, None).await {
             ui::debug(&format!("  relay-only re-establish for {pid} failed: {e}"));
         }
         if let (Some(l), Some(ks)) = (self.links.get_mut(pid), known) {
@@ -10995,7 +11015,7 @@ async fn send_cmd(
         // rung-1: a direct attempt that timed out without an authenticated QUIC
         // connection falls back to the WebRTC establish (unchanged path).
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.establish(info).await?;
+            conn.establish_as(info, None).await?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
