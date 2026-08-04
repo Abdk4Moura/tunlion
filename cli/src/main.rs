@@ -17828,7 +17828,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Windows: safe_resume_part must refuse a file symlink and leave its target untouched.
+    /// Windows: exact fixed assertion, expected to fail without hardening.
     #[cfg(windows)]
     #[tokio::test]
     async fn win_safe_resume_part_refuses_symlink() {
@@ -17846,17 +17846,17 @@ mod tests {
         let target = outside.join("target.part");
         std::fs::write(&target, b"outside data").unwrap();
         create_file_symlink(&target, &part_path);
-        let mut file = safe_resume_part(&part_path).await.expect("negative control follows the symlink");
-        use tokio::io::AsyncWriteExt;
-        file.write_all(b"redirected").await.unwrap();
-        drop(file);
-        assert_eq!(std::fs::read(&target).unwrap(), b"redirecteda");
+        let result = safe_resume_part(&part_path).await;
+        let err = result.expect_err("must refuse to resume through a symlink");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("reparse point"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside data");
         let _ = std::fs::remove_file(&part_path);
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Windows: safe_open_part must refuse a file symlink and leave its target untouched.
+    /// Windows: exact fixed assertion, expected to fail without hardening.
     #[cfg(windows)]
     #[tokio::test]
     async fn win_safe_open_part_refuses_symlink() {
@@ -17875,11 +17875,10 @@ mod tests {
         std::fs::write(&target, b"outside data").unwrap();
         create_file_symlink(&target, &part_path);
         let result = safe_open_part(&part_path).await;
-        let mut file = result.expect("negative control follows the symlink");
-        use tokio::io::AsyncWriteExt;
-        file.write_all(b"redirected").await.unwrap();
-        drop(file);
-        assert_eq!(std::fs::read(&target).unwrap(), b"redirectedata");
+        let err = result.expect_err("must refuse to open through a symlink");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("reparse point"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside data");
         let _ = std::fs::remove_file(&part_path);
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&tmp);
