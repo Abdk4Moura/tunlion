@@ -27,8 +27,8 @@ the GitHub release notes.
   Through 0.7.1 the receiver opened the `.part` path with a bare
   `OpenOptions::new().write(true).open(&part_path)` and there was no file-type
   check on any platform: no `cfg` split, no helper, no guard. 0.7.2 introduced the
-  `safe_open_part` / `safe_resume_part` / `safe_create_part` helpers and fixed the
-  unix arm, which fstats the open file descriptor and refuses non-regular files.
+  `safe_resume_part` / `safe_create_part` helpers and fixed the unix arm, which
+  fstats the open file descriptor and refuses non-regular files.
   The Windows arm was explicitly deferred in the 0.7.2 and 0.7.3 release notes, and
   the deferral was never closed, so from 0.7.2 to 0.7.6 unix is guarded and Windows
   is not.
@@ -48,8 +48,14 @@ the GitHub release notes.
   the download-style directories where untrusted content lands.
 
   Demonstrated rather than inferred: with the fix removed, the helper returns
-  `Ok(File)` whose resolved handle path is the outside directory, and the two
-  regression tests that assert the refusal go red.
+  `Ok(File)` whose resolved handle path is the outside directory, and one
+  regression test that asserts the refusal goes red
+  (`win_safe_resume_part_refuses_symlink`). Two did at the time of the finding;
+  the second, `win_safe_open_part_refuses_symlink`, was removed along with the
+  dead `safe_open_part` helper it exercised, so the difference is a deletion and
+  not a regression. Both numbers are recorded because two independent reds were
+  stronger evidence that the control discriminated than one is, and that was
+  true when the finding was made.
 
 ## [0.7.6] - 2026-07-31
 
@@ -194,6 +200,11 @@ the same features and actually builds and publishes.
   Unix — so a symlink or FIFO planted at the target cannot redirect a write. On
   Windows the resume path is not yet hardened (tracked as a follow-up); this
   protection is Unix-only in 0.7.2.
+  [correction 2026-08-04: it was NOT tracked. Nothing followed it up. The
+  Windows arm shipped unhardened through 0.7.6 and was found only when a branch
+  pushed on 2026-07-31 with no PR was noticed. The parenthetical above is left
+  as written because it is what the release said; this note records that it was
+  false. See the entry under `[Unreleased]`.]
 - **Shared the delegated-principal ceiling and the grant scan** between the two
   authorization paths so they cannot diverge (the recurring "two copies of a
   security check drift apart" bug class).
