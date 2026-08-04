@@ -118,7 +118,30 @@ a transition only a rebuild emits. They imply different fixes, so nothing here
 should be read as asserting A. The discriminator is whether the sender ever
 *attempted* to send file data on the retained link.
 
-All three proofs are required CI gates (`.github/workflows/proof.yml`).
+All four proofs are required CI gates (`.github/workflows/proof.yml`).
+
+## Companion: the stall-ladder model
+
+`stall_ladder_model.py` models the five-rung correction ladder with transience,
+failure type, and discarded recovery state as explicit inputs. Gate 0 first
+reproduces the observed #31, #50, and #38 outcomes: five attempts, 75 seconds,
+and no ladder recovery. The observations alone cannot distinguish a persistent
+condition from a transient condition whose required state the teardown
+discarded. It then shows the boundary: a transient condition can recover on a
+later rung only when the state that rung needs was retained. #50 directly shows
+state destruction, but whether its ICE condition was transient remains
+unmeasured; #38's later roster recovery is external and is not credited to the
+ladder.
+
+Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
+`cli/src/net.rs`; a source change fails the model until its calibration is
+explicitly redone.
+
+Run it with:
+
+```
+python3 stall_ladder_model.py
+```
 
 ## The properties
 
