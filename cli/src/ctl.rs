@@ -370,7 +370,7 @@ mod imp {
     /// PTY stream; `None` (no daemon / no warm link) means fall back to a fresh
     /// establish. `session` keys the peer's persistent PTY for reattach.
     /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
-    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<super::CtlClientStream> {
+    pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<(super::CtlClientStream, u32)> {
         if reuse_disabled() {
             return None;
         }
@@ -385,7 +385,11 @@ mod imp {
         s.flush().await.ok()?;
         let reply = read_line(&mut s, 4096).await.ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(s)
+        if v["ok"].as_bool() == Some(true) {
+            Some((s, v["sid"].as_u64().unwrap_or(0) as u32))
+        } else {
+            None
+        }
     }
 
     /// Relay a window-size change to an already-open warm PTY (by `session`),
@@ -477,7 +481,7 @@ mod imp {
     /// Arm the local daemon for enrollment: tell it an auth key is outstanding.
     /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
     pub async fn try_arm(key_id: String, expiry: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "arm", "key_id": key_id, "expiry": expiry });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -607,7 +611,7 @@ mod imp {
     /// no daemon answered. A fresh process has zero counters; only the running
     /// daemon (`filament up`) accumulates them across live opens.
     pub async fn try_cap_status() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "cap-status" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -623,7 +627,7 @@ mod imp {
 
     /// Ask the daemon for the list of pending consent requests.
     pub async fn try_list_pending() -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "list-pending" });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -645,7 +649,7 @@ mod imp {
 
     /// `try_list_warm` against an explicit socket path for hermetic tests.
     pub async fn try_list_warm_at(path: &Path) -> Option<Value> {
-        let mut s = UnixStream::connect(path).await.ok()?;
+        let mut s = transport_connect(path).await.ok()?;
         let mut line = serde_json::to_vec(&json!({ "op": "list-warm" })).ok()?;
         line.push(b'\n');
         s.write_all(&line).await.ok()?;
@@ -658,7 +662,7 @@ mod imp {
 
     /// Ask the daemon to approve a pending request by id.
     pub async fn try_approve_request(id: u64, allow: &str, expires: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "approve-request", "id": id, "allow": allow, "expires": expires });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -674,7 +678,7 @@ mod imp {
 
     /// Ask the daemon to deny a pending request by id.
     pub async fn try_deny_request(id: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut s = transport_connect(&control_sock_path()).await.ok()?;
         let req = json!({ "op": "deny-request", "id": id });
         let mut line = serde_json::to_vec(&req).ok()?;
         line.push(b'\n');
@@ -686,6 +690,7 @@ mod imp {
             .ok()?;
         let v: Value = serde_json::from_str(&reply).ok()?;
         (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
     /// Send an out-of-band EOF signal for stream `sid`. Opens a SEPARATE ctl
     /// connection (not the data pipe) to keep the data pipe byte-transparent.
     /// The daemon shuts down the L2 stream's write half so the remote sees EOF
@@ -948,7 +953,7 @@ mod imp {
             use crate::l2;
             use std::sync::Arc;
 
-            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (client, server) = tokio::io::duplex(16 * 1024);
             let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
             let l2_tx_clone = l2_tx.clone();
             let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
@@ -983,6 +988,7 @@ mod imp {
             let server_task = tokio::spawn(async move {
                 l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None, Some(eof_rx)).await;
             });
+            drop(_tx);
 
             // Client side: write data, wait for it to be processed, then the
             // OOB eof signal fires (simulating daemon receiving ReqKind::Eof).
