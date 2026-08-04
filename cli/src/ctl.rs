@@ -954,8 +954,13 @@ mod imp {
             use std::sync::Arc;
 
             let (client, server) = tokio::io::duplex(16 * 1024);
-            let (l2_tx, mut l2_rx) = tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
-            let l2_tx_clone = l2_tx.clone();
+            // One channel observes local socket -> L2 frames; the other feeds
+            // remote L2 -> socket response frames into the bridge.
+            let (observed_tx, mut observed_rx) =
+                tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
+            let observed_tx_clone = observed_tx.clone();
+            let (response_tx, response_rx) =
+                tokio::sync::mpsc::unbounded_channel::<Option<bytes::Bytes>>();
             let (eof_tx, eof_rx) = tokio::sync::watch::channel(false);
 
             struct MockTransport(tokio::sync::mpsc::UnboundedSender<Option<bytes::Bytes>>);
@@ -979,16 +984,17 @@ mod imp {
                 fn max_payload(&self) -> usize { 65536 }
             }
 
-            let mux = l2::Mux::new(Arc::new(MockTransport(l2_tx_clone)));
+            let mux = l2::Mux::new(Arc::new(MockTransport(observed_tx_clone)));
             let sid = 42;
-            let (_tx, rx_pipe) = tokio::sync::mpsc::channel(10);
 
             // Server side: run the REAL serve_stream with the eof_signal wired in.
             // This exercises the full OOB path: eof_signal -> socket_to_dc -> L2 FIN.
             let server_task = tokio::spawn(async move {
-                l2::serve_stream_for_test(mux.clone(), sid, server, rx_pipe, true, None, Some(eof_rx)).await;
+                l2::serve_stream_for_test(
+                    mux.clone(), sid, server, response_rx, true, None, Some(eof_rx),
+                )
+                .await;
             });
-            drop(_tx);
 
             // Client side: write data, wait for it to be processed, then the
             // OOB eof signal fires (simulating daemon receiving ReqKind::Eof).
@@ -1011,9 +1017,9 @@ mod imp {
             // reads this data and writes it to the client socket. The channel
             // must stay open long enough for dc_to_socket to read the data.
             let response = b"response-after-eof";
-            let _ = l2_tx.send(Some(bytes::Bytes::from_static(response)));
+            let _ = response_tx.send(Some(bytes::Bytes::from_static(response)));
             // Now close the L2 channel so dc_to_socket finishes after reading
-            drop(l2_tx);
+            drop(response_tx);
 
             // Fire the OOB eof signal AFTER sending response. This causes
             // socket_to_dc to send L2 FIN and return. dc_to_socket has already
@@ -1036,7 +1042,7 @@ mod imp {
 
             // Verify the L2 channel got the client's data + FIN
             let mut l2_data = Vec::new();
-            while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), l2_rx.recv()).await {
+            while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(2), observed_rx.recv()).await {
                 match item {
                     Some(data) => l2_data.extend_from_slice(&data),
                     None => break,
