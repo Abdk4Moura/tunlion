@@ -30,8 +30,9 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNITS=(filament-monitor.service filament-monitor.timer
-       filament-oom-shield.service filament-oom-shield.timer)
-TIMERS=(filament-monitor.timer filament-oom-shield.timer)
+       filament-oom-shield.service filament-oom-shield.timer
+       filament-memory-pressure.service filament-memory-pressure.timer)
+TIMERS=(filament-monitor.timer filament-oom-shield.timer filament-memory-pressure.timer)
 DEST=/etc/systemd/system
 
 verify() {
@@ -67,7 +68,7 @@ fi
 for u in "${UNITS[@]}"; do
   [ -f "$HERE/$u" ] || { echo "install-timers: missing $HERE/$u"; exit 1; }
 done
-for s in "$HERE/signaling-monitor.py" "$HERE/oom-shield-monitor.py" "$HERE/../assert-oom-shield.sh"; do
+for s in "$HERE/signaling-monitor.py" "$HERE/oom-shield-monitor.py" "$HERE/memory-pressure-monitor.py" "$HERE/../assert-oom-shield.sh"; do
   [ -f "$s" ] || { echo "install-timers: unit target missing: $s"; exit 1; }
 done
 for u in "${UNITS[@]}"; do

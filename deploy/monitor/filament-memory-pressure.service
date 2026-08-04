@@ -1,0 +1,8 @@
+[Unit]
+Description=Report sustained host memory pressure before OOM
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/memory-pressure-monitor.py
+SuccessExitStatus=0 1
