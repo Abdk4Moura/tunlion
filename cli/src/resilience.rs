@@ -126,9 +126,9 @@ pub struct LiveObs {
     pub in_flight: bool,
     /// A transport (data channel / QUIC) exists for this link.
     pub transport_up: bool,
-    /// The transport has moved its first DATA byte (`Transport::has_flowed`).
+    /// The transport exposes a tracked idle clock for current activity.
     pub flowed: bool,
-    /// Ms since the last data byte moved (`u64::MAX` if the transport is dead/absent).
+    /// Ms since the last tracked data byte (`u64::MAX` if unavailable).
     pub idle_ms: u64,
     /// Before-first-byte establishment grace (`net::establish_grace_ms`).
     pub grace_ms: u64,
@@ -137,7 +137,7 @@ pub struct LiveObs {
 }
 
 /// The no-progress timeout a phase is judged against. The SINGLE place a phase
-/// maps to its clock: a not-yet-flowed link gets the grace, a flowing one the
+/// maps to its clock: an untracked link gets the grace, a tracked one the
 /// tight threshold. Centralizing this is what makes the wrong-threshold bug
 /// unrepresentable, callers ask `classify`, they never pick a threshold.
 pub fn phase_threshold(flowed: bool, grace_ms: u64, stall_ms: u64) -> u64 {
@@ -163,9 +163,8 @@ pub fn classify(o: &LiveObs) -> Liveness {
     if !o.transport_up {
         return Liveness::Establishing;
     }
-    // Transport up but no first DATA byte: ESTABLISHING, judged against the grace.
-    // Such a link can NEVER be Flowing. (This is the phase the regression
-    // mis-judged by the tight threshold.)
+    // Transport up but no tracked activity clock: ESTABLISHING, judged against
+    // the grace. Such a link can NEVER be Flowing.
     if !o.flowed {
         let grace = phase_threshold(false, o.grace_ms, o.stall_ms);
         return if o.idle_ms >= grace {
@@ -174,7 +173,7 @@ pub fn classify(o: &LiveObs) -> Liveness {
             Liveness::Establishing
         };
     }
-    // First byte has flowed: judged against the tight flowing threshold.
+    // A tracked activity clock is available: judged against the tight threshold.
     let thr = phase_threshold(true, o.grace_ms, o.stall_ms);
     if o.idle_ms >= thr {
         Liveness::Stalled

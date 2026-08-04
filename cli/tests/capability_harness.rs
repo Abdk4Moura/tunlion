@@ -1681,6 +1681,111 @@ mod captured_child_tests {
     }
 }
 
+/// Measure the bytes-moved watchdog against the in-binary one-shot black-hole.
+/// This deliberately uses the captured-child helper so a stalled receiver can
+/// be classified as DETECTED_NOT_RECOVERED instead of hanging the test runner.
+/// It is ignored because it reports an open defect, not because it is unreliable;
+/// ignored tests can decay exactly like the unreferenced gates found on 2026-08-03.
+#[test]
+#[ignore = "reports the open #31 recovery defect; enable with cargo test --features test-hooks -- --ignored after recovery is fixed"]
+fn freeze_stall_detector_classification() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+    let payload_path = h.work_dir.join("stall_payload.bin");
+    let payload: Vec<u8> = (0..4_000_000).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&payload_path, &payload).expect("write stall payload");
+    let expected_hash = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&payload).iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let loopback = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+
+    let mut send = Command::new(&bin);
+    send.env("FILAMENT_CAP_AUTHORITATIVE", "0")
+        .env("FILAMENT_DIRECT", "1")
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("FILAMENT_LOG", "debug")
+        .env("FILAMENT_STALL_MS", "2500")
+        .env("FILAMENT_WARM_STANDBY", "0")
+        .env("FILAMENT_TEST_FREEZE_AFTER_BYTES", "700000")
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .arg("send").arg(&payload_path).arg("--word").arg(CODE_WORD)
+        .arg("--server").arg(&server);
+    let send = spawn_captured(send).expect("spawn measured sender");
+
+    let started = std::time::Instant::now();
+    let code = loop {
+        let (stdout, stderr) = send.snapshot();
+        let text = format!("{stdout}\n{stderr}");
+        if let Some(start) = text.to_lowercase().find(&CODE_WORD.to_lowercase()) {
+            let rest = &text[start..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            break rest[..end].to_string();
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "sender did not mint a code");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let recv_dir = h.b_dir.join("stall_received");
+    std::fs::create_dir_all(&recv_dir).expect("create receive directory");
+    let mut recv = Command::new(&bin);
+    recv.env("FILAMENT_CAP_AUTHORITATIVE", "0")
+        .env("FILAMENT_DIRECT", "1")
+        .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
+        .env("FILAMENT_LOG", "debug")
+        .env("FILAMENT_STALL_MS", "2500")
+        .env("FILAMENT_WARM_STANDBY", "0")
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .arg("recv").arg(&code).arg("--yes").arg("--dir").arg(&recv_dir)
+        .arg("--server").arg(&server);
+    let recv = spawn_captured(recv).expect("spawn measured receiver");
+    let deadline_secs = std::env::var("FILAMENT_STALL_MEASUREMENT_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(90);
+    let recovery_deadline = Duration::from_secs(deadline_secs);
+    let recv_result = recv.wait_until(recovery_deadline);
+    let send_result = send.wait_until(Duration::from_secs(10));
+    let logs = format!("{}\n{}\n{}\n{}", send_result.stdout, send_result.stderr,
+        recv_result.stdout, recv_result.stderr);
+    let armed = logs.contains("STALL_WATCHDOG_ARMED idle_ms_tracked");
+    let froze = logs.contains("data-path FREEZE engaged");
+    let detected = logs.contains("stall detected") || logs.contains("inbound stall");
+    let recovery_started = logs.contains("repairing the link")
+        || logs.contains("re-establish")
+        || logs.contains("re-dial")
+        || logs.contains("stall correction");
+    let received = recv_dir.join("stall_payload.bin");
+    let recovered = matches!(recv_result.outcome, ChildOutcome::ExitedSuccess(_))
+        && received.exists()
+        && std::fs::read(&received).ok().map(|data| {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect::<String>()
+        }).as_deref() == Some(expected_hash.as_str());
+
+    if !armed {
+        panic!("UNCLASSIFIED: stall watchdog armed marker absent; instrument presence was not proven");
+    }
+    if !froze {
+        panic!("UNCLASSIFIED: freeze hook did not engage; no stall was injected");
+    }
+    if !detected {
+        panic!("FAIL: freeze engaged but no stall detector event was observed");
+    }
+    if !recovered {
+        if recovery_started {
+            if !matches!(recv_result.outcome, ChildOutcome::TimedOut) {
+                panic!("DETECTED_NOT_RECOVERED: recovery started, receiver exited before the {recovery_deadline:?} deadline without byte-exact completion");
+            }
+            panic!("DETECTED_NOT_RECOVERED_WITHIN_DEADLINE: recovery started but did not complete within {recovery_deadline:?}");
+        }
+        panic!("DETECTED_RECOVERY_UNOBSERVED: detector fired but no recovery marker was observed");
+    }
+    eprintln!("PASS: freeze injected, detector fired, and transfer recovered byte-exact");
+}
+
 #[test]
 fn warm_one_shot_pty_instant_eof() {
     // Proves fix/warm-oneshot-pty-reuse: one-shot `pty <peer> -- printf ...`

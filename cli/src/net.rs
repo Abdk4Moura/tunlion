@@ -29,6 +29,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "test-hooks")]
+static STALL_WATCHDOG_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 use tokio::sync::{mpsc, Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -394,6 +398,10 @@ pub trait Transport: Send + Sync {
     /// Idle time when the transport tracks activity. `None` means the value is
     /// unknown; liveness is checked separately with `is_alive()`.
     fn idle_ms_tracked(&self) -> Option<u64> {
+        #[cfg(feature = "test-hooks")]
+        if !STALL_WATCHDOG_ARMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[test] STALL_WATCHDOG_ARMED idle_ms_tracked");
+        }
         let idle_ms = self.idle_ms();
         (idle_ms != u64::MAX).then_some(idle_ms)
     }

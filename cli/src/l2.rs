@@ -3867,10 +3867,18 @@ mod h1_tests {
     /// Minimal in-memory Transport: records control messages, discards frames.
     struct MockTransport {
         controls: StdMutex<Vec<Value>>,
+        alive: bool,
+        idle: u64,
     }
     impl MockTransport {
         fn new() -> Arc<Self> {
-            Arc::new(MockTransport { controls: StdMutex::new(Vec::new()) })
+            Self::new_with_alive(true)
+        }
+        fn new_with_alive(alive: bool) -> Arc<Self> {
+            Self::new_with_state(alive, u64::MAX)
+        }
+        fn new_with_state(alive: bool, idle: u64) -> Arc<Self> {
+            Arc::new(MockTransport { controls: StdMutex::new(Vec::new()), alive, idle })
         }
     }
     #[async_trait]
@@ -3888,12 +3896,38 @@ mod h1_tests {
         fn max_payload(&self) -> usize {
             1024
         }
+        fn idle_ms(&self) -> u64 {
+            self.idle
+        }
         fn is_dead(&self) -> bool {
-            false
+            !self.alive
+        }
+        fn is_alive(&self) -> bool {
+            self.alive
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[test]
+    fn stall_observation_reports_dead_transport_down() {
+        let dead = MockTransport::new_with_alive(false);
+        let (transport_up, _flowed, idle_ms) = crate::Conn::stall_observation(Some(dead.as_ref()), &[]);
+        assert!(!transport_up, "a dead transport must not be observed as up");
+        assert_eq!(idle_ms, u64::MAX, "dead transport must not contribute activity");
+    }
+
+    #[test]
+    fn stall_observation_uses_oldest_live_activity() {
+        let primary = MockTransport::new_with_state(true, 9_000);
+        let worker = MockTransport::new_with_state(true, 10);
+        let workers: Vec<Arc<dyn Transport>> = vec![worker];
+        let (transport_up, flowed, idle_ms) =
+            crate::Conn::stall_observation(Some(primary.as_ref()), &workers);
+        assert!(transport_up);
+        assert!(flowed);
+        assert_eq!(idle_ms, 9_000, "a recently active worker must not mask a stalled primary");
     }
 
     fn open_msg(sid: u32) -> Value {
