@@ -12,14 +12,13 @@ the checked-in test estate, not a claim that every test runs in every workflow.
 | L2 and SSH gates | Two local daemons plus local sshd | `127.0.0.1` services and a same-host data channel | None | `cli/tests/l2-gates.sh:25`, `:96-115`, `:148-163`; `cli/tests/ssh-gates.sh:32`, `:60-65` |
 | Local lab | Two Linux network namespaces on one host | Direct veth, userspace UDP, WireGuard, or filament carrier over a private underlay | None. Namespaces are isolated, but no NAT or Internet edge is configured | `lab/README.md:8-15`, `:37-57`, `:69-78`; `lab/topologies/two-nodes.yml:18-21` |
 | Relay gate | Two local peers and local coturn | Forced TURN relay on `127.0.0.1` | Relay transport is covered, but not NAT traversal | `cli/tests/gates.sh:329-347` |
-| Hole-punch gates | Two Linux NAT namespaces | Controlled port-restricted or symmetric NAT emulation, with STUN/TURN in a lab namespace | Cone and symmetric cases are covered when run explicitly; not CI coverage | `cli/tests/holepunch-gates.sh:4-19`, `:227-276` |
+| Cone-NAT diagnostic | Two Linux NAT namespaces | Controlled cone-NAT emulation with local STUN | Not product coverage: the receiving-router emulation currently drops inbound peer checks | `cli/tests/nat-cone-gate.sh`; `docs/testing-nat-cone-gate.md`; issue #134 |
 
-The hole-punch script is the only checked-in test that creates a NAT boundary.
-It is not a hosted workflow: it defaults to an external
-`/root/wt-stress/cli/tests/transport-lab` path (`holepunch-gates.sh:24`),
-requires a prebuilt binary and a Python environment (`:66-70`), and is opt-in
-through `GATES` (`:225`). Treat its results as controlled NAT emulation, not
-evidence from two independent residential or mobile networks.
+The old hole-punch script was retired because its external transport lab was
+never committed and no longer exists. The checked-in cone-NAT diagnostic is not
+a hosted workflow and is explicitly not coverage while issue #134 is open.
+Treat any future result as controlled NAT emulation, not evidence from two
+independent residential or mobile networks.
 
 ## What A Green Board Does Not Prove
 
@@ -30,9 +29,8 @@ The default CI and local gates have zero coverage for:
 - Two peers behind separate ordinary NATs. They cannot expose STUN mapping,
   inbound filtering, simultaneous-open timing, or direct-QUIC candidate failure
   across an actual NAT boundary.
-- Symmetric NAT and CGNAT in production networks. The opt-in hole-punch gate
-  emulates symmetric mapping, but does not exercise carrier-grade NAT policy,
-  ISP filtering, or mobile-network behavior.
+- Symmetric NAT and CGNAT in production networks. No active gate exercises
+  carrier-grade NAT policy, ISP filtering, or mobile-network behavior.
 - NAT hairpin behavior across different hosts. The same-host hairpin probe in
   CI (`capability-ci.yml:108-119`) checks a host kernel path, not a router's
   hairpin implementation.

@@ -1,0 +1,218 @@
+{
+  "version": 1,
+  "artifacts": [
+    {
+      "path": "cli/tests/ack-loss-repro.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/133",
+      "owner": "chief-ux",
+      "expires": "2026-09-01"
+    },
+    {
+      "path": "cli/tests/gates.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/gates.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/holepunch-gates.sh",
+      "disposition": "retired",
+      "reason": "Its external transport lab was never committed and no longer exists.",
+      "reference": "PR #94"
+    },
+    {
+      "path": "cli/tests/l1a/gate1_mutual_key.sh",
+      "disposition": "required",
+      "entrypoint": "BIN=cli/target/release/filament bash cli/tests/l1a/gate1_mutual_key.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/l1a/gate3_wrongpw_burn.sh",
+      "disposition": "required",
+      "entrypoint": "BIN=cli/target/release/filament bash cli/tests/l1a/gate3_wrongpw_burn.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/l1a/gate6_downgrade.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/l1a/gate6_downgrade.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/l1a/gate7_noregression.sh",
+      "disposition": "required",
+      "entrypoint": "BIN=cli/target/release/filament bash cli/tests/l1a/gate7_noregression.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/l1a/gate9_transfer_pake.sh",
+      "disposition": "required",
+      "entrypoint": "BIN=cli/target/release/filament bash cli/tests/l1a/gate9_transfer_pake.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/l1a/gate9b_shared_room.sh",
+      "disposition": "required",
+      "entrypoint": "BIN=cli/target/release/filament bash cli/tests/l1a/gate9b_shared_room.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/l2-gates.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/l2-gates.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/live-pairing-gate.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/live-pairing-gate.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/live-wire-check.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/live-wire-check.sh",
+      "matrix": [{"platform": "linux", "topology": "browser-loopback"}]
+    },
+    {
+      "path": "cli/tests/mount-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/135",
+      "owner": "rig-verifier",
+      "expires": "2026-08-11"
+    },
+    {
+      "path": "cli/tests/nat-cone-gate.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/134",
+      "owner": "opencode-101",
+      "expires": "2026-09-01"
+    },
+    {
+      "path": "cli/tests/natprobe-test.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/natprobe-test.sh",
+      "matrix": [{"platform": "linux", "topology": "linux-netns"}]
+    },
+    {
+      "path": "cli/tests/natprobe.py",
+      "disposition": "support",
+      "invoked_by": ["cli/tests/nat-cone-gate.sh", "cli/tests/natprobe-test.sh"]
+    },
+    {
+      "path": "cli/tests/reliability_test.sh",
+      "disposition": "retired",
+      "reason": "It targets a hard-coded live peer and exits zero after failed operations.",
+      "reference": "docs/executable-artifact-registry.md#retired-artifacts"
+    },
+    {
+      "path": "cli/tests/ssh-gates.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/ssh-gates.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "cli/tests/stun-server.py",
+      "disposition": "support",
+      "invoked_by": ["cli/tests/nat-cone-gate.sh"]
+    },
+    {
+      "path": "cli/tests/transport-gates.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/transport-gates.sh",
+      "matrix": [{"platform": "linux", "topology": "local-fixture"}]
+    },
+    {
+      "path": "deploy/assert-oom-shield.sh",
+      "disposition": "operational",
+      "entrypoint": "bash deploy/assert-oom-shield.sh",
+      "matrix": [{"platform": "linux", "topology": "deployment-host"}],
+      "activation": "systemd",
+      "invoked_by": ["deploy/monitor/oom-shield-monitor.py"]
+    },
+    {
+      "path": "deploy/monitor/install-timers.sh",
+      "disposition": "operational",
+      "entrypoint": "sudo bash deploy/monitor/install-timers.sh",
+      "matrix": [{"platform": "linux", "topology": "deployment-host"}],
+      "activation": "manual",
+      "invoked_by": []
+    },
+    {
+      "path": "deploy/monitor/memory-pressure-monitor.py",
+      "disposition": "operational",
+      "entrypoint": "python3 deploy/monitor/memory-pressure-monitor.py",
+      "matrix": [{"platform": "linux", "topology": "deployment-host"}],
+      "activation": "systemd",
+      "invoked_by": ["deploy/monitor/filament-memory-pressure.service"]
+    },
+    {
+      "path": "deploy/monitor/oom-shield-monitor.py",
+      "disposition": "operational",
+      "entrypoint": "python3 deploy/monitor/oom-shield-monitor.py",
+      "matrix": [{"platform": "linux", "topology": "deployment-host"}],
+      "activation": "systemd",
+      "invoked_by": ["deploy/monitor/filament-oom-shield.service"]
+    },
+    {
+      "path": "deploy/monitor/signaling-monitor.py",
+      "disposition": "operational",
+      "entrypoint": "python3 deploy/monitor/signaling-monitor.py",
+      "matrix": [{"platform": "linux", "topology": "deployment-host"}],
+      "activation": "systemd",
+      "invoked_by": ["deploy/monitor/filament-monitor.service"]
+    },
+    {
+      "path": "deploy/monitor/test-memory-pressure-monitor.py",
+      "disposition": "required",
+      "entrypoint": "python3 deploy/monitor/test-memory-pressure-monitor.py",
+      "matrix": [{"platform": "portable", "topology": "unit"}]
+    },
+    {
+      "path": "deploy/scale.sh",
+      "disposition": "operational",
+      "entrypoint": "bash deploy/scale.sh <replicas>",
+      "matrix": [{"platform": "linux", "topology": "deployment-host"}],
+      "activation": "manual",
+      "invoked_by": []
+    },
+    {
+      "path": "proofs/establishment_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/establishment_model.py",
+      "matrix": [{"platform": "portable", "topology": "model-checker"}]
+    },
+    {
+      "path": "proofs/stall_ladder_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/stall_ladder_model.py",
+      "matrix": [{"platform": "portable", "topology": "model-checker"}]
+    },
+    {
+      "path": "proofs/transport_lifecycle_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/transport_lifecycle_model.py",
+      "matrix": [{"platform": "portable", "topology": "model-checker"}]
+    },
+    {
+      "path": "proofs/transport_upgrade_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/transport_upgrade_model.py",
+      "matrix": [{"platform": "portable", "topology": "model-checker"}]
+    }
+  ],
+  "verdict_debt": [
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "pty_one_shot_exec_smoke",
+      "platforms": ["macos", "windows"],
+      "behavior": "Returns success after reporting that cold establish is unverified."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "warm_one_shot_pty_instant_eof",
+      "platforms": ["macos", "windows"],
+      "behavior": "Returns success after reporting a platform skip."
+    }
+  ]
+}

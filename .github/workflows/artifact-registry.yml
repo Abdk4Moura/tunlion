@@ -1,0 +1,21 @@
+name: Executable artifact registry
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test registry enforcement
+        run: python3 scripts/test_artifact_registry.py
+      - name: Reject unregistered or invalid executable artifacts
+        run: python3 scripts/check_artifact_registry.py
