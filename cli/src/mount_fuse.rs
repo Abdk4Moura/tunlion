@@ -53,7 +53,7 @@ const TTL: Duration = Duration::from_secs(1);
 /// pass.
 struct InodeMap {
     fwd: HashMap<u64, PathBuf>,
-    rev: HashMap<String, u64>,
+    rev: HashMap<Vec<u8>, u64>,
     next: u64,
     case_sensitive: bool,
 }
@@ -67,13 +67,20 @@ impl InodeMap {
         InodeMap { fwd, rev, next: 2, case_sensitive }
     }
 
-    fn normalize(path: &Path) -> String {
-        path.to_string_lossy().to_lowercase()
+    fn normalize(path: &Path) -> Vec<u8> {
+        let mut bytes = path.as_os_str().as_bytes().to_vec();
+        // Preserve undecodable bytes; Unicode folding cannot define their case.
+        for byte in &mut bytes {
+            if byte.is_ascii_uppercase() {
+                *byte = byte.to_ascii_lowercase();
+            }
+        }
+        bytes
     }
 
-    fn key(&self, path: &Path) -> String {
+    fn key(&self, path: &Path) -> Vec<u8> {
         if self.case_sensitive {
-            path.to_string_lossy().into_owned()
+            path.as_os_str().as_bytes().to_vec()
         } else {
             Self::normalize(path)
         }
@@ -656,6 +663,7 @@ impl Filesystem for FilamentFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn inodemap_case_sensitive_distinct_keys() {
@@ -679,6 +687,22 @@ mod tests {
         let _ = map.intern(PathBuf::from("Foo"));
         map.forget(Path::new("foo"));
         assert!(map.path(2).is_none());
+    }
+
+    #[test]
+    fn inodemap_non_utf8_names_do_not_collide() {
+        let mut map = InodeMap::new(true);
+        let a = PathBuf::from(std::ffi::OsString::from_vec(b"name-\xff".to_vec()));
+        let b = PathBuf::from(std::ffi::OsString::from_vec(b"name-\xfe".to_vec()));
+        assert_ne!(map.intern(a), map.intern(b));
+    }
+
+    #[test]
+    fn inodemap_non_utf8_name_round_trips() {
+        let mut map = InodeMap::new(true);
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"name-\xff".to_vec()));
+        let ino = map.intern(path.clone());
+        assert_eq!(map.intern(path), ino);
     }
 
     #[test]
