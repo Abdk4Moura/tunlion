@@ -10,7 +10,13 @@ confirmation.)
 
 ---
 
-## 1. The problem
+## 1. The problem (RESOLVED 2026-08-03, kept for the trail)
+
+> **STATUS: this section describes the state BEFORE the root cause was found.**
+> `pair_and_transfer_smoke` now passes on all three platforms. The cause and fix
+> are in section 3b. Everything below in this section is the investigation as it
+> stood, preserved because the wrong turns are instructive, not because it is
+> current.
 
 `pair_and_transfer_smoke` fails on two of three platforms on `main`.
 
@@ -98,65 +104,96 @@ All VERIFIED in source by `claude-advisor`:
 - Gate P: `FILAMENT_TEST_DROP_PUSH` server-side push dropper.
 
 **#71 works by RECOVERY, not prevention.** Roster re-adoption re-establishes
-after the teardown; the designed fallback is still broken. Do not describe it as
-fixed.
+after the teardown.
 
-## 4. In flight
+> **SUPERSEDED 2026-08-03 by #83 (47f756c).** The sentence that stood here said
+> "the designed fallback is still broken, do not describe it as fixed". That was
+> true when written and is now wrong. The root cause was never the fallback: the
+> offer site documented that *"on confirm the Signal handler sets `pake_done`
+> and re-emits ChannelReady to fall through here and offer"*, and the Signal
+> handler never re-emitted anything. The Option A teardown was performing that
+> dispatch by accident. See section 3b.
 
-### PR #78 `fix/promote-intent-v2` — the current candidate, MERGEABLE
-Rebuilt on current `main` after #71 squash-merged. Carries the whole chain:
+## 3b. What the macOS wedge actually was (2026-08-03, RESOLVED)
+
+The `--code` path DEFERS every offer until the PAKE confirms, and the offer site
+names who is supposed to wake it:
 
 ```rust
-enum DirectIntent { Normal, Probe, Promote }
-
-// a promotion SUPERSEDES a stale pending: one dialled before PAKE completed
-// has no secret and cannot authenticate, so it must not block the promotion
-if direct_pending.contains_key(pid) { if intent != Promote { return } ; remove(pid) }
-// a live link stops everyone EXCEPT a deliberate promotion
-if intent == Normal && has_live_transport(pid) { return }
-...all fallible setup, then register direct_pending...
-if intent == Promote { drop_link(pid) }      // destroy last, successor armed
+// ...on confirm the Signal handler sets `pake_done` and re-emits
+// ChannelReady to fall through here and offer.
+if use_code && !is_direct && !pake_done {
+    continue; // offers/remember wait for PAKE confirm
+}
 ```
 
-`start_direct_promote` is the only caller permitted to replace a serving link.
-The enum replaced a `(probe, promote)` bool pair on `claude-advisor`'s gate:
-four states, three meaningful, one nonsense (`probe && promote` = "a test dial
-that tears down a serving link") that nothing rejected.
+**The Signal handler sets `pake_done`. It never re-emitted anything.** What woke
+the loop was the Option A teardown: dropping the link forced a rebuild, and the
+rebuilt link's fresh `ChannelReady` fell through the now-satisfied guard carrying
+the offer. A destroy-and-rebuild cycle was standing in for an event dispatch, and
+no test could tell the difference because every platform either promoted to
+direct or rebuilt WebRTC. No configuration ever RETAINED the post-PAKE link and
+needed it to work, until the promote-intent restructure created one.
 
-### PR #77 — the control that decides it
-Same tree minus ONLY the roster reconciliation. #78 contains both the promote
-fix and roster recovery, so a green #78 says the transfer works, NOT which
-change did it. #77 is the only thing separating "the fallback is repaired" from
-"roster re-adoption is still masking it".
+Fixed by `rearm_channel_ready` at both PAKE sites (#83, 47f756c).
 
-### CLOSED as superseded or redundant
-#70 (winner rule; `answerer_for` is in main 4x via #71, verified by content
-because #71 was squashed), #75 and #76 (both stacked on a pre-#71 base, went
-CONFLICTING, and **GitHub schedules zero checks on a conflicting PR** — that
-reads exactly like "CI pending" and cost two wake cycles).
+## 4. Where things stand (2026-08-04)
+
+Twenty-three PRs merged on 2026-08-03. The transport-path investigation is
+closed. `main` is green on all three platforms.
+
+**Landed**: #71 roster reconciliation, #72 copy, #81 `channel_peers`, #82 the
+transport-upgrade proof, #83 the ChannelReady contract, #84 the
+transport-recovery obligation, #85 pending-survives-setup-failure, #86 the
+announce seq check, #87 the transition-staleness detector, #89 the fallback gate
+that had run nowhere, #90 this file onto main, #91 the role-comparison guard,
+#92 first-contact eligibility, #93 the coverage map, #94 the unrunnable NAT gate
+annotated, #95 the NAT prober, #96 exhausted-give-up suppression, #97 the SAS
+no-constructor guard, #98 config-mode repair, #99 the shell owner-equivalence
+gate, #100 the delegated ceiling, #101 owner-equivalent copy, #103 the pattern
+record, #104 the shell posture docs, #105 the OOM shield assertion.
+
+**Closed as superseded**: #70, #73, #74, #75, #76 (stacked on a pre-#71 base,
+went CONFLICTING, and **GitHub schedules zero checks on a conflicting PR**, which
+reads exactly like "CI pending" and cost two wake cycles), #77, #78 and #79
+(the promote-intent restructure alone was a REGRESSION: it removed the accidental
+teardown that was dispatching ChannelReady, so it re-landed inside #83 with the
+re-emit that makes it correct).
 
 ## 5. Open, in priority order
 
-1. **#78 macOS result**, then **#77's control**. Green on #77 = the designed
-   fallback is genuinely repaired rather than routed around.
-2. **`FILAMENT_DIRECT=0` wedges transfers** (section 2). Documented opt-out,
-   product bug, 600s wedge. #78 fixes the mechanism; needs its own coverage.
-3. **Fallback latency**: documented ~5s, observed 30s (a sync interval, not the
-   budget). Untouched by any fix so far.
-4. **Reap + `channel_peers`** (filament-new-guy, started): `on_synced` returns
-   `peers` and drops `channel_peers`, so the five `Ev::KnownPeer` consumers
-   (main.rs 3631, 3818, 4044, 4523, 10805) and `KnownPeerLeft` (12938) have NO
-   repair path, and `#[must_use]` cannot help them.
-5. **PR #72** (#23 copy): ubuntu failure diagnosed by opencode-101 as the
-   pre-#71 transfer baseline, NOT copy-induced. Rebase onto current main is the
-   discriminating check.
-6. **#25** wired by optimizer at `671c6e2` on `task25-current-main`, unbuilt.
-7. **Adoption cannot distinguish a deliberate drop** from a missed
-   `peer-joined` — guard is `!links.contains_key(pid)`, satisfied after any
-   teardown, and Option A drops deliberately on every transfer.
-8. **Stall detector** `0f9d031`: real, unmerged, unmeasured. Must NOT be
-   validated by its own clean-run hang count; a correct detector and a broken
-   one both report zero. Induce a stall.
+1. **#49 `pair --word` mints a code its own router rejects.** `mint_nameplate()`
+   returns 3 digits; `looks_like_pake_code` requires >=4; the bare-token router
+   sends 2-3 digits to `recv`. A test at `words.rs:215` PINS the wrong width, so
+   the suite defends the mismatch. Fix needs a separate pairing mint plus a
+   ROUND-TRIP assertion: what `pair --word` mints must satisfy
+   `looks_like_pake_code`. Pinning widths independently is what let them drift.
+2. **#50 the first-ever NAT pairing attempt FAILED**, ICE stuck then timeout.
+   Cause UNKNOWN between lab and product and **must not be guessed**. The
+   `FILAMENT_BIN=/bin/true` control proves the topology and prober, NOT that the
+   lab can carry WebRTC. Needs a control proving WebRTC works in that lab at all.
+   Do NOT resolve it by adding TURN and observing a relay: that proves relay and
+   says nothing about hole-punch.
+3. **#31 recovery does not converge.** Detector arms, freeze engages, detector
+   fires, recovery STARTS, transfer terminates without completing. A 240s bound
+   went unused: the receiver exited on its own at 149.48s. Exit reason
+   deliberately UNATTRIBUTED, because the log line that would name it is not
+   emitted. Adding an establish/adopt marker is the next step, and it is a code
+   change, not another run.
+4. **#51 the 6.0s fallback figure is narrower than published.** `expired_direct`
+   at `main.rs:7535` only falls back when the link is ABSENT at expiry
+   (`!self.links.contains_key(pid)`). If the link returns first the pending is
+   silently discarded and no `DIRECT-FALLBACK` is emitted. So 6.032 / 6.006 /
+   6.015s is *the designed fallback WHEN the other recovery route loses the
+   race*, not the only route. CI took one route, Linux takes the other.
+5. **#43 PATHSET** (build alongside, promote on proof). Unblocked by #83:
+   `proofs/transport_upgrade_model.py` scores it 8/8 with `ctrl_carries=True`
+   versus main's 7/8. Not urgent; the remaining break is real, not a formality.
+6. **#20 fleet-cert enrollment** stays deliberately UNWIRED. The escalation chain
+   is documented and guarded (#100), and no live path can produce the artefact it
+   needs. Do not implement it to unblock something.
+7. **#48 follow-up**: `deploy/assert-oom-shield.sh` exists and is not wired to a
+   cron or healthcheck. It must be RUN to be useful.
 
 ## 6. RULED OUT — do not re-investigate
 
