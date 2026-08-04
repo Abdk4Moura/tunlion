@@ -18,14 +18,32 @@ jobs:
       - name: Build and capture warning count
         id: build
         run: |
+          set -o pipefail
           cd cli
-          CARGO_PROFILE_RELEASE_LTO=false cargo check -j2 2>&1 | grep "^warning:" > /tmp/warnings.txt || true
+          # `cargo check | grep ... || true` used to swallow a COMPILE FAILURE:
+          # grep finds no warnings, `|| true` hides the failure, the count is 0,
+          # and 0 <= baseline so the ratchet passes. A tree that does not build
+          # scored a perfect warning count. Capture the status explicitly.
+          CARGO_PROFILE_RELEASE_LTO=false cargo check -j2 2>&1 | tee /tmp/check.log || CHECK_FAILED=1
+          if [ "${CHECK_FAILED:-0}" = "1" ]; then
+            echo "::error::cargo check FAILED; the warning count below is meaningless."
+            tail -40 /tmp/check.log
+            exit 1
+          fi
+          grep "^warning:" /tmp/check.log > /tmp/warnings.txt || true
           printf '%d' "$(wc -l < /tmp/warnings.txt)" > /tmp/warning-count
           echo "current=$(cat /tmp/warning-count)" >> $GITHUB_OUTPUT
 
       - name: Ratchet check
         run: |
-          BASELINE=$(cat .github/warning-baseline 2>/dev/null || echo "9999")
+          # A MISSING baseline used to become 9999, so every count passed and
+          # the gate silently stopped gating. Absence of the baseline is a
+          # broken gate, not a permissive one.
+          if [ ! -f .github/warning-baseline ]; then
+            echo "::error::.github/warning-baseline is missing; the ratchet cannot gate without it."
+            exit 1
+          fi
+          BASELINE=$(cat .github/warning-baseline)
           CURRENT=${{ steps.build.outputs.current }}
           echo "baseline=$BASELINE current=$CURRENT"
           if [ "$CURRENT" -gt "$BASELINE" ]; then

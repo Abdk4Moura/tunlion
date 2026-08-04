@@ -159,6 +159,13 @@ jobs:
         working-directory: cli
         shell: bash
         run: |
+          # `shell: bash` runs `bash -e`, which does NOT set pipefail. Without
+          # this line the macOS branch below returns TEE's exit status, so a
+          # FAILING capability harness exits 0 and the step passes green. Every
+          # macOS harness result before 2026-08-04 was produced without it and
+          # cannot be trusted. Found by deep-wisdom while auditing whether green
+          # can mean the command failed.
+          set -o pipefail
           if [ "$RUNNER_OS" = "macOS" ]; then
             cargo test --features test-hooks --release --test capability_harness \
               -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
