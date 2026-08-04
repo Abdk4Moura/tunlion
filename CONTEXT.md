@@ -302,6 +302,28 @@ produces results actually ran.*
   seq is signed and no receiver ever compares it). **A signature over a field
   creates a strong presumption that someone verifies it** — grep for the
   consumer before believing it.
+- **"In the repo" and "running on the host" are different facts, and only one
+  is visible in a diff.** `deploy/monitor/filament-monitor.timer` and `.service`
+  were committed on 2026-06-27, but on 2026-08-04 the droplet had no unit under
+  `/etc/systemd/system`, no timer in `systemctl list-timers`, and no cron entry;
+  its state file was last written by a hand-run on 2026-07-31, even though the
+  monitor had correctly recorded a real DOWN and recovery. Likewise,
+  `oom_score_adj: -800` in `deploy/docker-compose.yml` left all four running
+  containers at 0 because compose applies it at container creation. **Ship an
+  installer plus a verify mode that inspects the live system**: `install-timers.sh
+  verify` must require a scheduled next elapse, not merely enabled and active.
+  It caught a timer that was enabled and active but had no next elapse, which
+  `is-enabled` and `is-active` both reported as fine.
+- **Every failed check catalogued this week was a false negative: a check that
+  silently passes when it should fail.** The absence read as a null, the signed
+  announce sequence had no verifier, the contract lived only in a comment, and
+  roster reconciliation could not fire. A false positive of the right shape is
+  more dangerous: `fuser -m <target-dir>` checked the mounted filesystem
+  containing the path, reported every process including init, and made a
+  catastrophic in-use finding out of an instrument error. The safe-looking
+  response would have left a 98% disk untouched. **Ask about the thing, not a
+  proxy for it**: a cargo target is held only by a build, so
+  `pgrep -x cargo; pgrep -x rustc; pgrep -x mold` was the decisive check.
 - **An invariant maintained by convention at N call sites will be missed at
   call site N+1**, and no test that gives each daemon its own config dir can
   ever catch a same-install filter. Put it in the type or in the signature.
