@@ -5,6 +5,17 @@ Driven by a systemd timer. This monitor only reads /proc and takes one `ps`
 snapshot; that constraint is deliberate so the warning itself cannot amplify
 pressure on a host already running low. It reports, but never kills or
 restarts, a process: choosing whose build to stop is an operator decision.
+
+The high-severity condition requires BOTH `MemAvailable` and `SwapFree` to be
+below their thresholds. `MemAvailable` governs whether the NEXT ALLOCATION has
+room. Low `SwapFree` on its own is a LEADING indicator and can coexist with
+ample reclaimable memory: on 2026-08-04 the monitor observed swap free at 1 MiB
+alongside available memory at 1167 MiB and then 2229 MiB, with zero OOM kills.
+A swap-only WARNING is wanted and is deliberately absent because no calibrated
+threshold exists for it yet. The follow-up needs observations of SwapFree during
+a period that ends in an OOM kill. The journal still contains the 2026-08-02
+OOM events, but no SwapFree/MemAvailable readings were logged alongside them,
+so it supplies an OOM event without the threshold calibration data.
 """
 import json
 import os
