@@ -11048,7 +11048,11 @@ async fn send_cmd(
         // location is sufficient to distinguish this fallback from adoption.
         // The receiver-side caller below routes through maybe_adopt instead.
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.establish_as(info, None).await?;
+            conn.establish_as(info, None)
+                .await
+                .with_context(|| {
+                    format!("direct fallback establish failed for peer {pid} on send path")
+                })?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
@@ -13688,7 +13692,11 @@ async fn recv_cmd(
         // ADOPT for the same peer; that sequence is not sound if peers recover
         // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
-            conn.maybe_adopt(&info, true).await?;
+            conn.maybe_adopt(&info, true)
+                .await
+                .with_context(|| {
+                    format!("direct fallback adoption failed for peer {pid} on receive path")
+                })?;
             if let Some(l) = conn.link_mut(&pid) {
                 l.expected_secret = Some((n, sec));
             }
