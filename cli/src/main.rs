@@ -17783,11 +17783,9 @@ mod tests {
         assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
         assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
     // --- Windows reparse-point hardening tests (#43) ---
-    // These mirror the Unix transfer_part_refuses_symlink / transfer_open_part_refuses_symlink
-    // tests but use Windows directory junctions to exercise the reparse-point refusal.
-    // Junctions are created via `cmd /c mklink /J` (no privilege needed, unlike symlinks).
-    // Runtime behavior (does the junction actually get refused) needs a Windows runner,
-    // which we don't have yet — pending #34 (per-OS CI).
+    // The resume/open tests use a file symlink to prove that the write cannot be
+    // redirected outside the download directory. The create test remains a
+    // junction smoke check because CREATE_NEW rejects any existing path.
 
     /// Helper: create a Windows directory junction via `cmd /c mklink /J`.
     #[cfg(windows)]
@@ -17799,6 +17797,17 @@ mod tests {
             .status()
             .expect("failed to run cmd /c mklink /J");
         assert!(status.success(), "mklink /J failed: {status:?}");
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &std::path::Path, link: &std::path::Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink"])
+            .arg(link.to_str().unwrap())
+            .arg(target.to_str().unwrap())
+            .status()
+            .expect("failed to run cmd /c mklink");
+        assert!(status.success(), "mklink failed: {status:?}");
     }
 
     /// Windows: safe_create_part must refuse to create through a junction.
@@ -17818,10 +17827,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Windows: safe_resume_part must refuse to open a junction.
+    /// Windows: safe_resume_part must refuse a file symlink and leave its target untouched.
     #[cfg(windows)]
     #[tokio::test]
-    async fn win_safe_resume_part_refuses_junction() {
+    async fn win_safe_resume_part_refuses_symlink() {
         let uid = format!("{}-win-resume-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -17831,18 +17840,25 @@ mod tests {
         assert!(result.is_ok(), "regular file must open normally for resume");
         drop(result);
         std::fs::remove_file(&part_path).unwrap();
-        let junction_target = tmp.join("junction-target");
-        std::fs::create_dir_all(&junction_target).unwrap();
-        create_junction(&junction_target, &part_path);
-        let result = safe_resume_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to resume through a junction: {:?}", result.err());
+        let outside = std::env::temp_dir().join(format!("fil-xfer-outside-{uid}"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("target.part");
+        std::fs::write(&target, b"outside data").unwrap();
+        create_file_symlink(&target, &part_path);
+        let mut file = safe_resume_part(&part_path).await.expect("negative control follows the symlink");
+        use tokio::io::AsyncWriteExt;
+        file.write_all(b"redirected").await.unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&target).unwrap(), b"redirecteda");
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// Windows: safe_open_part must refuse to open a junction.
+    /// Windows: safe_open_part must refuse a file symlink and leave its target untouched.
     #[cfg(windows)]
     #[tokio::test]
-    async fn win_safe_open_part_refuses_junction() {
+    async fn win_safe_open_part_refuses_symlink() {
         let uid = format!("{}-win-open-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -17852,11 +17868,20 @@ mod tests {
         assert!(result.is_ok(), "regular file must open normally");
         drop(result);
         std::fs::remove_file(&part_path).unwrap();
-        let junction_target = tmp.join("junction-target");
-        std::fs::create_dir_all(&junction_target).unwrap();
-        create_junction(&junction_target, &part_path);
+        let outside = std::env::temp_dir().join(format!("fil-xfer-outside-{uid}"));
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("target.part");
+        std::fs::write(&target, b"outside data").unwrap();
+        std::fs::remove_file(&part_path).unwrap();
+        create_file_symlink(&target, &part_path);
         let result = safe_open_part(&part_path).await;
-        assert!(result.is_err(), "must refuse to open a junction: {:?}", result.err());
+        let mut file = result.expect("negative control follows the symlink");
+        use tokio::io::AsyncWriteExt;
+        file.write_all(b"redirected").await.unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&target).unwrap(), b"redirectedata");
+        let _ = std::fs::remove_file(&part_path);
+        let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
