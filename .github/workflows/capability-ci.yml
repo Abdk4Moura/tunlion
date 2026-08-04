@@ -159,13 +159,13 @@ jobs:
         working-directory: cli
         shell: bash
         run: |
-          # `shell: bash` runs `bash -e`, which does NOT set pipefail. Without
-          # this line the macOS branch below returns TEE's exit status, so a
-          # FAILING capability harness exits 0 and the step passes green. Every
-          # macOS harness result before 2026-08-04 was produced without it and
-          # cannot be trusted. Found by deep-wisdom while auditing whether green
-          # can mean the command failed.
-          set -o pipefail
+          # This step's `shell: bash` above already supplies pipefail: GitHub
+          # runs `bash --noprofile --norc -eo pipefail {0}` for an EXPLICIT
+          # `shell: bash`, and the bare default `bash -e {0}` only when no
+          # shell key is given. The explicit form, which reads like a no-op, is
+          # the one that ADDS pipefail. A commit on 2026-08-04 asserted the
+          # opposite here and briefly declared every macOS harness green
+          # invalid; it was wrong and the greens were always valid.
           if [ "$RUNNER_OS" = "macOS" ]; then
             cargo test --features test-hooks --release --test capability_harness \
               -- --nocapture --test-threads=1 2>&1 | tee /tmp/harness-macos.log
