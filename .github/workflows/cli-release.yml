@@ -124,6 +124,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # The release job did not check out the repo, because it only ever
+      # assembled artifacts. It does now, so the notes can be built FROM
+      # CHANGELOG.md instead of being a static template that cannot mention
+      # what changed.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: pkg-*
@@ -138,9 +143,68 @@ jobs:
           subject-path: |
             filament-*
             SHA256SUMS
+      # WHY THIS EXISTS
+      #
+      # The release body below used to be a static install + quick-start
+      # template with no reference to CHANGELOG.md. So a change could be
+      # written up correctly in the changelog and still be invisible in the
+      # release notes, which is what a user actually reads when `filament
+      # update` or winget offers them a new version.
+      #
+      # That was found on 2026-08-04 while landing a security entry under
+      # [Unreleased]. The entry was correct, merged, and would have reached
+      # nobody. Writing the entry and publishing the entry are two different
+      # facts and only one of them was happening.
+      #
+      # If the changelog has no section for this tag, that is stated LOUDLY in
+      # the published notes rather than passed over. A missing entry is worth
+      # seeing; silence is what let a deferral sit unread for four days.
+      - name: Build release notes from CHANGELOG.md
+        run: |
+          VER="${GITHUB_REF_NAME#cli-v}"
+          extract() {
+            awk -v want="$1" '
+              $0 ~ "^## \\[" want "\\]" { found = 1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md
+          }
+          SECTION="$(extract "$VER")"
+          if [ -z "$(printf '%s' "$SECTION" | tr -d '[:space:]')" ]; then
+            UNREL="$(extract "Unreleased")"
+            if [ -n "$(printf '%s' "$UNREL" | tr -d '[:space:]')" ]; then
+              {
+                echo "> **Note:** CHANGELOG.md has no \`## [$VER]\` section, so the"
+                echo "> notes below come from its \`[Unreleased]\` section. Rename that"
+                echo "> heading to \`[$VER]\` and the next release picks it up directly."
+                echo
+                printf '%s\n' "$UNREL"
+              } > notes-head.md
+            else
+              {
+                echo "> **Note:** CHANGELOG.md has no entry for \`$VER\` and no"
+                echo "> \`[Unreleased]\` section. These notes describe how to install"
+                echo "> this version, not what changed in it."
+              } > notes-head.md
+            fi
+          else
+            printf '%s\n' "$SECTION" > notes-head.md
+          fi
+          echo "--- release notes head ---"
+          cat notes-head.md
+      - name: Assemble the full release body
+        run: |
+          {
+            cat notes-head.md
+            echo
+            cat .github/release-body.md
+          } > release-notes.md
+          echo "--- full body ---"
+          cat release-notes.md
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           # A tag with a hyphen (cli-v0.2.1-beta.1) is a PRERELEASE: GitHub
           # hides it from /releases/latest, and the installer + self-update
           # skip it unless explicitly opted in (FILAMENT_CHANNEL=beta /
@@ -149,28 +213,3 @@ jobs:
           files: |
             filament-*
             SHA256SUMS
-          body: |
-            ## Install
-
-            **Linux / macOS** (verifies checksums, installs to `~/.local/bin`, no sudo):
-            ```
-            curl -fsSL https://filament.autumated.com/install | sh
-            ```
-
-            **Windows:**
-            ```
-            winget install Abdk4Moura.Filament
-            ```
-
-            **Homebrew:** `brew install abdk4moura/tap/filament` · **Cargo:** `cargo install filament-cli`
-
-            Already installed? `filament update`
-
-            ## Quick start
-            ```
-            filament send video.mp4 --code      # speak the code aloud
-            filament recv clever-lynx-63        # …or open filament.autumated.com in any browser
-            ```
-
-            All binaries are checksummed (SHA256SUMS) and carry GitHub build
-            provenance attestations. The Linux binary is fully static (musl).
