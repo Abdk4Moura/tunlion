@@ -4,6 +4,53 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [Unreleased]
+
+### Security
+
+- **`.part` files are no longer opened through a symlink or directory junction.**
+  A junction or symlink planted at the `.part` path was followed when the receiver
+  opened it, redirecting the write outside the download directory with the
+  authority of the user running filament.
+
+  **The affected platforms differ by version. Read the row that applies to you.**
+
+  **Every released version is affected.** The pattern is present in `cli-v0.1.0`,
+  the first tag this project ever cut, so there is no unaffected release to
+  upgrade sideways to. What changes across versions is which platforms:
+
+  | versions | affected platforms |
+  |---|---|
+  | **every release through 0.7.1** (0.1.0 onward, stable and beta alike) | **all platforms**, including Linux and macOS |
+  | **0.7.2** through 0.7.6 | **Windows only** |
+
+  Through 0.7.1 the receiver opened the `.part` path with a bare
+  `OpenOptions::new().write(true).open(&part_path)` and there was no file-type
+  check on any platform: no `cfg` split, no helper, no guard. 0.7.2 introduced the
+  `safe_open_part` / `safe_resume_part` / `safe_create_part` helpers and fixed the
+  unix arm, which fstats the open file descriptor and refuses non-regular files.
+  The Windows arm was explicitly deferred in the 0.7.2 and 0.7.3 release notes, and
+  the deferral was never closed, so from 0.7.2 to 0.7.6 unix is guarded and Windows
+  is not.
+
+  Fixed by opening with `FILE_FLAG_OPEN_REPARSE_POINT` so the link is not followed,
+  then rejecting reparse points and non-regular files via
+  `GetFileInformationByHandle` on the open handle. Handle-based, so there is no
+  TOCTOU window between the check and the use, matching what the unix arm already
+  did.
+
+  **Scope, stated plainly.** This is a local issue, not a remote one. An attacker
+  must already be able to write into the download directory in order to plant the
+  reparse point; a remote sender can influence the `.part` filename but cannot
+  create the link. It is not remote code execution. What it is, is a confused
+  deputy that converts write access to the download directory into write access
+  anywhere the running user can write, which matters most on shared machines and in
+  the download-style directories where untrusted content lands.
+
+  Demonstrated rather than inferred: with the fix removed, the helper returns
+  `Ok(File)` whose resolved handle path is the outside directory, and the two
+  regression tests that assert the refusal go red.
+
 ## [0.7.6] - 2026-07-31
 
 `shell` defaults to a native PTY, and file transfers stop spuriously rejecting
