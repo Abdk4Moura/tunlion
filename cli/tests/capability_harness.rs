@@ -406,7 +406,7 @@ fn spawn_daemon_inner(
         .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_CONFIG_DIR", config_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_LOG", "debug")
+        .env("FILAMENT_LOG", "trace")
         .env(
         "FILAMENT_DIRECT_LOOPBACK_ONLY",
         std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY")
@@ -1372,7 +1372,7 @@ fn warm_all_makes_first_contact_warm() {
         .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
         .env("FILAMENT_L3_USERSPACE", "1")
-        .env("FILAMENT_LOG", "debug")
+        .env("FILAMENT_LOG", "trace")
         .env("FILAMENT_AUTO_WARM", "0")
         .env(
             "FILAMENT_DIRECT_LOOPBACK_ONLY",
@@ -1687,7 +1687,7 @@ mod captured_child_tests {
 /// It is ignored because it reports an open defect, not because it is unreliable;
 /// ignored tests can decay exactly like the unreferenced gates found on 2026-08-03.
 #[test]
-#[ignore = "reports the open #31 recovery defect; enable with cargo test --features test-hooks -- --ignored after recovery is fixed"]
+#[ignore = "reports #31 ladder exhaustion after recovery attempts; enable with cargo test --features test-hooks -- --ignored after recovery is fixed"]
 fn freeze_stall_detector_classification() {
     let h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1764,17 +1764,27 @@ fn freeze_stall_detector_classification() {
             use sha2::{Digest, Sha256};
             Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect::<String>()
         }).as_deref() == Some(expected_hash.as_str());
+    let dump_logs = || {
+        eprintln!("--- measured sender stdout ---\n{}", send_result.stdout);
+        eprintln!("--- measured sender stderr ---\n{}", send_result.stderr);
+        eprintln!("--- measured receiver stdout ---\n{}", recv_result.stdout);
+        eprintln!("--- measured receiver stderr ---\n{}", recv_result.stderr);
+    };
 
     if !armed {
+        dump_logs();
         panic!("UNCLASSIFIED: stall watchdog armed marker absent; instrument presence was not proven");
     }
     if !froze {
+        dump_logs();
         panic!("UNCLASSIFIED: freeze hook did not engage; no stall was injected");
     }
     if !detected {
+        dump_logs();
         panic!("FAIL: freeze engaged but no stall detector event was observed");
     }
     if !recovered {
+        dump_logs();
         if recovery_started {
             if !matches!(recv_result.outcome, ChildOutcome::TimedOut) {
                 panic!("DETECTED_NOT_RECOVERED: recovery started, receiver exited before the {recovery_deadline:?} deadline without byte-exact completion");
