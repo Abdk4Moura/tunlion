@@ -2001,22 +2001,28 @@ fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<String>)> {
 /// every non-granted device, so this does NOT broaden access, it only honors the
 /// grants that already exist.
 fn any_shell_grant() -> bool {
-    any_shell_grant_at(&devices_path())
+    !shell_grant_names_at(&devices_path()).is_empty()
 }
 
 fn any_shell_grant_at(path: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(path) else { return false };
-    let Ok(arr) = serde_json::from_str::<Value>(&raw) else { return false };
-    arr.as_array()
-        .map(|a| {
-            a.iter().any(|d| {
-                d.get("caps")
-                    .and_then(|c| c.as_array())
-                    .map(|list| list.iter().any(|c| c.as_str() == Some("shell")))
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+    !shell_grant_names_at(path).is_empty()
+}
+
+fn shell_grant_names() -> Vec<String> {
+    shell_grant_names_at(&devices_path())
+}
+
+fn shell_grant_names_at(path: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(arr) = serde_json::from_str::<Value>(&raw) else { return Vec::new() };
+    let mut names: Vec<String> = arr.as_array().into_iter().flatten()
+        .filter(|d| d.get("caps").and_then(|c| c.as_array())
+            .map(|list| list.iter().any(|c| c.as_str() == Some("shell")))
+            .unwrap_or(false))
+        .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    names.sort();
+    names
 }
 
 /// Whether to serve an `l2-open` (TCP tunnel / ssh data link) from a peer.
@@ -2822,6 +2828,7 @@ async fn up_cmd(
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(pidfile(), std::process::id().to_string())?;
+    let granted_names = shell_grant_names();
     match &shell_policy {
         // M-2: --shell intentionally grants ALL proof-verified paired devices
         // (current AND any introduced later via pair-intro). This is a broad,
@@ -2839,6 +2846,11 @@ async fn up_cmd(
                 ui::paint(ui::Tone::Warn, "!"),
             ));
         }
+        ShellPolicy::Granted if !granted_names.is_empty() => ui::say(&format!(
+            "  {} seamless shell ON for: {}, they can `filament ssh` into this machine",
+            ui::paint(ui::Tone::Warn, "!"),
+            granted_names.join(", "),
+        )),
         ShellPolicy::Granted => {}
     }
     // Shell without a dropped account is owner-equivalent at any uid. A dropped
@@ -17135,6 +17147,7 @@ mod tests {
         )
         .unwrap();
         assert!(any_shell_grant_at(&p), "a shell grant enables L2");
+        assert_eq!(shell_grant_names_at(&p), vec!["popos"]);
         // A missing/garbage file is false, never a panic.
         assert!(!any_shell_grant_at(&dir.join("nope.json")));
         let _ = std::fs::remove_dir_all(&dir);
