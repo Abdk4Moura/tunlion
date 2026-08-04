@@ -1229,6 +1229,11 @@ impl Peer {
         tx: mpsc::UnboundedSender<Ev>,
         generation: u32,
     ) -> Result<Arc<Peer>> {
+        crate::ui::debug(&format!(
+            "filament: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
+            ice_servers.len(),
+            ice_servers.iter().flat_map(|s| s.urls.clone()).collect::<Vec<_>>()
+        ));
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
         let mut registry = Registry::new();
