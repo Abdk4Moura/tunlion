@@ -17873,7 +17873,6 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let target = outside.join("target.part");
         std::fs::write(&target, b"outside data").unwrap();
-        std::fs::remove_file(&part_path).unwrap();
         create_file_symlink(&target, &part_path);
         let result = safe_open_part(&part_path).await;
         let mut file = result.expect("negative control follows the symlink");
