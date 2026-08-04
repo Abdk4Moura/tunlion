@@ -11043,6 +11043,9 @@ async fn send_cmd(
         }
         // rung-1: a direct attempt that timed out without an authenticated QUIC
         // connection falls back to the WebRTC establish (unchanged path).
+        // This is the sender-side expired_direct caller: the ESTABLISH caller
+        // location is sufficient to distinguish this fallback from adoption.
+        // The receiver-side caller below routes through maybe_adopt instead.
         for (pid, info, (n, sec)) in conn.expired_direct() {
             conn.establish_as(info, None).await?;
             if let Some(l) = conn.link_mut(&pid) {
@@ -13573,6 +13576,11 @@ async fn recv_cmd(
         #[cfg(unix)]
         reap_warm_bootstraps(&mut pending_bootstrap);
         // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).
+        // Unlike the sender call above, this receiver-side fallback routes
+        // through maybe_adopt, so its ESTABLISH caller is indistinguishable
+        // from ordinary adoption. Correlate DIRECT-FALLBACK with the following
+        // ADOPT for the same peer; that sequence is not sound if peers recover
+        // concurrently, so caller attribution alone is insufficient here.
         for (pid, info, (n, sec)) in conn.expired_direct() {
             conn.maybe_adopt(&info, true).await?;
             if let Some(l) = conn.link_mut(&pid) {
