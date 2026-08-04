@@ -17782,6 +17782,7 @@ mod tests {
         assert!(warning.contains("filament revoke laptop --certificate"));
         assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
         assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
+    }
     // --- Windows reparse-point hardening tests (#43) ---
     // The resume/open tests use a file symlink to prove that the write cannot be
     // redirected outside the download directory. The create test remains a
