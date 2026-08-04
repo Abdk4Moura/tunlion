@@ -71,6 +71,33 @@ cargo build --release                                          # -> target/relea
 cargo build --release --target x86_64-unknown-linux-musl --features static   # fully static
 ```
 
+For repeated functional experiments against a real binary, use the measurement
+profile and a persistent target directory dedicated to the current worktree:
+
+```
+CARGO_TARGET_DIR=/root/.cargo-target-measure/<worktree-id> \
+  cargo build --profile measure --features test-hooks -j2
+```
+
+The target directory is part of the mechanism. Keep it while its branch or PR is
+active: a swept or newly allocated directory turns the warm build back into a
+cold build. Never share one measurement target between active worktrees, and
+record the source commit and binary SHA256 before a run whose output will be
+cited. Merged and abandoned targets are sweepable. The live-target ceiling and
+sweep procedure are in [`../docs/feedback-loop.md`](../docs/feedback-loop.md).
+
+**Do not quote timing, throughput, resource-use, binary-size, or other
+optimization-sensitive claims from the `measure` profile.** It uses
+`opt-level=1` without LTO, so it measures a different binary. Use it to iterate
+on functional and causal behavior, then repeat every performance or timing
+claim with the release profile.
+
+Every binary identifies its profile in `filament --version`, including
+`profile=release`. Timing gates must carry that profile beside a number or fail
+as unclassified. The profile removes warm compile waiting; it does not make cold
+builds cheap or make a weak experiment trustworthy. The rule is: qualify the
+question, then pay 7 seconds instead of 5 minutes to answer it.
+
 Releasing (maintainer): `git tag cli-vX.Y.Z && git push origin cli-vX.Y.Z` -
 CI builds the matrix, checksums, attests, and publishes; then
 `packaging/release-followup.sh cli-vX.Y.Z --pr` refreshes the Homebrew tap and

@@ -148,3 +148,12 @@ windows-sys = { version = "0.59", features = [
 lto = "thin"
 codegen-units = 16
 strip = true
+
+# Fast functional iteration for real-binary gates. This is not release evidence:
+# optimization-sensitive measurements must be repeated with `--release`.
+[profile.measure]
+inherits = "release"
+opt-level = 1
+lto = false
+debug = 0
+incremental = true

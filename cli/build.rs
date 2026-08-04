@@ -24,6 +24,22 @@ fn watch_if_exists(path: &str) {
     }
 }
 
+/// Cargo does not expose the custom profile name as a stable dedicated variable.
+/// OUT_DIR is always `<target>/<profile>/build/<package>/out`, including for
+/// cross-target builds, so its third ancestor is the profile directory.
+fn build_profile() -> String {
+    std::env::var_os("OUT_DIR")
+        .and_then(|out| {
+            Path::new(&out)
+                .ancestors()
+                .nth(3)
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .or_else(|| std::env::var("PROFILE").ok())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn main() {
     let sha = std::env::var("FILAMENT_BUILD_SHA")
         .ok()
@@ -36,11 +52,14 @@ fn main() {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     });
+    let profile = build_profile();
+    println!("cargo:rustc-env=FILAMENT_BUILD_PROFILE={profile}");
     println!(
-        "cargo:rustc-env=FILAMENT_BUILD_INFO={} ({} {})",
+        "cargo:rustc-env=FILAMENT_BUILD_INFO={} ({} {} profile={})",
         env!("CARGO_PKG_VERSION"),
         sha.unwrap_or_else(|| "dev".into()),
         date.unwrap_or_else(|| "unstamped".into()),
+        profile,
     );
 
     // Re-stamp whenever HEAD moves (new commit, checkout, branch switch), not

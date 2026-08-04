@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CODE_WORD: &str = "gigantic-element-tango";
+const BUILD_PROFILE: &str = env!("FILAMENT_BUILD_PROFILE");
 
 /// Result of waiting for a captured child. Timeout is deliberately distinct
 /// from an ordinary non-zero exit: a stalled transfer is a different finding
@@ -195,41 +196,24 @@ impl LiveChild {
 // ---------------------------------------------------------------- helpers ---
 
 fn binary() -> PathBuf {
-    // #34: honour CARGO_TARGET_DIR. Hardcoding <manifest>/target made correct
-    // results depend on the operator knowing to symlink, and a run with a
-    // custom target dir fails with a bare "No such file or directory" that
-    // names nothing. Worse, a STALE binary at the hardcoded path would be
-    // silently tested instead of the one just built, which is how a shared
-    // target dir voided a measurement run this week.
-    //
-    // Windows appends .exe; the extension is not part of the profile search.
-    let exe = if cfg!(windows) { "filament.exe" } else { "filament" };
-    let roots: Vec<PathBuf> = match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(d) => vec![PathBuf::from(d)],
-        None => vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")],
-    };
-
-    // Release first: Windows CI builds --release to avoid a stack overflow.
-    let mut tried = Vec::new();
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    for root in &roots {
-        for p in ["release", profile] {
-            let cand = root.join(p).join(exe);
-            if cand.exists() {
-                return cand;
-            }
-            tried.push(cand);
-        }
-    }
-
-    // Never return a path we know is absent: the caller would spawn it and get
-    // an errno with no context. Name what was searched instead.
-    panic!(
-        "filament binary not found. Searched:\n{}\n\
-         Build it first (cargo build --features test-hooks [--release]), and if \
-         you set CARGO_TARGET_DIR, this honours it.",
-        tried.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
+    // Cargo supplies the exact executable for this test invocation, including
+    // custom target directories, target triples, profile, and .exe suffix.
+    let cand = PathBuf::from(env!("CARGO_BIN_EXE_filament"));
+    let profile = BUILD_PROFILE;
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(&cand)
+        .unwrap_or_else(|error| panic!("cannot hash harness binary {}: {error}", cand.display()));
+    let sha256 = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    eprintln!(
+        "HARNESS-BINARY profile={} path={} sha256={}",
+        profile,
+        cand.display(),
+        sha256,
     );
+    cand
 }
 
 fn find_backend_app() -> PathBuf {
@@ -771,18 +755,29 @@ fn direct_blocked_falls_back_to_webrtc_promptly() {
     // processes could pair a sender's block with the receiver's fallback.
     // Use the slowest complete transition so one daemon cannot hide behind the
     // other; some platforms may only expose one side's markers.
+    if BUILD_PROFILE != "release" {
+        panic!(
+            "UNCLASSIFIED: fallback completed functionally, but latency coverage requires build profile release; current profile is {}",
+            BUILD_PROFILE,
+        );
+    }
     if both.contains("DIRECT-FALLBACK") {
-        let elapsed = [marker_delta(&send_out.events), marker_delta(&recv_out.events)]
-            .into_iter()
-            .flatten()
-            .max()
-            .expect("DIRECT-FALLBACK marker was present without a complete marker transition");
+        let elapsed = [
+            marker_delta(&send_out.events),
+            marker_delta(&recv_out.events),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .expect("DIRECT-FALLBACK marker was present without a complete marker transition");
         assert!(
             elapsed < Duration::from_secs(10),
             "fallback marker delta was {elapsed:?}; investigate instead of raising \
              this bound: the designed path is ~6s, while roster reconciliation is ~30s"
         );
-        eprintln!("PASS via designed DIRECT-FALLBACK in {elapsed:?}");
+        eprintln!(
+            "PASS via designed DIRECT-FALLBACK in {elapsed:?} (build profile {BUILD_PROFILE})"
+        );
     } else {
         // A link can return before the direct budget expires. In that case
         // expired_direct discards its pending entry because self.links exists,
