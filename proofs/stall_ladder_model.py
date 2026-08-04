@@ -67,6 +67,37 @@ class Result:
     terminal: str
 
 
+WINDOWS = ((0.5, "0.5"), (1.0, "1"), (2.0, "2"), (3.0, "3"), (5.0, "5"), (6.0, "5+"))
+
+
+def candidate_result(window, fix, retention_bounded):
+    """Evaluate the two candidate fixes without using transfer completion as a clock."""
+    if fix == "fail-fast":
+        return False, "hard-fail"
+    if not retention_bounded:
+        return False, "unsafe-unbounded-retention"
+    return window <= MAX_ATTEMPTS, ("recovered" if window <= MAX_ATTEMPTS else "hard-fail")
+
+
+def candidate_sweep(retention_bounded):
+    rows = []
+    for window, label in WINDOWS:
+        fail_fast = candidate_result(window, "fail-fast", retention_bounded)
+        preserve = candidate_result(window, "preserve-state", retention_bounded)
+        rows.append((label, fail_fast, preserve, fail_fast[0] != preserve[0]))
+    return rows
+
+
+def sweep_guard():
+    bounded = candidate_sweep(True)
+    divergent = [label for label, _, _, differs in bounded if differs]
+    expected = ["0.5", "1", "2", "3", "5"]
+    if divergent != expected:
+        raise SystemExit(f"SWEEP FAILED: expected bounded-retention divergence {expected}, got {divergent}")
+    if any(differs for _, _, _, differs in candidate_sweep(False)):
+        raise SystemExit("SWEEP FAILED: unbounded retention must not recommend preserve-state")
+
+
 def run_ladder(environment: Environment, attempts=MAX_ATTEMPTS) -> Result:
     """Run the ladder; return whether the ladder itself recovered the transfer."""
     required = FAILURE_STATE[environment.failure_type]
@@ -130,6 +161,7 @@ def explore():
 def main():
     coherence_guard()
     gate_0()
+    sweep_guard()
     for name, observation in CALIBRATIONS.items():
         outcomes = [
             run_ladder(Environment(transience, observation.failure_type, observation.discarded_state))
@@ -143,9 +175,17 @@ def main():
     ]
     print(f"TRANSIENT + RETAINED STATE: later-rung recoveries={len(later_rung_successes)}")
     print("OBSERVED FAILURES: indistinguishable between (a) persistent conditions and (b) transient conditions whose required state the teardown discarded.")
-    print("SEPARATING MEASUREMENT: measure whether the transient window exceeds one watchdog rung while preserving the candidate's ICE/conntrack state.")
+    for bounded in (True, False):
+        rows = candidate_sweep(bounded)
+        divergent = [label for label, _, _, differs in rows if differs]
+        retention = "bounded" if bounded else "unbounded"
+        suffix = "" if bounded else " (preserve-state unsafe)"
+        print(f"CANDIDATES retention={retention}: divergent windows={divergent or 'none'}{suffix}")
+    print("RETENTION PRECONDITION: bounded retention is required before the condition measurement is worth taking.")
+    print("RETENTION DECISION: unbounded retention rules out preserve-state WITHOUT AN EXPLICIT LIFETIME BOUND; a bounded variant remains in the divergent set and still requires condition measurement.")
+    print("SEPARATING MEASUREMENT: instrument the condition directly (when the ICE pair becomes usable again and when the conntrack entry reappears), not when the file arrives.")
     print("#50 evidence: each drop destroyed ICE progress, sockets, mapped ports, and conntrack state; whether the underlying ICE condition was transient remains unmeasured.")
-    print("RECOMMENDATION: do not raise MAX_ATTEMPTS or WATCHDOG_SECS until transience is measured; persistent failure favors fail-fast, transient+discarded state favors preserving state.")
+    print("RECOMMENDATION: bounded retention diverges for windows 0.5-5 rungs; naive unbounded retention is unsafe. Measure the condition directly before choosing fail-fast versus bounded preserve-state.")
 
 
 if __name__ == "__main__":

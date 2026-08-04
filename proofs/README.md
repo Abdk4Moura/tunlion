@@ -133,6 +133,57 @@ state destruction, but whether its ICE condition was transient remains
 unmeasured; #38's later roster recovery is external and is not credited to the
 ladder.
 
+The model sweeps transient windows of 0.5, 1, 2, 3, and 5+ rungs against both
+ fail-fast and preserve-state candidates, with retention boundedness explicit.
+It reports their divergence band and requires the separating measurement to
+instrument the ICE condition and conntrack state directly, never file arrival.
+
+The retention precondition is a code question before it is a network question:
+
+| State a preserve-state rung would hold | Bound status | Cost / open question |
+|---|---|---|
+| WebRTC peer and ICE/DTLS sockets | BOUNDABLE | Holding a peer/socket for one rung costs roughly 15 seconds of resources; a lifetime policy does not exist today |
+| NAT mapping and conntrack state | NOT OURS TO BOUND | Host defaults are `nf_conntrack_udp_timeout=30s` and `nf_conntrack_udp_timeout_stream=120s`; the five-rung ladder is 75s. The #50 dumps showed `[UNREPLIED]` entries, which use the shorter timeout, so the kernel can expire the state before the ladder finishes. The app can send traffic but cannot set the entry's lifetime. |
+| QUIC transport file descriptor and UDP port | BOUNDABLE | One descriptor/port per retained transport for at most one rung; count is bounded per link and configured worker count, but the lifetime policy does not exist today |
+| `direct_pending` expiry | BOUNDED TODAY | Pending state already has an expiry path |
+| `buffered_offers` / `deferred_left` entries | BOUNDABLE | Per-peer entries are small, but a global retention ceiling would need to be designed |
+| Active link slot | BOUNDABLE | Count one per peer; lifetime still follows the retained transport |
+
+The host check also showed live UDP entries in both states: `[UNREPLIED]` and
+`[ASSURED]`. That matters because only the latter has the longer stream timeout;
+the relevant #50 entries were `[UNREPLIED]`. This is evidence that conntrack is
+not ours to bound for the ICE case, not evidence that every NAT flow expires in
+30 seconds. The exact arithmetic from this host's operator-configurable kernel
+defaults is decisive for the observed case:
+
+```
+nf_conntrack_udp_timeout          30s   (UNREPLIED)
+nf_conntrack_udp_timeout_stream  120s   (ASSURED)
+ladder                            5 x 15s = 75s
+#50's observed entries            [UNREPLIED]
+```
+
+An `UNREPLIED` entry expires at 30 seconds, so it is gone before rung 3 of a
+75-second ladder. An entry only earns the 120-second `ASSURED` timeout by
+receiving a reply; #50's defining failure was that no reply arrived. The entry
+therefore cannot be promoted and expires mid-ladder by construction. The
+failure that prevents the reply is also what prevents the state surviving long
+enough for the retries to use it.
+
+This closes the ICE/conntrack half of #63: bounded preserve-state cannot retain
+that kernel-owned state, so fail-fast or a fundamentally different approach is
+what remains and the expensive condition measurement is unnecessary there. It
+does not close the QUIC fd/port case, where state is ours and a bound is
+constructible, nor #31's transport-level data-freeze case, which is not
+conntrack. The sysctl values are from this host and an operator can change them;
+the arithmetic must be recalculated for a deployment with different defaults.
+
+If retention cannot be bounded, naive preserve-state without an explicit
+lifetime bound is unsafe and fail-fast wins for that design. A bounded
+preserve-state variant remains live: the sweep says the candidates diverge
+across the full 0.5-5 rung range, so condition instrumentation remains worth
+taking. This is an inventory only; it does not implement state preservation.
+
 Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
 `cli/src/net.rs`; a source change fails the model until its calibration is
 explicitly redone.
