@@ -15,10 +15,16 @@
 # Point at an external backend with FILAMENT_TEST_SERVER, else it autostarts one
 # from a venv (FILAMENT_TEST_VENV, default /root/filament-bench/venv).
 #
-# Exit 0 = harness healthy AND the reproducer behaved as expected for the build:
-#   baseline (no hook) -> delivered+verified; premature-close -> NOT confirmed
-#   (bug present, e.g. on main) OR delivered anyway (robust, once the fix lands).
-# Exit 2 = harness/setup failure (backend, build, pairing) -- not a verdict.
+# Verdicts:
+#   baseline (no hook)          -> delivered+verified  (harness OK); else exit 2.
+#   premature-close (vanished recv) -> the CORRECT outcome is PROMPT "not
+#     confirmed" (sender detects the dead conn, never re-probes). Exit 0 only
+#     for that.
+#     Exit 1 with "HANG"   = the sender re-probed (link looked alive) = the
+#     keepalive leak reproduced.
+#     Exit 1 with "UNEXPECTED" = delivered, impossible for a vanished receiver
+#     (hook did not engage or the model is wrong).
+#   Exit 2 = harness/setup failure (backend, build, pairing) -- not a verdict.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -53,13 +59,13 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "SETUP: no backend at $SERVE
 
 head -c $((1024 * 1024)) /dev/urandom > "$WORK/payload.bin"
 
-# one send/recv round; $1 = extra env for the receiver, $2 = tag. Prints the
-# sender log path. The sender always ends (delivered OR unconfirmed/timeout).
+# one send/recv round; $1 = extra env for the SENDER, $2 = extra env for the
+# RECEIVER, $3 = tag. The sender always ends (delivered OR unconfirmed/timeout).
 round() {
-  local recv_env="$1" tag="$2"
+  local send_env="$1" recv_env="$2" tag="$3"
   local D="$WORK/out-$tag"; mkdir -p "$D"
   local word="ackloss-$tag"
-  "$BIN" send "$WORK/payload.bin" --word "$word" --server "$SERVER" >"$WORK/$tag-send.log" 2>&1 &
+  env $send_env "$BIN" send "$WORK/payload.bin" --word "$word" --server "$SERVER" >"$WORK/$tag-send.log" 2>&1 &
   local sp=$!
   local code=""
   for _ in $(seq 1 40); do
@@ -76,7 +82,7 @@ confirmed() { grep -qiE "delivered \+ verified|sha256 matched|delivered.*verifie
 echo "== BUG-ACKLOSS deterministic reproducer =="
 
 # 2. baseline: no hook -> the ack must land.
-round "" baseline || exit 2
+round "" "" baseline || exit 2
 if confirmed "$WORK/baseline-send.log"; then
   echo "  baseline (no hook)        : delivered + verified   [harness OK]"
 else
@@ -95,13 +101,28 @@ fi
 #    STAYS ALIVE; use an `up` daemon receiver -- ROBUST mode, exercise once the
 #    abortable-keepalive + wait_idle fix lands.)
 t0=$SECONDS
-round "FILAMENT_TEST_PREMATURE_CLOSE=1" premature || exit 2
+round "FILAMENT_LOG=debug" "FILAMENT_TEST_PREMATURE_CLOSE=1" premature || exit 2
 dt=$((SECONDS - t0))
+# Intended verdict from proofs/transport_lifecycle_model.py (rx_gone) and the
+# P4 no-ack window in main.rs: ack_wait=15s (FILAMENT_ACK_TIMEOUT), ack_reprobe=5s.
+# A VANISHED recv cannot deliver; not-confirmed is correct ONLY if PROMPT. The
+# keepalive leak means is_dead() never fires, the link looks alive, and the sender
+# burns the whole ack_wait+ack_reprobe window (Reprobe then give up). A detected
+# dead conn gives up at the first ack_wait (no reprobe). So the PRIMARY verdict is
+# load-independent: did the sender RE-PROBE? The re-probe line fires only when
+# link_alive was true at the first window, which is exactly the leak. Wall-clock
+# dt is printed as corroboration only (the window constants: main.rs:10988
+# ack_wait = FILAMENT_ACK_TIMEOUT, default 15s; main.rs:10996 ack_reprobe = 5s).
+reprobe_marker=$(grep -m1 "no delivery-ack yet, re-probing (re-sending file-end)" "$WORK/premature-send.log")
 if confirmed "$WORK/premature-send.log"; then
-  echo "  premature-close (recv)    : delivered (${dt}s)      [receiver recovered -- unexpected for a vanishing recv]"
+  echo "  premature-close (recv)    : delivered (${dt}s)      [UNEXPECTED: a vanished receiver cannot deliver; hook/model regression]"
+  exit 1
+elif [ -n "$reprobe_marker" ]; then
+  echo "  premature-close (recv)    : not confirmed (${dt}s)  [HANG: sender re-probed (link looked alive) = keepalive-leak, BUG-ACKLOSS present]"
+  grep -iE "confirm|closed|lost|dead|stall|repair|corpse|re-probing" "$WORK/premature-send.log" | tail -n 4 | sed 's/^/      /'
+  exit 1
 else
-  echo "  premature-close (recv)    : not confirmed (${dt}s)  [correct for a vanished receiver]"
-  echo "    want PROMPT (sender detected the dead conn); a full-window time = the keepalive-leak HANG."
-  grep -iE "confirm|closed|lost|dead|stall|repair|corpse" "$WORK/premature-send.log" | tail -n 4 | sed 's/^/      /'
+  echo "  premature-close (recv)    : not confirmed (${dt}s)  [PROMPT: sender detected the dead conn, no re-probe -- correct]"
 fi
 echo "== done (1 MB, localhost, deterministic) =="
+exit 0
