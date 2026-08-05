@@ -57,6 +57,25 @@ the GitHub release notes.
   stronger evidence that the control discriminated than one is, and that was
   true when the finding was made.
 
+### Fixed
+
+- **Files whose names are not valid UTF-8 can be read through a mount again.**
+  Two conversions inside `safe_open_beneath` went through a UTF-8 string on the
+  way to the syscall: the Linux `openat2` path and the component walk used on
+  other Unix. A name containing a byte like `0xFF` was either refused outright
+  or silently emptied, so a file that exists on the server was unreadable, or
+  readable as nothing, through the mount. Both now carry the raw bytes to the
+  syscall, and interior-NUL validation is unchanged. Lookup and open of a
+  non-UTF-8 name are byte-exact.
+
+  **Listing such a directory is still broken and is not fixed here.** `find`
+  and `ls` over a mount return `EINVAL` and enumerate nothing. That failure
+  happens at the kernel/FUSE directory-operation boundary before either
+  directory-read callback runs, so it is a separate defect from the byte
+  handling fixed above, and it is tracked separately. If you rely on listing a
+  mounted directory rather than opening a known path, this release does not
+  help you yet.
+
 ## [0.7.6] - 2026-07-31
 
 `shell` defaults to a native PTY, and file transfers stop spuriously rejecting
