@@ -12137,7 +12137,13 @@ async fn safe_create_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
     {
         let parent = path.parent().unwrap_or(std::path::Path::new("."));
         let rel = path.strip_prefix(parent).unwrap_or(path);
-        crate::mount_proto::safe_open_beneath(parent, rel, (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as i32)
+        // deny_symlinks=true: this is the final component of a file we are
+        // creating. It must never be a symlink, so an attacker who can write
+        // into the download directory cannot plant one that redirects an
+        // incoming transfer to a different file in that same directory. The
+        // mount path uses false because a symlink beneath the share root is
+        // legitimate content; do not unify these without the security entry.
+        crate::mount_proto::safe_open_beneath(parent, rel, (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as i32, true)
             .map_err(|e| std::io::Error::new(e.kind(), format!("safe create .part: {e}")))
             .map(|f| tokio::fs::File::from_std(f))
     }
@@ -12171,7 +12177,10 @@ async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<tokio::fs::
     {
         let parent = path.parent().unwrap_or(std::path::Path::new("."));
         let rel = path.strip_prefix(parent).unwrap_or(path);
-        let file = crate::mount_proto::safe_open_beneath(parent, rel, libc::O_WRONLY | libc::O_NONBLOCK as i32)
+        // deny_symlinks=true, same reason as safe_create_part: the .part final
+        // component must never be a symlink planted inside the download
+        // directory. The mount path uses false; keep them distinct.
+        let file = crate::mount_proto::safe_open_beneath(parent, rel, libc::O_WRONLY | libc::O_NONBLOCK as i32, true)
             .map_err(|e| std::io::Error::new(e.kind(), format!("safe resume .part: {e}")))?;
         // Verify what we opened is a regular file (not FIFO, device, etc.)
         let meta = file.metadata()?;
@@ -16913,6 +16922,37 @@ mod tests {
         // Must refuse
         let result = safe_resume_part(&part_path).await;
         assert!(result.is_err(), "must refuse to resume through a symlink");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Transfer resume: a .part symlink whose target is BENEATH the parent
+    /// (same directory) must still be refused. RESOLVE_BENEATH alone would
+    /// follow it and open the victim; only the NO_SYMLINKS bit discriminates.
+    /// This is the release security entry's guarantee, pinned so a future
+    /// resolve-set unification cannot silently drop it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_open_part_refuses_beneath_symlink() {
+        let uid = format!("{}-beneath-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // A real file in the SAME directory as the .part path.
+        let victim = tmp.join("victim.bin");
+        std::fs::write(&victim, b"do not overwrite me").unwrap();
+
+        // Plant a RELATIVE .part symlink pointing at it. An absolute target
+        // would be refused by BENEATH alone (it escapes the dirfd); a relative
+        // target that stays beneath the parent is exactly what BENEATH allows
+        // and NO_SYMLINKS must still refuse. This is the discriminating case.
+        let part_path = tmp.join("data.tar.part");
+        std::os::unix::fs::symlink("victim.bin", &part_path).unwrap();
+
+        // Must refuse: the .part path is a symlink even though its target stays
+        // beneath the parent. BENEATH alone would follow it and open the victim.
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a same-dir symlink");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -117,6 +117,25 @@ else
   bad "gate1: mount never came live"
 fi
 
+# ===================================================================== gate 1b ==
+# enumeration: a directory listing through the mount must show the ASCII
+# fixtures. This is the instrument that was missing when #135 hid: file reads
+# (gate 1) work even when listing is broken, so nothing caught it.
+say 1b
+if mountpoint -q "$MNT" 2>/dev/null; then
+  listing=$(ls -A "$MNT" 2>"$WORK/ls.err")
+  if [ "$?" = "0" ] \
+     && printf '%s\n' "$listing" | grep -qx "big.bin" \
+     && printf '%s\n' "$listing" | grep -qx "hello.txt"; then
+    ok "gate1b: directory enumerates (ls lists big.bin, hello.txt)"
+  else
+    echo "-- listing --"; printf '%s\n' "$listing"; echo "-- ls.err --"; cat "$WORK/ls.err"
+    bad "gate1b: directory does not enumerate"
+  fi
+else
+  bad "gate1b: no live mount to enumerate"
+fi
+
 # ===================================================================== gate 2 ==
 # write-through: create a file inside the mount, verify it lands in $SERVED.
 say 2
