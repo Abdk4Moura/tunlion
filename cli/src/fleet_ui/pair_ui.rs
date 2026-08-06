@@ -76,7 +76,7 @@ pub fn render_pake_words(sas: &SpokenSas) -> String {
 /// Render the PAKE mismatch (No / stop) message.
 pub fn render_pake_mismatch() -> String {
     format!(
-        "{err} Stopped. If the words didn't match, someone may be in the middle. Do not retry\n  on the same channel. Get a fresh code from them and try again.",
+        "{err} Stopped. If the words didn't match, someone may be in the middle. Don't retry\n  on the same channel. Get a fresh code from them and try again.",
         err = ui::paint(Tone::Err, ui::glyph_err()),
     )
 }
@@ -131,13 +131,13 @@ pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> St
     )
 }
 
-/// Non-TTY refusal: pair is interactive.
+/// Non-TTY refusal: add is interactive.
 pub fn err_pair_interactive() -> (String, i32) {
     (
         format!(
-            "{err} pair is interactive (it needs the spoken-words step). For automation, mint a key instead:\n  {fix}",
+            "{err} add is interactive (it needs consent on both ends). For automation, create a bounded invitation instead:\n  {fix}",
             err = ui::paint(Tone::Err, ui::glyph_err()),
-            fix = "filament mint --external carol --ttl 1h --allow transfer",
+            fix = "filament invite",
         ),
         super::EXIT_BAD_ARG,
     )
@@ -180,7 +180,7 @@ mod tests {
     fn pake_mismatch_honest_copy() {
         let s = render_pake_mismatch();
         assert!(s.contains("someone may be in the middle"), "must explain the risk");
-        assert!(s.contains("don't retry"), "must advise against retry");
+        assert!(s.to_lowercase().contains("don't retry"), "must advise against retry");
     }
 
     #[test]
@@ -204,7 +204,7 @@ mod tests {
     fn err_pair_interactive_exit_code() {
         let (msg, code) = err_pair_interactive();
         assert!(msg.contains("interactive"), "must explain why");
-        assert!(msg.contains("mint"), "must suggest alternative");
+        assert!(msg.contains("invite"), "must suggest alternative");
         assert_eq!(code, 2, "bad-arg = exit 2");
     }
 
