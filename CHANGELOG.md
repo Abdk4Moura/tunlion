@@ -4,7 +4,7 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
-## [Unreleased]
+## [0.7.7] - 2026-08-06
 
 ### Security
 
