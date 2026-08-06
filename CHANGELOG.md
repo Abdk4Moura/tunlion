@@ -68,13 +68,47 @@ the GitHub release notes.
   syscall, and interior-NUL validation is unchanged. Lookup and open of a
   non-UTF-8 name are byte-exact.
 
-  **Listing such a directory is still broken and is not fixed here.** `find`
-  and `ls` over a mount return `EINVAL` and enumerate nothing. That failure
-  happens at the kernel/FUSE directory-operation boundary before either
-  directory-read callback runs, so it is a separate defect from the byte
-  handling fixed above, and it is tracked separately. If you rely on listing a
-  mounted directory rather than opening a known path, this release does not
-  help you yet.
+- **Directory listing through a mount works again.** `ls` and `find` over a
+  mount returned `EINVAL` and enumerated nothing, for every filename, not only
+  unusual ones. `safe_open_beneath` computed the `openat2` mode as
+  `if (flags & (O_CREAT | O_TMPFILE)) != 0 { 0o644 }`, but `O_TMPFILE` is a
+  multi-bit constant that CONTAINS `O_DIRECTORY`, so the test was true for every
+  directory open. Each one sent a non-zero mode without `O_CREAT`, which
+  `openat2` rejects with `EINVAL` exactly as documented. File opens carry no
+  `O_DIRECTORY` bit, so they kept working, which is why reading a known path
+  succeeded while listing the directory containing it did not. A root-directory
+  open also resolved to an empty relative path, which `openat2` rejects
+  separately; it is now normalized to `.`.
+
+  Broken in 0.7.3, when this call site moved to `openat2`. It was masked until
+  0.7.6 by a NUL-termination bug in the same call that failed earlier with
+  `EFAULT`; fixing that in 0.7.6 exposed this one. `cli-v0.6.0` enumerates
+  correctly, `cli-v0.7.6` does not.
+
+  The reason this survived four releases is that no test enumerated a mounted
+  directory. The one gate that listed anything was the non-UTF-8 name gate, so a
+  total enumeration failure could only ever present as a name-encoding problem.
+  A gate that lists a plain ASCII directory now exists.
+
+- **The Linux `openat2` path now actually applies `RESOLVE_BENEATH`.** The
+  constants were declared as `RESOLVE_BENEATH = 0x02` and
+  `RESOLVE_NO_MAGICLINKS = 0x04`; those values are really `NO_MAGICLINKS` and
+  `NO_SYMLINKS`. `RESOLVE_BENEATH` was therefore never passed to the kernel from
+  0.7.3 through 0.7.6, while a comment on the non-Linux arm stated that Linux was
+  relying on it for containment.
+
+  **No release was exposed.** Containment held throughout by other means: peer
+  supplied paths are normalized and rejected by a lexical `starts_with(root)`
+  guard before the syscall, so no `..` component ever reaches it, and the value
+  set by mistake was `NO_SYMLINKS`, which is stricter on symlinks than
+  `RESOLVE_BENEATH` is. Every vector `RESOLVE_BENEATH` would have covered was
+  covered by something else. This entry records a corrected safety claim, not a
+  vulnerability.
+
+  Because the corrected flags are less strict about symlinks by design, the
+  `.part` write path now passes `RESOLVE_NO_SYMLINKS` explicitly. A symlink at
+  a `.part` path is still refused, including one pointing at a file in the same
+  directory, which the flag correction alone would have permitted.
 
 ## [0.7.6] - 2026-07-31
 
