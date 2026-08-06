@@ -533,8 +533,9 @@ struct Cli {
     #[arg(long, global = true)]
     no_interactive: bool,
     /// Open the guided human flow even when all command arguments were supplied.
-    /// Requires a TTY and conflicts with --no-interactive and --json.
-    #[arg(long, global = true, conflicts_with_all = ["no_interactive", "json"])]
+    /// Requires a TTY. Conflicts with --no-interactive and --json (enforced in
+    /// code, because subcommands shadow the global json arg).
+    #[arg(long, global = true, conflicts_with = "no_interactive")]
     interactive: bool,
     /// Colorize output: auto (default; only at a TTY), always, or never. A flag
     /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
@@ -1069,6 +1070,9 @@ enum Cmd {
         /// Do not prompt for deliberate choices.
         #[arg(long)]
         yes: bool,
+        /// Write the secret key bundle to a new owner-only file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     /// Mint auth keys or enroll as an ephemeral delegated device.
     #[command(hide = true)]
@@ -3287,7 +3291,7 @@ async fn init_experience(
     let inbox = inbox.unwrap_or_else(default_drop_dir);
     let pending = identity::PendingIdentity::generate()?;
     let phrase = Zeroizing::new(pending.mnemonic().to_string());
-    let words = pending.mnemonic().word_iter().collect::<Vec<_>>();
+    let words = pending.mnemonic().words().collect::<Vec<_>>();
 
     if let Some(path) = recovery_file.as_deref() {
         write_owner_only_file(path, phrase.as_str())?;
@@ -10412,6 +10416,9 @@ async fn main() -> Result<()> {
     if cli.interactive && !std::io::stdin().is_terminal() {
         bail!("--interactive requires a terminal; remove it or provide every required option");
     }
+    if cli.interactive && (cli.no_interactive || cli.json) {
+        bail!("--interactive conflicts with --no-interactive and --json; pick one mode");
+    }
     if cli.no_interactive || cli.json {
         NO_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -10440,6 +10447,7 @@ async fn main() -> Result<()> {
                 | Cmd::Set { .. }
                 | Cmd::Reach { .. }
                 | Cmd::Doctor { .. }
+                | Cmd::Addr { .. }
                 | Cmd::Devices { action: None, .. }
         )
     {
@@ -10478,6 +10486,7 @@ async fn main() -> Result<()> {
             ui_caps.json || cli.json,
         ).await,
         Cmd::Addr { device, v4 } => {
+            let json_output = ui_caps.json || cli.json;
             if let Some(name) = device {
                 // Show a specific device's info.
                 let all = devices_load();
@@ -10497,24 +10506,44 @@ async fn main() -> Result<()> {
                     else if ago < 86400 { format!("{}h ago", ago / 3600) }
                     else { format!("{}d ago", ago / 86400) }
                 };
-                println!("  {}", ui::paint(ui::Tone::Bold, &name));
-                println!("  channel:  {}", &channel[..12.min(channel.len())]);
-                // Show overlay addresses if we have them.
-                if let Some(v6) = &stored_v6 {
-                    let v4_str = stored_v4.as_ref().map(|a| format!(" / {a}")).unwrap_or_default();
-                    println!("  overlay:  {v6}{v4_str}");
-                    println!("  mesh:     {name}.mesh");
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "name": name,
+                        "channel": channel,
+                        "caps": caps,
+                        "lastSeen": last_seen,
+                        "lastSeenLabel": last_seen_str,
+                        "overlayV6": stored_v6,
+                        "overlayV4": stored_v4,
+                        "mesh": format!("{name}.mesh"),
+                    }))?);
+                } else {
+                    println!("  {}", ui::paint(ui::Tone::Bold, &name));
+                    println!("  channel:  {}", &channel[..12.min(channel.len())]);
+                    // Show overlay addresses if we have them.
+                    if let Some(v6) = &stored_v6 {
+                        let v4_str = stored_v4.as_ref().map(|a| format!(" / {a}")).unwrap_or_default();
+                        println!("  overlay:  {v6}{v4_str}");
+                        println!("  mesh:     {name}.mesh");
+                    }
+                    // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
+                    // (what THIS machine authorized the peer to do), NOT what the peer offers.
+                     println!("  granted:  {}", capability_list_summary(&caps));
+                    println!("  last seen: {last_seen_str}");
                 }
-                // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
-                // (what THIS machine authorized the peer to do), NOT what the peer offers.
-                 println!("  granted:  {}", capability_list_summary(&caps));
-                println!("  last seen: {last_seen_str}");
             } else {
                 // Show this machine's address.
                 let id = overlay::Identity::load_or_create()?;
                 let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
                 let mesh_name = l3::sanitize_host(&my_name);
-                if v4 {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&json!({
+                        "name": mesh_name,
+                        "overlayV6": id.addr().to_string(),
+                        "overlayV4": id.addr_v4().to_string(),
+                        "mesh": format!("{mesh_name}.mesh"),
+                    }))?);
+                } else if v4 {
                     println!("{}", id.addr_v4());
                 } else {
                     println!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
@@ -11157,13 +11186,13 @@ fn resolve_mount_plan(
 ) -> Result<MountPlan> {
     let opened_flow = caps.interactive && (peer.is_none() || remote.is_none() || interactive_requested());
     if remote.is_none() {
-        if let Some(raw) = peer.as_deref() {
-            if let Some((device, path)) = raw.split_once(':') {
-                if !device.is_empty() && !path.is_empty() {
-                    peer = Some(device.to_string());
-                    remote = Some(path.to_string());
-                }
-            }
+        let (device, path) = match peer.as_deref().and_then(|raw| raw.split_once(':')) {
+            Some((device, path)) if !device.is_empty() && !path.is_empty() => (device.to_string(), path.to_string()),
+            _ => (String::new(), String::new()),
+        };
+        if !device.is_empty() && !path.is_empty() {
+            peer = Some(device);
+            remote = Some(path);
         }
     }
     if peer.is_none() {
