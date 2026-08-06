@@ -7,10 +7,10 @@
 // deliver straight to a phone with nothing installed on it.
 //
 //   filament send video.mp4 --code          mint a speakable one-time code
-//   filament recv clever-lynx-63            claim it on the other machine
+//   filament receive clever-lynx-63          claim it on the other machine
 //   filament send ./dir --room demo         directories are tarred on the fly
 //   tar c logs | filament send - --name logs.tar --code
-//   filament recv -y --dir ~/Drops          auto-accept into a directory
+//   filament receive -y --dir ~/Drops       auto-accept into a directory
 //
 // Failure-mode ledger: ../docs/cli-resilience.md, every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
@@ -453,6 +453,8 @@ COMMANDS
   Start
     init                   create your Filament identity and first device
     add                    add a device with a human present
+    invite                 create a bounded invitation for a device or person
+    join                   join through a bounded invitation
     id                     show your identity and certified devices
   Share
     send <file>            send files (mints a one-time code, or --to <device>)
@@ -476,7 +478,7 @@ EXAMPLES
   filament receive clever-lynx-63    claim a code and receive
   filament send big.iso --to laptop  send to a remembered device, no code
   filament add --name phone          add a device
-  filament up --install              always-on drop target
+  filament receive --background     always-on inbox (drop target)
   filament shell laptop              open a shell on a known device
   filament reach laptop              check if a device is reachable
   filament reach laptop:5432         tunnel to a peer's localhost port
