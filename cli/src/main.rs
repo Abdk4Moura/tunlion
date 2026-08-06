@@ -85,6 +85,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
+use zeroize::Zeroizing;
 
 /// Positional write at an absolute offset, used by concurrent spawn_blocking
 /// writer tasks for out-of-order multi-stream reassembly (no seek, atomic per
@@ -318,6 +319,7 @@ fn relay_forbidden() -> bool {
 /// Set once in `run`, before any worker spawns, from the global `--no-interactive`
 /// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
 static NO_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FORCE_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// App-wide UI capability resolved once from flags + env. Controls how every
 /// command renders: interactive vs steer, human vs JSON, color vs plain.
@@ -332,6 +334,7 @@ impl UiCapability {
     pub(crate) fn from_cli(cli: &Cli) -> Self {
         let interactive = std::io::stdin().is_terminal()
             && !cli.no_interactive
+            && !cli.json
             && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none();
         let color = match cli.color.as_deref() {
             Some("always") => true,
@@ -371,6 +374,10 @@ fn interactive_allowed() -> bool {
     std::io::stdin().is_terminal()
         && !NO_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
         && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none()
+}
+
+fn interactive_requested() -> bool {
+    FORCE_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The one honest CLI line shown whenever a transfer/connection is actually on
@@ -443,12 +450,13 @@ const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 
 const EXAMPLES: &str = "\
 COMMANDS
-  Connect
-    pair <name>            remember a device (run on both ends; exchanges the pair secret)
-    up [--install]         always-on receiver for your trusted devices
+  Start
+    init                   create your Filament identity and first device
+    add                    add a device with a human present
+    id                     show your identity and certified devices
   Share
-    <file>  /  send        send files (mints a one-time code, or --to <device>)
-    recv <code>            claim a code and receive
+    send <file>            send files (mints a one-time code, or --to <device>)
+    receive [code]         receive from a code or your nearby network
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     reach <device>         check if a device is reachable (direct/relay + rtt)
     reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
@@ -459,17 +467,15 @@ COMMANDS
     requests               approve or deny access others asked for
     grant / revoke         give or take a capability on a device
     status                 what the daemon is doing / recently received
-  Identity
-    identity               manage your user key + device certs
   Mesh
     addr                   show your overlay address (or a device's)
     doctor                 diagnose a link
 
 EXAMPLES
   filament video.mp4                 send it; mints a speakable one-time code + QR
-  filament clever-lynx-63            claim a code and receive
+  filament receive clever-lynx-63    claim a code and receive
   filament send big.iso --to laptop  send to a remembered device, no code
-  filament pair --name phone         remember a device
+  filament add --name phone          add a device
   filament up --install              always-on drop target
   filament shell laptop              open a shell on a known device
   filament reach laptop              check if a device is reachable
@@ -488,7 +494,7 @@ EXAMPLES
 #[command(
     name = "filament",
     version = VERSION,
-    about = "Peer-to-peer between your terminals and browsers: send files, open a shell, forward a port, mount a folder. No upload, no account \u{2014} your own devices form a fleet that just works.",
+    about = "One secure thread across your devices: send, receive, mount files, and open an authorized shell without an account or cloud upload.",
     after_help = EXAMPLES,
     help_template = "{about-with-newline}\n{usage-heading} {usage}\n\n{after-help}\n\nOptions:\n{options}"
 )]
@@ -524,6 +530,10 @@ struct Cli {
     /// without this; the env var FILAMENT_NONINTERACTIVE=1 does the same thing.
     #[arg(long, global = true)]
     no_interactive: bool,
+    /// Open the guided human flow even when all command arguments were supplied.
+    /// Requires a TTY and conflicts with --no-interactive and --json.
+    #[arg(long, global = true, conflicts_with_all = ["no_interactive", "json"])]
+    interactive: bool,
     /// Colorize output: auto (default; only at a TTY), always, or never. A flag
     /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
@@ -542,6 +552,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    // ── Start ───────────────────────────────────────────────────────
+    /// Create your Filament identity and configure this first device.
+    Init {
+        /// Name this device (default: hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Directory where received files land (default: ~/Filament).
+        #[arg(long)]
+        inbox: Option<PathBuf>,
+        /// Write the recovery phrase to a new owner-only file for automation.
+        #[arg(long, value_name = "PATH", conflicts_with = "recovery_fd")]
+        recovery_file: Option<PathBuf>,
+        /// Write the recovery phrase to an already-open file descriptor.
+        #[arg(long, value_name = "FD", conflicts_with = "recovery_file")]
+        recovery_fd: Option<i32>,
+        /// Install the always-on receive service without prompting.
+        #[arg(long, conflicts_with = "no_background")]
+        background: bool,
+        /// Leave the always-on receive service off.
+        #[arg(long, conflicts_with = "background")]
+        no_background: bool,
+    },
     // ── Share ───────────────────────────────────────────────────────
     /// Send files or directories to a peer (browser or CLI).
     #[command(next_help_heading = "Share")]
@@ -568,7 +600,7 @@ enum Cmd {
         name: Option<String>,
         /// Enroll as delegated principal using an auth key file before sending
         #[arg(long, hide = true)]
-        auth_key: Option<String>,
+        auth_key: Option<PathBuf>,
     },
     /// Receive files from a peer (browser or CLI).
     ///
@@ -576,12 +608,13 @@ enum Cmd {
     /// for the local-network auto room). Scripts are safe by default: a non-TTY
     /// uses the auto room; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass
     /// --no-interactive to skip the prompt.
-    Recv {
+    #[command(alias = "recv")]
+    Receive {
         /// One-time code spoken by the sender (omit to use the auto room)
         code: Option<String>,
         /// Directory to write received files into
-        #[arg(long, default_value = ".")]
-        dir: PathBuf,
+        #[arg(long)]
+        dir: Option<PathBuf>,
         /// Accept every offer without prompting
         #[arg(long, short = 'y')]
         yes: bool,
@@ -600,11 +633,13 @@ enum Cmd {
         /// Rename the (single) received file; '-' streams it to stdout
         #[arg(long, short = 'o')]
         output: Option<String>,
+        /// Install the always-on receive service instead of listening once.
+        #[arg(long)]
+        background: bool,
     },
-    /// Remember a device (pairing ceremony, no file transfer).
-    /// Exchanges the pair secret with consent on both ends.
-    #[command(next_help_heading = "Connect")]
-    Pair {
+    /// Add a device or person with consent on both ends.
+    #[command(next_help_heading = "Connect", alias = "pair")]
+    Add {
         /// A code from the other device; omit to mint one for them
         code: Option<String>,
         /// What to call them (asked interactively if omitted)
@@ -615,6 +650,36 @@ enum Cmd {
         /// least two words, e.g. --word "gigantic element".
         #[arg(long)]
         word: Option<String>,
+    },
+    /// Create a bounded invitation for a device or person.
+    Invite {
+        /// Invitation kind: device or person. Asked interactively when omitted.
+        #[arg(long, value_parser = ["device", "person"])]
+        kind: Option<String>,
+        /// Maximum capabilities. Defaults to transfer+mount for a device, transfer for a person.
+        #[arg(long, value_delimiter = ',')]
+        allow: Vec<String>,
+        /// Invitation and joined certificate lifetime, such as 1h or 30d.
+        #[arg(long)]
+        expires: Option<String>,
+        /// Write the invitation to a new owner-only file instead of displaying it.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// Join through a bounded invitation. Invitation material is never accepted in argv.
+    Join {
+        /// Read the invitation from an owner-only regular file.
+        #[arg(long, value_name = "PATH", conflicts_with = "invite_fd")]
+        invite_file: Option<PathBuf>,
+        /// Read the invitation from an already-open file descriptor.
+        #[arg(long, value_name = "FD", conflicts_with = "invite_file")]
+        invite_fd: Option<i32>,
+        /// Proposed name for this device (default: hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Owner device display name when several owners are present.
+        #[arg(long)]
+        to: Option<String>,
     },
     // ── Devices ─────────────────────────────────────────────────────
     /// List known devices (trusted for --to and auto-accept)
@@ -627,6 +692,7 @@ enum Cmd {
         json: bool,
     },
     /// Always-on receiver: trusted known devices only, invisible to strangers
+    #[command(hide = true)]
     Up {
         /// Install + start a systemd user service instead of running attached
         #[arg(long)]
@@ -682,6 +748,7 @@ enum Cmd {
         no_proxy_fallback: bool,
     },
     /// Show whether the daemon runs and what it received recently
+    #[command(hide = true)]
     Status {
         /// Machine-readable JSON (for scripts): {running, pid, devices, exposed, recent}.
         #[arg(long)]
@@ -689,13 +756,14 @@ enum Cmd {
     },
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
+    #[command(hide = true)]
     Down,
     /// Show or change settings (no args = show all).
     ///
     /// No args prints all settings with their value, scope, and where each came
     /// from (env > peer > config > default). Strictly imperative: `set` only
     /// changes the key you name.
-    #[command(after_help = "\x1b[1mExamples:\x1b[0m\n  \
+    #[command(hide = true, after_help = "\x1b[1mExamples:\x1b[0m\n  \
         filament set                          show every setting + where it came from\n  \
         filament set auto-extract on          change one setting (partial, never resets others)\n  \
         filament set shell on --peer laptop   per-device override\n  \
@@ -720,6 +788,9 @@ enum Cmd {
         /// Skip the confirmation prompt (required for --reset in a pipe/CI)
         #[arg(long)]
         yes: bool,
+        /// Write the secret key bundle to a new owner-only file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -732,7 +803,7 @@ enum Cmd {
     },
     // ── Mesh ────────────────────────────────────────────────────────
     /// Show this machine's overlay address, or a device's info
-    #[command(next_help_heading = "Mesh")]
+    #[command(hide = true, next_help_heading = "Mesh")]
     Addr {
         /// Device name to show info for (omit for this machine's address).
         device: Option<String>,
@@ -742,16 +813,17 @@ enum Cmd {
     },
     // ── Identity ────────────────────────────────────────────────────
     /// Manage your user identity (key + device certs)
-    #[command(next_help_heading = "Identity")]
-    Identity {
+    #[command(next_help_heading = "Identity", alias = "identity")]
+    Id {
         #[command(subcommand)]
-        action: IdentityAction,
+        action: Option<IdAction>,
     },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `filament set`; this is kept for scripts that wrote it directly.
     #[command(hide = true)]
     Config { key: Option<String>, value: Option<String> },
     /// Update filament to the latest release
+    #[command(hide = true)]
     Update {
         /// Check only; don't install
         #[arg(long)]
@@ -777,6 +849,7 @@ enum Cmd {
     ///
     /// Local TCP listener; each connection becomes one stream to the peer's
     /// localhost:<rport>.
+    #[command(hide = true)]
     Forward {
         /// Local port to listen on (127.0.0.1)
         lport: u16,
@@ -793,6 +866,7 @@ enum Cmd {
     /// (`filament set tun-addr auto`). Persists across restarts.
     ///
     /// Use `filament expose <port> --off` to stop exposing a port.
+    #[command(hide = true)]
     Expose {
         /// Port to publish on the overlay. Omit together with --list or --off.
         port: Option<u16>,
@@ -815,6 +889,7 @@ enum Cmd {
     /// `<dev>`: reachability probe (is the device reachable, and how: direct/relay + rtt).
     /// `<dev>:<port>`: tunnels to the peer's localhost:<port> (the `reach` mental model).
     /// `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
+    #[command(hide = true)]
     Reach {
         /// Device to probe (e.g. laptop) or device:port to tunnel (e.g. laptop:5432)
         dev_port: Option<String>,
@@ -838,6 +913,7 @@ enum Cmd {
     ///
     /// With a device: run an "establish then drop" probe and print the per-phase
     /// ladder + verdict. Without a device: environment preflight.
+    #[command(hide = true)]
     Doctor {
         /// Known device (petname) to probe; omit for environment preflight
         device: Option<String>,
@@ -854,6 +930,7 @@ enum Cmd {
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
+    #[command(hide = true)]
     Grant {
         /// Known device (petname), or omit with --tag
         device: String,
@@ -874,32 +951,26 @@ enum Cmd {
         #[arg(long)]
         certificate: bool,
     },
-    /// Mount a remote directory over the mesh via sshfs.
-    ///
-    /// Requires sshfs on both ends. Uses the same transport as `filament ssh`
-    /// (L3 overlay preferred, L2 tunnel fallback). The peer must have sshd
-    /// running and shell access granted.
-    ///
-    /// By default runs in background with auto-recovery. Use --foreground to
-    /// run sshfs in the foreground (blocks the terminal).
+    /// Mount a remote directory over Filament's native filesystem protocol.
+    /// Read-only is the default; the remote share root and grant remain authoritative.
     Mount {
         /// Known device (petname) to mount from
         peer: Option<String>,
         /// Remote directory path
         remote: Option<String>,
-        /// Local mount point (default: basename of remote path)
+        /// Local mount point (default: ~/Filament Mounts/<device>/<remote>)
         local: Option<String>,
-        /// Mount read-only
+        /// Permit writes when the remote grant also allows them. Read-only is the default.
         #[arg(long)]
-        read_only: bool,
+        read_write: bool,
         /// Extra sshfs options (comma-separated)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         options: Option<String>,
         /// Run sshfs in the foreground (blocks terminal)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         foreground: bool,
         /// Auto-restore this mount on daemon start (off by default)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         save_auto: bool,
         /// List all filament mounts and their status
         #[arg(long)]
@@ -908,16 +979,16 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         check: Option<String>,
         /// Save current mounts as a named profile
-        #[arg(long = "save-profile", alias = "save", value_name = "NAME")]
+        #[arg(long = "save-profile", alias = "save", value_name = "NAME", hide = true)]
         save_profile: Option<String>,
         /// Apply a saved mount profile
-        #[arg(long = "apply-profile", alias = "apply", value_name = "NAME")]
+        #[arg(long = "apply-profile", alias = "apply", value_name = "NAME", hide = true)]
         apply_profile: Option<String>,
         /// List saved mount profiles
-        #[arg(long)]
+        #[arg(long, hide = true)]
         profiles: bool,
         /// Delete a saved mount profile
-        #[arg(long, value_name = "NAME")]
+        #[arg(long, value_name = "NAME", hide = true)]
         delete_profile: Option<String>,
         /// Unmount a filament mount point (replaces `filament unmount`).
         #[arg(long, value_name = "PATH")]
@@ -927,6 +998,7 @@ enum Cmd {
     ///
     /// Requires rsync on both ends. Uses `filament ssh` as the remote shell,
     /// so the same transport and bootstrap logic applies.
+    #[command(hide = true)]
     Backup {
         /// Known device (petname) to back up from/to
         peer: String,
@@ -949,25 +1021,27 @@ enum Cmd {
     },
     /// Open a shell on a device.
     ///
-    /// Default: filament's own native PTY (the peer must run `up --shell`).
+    /// Default: Filament's native PTY. The peer must explicitly authorize shell.
     /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
     /// (reuses your keys, known_hosts, and ~/.ssh/config).
     Shell {
         /// Known device (petname) to open a shell on
-        peer: String,
+        peer: Option<String>,
         /// Use real ssh (ProxyCommand over filament) instead of the native PTY
-        #[arg(long)]
+        #[arg(long, hide = true)]
         ssh: bool,
         /// Extra args passed through to ssh (only with --ssh)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// List, approve, or deny pending consent requests from peers.
+    #[command(hide = true)]
     Requests {
         #[command(subcommand)]
         action: Option<RequestsAction>,
     },
     /// Mint a scoped, expiring key for another machine to join.
+    #[command(hide = true)]
     Mint {
         /// Mint a key for a device in your fleet.
         #[arg(long)]
@@ -1011,6 +1085,7 @@ enum Cmd {
     ///
     /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
     /// from a non-TTY / scripts).
+    #[command(hide = true)]
     Reset,
 }
 
@@ -1034,11 +1109,15 @@ enum EphemeralAction {
         /// Human-readable tag for the use case
         #[arg(long, default_value = "ci")]
         tag: String,
+        /// Write the secret key bundle to a new owner-only file.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     /// Enroll as an ephemeral delegated device using an auth key.
     Enroll {
-        /// Path to the auth key JSON file, or the raw JSON string
-        auth_key: String,
+        /// Owner-only file containing the auth key bundle.
+        #[arg(long, value_name = "PATH")]
+        auth_key_file: PathBuf,
         /// Target peer display name or channel (the owner device to enroll at)
         #[arg(long)]
         to: Option<String>,
@@ -1048,15 +1127,17 @@ enum EphemeralAction {
 /// User identity management: generate the identity key, show the fingerprint,
 /// certify a known device so peers can verify it belongs to the same person.
 #[derive(Subcommand)]
-enum IdentityAction {
-    /// Generate a new user identity key on this device.
-    Init,
+enum IdAction {
     /// Show the user identity fingerprint + certified devices.
     Show,
-    /// Sign a device certificate for a known device, authorizing it as yours.
-    Certify {
-        /// Petname of the known device to certify as yours
-        device: String,
+    /// Restore an identity from its 12-word recovery phrase.
+    Recover {
+        /// Read recovery words from an owner-only regular file.
+        #[arg(long, value_name = "PATH", conflicts_with = "words_fd")]
+        words_file: Option<PathBuf>,
+        /// Read recovery words from an already-open file descriptor.
+        #[arg(long, value_name = "FD", conflicts_with = "words_file")]
+        words_fd: Option<i32>,
     },
 }
 
@@ -1396,6 +1477,7 @@ pub(crate) fn upsert_peer_record(
     caps: Option<&[String]>,
     scope: Option<u8>,
     user_key_hex: Option<&str>,
+    delegated: Option<(&[String], u64)>,
 ) -> String {
     // For existing name, update in place preserving other fields.
     if let Some(existing) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
@@ -1405,6 +1487,7 @@ pub(crate) fn upsert_peer_record(
         if let Some(c) = cert {
             existing["userKey"] = json!(hex::encode(c.user_pub));
             existing["deviceCert"] = c.to_json();
+            existing["certRevoked"] = json!(false);
         } else if let Some(uk) = user_key_hex {
             existing["userKey"] = json!(uk);
         }
@@ -1414,6 +1497,11 @@ pub(crate) fn upsert_peer_record(
         }
         if let Some(sc) = scope {
             existing["identityScope"] = json!(sc);
+        }
+        if let Some((ceiling, expires)) = delegated {
+            existing["principalKind"] = json!("delegated");
+            existing["principalCeiling"] = json!(ceiling);
+            existing["principalExpires"] = json!(expires);
         }
         return existing["name"].as_str().unwrap_or(name).to_string();
     }
@@ -1439,6 +1527,7 @@ pub(crate) fn upsert_peer_record(
     if let Some(c) = cert {
         obj.insert("userKey".to_string(), json!(hex::encode(c.user_pub)));
         obj.insert("deviceCert".to_string(), c.to_json());
+        obj.insert("certRevoked".to_string(), json!(false));
     } else if let Some(uk) = user_key_hex {
         obj.insert("userKey".to_string(), json!(uk));
     }
@@ -1448,6 +1537,11 @@ pub(crate) fn upsert_peer_record(
     }
     if let Some(sc) = scope {
         obj.insert("identityScope".to_string(), json!(sc));
+    }
+    if let Some((ceiling, expires)) = delegated {
+        obj.insert("principalKind".to_string(), json!("delegated"));
+        obj.insert("principalCeiling".to_string(), json!(ceiling));
+        obj.insert("principalExpires".to_string(), json!(expires));
     }
     obj.insert("addedAt".to_string(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
     arr.push(Value::Object(obj));
@@ -1465,6 +1559,7 @@ pub(crate) fn devices_upsert_atomic(
     caps: Option<&[String]>,
     scope: Option<u8>,
     user_key_hex: Option<&str>,
+    delegated: Option<(&[String], u64)>,
 ) -> Result<String> {
     let clean = sanitize_device_name(name);
     let name = clean.as_str();
@@ -1477,7 +1572,7 @@ pub(crate) fn devices_upsert_atomic(
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-    let final_name = upsert_peer_record(&mut arr, name, secret, cert, caps, scope, user_key_hex);
+    let final_name = upsert_peer_record(&mut arr, name, secret, cert, caps, scope, user_key_hex, delegated);
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).context("serialize devices")?)
         .context("atomic write devices.json")?;
     Ok(final_name)
@@ -1535,7 +1630,7 @@ fn sanitize_device_name(name: &str) -> String {
 
 fn devices_store(name: &str, secret: &str) -> Result<()> {
     // Delegate to atomic upsert: secret only, preserve cert
-    devices_upsert_atomic(name, Some(secret), None, None, None, None)?;
+    devices_upsert_atomic(name, Some(secret), None, None, None, None, None)?;
     Ok(())
 }
 
@@ -1546,21 +1641,7 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// working byte-for-byte, no regression.
 fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
     // Delegate to atomic upsert: secret + caps together, preserve cert
-    devices_upsert_atomic(name, Some(secret), None, Some(caps), None, None)?;
-    Ok(())
-}
-
-/// Attach a device certificate + user key to an existing device record.
-fn update_device_cert(name: &str, uk: &identity::UserKey, cert: &identity::DeviceCert) -> Result<()> {
-    // Check existence first (atomic upsert doesn't fail if missing for existing -> it would create new)
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).ok().unwrap_or_default();
-    let arr: Vec<Value> = serde_json::from_str(&raw).ok().unwrap_or_default();
-    if !arr.iter().any(|d| d["name"].as_str() == Some(name)) {
-        bail!("device '{name}' is not in the device store. Pair with it first.");
-    }
-    // Delegate to atomic upsert: cert only, preserve secret
-    devices_upsert_atomic(name, None, Some(cert), None, None, Some(&uk.public_key_hex()))?;
+    devices_upsert_atomic(name, Some(secret), None, Some(caps), None, None, None)?;
     Ok(())
 }
 
@@ -1575,6 +1656,48 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
         }
     }
     None
+}
+
+fn persisted_principal_for_cert(
+    cert: &identity::DeviceCert,
+) -> (crate::capability::PrincipalKind, Option<u64>) {
+    let records = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default();
+    let own_user_pub = load_owner_key().map(|owner| owner.public_key_bytes());
+    principal_from_records(&records, cert, own_user_pub.as_ref())
+}
+
+fn principal_from_records(
+    records: &[Value],
+    cert: &identity::DeviceCert,
+    own_user_pub: Option<&[u8; 32]>,
+) -> (crate::capability::PrincipalKind, Option<u64>) {
+    let record = records.iter().find(|record| {
+        identity::DeviceCert::from_json(&record["deviceCert"])
+            .map(|stored| stored.device_pub == cert.device_pub)
+            .unwrap_or(false)
+    });
+    if let Some(record) = record {
+        if record["principalKind"].is_null() {
+            return (crate::capability::PrincipalKind::OwnerDevice, None);
+        }
+        if record["principalKind"].as_str() == Some("delegated") {
+            let caps = record["principalCeiling"]
+                .as_array()
+                .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            let expires = record["principalExpires"].as_u64().unwrap_or(0);
+            return (crate::capability::PrincipalKind::Delegated { caps }, Some(expires));
+        }
+        return (crate::capability::PrincipalKind::Delegated { caps: Vec::new() }, Some(0));
+    }
+    let is_same_owner = own_user_pub.map(|owner| *owner == cert.user_pub).unwrap_or(false);
+    if is_same_owner {
+        return (crate::capability::PrincipalKind::Delegated { caps: Vec::new() }, Some(0));
+    }
+    (crate::capability::PrincipalKind::OwnerDevice, None)
 }
 
 fn fleet_certificate_warning(name: &str) -> Option<String> {
@@ -1648,7 +1771,23 @@ fn load_owner_key() -> Option<crate::identity::UserKey> {
     crate::identity::UserKey::load(&crate::platform::PlatformKeyStore).ok().flatten()
 }
 
+fn local_device_cert_path() -> PathBuf {
+    crate::platform::Paths::config_path("identity/device-cert.json")
+}
+
 fn local_device_cert() -> Option<identity::DeviceCert> {
+    if let (Ok(raw), Ok(overlay_pub)) = (
+        std::fs::read_to_string(local_device_cert_path()),
+        crate::overlay::overlay_pubkey_bytes(),
+    ) {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            if let Some(cert) = identity::DeviceCert::from_json(&value["cert"]) {
+                if cert.device_pub == overlay_pub && cert.verify(identity::now_secs()).is_ok() {
+                    return Some(cert);
+                }
+            }
+        }
+    }
     // Try display name first
     if let Some(cert) = device_cert_for(&display_name()) {
         if cert.verify(identity::now_secs()).is_ok() {
@@ -1689,6 +1828,47 @@ fn local_device_cert() -> Option<identity::DeviceCert> {
     None
 }
 
+fn certify_local_device(user_key: &identity::UserKey, name: &str) -> Result<identity::DeviceCert> {
+    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+    let cert = identity::DeviceCert::certify(
+        user_key,
+        device_pub,
+        identity::now_secs(),
+        identity::CERT_TTL_SECS,
+    )?;
+    let path = local_device_cert_path();
+    crate::platform::SecretFile::write_str(
+        &path,
+        &serde_json::to_string_pretty(&json!({ "name": name, "cert": cert.to_json() }))?,
+    )
+    .with_context(|| format!("write local device certificate to {}", path.display()))?;
+    Ok(cert)
+}
+
+fn certified_device_names(user_pub: &[u8; 32]) -> Vec<(String, identity::DeviceCert)> {
+    let mut result = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
+        if let Ok(record) = serde_json::from_str::<Value>(&raw) {
+            if let (Some(name), Some(cert)) = (
+                record["name"].as_str(),
+                identity::DeviceCert::from_json(&record["cert"]),
+            ) {
+                if cert.user_pub == *user_pub {
+                    result.push((name.to_string(), cert));
+                }
+            }
+        }
+    }
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else { return result };
+    let Ok(records) = serde_json::from_str::<Vec<Value>>(&raw) else { return result };
+    result.extend(records.into_iter().filter_map(|record| {
+            let name = record["name"].as_str()?.to_string();
+            let cert = identity::DeviceCert::from_json(&record["deviceCert"])?;
+            (cert.user_pub == *user_pub).then_some((name, cert))
+        }));
+    result
+}
+
 /// Populate link identity from the peer's stored device cert, if the
 /// link already has a proof-verified name but identity pubkeys are absent.
 /// Cached back onto the link on first successful resolution (resolve-once,
@@ -1725,23 +1905,9 @@ fn resolve_peer_identity(link: &mut Link) {
     link.identity_device_pub = Some(cert.device_pub);
     link.identity_user_pub = Some(cert.user_pub);
     link.identity_binding = crate::capability::BindingStrength::Inferred;
-    link.identity_cert_expires = Some(cert.expires);
-    // SET THE CEILING EXPLICITLY, even though this is the constructor default.
-    //
-    // A DeviceCert carries no principal kind and no ceiling, so resolving one
-    // decides the ceiling by OMISSION: whatever `Link` was built with survives.
-    // That is correct today because every persisted cert is an owner device, but
-    // the decision is invisible at the exact site where identity is restored
-    // from a cert, which is where a future implementer of delegated certs will
-    // be standing when they need to handle it.
-    //
-    // Writing it here makes the currently-correct behaviour legible instead of
-    // accidental, and turns "add Delegated support" into an edit to a line that
-    // exists rather than a line someone has to know to add.
-    //
-    // If you are adding delegated certs: this line is the one to change, and see
-    // admit_delegated for why persisting a delegated link is an escalation.
-    link.principal_kind = crate::capability::PrincipalKind::OwnerDevice;
+    let (principal_kind, principal_expires) = persisted_principal_for_cert(&cert);
+    link.identity_cert_expires = Some(principal_expires.map_or(cert.expires, |expires| expires.min(cert.expires)));
+    link.principal_kind = principal_kind;
 }
 
 /// When a link becomes trusted, send a nonce challenge to the peer so it can
@@ -1867,11 +2033,13 @@ fn handle_identity_expose(
     if cert.device_pub == own_dpub { return false; }
     // Store as provisional, then promote on link
     let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
+    let (principal_kind, principal_expires) = persisted_principal_for_cert(&cert);
     if let Some(l) = conn.link_mut(pid) {
         l.identity_device_pub = Some(cert.device_pub);
         l.identity_user_pub = Some(cert.user_pub);
         l.identity_binding = crate::capability::BindingStrength::Proven;
-        l.identity_cert_expires = Some(cert.expires);
+        l.identity_cert_expires = Some(principal_expires.map_or(cert.expires, |expires| expires.min(cert.expires)));
+        l.principal_kind = principal_kind;
     }
     ui::say(&format!(
         "{} identity proven for peer {}",
@@ -1947,7 +2115,7 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 
 fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
     // Delegate to atomic upsert: cert only, preserve secret & caps
-    devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None)?;
+    devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None, None)?;
     Ok(())
 }
 
@@ -2927,6 +3095,291 @@ async fn up_cmd(
     res
 }
 
+fn write_owner_only_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create owner-only file {}", path.display()))?;
+    writeln!(file, "{contents}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_owner_only_fd(fd: i32, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        bail!("secret file descriptor must be non-negative");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    writeln!(file, "{contents}")?;
+    file.flush()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only_fd(_fd: i32, _contents: &str) -> Result<()> {
+    bail!("file-descriptor secret output is not yet implemented on this platform; use a new owner-only file")
+}
+
+fn read_owner_only_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open owner-only file {} without following links", path.display()))?;
+    let metadata = file.metadata()
+        .with_context(|| format!("inspect owner-only file {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!("secret input must be a regular file, not a symlink");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o077 != 0 {
+            bail!("secret file must be owner-only (chmod 600 {})", path.display());
+        }
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("read owner-only file {}", path.display()))?;
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn read_owner_only_fd(fd: i32) -> Result<String> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        bail!("secret file descriptor must be non-negative");
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
+#[cfg(not(unix))]
+fn read_owner_only_fd(_fd: i32) -> Result<String> {
+    bail!("file-descriptor secret input is not yet implemented on this platform; use an owner-only file")
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::Write;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+fn command_arg(value: &str) -> String {
+    if value.chars().all(|character| character.is_ascii_alphanumeric() || "-._/:".contains(character)) {
+        return value.to_string();
+    }
+    #[cfg(windows)]
+    {
+        return format!("\"{}\"", value.replace('"', "\\\""));
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
+    use crossterm::{execute, terminal};
+    let mut err = std::io::stderr();
+    execute!(err, terminal::EnterAlternateScreen, terminal::Clear(terminal::ClearType::All))?;
+    let result = (|| -> Result<()> {
+        eprintln!("{}", ui::paint(ui::Tone::Brand, "  FILAMENT / YOUR WAY BACK"));
+        eprintln!();
+        eprintln!("  Anyone with these words can become you.");
+        eprintln!("  Write them somewhere offline. Filament cannot reset them.");
+        eprintln!();
+        for (row, chunk) in words.chunks(4).enumerate() {
+            let cells = chunk
+                .iter()
+                .enumerate()
+                .map(|(column, word)| format!("{:>2}  {:<10}", row * 4 + column + 1, word))
+                .collect::<Vec<_>>()
+                .join("   ");
+            eprintln!("     {cells}");
+        }
+        eprintln!();
+        let qr = prompt_line("  Enter to check your copy, or type QR for a scannable export: ")?;
+        if qr.eq_ignore_ascii_case("qr") {
+            eprintln!();
+            eprintln!("  Anyone who captures this QR can become you.");
+            eprintln!("{}", ui::qr(&format!("filament-recovery:v1:{phrase}")));
+            let _ = prompt_line("  Press Enter after saving it somewhere you control: ")?;
+        }
+        let fourth = prompt_line("  Word 4:  ")?;
+        if fourth != words[3] {
+            bail!("word 4 did not match; identity was not created");
+        }
+        let eleventh = prompt_line("  Word 11: ")?;
+        if eleventh != words[10] {
+            bail!("word 11 did not match; identity was not created");
+        }
+        Ok(())
+    })();
+    let _ = execute!(err, terminal::LeaveAlternateScreen);
+    result
+}
+
+async fn init_experience(
+    caps: &UiCapability,
+    server: &str,
+    relay: bool,
+    name: Option<String>,
+    inbox: Option<PathBuf>,
+    recovery_file: Option<PathBuf>,
+    recovery_fd: Option<i32>,
+    background: bool,
+    no_background: bool,
+) -> Result<()> {
+    let store = crate::platform::PlatformKeyStore;
+    if caps.json && background {
+        bail!("init --json cannot install a service without mixing service output; run `filament receive --background` separately");
+    }
+    if let Some(existing) = identity::UserKey::load(&store)? {
+        bail!("this device already has identity {}; see `filament id`", existing.fingerprint());
+    }
+    if !caps.interactive && recovery_file.is_none() && recovery_fd.is_none() {
+        bail!("non-interactive init requires --recovery-file <new-path> or --recovery-fd <fd>");
+    }
+    if !caps.interactive && !caps.yes {
+        bail!("non-interactive init requires --yes after naming a recovery destination");
+    }
+
+    let device_name = match name {
+        Some(name) => name,
+        None if caps.interactive => {
+            let suggested = l3::hostname();
+            let entered = prompt_line(&format!("  Name this device [{suggested}]: "))?;
+            if entered.is_empty() { suggested } else { entered }
+        }
+        None => bail!("non-interactive init requires --name <device>"),
+    };
+    let inbox = inbox.unwrap_or_else(default_drop_dir);
+    let pending = identity::PendingIdentity::generate()?;
+    let phrase = Zeroizing::new(pending.mnemonic().to_string());
+    let words = pending.mnemonic().word_iter().collect::<Vec<_>>();
+
+    if let Some(path) = recovery_file.as_deref() {
+        write_owner_only_file(path, phrase.as_str())?;
+    } else if let Some(fd) = recovery_fd {
+        write_owner_only_fd(fd, phrase.as_str())?;
+    } else {
+        confirm_recovery_phrase(&words, phrase.as_str())?;
+    }
+
+    let user_key = pending.commit(&store)?;
+    config_set("name", &device_name)?;
+    config_set("dir", &inbox.display().to_string())?;
+    std::fs::create_dir_all(&inbox)?;
+    certify_local_device(&user_key, &device_name)?;
+    ensure_self_genesis_header(&crate::settings::config_dir(), &user_key);
+    let start_background = if no_background {
+        false
+    } else if background {
+        true
+    } else if caps.interactive {
+        !prompt_line("  Stay available in the background? [Y/n]: ")?.eq_ignore_ascii_case("n")
+    } else {
+        false
+    };
+    if start_background {
+        up_cmd(server, true, false, Some(inbox.clone()), relay, false, None, None, None, false, false, false)
+            .await
+            .context("install always-on receive service")?;
+    }
+
+    if caps.json {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "identity": user_key.fingerprint(),
+            "device": device_name,
+            "inbox": inbox,
+            "recoveryExported": true,
+            "background": start_background,
+        }))?);
+        return Ok(());
+    }
+    ui::say(&format!("  {} identity created", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+    ui::say(&format!("  {} this device: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &device_name)));
+    ui::say(&format!("  {} inbox: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), inbox.display()));
+    ui::say("");
+    ui::say("  Secure defaults");
+    ui::say("  + paired devices may send into this inbox");
+    ui::say("  - remote shell is off");
+    ui::say("  - remote writing is off");
+    ui::say("  - local ports are private");
+    ui::say("");
+    if start_background {
+        ui::say(&format!("  {} available in the background", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+    } else {
+        ui::say(&ui::paint(ui::Tone::Dim, "  Stay available: filament receive --background"));
+    }
+    Ok(())
+}
+
+fn recover_identity(caps: &UiCapability, words_file: Option<PathBuf>, words_fd: Option<i32>) -> Result<()> {
+    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
+        bail!("an identity already exists; recovery will not overwrite it");
+    }
+    let phrase = Zeroizing::new(if let Some(path) = words_file.as_deref() {
+        read_owner_only_file(path)?
+    } else if let Some(fd) = words_fd {
+        read_owner_only_fd(fd)?
+    } else if caps.interactive {
+        use crossterm::{execute, terminal};
+        let mut err = std::io::stderr();
+        execute!(err, terminal::EnterAlternateScreen, terminal::Clear(terminal::ClearType::All))?;
+        eprintln!("  Enter your 12 recovery words.");
+        eprintln!("  They remain visible while you correct them; this screen is cleared afterward.");
+        let result = prompt_line("\n  words: ");
+        let _ = execute!(err, terminal::LeaveAlternateScreen);
+        result?
+    } else {
+        bail!("non-interactive recovery requires --words-file <path> or --words-fd <fd>");
+    });
+    let user_key = identity::UserKey::restore(&crate::platform::PlatformKeyStore, phrase.as_str().trim())?;
+    certify_local_device(&user_key, &display_name())?;
+    ensure_self_genesis_header(&crate::settings::config_dir(), &user_key);
+    if caps.json {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "identity": user_key.fingerprint(),
+            "restored": true,
+            "revokedStolenDevices": false,
+        }))?);
+    } else {
+        ui::say(&format!("  {} identity restored: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), user_key.fingerprint()));
+        ui::say(&ui::paint(ui::Tone::Warn, "  Recovery does not revoke a stolen device or a key it already holds."));
+    }
+    Ok(())
+}
+
 /// Bare-command tour: what filament is, the current state, and the two or three
 /// things you'd actually do next, adapted to whether you've paired anyone yet. No
 /// flags to learn; `--help` still has the full surface. (CLI-UX work, point #2.)
@@ -2935,7 +3388,7 @@ fn tour_cmd() -> Result<()> {
     ui::say(&format!(
         "  {}  {}",
         ui::paint_when(color, ui::Tone::Brand, "filament"),
-        ui::paint_when(color, ui::Tone::Dim, "· send files and reach your devices, no account"),
+        ui::paint_when(color, ui::Tone::Dim, "/ one thread across every device"),
     ));
     ui::say("");
     match daemon_alive() {
@@ -2943,19 +3396,24 @@ fn tour_cmd() -> Result<()> {
         None => ui::say(&format!("  {} daemon not running", ui::paint_when(color, ui::Tone::Dim, "·"))),
     }
     let n = devices_load().len();
-    ui::say(&format!("  {n} known device{}", if n == 1 { "" } else { "s" }));
+    let identity = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
+    ui::say(&format!("  {n} device{}", if n == 1 { "" } else { "s" }));
+    match identity {
+        Some(key) => ui::say(&format!("  identity {}", ui::paint_when(color, ui::Tone::Bold, &key.fingerprint()))),
+        None => ui::say(&format!("  {} no identity yet", ui::paint_when(color, ui::Tone::Warn, "!"))),
+    }
     ui::say("");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  do this:"));
     let act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));
-    act("filament send <file>", "send files (to a browser or a paired device)");
+    act("filament send <file>", "send something");
     if n == 0 {
-        act("filament pair", "remember a device (unlocks ssh + expose)");
+        act("filament add", "add a device or person");
     } else {
-        act("filament <device>", "shell into a paired device (e.g. filament dovm)");
-        act("filament expose <port>", "publish a local port on the mesh");
+        act("filament mount", "open files from another device");
+        act("filament shell <device>", "open an authorized terminal");
     }
-    act("filament up", "receive in the background");
-    ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  ·  filament status  ·  filament devices"));
+    act("filament receive", "receive once");
+    ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  /  filament devices  /  filament id"));
     Ok(())
 }
 
@@ -3500,6 +3958,7 @@ async fn mint_cmd(
     allow: Vec<String>,
     audience: Option<String>,
     _yes: bool,
+    out: Option<PathBuf>,
     relay: bool,
 ) -> Result<()> {
     let is_external = external.is_some();
@@ -3573,6 +4032,7 @@ async fn mint_cmd(
                 fleet_ui::mint::Reuse::Reusable => "Reusable".to_string(),
             },
             tag: if ci { "ci".to_string() } else if is_external { "external".to_string() } else { "fleet".to_string() },
+            out,
         },
         relay,
     )
@@ -3582,10 +4042,10 @@ async fn mint_cmd(
 /// CLI handler for `filament ephemeral`
 async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Result<()> {
     match action {
-        EphemeralAction::Mint { caps, audience, ttl, reuse, tag } => {
+        EphemeralAction::Mint { caps, audience, ttl, reuse, tag, out } => {
             let uk = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                 Some(uk) => uk,
-                None => bail!("no user identity. Run 'filament identity init' first."),
+                None => bail!("no identity. Run 'filament init' first."),
             };
             let rng = ring::rand::SystemRandom::new();
             let mut seed = [0u8; 32];
@@ -3611,16 +4071,16 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
                 _ => bail!("invalid reuse: {reuse} (Once, N(3), Reusable)"),
             };
             let ak = crate::ephemeral::AuthKey::mint(uk.keypair(), enroll_pub, caps, audience_pubs, ttl, reuse, tag)?;
-            let json = serde_json::to_string_pretty(&serde_json::json!({
+            let json = Zeroizing::new(serde_json::to_string_pretty(&serde_json::json!({
                 "auth_key": ak.to_json(),
                 "enroll_private_key": hex::encode(seed),
-            }))?;
-            println!("{}", json);
-            eprintln!("{} auth key minted — save the JSON above. The enroll_private_key proves possession.",
-                ui::paint(ui::Tone::Ok, ui::glyph_ok()));
+            }))?);
+            seed.fill(0);
+            let out = out.ok_or_else(|| anyhow!("secret output requires --out <new-owner-only-file>; use `filament invite` for the guided flow"))?;
+            write_owner_only_file(&out, json.as_str())?;
+            eprintln!("{} auth key bundle written to {}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
             // Arm the local daemon so it joins the enrollment room
-            let ak = crate::ephemeral::AuthKey::from_json(&serde_json::from_str::<serde_json::Value>(&json)?.get("auth_key").unwrap_or(&serde_json::Value::Null))
-                .ok_or_else(|| anyhow::anyhow!("failed to re-parse minted auth key"))?;
             if ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await.is_some() {
                 ui::debug("local daemon armed for enrollment");
             } else {
@@ -3629,13 +4089,260 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             }
             Ok(())
         }
-        EphemeralAction::Enroll { auth_key, to } => {
-            enroll_cmd(server, &auth_key, to, relay).await
+        EphemeralAction::Enroll { auth_key_file, to } => {
+            let auth_key = Zeroizing::new(read_owner_only_file(&auth_key_file)?);
+            enroll_cmd(server, auth_key.as_str(), to, relay, None, false).await
         }
     }
 }
 
-async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, relay: bool) -> Result<()> {
+fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<String> {
+    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
+        bail!("this device already holds an identity key; join only from a clean Filament identity");
+    }
+    if local_device_cert_path().exists() {
+        bail!("this device already holds a joined certificate; refusing to overwrite it");
+    }
+    let assigned_name = v["name"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
+    let owner_name = v["owner_name"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the owner name"))?;
+    let secret = v["secret"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the reconnect secret"))?;
+    if hex::decode(secret).map(|bytes| bytes.len()).ok() != Some(32) {
+        bail!("join acknowledgement carried an invalid reconnect secret");
+    }
+    let expires = v["expires"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its expiry"))?;
+    let ceiling = v["ceiling"]
+        .as_array()
+        .ok_or_else(|| anyhow!("join acknowledgement omitted its capability ceiling"))?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| anyhow!("join ceiling contains a non-string capability")))
+        .collect::<Result<Vec<_>>>()?;
+    if expires != auth_key.expires || ceiling != auth_key.caps {
+        bail!("join acknowledgement changed the signed capability ceiling or expiry");
+    }
+    let local_cert = identity::DeviceCert::from_json(&v["device_cert"])
+        .ok_or_else(|| anyhow!("join acknowledgement omitted the local device certificate"))?;
+    let owner_cert = identity::DeviceCert::from_json(&v["owner_cert"])
+        .ok_or_else(|| anyhow!("join acknowledgement omitted the owner certificate"))?;
+    let overlay_pub = crate::overlay::overlay_pubkey_bytes()?;
+    if local_cert.device_pub != overlay_pub
+        || local_cert.user_pub != auth_key.issuer
+        || local_cert.expires != expires
+        || local_cert.verify(identity::now_secs()).is_err()
+    {
+        bail!("join acknowledgement carried an invalid local device certificate");
+    }
+    if owner_cert.user_pub != auth_key.issuer || owner_cert.verify(identity::now_secs()).is_err() {
+        bail!("join acknowledgement carried an invalid owner certificate");
+    }
+    let cert_path = local_device_cert_path();
+    crate::platform::SecretFile::write_str(
+        &cert_path,
+        &serde_json::to_string_pretty(&json!({ "name": assigned_name, "cert": local_cert.to_json() }))?,
+    )?;
+    let transfer_caps = vec!["transfer".to_string()];
+    devices_upsert_atomic(
+        owner_name,
+        Some(secret),
+        Some(&owner_cert),
+        Some(&transfer_caps),
+        Some(identity::IntroScope::Device.to_byte()),
+        None,
+        None,
+    )?;
+    config_set("name", assigned_name)?;
+    Ok(assigned_name.to_string())
+}
+
+async fn invite_cmd(
+    caps: &UiCapability,
+    mut kind: Option<String>,
+    allow: Vec<String>,
+    expires: Option<String>,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    use base64::Engine;
+    if kind.is_none() && caps.interactive {
+        let choices = vec!["A device I control".to_string(), "Another person".to_string()];
+        kind = codeentry::pick("WHO IS JOINING", &choices)?
+            .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() });
+    }
+    let kind = kind.ok_or_else(|| anyhow!("non-interactive invite requires --kind device|person"))?;
+    if kind != "device" && kind != "person" {
+        bail!("invitation kind must be device or person");
+    }
+    let mut ceiling = if allow.is_empty() {
+        if kind == "device" {
+            vec!["transfer".to_string(), "mount".to_string()]
+        } else {
+            vec!["transfer".to_string()]
+        }
+    } else {
+        allow.into_iter().map(|capability| mint_capability(&capability)).collect::<Result<Vec<_>>>()?
+    };
+    ceiling.sort();
+    ceiling.dedup();
+    let ttl_text = expires.unwrap_or_else(|| if kind == "device" { "30d".to_string() } else { "1h".to_string() });
+    let ttl = parse_mint_ttl(&ttl_text)?;
+    if ttl == 0 || ttl > 30 * 24 * 3600 {
+        bail!("invitations must expire between 1 second and 30 days");
+    }
+    if ceiling.iter().any(|capability| capability == "shell" || capability == "all-ports") {
+        caps.confirm("include deliberate remote authority in this invitation ceiling")?;
+    }
+    if !caps.interactive && out.is_none() {
+        bail!("non-interactive invite requires --out <new-owner-only-file>");
+    }
+    let owner_key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?
+        .ok_or_else(|| anyhow!("no identity. Run `filament init` first"))?;
+    let mut enroll_seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut enroll_seed)
+        .map_err(|_| anyhow!("failed to generate invitation possession key"))?;
+    let enroll_key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&enroll_seed)
+        .map_err(|_| anyhow!("failed to create invitation possession key"))?;
+    let enroll_pub: [u8; 32] = ring::signature::KeyPair::public_key(&enroll_key)
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow!("invitation public key has the wrong size"))?;
+    let auth_key = crate::ephemeral::AuthKey::mint(
+        owner_key.keypair(),
+        enroll_pub,
+        ceiling.clone(),
+        Vec::new(),
+        ttl,
+        crate::ephemeral::Reuse::Once,
+        format!("join-{kind}"),
+    )?;
+    let bundle = json!({
+        "auth_key": auth_key.to_json(),
+        "enroll_private_key": hex::encode(enroll_seed),
+        "owner_name": display_name(),
+        "kind": kind.clone(),
+    });
+    enroll_seed.fill(0);
+    let token = Zeroizing::new(format!(
+        "filament-invite:v1:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle)?)
+    ));
+    if crate::ctl::try_arm(hex::encode(auth_key.enroll_pub), auth_key.expires).await.is_none() {
+        bail!("the background receiver is not running; start `filament receive --background` before inviting")
+    }
+
+    if let Some(path) = out.as_deref() {
+        write_owner_only_file(path, token.as_str())?;
+    } else {
+        use crossterm::{execute, terminal};
+        let mut err = std::io::stderr();
+        execute!(err, terminal::EnterAlternateScreen, terminal::Clear(terminal::ClearType::All))?;
+        eprintln!("  {}", ui::paint(ui::Tone::Brand, "JOIN INVITATION"));
+        eprintln!("  kind     {kind}");
+        eprintln!("  ceiling  {}", ceiling.join(", "));
+        eprintln!("  expires  {ttl_text}");
+        eprintln!();
+        eprintln!("  Whoever captures this can join until it is used or expires.");
+        eprintln!("{}", ui::qr(token.as_str()));
+        eprintln!("{}", token.as_str());
+        let result = prompt_line("\n  Press Enter after the other device has captured it: ");
+        let _ = execute!(err, terminal::LeaveAlternateScreen);
+        result?;
+    }
+    if caps.json {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "kind": kind,
+            "ceiling": ceiling,
+            "expires": auth_key.expires,
+            "writtenTo": out,
+            "invitationSecretPrinted": false,
+        }))?);
+    } else if let Some(path) = out {
+        ui::say(&format!("  {} invitation written to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), path.display()));
+        ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
+    }
+    Ok(())
+}
+
+fn parse_invitation(raw: &str) -> Result<Value> {
+    use base64::Engine;
+    let token = raw.trim();
+    let encoded = token
+        .strip_prefix("filament-invite:v1:")
+        .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
+    let bytes = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| anyhow!("invitation is not valid base64url"))?);
+    serde_json::from_slice(bytes.as_slice()).map_err(|_| anyhow!("invitation payload is not valid JSON"))
+}
+
+async fn join_cmd(
+    caps: &UiCapability,
+    server: &str,
+    relay: bool,
+    invite_file: Option<PathBuf>,
+    invite_fd: Option<i32>,
+    name: Option<String>,
+    to: Option<String>,
+) -> Result<()> {
+    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
+        bail!("this device already has an identity; join starts from a clean Filament identity");
+    }
+    if local_device_cert_path().exists() {
+        bail!("this device has already joined an identity; reset it before joining another");
+    }
+    let invitation = Zeroizing::new(if let Some(path) = invite_file.as_deref() {
+        read_owner_only_file(path)?
+    } else if let Some(fd) = invite_fd {
+        read_owner_only_fd(fd)?
+    } else if caps.interactive {
+        use crossterm::{execute, terminal};
+        let mut err = std::io::stderr();
+        execute!(err, terminal::EnterAlternateScreen, terminal::Clear(terminal::ClearType::All))?;
+        eprintln!("  Paste the invitation. It is cleared from this terminal after reading.");
+        let result = prompt_line("\n  invitation: ");
+        let _ = execute!(err, terminal::LeaveAlternateScreen);
+        result?
+    } else {
+        bail!("non-interactive join requires --invite-file <path> or --invite-fd <fd>");
+    });
+    let bundle = parse_invitation(invitation.as_str())?;
+    let auth_key = crate::ephemeral::AuthKey::from_json(&bundle["auth_key"])
+        .ok_or_else(|| anyhow!("invitation contains an invalid signed authorization"))?;
+    if auth_key.expires <= identity::now_secs() {
+        bail!("this invitation has expired");
+    }
+    let owner_name = to.or_else(|| bundle["owner_name"].as_str().map(str::to_string));
+    let proposed_name = name.unwrap_or_else(l3::hostname);
+    if caps.interactive {
+        eprintln!();
+        eprintln!("  {}", ui::paint(ui::Tone::Brand, "JOIN"));
+        eprintln!("  as       {proposed_name}");
+        eprintln!("  owner    {}", owner_name.as_deref().unwrap_or("invitation issuer"));
+        eprintln!("  ceiling  {}", capability_list_summary(&auth_key.caps));
+        eprintln!("  expires  {}", auth_key.expires);
+        eprintln!("  proof    the ceiling is persisted and reloaded before reconnect authorization");
+        let confirmation = prompt_line("\n  Press Enter to join, or type cancel: ")?;
+        if confirmation.eq_ignore_ascii_case("cancel") {
+            bail!("cancelled");
+        }
+    }
+    let bundle_json = Zeroizing::new(serde_json::to_string(&bundle)?);
+    enroll_cmd(
+        server,
+        bundle_json.as_str(),
+        owner_name,
+        relay,
+        Some(&proposed_name),
+        caps.json,
+    )
+    .await
+}
+
+async fn enroll_cmd(
+    server: &str,
+    auth_key_json: &str,
+    to_name: Option<String>,
+    relay: bool,
+    proposed_name: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
     use crate::ephemeral::AuthKey;
 
     let v: serde_json::Value = {
@@ -3652,17 +4359,14 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
         .and_then(|s| hex::decode(s).ok())
         .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key in auth key JSON"))?;
     let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key seed"))?;
-    let mut dseed = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
 
-    ui::say(&format!("{} auth key loaded (caps: {}, issuer: {})",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        capability_list_summary(&ak.caps),
-        hex::encode(&ak.issuer[..4])));
+    if !json_output {
+        ui::say(&format!("{} auth key loaded (caps: {}, issuer: {})",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            capability_list_summary(&ak.caps),
+            hex::encode(&ak.issuer[..4])));
+    }
 
     let my_uid = mk_uid("e");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
@@ -3672,10 +4376,11 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
     // Enroller sets its own room (so signals route) + subscribes to the
     // enrollment channel. Discovery via KnownPeer on shared channel.
     let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
-    let mut sess = session::Session::new(&display_name(), &my_uid);
+    let local_name = proposed_name.map(str::to_string).unwrap_or_else(display_name);
+    let mut sess = session::Session::new(&local_name, &my_uid);
     sess.room = Some(format!("enrollup-{}", fresh_secret()));
     sess.channels = vec![enroll_chan.clone()];
-    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": local_name, "uid": my_uid })).await;
     sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(
@@ -3783,7 +4488,6 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
                 crate::ephemeral::register_enrollment(
                     pid.clone(),
                     enroll_seed,
-                    dseed,
                     device_pub,
                     ak.clone(),
                 );
@@ -3794,9 +4498,11 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
                     "device_pub": hex::encode(device_pub),
                 })).await;
 
-                ui::say(&format!("  {} sent enrollment request to {}",
-                    ui::paint(ui::Tone::Dim, "->"),
-                    pid));
+                if !json_output {
+                    ui::say(&format!("  {} sent enrollment request to {}",
+                        ui::paint(ui::Tone::Dim, "->"),
+                        pid));
+                }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 Some("identity-auth-key-enroll-challenge") => {
@@ -3825,11 +4531,22 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
-                    let name = v["name"].as_str().unwrap_or("ephemeral-device");
-                    ui::say(&format!("{} enrolled as ephemeral device '{}' (device_pub: {})",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        name,
-                        hex::encode(device_pub)));
+                    let name = persist_join_ack(&v, &ak)?;
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&json!({
+                            "joined": true,
+                            "name": name,
+                            "devicePub": hex::encode(device_pub),
+                            "ceiling": ak.caps,
+                            "expires": ak.expires,
+                            "persistsAcrossReconnect": true,
+                        }))?);
+                    } else {
+                        ui::say(&format!("{} joined as '{}' with a persisted ceiling (device_pub: {})",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                            name,
+                            hex::encode(device_pub)));
+                    }
                     return Ok(());
                 }
                 Some("identity-auth-key-enroll-error") => {
@@ -3851,21 +4568,15 @@ async fn enroll_cmd(server: &str, auth_key_json: &str, to_name: Option<String>, 
 /// files over the enrolled transport. The owner's daemon applies the ceiling.
 async fn enroll_and_send_cmd(
     server: &str,
-    auth_key_path: String,
+    auth_key_path: PathBuf,
     to_name: Option<String>,
     paths: Vec<String>,
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
     // Load auth key
-    let v: serde_json::Value = {
-        let ak_str = if std::path::Path::new(&auth_key_path).exists() {
-            std::fs::read_to_string(&auth_key_path)?
-        } else {
-            auth_key_path.clone()
-        };
-        serde_json::from_str(&ak_str)?
-    };
+    let auth_key_contents = Zeroizing::new(read_owner_only_file(&auth_key_path)?);
+    let v: serde_json::Value = serde_json::from_str(auth_key_contents.as_str())?;
     let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
         .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
     let enroll_seed = v.get("enroll_private_key")
@@ -3873,12 +4584,7 @@ async fn enroll_and_send_cmd(
         .and_then(|s| hex::decode(s).ok())
         .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
     let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
-    let mut dseed = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
 
     ui::say(&format!("  {} enrolling as delegated (caps: {})",
         ui::paint(ui::Tone::Dim, "->"),
@@ -3895,7 +4601,6 @@ async fn enroll_and_send_cmd(
     sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
-    crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
 
     {
         let tx = tx.clone();
@@ -3977,7 +4682,7 @@ async fn enroll_and_send_cmd(
                     l.presence = Presence::Ready;
                 }
                 if conn.active.is_none() { conn.active = Some(pid.clone()); }
-                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, dseed, device_pub, ak.clone());
+                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, device_pub, ak.clone());
                 let _ = t.send_control(&json!({
                     "type": "identity-auth-key-enroll-request",
                     "auth_key": ak.to_json(),
@@ -4009,8 +4714,8 @@ async fn enroll_and_send_cmd(
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
-                    let dp_hex = v["device_pub"].as_str().unwrap_or("?");
-                    ui::say(&format!("  {} enrolled (device_pub: {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), &dp_hex[..16]));
+                    let name = persist_join_ack(&v, &ak)?;
+                    ui::say(&format!("  {} joined as {name}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                     // Enrollment complete — break to send files
                     conn.active = Some(pid.clone());
                     break;
@@ -4100,20 +4805,14 @@ async fn enroll_and_send_cmd(
 /// Same flow as enroll_and_send_cmd but opens an l2 shell instead of sending files.
 async fn enroll_and_netcat_cmd(
     server: &str,
-    auth_key_path: String,
+    auth_key_path: PathBuf,
     to_name: Option<String>,
     rport: u16,
     relay: bool,
 ) -> Result<()> {
     // Load auth key (same as enroll_and_send_cmd)
-    let v: serde_json::Value = {
-        let ak_str = if std::path::Path::new(&auth_key_path).exists() {
-            std::fs::read_to_string(&auth_key_path)?
-        } else {
-            auth_key_path.clone()
-        };
-        serde_json::from_str(&ak_str)?
-    };
+    let auth_key_contents = Zeroizing::new(read_owner_only_file(&auth_key_path)?);
+    let v: serde_json::Value = serde_json::from_str(auth_key_contents.as_str())?;
     let ak = crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v))
         .ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
     let enroll_seed = v.get("enroll_private_key")
@@ -4121,12 +4820,7 @@ async fn enroll_and_netcat_cmd(
         .and_then(|s| hex::decode(s).ok())
         .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key"))?;
     let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key"))?;
-    let mut dseed = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut dseed)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&dseed)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let device_pub: [u8; 32] = ring::signature::KeyPair::public_key(&device_kp).as_ref().try_into().unwrap();
+    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
 
     ui::say(&format!("  {} enrolling as delegated (caps: {})",
         ui::paint(ui::Tone::Dim, "->"),
@@ -4143,7 +4837,6 @@ async fn enroll_and_netcat_cmd(
     sess.emit(&sio, "subscribe", json!({ "channels": [enroll_chan] })).await;
 
     let mut conn = Conn::for_command(server, sio.clone(), tx.clone(), my_uid, relay, to_name.clone(), false, direct::direct_enabled());
-    crate::ephemeral::register_enrollment(String::new(), enroll_seed, dseed, device_pub, ak.clone());
 
     {
         let tx = tx.clone();
@@ -4214,7 +4907,7 @@ async fn enroll_and_netcat_cmd(
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) { l.transport = Some(t.clone()); l.presence = Presence::Ready; }
                 if conn.active.is_none() { conn.active = Some(pid.clone()); }
-                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, dseed, device_pub, ak.clone());
+                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, device_pub, ak.clone());
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-request", "auth_key": ak.to_json()})).await;
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
@@ -4242,8 +4935,8 @@ async fn enroll_and_netcat_cmd(
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
-                    let dp_hex = v["device_pub"].as_str().unwrap_or("?");
-                    ui::say(&format!("  {} enrolled (device_pub: {})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), &dp_hex[..16]));
+                    let name = persist_join_ack(&v, &ak)?;
+                    ui::say(&format!("  {} joined as {name}", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                     conn.active = Some(pid.clone());
                     break;
                 }
@@ -4343,13 +5036,14 @@ async fn respond_to_auth_key_enroll_request(
     };
 
     // Verify against our trusted owner
-    let owner_pub = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-        Ok(Some(uk)) => uk.public_key_bytes(),
+    let owner_key = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+        Ok(Some(uk)) => uk,
         _ => {
             let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
+    let owner_pub = owner_key.public_key_bytes();
     let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
         Ok(pk) => pk,
         Err(e) => {
@@ -4398,13 +5092,14 @@ async fn handle_auth_key_enroll_response(
             return;
         }
     };
-    let owner_pub = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
-        Ok(Some(uk)) => uk.public_key_bytes(),
+    let owner_key = match crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+        Ok(Some(uk)) => uk,
         _ => {
             let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
             return;
         }
     };
+    let owner_pub = owner_key.public_key_bytes();
     let verifier_pub = match crate::overlay::overlay_pubkey_bytes() {
         Ok(pk) => pk,
         Err(e) => {
@@ -4434,13 +5129,51 @@ async fn handle_auth_key_enroll_response(
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
             }
+            let requested_name = conn
+                .link(&pid)
+                .map(|link| link.name.clone())
+                .unwrap_or_else(|| "joined-device".to_string());
+            let secret = fresh_secret();
+            let now = identity::now_secs();
+            let certificate_ttl = ak.expires.saturating_sub(now);
+            let device_cert = match identity::DeviceCert::certify(&owner_key, device_pub, now, certificate_ttl) {
+                Ok(cert) => cert,
+                Err(error) => {
+                    ui::debug(&format!("enroll response certificate failed: {error}"));
+                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                    return;
+                }
+            };
+            let stored_name = match devices_upsert_atomic(
+                &requested_name,
+                Some(&secret),
+                Some(&device_cert),
+                Some(&ak.caps),
+                Some(identity::IntroScope::Device.to_byte()),
+                None,
+                Some((&ak.caps, ak.expires)),
+            ) {
+                Ok(name) => name,
+                Err(error) => {
+                    ui::debug(&format!("enroll response persistence failed: {error}"));
+                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                    return;
+                }
+            };
             // Admit as Delegated principal — structurally, all four fields together
             if let Some(link) = conn.link_mut(&pid) {
+                link.verified_name = Some(stored_name.clone());
                 link.admit_delegated(owner_pub, device_pub, ak.expires, ak.caps.clone());
             }
             let _ = t.send_control(&json!({
                 "type": "identity-auth-key-enroll-ack",
+                "name": stored_name,
+                "owner_name": display_name(),
+                "secret": secret,
                 "device_pub": hex::encode(device_pub),
+                "device_cert": device_cert.to_json(),
+                "owner_cert": local_device_cert().map(|cert| cert.to_json()),
+                "ceiling": ak.caps,
                 "expires": ak.expires
             })).await;
             ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {})",
@@ -4541,6 +5274,7 @@ fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
     //    file is a silent no-op. Explicit list (NOT a blanket rmdir of the config
     //    dir) so a mis-set FILAMENT_CONFIG_DIR can never take out unrelated files.
     reset_remove(&cfg.join("identity.ed25519"), "user identity key", &mut wiped);
+    reset_remove(&cfg.join("identity/device-cert.json"), "local device certificate", &mut wiped);
     reset_remove(&cfg.join("overlay.ed25519"), "overlay key", &mut wiped);
     reset_remove(&cfg.join("devices.json"), "paired-device store (device certs)", &mut wiped);
     reset_remove(&cfg.join("caps.json"), "capability store", &mut wiped);
@@ -4568,7 +5302,7 @@ fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
         for line in &wiped {
             ui::say(&format!("    - {line}"));
         }
-        ui::say("  this machine is now a clean slate (re-pair / `filament identity init` to start over)");
+        ui::say("  this machine is now a clean slate (`filament init` to start over)");
     }
     Ok(())
 }
@@ -4897,7 +5631,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // No code at all -> CREATE entry.
             (None, _) => {
                 let auto_np = crate::pake::words::mint_pair_nameplate();
-                match codeentry::run("  pair · choose words  ", codeentry::Mode::Create, "", &auto_np)? {
+                match codeentry::run("  add / choose words  ", codeentry::Mode::Create, "", &auto_np)? {
                     codeentry::Outcome::Submitted(words) => {
                         word = Some(words);
                         // Reuse the SAME nameplate we just previewed, so the code
@@ -4914,7 +5648,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             (Some(raw), Some(_)) => {
                 malformed_entry_banner(raw);
                 let prefill = crate::pake::norm_code(raw);
-                match codeentry::run("  pair · code  ", codeentry::Mode::Claim, &prefill, "")? {
+                match codeentry::run("  add / code  ", codeentry::Mode::Claim, &prefill, "")? {
                     codeentry::Outcome::Submitted(c) => code = Some(c),
                     // Empty submit on a claim-fix means "give up on this code".
                     codeentry::Outcome::Empty => return Err(cancelled()),
@@ -4962,8 +5696,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         if regex_lite_code(c) && !looks_like_pake_code(c) {
             bail!(
                 "'{c}' looks like a one-time TRANSFER code (from `filament send --code`), not a pairing code.\n  \
-                 To receive that transfer: run `filament {c}` (or `filament recv {c}`)\n  \
-                 A pairing code ends in a 4-digit number, e.g. `brave-otter-3141`."
+                 To receive that transfer: run `filament receive {c}`\n  \
+                 An add code ends in a 4-digit number, e.g. `brave-otter-3141`."
             );
         }
     }
@@ -5141,7 +5875,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
                     // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
                     let pcert = peer_identity_cert.as_ref().unwrap();
-                    devices_upsert_atomic(&n, Some(&sec), Some(pcert), Some(&caps), Some(scope), None)
+                    devices_upsert_atomic(&n, Some(&sec), Some(pcert), Some(&caps), Some(scope), None, None)
                         .context("atomic store secret+cert")?;
                     // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
                     store_provisional_identity(&n, pcert)
@@ -5170,7 +5904,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         // time, the peer disconnected or never connected.
         if let Some(dl) = ceremony_deadline {
             if Instant::now() > dl {
-                bail!("the other device disconnected or could not connect before pairing finished, make sure both run `filament pair` at the same time, then try again");
+                bail!("the other device disconnected before setup finished; make sure both run `filament add` at the same time, then try again");
             }
         }
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
@@ -5285,7 +6019,11 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 ui::say("");
                 ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &full.to_uppercase())));
                 ui::say("");
-                ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament pair <code>`"));
+                if interactive_allowed() {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  scan this in Filament, or enter the code below it"));
+                    ui::say(&ui::qr(&full));
+                }
+                ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament add <code>`"));
                 ui::say(&ui::paint(ui::Tone::Dim, "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)"));
             }
             Ev::PairCode(v) => {
@@ -5323,7 +6061,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 }
                 let hint = match v["why"].as_str() {
                     Some("sender-gone") => "that code's creator already left, ask them for a fresh one".to_string(),
-                    _ => format!("{}, codes burn after one use; a failed pairing needs a FRESH code (re-run `filament pair`)", v["error"].as_str().unwrap_or("?")),
+                    _ => format!("{}, codes burn after one use; a failed setup needs a FRESH code (re-run `filament add`)", v["error"].as_str().unwrap_or("?")),
                 };
                 bail!("code rejected: {hint}");
             }
@@ -5650,44 +6388,12 @@ impl Link {
     /// Ensures caps are structurally tied to the Proven identity — a Delegated
     /// principal CANNOT exist without its ceiling.
     ///
-    /// NON-PERSISTENCE INVARIANT: a delegated principal's authority is conferred
-    /// by certain Link fields and bounded by others. All five MUST travel
-    /// together as in-memory Link state, and none may be persisted to devices.json:
-    ///
-    ///   CONFERS authority (owner-shortcut in evaluate() if bounding fields are absent):
-    ///   - identity_user_pub    (= owner_pub; triggers owner-derived authorize)
-    ///   - identity_device_pub  (enables device-targeted grants)
-    ///   - identity_binding     (Proven; satisfies cap_authorize_proven + trust floor)
-    ///
-    ///   BOUNDS authority (ceiling and expiry; if dropped, owner-shortcut is unbounded):
-    ///   - principal_kind       (Delegated{caps}; the ceiling; owner-shortcut bypasses it if absent)
-    ///   - identity_cert_expires (cap_authorize_expired; None => treated as expired => denies,
-    ///                           so it fails closed, but list it so a subset-persist is obviously dangerous)
-    ///
-    /// This is safe ONLY because Link is in-memory and never persisted.
-    ///
-    /// If identity_user_pub were ever persisted, or a delegated link were written
-    /// into devices.json, then on reconnect `resolve_peer_identity` would restore
-    /// `identity_user_pub = owner_pub` while `principal_kind` defaults to
-    /// `OwnerDevice`, `auth_key_caps()` returns `None`, the ceiling vanishes, and
-    /// the owner-shortcut in evaluate() authorizes everything — a full escalation.
-    /// SO: never persist a delegated link.
-    ///
-    /// WHAT ACTUALLY PROTECTS US, corrected 2026-08-03 by claude-advisor. An
-    /// earlier version of this line said "the devices_json writer must exclude
-    /// it", which describes an active exclusion. THERE IS NONE.
-    /// `devices_upsert_atomic` (via update_device_cert) persists name, secret,
-    /// cert and user_pub, and performs no delegated-link check, because
-    /// devices.json HAS NO FIELD for a ceiling or a principal kind. There is
-    /// nothing for it to exclude.
-    ///
-    /// So the protection is a SCHEMA LIMITATION, not a guard: the format cannot
-    /// REPRESENT a delegated principal, so none get written. Safe today, and
-    /// safe for a reason that evaporates silently. The moment anyone adds a
-    /// principal_kind field to devices.json, or persists link-derived state,
-    /// there is no check to stop them, and the old comment would have told them
-    /// one existed. If you are adding such a field, the writer-side exclusion
-    /// has to be written at the same time; it does not exist yet.
+    /// PERSISTENCE INVARIANT: a delegated device record writes its certificate,
+    /// reconnect secret, principal kind, capability ceiling, and expiry in one
+    /// atomic devices.json update. `resolve_peer_identity` restores the ceiling
+    /// and clamps the certificate expiry before any owner-derived authorization.
+    /// A same-owner certificate with no matching record fails closed as a
+    /// delegated principal with an empty ceiling and expiry zero.
     fn admit_delegated(&mut self, owner_pub: [u8; 32], device_pub: [u8; 32], expires: u64, caps: Vec<String>) {
         // A delegated principal acts UNDER the owner's user identity (the auth
         // key issuer), so it presents user_pub = owner_pub. evaluate()'s owner
@@ -9399,9 +10105,9 @@ enum BareTarget {
     /// An existing local path: `send <path> --code`.
     Send,
     /// A 4-digit nameplate looks like a pairing code (preserved muscle memory).
-    Pair,
+    Add,
     /// A 2-3 digit nameplate looks like a legacy transfer code.
-    Recv,
+    Receive,
     /// `device:port` -> forward local-port device remote-port.
     Forward { lport: String, peer: String, rport: String },
     /// `device.mesh` or `device.mesh:port` -> reach.
@@ -9438,11 +10144,11 @@ fn classify_bare_token(
     // 4-digit nameplates are the pairing-code shape; keep routing them to `pair`
     // because that is the long-standing bare-code behavior.
     if looks_like_pake_code(token) {
-        return BareTarget::Pair;
+        return BareTarget::Add;
     }
     // 2-3 digit nameplates are the legacy one-time transfer-code shape.
     if regex_lite_code(token) {
-        return BareTarget::Recv;
+        return BareTarget::Receive;
     }
     // `device:port` -> forward (same port locally and remotely). The device part
     // must be a known petname and the port must parse as a u16. If either fails,
@@ -9538,7 +10244,7 @@ async fn main() -> Result<()> {
                     argv.insert(1, "send".into());
                     argv.push("--code".into());
                 }
-                BareTarget::Pair => {
+                BareTarget::Add => {
                     // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
                     // the SAME ephemeral SPAKE2 ceremony whether the verb is `pair`
                     // or `recv`; a bare code is ambiguous. We keep routing it to
@@ -9547,13 +10253,13 @@ async fn main() -> Result<()> {
                     // preserved. To RECEIVE a transfer code, run `filament recv
                     // <code>` explicitly (the `send --code` output prints exactly
                     // that hint), or `filament pair <code>` to remember the device.
-                    argv.insert(1, "pair".into());
+                    argv.insert(1, "add".into());
                 }
-                BareTarget::Recv => {
+                BareTarget::Receive => {
                     // A legacy `word-word-NNN` (2-3 digit) transfer code from an old
                     // sender, receive it (no v2 ceremony; the recv path fails loudly
                     // if the peer can't run the handshake).
-                    argv.insert(1, "recv".into());
+                    argv.insert(1, "receive".into());
                 }
                 BareTarget::Forward { lport, peer, rport } => {
                     // `filament device:port` -> `filament forward lport peer rport`.
@@ -9610,11 +10316,7 @@ async fn main() -> Result<()> {
                         .min_by_key(|(d, _)| *d)
                         .map(|(_, c)| c.clone());
                     eprintln!("filament: unknown command or device '{first}'");
-                    if first == "init" {
-                        // There is no top-level `init`; the user almost certainly
-                        // wants to create the user identity key.
-                        eprintln!("  did you mean `filament identity init`?");
-                    } else if let Some(h) = hint {
+                    if let Some(h) = hint {
                         eprintln!("  did you mean '{h}'?");
                     }
                     eprintln!("  see what you can do:  filament  ·  filament --help  ·  filament devices");
@@ -9633,6 +10335,43 @@ async fn main() -> Result<()> {
         eprintln!("filament: `devices remove` is not a command");
         eprintln!("  did you mean `filament devices forget <name>`?");
         std::process::exit(2);
+    }
+    if argv.len() == 1 && std::io::stdin().is_terminal() {
+        let device_count = devices_load().len();
+        let availability = if daemon_alive().is_some() { "AVAILABLE" } else { "PAUSED" };
+        let header = format!("FILAMENT  /  {device_count} DEVICES  /  {availability}");
+        let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
+        let joined = !owner && local_device_cert().is_some();
+        let actions: Vec<(&str, &str)> = if owner {
+            vec![
+                ("Send something", "send"),
+                ("Receive something", "receive"),
+                ("Mount remote files", "mount"),
+                ("Add with a person present", "add"),
+                ("Invite a device or person", "invite"),
+                ("See every device", "devices"),
+                ("View my identity", "id"),
+            ]
+        } else if joined {
+            vec![
+                ("Send something", "send"),
+                ("Receive something", "receive"),
+                ("Mount remote files", "mount"),
+                ("See every device", "devices"),
+                ("View my joined identity", "id"),
+            ]
+        } else {
+            vec![
+                ("Set up this first device", "init"),
+                ("Join with an invitation", "join"),
+                ("Receive a one-time transfer", "receive"),
+            ]
+        };
+        let labels = actions.iter().map(|(label, _)| (*label).to_string()).collect::<Vec<_>>();
+        match codeentry::pick(&header, &labels)? {
+            Some(index) => argv.push(actions[index].1.to_string()),
+            None => return tour_cmd(),
+        }
     }
     let cli = Cli::parse_from(argv);
     let ui_caps = UiCapability::from_cli(&cli);
@@ -9668,8 +10407,14 @@ async fn main() -> Result<()> {
     };
     // Record the global --no-interactive opt-out before any command runs (the
     // gate also honors FILAMENT_NONINTERACTIVE and a non-TTY stdin).
-    if cli.no_interactive {
+    if cli.interactive && !std::io::stdin().is_terminal() {
+        bail!("--interactive requires a terminal; remove it or provide every required option");
+    }
+    if cli.no_interactive || cli.json {
         NO_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if cli.interactive {
+        FORCE_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let server = if cli.server == DEFAULT_SERVER {
         config_get("server").unwrap_or(cli.server.clone())
@@ -9682,7 +10427,23 @@ async fn main() -> Result<()> {
     let Some(cmd) = cli.cmd else {
         return tour_cmd();
     };
+    if cli.json
+        && !matches!(
+            &cmd,
+            Cmd::Init { .. }
+                | Cmd::Invite { .. }
+                | Cmd::Join { .. }
+                | Cmd::Id { .. }
+                | Cmd::Status { .. }
+                | Cmd::Devices { action: None, .. }
+        )
+    {
+        bail!("--json is not implemented for this operation; refusing to mix human output with machine data");
+    }
     match cmd {
+        Cmd::Init { name, inbox, recovery_file, recovery_fd, background, no_background } => {
+            init_experience(&ui_caps, &server, relay, name, inbox, recovery_file, recovery_fd, background, no_background).await
+        }
         Cmd::Send { paths, code, word, room, to, name, remember, auth_key } => {
             if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
@@ -9690,8 +10451,16 @@ async fn main() -> Result<()> {
                 send_cmd(&server, paths, code || word.is_some(), word, room, to, name, relay, remember).await
             }
         }
-        Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
+        Cmd::Receive { code, dir, yes, room, to, keep_open, remember, output, background } => {
+            let dir = drop_dir(dir);
+            if background {
+                if code.is_some() || room.is_some() || to.is_some() || keep_open || remember.is_some() || output.is_some() {
+                    bail!("receive --background configures your standing inbox; code, room, sender, and output options are one-shot only");
+                }
+                up_cmd(&server, true, false, Some(dir), relay, false, None, None, None, false, false, false).await
+            } else {
+                recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
+            }
         }
         Cmd::Set { key, value, peer, dry_run, reset, hard, .. } => settings::run_set(
             key.as_deref(),
@@ -9750,77 +10519,78 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Identity { action } => {
-            match action {
-                IdentityAction::Init => {
-                    match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
-                        Some(uk) => {
-                            println!("{}", ui::paint(ui::Tone::Dim,
-                                &format!("you already have a user identity: fingerprint {}",
-                                    uk.fingerprint())));
-                            println!("  use 'filament identity show' to see it");
-                        }
-                        None => {
-                            let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore)?;
-                            // Seed the owner's self genesis cap header at init so
-                            // authoritative capability enforcement works from the
-                            // start (also healed on daemon start for older keys).
-                            ensure_self_genesis_header(&crate::settings::config_dir(), &uk);
-                            println!("  {} user identity created: fingerprint {}",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                                ui::paint(ui::Tone::Bold, &uk.fingerprint()));
-                            println!("  {}", ui::paint(ui::Tone::Dim, "next: certify your devices with 'filament identity certify <device>'"));
-                        }
-                    }
-                    Ok(())
-                }
-                IdentityAction::Show => {
+        Cmd::Id { action } => {
+            match action.unwrap_or(IdAction::Show) {
+                IdAction::Show => {
                     match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                         None => {
-                            println!("no user identity yet. Run 'filament identity init' to create one.");
-                        }
-                        Some(uk) => {
-                            let uk_pub = uk.public_key_bytes();
-                            println!("  user fingerprint: {}", ui::paint(ui::Tone::Bold, &uk.fingerprint()));
-                            println!("  public key:       {}", ui::paint(ui::Tone::Dim, &uk.public_key_hex()));
-                            let devices = devices_load();
-                            let mut found = 0usize;
-                            for (name, _secret) in &devices {
-                                if let Some(cert) = device_cert_for(name) {
-                                    if cert.user_pub == uk_pub {
-                                        let exp = if identity::now_secs() >= cert.expires {
-                                            "EXPIRED".to_string()
+                            if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
+                                if let Ok(record) = serde_json::from_str::<Value>(&raw) {
+                                    if let Some(cert) = identity::DeviceCert::from_json(&record["cert"]) {
+                                        let fingerprint = hex::encode(cert.user_pub).chars().take(8).collect::<String>();
+                                        if ui_caps.json {
+                                            println!("{}", serde_json::to_string_pretty(&json!({
+                                                "configured": true,
+                                                "fingerprint": fingerprint,
+                                                "role": "joined-device",
+                                                "holdsOwnerSigningKey": false,
+                                                "certificateExpires": cert.expires,
+                                            }))?);
                                         } else {
-                                            format!("{}d", cert.expires.saturating_sub(identity::now_secs()) / 86400)
-                                        };
-                                        println!("  {} {}", ui::paint(ui::Tone::Bold, name), ui::paint(ui::Tone::Dim, &format!("(valid {exp})")));
-                                        found += 1;
+                                            println!("  identity:          {}", ui::paint(ui::Tone::Bold, &fingerprint));
+                                            println!("  role:              joined device (no owner signing key)");
+                                            println!("  local certificate: expires {}", cert.expires);
+                                        }
+                                        return Ok(());
                                     }
                                 }
                             }
+                            if ui_caps.json {
+                                println!("{}", serde_json::to_string_pretty(&json!({ "configured": false }))?);
+                            } else {
+                                println!("no identity yet. Run 'filament init' or 'filament join'.");
+                            }
+                        }
+                        Some(uk) => {
+                            let uk_pub = uk.public_key_bytes();
+                            let certified = certified_device_names(&uk_pub);
+                            if ui_caps.json {
+                                let devices = certified.iter().map(|(name, cert)| json!({
+                                    "name": name,
+                                    "devicePub": hex::encode(cert.device_pub),
+                                    "expires": cert.expires,
+                                })).collect::<Vec<_>>();
+                                println!("{}", serde_json::to_string_pretty(&json!({
+                                    "configured": true,
+                                    "fingerprint": uk.fingerprint(),
+                                    "publicKey": uk.public_key_hex(),
+                                    "role": "owner",
+                                    "holdsOwnerSigningKey": true,
+                                    "devices": devices,
+                                }))?);
+                                return Ok(());
+                            }
+                            println!("  user fingerprint: {}", ui::paint(ui::Tone::Bold, &uk.fingerprint()));
+                            println!("  public key:       {}", ui::paint(ui::Tone::Dim, &uk.public_key_hex()));
+                            let mut found = 0usize;
+                            for (name, cert) in certified {
+                                let exp = if identity::now_secs() >= cert.expires {
+                                    "EXPIRED".to_string()
+                                } else {
+                                    format!("{}d", cert.expires.saturating_sub(identity::now_secs()) / 86400)
+                                };
+                                println!("  {} {}", ui::paint(ui::Tone::Bold, &name), ui::paint(ui::Tone::Dim, &format!("(valid {exp})")));
+                                found += 1;
+                            }
                             if found == 0 {
-                                println!("  {}", ui::paint(ui::Tone::Dim, "no certified devices. use 'filament identity certify <device>'"));
+                                println!("  {}", ui::paint(ui::Tone::Warn, "no certified local device record; run `filament init` or `filament id recover` on a clean device"));
                             }
                         }
                     }
                     Ok(())
                 }
-                IdentityAction::Certify { device } => {
-                    let uk = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
-                        Some(uk) => uk,
-                        None => bail!("no user identity. Run 'filament identity init' first."),
-                    };
-                    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
-                    let now = identity::now_secs();
-                    let cert = identity::DeviceCert::certify(&uk, device_pub, now, identity::CERT_TTL_SECS)?;
-                    update_device_cert(&device, &uk, &cert)?;
-                    ui::say(&format!(
-                        "  {} {} certified as your device (valid {} days)",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, &device),
-                        identity::CERT_TTL_SECS / 86400,
-                    ));
-                    Ok(())
+                IdAction::Recover { words_file, words_fd } => {
+                    recover_identity(&ui_caps, words_file, words_fd)
                 }
             }
         }
@@ -9861,15 +10631,21 @@ async fn main() -> Result<()> {
             };
             up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback).await
         }
-        Cmd::Status { json } => status_cmd(json),
+        Cmd::Status { json } => status_cmd(json || ui_caps.json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
+        Cmd::Add { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
+        Cmd::Invite { kind, allow, expires, out } => {
+            invite_cmd(&ui_caps, kind, allow, expires, out).await
+        }
+        Cmd::Join { invite_file, invite_fd, name, to } => {
+            join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
+        }
         Cmd::Devices { action, json } => {
             match action {
                 None => {
                     let all = devices_load();
-                    if json {
+                    if json || ui_caps.json {
                         let arr: Vec<Value> = all
                             .iter()
                             .map(|(n, s)| {
@@ -9969,6 +10745,33 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Shell { peer, ssh, args } => {
+            let opened_flow = ui_caps.interactive && (peer.is_none() || interactive_requested());
+            let peer = match peer {
+                Some(peer) => peer,
+                None if ui_caps.interactive => {
+                    let devices = devices_load();
+                    if devices.is_empty() {
+                        bail!("no devices are connected; start with `filament add`");
+                    }
+                    let labels = devices.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
+                    let selected = codeentry::pick("OPEN A TERMINAL ON", &labels)?
+                        .ok_or_else(|| anyhow!("cancelled"))?;
+                    devices[selected].0.clone()
+                }
+                None => bail!("shell needs a device in non-interactive mode: filament shell <device>"),
+            };
+            if opened_flow {
+                eprintln!();
+                eprintln!("  {}", ui::paint(ui::Tone::Brand, "REMOTE TERMINAL"));
+                eprintln!("  device   {peer}");
+                eprintln!("  channel  {}", if ssh { "SSH over Filament" } else { "native encrypted PTY" });
+                eprintln!("  access   the remote device enforces its shell grant and OS account");
+                eprintln!("  command  filament shell {}{}", command_arg(&peer), if ssh { " --ssh" } else { "" });
+                let confirmation = prompt_line("\n  Press Enter to open it, or type cancel: ")?;
+                if confirmation.eq_ignore_ascii_case("cancel") {
+                    bail!("cancelled");
+                }
+            }
             if ssh {
                 l2::ssh_cmd(&server, &peer, &args, relay).await
             } else {
@@ -10277,7 +11080,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Mount { peer, remote, local, read_only: _, options: _, foreground: _, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile, off } => {
+        Cmd::Mount { peer, remote, local, read_write, options, foreground, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile, off } => {
             if let Some(path) = off {
                 ui_caps.confirm(&format!("unmount {path}"))?;
                 mount::unmount_cmd(&path)
@@ -10293,79 +11096,131 @@ async fn main() -> Result<()> {
                 mount::list_cmd()
             } else if let Some(path) = check {
                 mount::check_cmd(&path)
-            } else if peer.is_none() && remote.is_none() {
-                // No arguments: interactive mode for TTY, help for machines
-                if std::io::stdin().is_terminal() {
-                    mount::interactive_mount_fancy(&server, relay).await
-                } else {
-                    mount::print_mount_help();
-                    Ok(())
-                }
             } else {
-                let peer = peer.ok_or_else(|| anyhow::anyhow!("peer is required"))?;
-                let remote = remote.ok_or_else(|| anyhow::anyhow!("remote path is required"))?;
-                let _auto_restore = save_auto;
-                let mut client = l2::mount_cmd(&server, &peer, relay, &remote).await?;
-                if let Some(local) = local {
-                    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
-                    {
-                        return mount_fuse_cmd(client, &peer, &remote, &local).await;
-                    }
-                    #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows"))))]
-                    {
-                        let _ = &local;
-                        ui::say(&format!(
-                            "  {} mesh-native mount protocol connected to {peer}:{remote}",
-                            ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                        ));
-                        ui::say(&format!(
-                            "  {} local mount adapter not available on this OS; listing directory instead",
-                            ui::paint(ui::Tone::Warn, "!")
-                        ));
-                    }
+                if options.is_some() || foreground || save_auto {
+                    bail!("--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount");
                 }
-                // List the root directory
-                use crate::mount_proto::MountOp;
-                let root_enc = mount_proto::path_encode(std::path::Path::new("."));
-                let resp = client.call(MountOp::Open { path: root_enc, flags: 0 }).await?;
-                match resp.result {
-                    crate::mount_proto::MountResult::Ok(v) => {
-                        let fh = v["fh"].as_u64().unwrap_or(0);
-                        ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), remote));
-                        let entries = client.call(MountOp::ReadDir { fh, offset: 0 }).await?;
-                        match entries.result {
-                            crate::mount_proto::MountResult::Ok(v) => {
-                                if let Some(arr) = v.as_array() {
-                                    for entry in arr {
-                                        let name_enc = entry["name"].as_str().unwrap_or("?");
-                                        let name = mount_proto::path_decode(name_enc)
-                                            .map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "?".into()))
-                                            .unwrap_or_else(|_| "?".into());
-                                        let kind = entry["stat"]["kind"].as_str().unwrap_or("file");
-                                        let size = entry["stat"]["size"].as_u64().unwrap_or(0);
-                                        ui::say(&format!("    {name}  ({kind}, {size}B)"));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    crate::mount_proto::MountResult::Err(e) => {
-                        ui::say(&format!("  {} {}: {}", ui::paint(ui::Tone::Err, ui::glyph_err()), remote, e.msg));
-                    }
+                let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
+                let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;
+                #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
+                {
+                    return mount_fuse_cmd(client, &plan).await;
                 }
-                Ok(())
+                #[cfg(not(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows"))))]
+                {
+                    let _ = client;
+                    bail!("local mount adapter is not available on this platform")
+                }
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
-        Cmd::Mint { fleet, external, ci, ttl, reuse, allow, audience, yes } => {
-            mint_cmd(&server, fleet, external, ci, ttl, reuse, allow, audience, yes, relay).await
+        Cmd::Mint { fleet, external, ci, ttl, reuse, allow, audience, yes, out } => {
+            mint_cmd(&server, fleet, external, ci, ttl, reuse, allow, audience, yes, out, relay).await
         }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountPlan {
+    peer: String,
+    remote: String,
+    local: String,
+    read_only: bool,
+}
+
+fn default_mount_point(peer: &str, remote: &str) -> String {
+    let leaf = Path::new(remote)
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "files".to_string());
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join("Filament Mounts").join(peer).join(leaf).display().to_string()
+}
+
+fn resolve_mount_plan(
+    caps: &UiCapability,
+    mut peer: Option<String>,
+    mut remote: Option<String>,
+    local: Option<String>,
+    mut read_write: bool,
+) -> Result<MountPlan> {
+    let opened_flow = caps.interactive && (peer.is_none() || remote.is_none() || interactive_requested());
+    if remote.is_none() {
+        if let Some(raw) = peer.as_deref() {
+            if let Some((device, path)) = raw.split_once(':') {
+                if !device.is_empty() && !path.is_empty() {
+                    peer = Some(device.to_string());
+                    remote = Some(path.to_string());
+                }
+            }
+        }
+    }
+    if peer.is_none() {
+        if !caps.interactive {
+            bail!("mount needs a device in non-interactive mode: filament mount <device> <remote> [local]");
+        }
+        let devices = devices_load();
+        if devices.is_empty() {
+            bail!("no devices are connected; start with `filament add`");
+        }
+        let labels = devices
+            .iter()
+            .map(|(name, _)| {
+                let relation = device_cert_for(name)
+                    .and_then(|cert| load_owner_key().map(|owner| cert.user_pub == owner.public_key_bytes()))
+                    .map(|mine| if mine { "MY DEVICE" } else { "EXTERNAL" })
+                    .unwrap_or("PAIRED");
+                format!("{name:<20} {relation}")
+            })
+            .collect::<Vec<_>>();
+        let selected = codeentry::pick("MOUNT FILES FROM", &labels)?
+            .ok_or_else(|| anyhow!("cancelled"))?;
+        peer = Some(devices[selected].0.clone());
+    }
+    let peer = peer.unwrap();
+    let remote = match remote {
+        Some(remote) => remote,
+        None if caps.interactive => {
+            let entered = prompt_line(&format!("  Shared path on {peer} [.]: "))?;
+            if entered.is_empty() { ".".to_string() } else { entered }
+        }
+        None => bail!("mount needs a remote path in non-interactive mode"),
+    };
+    let suggested = default_mount_point(&peer, &remote);
+    let local = match local {
+        Some(local) => local,
+        None if caps.interactive && opened_flow => {
+            let entered = prompt_line(&format!("  Mount here [{suggested}]: "))?;
+            if entered.is_empty() { suggested } else { entered }
+        }
+        None => suggested,
+    };
+    if caps.interactive && opened_flow && !read_write {
+        let access = prompt_line("  Access [read only] (type WRITE for read and write): ")?;
+        read_write = access == "WRITE";
+    }
+    let plan = MountPlan { peer, remote, local, read_only: !read_write };
+    if caps.interactive && opened_flow {
+        eprintln!();
+        eprintln!("  {}", ui::paint(ui::Tone::Brand, "MOUNT"));
+        eprintln!("  source   {}:{}", plan.peer, plan.remote);
+        eprintln!("  local    {}", plan.local);
+        eprintln!("  access   {}", if plan.read_only { "read only" } else { "read and write" });
+        eprintln!();
+        eprintln!("  The remote device still enforces its configured share root and grant.");
+        eprintln!("  command  filament mount {} {} {}{}", command_arg(&plan.peer), command_arg(&plan.remote), command_arg(&plan.local),
+            if plan.read_only { "" } else { " --read-write" });
+        let confirmation = prompt_line("\n  Press Enter to mount, or type cancel: ")?;
+        if confirmation.eq_ignore_ascii_case("cancel") {
+            bail!("cancelled");
+        }
+    }
+    Ok(plan)
 }
 
 // ------------------------------------------------------------------ mount --
@@ -10383,12 +11238,14 @@ async fn main() -> Result<()> {
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
 async fn mount_fuse_cmd(
     mut client: crate::mount_proto::MountClient,
-    peer: &str,
-    remote: &str,
-    local: &str,
+    plan: &MountPlan,
 ) -> Result<()> {
     use crate::mount_proto::{MountOp, MountResult};
 
+    let peer = &plan.peer;
+    let remote = &plan.remote;
+    let local = &plan.local;
+    client.set_read_only(plan.read_only);
     // 1. Probe the link before we mount anything.
     let root_enc = mount_proto::path_encode(std::path::Path::new("."));
     let probe = tokio::time::timeout(
@@ -10424,8 +11281,9 @@ async fn mount_fuse_cmd(
     }
 
     ui::say(&format!(
-        "  {} mesh-native mount: {peer}:{remote} -> {local} (FUSE, no sshd/sshfs)",
-        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+        "  {} mesh-native mount: {peer}:{remote} -> {local} ({}, FUSE)",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+        if plan.read_only { "read only" } else { "read and write" }
     ));
     ui::say(&format!(
         "  {} mounted. unmount with `filament unmount {local}` or ctrl-c",
@@ -10754,7 +11612,7 @@ struct Outgoing {
 #[allow(clippy::too_many_arguments)]
 async fn send_cmd(
     server: &str,
-    paths: Vec<String>,
+    mut paths: Vec<String>,
     mut use_code: bool,
     mut word: Option<String>,
     room: Option<String>,
@@ -10763,8 +11621,17 @@ async fn send_cmd(
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
+    let opened_flow = interactive_allowed()
+        && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
     if paths.is_empty() {
-        bail!("nothing to send, pass files, directories, or '-' for stdin");
+        if !interactive_allowed() {
+            bail!("nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin");
+        }
+        let path = prompt_line("  What do you want to send? ")?;
+        if path.is_empty() {
+            bail!("cancelled");
+        }
+        paths.push(path);
     }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
     // from stdin. First offer to pick a PAIRED DEVICE (arrow-key list); the last
@@ -10774,7 +11641,16 @@ async fn send_cmd(
         let names: Vec<String> = devices_load().into_iter().map(|(n, _)| n).collect();
         let mut chose_device = false;
         if !names.is_empty() {
-            let mut items = names.clone();
+            let mut items = names
+                .iter()
+                .map(|name| {
+                    let relation = device_cert_for(name)
+                        .and_then(|cert| load_owner_key().map(|owner| cert.user_pub == owner.public_key_bytes()))
+                        .map(|mine| if mine { "MY DEVICE" } else { "EXTERNAL" })
+                        .unwrap_or("PAIRED");
+                    format!("{name:<20} {relation}")
+                })
+                .collect::<Vec<_>>();
             items.push("shareable code / local network".into());
             let header = ui::paint(ui::Tone::Dim, "  send to which device?  (up/down, enter, esc)");
             if let Some(i) = codeentry::pick(&header, &items)? {
@@ -10856,6 +11732,26 @@ async fn send_cmd(
     }
     for o in &outgoing {
         ui::say(&format!("send: {} ({})", o.name, human(o.size)));
+    }
+    if opened_flow {
+        let total = outgoing.iter().map(|item| item.size).sum::<u64>();
+        eprintln!();
+        eprintln!("  {}", ui::paint(ui::Tone::Brand, "SEND"));
+        eprintln!("  files    {} item{} / {}", outgoing.len(), if outgoing.len() == 1 { "" } else { "s" }, human(total));
+        eprintln!("  to       {}", to.as_deref().unwrap_or(if use_code { "one-time code" } else { "nearby receiver" }));
+        eprintln!("  proof    receiver must acknowledge the whole-file hash");
+        let mut replay = vec!["filament".to_string(), "send".to_string()];
+        replay.extend(paths.iter().map(|path| command_arg(path)));
+        if let Some(target) = to.as_deref() {
+            replay.extend(["--to".to_string(), command_arg(target)]);
+        } else if use_code {
+            replay.push("--code".to_string());
+        }
+        eprintln!("  command  {}", replay.join(" "));
+        let confirmation = prompt_line("\n  Press Enter to send, or type cancel: ")?;
+        if confirmation.eq_ignore_ascii_case("cancel") {
+            bail!("cancelled");
+        }
     }
 
     let room = match room {
@@ -11228,7 +12124,7 @@ async fn send_cmd(
                 ui::clipboard(&full);
                 ui::say("");
                 ui::say(&format!("  code   {}   {}", ui::paint(ui::Tone::Brand, &full), ui::paint(ui::Tone::Dim, "(copied to clipboard)")));
-                ui::say(&format!("         {}", ui::paint(ui::Tone::Dim, &format!("terminal: filament recv {full}   browser: {} (RECEIVE WITH CODE)", ui::link(&site, &site.replace("https://", ""))))));
+                ui::say(&format!("         {}", ui::paint(ui::Tone::Dim, &format!("terminal: filament receive {full}   browser: {} (RECEIVE WITH CODE)", ui::link(&site, &site.replace("https://", ""))))));
                 ui::say(&format!("         {}", ui::paint(ui::Tone::Dim, &format!("one claim · expires in {} min · authenticated end-to-end (no key crosses the server)", ttl / 60))));
                 ui::say("");
             }
@@ -12577,6 +13473,7 @@ async fn recv_cmd(
     mut shell_user: Option<String>,
     no_proxy_fallback: bool,
 ) -> Result<()> {
+    let opened_flow = !daemon && interactive_allowed() && (code.is_none() || interactive_requested());
     let to_stdout = output.as_deref() == Some("-");
     // Daemon start: idempotently heal the owner's self genesis cap header.
     // Identities created before this seeding existed have no header; seeding
@@ -12599,10 +13496,31 @@ async fn recv_cmd(
             ui::Tone::Dim,
             "  enter a code to connect to a specific person, or press enter to use the local network",
         ));
-        match codeentry::run("  recv · code  ", codeentry::Mode::Claim, "", "")? {
+        match codeentry::run("  receive / code  ", codeentry::Mode::Claim, "", "")? {
             codeentry::Outcome::Submitted(c) => code = Some(c),
             codeentry::Outcome::Empty => { /* fall through to the local-network auto room */ }
             codeentry::Outcome::Cancelled => return Err(cancelled()),
+        }
+    }
+    if opened_flow {
+        eprintln!();
+        eprintln!("  {}", ui::paint(ui::Tone::Brand, "RECEIVE"));
+        eprintln!("  from     {}", to.as_deref().unwrap_or(if code.is_some() { "holder of this one-time code" } else { "nearby sender" }));
+        eprintln!("  into     {}", if to_stdout { "stdout".to_string() } else { dir.display().to_string() });
+        eprintln!("  verify   whole-file hash before final placement");
+        eprintln!("  consent  {}", if yes { "accept matching offers" } else { "ask before each offer" });
+        let mut replay = vec!["filament".to_string(), "receive".to_string()];
+        if let Some(code) = code.as_deref() {
+            replay.push(command_arg(code));
+        }
+        replay.extend(["--dir".to_string(), command_arg(&dir.display().to_string())]);
+        if yes {
+            replay.push("--yes".to_string());
+        }
+        eprintln!("  command  {}", replay.join(" "));
+        let confirmation = prompt_line("\n  Press Enter to wait, or type cancel: ")?;
+        if confirmation.eq_ignore_ascii_case("cancel") {
+            bail!("cancelled");
         }
     }
     // L1-a unification: a transfer code and a pairing code now have the SAME
@@ -14064,7 +14982,7 @@ async fn recv_cmd(
                 ui::say("");
                 ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &c.to_uppercase())));
                 ui::say("");
-                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud, they type it in the web app or `filament pair <code>` · one claim · 10 min"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud; they type it in the web app or `filament add <code>` / one claim / 10 min"));
             }
             Ev::PairUsed(_) => {
                 ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting..."));
@@ -14708,6 +15626,12 @@ async fn recv_cmd(
                     // Daemon receives the enrollment response with possession proofs.
                     // Must have a pending challenge nonce for this peer.
                     handle_auth_key_enroll_response(&mut conn, pid.clone(), v.clone()).await;
+                    // A successful join adds a reconnect secret. Refresh the
+                    // daemon's live channel set immediately; waiting for restart
+                    // would make the persisted ceiling correct but unreachable.
+                    devices = devices_load();
+                    sess.channels = devices.iter().map(|(_, secret)| channel_of(secret)).collect();
+                    sess.invalidate();
                 }
                 _ if !conn.links.contains_key(&pid) => {}
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
@@ -16466,7 +17390,7 @@ async fn recv_cmd(
                     // lost its file-end, finalize before deciding it's fatal.
                     sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
                     if completed == 0 {
-                        bail!("lost the sender after {} attempts; the partial is kept, re-run `filament recv <code>` to resume", MAX_ATTEMPTS);
+                        bail!("lost the sender after {} attempts; the partial is kept, re-run `filament receive <code>` to resume", MAX_ATTEMPTS);
                     }
                 }
             }
@@ -16474,7 +17398,7 @@ async fn recv_cmd(
                 if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
                     sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
                     if completed == 0 {
-                        bail!("lost the sender after {} attempts; the partial is kept, re-run `filament recv <code>` to resume", MAX_ATTEMPTS);
+                        bail!("lost the sender after {} attempts; the partial is kept, re-run `filament receive <code>` to resume", MAX_ATTEMPTS);
                     }
                 }
             }
@@ -17764,14 +18688,14 @@ mod tests {
         let mut arr: Vec<Value> = vec![];
 
         // Generation A: secretA + certA land together.
-        upsert_peer_record(&mut arr, "bob", Some("secretA"), Some(&cert_a), None, None, None);
+        upsert_peer_record(&mut arr, "bob", Some("secretA"), Some(&cert_a), None, None, None, None);
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["secret"].as_str(), Some("secretA"));
         let stored_a = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
         assert_eq!(stored_a.device_pub, [0xa1u8; 32], "gen A: cert must be certA");
 
         // Generation B: secretB + certB — the update that a non-atomic path could tear.
-        upsert_peer_record(&mut arr, "bob", Some("secretB"), Some(&cert_b), None, None, None);
+        upsert_peer_record(&mut arr, "bob", Some("secretB"), Some(&cert_b), None, None, None, None);
         assert_eq!(arr.len(), 1, "same name updates in place, not duplicated");
         // The invariant: secret and cert are BOTH gen-B in the SAME record.
         assert_eq!(arr[0]["secret"].as_str(), Some("secretB"), "secret must be gen B");
@@ -17860,20 +18784,8 @@ mod tests {
         assert_eq!(reqs[0].status, snapshot, "terminal status must not be re-expired");
     }
 
-    /// Admitting a delegated principal MUST NOT persist anything to the device
-    /// store. A delegated link's authority comes from identity_user_pub=owner_pub
-    /// + principal_kind=Delegated{caps}; these are in-memory Link fields only.
-    /// If identity_user_pub were ever written to devices.json, then on reconnect
-    /// resolve_peer_identity would restore it while principal_kind defaults to
-    /// OwnerDevice (ak_caps=None), the ceiling vanishes, and the owner-shortcut
-    /// authorizes everything — a full escalation.
-    ///
-    /// The non-persistence invariant is enforced at the rig level: devices.json is
-    /// byte-identical before/after a successful enrollment. A unit test on
-    /// admit_delegated alone is vacuous (it has no device-store access); the rig
-    /// covers ANY write path including unanticipated ones.
     #[test]
-    fn delegated_principal_never_written_to_device_store() {
+    fn delegated_ceiling_survives_record_roundtrip() {
         let mk_cert = |dpub: u8| -> identity::DeviceCert {
             identity::DeviceCert::from_json(&serde_json::json!({
                 "devicePub": hex::encode([dpub; 32]),
@@ -17885,27 +18797,63 @@ mod tests {
         };
         let cert = mk_cert(0xdd);
         let mut arr: Vec<Value> = vec![];
-        // Simulate what the daemon does: store a device record via upsert_peer_record
-        upsert_peer_record(&mut arr, "delegated-peer", Some("secret123"), Some(&cert), None, None, None);
+        let ceiling = vec!["transfer".to_string(), "mount".to_string()];
+        upsert_peer_record(
+            &mut arr,
+            "delegated-peer",
+            Some("secret123"),
+            Some(&cert),
+            Some(&ceiling),
+            None,
+            None,
+            Some((&ceiling, u64::MAX)),
+        );
         assert_eq!(arr.len(), 1);
         let record = &arr[0];
-        // The device store record MUST NOT contain identity_user_pub or principal_kind
-        assert!(!record.get("identity_user_pub").is_some(),
-            "device store must not contain identity_user_pub — that is a Link-only field");
-        assert!(!record.get("principal_kind").is_some(),
-            "device store must not contain principal_kind — that is a Link-only field");
-        assert!(!record.get("identity_binding").is_some(),
-            "device store must not contain identity_binding — that is a Link-only field");
-        // The record should only have the fields the store actually uses:
-        // name, secret, caps, deviceCert, addedAt, userKey, identityScope, v
-        let allowed: std::collections::HashSet<&str> = [
-            "name", "secret", "caps", "deviceCert", "addedAt", "v",
-            "userKey", "identityScope",
-        ].iter().cloned().collect();
-        for key in record.as_object().unwrap().keys() {
-            assert!(allowed.contains(key.as_str()),
-                "unexpected device store field '{key}' — is a Link field leaking?");
-        }
+        assert_eq!(record["principalKind"], "delegated");
+        assert_eq!(record["principalCeiling"], json!(["transfer", "mount"]));
+        assert_eq!(record["principalExpires"], u64::MAX);
+
+        let encoded = serde_json::to_vec(&arr).unwrap();
+        let reconnected: Vec<Value> = serde_json::from_slice(&encoded).unwrap();
+        let (principal, expires) = principal_from_records(&reconnected, &cert, Some(&cert.user_pub));
+        assert_eq!(
+            principal,
+            crate::capability::PrincipalKind::Delegated { caps: ceiling },
+        );
+        assert_eq!(expires, Some(u64::MAX));
+        assert!(!principal.auth_key_caps().unwrap().contains(&"shell".to_string()));
+        let decision = crate::capability::cap_gate_effective(
+            true,
+            &crate::capability::CapOutcome::Authorized,
+            crate::capability::CAP_SHELL,
+            "self",
+            Some(&cert.device_pub),
+            Some(&cert.user_pub),
+            crate::capability::BindingStrength::Proven,
+            expires,
+            principal.auth_key_caps(),
+            Some(&cert.user_pub),
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(decision, crate::capability::GateDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn missing_same_owner_record_fails_closed() {
+        let cert = identity::DeviceCert::from_json(&json!({
+            "devicePub": hex::encode([0xddu8; 32]),
+            "userPub": hex::encode([0x11u8; 32]),
+            "expires": 9_999_999_999u64,
+            "issued": 1u64,
+            "sig": hex::encode([0u8; 64]),
+        }))
+        .unwrap();
+        let (principal, expires) = principal_from_records(&[], &cert, Some(&cert.user_pub));
+        assert_eq!(principal, crate::capability::PrincipalKind::Delegated { caps: Vec::new() });
+        assert_eq!(expires, Some(0));
     }
 
     #[test]
@@ -17936,6 +18884,66 @@ mod tests {
         );
     }
 
+    fn noninteractive_ui() -> UiCapability {
+        UiCapability {
+            interactive: false,
+            json: false,
+            yes: false,
+            color: false,
+        }
+    }
+
+    #[test]
+    fn direct_mount_plan_is_read_only_by_default() {
+        let plan = resolve_mount_plan(
+            &noninteractive_ui(),
+            Some("jade".into()),
+            Some("photos".into()),
+            Some("/mnt/photos".into()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.peer, "jade");
+        assert_eq!(plan.remote, "photos");
+        assert_eq!(plan.local, "/mnt/photos");
+        assert!(plan.read_only);
+    }
+
+    #[test]
+    fn colon_mount_form_builds_the_same_plan() {
+        let plan = resolve_mount_plan(
+            &noninteractive_ui(),
+            Some("jade:photos".into()),
+            None,
+            Some("/mnt/photos".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.peer, "jade");
+        assert_eq!(plan.remote, "photos");
+        assert!(!plan.read_only);
+    }
+
+    #[test]
+    fn invitation_envelope_roundtrips_without_argv_parsing() {
+        use base64::Engine;
+        let bundle = json!({"auth_key": {"issuer": "test"}, "enroll_private_key": "secret"});
+        let token = format!(
+            "filament-invite:v1:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&bundle).unwrap())
+        );
+        assert_eq!(parse_invitation(&token).unwrap(), bundle);
+        assert!(parse_invitation("secret-as-a-positional-argument").is_err());
+    }
+
+    #[test]
+    fn replay_arguments_quote_spaces_and_single_quotes() {
+        assert_eq!(command_arg("plain/path"), "plain/path");
+        #[cfg(not(windows))]
+        assert_eq!(command_arg("Sam's Photos"), "'Sam'\\''s Photos'");
+    }
+
     #[test]
     fn code_shaped_existing_path_stays_send() {
         let known = std::collections::HashSet::<String>::new();
@@ -17945,22 +18953,22 @@ mod tests {
         );
     }
 
-    /// 4-digit nameplates stay pairing codes; 2-3 digit nameplates stay legacy
-    /// transfer codes. Collapsing both to `recv` would break this test.
+    /// 4-digit nameplates stay add codes; 2-3 digit nameplates stay transfer
+    /// codes. Collapsing both to `receive` would break this test.
     #[test]
     fn bare_code_width_decides_pair_vs_recv() {
         let known: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert_eq!(
             classify_bare_token("clever-lynx-1234", &|_| false, &|t| known.contains(t)),
-            BareTarget::Pair
+            BareTarget::Add
         );
         assert_eq!(
             classify_bare_token("clever-lynx-123", &|_| false, &|t| known.contains(t)),
-            BareTarget::Recv
+            BareTarget::Receive
         );
         assert_eq!(
             classify_bare_token("clever-lynx-12", &|_| false, &|t| known.contains(t)),
-            BareTarget::Recv
+            BareTarget::Receive
         );
     }
 

@@ -1048,7 +1048,7 @@ async fn bring_up_to_known(
         .into_iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(peer_name))
         .map(|(_, s)| s)
-        .ok_or_else(|| anyhow!("no known device named '{peer_name}', run `filament pair` first (see `filament devices`)"))?;
+        .ok_or_else(|| anyhow!("no known device named '{peer_name}', run `filament add` first (see `filament devices`)"))?;
     let channel = crate::channel_of(&secret);
 
     // Establishment telemetry: a connect span, peer tagged by SHORT HASH (never
@@ -2727,7 +2727,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     // "ready" (the warm path used to announce success before ever reaching the peer).
     if !crate::devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(peer)) {
         bail!(
-            "filament: no known device named '{peer}'. Pair it first with `filament pair`, \
+            "filament: no known device named '{peer}'. Add it first with `filament add`, \
              then `filament devices` shows who you can reach."
         );
     }

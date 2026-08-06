@@ -915,7 +915,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
     if items.is_empty() {
         drop(_guard);
         println!("\x1b[33mNo devices paired and no mounts configured.\x1b[0m");
-        println!("Pair a device first: filament pair");
+        println!("Add a device first: filament add");
         return Ok(());
     }
 

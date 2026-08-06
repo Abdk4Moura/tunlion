@@ -310,7 +310,7 @@ pub struct EnrollmentPayload {
 
 /// Possession message: binds the enrollment to a specific nonce, device,
 /// AND verifier, so a payload captured for peer A cannot be presented to peer B.
-fn enrollment_possession_msg(nonce: &[u8; 32], device_pub: &[u8; 32], verifier_pub: &[u8; 32]) -> Vec<u8> {
+pub fn enrollment_possession_msg(nonce: &[u8; 32], device_pub: &[u8; 32], verifier_pub: &[u8; 32]) -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(b"filament-auth-key-enroll-v1");
     msg.extend_from_slice(nonce);

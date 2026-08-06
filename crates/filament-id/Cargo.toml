@@ -30,8 +30,11 @@ hex = "0.4"
 # real dependency of the moved code (the task's dep list under-specified it).
 sha2_pake = { package = "sha2", version = "0.10" }
 hkdf = "0.12"
+bip39 = { version = "2.2", features = ["zeroize"] }
+zeroize = "1.8"
 
 [dev-dependencies]
 # The identity tests exercise the PAKE confirm-MAC / capability-digest helpers
 # (the CLI reaches them as `crate::pake::…`, an alias of this crate).
 filament-pair = { path = "../filament-pair", version = "0.1.0" }
+tempfile = "3"
