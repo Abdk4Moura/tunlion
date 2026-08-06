@@ -10437,6 +10437,9 @@ async fn main() -> Result<()> {
                 | Cmd::Join { .. }
                 | Cmd::Id { .. }
                 | Cmd::Status { .. }
+                | Cmd::Set { .. }
+                | Cmd::Reach { .. }
+                | Cmd::Doctor { .. }
                 | Cmd::Devices { action: None, .. }
         )
     {
@@ -10781,6 +10784,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Reach { dev_port, socks, json, port, bind, http_port } => {
+            let json = json || ui_caps.json;
             if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else if let Some(dp) = dev_port {
@@ -10812,7 +10816,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Doctor { device, watch, repeat, json } => {
-            doctor::doctor_cmd(&server, device, watch, repeat, json, relay).await
+            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
             let capability = crate::capability::canonical_capability(&capability)?;
