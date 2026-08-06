@@ -54,7 +54,7 @@ pub struct Lifetime {
 pub fn render_header() -> String {
     format!(
         "  {}",
-        ui::paint(Tone::Brand, "filament mint — a key that lets a machine join, scoped and expiring")
+        ui::paint(Tone::Brand, "filament mint / a key that lets a machine join, scoped and expiring")
     )
 }
 
@@ -65,7 +65,7 @@ pub fn render_key_type_picker() -> String {
         ui::paint(Tone::Brand, ui::glyph_fleet()),
         ui::paint(Tone::Bold, "(o) A device in my fleet")
     );
-    let fleet_desc = ui::paint(Tone::Dim, "       my own laptop / box / CI — permissive within scope");
+    let fleet_desc = ui::paint(Tone::Dim, "       my own laptop / box / CI / permissive within scope");
     let external = format!(
         " {} {}",
         ui::paint(Tone::Warn, ui::glyph_extern()),
@@ -91,17 +91,17 @@ pub fn render_summary(key_type: KeyType, caps: &MintCaps) -> String {
         KeyType::Fleet => {
             lines.push(can_line(true, false, "drop files in your inbox · reach your exposed ports · read ~/share"));
             if caps.shell {
-                lines.push(can_line(true, true, "OWNER-EQUIVALENT — act as you through a shell on this machine"));
+                lines.push(can_line(true, true, "OWNER-EQUIVALENT / act as you through a shell on this machine"));
             } else {
                 lines.push(can_line(false, false, "open a shell"));
             }
             if caps.write {
-                lines.push(can_line(true, true, "write to mounted dirs — can change or delete your files"));
+                lines.push(can_line(true, true, "write to mounted dirs / can change or delete your files"));
             } else if caps.all_ports {
                 lines.push(can_line(false, false, "write to disk"));
             }
             if caps.all_ports {
-                lines.push(can_line(true, true, "reach ALL ports — not just the ports you chose to expose"));
+                lines.push(can_line(true, true, "reach ALL ports / not just the ports you chose to expose"));
             } else if caps.write {
                 lines.push(can_line(false, false, "join your mesh"));
             } else {
@@ -133,7 +133,7 @@ pub fn render_deliberate_access(caps: &MintCaps, pending_token: Option<&str>) ->
     let border = format!(
         "  {} {} {}",
         ui::paint(Tone::Warn, ui::glyph_warn()),
-        ui::paint(Tone::Warn, "DELIBERATE ACCESS — off unless you turn it on"),
+        ui::paint(Tone::Warn, "DELIBERATE ACCESS / off unless you turn it on"),
         ui::paint(Tone::Dim, rule())
     );
 
@@ -185,7 +185,7 @@ pub fn render_lifetime(lifetime: &Lifetime) -> String {
     if lifetime.reuse != Reuse::Once {
         lines.push(format!(
             "  {}",
-            ui::paint(Tone::Warn, "\"5 times\" is best-effort hygiene, not a guarantee — a copied key can be")
+            ui::paint(Tone::Warn, "\"5 times\" is best-effort hygiene, not a guarantee / a copied key can be")
         ));
         lines.push(format!(
             "  {}",
@@ -291,7 +291,7 @@ pub fn err_mesh_not_grantable() -> (String, i32) {
     (
         format!(
             "{err}\n{fix}",
-            err = ui::paint(Tone::Err, &format!("{} mesh is never grantable by a key — a runner or borrower can't join your L3 overlay.", ui::glyph_err())),
+            err = ui::paint(Tone::Err, &format!("{} mesh is never grantable by a key / a runner or borrower can't join your L3 overlay.", ui::glyph_err())),
             fix = ui::paint(Tone::Dim, "(Refused at the verifier regardless of signature. Not a flag; there's no override.)"),
         ),
         super::EXIT_REFUSED,

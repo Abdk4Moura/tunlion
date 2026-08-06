@@ -43,7 +43,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Brand, ui::glyph_fleet()),
-            ui::paint(Tone::Brand, "FLEET  — your devices, permissive within scope, self-renewing")
+            ui::paint(Tone::Brand, "FLEET  /  your devices, permissive within scope")
         ));
         for d in &fleet {
             lines.push(render_device_row(d));
@@ -57,7 +57,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Dim, ui::glyph_extern()),
-            ui::paint(Tone::Dim, "EXTERNAL  — other people, time-boxed, deny-by-default")
+            ui::paint(Tone::Dim, "EXTERNAL  /  other people, time-boxed, deny-by-default")
         ));
         for d in &externs {
             lines.push(render_device_row(d));
@@ -71,7 +71,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Warn, ui::glyph_review()),
-            ui::paint(Tone::Warn, "NEEDS REVIEW  — paired before scoped trust; promote to sort into a tier")
+            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired before scoped trust; promote to sort into a tier")
         ));
         for d in &review {
             lines.push(render_device_row(d));

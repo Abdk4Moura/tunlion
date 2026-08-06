@@ -4086,7 +4086,7 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             if ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await.is_some() {
                 ui::debug("local daemon armed for enrollment");
             } else {
-                ui::say(&format!("  {} no local daemon — enrollment room not armed (start 'filament up' first)",
+                ui::say(&format!("  {} no local daemon / enrollment room not armed (start 'filament up' first)",
                     ui::paint(ui::Tone::Dim, "·")));
             }
             Ok(())
@@ -5298,7 +5298,7 @@ fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
     crate::capability::invalidate_cap_cache();
 
     if wiped.is_empty() {
-        ui::say("  nothing to wipe — no local filament state found");
+        ui::say("  nothing to wipe / no local filament state found");
     } else {
         ui::say(&format!("  {} wiped local filament state:", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
         for line in &wiped {
@@ -11448,7 +11448,7 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     let source = platform::InstallSource::detect();
     if source != platform::InstallSource::SelfInstalled {
         let hint = source.upgrade_hint();
-        println!("filament was installed via a package manager — update with: {hint}");
+        println!("filament was installed via a package manager, update with: {hint}");
         return Ok(());
     }
 
