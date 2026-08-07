@@ -83,10 +83,9 @@
     },
     {
       "path": "cli/tests/nat-cone-gate.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/134",
-      "owner": "opencode-101",
-      "expires": "2026-09-01"
+      "disposition": "retired",
+      "reason": "Its probe proves only endpoint-independent MAPPING, which is not a cone NAT (cone also requires endpoint-independent filtering, which Linux MASQUERADE does not provide), and its hole-punch transfer assertion has never passed on any NAT topology in this emulation. The mapping-probe harness survives as natprobe-test.sh.",
+      "reference": "https://github.com/Abdk4Moura/filament/issues/134"
     },
     {
       "path": "cli/tests/natprobe-test.sh",
@@ -97,7 +96,7 @@
     {
       "path": "cli/tests/natprobe.py",
       "disposition": "support",
-      "invoked_by": ["cli/tests/nat-cone-gate.sh", "cli/tests/natprobe-test.sh"]
+      "invoked_by": ["cli/tests/natprobe-test.sh"]
     },
     {
       "path": "cli/tests/reliability_test.sh",
@@ -113,8 +112,9 @@
     },
     {
       "path": "cli/tests/stun-server.py",
-      "disposition": "support",
-      "invoked_by": ["cli/tests/nat-cone-gate.sh"]
+      "disposition": "retired",
+      "reason": "Its only consumer was the retired nat-cone-gate.sh emulation.",
+      "reference": "https://github.com/Abdk4Moura/filament/issues/134"
     },
     {
       "path": "cli/tests/transport-gates.sh",

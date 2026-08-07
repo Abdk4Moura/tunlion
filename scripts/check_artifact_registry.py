@@ -26,7 +26,9 @@ TOPOLOGIES = {
 ISSUE_RE = re.compile(r"https://github\.com/Abdk4Moura/filament/issues/[1-9][0-9]*$")
 RETIRED_TOMBSTONES = {
     "cli/tests/holepunch-gates.sh",
+    "cli/tests/nat-cone-gate.sh",
     "cli/tests/reliability_test.sh",
+    "cli/tests/stun-server.py",
 }
 
 

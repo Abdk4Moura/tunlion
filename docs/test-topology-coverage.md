@@ -12,12 +12,15 @@ the checked-in test estate, not a claim that every test runs in every workflow.
 | L2 and SSH gates | Two local daemons plus local sshd | `127.0.0.1` services and a same-host data channel | None | `cli/tests/l2-gates.sh:25`, `:96-115`, `:148-163`; `cli/tests/ssh-gates.sh:32`, `:60-65` |
 | Local lab | Two Linux network namespaces on one host | Direct veth, userspace UDP, WireGuard, or filament carrier over a private underlay | None. Namespaces are isolated, but no NAT or Internet edge is configured | `lab/README.md:8-15`, `:37-57`, `:69-78`; `lab/topologies/two-nodes.yml:18-21` |
 | Relay gate | Two local peers and local coturn | Forced TURN relay on `127.0.0.1` | Relay transport is covered, but not NAT traversal | `cli/tests/gates.sh:329-347` |
-| Cone-NAT diagnostic | Two Linux NAT namespaces | Controlled cone-NAT emulation with local STUN | Not product coverage: the receiving-router emulation currently drops inbound peer checks | `cli/tests/nat-cone-gate.sh`; `docs/testing-nat-cone-gate.md`; issue #134 |
+| NAT mapping probe | One Linux NAT namespace | MASQUERADE with and without `--random-fully` | Measures UDP mapping classification only (endpoint-independent vs endpoint-dependent); it is not NAT traversal coverage and not a cone-NAT claim | `cli/tests/natprobe-test.sh`; `cli/tests/natprobe.py` |
 
 The old hole-punch script was retired because its external transport lab was
-never committed and no longer exists. The checked-in cone-NAT diagnostic is not
-a hosted workflow and is explicitly not coverage while issue #134 is open.
-Treat any future result as controlled NAT emulation, not evidence from two
+never committed and no longer exists. The cone-NAT emulation
+(`cli/tests/nat-cone-gate.sh`) was retired with it: its probe proved only
+endpoint-independent mapping (not a cone NAT, which also requires
+endpoint-independent filtering), and its hole-punch transfer assertion never
+passed on any NAT topology in the emulation. Its mapping probe survives as the
+wired `natprobe-test.sh`. The surviving NAT probe is not evidence from two
 independent residential or mobile networks.
 
 ## What A Green Board Does Not Prove

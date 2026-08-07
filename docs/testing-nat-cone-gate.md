@@ -1,55 +1,56 @@
-# Cone NAT Gate Investigation
+# Cone NAT Gate Retirement
 
-Status: the topology is not valid evidence about Filament NAT traversal.
+Status: RETIRED. `cli/tests/nat-cone-gate.sh` was deleted on 2026-08-07 and is
+tombstoned in the artifact registry (issue #134). Do not revive it as a product
+gate without re-proving it can discriminate.
 
-The gate is `cli/tests/nat-cone-gate.sh`. It builds two client namespaces,
-two MASQUERADE routers, and a WAN namespace containing signaling, STUN, and
-the packet capture point.
+## What it was
 
-## Established
+Two client network namespaces, two MASQUERADE routers, and a WAN namespace
+containing signaling, STUN, and the capture point. It tried to (1) prove both
+NATs were "cone" and (2) assert a hole-punched, byte-exact transfer between two
+Filament peers behind them.
 
-- `NO_NAT=1` is a positive control: pairing completes, the payload is
-  byte-exact, and the direct route succeeds with exit code 0.
-- The hand-rolled STUN responder is not compatible with stock clients:
-  `turnutils_stunclient` times out. Replacing it with coturn makes srflx
-  candidates appear on both peers.
-- With coturn, ICE emits checks to both advertised srflx addresses, but the
-  connection still fails.
-- The advertised srflx ports match the peer destinations.
-- Plain MASQUERADE is used. There is no `--random-fully` rule.
-- Conntrack reply tuples match the peer addresses and ports, but remain
-  `[UNREPLIED]`.
-- `rp_filter=2` and `ip_forward=1` are set on both routers and the WAN.
-  Routes exist and all input, forward, and output chains accept traffic.
-- A WAN capture saw 256 peer-check packets crossing in both directions.
-- Client captures saw none of those peer-check packets arriving on either LAN.
+## Why it was retired (evidence)
 
-The failure is located at the receiving router inbound path in this emulation:
-the checks cross the WAN, reach the receiving router's public side, and are
-not delivered to its client LAN.
+- **The "cone" proof measured mapping only.** `natprobe.py` classifies a NAT by
+  whether two independent reflectors observe the same source port
+  (endpoint-independent) or different ports (endpoint-dependent). That is a
+  MAPPING classification. A cone NAT also requires endpoint-independent
+  FILTERING. Linux MASQUERADE gives endpoint-independent mapping but
+  endpoint-dependent filtering, so the emulated NAT is not a cone by the
+  filtering dimension the gate never measured. "Cone proven" was an
+  adjacent-question instrument: it answered a mapping question and the result
+  was read as a filtering claim.
+- **The transfer assertion never passed on any NAT topology.** Only the
+  `NO_NAT=1` positive control passed. Under two MASQUERADEs the hole-punch
+  transfer failed at the receiving-router inbound path (documented below). A
+  gate that cannot go green on the topology it claims to accept cannot
+  discriminate, so it was not fixable by tuning the transfer assertion.
+- **The one correct measurement was redundant.** `natprobe-test.sh` already
+  proves the probe classifies both endpoint-independent (plain MASQUERADE) and
+  endpoint-dependent (`--random-fully`) mappings. It is wired into CI as a
+  required linux-netns artifact and passes. Nothing useful died with the gate.
 
-## Not Established
+## The emulation failure that motivated the investigation
 
-- Why the receiving router drops packets matching its conntrack reply tuple.
-- Whether the emulated filtering behavior matches a real cone NAT.
-- Whether Filament has a NAT traversal defect.
+Checks crossed the WAN (256 packets, both directions), reached the receiving
+router's public side, and were not delivered to its client LAN. Conntrack reply
+tuples matched the peer addresses and ports but stayed `[UNREPLIED]`;
+`rp_filter=2` and `ip_forward=1` were set on both routers and the WAN. The
+cause was never established, which is part of why the gate was retired rather
+than repaired: the emulation could not demonstrate even stock UDP hole punching,
+and a cone-NAT emulation needs endpoint-independent filtering that plain Linux
+MASQUERADE does not provide.
 
-## Scope Boundary
+## Scope boundary
 
-This does not resolve issue #50. That issue concerns real NAT, real Internet
-connectivity, a reachable STUN service, and a production binary without test
-hooks. This gate cannot provide a product verdict while its emulated topology
-cannot demonstrate stock UDP hole punching.
+Retiring this gate does not resolve issue #50 (the original real-NAT pairing
+failure). That issue concerns real NAT, real Internet connectivity, a reachable
+STUN service, and a production binary. Nothing in the lab work bore on it.
 
-## Method Lesson
+## What to cite instead
 
-Before the positive control, the gate had never passed, so its red result had
-no discriminating power. The no-NAT control established that the signaling,
-pairing driver, and transfer assertion work. Subsequent measurements then
-separated the responder defect, ICE checks, conntrack state, WAN forwarding,
-and receiving-router drop instead of treating one end-to-end timeout as a
-product diagnosis.
-
-Diagnostic options include `NO_NAT=1`, `COTURN=1`, and `CAPTURE=1`. The branch
-also records route tables, firewall rules, sysctls, client/WAN packet captures,
-and conntrack state when capture is enabled.
+- For UDP mapping classification: `cli/tests/natprobe-test.sh` (wired, passes).
+- For a real-NAT verdict: nothing in this repo yet; see
+  `docs/test-topology-coverage.md` for the cheapest real-NAT recommendation.
