@@ -133,16 +133,29 @@ jobs:
         with:
           pattern: pkg-*
           merge-multiple: true
+          # Assemble into a dedicated directory so the release globs below can
+          # never see the repo tree. actions/checkout puts CHANGELOG.md and any
+          # repo-root file into the working directory, and a bare `filament-*`
+          # glob would silently include a repo-root file named filament-*.
+          path: dist
       - name: Checksums
         run: |
-          sha256sum filament-* > SHA256SUMS
-          cat SHA256SUMS
+          (cd dist && sha256sum filament-*.tar.gz filament-*.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+      # #151: pin the release asset set to EXACTLY the four platform artifacts
+      # plus SHA256SUMS. cli-v0.7.7 published three repo-root docs under
+      # filament-*.md because the release job gained a checkout (for
+      # changelog-driven notes) and the bare globs widened. This check fails
+      # the release on any extra or missing asset.
+      - name: Release asset hygiene check
+        run: bash scripts/check-release-assets.sh dist
       - name: Provenance attestation
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            filament-*
-            SHA256SUMS
+            dist/filament-*.tar.gz
+            dist/filament-*.zip
+            dist/SHA256SUMS
       # WHY THIS EXISTS
       #
       # The release body below used to be a static install + quick-start
@@ -211,5 +224,6 @@ jobs:
           # `filament update --beta`).
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') }}
           files: |
-            filament-*
-            SHA256SUMS
+            dist/filament-*.tar.gz
+            dist/filament-*.zip
+            dist/SHA256SUMS
