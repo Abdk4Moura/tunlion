@@ -825,37 +825,80 @@ fn do_readdir(root: &PathBuf, open_files: &HashMap<u64, (std::fs::File, PathBuf)
 
 fn do_unlink(root: &PathBuf, path: &str) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    std::fs::remove_file(&resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    let rel = resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "path not beneath root".into() })?;
+    // #148: resolve() is lexical and cannot see a symlink, so the parent must
+    // be resolved to a dirfd the kernel guarantees is inside root and the
+    // mutation applied to the bare name relative to it. The final component is
+    // never followed by unlinkat, so containment is purely a parent question.
+    let (parent, name) = resolve_parent_beneath(root, rel)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    beneath_unlink(&parent, &name)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(Value::Null)
 }
 
 fn do_mkdir(root: &PathBuf, path: &str, mode: u32) -> Result<Value, MountError> {
+    // Bound the mode at the protocol boundary: a mode is 12 significant bits
+    // (0o7777). libc::mode_t is u32 on Linux but u16 on Darwin, so an unmasked
+    // peer value would truncate differently per platform. Masking here makes
+    // "the same request means the same thing on every platform" (the property
+    // this whole change exists for) and lets the syscall boundary cast freely.
+    let mode = mode & 0o7777;
     let resolved = resolve(root, path)?;
-    std::fs::create_dir(&resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(mode));
-    }
+    let rel = resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "path not beneath root".into() })?;
+    let (parent, name) = resolve_parent_beneath(root, rel)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    beneath_mkdir(&parent, &name, mode)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(Value::Null)
 }
 
 fn do_rmdir(root: &PathBuf, path: &str) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    std::fs::remove_dir(&resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    let rel = resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "path not beneath root".into() })?;
+    let (parent, name) = resolve_parent_beneath(root, rel)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    beneath_rmdir(&parent, &name)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(Value::Null)
 }
 
 fn do_rename(root: &PathBuf, from: &str, to: &str) -> Result<Value, MountError> {
     let from_resolved = resolve(root, from)?;
     let to_resolved = resolve(root, to)?;
-    std::fs::rename(&from_resolved, &to_resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    let from_rel = from_resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "from path not beneath root".into() })?;
+    let to_rel = to_resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "to path not beneath root".into() })?;
+    // Both sides of the rename must be contained; they may be in different
+    // directories, so each parent is resolved beneath root independently and
+    // renameat ties the two contained names together.
+    let (from_parent, from_name) = resolve_parent_beneath(root, from_rel)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    let (to_parent, to_name) = resolve_parent_beneath(root, to_rel)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    beneath_rename(&from_parent, &from_name, &to_parent, &to_name)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(Value::Null)
 }
 
 fn do_truncate(root: &PathBuf, path: &str, size: u64) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    let file = std::fs::OpenOptions::new().write(true).open(&resolved)
+    let rel = resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "path not beneath root".into() })?;
+    // #148: truncate FOLLOWS its target, so unlike the four name-ops it is an
+    // open. Reuse safe_open_beneath unchanged: on Linux RESOLVE_BENEATH
+    // refuses (EXDEV) any component that resolves outside the root.
+    let file = safe_open_beneath(root, rel, O_WRONLY, false)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     file.set_len(size).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(Value::Null)
@@ -1106,6 +1149,245 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
     open_file(&canonical, flags)
 }
 
+// -------------------------------------------------------- beneath mutations --
+//
+// The five mutating handlers (#148): resolve() is lexical and cannot see a
+// symlink, so the old code ran std::fs on the resolved absolute path and a
+// pre-existing symlink inside the share was followed outside it. The fix:
+//
+//   - unlink/mkdir/rmdir/rename act on a NAME; the final component is never
+//     followed, so containment is entirely a parent question. Resolve the
+//     parent to a dirfd the kernel guarantees is inside root, then act on the
+//     bare name relative to it.
+//   - truncate FOLLOWS its target, so it is an open: it reuses safe_open_beneath.
+//
+// ONE containment decision per platform, five callers. The platform split
+// mirrors safe_open_beneath (Linux openat2 RESOLVE_BENEATH / other-Unix walk /
+// non-Unix canonicalize) and is never re-derived per call site.
+
+/// Resolve the parent of `rel` beneath `root`, returning the parent plus the
+/// final component. Empty `rel` (the share root itself) and non-plain final
+/// names are refused.
+#[cfg(unix)]
+fn resolve_parent_beneath(root: &std::path::Path, rel: &std::path::Path) -> std::io::Result<(std::os::fd::OwnedFd, std::ffi::CString)> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut comps = rel.components();
+    let last = match comps.next_back() {
+        Some(Component::Normal(n)) => n,
+        _ => return Err(std::io::Error::from_raw_os_error(EINVAL)),
+    };
+    if last == std::ffi::OsStr::new(".") || last == std::ffi::OsStr::new("..") {
+        return Err(std::io::Error::from_raw_os_error(EINVAL));
+    }
+    let last_c = std::ffi::CString::new(last.as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "final component contains an interior NUL byte")
+    })?;
+    let parent: std::path::PathBuf = comps.collect();
+    let parent_fd = open_parent_beneath(root, &parent)?;
+    Ok((parent_fd, last_c))
+}
+
+/// Open the directory `dir_rel` (a relative path beneath `root`) to a dirfd,
+/// refusing any resolution that escapes. Empty relative path = root itself.
+#[cfg(unix)]
+fn open_parent_beneath(root: &std::path::Path, dir_rel: &std::path::Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(root)?;
+
+        // Values per include/uapi/linux/openat2.h, same as safe_open_beneath.
+        const RESOLVE_BENEATH: u64 = 0x08;
+        const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_DIRECTORY as u64) | libc::O_CLOEXEC as u64;
+        how.mode = 0;
+        // Mount semantics: in-share symlinks resolve (deny_symlinks=false in
+        // safe_open_beneath); only ESCAPE is refused, by RESOLVE_BENEATH.
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
+
+        let rel_os = if dir_rel.as_os_str().as_bytes().is_empty() {
+            std::ffi::OsStr::new(".")
+        } else {
+            dir_rel.as_os_str()
+        };
+        let rel_c = std::ffi::CString::new(rel_os.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains an interior NUL byte")
+        })?;
+
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                root_fd.as_raw_fd(),
+                rel_c.as_ptr(),
+                &how as *const _,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::path::Component;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root)?;
+        let mut current = unsafe { OwnedFd::from_raw_fd(root_file.into_raw_fd()) };
+
+        for comp in dir_rel.components() {
+            match comp {
+                Component::Normal(name) => {
+                    let name_c = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path component contains an interior NUL byte")
+                    })?;
+                    // O_NOFOLLOW on every step: this arm refuses ALL symlinks
+                    // (stricter than Linux, never the reverse), matching
+                    // safe_open_beneath's non-Linux arm.
+                    let fd = unsafe {
+                        libc::openat(current.as_raw_fd(), name_c.as_ptr(), libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    };
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    current = unsafe { OwnedFd::from_raw_fd(fd) };
+                }
+                // Lexically impossible after resolve(); refuse rather than guess.
+                Component::ParentDir | Component::CurDir => {
+                    return Err(std::io::Error::from_raw_os_error(EACCES));
+                }
+                _ => {
+                    return Err(std::io::Error::from_raw_os_error(EACCES));
+                }
+            }
+        }
+        Ok(current)
+    }
+}
+
+#[cfg(not(unix))]
+fn resolve_parent_beneath(root: &std::path::Path, rel: &std::path::Path) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::path::Component;
+
+    let mut comps = rel.components();
+    let last = match comps.next_back() {
+        Some(Component::Normal(n)) => n.to_os_string(),
+        _ => return Err(std::io::Error::from_raw_os_error(EINVAL)),
+    };
+    if last == std::ffi::OsString::from(".") || last == std::ffi::OsString::from("..") {
+        return Err(std::io::Error::from_raw_os_error(EINVAL));
+    }
+    let parent_rel: std::path::PathBuf = comps.collect();
+    // Canonicalize the PARENT (not the full path): the final name is never
+    // followed by the std::fs mutation calls, so only the parent needs the
+    // beneath check. TOCTOU caveat, same as safe_open_beneath's non-Unix arm;
+    // on Windows the live mount surface is WinFsp, so this is defense in depth.
+    let canonical_parent = root.join(&parent_rel).canonicalize()?;
+    let root_canonical = root.canonicalize()?;
+    if !canonical_parent.starts_with(&root_canonical) {
+        return Err(std::io::Error::from_raw_os_error(EACCES));
+    }
+    Ok((canonical_parent, std::path::PathBuf::from(last)))
+}
+
+#[cfg(unix)]
+fn beneath_unlink(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn beneath_unlink(parent: &std::path::Path, name: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_file(parent.join(name))
+}
+
+#[cfg(unix)]
+fn beneath_rmdir(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn beneath_rmdir(parent: &std::path::Path, name: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_dir(parent.join(name))
+}
+
+#[cfg(unix)]
+fn beneath_mkdir(parent: &std::os::fd::OwnedFd, name: &std::ffi::CStr, mode: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // mode_t is a platform alias (u32 on Linux, u16 on Darwin), so cast at the
+    // syscall boundary. The caller masks to 0o7777, so the narrowing never
+    // truncates a meaningful bit.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // fchmodat is not subject to umask (mkdirat is), so applying the mode here
+    // gives the peer exactly what it asked for. AT_SYMLINK_NOFOLLOW means a
+    // symlink swapped in for the entry cannot be chmodded instead; the
+    // freshly-created entry cannot be a symlink, so it never rejects a
+    // legitimate directory.
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn beneath_mkdir(parent: &std::path::Path, name: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    std::fs::create_dir(parent.join(name))
+}
+
+#[cfg(unix)]
+fn beneath_rename(
+    from_parent: &std::os::fd::OwnedFd,
+    from_name: &std::ffi::CStr,
+    to_parent: &std::os::fd::OwnedFd,
+    to_name: &std::ffi::CStr,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe {
+        libc::renameat(
+            from_parent.as_raw_fd(),
+            from_name.as_ptr(),
+            to_parent.as_raw_fd(),
+            to_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn beneath_rename(
+    from_parent: &std::path::Path,
+    from_name: &std::path::Path,
+    to_parent: &std::path::Path,
+    to_name: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(from_parent.join(from_name), to_parent.join(to_name))
+}
+
 fn file_ino(path: &std::path::Path) -> u64 {
     #[cfg(unix)]
     {
@@ -1193,6 +1475,144 @@ mod tests {
         let enc = path_encode(std::path::Path::new("../../etc/passwd"));
         let err = resolve(&root, &enc).unwrap_err();
         assert_eq!(err.code, EACCES);
+    }
+
+    // ------------------------------------------- #148 mutation containment
+    //
+    // The five mutating handlers once ran std::fs on a lexically-resolved path,
+    // so a pre-existing symlink inside the share pointing outside it was
+    // followed and the mutation landed outside the root. Each test plants that
+    // symlink and asserts BOTH that the op is refused AND that the outside
+    // state is byte-for-byte unchanged. The outside-state assertion is the one
+    // that separates refusal-that-prevents from refusal-that-merely-reports.
+    // read_only=false is deliberate: the EROFS gate would refuse these ops for
+    // an unrelated reason, and a test that failed on the gate would prove
+    // nothing about the containment primitive.
+
+    #[cfg(unix)]
+    struct EscapeFixture {
+        share: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl EscapeFixture {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir()
+                .join(format!("fil-mount-esc-{name}-{}", std::process::id()));
+            let share = base.join("share");
+            let outside = base.join("outside");
+            std::fs::create_dir_all(&share).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            // share/evil -> outside : the pre-existing symlink inside the share.
+            std::os::unix::fs::symlink(&outside, share.join("evil")).unwrap();
+            EscapeFixture { share, outside }
+        }
+        fn enc(&self, rel: &str) -> String {
+            path_encode(std::path::Path::new(rel))
+        }
+        fn cleanup(&self) {
+            let _ = std::fs::remove_dir_all(self.share.parent().unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    async fn call_mount(root: &std::path::PathBuf, op: MountOp) -> MountResult {
+        let mut open_files = HashMap::new();
+        let mut next_fh = 1u64;
+        let req = MountRequest { id: 1, bin: None, op };
+        let (resp, _) =
+            handle_mount_request(root, &mut open_files, &mut next_fh, &req, None, true, false).await;
+        resp.result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unlink_refuses_escape_and_leaves_outside_unchanged() {
+        let f = EscapeFixture::new("unlink");
+        let victim = f.outside.join("victim.txt");
+        std::fs::write(&victim, b"AAAA").unwrap();
+        let res = call_mount(&f.share, MountOp::Unlink { path: f.enc("evil/victim.txt") }).await;
+        // Outside-state assertion first: in the RED run this is the arm that
+        // proves the pre-fix code actually reached outside the share.
+        assert!(victim.exists(), "outside victim must survive the refused unlink");
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "unlink through escaping symlink must be refused: {res:?}"
+        );
+        f.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mkdir_refuses_escape_and_leaves_outside_unchanged() {
+        let f = EscapeFixture::new("mkdir");
+        let res = call_mount(&f.share, MountOp::MkDir { path: f.enc("evil/newdir"), mode: 0o755 }).await;
+        assert!(
+            !f.outside.join("newdir").exists(),
+            "outside dir must NOT be created by the refused mkdir"
+        );
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "mkdir through escaping symlink must be refused: {res:?}"
+        );
+        f.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rmdir_refuses_escape_and_leaves_outside_unchanged() {
+        let f = EscapeFixture::new("rmdir");
+        let outside_dir = f.outside.join("emptydir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        let res = call_mount(&f.share, MountOp::RmDir { path: f.enc("evil/emptydir") }).await;
+        assert!(outside_dir.exists(), "outside dir must survive the refused rmdir");
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "rmdir through escaping symlink must be refused: {res:?}"
+        );
+        f.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_refuses_escape_and_leaves_outside_unchanged() {
+        let f = EscapeFixture::new("rename");
+        let a = f.outside.join("a.txt");
+        std::fs::write(&a, b"AAA").unwrap();
+        let res = call_mount(&f.share, MountOp::Rename {
+            from: f.enc("evil/a.txt"),
+            to: f.enc("renamed.txt"),
+        }).await;
+        assert!(a.exists(), "outside source must survive the refused rename");
+        assert!(
+            !f.share.join("renamed.txt").exists(),
+            "refused rename must not create the destination inside the share either"
+        );
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "rename out of the share must be refused: {res:?}"
+        );
+        f.cleanup();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncate_refuses_escape_and_leaves_outside_unchanged() {
+        let f = EscapeFixture::new("truncate");
+        let victim = f.outside.join("victim.txt");
+        std::fs::write(&victim, b"AAAA").unwrap();
+        let res = call_mount(&f.share, MountOp::Truncate { path: f.enc("evil/victim.txt"), size: 0 }).await;
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().len(),
+            4,
+            "outside victim length must stay 4 after the refused truncate"
+        );
+        assert!(
+            matches!(res, MountResult::Err(_)),
+            "truncate through escaping symlink must be refused: {res:?}"
+        );
+        f.cleanup();
     }
 
     // -------------------------------------------------- binary frame round-trip
