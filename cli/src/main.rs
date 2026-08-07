@@ -1823,8 +1823,16 @@ fn fleet_certificate_warning_for(
 /// is untrusted, and the gate denies it before revocation is even consulted.
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return false };
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    // A NON-EXISTENT store means no device records at all: every peer is
+    // unknown, not revoked (a fresh init has no devices.json until the first
+    // pair). An EXISTING store that is unreadable or unparseable FAILS CLOSED
+    // to revoked: a corrupt store must not silently un-revoke every device
+    // (advisor ruling).
+    if !p.exists() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(&p) else { return true };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return true };
     let key = hex::encode(device_pub);
     match arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key)) {
         None => false, // unknown device, not revoked
@@ -18939,6 +18947,35 @@ mod tests {
             "no record at all is UNKNOWN, not revoked: revocation is a decision about a known device, and a fresh code peer legitimately has no record yet (#161)"
         );
 
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_store_fails_closed_to_revoked() {
+        // Advisor ruling: an EXISTING unreadable or unparseable devices.json
+        // must NOT silently un-revoke every device. A NON-EXISTENT store is
+        // different: no device records exist, so every peer is unknown, not
+        // revoked (a fresh init has no devices.json until the first pair).
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-revoked-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let any = [0x55u8; 32];
+        assert!(
+            !device_cert_revoked(&any),
+            "a NON-EXISTENT store means no records; the device is unknown, not revoked"
+        );
+        std::fs::write(dir.join("devices.json"), "not valid json {").unwrap();
+        assert!(
+            device_cert_revoked(&any),
+            "an EXISTING unparseable store must fail closed to revoked"
+        );
+        std::fs::write(dir.join("devices.json"), "[]").unwrap();
+        assert!(
+            !device_cert_revoked(&any),
+            "a parseable store without the device means unknown, not revoked"
+        );
         unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
