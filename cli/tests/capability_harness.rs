@@ -26,6 +26,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 const CODE_WORD: &str = "gigantic-element-tango";
 const BUILD_PROFILE: &str = env!("FILAMENT_BUILD_PROFILE");
 
@@ -676,52 +678,31 @@ fn revoked_device_first_transfer_is_denied() {
         ("FILAMENT_L3_USERSPACE", "1"),
     ];
 
-    // 1. Pair A and B so B holds A's device record (cert + secret).
-    let pair_word = format!("revoked-pair-{:x}", std::process::id());
-    let mut create = Command::new(&bin)
-        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_NAME", "test-a")
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "add", "--word", &pair_word])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("pair create");
-    let stderr = create.stderr.take().unwrap();
-    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            let line = line.unwrap_or_default();
-            if line.to_lowercase().contains(&pair_word.to_lowercase()) {
-                if let Some(code) = line.split_whitespace().find(|w| {
-                    w.to_lowercase().contains(&pair_word.to_lowercase())
-                        && w.split('-').count() >= 4
-                }) {
-                    let _ = code_tx.send(code.to_string());
-                }
-            }
-        }
-    });
-    let pair_code = code_rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("pair create did not mint a code within 60s");
-    let mut claim = Command::new(&bin)
-        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_NAME", "test-b")
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .args(["--server", &server, "add", &pair_code])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("pair claim");
-    let claim_out = claim.wait_with_output().expect("pair claim result");
+    // 1. B holds A's device record (cert + secret). Construct it directly from
+    // A's own device cert rather than running a live pairing ceremony: the
+    // ceremony's code mint is slow on cold CI runners (it timed out on macOS
+    // and ubuntu within 60s), and the pairing itself is not what this test
+    // asserts. What matters is that B can resolve A's cert from the store.
+    let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
+    let a_cert_raw = std::fs::read_to_string(&a_cert_path).expect("a device cert");
+    let a_cert_val: Value =
+        serde_json::from_str(&a_cert_raw).expect("parse a device cert");
+    let a_cert = &a_cert_val["cert"];
     assert!(
-        claim_out.status.success(),
-        "pair claim failed: {}",
-        String::from_utf8_lossy(&claim_out.stderr)
+        a_cert["devicePub"].as_str().is_some(),
+        "A's device cert has a devicePub"
     );
-    let _ = create.wait_with_output().expect("pair create result");
+    let a_record = serde_json::json!([{
+        "name": "test-a",
+        "secret": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "deviceCert": a_cert,
+        "caps": ["transfer"],
+    }]);
+    std::fs::write(
+        h.b_dir.join("devices.json"),
+        serde_json::to_string_pretty(&a_record).unwrap(),
+    )
+    .expect("write b devices.json");
 
     // 2. Durable revoke: A is no longer recognized on B.
     let revoke = Command::new(&bin)
