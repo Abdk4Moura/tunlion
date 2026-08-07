@@ -655,6 +655,8 @@ mod tests {
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
+    static CAP_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn make_owner() -> Ed25519KeyPair {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -787,6 +789,7 @@ mod tests {
     /// why the CLI warns after a capability-only revoke.
     #[test]
     fn capability_revoke_alone_does_not_remove_fleet_trust() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let user_pub = [0xaa; 32];
         let device_pub = [0xcc; 32];
         let decision = cap_gate_effective(
@@ -810,6 +813,7 @@ mod tests {
 
     #[test]
     fn cert_revoke_removes_fleet_trust() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let user_pub = [0xaa; 32];
         let device_pub = [0xcc; 32];
         let decision = cap_gate_effective(
@@ -836,6 +840,7 @@ mod tests {
     /// One mis-bucketed counter could satisfy flip_ready silently.
     #[test]
     fn per_action_counters_bucket_correctly() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         // Fresh owner + unknown principal; no actual store so outcome is
         // Unprovisioned (no cap header on disk). We test the counter
         // increment path directly via cap_gate_effective.
@@ -896,7 +901,8 @@ mod tests {
     /// Detector proof: one input per outcome bucket, asserting each increments
     /// exactly the right global counter and no sibling. A mis-bucketed increment
     /// would satisfy flip_ready() silently, so this proves the instrument before any
-    /// rig reading is trusted. Delta-based, since the counters are process-global.
+    /// rig reading is trusted. Every test that touches the process-global counters
+    /// holds the shared test lock; this test keeps it across each snapshot/call pair.
     #[test]
     fn shadow_detector_proof_six_buckets() {
         // Mode-independent since the 0.7 authoritative-default flip: pass
@@ -904,6 +910,7 @@ mod tests {
         // no-ops and each (legacy, cap-outcome) pair is counted verbatim,
         // whether FILAMENT_CAP_AUTHORITATIVE is on (default) or off (shadow).
         let uk = [0xaa; 32];
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
 
         fn snap() -> [u64; 6] {
             [
@@ -1319,6 +1326,7 @@ mod tests {
     // cap_authorize result.
     #[test]
     fn fleet_gate_allows_scoped_default_proven_in_scope_without_grant() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x11u8; 32];
         // same-owner (peer user_pub == own_user_pub) + Proven + in-scope + NO grant
         // → ALLOW, even though legacy denied and the passed outcome is Denied.
@@ -1332,6 +1340,7 @@ mod tests {
 
     #[test]
     fn fleet_gate_denies_deliberate_without_grant() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x22u8; 32];
         // same-owner + Proven + DELIBERATE tier (scoped_in_bounds=false) + no grant
         // → DENY (the deliberate tier is never auto-trusted).
@@ -1345,6 +1354,7 @@ mod tests {
 
     #[test]
     fn fleet_gate_denies_inferred_binding() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x33u8; 32];
         // same-owner + INFERRED (not Proven) + in-scope → NOTHING (the Proven gate).
         let d = cap_gate_effective(
@@ -1357,6 +1367,7 @@ mod tests {
 
     #[test]
     fn fleet_gate_denies_out_of_scope() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x44u8; 32];
         // same-owner + Proven + a scoped-default action but OUT of its bounds
         // (scoped_in_bounds=false: e.g. transfer to a non-inbox path, reach a
@@ -1371,6 +1382,7 @@ mod tests {
 
     #[test]
     fn fleet_gate_denies_different_owner() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x55u8; 32];
         let other = [0x66u8; 32];
         // different owner (peer cert chains to a DIFFERENT user key) + Proven +
@@ -1385,6 +1397,7 @@ mod tests {
 
     #[test]
     fn fleet_gate_expired_cert_denies_even_in_scope() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x77u8; 32];
         // same-owner + Proven + in-scope but EXPIRED cert → DENY: fleet force-allow
         // still respects cert expiry (renewal is the only revocation bound).
@@ -1398,6 +1411,7 @@ mod tests {
 
     #[test]
     fn fleet_gate_revoked_cert_denies_scoped_default() {
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x88u8; 32];
         let d = cap_gate_effective(
             false, &CapOutcome::Denied("x".into()), "transfer", "self",
