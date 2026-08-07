@@ -144,6 +144,19 @@ pub fn cap_authoritative() -> bool {
         .unwrap_or(false)
 }
 
+/// #161 probe scope: the ordering window is a REAL-FLOW property (the gate
+/// reached with legacy trust before the identity ceremony settles). Unit tests
+/// construct that state directly to exercise gate semantics, so they must not
+/// trip the probe. main() flips this on before dispatch; the capability harness
+/// spawns the real binary, so the probe stays live there.
+static GATE_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_gate_live() {
+    GATE_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+fn gate_live() -> bool {
+    GATE_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // Shadow counters bucketed by the LEGACY decision AND by three cap outcomes:
 // authorized, denied (a header EXISTS and refused, a real disagreement), and
 // no-header (the resource is UNPROVISIONED, not a disagreement). The only opens a
@@ -356,6 +369,26 @@ pub fn cap_gate_effective(
     cert_revoked: bool,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
+
+    // === #161 probe: the revocation ordering window =====================
+    // Two facts about a link are set by SEPARATE events: `trusted` (pair-secret
+    // MAC passes, feeds legacy_allowed) and `identity_device_pub` (lazy
+    // resolve_peer_identity, feeds device_pub). If the gate is ever reached
+    // with legacy trust but NO resolved device identity, cert_revoked_for(None)
+    // is false and legacy_allowed is true, so a revoked device is authorized
+    // until identity settles. This debug_assert is the PROBE: it fires in debug
+    // builds (and the capability harness) if any exercised path reaches the
+    // gate in that state. It goes quiet only because the ordering is fixed,
+    // never because the assertion was relaxed. Zero cost in release.
+    // `!cert_revoked` excludes the deliberately-constructed state where the
+    // caller already knows the device is revoked (the gate denies it anyway);
+    // the window is precisely when revocation is UNKNOWABLE at gate time.
+    // `gate_live()` scopes the probe to real flows (binary + harness); unit
+    // tests construct the state directly and must not trip it.
+    debug_assert!(
+        !(gate_live() && legacy_allowed && device_pub.is_none() && !cert_revoked),
+        "gate reached before identity resolution: legacy trust with no resolved device identity"
+    );
 
     // === Delegated-principal ceiling (check 2 of 2) ===================
     // Auth key ceiling applies UNCONDITIONALLY in both modes. Purely restrictive

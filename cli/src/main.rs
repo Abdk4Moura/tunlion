@@ -496,7 +496,7 @@ EXAMPLES
 #[command(
     name = "filament",
     version = VERSION,
-    about = "One secure thread across your devices: send, receive, mount files, and open an authorized shell without an account or cloud upload.",
+    about = "One thread across your devices, end-to-end encrypted: send, receive, mount files, and open an authorized shell without an account or cloud upload.",
     after_help = EXAMPLES,
     help_template = "{about-with-newline}\n{usage-heading} {usage}\n\n{after-help}\n\nOptions:\n{options}"
 )]
@@ -611,7 +611,7 @@ enum Cmd {
     /// for the local-network auto room). Scripts are safe by default: a non-TTY
     /// uses the auto room; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass
     /// --no-interactive to skip the prompt.
-    #[command(alias = "recv")]
+    #[command(next_help_heading = "Share")]
     Receive {
         /// One-time code spoken by the sender (omit to use the auto room)
         code: Option<String>,
@@ -641,7 +641,7 @@ enum Cmd {
         background: bool,
     },
     /// Add a device or person with consent on both ends.
-    #[command(next_help_heading = "Connect", alias = "pair")]
+    #[command(next_help_heading = "Connect")]
     Add {
         /// A code from the other device; omit to mint one for them
         code: Option<String>,
@@ -821,7 +821,7 @@ enum Cmd {
     },
     // ── Identity ────────────────────────────────────────────────────
     /// Manage your user identity (key + device certs)
-    #[command(next_help_heading = "Identity", alias = "identity")]
+    #[command(next_help_heading = "Identity")]
     Id {
         #[command(subcommand)]
         action: Option<IdAction>,
@@ -1808,28 +1808,36 @@ fn fleet_certificate_warning_for(
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
 ///
-/// Absence semantics are the #156 fix: distinguish the two kinds of "no
-/// `certRevoked` field". A device with NO record at all fails closed to
-/// revoked; a KNOWN record whose field is absent starts clean (NOT revoked).
-/// The old `.and_then(...).unwrap_or(true)` collapsed both into `true`, so
-/// every legacy record without the field read as revoked.
+/// Absence semantics: a device with NO record at all is UNKNOWN, not revoked
+/// (#161: the typed-code possession ceremony resolves a fresh code peer's
+/// cert, which has no record yet; treating unknown as revoked would deny every
+/// one-shot transfer the product ships). Revocation is a decision about a
+/// KNOWN device: only a record that EXISTS and is marked `certRevoked` denies.
+/// The #156 fix is the field-absence half: a KNOWN record whose field is
+/// absent starts clean (NOT revoked) - the old `.and_then(...).unwrap_or(true)`
+/// collapsed it with `true`, so every legacy record without the field read as
+/// revoked (6 live production records).
+///
+/// A revoked device whose record was deleted is NOT re-authorized: deleting
+/// the record also deletes the pair secret, so the pair-proof fails, the link
+/// is untrusted, and the gate denies it before revocation is even consulted.
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return true };
-    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return true };
+    let Ok(raw) = std::fs::read_to_string(&p) else { return false };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
     let key = hex::encode(device_pub);
     match arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key)) {
-        None => true,                                           // unknown device
-        Some(d) => d["certRevoked"].as_bool().unwrap_or(false), // known, unmarked
+        None => false, // unknown device, not revoked
+        Some(d) => d["certRevoked"].as_bool().unwrap_or(false),
     }
 }
 
 /// #157 call-site derivation for the gate's `cert_revoked` input. A peer with
 /// NO resolved device identity is UNIDENTIFIED, not revoked: revocation is a
 /// decision about a KNOWN device, and an unidentified peer is one the gate
-/// must judge by binding strength, trust floor and grants. The unknown-DEVICE
-/// case (a device_pub with no record) still fails closed to revoked inside
-/// `device_cert_revoked`, where that judgement belongs.
+/// must judge by binding strength, trust floor and grants. An unknown DEVICE
+/// (a device_pub with no record) is likewise not revoked; it is a fresh peer
+/// the normal gate decides by consent and grants.
 fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
@@ -3521,7 +3529,7 @@ async fn init_experience(
     ui::say(&format!("  {} this device: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &device_name)));
     ui::say(&format!("  {} inbox: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), inbox.display()));
     ui::say("");
-    ui::say("  Secure defaults");
+    ui::say("  Least privilege by default");
     ui::say("  + paired devices may send into this inbox");
     ui::say("  - remote shell is off");
     ui::say("  - remote writing is off");
@@ -10649,6 +10657,10 @@ async fn main() -> Result<()> {
     // rustls refuses to guess between two providers, so pick ring explicitly
     // BEFORE anything touches TLS.
     rustls::crypto::ring::default_provider().install_default().ok();
+    // #161 probe scope: mark this process as a live flow so the gate's
+    // ordering-window probe fires here (and in the harness) but not in unit
+    // tests that construct the window state deliberately.
+    crate::capability::set_gate_live();
     // Migrate state from legacy cwd-relative .config/filament (the broken
     // Windows fallback when HOME was unset) to the platform-correct path.
     platform::Paths::migrate_legacy();
@@ -10766,6 +10778,22 @@ async fn main() -> Result<()> {
                     // Not a command, path, code, or paired device. Give a filament-native
                     // error with a did-you-mean over BOTH commands and device names,
                     // instead of clap's bare "unrecognized subcommand" (smart errors).
+                    // The 0.7.5 rule: a deleted legacy name errors with a did-you-mean.
+                    // The levenshtein hint below cannot match the renames (recv->receive
+                    // is distance 3, pair->add is 4, identity->id is 8), so map them
+                    // explicitly: this audience meets the product afresh and the old
+                    // names should teach the new ones, not silently route.
+                    let legacy = match first.as_str() {
+                        "recv" => Some("receive"),
+                        "pair" => Some("add"),
+                        "identity" => Some("id"),
+                        _ => None,
+                    };
+                    if let Some(h) = legacy {
+                        eprintln!("filament: '{first}' is not a command");
+                        eprintln!("  did you mean '{h}'?  the command was renamed; `filament --help` lists everything");
+                        std::process::exit(2);
+                    }
                     let mut cands: Vec<String> = cmd_names.iter().cloned().collect();
                     cands.extend(devices_load().into_iter().map(|(n, _)| n));
                     let hint = cands
@@ -14105,6 +14133,14 @@ async fn recv_cmd(
     // instant that peer authenticates. Bounded by RECV_MAX_CANDIDATES (same keys).
     let mut recv_pending_offers: HashMap<String, Value> = HashMap::new();
     let mut recv_pending_direct: HashMap<String, (Vec<String>, Option<String>)> = HashMap::new();
+    // #161: first-offer hold start times per peer. On the typed-code path the
+    // buffered offer is replayed at PAKE confirm, BEFORE DirectReady issues the
+    // 0x02 identity challenge, so the first offer always arrives with identity
+    // unresolved. The offer is held (re-injected) while identity resolution is
+    // pending, bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight so a
+    // ceremony that never resolves cannot wedge the transfer.
+    let mut recv_identity_hold: HashMap<String, std::time::Instant> = HashMap::new();
+    const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
         std::env::var("FILAMENT_PAIR_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
@@ -15807,32 +15843,56 @@ async fn recv_cmd(
                 if let Some(l) = conn.link_mut(&pid) {
                     resolve_peer_identity(l);
                 }
-                let needs_proven = if let Some(l) = conn.link(&pid) {
-                    l.identity_device_pub.is_some()
-                        && l.identity_binding != crate::capability::BindingStrength::Proven
+                let (idev_known, proven) = conn
+                    .link(&pid)
+                    .map(|l| {
+                        (
+                            l.identity_device_pub.is_some(),
+                            l.identity_binding
+                                == crate::capability::BindingStrength::Proven,
+                        )
+                    })
+                    .unwrap_or((false, false));
+                // #161: in shadow mode, a typed-code link with NO identity still
+                // needs the challenge so revocation can bind: shadow mode never
+                // resolves a fresh code peer's identity otherwise (the old code
+                // issued the challenge under authoritative only), and the gate
+                // would then decide a legacy-trusted offer with
+                // cert_revoked_for(None)=false, letting a revoked device push a
+                // transfer before its revoked cert resolves.
+                let needs_challenge = if crate::capability::cap_authoritative() {
+                    idev_known && !proven
                 } else {
-                    false
+                    recv_code_path && !idev_known
                 };
-                if needs_proven && crate::capability::cap_authoritative() {
+                if needs_challenge {
                     // Shared issue-and-hold (hold-then-await; see the helper). This
                     // registers the pending_proven hold BEFORE sending, identically to
                     // the ChannelReady site, so the two sites cannot diverge on order.
                     issue_proven_challenge_and_hold(&conn, &pid, &t, &pending_proven, &mut identity_nonces).await;
-                    ui::say(&format!("  identity challenge sent to {pid}, holding until Proven or timeout"));
-                    // DirectReady-specific release policy: HOLD ChannelReady (do not
-                    // emit it here) and RE-EMIT it when the 3s hold expires, so a
-                    // direct link's gates never observe Inferred at all.
-                    let hold_t = t.clone();
-                    let hold_tx = tx.clone();
-                    let hold_pending = pending_proven.clone();
-                    let hold_pid = pid.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        if hold_pending.lock().unwrap().contains_key(&hold_pid) {
-                            hold_pending.lock().unwrap().remove(&hold_pid);
-                            let _ = hold_tx.send(Ev::ChannelReady(hold_pid, hold_t));
-                        }
-                    });
+                    if crate::capability::cap_authoritative() {
+                        ui::say(&format!("  identity challenge sent to {pid}, holding until Proven or timeout"));
+                        // DirectReady-specific release policy: HOLD ChannelReady (do not
+                        // emit it here) and RE-EMIT it when the 3s hold expires, so a
+                        // direct link's gates never observe Inferred at all.
+                        let hold_t = t.clone();
+                        let hold_tx = tx.clone();
+                        let hold_pending = pending_proven.clone();
+                        let hold_pid = pid.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            if hold_pending.lock().unwrap().contains_key(&hold_pid) {
+                                hold_pending.lock().unwrap().remove(&hold_pid);
+                                let _ = hold_tx.send(Ev::ChannelReady(hold_pid, hold_t));
+                            }
+                        });
+                    } else {
+                        // #161 shadow mode: the typed-code path already rearmed
+                        // ChannelReady at PAKE confirm. Issue the challenge for
+                        // identity but do NOT hold the channel; the file-offer
+                        // hold re-injects the first offer until identity settles.
+                        let _ = tx.send(Ev::ChannelReady(pid, t));
+                    }
                 } else {
                     let _ = tx.send(Ev::ChannelReady(pid, t));
                 }
@@ -17250,35 +17310,53 @@ async fn recv_cmd(
                         }
                     }
 
-                    // #30 GAP 2: honor the pending_proven hold. If a
-                    // possession-sig challenge is still in flight for this peer
-                    // (the adopt-time hold has not settled) and the binding is
-                    // PRE-ADMIT RACE: a file-offer can arrive before
-                    // admit_delegated sets identity_user_pub + principal_kind for
-                    // this link. The ordering is UNENFORCED. This is safe only
-                    // because the pre-admit link state is authority-free:
-                    // identity_user_pub=None + binding=None => denied under
-                    // authoritative; refusal under shadow. If an unadmitted link
-                    // ever gains a default authority, the race opens.
+                    // #30 GAP 2 / #161: hold the offer while identity resolution
+                    // is pending. Do NOT decide the offer with an un-resolved
+                    // sender.
                     //
-                    // not yet Proven, do NOT decide on Inferred now: the
-                    // identity-expose that flips us to Proven is a SEPARATE
-                    // event this single-consumer loop must be free to process,
-                    // so blocking inline would deadlock. Re-inject the offer
-                    // shortly and let the loop drain. The hold entry is removed
-                    // on Proven OR at the 3s deadline, so this self-terminates
-                    // and the re-injected offer is then decided for real.
-                    if crate::capability::cap_authoritative() {
-                        let challenge_in_flight =
-                            pending_proven.lock().unwrap().contains_key(&pid);
-                        let proven = conn
+                    // #30 (authoritative): if a possession-sig challenge is still
+                    // in flight and the binding is not yet Proven, do NOT decide
+                    // on Inferred now: the identity-expose that flips us to
+                    // Proven is a SEPARATE event this single-consumer loop must
+                    // be free to process, so blocking inline would deadlock.
+                    //
+                    // #161 (both modes, typed-code path): the buffered offer is
+                    // replayed at PAKE confirm BEFORE DirectReady issues the 0x02
+                    // identity challenge, so the first offer always arrives with
+                    // identity unresolved. Revocation is mode-independent (the
+                    // #158 absolute Deny fires in both modes), so accepting a
+                    // legacy-trusted offer with cert_revoked_for(None)=false lets
+                    // a revoked device push a transfer before its stored revoked
+                    // cert resolves. Hold the offer while identity is unresolved,
+                    // bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight.
+                    //
+                    // Both self-terminate: the pending_proven entry is removed on
+                    // Proven OR its 3s deadline; the #161 hold clears at its own
+                    // deadline and the re-injected offer is then decided for real.
+                    {
+                        let (proven, idev_known) = conn
                             .link(&pid)
                             .map(|l| {
-                                l.identity_binding
-                                    == crate::capability::BindingStrength::Proven
+                                (
+                                    l.identity_binding
+                                        == crate::capability::BindingStrength::Proven,
+                                    l.identity_device_pub.is_some(),
+                                )
                             })
-                            .unwrap_or(false);
-                        if challenge_in_flight && !proven {
+                            .unwrap_or((false, false));
+                        let challenge_in_flight =
+                            pending_proven.lock().unwrap().contains_key(&pid);
+                        let hold = if recv_code_path && !proven && !idev_known {
+                            let deadline = *recv_identity_hold
+                                .entry(pid.clone())
+                                .or_insert_with(std::time::Instant::now);
+                            deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
+                        } else {
+                            crate::capability::cap_authoritative()
+                                && challenge_in_flight
+                                && !proven
+                        };
+                        if hold {
                             let rtx = tx.clone();
                             let rpid = pid.clone();
                             let rv = v.clone();
@@ -18857,8 +18935,8 @@ mod tests {
         );
         let nobody = [0x33u8; 32];
         assert!(
-            device_cert_revoked(&nobody),
-            "no record at all must fail closed to revoked"
+            !device_cert_revoked(&nobody),
+            "no record at all is UNKNOWN, not revoked: revocation is a decision about a known device, and a fresh code peer legitimately has no record yet (#161)"
         );
 
         unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
@@ -18872,14 +18950,15 @@ mod tests {
         // `.map(device_cert_revoked).unwrap_or(true)` at the call sites
         // conflated "we do not know who you are" with "you are revoked", and
         // the absolute gate Deny turned that into a total transfer outage for
-        // every freshly paired peer before identity resolution settles. The
-        // unknown-DEVICE case (a device_pub with no record) still fails closed
-        // to revoked inside device_cert_revoked.
+        // every freshly paired peer before identity resolution settles. An
+        // unknown DEVICE (a device_pub with no record) is likewise not revoked:
+        // revocation is a decision about a known device, and a fresh code peer
+        // legitimately has no record yet (#161 composition).
         assert!(!cert_revoked_for(None), "no identity must not read as revoked");
         let unknown = [0x44u8; 32];
         assert!(
-            cert_revoked_for(Some(&unknown)),
-            "an unknown device record must still fail closed to revoked"
+            !cert_revoked_for(Some(&unknown)),
+            "an unknown device (no record) is not revoked"
         );
     }
 
