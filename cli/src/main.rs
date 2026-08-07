@@ -1503,7 +1503,6 @@ pub(crate) fn upsert_peer_record(
         if let Some(c) = cert {
             existing["userKey"] = json!(hex::encode(c.user_pub));
             existing["deviceCert"] = c.to_json();
-            existing["certRevoked"] = json!(false);
         } else if let Some(uk) = user_key_hex {
             existing["userKey"] = json!(uk);
         }
@@ -1554,7 +1553,6 @@ pub(crate) fn upsert_peer_record(
     if let Some(c) = cert {
         obj.insert("userKey".to_string(), json!(hex::encode(c.user_pub)));
         obj.insert("deviceCert".to_string(), c.to_json());
-        obj.insert("certRevoked".to_string(), json!(false));
     } else if let Some(uk) = user_key_hex {
         obj.insert("userKey".to_string(), json!(uk));
     }
@@ -1871,7 +1869,7 @@ fn devices_find_by_device_pub(device_pub: &[u8; 32]) -> Option<Value> {
 /// REVOKED is a decision and is not revivable by any fresh invitation; LAPSED
 /// (an accident) revives. None means the enrollment may proceed.
 fn enrollment_refusal(prior: &Value) -> Option<String> {
-    let revoked = prior["revoked"].as_bool() == Some(true)
+    let revoked = prior["certRevoked"].as_bool() == Some(true)
         || prior["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED);
     if revoked {
         Some("this device was revoked; the owner must run 'filament devices restore <name>' to allow it back".to_string())
@@ -1880,9 +1878,10 @@ fn enrollment_refusal(prior: &Value) -> Option<String> {
     }
 }
 
-/// Durable device-level revoke. Unlike `certRevoked` (which a cert renewal
-/// clears), this marker survives every cert update and makes the gate refuse
-/// the device on every reconnect until `Restore`.
+/// Durable device-level revoke. Writes the SINGLE `certRevoked` marker (a
+/// decision about the device, not a certificate): the gate refuses the device
+/// on every reconnect, and a cert renewal must not clear it (the writer has no
+/// clearing line). `principalState`/`revokedAt` are display only.
 fn set_device_revoked(name: &str, revoked: bool) -> Result<()> {
     let p = devices_path();
     let raw = std::fs::read_to_string(&p).unwrap_or_default();
@@ -1890,7 +1889,7 @@ fn set_device_revoked(name: &str, revoked: bool) -> Result<()> {
     let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
         bail!("device '{name}' is not in the device store");
     };
-    device["revoked"] = json!(revoked);
+    device["certRevoked"] = json!(revoked);
     if revoked {
         device["revokedAt"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
         device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
@@ -1919,7 +1918,7 @@ fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
         if record["principalKind"].as_str() != Some("delegated") {
             continue;
         }
-        if record["revoked"].as_bool() == Some(true)
+        if record["certRevoked"].as_bool() == Some(true)
             || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED)
             || record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED)
         {
@@ -3996,6 +3995,41 @@ fn capability_list_summary(caps: &[String]) -> String {
         .join(", ")
 }
 
+/// Human state text for a DELEGATED device's row, quoting the binding clock
+/// from effective_principal_deadline (never restating a bound we do not compute).
+/// Returns None for owner devices (they keep the existing cert countdown).
+fn delegated_device_state(name: &str, cert: Option<&identity::DeviceCert>, now: u64, records: &[Value]) -> Option<(String, ui::Tone)> {
+    let cert = cert?;
+    let record = records.iter().find(|d| d["name"].as_str() == Some(name))?;
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
+    }
+    if record["certRevoked"].as_bool() == Some(true) || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
+        return Some(("revoked".to_string(), ui::Tone::Err));
+    }
+    let not_after = record["principalExpires"].as_u64();
+    let last_seen = record["lastSeen"].as_u64();
+    let max_offline = record["principalMaxOffline"].as_u64();
+    let (deadline, clock) = effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+    if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) || deadline <= now {
+        return Some(("lapsed".to_string(), ui::Tone::Warn));
+    }
+    let secs = deadline - now;
+    let (n, unit) = if secs < 3600 {
+        (secs / 60, "m")
+    } else if secs < 86400 {
+        (secs / 3600, "h")
+    } else {
+        (secs / 86400, "d")
+    };
+    let clock_label = match clock {
+        DeadlineClock::CertExpiry => "cert expires",
+        DeadlineClock::AbsoluteStop => "stop time",
+        DeadlineClock::LivenessBudget => "offline budget",
+    };
+    Some((format!("{n}{unit} left ({clock_label})"), ui::Tone::Dim))
+}
+
 fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
     let owner = load_owner_key().map(|key| key.public_key_bytes());
@@ -4003,6 +4037,10 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    let records: Vec<Value> = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default();
 
     devices_load()
         .into_iter()
@@ -4043,10 +4081,10 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                 tier,
                 online: warm_names.contains(&name),
                 caps_summary,
-                countdown: if needs_promote {
-                    String::new()
-                } else {
-                    device_countdown(tier, cert.as_ref())
+                countdown: match delegated_device_state(&name, cert.as_ref(), now, &records) {
+                    Some((text, tone)) => ui::paint(tone, &text),
+                    None if needs_promote => String::new(),
+                    None => device_countdown(tier, cert.as_ref()),
                 },
                 last_seen,
                 needs_promote,
@@ -19366,7 +19404,7 @@ mod tests {
             // B: live (observed at now).
             delegated(0xb2, &[("lastSeen", json!(now))]),
             // C: revoked, must never be touched by the sweep.
-            delegated(0xc3, &[("revoked", json!(true)), ("principalState", json!("revoked"))]),
+            delegated(0xc3, &[("certRevoked", json!(true)), ("principalState", json!("revoked"))]),
             // D: already lapsed, must not be re-marked.
             delegated(0xd4, &[("lastSeen", json!(now - 100)), ("principalState", json!("lapsed")), ("lapsedAt", json!(now - 1))]),
         ];
@@ -19464,7 +19502,7 @@ mod tests {
                 "principalCeiling": ["transfer"],
             });
             if let serde_json::Value::Object(map) = &mut v {
-                if revoked { map.insert("revoked".into(), json!(true)); }
+                if revoked { map.insert("certRevoked".into(), json!(true)); }
                 if let Some(s) = state { map.insert("principalState".into(), json!(s)); }
             }
             v
@@ -19495,9 +19533,68 @@ mod tests {
                 "issued": 1u64,
                 "sig": hex::encode([0u8; 64]),
             },
-            "revoked": true,
+            "certRevoked": true,
         }])).unwrap()).unwrap();
         assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn revoked_device_survives_cert_renewal() {
+        // The certRevoked marker is a decision about the DEVICE: renewing the
+        // certificate through the ordinary path must not clear it. A revoked
+        // device presenting a fresh cert is exactly the case the marker exists
+        // for.
+        let _guard = lock_test_config();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fil-renew-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let cert_a = mk_cert(0xa1);
+        let cert_b = mk_cert(0xa2);
+        let p = dir.join("devices.json");
+        std::fs::write(&p, serde_json::to_string(&serde_json::json!([{
+            "name": "quietbox",
+            "secret": "b".repeat(64),
+            "v": 2,
+            "caps": ["transfer"],
+            "deviceCert": cert_a.to_json(),
+            "principalKind": "delegated",
+            "principalCeiling": ["transfer"],
+        }])).unwrap()).unwrap();
+        set_device_revoked("quietbox", true).unwrap();
+        assert!(device_cert_revoked(&cert_a.device_pub), "revoked immediately");
+        // Ordinary cert renewal path: a plain cert update, no delegated arg.
+        devices_upsert_atomic("quietbox", None, Some(&cert_b), None, None, None, None).unwrap();
+        assert!(device_cert_revoked(&cert_b.device_pub),
+            "a cert renewal must NOT clear a durable revoke");
+        // The gate still refuses the renewed device on reconnect, and a
+        // standing explicit grant does NOT override the revocation.
+        let decision = crate::capability::cap_gate_effective(
+            true,
+            &crate::capability::CapOutcome::Authorized,
+            crate::capability::CAP_TRANSFER,
+            "self",
+            Some(&cert_b.device_pub),
+            Some(&cert_b.user_pub),
+            crate::capability::BindingStrength::Proven,
+            Some(cert_b.expires),
+            Some(&["transfer".to_string()]),
+            Some(&cert_b.user_pub),
+            true,
+            true, // has_explicit_grant: revocation must still win
+            true, // cert_revoked
+        );
+        assert!(matches!(decision, crate::capability::GateDecision::Deny { .. }),
+            "a revoked device must stay refused after a cert renewal, even with a grant");
     }
 
     #[test]

@@ -357,6 +357,18 @@ pub fn cap_gate_effective(
 ) -> GateDecision {
     let authoritative = cap_authoritative();
 
+    // === Revoked device, absolute (before any grant) =====================
+    // `cert_revoked` is the durable decision that this DEVICE is no longer
+    // welcome. It must override every path below, including an explicit grant:
+    // a revoked device presenting a fresh cert or a standing grant is exactly
+    // the case the marker exists for. Without this guard a revoked device with
+    // a pre-existing grant stayed authorized (revocation only fed the fleet
+    // auto-trust path), making `devices revoke` conditional on the owner also
+    // remembering to remove grants.
+    if cert_revoked {
+        return GateDecision::Deny { cap_reason: Some("device revoked".into()) };
+    }
+
     // === Delegated-principal ceiling (check 2 of 2) ===================
     // Auth key ceiling applies UNCONDITIONALLY in both modes. Purely restrictive
     // (Authorized→Denied), no-op for non-delegated (None). A delegated principal
