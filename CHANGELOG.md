@@ -70,7 +70,10 @@ the GitHub release notes.
 - **Releases no longer publish stray repository files as assets.** The release
   job began checking out the repository in 0.7.7 so notes could be generated from
   this changelog, which put the working tree where two `filament-*` globs could
-  match it. `cli-v0.7.7` consequently shipped three unrelated documents as
+  match it. `cli-v0.7.7` consequently shipped three unrelated repository
+  documents — `filament-status-2026-06-14.md`,
+  `filament-update-2026-06-14b.md` and
+  `filament-webshell-redesign-2026-06-15.md`, all ordinary session records — as
   release assets and attested them in `SHA256SUMS`. Artifacts are now assembled
   in a dedicated directory that the globs are scoped to, and a check refuses to
   publish unless the asset set is exactly the four platform archives plus
@@ -81,7 +84,7 @@ the GitHub release notes.
 
 - **The cone-NAT gate is retired**, along with its STUN fixture. Its hole-punch
   assertion had never passed on any NAT topology — only on the no-NAT control —
-  so it had no positive control and could not discriminate in either direction.
+  so it had no positive control **under NAT** and could not discriminate there.
   Separately, its "cone" proof measured endpoint-independent *mapping* only;
   cone requires endpoint-independent mapping **and** filtering, and Linux
   `MASQUERADE` is EI mapping with ED filtering, so a correct measurement of one
