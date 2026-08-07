@@ -2184,10 +2184,19 @@ async fn issue_proven_challenge_and_hold(
                 return; // challenge already in flight; do not clobber its nonce
             }
         }
-        pend.insert(pid.to_string(), (t.clone(), Instant::now() + Duration::from_secs(3)));
+        pend.insert(pid.to_string(), (t.clone(), Instant::now() + PROVEN_CHALLENGE_DEADLINE));
     }
     send_identity_challenge(conn, pid, identity_nonces).await;
 }
+
+/// #161: how long the possession challenge stays LIVE. This is the backstop
+/// for a slow-but-capable link, NOT a decision boundary: it MUST be raised in
+/// lockstep with the offer hold (RECV_IDENTITY_HOLD_DEADLINE) and the nonce
+/// lifetime, because the challenge entry expiring lets a re-issue clobber the
+/// in-flight nonce and the peer's answer then verifies against the wrong nonce
+/// and never reaches Proven. 3s was routinely crossed by the blocked-direct
+/// WebRTC fallback. Identity resolution normally settles well under a second.
+const PROVEN_CHALLENGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Handle a possession-sig identity-expose response sent by a peer after we
 /// challenged it. Verifies the nonce (single-use), the possession_sig under
@@ -14166,7 +14175,16 @@ async fn recv_cmd(
     // pending, bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight so a
     // ceremony that never resolves cannot wedge the transfer.
     let mut recv_identity_hold: HashMap<String, std::time::Instant> = HashMap::new();
-    const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+    // #161: the OFFER hold and the CHALLENGE lifetime must move together. Two
+    // coupled 3s clocks fought each other: the challenge's pending_proven
+    // entry expired, a re-issue then clobbered the in-flight nonce, and the
+    // offer's own deadline declined a legitimate slow fallback link. Both are
+    // raised together (see PROVEN_CHALLENGE_DEADLINE at module scope), so a
+    // slow-but-capable peer's answer is accepted, a revoked device is still
+    // denied (it just waits longer to be), and a ceremony that genuinely never
+    // resolves fails closed at the cap. This is the backstop, not a decision
+    // boundary: identity resolution normally settles in well under a second.
+    const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
         std::env::var("FILAMENT_PAIR_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
@@ -15933,7 +15951,7 @@ async fn recv_cmd(
                         let hold_pending = pending_proven.clone();
                         let hold_pid = pid.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            tokio::time::sleep(PROVEN_CHALLENGE_DEADLINE).await;
                             if hold_pending.lock().unwrap().contains_key(&hold_pid) {
                                 hold_pending.lock().unwrap().remove(&hold_pid);
                                 let _ = hold_tx.send(Ev::ChannelReady(hold_pid, hold_t));
@@ -17145,7 +17163,7 @@ async fn recv_cmd(
                                     let hold_pending = pending_proven.clone();
                                     let hold_pid = pid.clone();
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(Duration::from_secs(3)).await;
+                                        tokio::time::sleep(PROVEN_CHALLENGE_DEADLINE).await;
                                         hold_pending.lock().unwrap().remove(&hold_pid);
                                     });
                                 }
