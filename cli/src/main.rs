@@ -11200,8 +11200,28 @@ async fn main() -> Result<()> {
                     if !had {
                         bail!("no device named '{name}', see `filament devices`");
                     }
+                    // advisor's anti-theatre point: deleting the record also
+                    // discards any revocation on it, and the copy must say so.
+                    // Otherwise a revoked device that is forgotten looks like a
+                    // first-time peer again, and typing its code (its own or a
+                    // fresh mint) reads as ordinary pairing with nothing
+                    // signalling the revocation was just undone.
+                    let was_revoked = std::fs::read_to_string(devices_path())
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|d| {
+                            d["name"].as_str() == Some(name.as_str())
+                                && d["certRevoked"].as_bool() == Some(true)
+                        });
                     devices_remove(&name)?;
-                    println!("forgot '{name}', it can no longer find or auto-connect to this machine");
+                    if was_revoked {
+                        println!("forgot '{name}' and its revocation; it can now be added or joined again (if it still holds its key)");
+                    } else {
+                        println!("forgot '{name}', it can no longer find or auto-connect to this machine");
+                    }
                     println!("(their side still holds its half; it will hear \"never met you\" on the next proof)");
                 }
                 Some(DevicesAction::Rename { old, new }) => {
