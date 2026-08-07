@@ -4,6 +4,56 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.8.0] - 2026-08-07
+
+### Breaking
+
+- **The command surface is a clean break.** `identity`, `pair`, and `recv`
+  are gone. The commands are `id`, `add`, and `receive`; the old names error
+  with a did-you-mean to the renamed verb. The audience meets the product
+  afresh, so there are no compatibility aliases.
+
+### Security
+
+- **Revocation binds before the first typed-code transfer.** A revoked device
+  that reconnects through a freshly minted code was authorized until its
+  identity resolved, because shadow mode never issued the identity challenge
+  and the first offer was decided before the DirectReady challenge. The
+  receiver now issues the possession challenge in both modes for a typed-code
+  link, holds the first offer until identity settles (bounded, self
+  terminating), and the gate denies a durably revoked device's first
+  operation before any bytes land. The probe that found the window stays
+  permanently: it goes quiet only when the ordering is fixed.
+
+### Added
+
+- **Recoverable identity.** `filament init` creates your identity from a
+  random 12-word BIP39 recovery phrase. The identity is committed only after
+  you prove you wrote the phrase down (a word transcription check); `id
+  recover` restores the same identity from the phrase on another device.
+  Recovery phrases and invitation secrets are written only to owner-only
+  files or a terminal, never to argv, logs, or stdout.
+- **Bounded invitations.** `filament invite` mints a key with a capability
+  ceiling and a lifetime; `filament join` claims it and becomes a delegated
+  device whose ceiling is persisted in one record and restored on reconnect.
+  A re-joining device gets the NEW key's bounds, never a wider inherited set;
+  a lapsed device revives, a revoked one does not.
+- **Device lifecycle.** A joined device has an effective deadline (the
+  earliest of its cert expiry, its offline budget, and its absolute stop),
+  named in `devices` output. Idle-but-connected devices do not decay
+  (liveness is observed, not traffic-driven). Past-deadline devices are
+  marked `lapsed` and kept as evidence. `devices revoke`/`restore` durably
+  revokes: the marker survives cert renewal and overrides any standing grant.
+  `filament depart` signs and announces a goodbye; it is advisory, never
+  load-bearing.
+- **Ephemeral enrollment.** An ephemeral auth key admits a device in memory
+  only, gone at restart; a persistent key writes the durable record. The
+  device validates the ack against the key's persistence choice.
+- **Guided flows.** Bare `filament` on a terminal opens a picker; every
+  file, mount, and identity flow shows a review screen naming the exact
+  replay command. Mounts default to read-only with an explicit
+  `--read-write`; the remote side still enforces its share root and grant.
+
 ## [0.7.7] - 2026-08-06
 
 ### Security
