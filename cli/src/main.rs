@@ -15821,6 +15821,33 @@ async fn recv_cmd(
                         // ChannelReady arm sends `caps` and the signed L3 announce,
                         // which a peer on a retained link would otherwise never get.
                         conn.rearm_channel_ready(&from, promo);
+                        // #161 (WebRTC/relay path): issue the possession challenge
+                        // now that this peer authenticated. The direct path resolves
+                        // identity at DirectReady (start_direct_promote above); the
+                        // WebRTC path has no pair-proof for a fresh code peer (no
+                        // stored secret) and no DirectReady, so without this its
+                        // identity never resolves and revocation cannot bind. The
+                        // helper is idempotent with the DirectReady site.
+                        if recv_code_path {
+                            if let Some(l) = conn.link_mut(&from) {
+                                resolve_peer_identity(l);
+                            }
+                            let (idev_known, proven) = conn
+                                .link(&from)
+                                .map(|l| {
+                                    (
+                                        l.identity_device_pub.is_some(),
+                                        l.identity_binding
+                                            == crate::capability::BindingStrength::Proven,
+                                    )
+                                })
+                                .unwrap_or((false, false));
+                            if !proven && !idev_known {
+                                if let Some(t) = conn.transport_of(&from) {
+                                    issue_proven_challenge_and_hold(&conn, &from, &t, &pending_proven, &mut identity_nonces).await;
+                                }
+                            }
+                        }
                         // Replay any buffered transport-offer that arrived before PAKE
                         // (now that start_direct created a DirectPending with the secret)
                         if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
@@ -15946,6 +15973,16 @@ async fn recv_cmd(
                 // by then). Both go through the now-idempotent issue_proven_challenge_and_hold,
                 // which dedupes by a live pending_proven entry so the two sites are
                 // order-independent and cannot clobber each other's nonce.
+                //
+                // #161 EXCEPTION (typed-code path): a fresh code peer has NO stored pair
+                // secret, so pair-proof never fires and the #39 rule above would leave its
+                // identity permanently unresolved on the WebRTC transport - the direct
+                // path resolves it at DirectReady, the WebRTC path would never. Without
+                // the challenge its cert never reaches the gate, so revocation cannot
+                // bind and a revoked device's first transfer lands. The challenge is
+                // issued at PAKE confirm (the peer is authenticated and its responder
+                // loop is live), not here: at ChannelReady the sender is not yet ready
+                // to answer, and the 3s hold would expire before it is.
                 // web-shell discovery: tell the peer whether this receiver offers a
                 // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
                 // shows its per-device shell button ONLY when this is true; the
@@ -17358,7 +17395,20 @@ async fn recv_cmd(
                     //
                     // Both self-terminate: the pending_proven entry is removed on
                     // Proven OR its 3s deadline; the #161 hold clears at its own
-                    // deadline and the re-injected offer is then decided for real.
+                    // deadline and the offer below is then decided.
+                    //
+                    // #161 FAIL-CLOSED EXPIRY: if the hold clears with identity
+                    // STILL unresolved on the typed-code path, DENY rather than
+                    // proceed. Deciding a legacy-trusted offer with
+                    // cert_revoked_for(None)=false would admit a device whose
+                    // revocation cannot bind - #156 makes unidentified read as
+                    // not-revoked by design, and #161's hold was the only thing
+                    // standing between them. The operator is present by
+                    // construction (they typed the code), so the cost of denial
+                    // is a retry at the terminal, not a lost unattended
+                    // transfer. A peer whose ceremony cannot resolve within the
+                    // hold is either revoked or on a link the ceremony does not
+                    // complete on; both must be refused, not admitted.
                     {
                         let (proven, idev_known) = conn
                             .link(&pid)
@@ -17390,6 +17440,22 @@ async fn recv_cmd(
                                 tokio::time::sleep(Duration::from_millis(80)).await;
                                 let _ = rtx.send(Ev::Control(rpid, rv));
                             });
+                            continue;
+                        }
+                        if recv_code_path && !proven && !idev_known {
+                            let sender_name = conn
+                                .link(&pid)
+                                .map(|l| l.name.clone())
+                                .unwrap_or_default();
+                            ui::say(&ui::paint(ui::Tone::Dim, &format!(
+                                "  declined {name} from {sender_name} (sender identity did not resolve within the hold; revocation could not bind, try again)",
+                            )));
+                            if daemon {
+                                enqueue_if_requestable(&sender_name, "transfer");
+                            }
+                            if let Some(t) = conn.transport_of(&pid) {
+                                t.send_control(&protocol::decline_msg(&id)).await?;
+                            }
                             continue;
                         }
                     }
