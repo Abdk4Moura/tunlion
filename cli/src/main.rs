@@ -781,7 +781,7 @@ enum Cmd {
     Set {
         /// Setting name (run `filament set` to list them all)
         key: Option<String>,
-        /// New value; omit to read the current value
+        /// New value. `filament set` with no arguments lists every setting.
         value: Option<String>,
         /// Scope this change to one or more known devices (per-peer settings
         /// only). Comma-separated or repeatable: --peer a,b  or  --peer a --peer b
@@ -1823,13 +1823,18 @@ fn fleet_certificate_warning_for(
 /// is untrusted, and the gate denies it before revocation is even consulted.
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     let p = devices_path();
-    // A NON-EXISTENT store means no device records at all: every peer is
+    // A GENUINELY ABSENT store means no device records at all: every peer is
     // unknown, not revoked (a fresh init has no devices.json until the first
     // pair). An EXISTING store that is unreadable or unparseable FAILS CLOSED
     // to revoked: a corrupt store must not silently un-revoke every device
-    // (advisor ruling).
-    if !p.exists() {
-        return false;
+    // (advisor ruling). `exists()` is NOT the absence check: it returns false
+    // on permission-denied too, which would take the un-revoke branch. Use
+    // metadata and distinguish NotFound (absent) from every other error
+    // (exists but unreadable: fail closed).
+    match std::fs::metadata(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(_) => {}
     }
     let Ok(raw) = std::fs::read_to_string(&p) else { return true };
     let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return true };
@@ -5455,20 +5460,13 @@ async fn respond_to_auth_key_enroll_request(
         return;
     }
 
-    // Enroll-and-use is only COHERENT under authoritative capability enforcement:
-    // in shadow mode a delegated principal's ceiling does not gate the legacy
-    // path, so admitting one yields a hollow "enrolled" that then can't act (and
-    // could even be over-permitted). Refuse at this boundary with an explicit,
-    // non-oracle reason (config state, not key validity) so the operator knows
-    // exactly what to change, instead of a silent later decline.
-    if !crate::capability::cap_authoritative() {
-        ui::debug("enroll request declined: capability enforcement not authoritative (set FILAMENT_CAP_AUTHORITATIVE=1)");
-        let _ = t.send_control(&json!({
-            "type": "identity-auth-key-enroll-error",
-            "reason": "delegated principal: capability enforcement not authoritative"
-        })).await;
-        return;
-    }
+    // Enroll-and-use is coherent in BOTH modes: the delegated ceiling is
+    // enforced in shadow mode too (cap_gate_effective's ceiling check is
+    // mode-independent and load-bearing exactly because shadow's effective
+    // decision is legacy_allowed, which the ceiling check precedes). An
+    // earlier gate refused enrollment unless FILAMENT_CAP_AUTHORITATIVE=1;
+    // that rationale is stale and it made the flagship join flow fail for a
+    // default-configured owner. The joined device's ceiling binds either way.
 
     let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
         Some(ak) => ak,
@@ -18975,6 +18973,15 @@ mod tests {
         assert!(
             !device_cert_revoked(&any),
             "a parseable store without the device means unknown, not revoked"
+        );
+        // Metadata succeeds but the content is unreadable (a directory at the
+        // path): this is the EXISTS-but-unreadable class that `exists()`
+        // would misclassify as absent. Must fail closed.
+        std::fs::remove_file(dir.join("devices.json")).unwrap();
+        std::fs::create_dir(dir.join("devices.json")).unwrap();
+        assert!(
+            device_cert_revoked(&any),
+            "a store that exists but cannot be read must fail closed to revoked"
         );
         unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
