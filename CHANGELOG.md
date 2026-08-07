@@ -15,14 +15,23 @@ the GitHub release notes.
 
 ### Security
 
-- **Revocation binds before the first typed-code transfer.** A revoked device
-  that reconnects through a freshly minted code was authorized until its
-  identity resolved, because shadow mode never issued the identity challenge
-  and the first offer was decided before the DirectReady challenge. The
-  receiver now issues the possession challenge in both modes for a typed-code
-  link, holds the first offer until identity settles (bounded, self
-  terminating), and the gate denies a durably revoked device's first
-  operation before any bytes land. The probe that found the window stays
+- **Revocation binds before the first typed-code transfer, on both transports.**
+  A revoked device that reconnects through a freshly minted code was authorized
+  until its identity resolved, because shadow mode never issued the identity
+  challenge and the first offer was decided before the DirectReady challenge.
+  In earlier releases revocation did not bind on any transport; 0.8.0 makes it
+  bind on the direct path and the WebRTC/relay path alike. The receiver issues
+  the possession challenge in both modes for a typed-code link (at DirectReady
+  on the direct path and at PAKE confirm, re-issued at ChannelReady when the
+  transport arrives late, on the WebRTC path), holds the first offer until
+  identity settles, and the gate denies a durably revoked device's first
+  operation before any bytes land. The bound is explicit: a peer whose identity
+  does not resolve within the 3s hold is DECLINED, never admitted - the
+  operator is present by construction (they typed the code), so the cost is a
+  retry. Peers too old to run the encrypted handshake abort earlier with an
+  update message and never reach this hold; peers that can run the handshake,
+  including 0.7.7 senders, answer the possession challenge and resolve within
+  the hold on a functioning link. The probe that found the window stays
   permanently: it goes quiet only when the ordering is fixed.
 
 ### Added
