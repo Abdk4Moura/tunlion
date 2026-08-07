@@ -1185,6 +1185,11 @@ enum DevicesAction {
     /// Vouch between two known devices: mints a fresh secret and delivers it
     /// to both over verified channels (run on the device that knows both)
     Vouch { a: String, b: String },
+    /// Durable revoke: the device stops being recognized NOW and forever (the
+    /// record survives as evidence; the gate refuses it on reconnect).
+    Revoke { name: String },
+    /// Undo a durable revoke. The device returns to its prior state.
+    Restore { name: String },
 }
 
 /// Looks like a speakable CODE of the shape `word-word-DIGITS` (3 segments: two
@@ -1510,6 +1515,15 @@ pub(crate) fn upsert_peer_record(
             existing["principalExpires"] = json!(expires);
             existing["principalMaxOffline"] = json!(max_offline);
             existing["principalMaxOfflineCeiling"] = json!(max_offline_ceiling);
+            // A fresh enrollment is a NEW signed claim: its bounds WIN over any
+            // prior record's, never merged (a device re-joining with a narrower
+            // key must not inherit its wider old ceiling). Clearing the terminal
+            // state is the revival of a LAPSED record by name continuity; a
+            // REVOKED record is refused upstream before this write runs.
+            existing["principalState"] = Value::Null;
+            if let Some(map) = existing.as_object_mut() {
+                map.remove("lapsedAt");
+            }
         }
         return existing["name"].as_str().unwrap_or(name).to_string();
     }
@@ -1552,8 +1566,7 @@ pub(crate) fn upsert_peer_record(
         obj.insert("principalExpires".to_string(), json!(expires));
         obj.insert("principalMaxOffline".to_string(), json!(max_offline));
         obj.insert("principalMaxOfflineCeiling".to_string(), json!(max_offline_ceiling));
-    }
-    obj.insert("addedAt".to_string(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+    }    obj.insert("addedAt".to_string(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
     arr.push(Value::Object(obj));
     final_name
 }
@@ -1817,6 +1830,7 @@ fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
 fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
+}
 
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
@@ -1831,6 +1845,106 @@ fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
         .context("atomic write devices.json")?;
     Ok(())
+}
+
+/// Terminal principal states written to `principalState` on a device record.
+const PRINCIPAL_STATE_LAPSED: &str = "lapsed";
+const PRINCIPAL_STATE_REVOKED: &str = "revoked";
+
+/// The full record for a device identified by its cert's device_pub, if any.
+/// Used by the enrollment path to decide revive (lapsed) vs refuse (revoked).
+fn devices_find_by_device_pub(device_pub: &[u8; 32]) -> Option<Value> {
+    let p = devices_path();
+    let Ok(raw) = std::fs::read_to_string(&p) else { return None };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return None };
+    let key = hex::encode(device_pub);
+    arr.into_iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+}
+
+/// The enrollment refusal for a prior record of the same device_pub, if any.
+/// REVOKED is a decision and is not revivable by any fresh invitation; LAPSED
+/// (an accident) revives. None means the enrollment may proceed.
+fn enrollment_refusal(prior: &Value) -> Option<String> {
+    let revoked = prior["revoked"].as_bool() == Some(true)
+        || prior["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED);
+    if revoked {
+        Some("this device was revoked; the owner must run 'filament devices restore <name>' to allow it back".to_string())
+    } else {
+        None
+    }
+}
+
+/// Durable device-level revoke. Unlike `certRevoked` (which a cert renewal
+/// clears), this marker survives every cert update and makes the gate refuse
+/// the device on every reconnect until `Restore`.
+fn set_device_revoked(name: &str, revoked: bool) -> Result<()> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p).unwrap_or_default();
+    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+        bail!("device '{name}' is not in the device store");
+    };
+    device["revoked"] = json!(revoked);
+    if revoked {
+        device["revokedAt"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
+    } else {
+        if let Some(map) = device.as_object_mut() {
+            map.remove("revokedAt");
+        }
+        // Restore returns the device to its pre-revoke state: if it was lapsed
+        // the sweeper's marker stays, otherwise clear the terminal state.
+        if device["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
+            device["principalState"] = Value::Null;
+        }
+    }
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
+        .context("atomic write devices.json")?;
+    Ok(())
+}
+
+/// Mark delegated records whose effective deadline has passed as lapsed.
+/// Idempotent; never touches revoked or already-lapsed records; the record is
+/// KEPT as evidence (a vanished record is indistinguishable from one never
+/// there). Returns how many records newly lapsed.
+fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
+    let mut changed = 0;
+    for record in records.iter_mut() {
+        if record["principalKind"].as_str() != Some("delegated") {
+            continue;
+        }
+        if record["revoked"].as_bool() == Some(true)
+            || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED)
+            || record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED)
+        {
+            continue;
+        }
+        let Some(cert) = identity::DeviceCert::from_json(&record["deviceCert"]) else { continue };
+        let not_after = record["principalExpires"].as_u64();
+        let last_seen = record["lastSeen"].as_u64();
+        let max_offline = record["principalMaxOffline"].as_u64();
+        let (deadline, _clock) = effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+        if deadline <= now {
+            record["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
+            record["lapsedAt"] = json!(now);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Sweep the device store for lapsed delegated records. Called periodically by
+/// the daemon. Returns how many records newly lapsed.
+fn devices_sweep_lapsed(now: u64) -> usize {
+    let p = devices_path();
+    let Ok(raw) = std::fs::read_to_string(&p) else { return 0 };
+    let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return 0 };
+    let changed = sweep_lapsed(&mut arr, now);
+    if changed > 0 {
+        let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
+    }
+    changed
 }
 
 fn load_owner_key() -> Option<crate::identity::UserKey> {
@@ -4191,11 +4305,13 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
         .map(|item| item.as_str().map(str::to_string).ok_or_else(|| anyhow!("join ceiling contains a non-string capability")))
         .collect::<Result<Vec<_>>>()?;
     let max_offline = v["max_offline"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its offline budget ceiling"))?;
+    let persistent = v["persistent"].as_bool().unwrap_or(false);
     if expires != auth_key.expires
         || ceiling != auth_key.caps
         || max_offline != auth_key.max_offline
+        || persistent != !auth_key.ephemeral
     {
-        bail!("join acknowledgement changed a signed principal bound (ceiling, expiry, or offline budget)");
+        bail!("join acknowledgement changed a signed principal bound (ceiling, expiry, offline budget, or persistence)");
     }
     let local_cert = identity::DeviceCert::from_json(&v["device_cert"])
         .ok_or_else(|| anyhow!("join acknowledgement omitted the local device certificate"))?;
@@ -4874,9 +4990,17 @@ async fn enroll_and_send_cmd(
         ui::say(&format!("  {} sent {} ({} bytes)", ui::paint(ui::Tone::Ok, ui::glyph_ok()), name, total));
     }
     if let Some(name) = remember {
-        // Not stored as known device — delegated is ephemeral
-        ui::say(&format!("  {} delegated devices are ephemeral (--remember for enrollment not stored)", ui::paint(ui::Tone::Dim, "·")));
-        let _ = name;
+        // The SIGNED key decides persistence, not this flag (it cannot flip a
+        // signature). An ephemeral key cannot be remembered: a durable device
+        // needs a join invitation, which mints a persistent key.
+        if ak.ephemeral {
+            ui::say(&format!(
+                "  {} --remember cannot persist this enrollment: the key is signed ephemeral. For a remembered device, the owner invites it (`filament invite`) and it joins (`filament join`).",
+                ui::paint(ui::Tone::Warn, "·"),
+            ));
+        } else {
+            ui::say(&format!("  {} enrolled persistently as '{name}'", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+        }
     }
     Ok(())
 }
@@ -5209,10 +5333,35 @@ async fn handle_auth_key_enroll_response(
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
                 return;
             }
-            let requested_name = conn
+            // #155: the enrollment side READS the signed `ephemeral` flag. An
+            // ephemeral key admits in-memory only: nothing durable is written,
+            // so the device is gone at daemon restart by construction (Q2). A
+            // persistent key writes the durable record with the ceiling and the
+            // offline-budget pair, surviving restart.
+            let persistent = !ak.ephemeral;
+            let mut requested_name = conn
                 .link(&pid)
                 .map(|link| link.name.clone())
                 .unwrap_or_else(|| "joined-device".to_string());
+            // A device re-joining with its own device_pub meets its prior record.
+            // LAPSED revives (a network accident): keep the name for continuity,
+            // and the delegated write below OVERWRITES the whole bounding set
+            // from the NEW key (fresh bounds win, never merged). REVOKED is a
+            // decision, not an accident: refuse, and tell the owner only
+            // `devices restore` undoes it.
+            let prior = devices_find_by_device_pub(&device_pub);
+            if let Some(prior_record) = &prior {
+                if let Some(reason) = enrollment_refusal(prior_record) {
+                    ui::debug(&format!("enroll response refused: device {pid} was revoked"));
+                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": reason})).await;
+                    return;
+                }
+                if persistent && prior_record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) {
+                    if let Some(name) = prior_record["name"].as_str() {
+                        requested_name = name.to_string();
+                    }
+                }
+            }
             let secret = fresh_secret();
             let now = identity::now_secs();
             let certificate_ttl = ak.expires.saturating_sub(now);
@@ -5224,21 +5373,26 @@ async fn handle_auth_key_enroll_response(
                     return;
                 }
             };
-            let stored_name = match devices_upsert_atomic(
-                &requested_name,
-                Some(&secret),
-                Some(&device_cert),
-                Some(&ak.caps),
-                Some(identity::IntroScope::Device.to_byte()),
-                None,
-                Some((&ak.caps, ak.expires, ak.max_offline, ak.max_offline)),
-            ) {
-                Ok(name) => name,
-                Err(error) => {
-                    ui::debug(&format!("enroll response persistence failed: {error}"));
-                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-                    return;
+            let stored_name = if persistent {
+                match devices_upsert_atomic(
+                    &requested_name,
+                    Some(&secret),
+                    Some(&device_cert),
+                    Some(&ak.caps),
+                    Some(identity::IntroScope::Device.to_byte()),
+                    None,
+                    Some((&ak.caps, ak.expires, ak.max_offline, ak.max_offline)),
+                ) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        ui::debug(&format!("enroll response persistence failed: {error}"));
+                        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                        return;
+                    }
                 }
+            } else {
+                // Ephemeral: nothing durable is written; the name is session-only.
+                requested_name
             };
             // Admit as Delegated principal — structurally, all four fields together
             if let Some(link) = conn.link_mut(&pid) {
@@ -5255,7 +5409,8 @@ async fn handle_auth_key_enroll_response(
                 "owner_cert": local_device_cert().map(|cert| cert.to_json()),
                 "ceiling": ak.caps,
                 "expires": ak.expires,
-                "max_offline": ak.max_offline
+                "max_offline": ak.max_offline,
+                "persistent": persistent
             })).await;
             ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
@@ -10817,6 +10972,21 @@ async fn main() -> Result<()> {
                 Some(DevicesAction::Vouch { a, b }) => {
                     introduce_cmd(&server, &a, &b, relay).await?;
                 }
+                Some(DevicesAction::Revoke { name }) => {
+                    if !devices_load().iter().any(|(n, _)| n == &name) {
+                        bail!("no device named '{name}', see `filament devices`");
+                    }
+                    ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
+                    set_device_revoked(&name, true)?;
+                    println!("revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `filament devices restore {name}` can)");
+                }
+                Some(DevicesAction::Restore { name }) => {
+                    if !devices_load().iter().any(|(n, _)| n == &name) {
+                        bail!("no device named '{name}', see `filament devices`");
+                    }
+                    set_device_revoked(&name, false)?;
+                    println!("restored '{name}'; it is recognized again under its prior record");
+                }
             }
             Ok(())
         }
@@ -14223,6 +14393,10 @@ async fn recv_cmd(
     // live link, independent of traffic. Without this an idle-but-connected
     // device would decay against its offline budget and be reaped while alive.
     let mut last_liveness_observe = Instant::now();
+    // Periodic sweep: marks lapsed delegated records (deadline passed, no
+    // observation revived them). State-only; the gate already denies past the
+    // deadline, the sweep is what makes LAPSED visible in `devices`.
+    let mut last_sweep = Instant::now();
 
     // systemd Type=notify: announce readiness once the serving loop is about to
     // run, then ping the watchdog below. No-op when not run under systemd.
@@ -14673,6 +14847,17 @@ async fn recv_cmd(
                 .collect();
             for who in live {
                 devices_touch(&who, None, None);
+            }
+        }
+
+        // SWEEP: mark lapsed delegated records whose effective deadline has
+        // passed and which no observation revived. Runs every 30s; keeps the
+        // record as evidence (option b, decided deliberately).
+        if daemon && last_sweep.elapsed() >= Duration::from_secs(30) {
+            last_sweep = Instant::now();
+            let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
+            if lapsed > 0 {
+                ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
             }
         }
 
@@ -18946,8 +19131,178 @@ mod tests {
     }
 
     #[test]
-    fn effective_deadline_names_the_binding_clock() {
-        // Q1 coherence: the effective deadline is min(cert expiry, absolute
+    fn sweep_marks_lapsed_and_keeps_evidence() {
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let now = 1_000_000u64;
+        let delegated = |dpub: u8, overrides: &[(&str, serde_json::Value)]| -> Value {
+            let mut v = json!({
+                "name": format!("dev-{}", dpub),
+                "secret": "b".repeat(64),
+                "v": 2,
+                "caps": ["transfer"],
+                "deviceCert": mk_cert(dpub).to_json(),
+                "principalKind": "delegated",
+                "principalCeiling": ["transfer"],
+                "principalExpires": 9_999_999_999u64,
+                "principalMaxOffline": 10,
+                "principalMaxOfflineCeiling": 10,
+            });
+            if let serde_json::Value::Object(map) = &mut v {
+                for (k, val) in overrides {
+                    map.insert(k.to_string(), val.clone());
+                }
+            }
+            v
+        };
+        let mut arr = vec![
+            // A: budget expired (lastSeen 100s ago + 10s budget).
+            delegated(0xa1, &[("lastSeen", json!(now - 100))]),
+            // B: live (observed at now).
+            delegated(0xb2, &[("lastSeen", json!(now))]),
+            // C: revoked, must never be touched by the sweep.
+            delegated(0xc3, &[("revoked", json!(true)), ("principalState", json!("revoked"))]),
+            // D: already lapsed, must not be re-marked.
+            delegated(0xd4, &[("lastSeen", json!(now - 100)), ("principalState", json!("lapsed")), ("lapsedAt", json!(now - 1))]),
+        ];
+        let changed = sweep_lapsed(&mut arr, now);
+        assert_eq!(changed, 1, "only record A should newly lapse");
+        assert_eq!(arr[0]["principalState"].as_str(), Some("lapsed"));
+        assert_eq!(arr[0]["lapsedAt"].as_u64(), Some(now));
+        assert!(arr[1]["principalState"].is_null(), "a live record is untouched");
+        assert_eq!(arr[2]["principalState"].as_str(), Some("revoked"), "the sweep never touches revoked");
+        assert_eq!(arr[3]["principalState"].as_str(), Some("lapsed"), "already-lapsed stays as-is");
+        // The record is KEPT (option b): evidence survives.
+        assert_eq!(arr.len(), 4);
+    }
+
+    #[test]
+    fn fresh_join_bounds_win_over_revived_record() {
+        // A re-joining device is a NEW signed claim: the whole bounding set must
+        // be OVERWRITTEN from the new key, never merged. A device that re-joins
+        // with a narrower key must not inherit its wider old ceiling.
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let cert = mk_cert(0xa1);
+        let mut arr: Vec<Value> = vec![json!({
+            "name": "quietbox",
+            "secret": "b".repeat(64),
+            "v": 2,
+            "caps": ["mount", "transfer"],
+            "deviceCert": cert.to_json(),
+            "principalKind": "delegated",
+            "principalCeiling": ["mount", "transfer"],
+            "principalExpires": 5_000_000_000u64,
+            "principalMaxOffline": 2_592_000u64,
+            "principalMaxOfflineCeiling": 2_592_000u64,
+            "principalState": "lapsed",
+            "lapsedAt": 1_000_000u64,
+            "lastSeen": 1_000_000u64,
+        })];
+        let narrow = vec!["transfer".to_string()];
+        // Re-join with a key whose ceiling is [transfer] only.
+        upsert_peer_record(
+            &mut arr,
+            "quietbox",
+            Some("newsecret"),
+            Some(&cert),
+            Some(&narrow),
+            None,
+            None,
+            Some((&narrow, 5_500_000_000u64, 86_400u64, 86_400u64)),
+        );
+        assert_eq!(arr[0]["principalCeiling"], json!(["transfer"]),
+            "fresh join must OVERWRITE the old ceiling, never merge the wider one back");
+        assert_eq!(arr[0]["principalMaxOffline"].as_u64(), Some(86_400), "budget overwritten too");
+        assert!(arr[0]["principalState"].is_null(), "revival clears the lapsed marker");
+        // mount must be refused under the new narrower ceiling.
+        let decision = crate::capability::cap_gate_effective(
+            true,
+            &crate::capability::CapOutcome::Authorized,
+            crate::capability::CAP_MOUNT,
+            "self",
+            Some(&cert.device_pub),
+            Some(&cert.user_pub),
+            crate::capability::BindingStrength::Proven,
+            Some(5_500_000_000u64),
+            Some(&narrow),
+            Some(&cert.user_pub),
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(decision, crate::capability::GateDecision::Deny { .. }),
+            "mount must be refused after the narrower re-join");
+    }
+
+    #[test]
+    fn revoked_record_is_not_revivable_by_enrollment() {
+        let mk_record = |state: Option<&str>, revoked: bool| -> Value {
+            let mut v = json!({
+                "name": "quietbox",
+                "secret": "b".repeat(64),
+                "deviceCert": {
+                    "devicePub": hex::encode([0x42u8; 32]),
+                    "userPub": hex::encode([0x11u8; 32]),
+                    "expires": 9_999_999_999u64,
+                    "issued": 1u64,
+                    "sig": hex::encode([0u8; 64]),
+                },
+                "principalKind": "delegated",
+                "principalCeiling": ["transfer"],
+            });
+            if let serde_json::Value::Object(map) = &mut v {
+                if revoked { map.insert("revoked".into(), json!(true)); }
+                if let Some(s) = state { map.insert("principalState".into(), json!(s)); }
+            }
+            v
+        };
+        // REVOKED is a decision: any fresh invitation is refused.
+        assert!(enrollment_refusal(&mk_record(Some("revoked"), true)).is_some());
+        assert!(enrollment_refusal(&mk_record(None, true)).is_some(), "the durable revoked flag alone must refuse");
+        // LAPSED is an accident: it revives, it is not a refusal.
+        assert!(enrollment_refusal(&mk_record(Some("lapsed"), false)).is_none());
+        assert!(enrollment_refusal(&mk_record(None, false)).is_none());
+
+        // And the gate refuses the revoked device on reconnect.
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fil-revoke-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let p = dir.join("devices.json");
+        std::fs::write(&p, serde_json::to_string(&serde_json::json!([{
+            "name": "quietbox",
+            "secret": "b".repeat(64),
+            "v": 2,
+            "caps": ["transfer"],
+            "deviceCert": {
+                "devicePub": hex::encode([0x42u8; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            },
+            "revoked": true,
+        }])).unwrap()).unwrap();
+        assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn effective_deadline_names_the_binding_clock() {        // Q1 coherence: the effective deadline is min(cert expiry, absolute
         // stop, last_seen + offline budget), and the returned clock says which
         // one actually binds, so "X time left" never lies about the bound in
         // charge.
