@@ -11,11 +11,11 @@ wire protocol, same one-time codes as the web app.
 filament send video.mp4 --code
 #   code: clever-lynx-63
 # other machine:
-filament recv clever-lynx-63
+filament receive clever-lynx-63
 # or: open filament.autumated.com on any phone and claim the code there
 
 # same network? no code needed: auto-discovery
-filament recv -y --dir ~/Drops          # this terminal
+filament receive -y --dir ~/Drops       # this terminal
 filament send report.pdf                # any device on the same network
 
 # directories tar on the fly; stdin works
@@ -32,7 +32,7 @@ filament send x.bin --server https://your-instance.example
   `<name>.part.meta`; a re-offer of the same file (name + size) continues
   from the bytes on disk. Browsers lose the file handle on reload: the CLI
   has a real filesystem, so it doesn't.
-- **Headless.** `filament recv -y --dir` on a server is a drop target for
+- **Headless.** `filament receive -y --dir` on a server is a drop target for
   any browser or CLI that can reach the signaling server.
 
 ## What it shares with the web app
