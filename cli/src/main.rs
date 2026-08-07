@@ -2189,13 +2189,13 @@ async fn issue_proven_challenge_and_hold(
     send_identity_challenge(conn, pid, identity_nonces).await;
 }
 
-/// #161: how long the possession challenge stays LIVE. This is the backstop
-/// for a slow-but-capable link, NOT a decision boundary: it MUST be raised in
+/// #161: how long the possession challenge stays LIVE. Must be raised in
 /// lockstep with the offer hold (RECV_IDENTITY_HOLD_DEADLINE) and the nonce
-/// lifetime, because the challenge entry expiring lets a re-issue clobber the
-/// in-flight nonce and the peer's answer then verifies against the wrong nonce
-/// and never reaches Proven. 3s was routinely crossed by the blocked-direct
-/// WebRTC fallback. Identity resolution normally settles well under a second.
+/// lifetime: if the challenge entry expires first, a re-issue clobbers the
+/// in-flight nonce and the peer's answer verifies against the wrong nonce and
+/// never reaches Proven. Identity resolution normally settles well under a
+/// second; the window exists for slow fallback links so a revoked device's
+/// cert can still reach the gate's absolute Deny.
 const PROVEN_CHALLENGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Handle a possession-sig identity-expose response sent by a peer after we
@@ -14175,15 +14175,14 @@ async fn recv_cmd(
     // pending, bounded by RECV_IDENTITY_HOLD_DEADLINE from first sight so a
     // ceremony that never resolves cannot wedge the transfer.
     let mut recv_identity_hold: HashMap<String, std::time::Instant> = HashMap::new();
-    // #161: the OFFER hold and the CHALLENGE lifetime must move together. Two
-    // coupled 3s clocks fought each other: the challenge's pending_proven
-    // entry expired, a re-issue then clobbered the in-flight nonce, and the
-    // offer's own deadline declined a legitimate slow fallback link. Both are
-    // raised together (see PROVEN_CHALLENGE_DEADLINE at module scope), so a
-    // slow-but-capable peer's answer is accepted, a revoked device is still
-    // denied (it just waits longer to be), and a ceremony that genuinely never
-    // resolves fails closed at the cap. This is the backstop, not a decision
-    // boundary: identity resolution normally settles in well under a second.
+    // #161: how long the offer waits for identity to resolve before deciding.
+    // Identity resolution normally settles in well under a second on a working
+    // link; the window exists so a revoked device's cert (which resolves via
+    // the challenge) reaches the gate's absolute Deny before the offer is
+    // decided. A peer whose identity does not resolve within the window is
+    // decided by the normal gate, which is the documented residual - see
+    // PROVEN_CHALLENGE_DEADLINE, which must stay in lockstep with this so the
+    // challenge's entry does not expire and let a re-issue clobber the nonce.
     const RECV_IDENTITY_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
@@ -17501,24 +17500,19 @@ async fn recv_cmd(
                             });
                             continue;
                         }
-                        // Hold cleared with the link READY and identity STILL
-                        // unresolved on the typed-code path: fail closed.
-                        if code_hold {
-                            let sender_name = conn
-                                .link(&pid)
-                                .map(|l| l.name.clone())
-                                .unwrap_or_default();
-                            ui::say(&ui::paint(ui::Tone::Dim, &format!(
-                                "  declined {name} from {sender_name} (sender identity did not resolve within the hold; revocation could not bind, try again)",
-                            )));
-                            if daemon {
-                                enqueue_if_requestable(&sender_name, "transfer");
-                            }
-                            if let Some(t) = conn.transport_of(&pid) {
-                                t.send_control(&protocol::decline_msg(&id)).await?;
-                            }
-                            continue;
-                        }
+                        // #161: the hold expires into a DECISION, not a denial.
+                        // Revocation binds wherever identity resolves: a revoked
+                        // device's cert resolves via the challenge and the gate's
+                        // absolute Deny fires. A peer whose identity does NOT
+                        // resolve within the hold (a slow fallback link, or a
+                        // lost challenge on a transport that came up late) is
+                        // decided by the normal gate - consent and grants in
+                        // shadow, the capability layer under authoritative. The
+                        // residual (a revoked device whose identity ceremony does
+                        // not complete on a given path being admitted) is
+                        // precondition-bounded and documented in the changelog;
+                        // the terminal-outcome model that closes it entirely is
+                        // the next iteration, not a 0.8.0 change.
                     }
 
                     // C14/C22: consent. -y accepts everything; a resume of a

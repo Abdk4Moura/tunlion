@@ -23,15 +23,16 @@ the GitHub release notes.
   bind on the direct path and the WebRTC/relay path alike. The receiver issues
   the possession challenge in both modes for a typed-code link (at DirectReady
   on the direct path and at PAKE confirm, re-issued at ChannelReady when the
-  transport arrives late, on the WebRTC path), holds the first offer until
-  identity settles, and the gate denies a durably revoked device's first
-  operation before any bytes land. The bound is explicit: a peer whose identity
-  does not resolve within the 3s hold is DECLINED, never admitted - the
-  operator is present by construction (they typed the code), so the cost is a
-  retry. Peers too old to run the encrypted handshake abort earlier with an
+  transport arrives late, on the WebRTC path) and holds the first offer until
+  the sender's identity resolves, so the gate's absolute denial of a durably
+  revoked device fires before any bytes land. The bound is explicit: a peer
+  whose identity resolves is decided with it (revoked denied, legitimate
+  accepted); a peer whose identity ceremony does NOT complete within the hold
+  window (a slow fallback link or a lost challenge) is decided by the normal
+  gate. Peers too old to run the encrypted handshake abort earlier with an
   update message and never reach this hold; peers that can run the handshake,
   including 0.7.7 senders, answer the possession challenge and resolve within
-  the hold on a functioning link. The probe that found the window stays
+  the window on a functioning link. The probe that found the window stays
   permanently: it goes quiet only when the ordering is fixed.
 
 ### Added
