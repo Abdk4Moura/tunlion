@@ -3995,6 +3995,20 @@ fn capability_list_summary(caps: &[String]) -> String {
         .join(", ")
 }
 
+/// Compact human duration ("30d", "8h", "15m", "90s") for copy that names a
+/// signed budget. Never em-dashes.
+fn fmt_short_duration(secs: u64) -> String {
+    if secs >= 86400 && secs % 86400 == 0 {
+        format!("{}d", secs / 86400)
+    } else if secs >= 3600 && secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Human state text for a DELEGATED device's row, quoting the binding clock
 /// from effective_principal_deadline (never restating a bound we do not compute).
 /// Returns None for owner devices (they keep the existing cert countdown).
@@ -4635,6 +4649,9 @@ async fn invite_cmd(
         eprintln!("  {}", ui::paint(ui::Tone::Brand, "JOIN INVITATION"));
         eprintln!("  kind     {kind}");
         eprintln!("  ceiling  {}", ceiling.join(", "));
+        eprintln!("  budget   {} (the key allows up to {})",
+            fmt_short_duration(auth_key.max_offline),
+            fmt_short_duration(auth_key.max_offline));
         eprintln!("  expires  {ttl_text}");
         eprintln!();
         eprintln!("  Whoever captures this can join until it is used or expires.");
@@ -4648,6 +4665,7 @@ async fn invite_cmd(
         println!("{}", serde_json::to_string_pretty(&json!({
             "kind": kind,
             "ceiling": ceiling,
+            "maxOffline": auth_key.max_offline,
             "expires": auth_key.expires,
             "writtenTo": out,
             "invitationSecretPrinted": false,
@@ -4715,8 +4733,11 @@ async fn join_cmd(
         eprintln!("  as       {proposed_name}");
         eprintln!("  owner    {}", owner_name.as_deref().unwrap_or("invitation issuer"));
         eprintln!("  ceiling  {}", capability_list_summary(&auth_key.caps));
+        eprintln!("  budget   {} (key allows up to {})",
+            fmt_short_duration(auth_key.max_offline),
+            fmt_short_duration(auth_key.max_offline));
         eprintln!("  expires  {}", auth_key.expires);
-        eprintln!("  proof    the ceiling is persisted and reloaded before reconnect authorization");
+        eprintln!("  proof    the ceiling and budget are persisted and reloaded before reconnect authorization");
         let confirmation = prompt_line("\n  Press Enter to join, or type cancel: ")?;
         if confirmation.eq_ignore_ascii_case("cancel") {
             bail!("cancelled");
