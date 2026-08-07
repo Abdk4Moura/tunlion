@@ -17,7 +17,7 @@ Already installed? `filament update`
 ## Quick start
 ```
 filament send video.mp4 --code      # speak the code aloud
-filament recv clever-lynx-63        # …or open filament.autumated.com in any browser
+filament receive clever-lynx-63     # …or open filament.autumated.com in any browser
 ```
 
 All binaries are checksummed (SHA256SUMS) and carry GitHub build

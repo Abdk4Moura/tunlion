@@ -35,9 +35,9 @@ Every prebuilt binary is checksummed against the release `SHA256SUMS` and carrie
 
 ```sh
 filament send video.mp4 --code       # speak the code aloud
-filament recv clever-lynx-63         # …or open the website on the other device
+filament receive clever-lynx-63      # …or open the website on the other device
 
-filament pair --name phone           # remember a device (no file needed)
+filament add --name phone            # remember a device (no file needed)
 filament up                          # receive in the background
 ```
 
