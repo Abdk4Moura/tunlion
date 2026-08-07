@@ -1593,7 +1593,7 @@ fn fleet_certificate_warning_for(
         return None;
     }
     Some(format!(
-        "{} {} still has fleet access via its certificate.\n  To remove it entirely: filament revoke {} --certificate",
+        "{} {} still has fleet access via its certificate.\n  Revoke it: filament revoke {} --certificate",
         ui::paint(ui::Tone::Warn, ui::glyph_warn()),
         name,
         name,
@@ -1602,15 +1602,31 @@ fn fleet_certificate_warning_for(
 
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
+///
+/// Absence semantics are the #156 fix: distinguish the two kinds of "no
+/// `certRevoked` field". A device with NO record at all fails closed to
+/// revoked; a KNOWN record whose field is absent starts clean (NOT revoked).
+/// The old `.and_then(...).unwrap_or(true)` collapsed both into `true`, so
+/// every legacy record without the field read as revoked.
 fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     let p = devices_path();
     let Ok(raw) = std::fs::read_to_string(&p) else { return true };
     let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return true };
     let key = hex::encode(device_pub);
-    arr.iter()
-        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
-        .and_then(|d| d["certRevoked"].as_bool())
-        .unwrap_or(true)
+    match arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key)) {
+        None => true,                                           // unknown device
+        Some(d) => d["certRevoked"].as_bool().unwrap_or(false), // known, unmarked
+    }
+}
+
+/// #157 call-site derivation for the gate's `cert_revoked` input. A peer with
+/// NO resolved device identity is UNIDENTIFIED, not revoked: revocation is a
+/// decision about a KNOWN device, and an unidentified peer is one the gate
+/// must judge by binding strength, trust floor and grants. The unknown-DEVICE
+/// case (a device_pub with no record) still fails closed to revoked inside
+/// `device_cert_revoked`, where that judgement belongs.
+fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
+    idev.map(device_cert_revoked).unwrap_or(false)
 }
 
 /// Mark a stored device certificate revoked locally. The check path must
@@ -10158,7 +10174,7 @@ async fn main() -> Result<()> {
                     bail!("device '{device}' certificate is not chained to this user identity");
                 }
                 set_device_cert_revoked(&device, true)?;
-                println!("revoked fleet certificate from '{device}'; fleet access is denied locally");
+                println!("revoked fleet certificate from '{device}'; the device is denied by the local capability gate");
                 return Ok(());
             }
             let capability = capability
@@ -14750,7 +14766,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
+                        let cert_revoked = cert_revoked_for(idev);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -14913,7 +14929,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
+                        let cert_revoked = cert_revoked_for(idev);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -15031,7 +15047,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
+                        let cert_revoked = cert_revoked_for(idev);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -15217,7 +15233,7 @@ async fn recv_cmd(
                         let iusr = link.and_then(|l| l.identity_user_pub.as_ref());
                         let binding = link.map(|l| l.identity_binding).unwrap_or(crate::capability::BindingStrength::None);
                         let expires = link.and_then(|l| l.identity_cert_expires);
-                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
+                        let cert_revoked = cert_revoked_for(idev);
                         let ak_caps = link.and_then(|l| l.principal_kind.auth_key_caps());
                         let outcome = crate::capability::cap_authorize(
                             &crate::settings::config_dir(),
@@ -15844,7 +15860,7 @@ async fn recv_cmd(
                         // could still redirect the write — closed separately by the
                         // plain-file-only (O_NOFOLLOW/O_EXCL) write hardening tracked as
                         // a fleet-trust follow-up.
-                        let cert_revoked = idev.map(device_cert_revoked).unwrap_or(true);
+                        let cert_revoked = cert_revoked_for(idev);
                         let landing = dir.join(&name);
                         let scoped_in_bounds = crate::path_within(&dir, &landing);
                         let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
@@ -16796,6 +16812,10 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 mod tests {
     use super::*;
 
+    /// Serialize tests that mutate the process-global FILAMENT_CONFIG_DIR, so
+    /// parallel unit threads cannot clobber each other's isolated config.
+    static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn exhausted_giveup_then_digest_does_not_recreate_link() {
         let mut suppressed = HashSet::new();
@@ -17271,6 +17291,7 @@ mod tests {
         // round-trip rewrote every survivor as bare {name, secret}, silently
         // dropping their grants, a remembered device lost its shell on the
         // next `forget`/`pair`.
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("fil-store-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Serialize: these tests mutate the process-global FILAMENT_CONFIG_DIR.
@@ -17301,6 +17322,68 @@ mod tests {
 
         unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoked_reader_absent_field_is_not_revoked_but_missing_record_is() {
+        // #156: the reader must distinguish "record present, no `certRevoked`
+        // field" (NOT revoked; a known device starts clean) from "no record at
+        // all" (revoked; fail closed). The old `.and_then(...).unwrap_or(true)`
+        // collapsed both into `true`, so every legacy record without the field
+        // (6 live production records, zero with it) read as revoked.
+        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("fil-revoked-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let clean = [0x11u8; 32];
+        let revoked = [0x22u8; 32];
+        let p = dir.join("devices.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "cleanbox", "secret": "b".repeat(64), "v": 2, "caps": ["transfer"],
+                 "deviceCert": {"devicePub": hex::encode(clean)}},
+                {"name": "revokedbox", "secret": "b".repeat(64), "v": 2, "caps": ["transfer"],
+                 "deviceCert": {"devicePub": hex::encode(revoked)}, "certRevoked": true},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            !device_cert_revoked(&clean),
+            "record present without certRevoked must be NOT revoked"
+        );
+        assert!(
+            device_cert_revoked(&revoked),
+            "record with certRevoked=true must be revoked"
+        );
+        let nobody = [0x33u8; 32];
+        assert!(
+            device_cert_revoked(&nobody),
+            "no record at all must fail closed to revoked"
+        );
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unidentified_peer_is_not_revoked_but_unknown_device_is() {
+        // #157 call-site derivation: a peer with NO resolved device identity
+        // (idev=None) must derive cert_revoked=false. The old
+        // `.map(device_cert_revoked).unwrap_or(true)` at the call sites
+        // conflated "we do not know who you are" with "you are revoked", and
+        // the absolute gate Deny turned that into a total transfer outage for
+        // every freshly paired peer before identity resolution settles. The
+        // unknown-DEVICE case (a device_pub with no record) still fails closed
+        // to revoked inside device_cert_revoked.
+        assert!(!cert_revoked_for(None), "no identity must not read as revoked");
+        let unknown = [0x44u8; 32];
+        assert!(
+            cert_revoked_for(Some(&unknown)),
+            "an unknown device record must still fail closed to revoked"
+        );
     }
 
     #[test]

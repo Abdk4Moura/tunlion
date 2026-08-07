@@ -386,6 +386,22 @@ pub fn cap_gate_effective(
         }
     }
 
+    // === Revoked device, absolute (before any grant) =====================
+    // `cert_revoked` is the durable decision that this DEVICE is no longer
+    // welcome. It must reach EVERY path, in BOTH modes:
+    //   - `legacy_allowed` is a CALLER PARAMETER that never sees cert_revoked,
+    //     yet in the shipped default (shadow) mode `effective` falls through to
+    //     it. Gate it here so revocation withdraws legacy trust too — otherwise
+    //     a revoked device the legacy path trusts stays authorized with no flag
+    //     flipped.
+    //   - the early return names the reason and denies before the
+    //     `fleet_ok || has_explicit_grant` decision can recompute the outcome
+    //     to Authorized for a revoked device holding a standing grant.
+    let legacy_allowed = legacy_allowed && !cert_revoked;
+    if cert_revoked {
+        return GateDecision::Deny { cap_reason: Some("device revoked".into()) };
+    }
+
     // === Same-owner fleet trust (Proven-gated scoped defaults) =============
     // A peer whose device cert chains to MY user key (`own_user_pub`) is a FLEET
     // MEMBER, not the local primary. The owner shortcut inside
@@ -1363,6 +1379,67 @@ mod tests {
              Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "same-owner INFERRED must get nothing, even in-scope");
+    }
+
+    #[test]
+    fn revoked_device_denied_even_with_explicit_grant() {
+        // #157: revocation must be absolute, ahead of the ceiling check AND
+        // ahead of fleet_ok || has_explicit_grant. Every existing call site in
+        // this suite passes cert_revoked=false, so the (revoked, explicit-grant)
+        // pair was never exercised: a revoked device holding a standing grant
+        // stayed authorized, because revocation only fed the fleet auto-trust
+        // path while has_explicit_grant recomputed the outcome to Authorized.
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
+        let me = [0x55u8; 32];
+        let d = cap_gate_effective(
+            true, &CapOutcome::Authorized, "shell", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ true, /*cert_revoked*/ true,
+        );
+        assert!(!d.allowed(), "a revoked device must be denied even with an explicit grant");
+        assert_eq!(
+            d.deny_reason("legacy"),
+            "device revoked",
+            "the denial must name the revocation, not the grant"
+        );
+    }
+
+    #[test]
+    fn revoked_device_denied_even_with_fleet_auto_trust() {
+        // The fleet path alone (same-owner Proven in-scope) must also be denied.
+        // Pre-fix fleet_auto_trust already received !cert_revoked, so this arm
+        // held; the explicit-grant path above is where the old gate leaked.
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
+        let me = [0x66u8; 32];
+        let d = cap_gate_effective(
+            true, &CapOutcome::Authorized, "transfer", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ true,
+        );
+        assert!(!d.allowed(), "a revoked device must be denied even when fleet auto-trust would apply");
+    }
+
+    #[test]
+    fn revoked_device_denied_in_default_mode_even_when_legacy_allows() {
+        // #157 in the SHIPPED default (shadow) mode: `effective` falls through
+        // to `legacy_allowed`, which is a caller parameter that never sees
+        // cert_revoked. A revoked device the legacy path trusts must be denied
+        // with authoritative OFF — this is the case broken in production.
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
+        let prior = std::env::var("FILAMENT_CAP_AUTHORITATIVE").unwrap_or_default();
+        unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", "0") };
+        let me = [0x77u8; 32];
+        let d = cap_gate_effective(
+            true, &CapOutcome::Authorized, "transfer", "self",
+            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
+            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ true, /*cert_revoked*/ true,
+        );
+        if prior.is_empty() {
+            unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") };
+        } else {
+            unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", &prior) };
+        }
+        assert!(!d.allowed(), "a revoked device must be denied in default mode even when legacy allows");
     }
 
     #[test]
