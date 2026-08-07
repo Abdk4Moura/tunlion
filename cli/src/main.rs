@@ -1833,7 +1833,6 @@ fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
 fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
-}
 
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
