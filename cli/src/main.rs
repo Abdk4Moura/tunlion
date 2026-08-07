@@ -684,6 +684,11 @@ enum Cmd {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Tell the owner you are shutting down so it frees your slot now.
+    /// Advisory only: if the owner is unreachable, the offline budget still
+    /// lapses you. A joined device's end-of-life verb.
+    #[command(hide = true)]
+    Depart,
     // ── Devices ─────────────────────────────────────────────────────
     /// List known devices (trusted for --to and auto-accept)
     #[command(next_help_heading = "Devices")]
@@ -4345,6 +4350,166 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
     )?;
     config_set("name", assigned_name)?;
     Ok(assigned_name.to_string())
+}
+
+/// Mark a device record lapsed immediately (advisory depart, or manual). The
+/// record is KEPT (option b): evidence survives. Returns the device name.
+fn mark_lapsed_now(device_pub: &[u8; 32]) -> Option<String> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let mut arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let key = hex::encode(device_pub);
+    let name = arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+        .and_then(|d| d["name"].as_str().map(str::to_string))?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    for d in arr.iter_mut() {
+        if d["name"].as_str() == Some(&name) {
+            d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
+            d["lapsedAt"] = json!(now);
+            break;
+        }
+    }
+    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
+    Some(name)
+}
+
+/// The joined device's owner record: the stored device whose cert chains to our
+/// own joined cert's issuer but is not this machine. `depart` uses it to reach
+/// the owner and ask it to free the slot now.
+fn joined_owner_record() -> Option<(String, String)> {
+    let mine = local_device_cert()?;
+    devices_load().into_iter().find(|(name, _)| {
+        device_cert_for(name)
+            .map(|cert| cert.user_pub == mine.user_pub && cert.device_pub != mine.device_pub)
+            .unwrap_or(false)
+    })
+}
+
+/// Advisory end-of-life verb for a joined device: tell the owner to free the
+/// slot NOW instead of paying out the whole offline budget. NEVER load-bearing:
+/// a crash, a power cut, or a hostile device sends nothing, and the budget is
+/// the mechanism that lapses them. The goodbye is only an optimization the
+/// polite path uses.
+async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
+    let Some((owner_name, owner_secret)) = joined_owner_record() else {
+        bail!("no joined owner on this device; `depart` is the end-of-life verb for a joined device");
+    };
+    let device_pub = crate::overlay::overlay_pubkey_bytes()?;
+    let msg = format!("filament-depart:v1:{}", hex::encode(device_pub));
+    let sig = crate::overlay::overlay_sign_possession(msg.as_bytes())?;
+
+    let my_uid = mk_uid("d");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let owner_chan = channel_of(&owner_secret);
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(format!("depart-{}", fresh_secret()));
+    sess.channels = vec![owner_chan.clone()];
+    sess.emit(&sio, "join", json!({ "room": sess.room.as_ref().unwrap(), "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [owner_chan] })).await;
+
+    let mut conn = Conn::for_command(
+        server,
+        sio.clone(),
+        tx.clone(),
+        my_uid,
+        relay,
+        Some(owner_name.clone()),
+        false,
+        direct::direct_enabled(),
+    );
+
+    let started = Instant::now();
+    let deadline = Duration::from_secs(20);
+    let mut sent = false;
+    let mut acked = false;
+    loop {
+        let slice = Duration::from_secs(2).min(deadline.saturating_sub(started.elapsed()));
+        let ev = match tokio::time::timeout(slice, rx.recv()).await {
+            Ok(Some(ev)) => Some(ev),
+            Ok(None) => break,
+            Err(_) => None,
+        };
+        sess.tick(&sio).await;
+        if !sent {
+            let goodbye = conn.links.iter().find_map(|(pid, l)| {
+                l.transport.as_ref().filter(|t| t.is_alive()).map(|t| (pid.clone(), t.clone()))
+            });
+            if let Some((_, t)) = goodbye {
+                let _ = t.send_control(&json!({
+                    "type": "depart",
+                    "device_pub": hex::encode(device_pub),
+                    "msg": msg,
+                    "sig": hex::encode(sig),
+                })).await;
+                sent = true;
+                ui::say(&format!("  {} told {owner_name} you are departing", ui::paint(ui::Tone::Dim, "->")));
+            }
+        }
+        let Some(ev) = ev else { continue };
+        match ev {
+            Ev::Welcome(v) => {
+                if let Some(id) = v["id"].as_str() { conn.my_id = id.to_string(); }
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers { conn.maybe_adopt(p, false).await?; }
+                }
+            }
+            Ev::PeerJoined(v) => { conn.maybe_adopt(&v, false).await?; }
+            Ev::Synced(v) => {
+                if let Some(roster) = sess.on_synced(&v) {
+                    for p in &roster.peers { conn.maybe_adopt_from(p, false, AdoptSource::Digest).await?; }
+                }
+            }
+            Ev::KnownPeer(v) => {
+                if !is_self_uid(&conn.my_uid, v["uid"].as_str()) {
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    if !pid.is_empty() && !conn.links.contains_key(&pid) && !conn.direct_pending.contains_key(&pid) {
+                        conn.roster.insert(pid.clone(), v.clone());
+                        conn.establish_as(v.clone(), Some(false)).await?;
+                    }
+                }
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                conn.apply_signal(&from, data).await;
+            }
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
+                }
+                if conn.active.is_none() {
+                    conn.active = Some(pid.clone());
+                }
+            }
+            Ev::Control(_pid, v) => {
+                if v["type"].as_str() == Some("depart-ack") {
+                    acked = true;
+                }
+            }
+            Ev::SignalingDown(reason) => {
+                ui::debug(&format!("depart: signaling down: {reason}"));
+                break;
+            }
+            _ => {}
+        }
+        if sent && acked { break; }
+        if sent && started.elapsed() >= Duration::from_secs(5) { break; }
+        if started.elapsed() >= deadline { break; }
+    }
+    let _ = sio.disconnect().await;
+    if acked {
+        ui::say(&format!("  {} {owner_name} acknowledged; your slot is freed", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+    } else {
+        ui::say(&format!("  {} departure advisory: if {owner_name} was unreachable, the offline budget still lapses you", ui::paint(ui::Tone::Dim, "·")));
+    }
+    Ok(())
 }
 
 async fn invite_cmd(
@@ -10905,6 +11070,7 @@ async fn main() -> Result<()> {
         Cmd::Join { invite_file, invite_fd, name, to } => {
             join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
         }
+        Cmd::Depart => depart_cmd(&server, relay).await,
         Cmd::Devices { action, json } => {
             match action {
                 None => {
@@ -15951,6 +16117,30 @@ async fn recv_cmd(
                     sess.channels = devices.iter().map(|(_, secret)| channel_of(secret)).collect();
                     sess.invalidate();
                 }
+                Some("depart") => {
+                    // Advisory goodbye: a joined device asks to free its slot NOW.
+                    // Verify possession of the claimed device_pub, then mark the
+                    // record lapsed immediately. Never load-bearing: if this
+                    // message never arrives, the offline budget lapses it anyway.
+                    let dpub_hex = v["device_pub"].as_str().unwrap_or_default();
+                    let msg = v["msg"].as_str().unwrap_or_default();
+                    let sig_hex = v["sig"].as_str().unwrap_or_default();
+                    if let (Ok(dpub), Ok(sig)) = (hex::decode(dpub_hex), hex::decode(sig_hex)) {
+                        if let (Ok(dpub_arr), Ok(sig_arr)) = (
+                            dpub.as_slice().try_into().map(|a: &[u8; 32]| *a),
+                            sig.as_slice().try_into().map(|a: &[u8; 64]| *a),
+                        ) {
+                            if crate::identity::verify_possession_sig(&dpub_arr, msg.as_bytes(), &sig_arr).is_ok() {
+                                if let Some(name) = mark_lapsed_now(&dpub_arr) {
+                                    ui::say(&format!("{} {name} departed; slot freed immediately", ui::paint(ui::Tone::Dim, "·")));
+                                    if let Some(t) = conn.transport_of(&pid) {
+                                        let _ = t.send_control(&json!({"type": "depart-ack", "name": name})).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 _ if !conn.links.contains_key(&pid) => {}
                 // Warm-reuse liveness: the acceptor confirmed a stream WE initiated
                 // (a warm `open`) is connected end to end. Route it to the mux so
@@ -18054,9 +18244,16 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 mod tests {
     use super::*;
 
-    /// Serialize tests that mutate the process-global FILAMENT_CONFIG_DIR, so
-    /// parallel unit threads cannot clobber each other's isolated config.
-    static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// FILAMENT_CONFIG_DIR is process-global, so tests that point it at their
+    /// own temp dir must not run concurrently with each other (a second test
+    /// overwriting the env mid-test would make it read/write the wrong store).
+    /// Every test that sets the var holds this lock for its whole body.
+    static TEST_CONFIG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
+        // Poison-tolerant: a test that panics while holding the lock must not
+        // poison every later FILAMENT_CONFIG_DIR test.
+        TEST_CONFIG_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn exhausted_giveup_then_digest_does_not_recreate_link() {
@@ -18533,7 +18730,7 @@ mod tests {
         // round-trip rewrote every survivor as bare {name, secret}, silently
         // dropping their grants, a remembered device lost its shell on the
         // next `forget`/`pair`.
-        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let _guard = lock_test_config();
         let dir = std::env::temp_dir().join(format!("fil-store-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Serialize: these tests mutate the process-global FILAMENT_CONFIG_DIR.
@@ -18573,7 +18770,7 @@ mod tests {
         // all" (revoked; fail closed). The old `.and_then(...).unwrap_or(true)`
         // collapsed both into `true`, so every legacy record without the field
         // (6 live production records, zero with it) read as revoked.
-        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
+        let _guard = lock_test_config();
         let dir = std::env::temp_dir().join(format!("fil-revoked-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
@@ -19073,6 +19270,7 @@ mod tests {
         // the periodic observation refreshes lastSeen from link-up state, not
         // from messages. Once the link is down and no observation runs, the
         // budget binds and the device lapses.
+        let _guard = lock_test_config();
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("fil-liveness-{}-{}", std::process::id(), unique));
         std::fs::create_dir_all(&dir).unwrap();
@@ -19279,6 +19477,7 @@ mod tests {
         assert!(enrollment_refusal(&mk_record(None, false)).is_none());
 
         // And the gate refuses the revoked device on reconnect.
+        let _guard = lock_test_config();
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("fil-revoke-{}-{}", std::process::id(), unique));
         std::fs::create_dir_all(&dir).unwrap();
@@ -19299,6 +19498,72 @@ mod tests {
             "revoked": true,
         }])).unwrap()).unwrap();
         assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn mark_lapsed_now_frees_slot_and_keeps_evidence() {
+        let _guard = lock_test_config();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fil-depart-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let p = dir.join("devices.json");
+        std::fs::write(&p, serde_json::to_string(&serde_json::json!([{
+            "name": "quietbox",
+            "secret": "b".repeat(64),
+            "v": 2,
+            "caps": ["transfer"],
+            "deviceCert": {
+                "devicePub": hex::encode([0x42u8; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            },
+            "principalKind": "delegated",
+            "principalCeiling": ["transfer"],
+        }])).unwrap()).unwrap();
+        // Advisory goodbye frees the slot NOW and KEEPS the record (option b).
+        let name = mark_lapsed_now(&[0x42u8; 32]);
+        assert_eq!(name.as_deref(), Some("quietbox"));
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(raw.contains("lapsed"), "the record must be marked lapsed");
+        assert!(raw.contains("\"quietbox\""), "the record must be kept as evidence");
+        // Lapsed is NOT revoked: the gate still denies by deadline, but a
+        // revoked lookup must not conflate the two.
+        assert!(!device_cert_revoked(&[0x42u8; 32]), "lapsed is not revoked");
+    }
+
+    #[test]
+    fn joined_owner_record_finds_the_owner_not_self() {
+        let _guard = lock_test_config();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fil-owner-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(dir.join("identity")).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        // A real overlay key for "this machine", so local_device_cert resolves.
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let self_pub: [u8; 32] = ring::signature::KeyPair::public_key(&kp).as_ref().try_into().unwrap();
+        std::fs::write(dir.join("overlay.ed25519"), pkcs8.as_ref()).unwrap();
+        // A real owner user key; the joined cert and the owner's cert both chain
+        // to it (exactly the join scenario).
+        let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+        let now = identity::now_secs();
+        let mine = identity::DeviceCert::certify(&uk, self_pub, now, 86400).unwrap();
+        let owner_cert = identity::DeviceCert::certify(&uk, [0xCCu8; 32], now, 86400).unwrap();
+        std::fs::write(dir.join("identity/device-cert.json"), serde_json::to_string(&serde_json::json!({
+            "name": "joinedbox",
+            "cert": mine.to_json(),
+        })).unwrap()).unwrap();
+        std::fs::write(dir.join("devices.json"), serde_json::to_string(&serde_json::json!([
+            { "name": "self",      "secret": "b".repeat(64), "deviceCert": mine.to_json() },
+            { "name": "ownerbox",  "secret": "c".repeat(64), "deviceCert": owner_cert.to_json() },
+        ])).unwrap()).unwrap();
+        let owner = joined_owner_record();
+        assert_eq!(owner.as_ref().map(|(n, _)| n.as_str()), Some("ownerbox"),
+            "the owner is the record chained to our issuer that is not this machine");
     }
 
     #[test]
