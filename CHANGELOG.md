@@ -4,6 +4,86 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [Unreleased]
+
+### Security
+
+- **Revoking a device now actually denies it.** `filament revoke <name>
+  --certificate` cut fleet auto-trust and nothing else. Two separate paths kept
+  authorizing a revoked device:
+
+  - an **explicit grant** for the attempted action authorized independently of
+    revocation. Grants are how the deliberate tier is reached — shell,
+    write-mount, out-of-scope reach — so revocation failed hardest for the
+    devices holding the most authority.
+  - in the **default (shadow) mode**, which is what ships, the decision falls
+    through to a caller-supplied `legacy_allowed` that never saw the revocation
+    at all. This was not gated behind `FILAMENT_CAP_AUTHORITATIVE`; it applied
+    with no flag set.
+
+  Revocation is now an absolute denial evaluated before any grant is consulted,
+  in both modes.
+
+  **A residual remains and is not fixed here.** Revocation binds once the peer's
+  identity resolves. On the one-shot code path a revoked device can still
+  complete a *first* operation if the receiver accepts a fresh pairing code from
+  it — the device cannot initiate this unaided, because the pairing words must be
+  obtained out of band and typed by the receiver. A revoked device reconnecting
+  on its own, using the pair secret it already holds, resolves identity at
+  admission and **is** denied, on every transport. The relay path is untested in
+  both directions. Tracked as #161.
+
+  **No release was exposed** in the sense of an attacker gaining access they did
+  not have: these defects failed to *withdraw* authorization rather than
+  conferring it. What was wrong is that a revocation you performed did less than
+  its message said. Present in every released version; the ordering predates the
+  capability gate.
+
+  Both messages that described the old behaviour are corrected. The pre-action
+  warning no longer claims revocation removes access "entirely", and the success
+  line names the capability gate rather than "fleet access".
+
+### Fixed
+
+- **A device that was never revoked is no longer treated as revoked.**
+  `device_cert_revoked` returned "revoked" for four conditions, three correctly
+  fail-closed and one not: a **known** device record carrying no `certRevoked`
+  field. Nothing writes that field except an explicit revoke, so every device
+  enrolled normally read as revoked. Under `FILAMENT_CAP_AUTHORITATIVE=1` that
+  made fleet auto-trust — the same-owner recognition added in 0.7.4 —
+  unreachable for every existing device. An unknown device, an unreadable store
+  and unparseable JSON still fail closed.
+
+- **An unidentified peer is no longer treated as a revoked one.** The gate
+  derived its revocation input as "no device identity ⇒ revoked". Harmless while
+  that only cut fleet auto-trust; once revocation became an absolute denial it
+  would have refused every peer before its identity resolved, breaking transfers
+  outright. The unknown-*device* case remains fail-closed where that judgement
+  belongs.
+
+- **Releases no longer publish stray repository files as assets.** The release
+  job began checking out the repository in 0.7.7 so notes could be generated from
+  this changelog, which put the working tree where two `filament-*` globs could
+  match it. `cli-v0.7.7` consequently shipped three unrelated documents as
+  release assets and attested them in `SHA256SUMS`. Artifacts are now assembled
+  in a dedicated directory that the globs are scoped to, and a check refuses to
+  publish unless the asset set is exactly the four platform archives plus
+  `SHA256SUMS`. `cli-v0.7.7` is not regenerated: its manifest and its assets
+  agree with each other, and rewriting a published checksum file would break that.
+
+### Removed
+
+- **The cone-NAT gate is retired**, along with its STUN fixture. Its hole-punch
+  assertion had never passed on any NAT topology — only on the no-NAT control —
+  so it had no positive control and could not discriminate in either direction.
+  Separately, its "cone" proof measured endpoint-independent *mapping* only;
+  cone requires endpoint-independent mapping **and** filtering, and Linux
+  `MASQUERADE` is EI mapping with ED filtering, so a correct measurement of one
+  property was being read as a claim about another. **This removes a signal
+  rather than fixing one:** cone-NAT traversal is now unverified rather than
+  falsely verified. The mapping probe that was correct is kept and still
+  classifies both mapping types.
+
 ## [0.7.7] - 2026-08-06
 
 ### Security
