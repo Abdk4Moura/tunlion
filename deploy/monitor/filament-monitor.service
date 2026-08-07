@@ -4,5 +4,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# ExecStart is rewritten by install-timers.sh at install time to point at
+# /usr/local/lib/filament-monitor, so production never runs from a git checkout.
 ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/signaling-monitor.py
 # Alerts go out via Resend; the send-only key is read from ~/secret_keys.

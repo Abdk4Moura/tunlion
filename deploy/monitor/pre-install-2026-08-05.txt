@@ -1,0 +1,11 @@
+# Pre-install live unit state captured 2026-08-05 before ExecStart rewrite
+# Source checkout: /root/stunning-tribble at dbf6172771a76a450a98fe6124193472af6075bf (task/monitor-install-parity)
+
+== filament-monitor.service ==
+ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/signaling-monitor.py
+
+== filament-oom-shield.service ==
+ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/oom-shield-monitor.py
+
+== filament-memory-pressure.service ==
+ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/memory-pressure-monitor.py

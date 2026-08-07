@@ -8,6 +8,8 @@ Type=oneshot
 # Must run as root: reading and writing /proc/PID/oom_score_adj for another
 # user's processes needs it, and so does lowering the value at all.
 User=root
+# ExecStart is rewritten by install-timers.sh at install time to point at
+# /usr/local/lib/filament-monitor, so production never runs from a git checkout.
 ExecStart=/usr/bin/python3 /root/stunning-tribble/deploy/monitor/oom-shield-monitor.py
 # Exit 1 (unshielded) and 2 (unverifiable) are reported by the script's own
 # alert, not by systemd. SuccessExitStatus keeps `systemctl status` from turning
