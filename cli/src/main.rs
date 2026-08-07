@@ -1483,7 +1483,7 @@ pub(crate) fn upsert_peer_record(
     caps: Option<&[String]>,
     scope: Option<u8>,
     user_key_hex: Option<&str>,
-    delegated: Option<(&[String], u64)>,
+    delegated: Option<(&[String], u64, u64, u64)>,
 ) -> String {
     // For existing name, update in place preserving other fields.
     if let Some(existing) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
@@ -1504,10 +1504,12 @@ pub(crate) fn upsert_peer_record(
         if let Some(sc) = scope {
             existing["identityScope"] = json!(sc);
         }
-        if let Some((ceiling, expires)) = delegated {
+        if let Some((ceiling, expires, max_offline, max_offline_ceiling)) = delegated {
             existing["principalKind"] = json!("delegated");
             existing["principalCeiling"] = json!(ceiling);
             existing["principalExpires"] = json!(expires);
+            existing["principalMaxOffline"] = json!(max_offline);
+            existing["principalMaxOfflineCeiling"] = json!(max_offline_ceiling);
         }
         return existing["name"].as_str().unwrap_or(name).to_string();
     }
@@ -1544,10 +1546,12 @@ pub(crate) fn upsert_peer_record(
     if let Some(sc) = scope {
         obj.insert("identityScope".to_string(), json!(sc));
     }
-    if let Some((ceiling, expires)) = delegated {
+    if let Some((ceiling, expires, max_offline, max_offline_ceiling)) = delegated {
         obj.insert("principalKind".to_string(), json!("delegated"));
         obj.insert("principalCeiling".to_string(), json!(ceiling));
         obj.insert("principalExpires".to_string(), json!(expires));
+        obj.insert("principalMaxOffline".to_string(), json!(max_offline));
+        obj.insert("principalMaxOfflineCeiling".to_string(), json!(max_offline_ceiling));
     }
     obj.insert("addedAt".to_string(), json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
     arr.push(Value::Object(obj));
@@ -1565,7 +1569,7 @@ pub(crate) fn devices_upsert_atomic(
     caps: Option<&[String]>,
     scope: Option<u8>,
     user_key_hex: Option<&str>,
-    delegated: Option<(&[String], u64)>,
+    delegated: Option<(&[String], u64, u64, u64)>,
 ) -> Result<String> {
     let clean = sanitize_device_name(name);
     let name = clean.as_str();
@@ -1664,9 +1668,54 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     None
 }
 
+/// The three clocks that can end a delegated device's recognition. The binding
+/// one is whichever expires first; the state display names it so "X time left"
+/// never lies about which bound is actually in charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadlineClock {
+    /// The device certificate's own expiry (`verify` fails past it).
+    CertExpiry,
+    /// The signed absolute stop (`not_after` from the auth key).
+    AbsoluteStop,
+    /// The liveness budget (`last_seen + effective_max_offline`).
+    LivenessBudget,
+}
+
+/// The single moment a delegated device stops being recognized:
+/// `min(cert_expiry, not_after, last_seen + max_offline)`. Each term is a
+/// hard bound; whichever comes first is the truth, and the returned clock says
+/// which one it was. `last_seen == 0` (never seen) does NOT start the budget
+/// clock, so a freshly enrolled or legacy device is governed by its absolute
+/// bounds until its first observation.
+pub(crate) fn effective_principal_deadline(
+    cert_expires: u64,
+    not_after: Option<u64>,
+    last_seen: Option<u64>,
+    max_offline: Option<u64>,
+) -> (u64, DeadlineClock) {
+    let mut deadline = cert_expires;
+    let mut clock = DeadlineClock::CertExpiry;
+    if let Some(na) = not_after {
+        if na < deadline {
+            deadline = na;
+            clock = DeadlineClock::AbsoluteStop;
+        }
+    }
+    if let (Some(ls), Some(mo)) = (last_seen, max_offline) {
+        if ls > 0 {
+            let budget_deadline = ls.saturating_add(mo);
+            if budget_deadline < deadline {
+                deadline = budget_deadline;
+                clock = DeadlineClock::LivenessBudget;
+            }
+        }
+    }
+    (deadline, clock)
+}
+
 fn persisted_principal_for_cert(
     cert: &identity::DeviceCert,
-) -> (crate::capability::PrincipalKind, Option<u64>) {
+) -> (crate::capability::PrincipalKind, Option<u64>, Option<u64>, Option<u64>) {
     let records = std::fs::read_to_string(devices_path())
         .ok()
         .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
@@ -1675,11 +1724,15 @@ fn persisted_principal_for_cert(
     principal_from_records(&records, cert, own_user_pub.as_ref())
 }
 
+/// Resolve the persisted principal record for a device cert. Returns
+/// `(kind, not_after, max_offline, last_seen)`. A missing or malformed record
+/// FAILS CLOSED as a ceiling-less delegated principal (denies everything), so
+/// a half-persisted record can never silently become an owner.
 fn principal_from_records(
     records: &[Value],
     cert: &identity::DeviceCert,
     own_user_pub: Option<&[u8; 32]>,
-) -> (crate::capability::PrincipalKind, Option<u64>) {
+) -> (crate::capability::PrincipalKind, Option<u64>, Option<u64>, Option<u64>) {
     let record = records.iter().find(|record| {
         identity::DeviceCert::from_json(&record["deviceCert"])
             .map(|stored| stored.device_pub == cert.device_pub)
@@ -1687,7 +1740,7 @@ fn principal_from_records(
     });
     if let Some(record) = record {
         if record["principalKind"].is_null() {
-            return (crate::capability::PrincipalKind::OwnerDevice, None);
+            return (crate::capability::PrincipalKind::OwnerDevice, None, None, None);
         }
         if record["principalKind"].as_str() == Some("delegated") {
             let caps = record["principalCeiling"]
@@ -1695,15 +1748,22 @@ fn principal_from_records(
                 .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             let expires = record["principalExpires"].as_u64().unwrap_or(0);
-            return (crate::capability::PrincipalKind::Delegated { caps }, Some(expires));
+            let max_offline = record["principalMaxOffline"].as_u64();
+            let last_seen = record["lastSeen"].as_u64();
+            return (crate::capability::PrincipalKind::Delegated { caps }, Some(expires), max_offline, last_seen);
         }
-        return (crate::capability::PrincipalKind::Delegated { caps: Vec::new() }, Some(0));
+        return (
+            crate::capability::PrincipalKind::Delegated { caps: Vec::new() },
+            Some(0),
+            None,
+            None,
+        );
     }
     let is_same_owner = own_user_pub.map(|owner| *owner == cert.user_pub).unwrap_or(false);
     if is_same_owner {
-        return (crate::capability::PrincipalKind::Delegated { caps: Vec::new() }, Some(0));
+        return (crate::capability::PrincipalKind::Delegated { caps: Vec::new() }, Some(0), None, None);
     }
-    (crate::capability::PrincipalKind::OwnerDevice, None)
+    (crate::capability::PrincipalKind::OwnerDevice, None, None, None)
 }
 
 fn fleet_certificate_warning(name: &str) -> Option<String> {
@@ -1911,8 +1971,9 @@ fn resolve_peer_identity(link: &mut Link) {
     link.identity_device_pub = Some(cert.device_pub);
     link.identity_user_pub = Some(cert.user_pub);
     link.identity_binding = crate::capability::BindingStrength::Inferred;
-    let (principal_kind, principal_expires) = persisted_principal_for_cert(&cert);
-    link.identity_cert_expires = Some(principal_expires.map_or(cert.expires, |expires| expires.min(cert.expires)));
+    let (principal_kind, not_after, max_offline, last_seen) = persisted_principal_for_cert(&cert);
+    let (deadline, _clock) = effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+    link.identity_cert_expires = Some(deadline);
     link.principal_kind = principal_kind;
 }
 
@@ -2039,12 +2100,13 @@ fn handle_identity_expose(
     if cert.device_pub == own_dpub { return false; }
     // Store as provisional, then promote on link
     let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
-    let (principal_kind, principal_expires) = persisted_principal_for_cert(&cert);
+    let (principal_kind, not_after, max_offline, last_seen) = persisted_principal_for_cert(&cert);
     if let Some(l) = conn.link_mut(pid) {
         l.identity_device_pub = Some(cert.device_pub);
         l.identity_user_pub = Some(cert.user_pub);
         l.identity_binding = crate::capability::BindingStrength::Proven;
-        l.identity_cert_expires = Some(principal_expires.map_or(cert.expires, |expires| expires.min(cert.expires)));
+        let (deadline, _clock) = effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+        l.identity_cert_expires = Some(deadline);
         l.principal_kind = principal_kind;
     }
     ui::say(&format!(
@@ -2153,12 +2215,18 @@ fn clear_provisional_identity(name: &str) {
 /// Update the `lastSeen` timestamp and overlay addresses for a known device.
 /// Called on each connect so `filament addr <device>` can show recency and addresses.
 fn devices_touch(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>) {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    devices_touch_at(name, v6, v4, now);
+}
+
+/// Clock-injectable form of `devices_touch` so the liveness tests can advance
+/// time without sleeping. The production call site passes the real wall clock.
+fn devices_touch_at(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>, now: u64) {
     let p = devices_path();
     let Ok(raw) = std::fs::read_to_string(&p) else { return };
     let Ok(val) = serde_json::from_str::<Value>(&raw) else { return };
     let Some(arr) = val.as_array() else { return };
     let mut arr = arr.clone();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     for d in arr.iter_mut() {
         if d["name"].as_str() == Some(name) {
             d["lastSeen"] = json!(now);
@@ -4076,7 +4144,7 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
                 }
                 _ => bail!("invalid reuse: {reuse} (Once, N(3), Reusable)"),
             };
-            let ak = crate::ephemeral::AuthKey::mint(uk.keypair(), enroll_pub, caps, audience_pubs, ttl, reuse, tag)?;
+            let ak = crate::ephemeral::AuthKey::mint_with_bounds(uk.keypair(), enroll_pub, caps, audience_pubs, ttl, reuse, tag, 30 * 24 * 3600, true)?;
             let json = Zeroizing::new(serde_json::to_string_pretty(&serde_json::json!({
                 "auth_key": ak.to_json(),
                 "enroll_private_key": hex::encode(seed),
@@ -4122,8 +4190,12 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
         .iter()
         .map(|item| item.as_str().map(str::to_string).ok_or_else(|| anyhow!("join ceiling contains a non-string capability")))
         .collect::<Result<Vec<_>>>()?;
-    if expires != auth_key.expires || ceiling != auth_key.caps {
-        bail!("join acknowledgement changed the signed capability ceiling or expiry");
+    let max_offline = v["max_offline"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its offline budget ceiling"))?;
+    if expires != auth_key.expires
+        || ceiling != auth_key.caps
+        || max_offline != auth_key.max_offline
+    {
+        bail!("join acknowledgement changed a signed principal bound (ceiling, expiry, or offline budget)");
     }
     let local_cert = identity::DeviceCert::from_json(&v["device_cert"])
         .ok_or_else(|| anyhow!("join acknowledgement omitted the local device certificate"))?;
@@ -4209,7 +4281,7 @@ async fn invite_cmd(
         .as_ref()
         .try_into()
         .map_err(|_| anyhow!("invitation public key has the wrong size"))?;
-    let auth_key = crate::ephemeral::AuthKey::mint(
+    let auth_key = crate::ephemeral::AuthKey::mint_with_bounds(
         owner_key.keypair(),
         enroll_pub,
         ceiling.clone(),
@@ -4217,6 +4289,8 @@ async fn invite_cmd(
         ttl,
         crate::ephemeral::Reuse::Once,
         format!("join-{kind}"),
+        30 * 24 * 3600,
+        false,
     )?;
     let bundle = json!({
         "auth_key": auth_key.to_json(),
@@ -5157,7 +5231,7 @@ async fn handle_auth_key_enroll_response(
                 Some(&ak.caps),
                 Some(identity::IntroScope::Device.to_byte()),
                 None,
-                Some((&ak.caps, ak.expires)),
+                Some((&ak.caps, ak.expires, ak.max_offline, ak.max_offline)),
             ) {
                 Ok(name) => name,
                 Err(error) => {
@@ -5180,7 +5254,8 @@ async fn handle_auth_key_enroll_response(
                 "device_cert": device_cert.to_json(),
                 "owner_cert": local_device_cert().map(|cert| cert.to_json()),
                 "ceiling": ak.caps,
-                "expires": ak.expires
+                "expires": ak.expires,
+                "max_offline": ak.max_offline
             })).await;
             ui::say(&format!("  {} ephemeral device {pid} enrolled (caps: {})",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
@@ -14144,6 +14219,10 @@ async fn recv_cmd(
     // (continuity), so the re-establish's add_peer swaps the transport under the
     // same overlay IP and the session resumes.
     let mut last_link_health = Instant::now();
+    // Periodic liveness observation: refreshes lastSeen for devices with a
+    // live link, independent of traffic. Without this an idle-but-connected
+    // device would decay against its offline budget and be reaped while alive.
+    let mut last_liveness_observe = Instant::now();
 
     // systemd Type=notify: announce readiness once the serving loop is about to
     // run, then ping the watchdog below. No-op when not run under systemd.
@@ -14575,6 +14654,25 @@ async fn recv_cmd(
                 ui::debug(&format!("filament: link to '{pid}' died, dropping so it can re-connect"));
                 conn.drop_link(&pid);
                 l2_muxes.remove(&pid);
+            }
+        }
+
+        // LIVENESS OBSERVATION: a device with a live link is alive regardless of
+        // traffic. Refresh lastSeen periodically for linked devices so an idle
+        // but connected device never decays against its offline budget. This is
+        // a PERIODIC OBSERVATION of link-up state, deliberately not an event
+        // fired by message receipt (a traffic-driven refresh would reap healthy
+        // quiet devices exactly the way xats reaped chief-ux).
+        if daemon && last_liveness_observe.elapsed() >= Duration::from_secs(8) {
+            last_liveness_observe = Instant::now();
+            let live: Vec<String> = conn
+                .links
+                .iter()
+                .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+                .map(|(_, l)| l.shown().to_string())
+                .collect();
+            for who in live {
+                devices_touch(&who, None, None);
             }
         }
 
@@ -18739,6 +18837,139 @@ mod tests {
         assert_ne!(stored_b.device_pub, [0xa1u8; 32], "new secret must not retain the old-gen cert");
     }
 
+    #[test]
+    fn delegated_ceiling_preserved_through_plain_cert_update() {
+        // The REQUIRED preservation property: a delegated record's principal
+        // fields (kind, ceiling, expiry, offline budget) must survive a normal
+        // cert update through the ordinary path even when that update passes NO
+        // delegated argument. The in-place writer preserves them. A wholesale
+        // rewrite would drop them and silently turn a delegated device into an
+        // OwnerDevice (the escalation the #142 invariant forbids).
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let cert_a = mk_cert(0xa1);
+        let cert_b = mk_cert(0xb2);
+        let ceiling = vec!["mount".to_string(), "transfer".to_string()];
+        let mut arr: Vec<Value> = vec![];
+        upsert_peer_record(
+            &mut arr,
+            "joinbox",
+            Some("secretA"),
+            Some(&cert_a),
+            Some(&ceiling),
+            Some(identity::IntroScope::Device.to_byte()),
+            None,
+            Some((&ceiling, 5_000_000_000u64, 2_592_000u64, 2_592_000u64)),
+        );
+        assert_eq!(arr[0]["principalKind"].as_str(), Some("delegated"));
+        assert_eq!(arr[0]["principalMaxOffline"].as_u64(), Some(2_592_000));
+
+        // Ordinary cert update, NO delegated argument (e.g. a renewal write).
+        upsert_peer_record(&mut arr, "joinbox", Some("secretB"), Some(&cert_b), None, None, None, None);
+        assert_eq!(arr[0]["principalKind"].as_str(), Some("delegated"),
+            "a plain cert update must preserve principalKind=delegated");
+        assert_eq!(arr[0]["principalCeiling"], json!(["mount", "transfer"]), "ceiling unchanged");
+        assert_eq!(arr[0]["principalExpires"].as_u64(), Some(5_000_000_000));
+        assert_eq!(arr[0]["principalMaxOffline"].as_u64(), Some(2_592_000), "offline budget unchanged");
+        assert_eq!(arr[0]["principalMaxOfflineCeiling"].as_u64(), Some(2_592_000), "budget ceiling unchanged");
+    }
+
+    #[test]
+    fn periodic_observation_keeps_idle_connected_device_live() {
+        // The REQUIRED liveness property: a device whose link is up stays LIVE
+        // even with ZERO traffic for longer than its offline budget, because
+        // the periodic observation refreshes lastSeen from link-up state, not
+        // from messages. Once the link is down and no observation runs, the
+        // budget binds and the device lapses.
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("fil-liveness-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Serialize: tests mutate the process-global FILAMENT_CONFIG_DIR.
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let p = dir.join("devices.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {
+                    "name": "quietbox",
+                    "secret": "b".repeat(64),
+                    "v": 2,
+                    "caps": ["transfer"],
+                    "deviceCert": {
+                        "devicePub": hex::encode([0x42u8; 32]),
+                        "userPub": hex::encode([0x11u8; 32]),
+                        "expires": 9_999_999_999u64,
+                        "issued": 1u64,
+                        "sig": hex::encode([0u8; 64]),
+                    },
+                    "principalKind": "delegated",
+                    "principalCeiling": ["transfer"],
+                    "principalExpires": 9_999_999_999u64,
+                    "principalMaxOffline": 10,
+                    "principalMaxOfflineCeiling": 10,
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let far: u64 = 9_999_999_999;
+        let budget: u64 = 10;
+
+        // t0: the link comes up. The connect handler observes it once.
+        let t0 = 1_000_000u64;
+        devices_touch_at("quietbox", None, None, t0);
+        let (last_seen, _, _) = devices_info("quietbox").unwrap();
+        assert_eq!(last_seen, t0);
+
+        // Hold the link open with ZERO traffic for 15s, longer than the 10s
+        // budget. The periodic observation (link still up) refreshes lastSeen.
+        let t1 = t0 + 15;
+        devices_touch_at("quietbox", None, None, t1);
+        let (last_seen, _, _) = devices_info("quietbox").unwrap();
+        assert_eq!(last_seen, t1, "the periodic observation advanced lastSeen with no traffic at all");
+        let (deadline, clock) = effective_principal_deadline(far, Some(far), Some(last_seen), Some(budget));
+        assert!(deadline > t1, "still LIVE at t1: deadline {} is after now {}", deadline, t1);
+        assert_eq!(clock, DeadlineClock::LivenessBudget, "the liveness budget is the clock that would end it");
+
+        // The link drops at t1. No observation refreshes lastSeen. By t1+11 the
+        // budget has run out and the device has lapsed.
+        let t2 = t1 + 11;
+        let (deadline, _) = effective_principal_deadline(far, Some(far), Some(last_seen), Some(budget));
+        assert!(deadline < t2, "lapsed by t2: deadline {} is before now {}", deadline, t2);
+    }
+
+    #[test]
+    fn effective_deadline_names_the_binding_clock() {
+        // Q1 coherence: the effective deadline is min(cert expiry, absolute
+        // stop, last_seen + offline budget), and the returned clock says which
+        // one actually binds, so "X time left" never lies about the bound in
+        // charge.
+        let cert = 100u64;
+        let not_after = 200u64;
+        let last_seen = 80u64;
+        let budget = 10u64;
+        // Budget binds: last_seen+budget = 90 < cert 100 < not_after 200.
+        let (d, c) = effective_principal_deadline(cert, Some(not_after), Some(last_seen), Some(budget));
+        assert_eq!((d, c), (90, DeadlineClock::LivenessBudget));
+        // Not-after binds: it is the earliest.
+        let (d, c) = effective_principal_deadline(cert, Some(50), Some(last_seen), Some(budget));
+        assert_eq!((d, c), (50, DeadlineClock::AbsoluteStop));
+        // Cert binds: cert is earliest.
+        let (d, c) = effective_principal_deadline(85, Some(not_after), Some(last_seen), Some(budget));
+        assert_eq!((d, c), (85, DeadlineClock::CertExpiry));
+        // Never-seen devices are governed by absolute bounds, not an epoch-
+        // relative budget clock (last_seen == 0 does not start the clock).
+        let (d, c) = effective_principal_deadline(cert, Some(not_after), Some(0), Some(budget));
+        assert_eq!((d, c), (100, DeadlineClock::CertExpiry));
+    }
+
     // --- consent-queue pure-fn tests ---------------------------------------
 
     /// add_pending_request appends and deduplicates by id.
@@ -18841,17 +19072,19 @@ mod tests {
             Some(&ceiling),
             None,
             None,
-            Some((&ceiling, u64::MAX)),
+            Some((&ceiling, u64::MAX, 2_592_000u64, 2_592_000u64)),
         );
         assert_eq!(arr.len(), 1);
         let record = &arr[0];
         assert_eq!(record["principalKind"], "delegated");
         assert_eq!(record["principalCeiling"], json!(["transfer", "mount"]));
         assert_eq!(record["principalExpires"], u64::MAX);
+        assert_eq!(record["principalMaxOffline"], 2_592_000u64);
+        assert_eq!(record["principalMaxOfflineCeiling"], 2_592_000u64);
 
         let encoded = serde_json::to_vec(&arr).unwrap();
         let reconnected: Vec<Value> = serde_json::from_slice(&encoded).unwrap();
-        let (principal, expires) = principal_from_records(&reconnected, &cert, Some(&cert.user_pub));
+        let (principal, expires, _max_offline, _last_seen) = principal_from_records(&reconnected, &cert, Some(&cert.user_pub));
         assert_eq!(
             principal,
             crate::capability::PrincipalKind::Delegated { caps: ceiling },
@@ -18886,7 +19119,7 @@ mod tests {
             "sig": hex::encode([0u8; 64]),
         }))
         .unwrap();
-        let (principal, expires) = principal_from_records(&[], &cert, Some(&cert.user_pub));
+        let (principal, expires, _max_offline, _last_seen) = principal_from_records(&[], &cert, Some(&cert.user_pub));
         assert_eq!(principal, crate::capability::PrincipalKind::Delegated { caps: Vec::new() });
         assert_eq!(expires, Some(0));
     }

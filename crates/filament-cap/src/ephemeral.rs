@@ -90,19 +90,36 @@ pub struct AuthKey {
     pub expires: u64,
     /// How many times this key may be used.
     pub reuse: Reuse,
-    /// Whether the enrolled device is ephemeral (removed on disconnect).
+    /// Whether the enrolled device is ephemeral (removed on disconnect; no
+    /// durable record written). `false` = persist the enrolled device.
     pub ephemeral: bool,
+    /// The signed CEILING on how long the device may be offline before it
+    /// stops being recognized, in seconds. Local owner policy may tighten it
+    /// (never loosen) at enrollment or later; the effective budget is
+    /// `min(signed_max_offline, local_policy)`, mirroring how caps work. Only
+    /// meaningful when `ephemeral` is false.
+    pub max_offline: u64,
     /// Human-readable tag for the use case ("ci", "gpu-borrower", etc.).
     pub tag: String,
     /// Ed25519 signature by the owner's user key over the canonical bytes.
     pub sig: [u8; 64],
+    /// Wire version. 1 = legacy (max_offline absent from canonical bytes),
+    /// 2 = current. Drives which canonical bytes the signature must cover so
+    /// legacy keys still verify and new keys cannot be mistaken for them.
+    version: u8,
 }
 
 /// Canonical bytes that the signature covers — deterministic, no ambiguity.
 /// Uses u32 length prefixes to prevent truncation-based canonical collisions.
+/// v2 appends `max_offline` after the ephemeral byte and prefixes a v2 tag, so
+/// the v1 byte stream is byte-identical for legacy keys.
 fn auth_key_canonical_bytes(k: &AuthKey) -> Vec<u8> {
     let mut b = Vec::new();
-    b.extend_from_slice(b"filament-auth-key-v1");
+    if k.version >= 2 {
+        b.extend_from_slice(b"filament-auth-key-v2");
+    } else {
+        b.extend_from_slice(b"filament-auth-key-v1");
+    }
     b.extend_from_slice(&k.issuer);
     b.extend_from_slice(&k.enroll_pub);
     // caps (already normalized: sorted, deduped, lowercase)
@@ -124,6 +141,9 @@ fn auth_key_canonical_bytes(k: &AuthKey) -> Vec<u8> {
     b.extend_from_slice(&disc.to_le_bytes());
     b.extend_from_slice(&count.to_le_bytes());
     b.push(if k.ephemeral { 1 } else { 0 });
+    if k.version >= 2 {
+        b.extend_from_slice(&k.max_offline.to_le_bytes());
+    }
     b.extend_from_slice(&(k.tag.len() as u32).to_le_bytes());
     b.extend_from_slice(k.tag.as_bytes());
     b
@@ -143,6 +163,24 @@ impl AuthKey {
         reuse: Reuse,
         tag: String,
     ) -> Result<Self> {
+        Self::mint_with_bounds(owner_uk, enroll_pub, caps, audience, ttl_secs, reuse, tag, MAX_TTL_SECS, true)
+    }
+
+    /// Like `mint`, but with an explicit signed `max_offline` CEILING (seconds)
+    /// and the persistence choice. Local policy may only tighten the budget, and
+    /// nothing may exceed the signed ceiling. `ephemeral: false` is the
+    /// persistent form (a durable, budget-governed device).
+    pub fn mint_with_bounds(
+        owner_uk: &Ed25519KeyPair,
+        enroll_pub: [u8; 32],
+        caps: Vec<String>,
+        audience: Vec<[u8; 32]>,
+        ttl_secs: u64,
+        reuse: Reuse,
+        tag: String,
+        max_offline: u64,
+        ephemeral: bool,
+    ) -> Result<Self> {
         let caps: Vec<String> = caps
             .iter()
             .map(|cap| super::capability::canonical_capability(cap))
@@ -161,9 +199,11 @@ impl AuthKey {
             audience,
             expires: now.saturating_add(ttl_secs.min(MAX_TTL_SECS)),
             reuse,
-            ephemeral: true,
+            ephemeral,
+            max_offline: max_offline.min(MAX_TTL_SECS),
             tag,
             sig: [0u8; 64],
+            version: 2,
         };
         let canonical = auth_key_canonical_bytes(&k);
         let sig = owner_uk.sign(&canonical);
@@ -213,7 +253,7 @@ impl AuthKey {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "issuer": hex::encode(self.issuer),
             "enroll_pub": hex::encode(self.enroll_pub),
             "caps": self.caps,
@@ -223,7 +263,15 @@ impl AuthKey {
             "ephemeral": self.ephemeral,
             "tag": self.tag,
             "sig": hex::encode(self.sig),
-        })
+        });
+        // v2 keys carry the signed max_offline ceiling; v1 keys serialize in
+        // their original shape so a legacy key round-trips as v1 and verifies.
+        if self.version >= 2 {
+            if let serde_json::Value::Object(map) = &mut json {
+                map.insert("max_offline".to_string(), serde_json::json!(self.max_offline));
+            }
+        }
+        json
     }
 
     /// SAFE deserialization: uses try_into() (no panics on wrong-length hex).
@@ -256,9 +304,14 @@ impl AuthKey {
             _ => return None,
         };
         let ephemeral = v.get("ephemeral")?.as_bool()?;
+        let max_offline = v.get("max_offline").and_then(|m| m.as_u64()).unwrap_or(MAX_TTL_SECS);
         let tag = v.get("tag")?.as_str()?.to_string();
         let sig: [u8; 64] = hex::decode(v.get("sig")?.as_str()?).ok()?.try_into().ok()?;
-        Some(AuthKey { issuer, enroll_pub, caps, audience, expires, reuse, ephemeral, tag, sig })
+        // Legacy keys have no max_offline field: they were signed over the v1
+        // canonical bytes, so the version stays 1 and max_offline is not verified
+        // (it is an owner-side policy default, never a signed commitment).
+        let version = if v.get("max_offline").is_some() { 2 } else { 1 };
+        Some(AuthKey { issuer, enroll_pub, caps, audience, expires, reuse, ephemeral, max_offline, tag, sig, version })
     }
 }
 
@@ -933,7 +986,7 @@ mod tests {
                 issuer: [0u8; 32], enroll_pub: [0u8; 32],
                 caps: long_cap, audience: vec![],
                 expires: 0, reuse: Reuse::Once, ephemeral: true,
-                tag: String::new(), sig: [0u8; 64],
+                max_offline: 0, tag: String::new(), sig: [0u8; 64], version: 1,
             };
             auth_key_canonical_bytes(&ak)
         };
@@ -942,7 +995,7 @@ mod tests {
                 issuer: [0u8; 32], enroll_pub: [0u8; 32],
                 caps: short_cap, audience: vec![],
                 expires: 0, reuse: Reuse::Once, ephemeral: true,
-                tag: String::new(), sig: [0u8; 64],
+                max_offline: 0, tag: String::new(), sig: [0u8; 64], version: 1,
             };
             auth_key_canonical_bytes(&ak)
         };
@@ -974,7 +1027,7 @@ mod tests {
                 caps: vec!["shell".into()],
                 audience: vec![],
                 expires: 0, reuse: Reuse::Once, ephemeral: true,
-                tag: String::new(), sig: [0u8; 64],
+                max_offline: 0, tag: String::new(), sig: [0u8; 64], version: 1,
             };
             auth_key_canonical_bytes(&ak)
         };
@@ -988,7 +1041,7 @@ mod tests {
                 caps: vec![],
                 audience: vec![],
                 expires: 0, reuse: Reuse::Once, ephemeral: true,
-                tag: String::new(), sig: [0u8; 64],
+                max_offline: 0, tag: String::new(), sig: [0u8; 64], version: 1,
             };
             auth_key_canonical_bytes(&ak)
         };
@@ -1015,8 +1068,10 @@ mod tests {
                 expires: now + 3600,
                 reuse: Reuse::N(n),
                 ephemeral: true,
+                max_offline: 0,
                 tag: "test".into(),
                 sig: [0u8; 64],
+                version: 1,
             };
             let canonical = auth_key_canonical_bytes(&ak);
             let sig = owner.sign(&canonical);
@@ -1048,7 +1103,9 @@ mod tests {
             audience: vec![],
             expires: now_secs() + 3600,
             reuse: Reuse::Once, ephemeral: true,
+            max_offline: 0,
             tag: "test".into(), sig: [0u8; 64],
+            version: 1,
         };
         let verifier_pub: [u8; 32] = [0xAB; 32];
         let err = ak.verify_against_owner(&[0u8; 32], &verifier_pub).unwrap_err().to_string();
@@ -1150,7 +1207,9 @@ mod tests {
         let ak = AuthKey {
             issuer: [0u8; 32], enroll_pub: [0u8; 32], caps: vec![], audience: vec![],
             expires: now_secs() + 3600, reuse: Reuse::Once, ephemeral: true,
+            max_offline: 0,
             tag: "test".into(), sig: [0u8; 64],
+            version: 1,
         };
         assert!(ak.audience_allows(&[1u8; 32]));
     }
@@ -1161,7 +1220,9 @@ mod tests {
         let ak = AuthKey {
             issuer: [0u8; 32], enroll_pub: [0u8; 32], caps: vec![], audience: vec![peer],
             expires: now_secs() + 3600, reuse: Reuse::Once, ephemeral: true,
+            max_offline: 0,
             tag: "test".into(), sig: [0u8; 64],
+            version: 1,
         };
         assert!(ak.audience_allows(&peer));
         assert!(!ak.audience_allows(&[0xBB; 32]));
@@ -1251,8 +1312,61 @@ mod tests {
         assert_eq!(ak.expires, round.expires);
         assert_eq!(ak.reuse, round.reuse);
         assert_eq!(ak.ephemeral, round.ephemeral);
+        assert_eq!(ak.max_offline, round.max_offline);
         assert_eq!(ak.tag, round.tag);
         assert_eq!(ak.sig, round.sig);
+        // A freshly minted v2 key must verify against its own signature.
+        assert!(round.verify_sig_and_expiry().is_ok());
+    }
+
+    #[test]
+    fn max_offline_ceiling_signed_and_roundtrips() {
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        let ak = AuthKey::mint_with_bounds(&owner, enroll_pub, vec!["transfer".into()], vec![], 3600, Reuse::Once, "join".into(), 3 * 86400, false).unwrap();
+        assert_eq!(ak.max_offline, 3 * 86400);
+        assert!(!ak.ephemeral);
+        let round = AuthKey::from_json(&ak.to_json()).unwrap();
+        assert_eq!(round.max_offline, 3 * 86400);
+        assert!(!round.ephemeral);
+        // The ceiling is committed to the signature: flipping it must break verify.
+        let mut forged = ak.clone();
+        forged.max_offline = 10 * 86400;
+        assert!(forged.verify_sig_and_expiry().is_err(), "tampered max_offline must fail signature");
+        // Local tightening never exceeds the signed ceiling.
+        assert_eq!(ak.max_offline.min(7 * 86400), 3 * 86400, "min(ceiling, tighter policy) must stay at the ceiling when tighter is larger");
+        assert_eq!(ak.max_offline.min(1 * 86400), 1 * 86400, "a tighter policy may lower the budget");
+    }
+
+    #[test]
+    fn legacy_v1_key_without_max_offline_still_verifies() {
+        // A key signed over the v1 canonical bytes (no max_offline) must parse,
+        // verify against the v1 canonical, and default its ceiling to the 30d cap.
+        let owner = gen_keypair();
+        let enroll_kp = gen_keypair();
+        let enroll_pub: [u8; 32] = enroll_kp.public_key().as_ref().try_into().unwrap();
+        let now = now_secs();
+        let mut k = AuthKey {
+            issuer: owner.public_key().as_ref().try_into().unwrap(),
+            enroll_pub,
+            caps: vec!["transfer".into()],
+            audience: vec![],
+            expires: now + 3600,
+            reuse: Reuse::Once,
+            ephemeral: true,
+            max_offline: MAX_TTL_SECS,
+            tag: "old".into(),
+            sig: [0u8; 64],
+            version: 1,
+        };
+        let canonical = auth_key_canonical_bytes(&k);
+        k.sig = owner.sign(&canonical).as_ref().try_into().unwrap();
+        let json = k.to_json();
+        assert!(json.get("max_offline").is_none(), "v1 keys serialize without max_offline");
+        let legacy = AuthKey::from_json(&json).expect("legacy key without max_offline must parse");
+        assert_eq!(legacy.max_offline, MAX_TTL_SECS, "legacy key defaults its ceiling to the 30d cap");
+        assert!(legacy.verify_sig_and_expiry().is_ok(), "legacy v1 key must verify against v1 canonical bytes");
     }
 
     #[test]
