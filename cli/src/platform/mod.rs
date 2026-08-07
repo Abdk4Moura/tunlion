@@ -46,11 +46,27 @@ impl Paths {
         repair_sensitive_permissions_in(&Self::config_dir())
     }
 
-    /// Migrate state from a legacy cwd-relative `.config/filament` directory
-    /// (the broken Windows fallback when HOME was unset). Best-effort, safe
-    /// to call repeatedly.
+    /// Migrate state from a legacy `$HOME/.config/filament` directory (the
+    /// broken Windows fallback when HOME was unset, which resolved relative to
+    /// the process cwd). Best-effort, safe to call repeatedly.
+    ///
+    /// Two guards, both earned:
+    /// 1. An explicit FILAMENT_CONFIG_DIR override means the caller knows where
+    ///    their config lives; migrating INTO it would copy whatever a
+    ///    cwd-relative ".config/filament" resolves to — the production identity
+    ///    when the shell's cwd is $HOME (issue #149, a key clone). Never
+    ///    migrate under an override.
+    /// 2. The legacy location is pinned to home_dir(), not the process cwd.
+    ///    "./.config/filament" names a different directory in every process;
+    ///    with the default shell cwd of $HOME it was indistinguishable from the
+    ///    live production config, which is exactly what let the override case
+    ///    clone keys. When HOME is unset, home_dir() falls back to ".", which
+    ///    is the original broken-Windows behaviour.
     pub fn migrate_legacy() {
-        let legacy = PathBuf::from(".config/filament");
+        if std::env::var_os("FILAMENT_CONFIG_DIR").is_some() {
+            return;
+        }
+        let legacy = Self::home_dir().join(".config").join("filament");
         if !legacy.is_dir() {
             return;
         }
@@ -874,5 +890,62 @@ mod tests {
         assert_eq!(repaired, 1);
         assert_eq!(std::fs::metadata(&caps).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for #149: setting FILAMENT_CONFIG_DIR to a fresh path from a
+    /// shell whose cwd is $HOME must NOT migrate the production identity into
+    /// it. Before the fix, `.config/filament` (cwd-relative) resolved to
+    /// $HOME/.config/filament, the live production config, and the migration
+    /// copied it wholesale into the override: a key clone.
+    #[cfg(unix)]
+    #[test]
+    fn override_config_dir_is_not_migrated_into() {
+        let uid = format!("{}-cfgdir-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let work = std::env::temp_dir().join(format!("fil-cfg-{uid}"));
+        let home = work.join("home");
+        let legacy = home.join(".config").join("filament");
+        let target = work.join("target");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("identity.ed25519"), b"production key").unwrap();
+        std::fs::write(legacy.join("overlay.ed25519"), b"production key 2").unwrap();
+
+        // Snapshot the real process state so it can be restored even if the
+        // assertion below fails (the failure must not leak into parallel tests).
+        let old_cwd = std::env::current_dir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_override = std::env::var_os("FILAMENT_CONFIG_DIR");
+
+        // Reproduce the report: fresh override, cwd == $HOME, populated legacy.
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("FILAMENT_CONFIG_DIR", &target);
+        }
+        std::env::set_current_dir(&home).unwrap();
+
+        Paths::migrate_legacy();
+
+        // Restore process-global state BEFORE asserting, so a failure cannot
+        // leave env/cwd mutated for sibling tests.
+        std::env::set_current_dir(&old_cwd).unwrap();
+        match old_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match old_override {
+            Some(v) => unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") },
+        }
+
+        // The override must stay EMPTY: migrating production keys into a fresh
+        // explicit config dir is the #149 key clone.
+        let entries: Vec<_> = std::fs::read_dir(&target)
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "FILAMENT_CONFIG_DIR override was populated by legacy migration: {entries:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
