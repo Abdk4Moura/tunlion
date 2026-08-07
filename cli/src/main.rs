@@ -15983,6 +15983,37 @@ async fn recv_cmd(
                 // issued at PAKE confirm (the peer is authenticated and its responder
                 // loop is live), not here: at ChannelReady the sender is not yet ready
                 // to answer, and the 3s hold would expire before it is.
+                // #161 EXCEPTION (typed-code path, transport-up re-issue): a
+                // fresh code peer has NO stored pair secret, so pair-proof never
+                // fires and the #39 rule above would leave its identity
+                // permanently unresolved on the WebRTC transport. The direct
+                // path resolves it at DirectReady; the WebRTC path issues the
+                // challenge at PAKE confirm. When that PAKE-confirm challenge
+                // was LOST because the WebRTC transport was not yet up (the
+                // direct-blocked fallback establishes the data channel AFTER
+                // PAKE), this ChannelReady re-issue delivers it now that the
+                // transport is genuinely ready. Gated on recv_pake_done so the
+                // normal WebRTC path (ChannelReady BEFORE PAKE) never gets an
+                // early challenge the sender cannot answer - only the case
+                // where the channel arrived after the ceremony.
+                if recv_code_path && recv_pake_done {
+                    if let Some(l) = conn.link_mut(&pid) {
+                        resolve_peer_identity(l);
+                    }
+                    let (idev_known, proven) = conn
+                        .link(&pid)
+                        .map(|l| {
+                            (
+                                l.identity_device_pub.is_some(),
+                                l.identity_binding
+                                    == crate::capability::BindingStrength::Proven,
+                            )
+                        })
+                        .unwrap_or((false, false));
+                    if !proven && !idev_known {
+                        issue_proven_challenge_and_hold(&conn, &pid, &t, &pending_proven, &mut identity_nonces).await;
+                    }
+                }
                 // web-shell discovery: tell the peer whether this receiver offers a
                 // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
                 // shows its per-device shell button ONLY when this is true; the
@@ -17410,23 +17441,33 @@ async fn recv_cmd(
                     // hold is either revoked or on a link the ceremony does not
                     // complete on; both must be refused, not admitted.
                     {
-                        let (proven, idev_known) = conn
+                        let (proven, idev_known, link_ready) = conn
                             .link(&pid)
                             .map(|l| {
                                 (
                                     l.identity_binding
                                         == crate::capability::BindingStrength::Proven,
                                     l.identity_device_pub.is_some(),
+                                    l.presence == Presence::Ready,
                                 )
                             })
-                            .unwrap_or((false, false));
+                            .unwrap_or((false, false, false));
                         let challenge_in_flight =
                             pending_proven.lock().unwrap().contains_key(&pid);
-                        let hold = if recv_code_path && !proven && !idev_known {
-                            let deadline = *recv_identity_hold
-                                .entry(pid.clone())
-                                .or_insert_with(std::time::Instant::now);
-                            deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
+                        let code_hold = recv_code_path && !proven && !idev_known;
+                        let hold = if code_hold {
+                            if !link_ready {
+                                // Transport still establishing (the direct-blocked
+                                // fallback brings WebRTC up AFTER PAKE, and the
+                                // ChannelReady re-issue delivers the challenge when
+                                // it does). Hold without starting the clock.
+                                true
+                            } else {
+                                let deadline = *recv_identity_hold
+                                    .entry(pid.clone())
+                                    .or_insert_with(std::time::Instant::now);
+                                deadline.elapsed() < RECV_IDENTITY_HOLD_DEADLINE
+                            }
                         } else {
                             crate::capability::cap_authoritative()
                                 && challenge_in_flight
@@ -17442,7 +17483,9 @@ async fn recv_cmd(
                             });
                             continue;
                         }
-                        if recv_code_path && !proven && !idev_known {
+                        // Hold cleared with the link READY and identity STILL
+                        // unresolved on the typed-code path: fail closed.
+                        if code_hold {
                             let sender_name = conn
                                 .link(&pid)
                                 .map(|l| l.name.clone())
