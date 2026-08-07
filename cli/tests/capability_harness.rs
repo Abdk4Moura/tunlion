@@ -654,16 +654,11 @@ fn pair_and_transfer_smoke() {
 /// identity via the possession ceremony and deny before any bytes land.
 #[test]
 fn revoked_device_first_transfer_is_denied() {
-    // macOS cold establish is a known harness weakness with an existing,
-    // documented skip (see shell_daemon_live_pairing_no_restart): the pairing
-    // ceremony does not complete within the harness timeout on a cold macOS
-    // runner. This security test must therefore report its coverage honestly
-    // rather than flake. The notes carry the unexercised list verbatim.
-    #[cfg(target_os = "macos")]
-    {
-        eprintln!("revoked_device_first_transfer_is_denied: skipped on macOS (cold establish not yet verified on this platform)");
-        return;
-    }
+    // No live pairing ceremony here (it was the flaky part on cold runners):
+    // B's record for A is constructed directly from A's device cert. The
+    // remaining flow is the same code-transfer path pair_and_transfer_smoke
+    // uses, which is verified on all three platforms, so no macOS skip is
+    // needed.
     let h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
