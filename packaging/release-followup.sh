@@ -106,7 +106,7 @@ if [ "$OPEN_PR" = "--pr" ] && gh auth status >/dev/null 2>&1; then
   git -C "$WPDIR" push -q -u origin "$BR"
   gh pr create --repo microsoft/winget-pkgs --head "$ME:$BR" \
     --title "New package: Abdk4Moura.Filament version $VERSION" \
-    --body "Adds Abdk4Moura.Filament $VERSION (portable zip, x64). P2P file transfer CLI; binaries built and attested by GitHub Actions in https://github.com/$REPO. Validated against manifest schema 1.12.0."
+    --body "Adds Abdk4Moura.Filament $VERSION (portable zip, x64). P2P file transfer CLI; binaries built and attested by GitHub Actions in https://github.com/$REPO. Validated against manifest schema 1.28.0."
   rm -rf "$WPDIR"
 fi
 echo "done."
