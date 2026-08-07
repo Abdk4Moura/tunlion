@@ -24,20 +24,26 @@ the GitHub release notes.
   Revocation is now an absolute denial evaluated before any grant is consulted,
   in both modes.
 
-  **A residual remains and is not fixed here.** Revocation binds once the peer's
-  identity resolves. On the one-shot code path a revoked device can still
-  complete a *first* operation if the receiver accepts a fresh pairing code from
-  it — the device cannot initiate this unaided, because the pairing words must be
-  obtained out of band and typed by the receiver. A revoked device reconnecting
-  on its own, using the pair secret it already holds, resolves identity at
-  admission and **is** denied, on every transport. The relay path is untested in
-  both directions. Tracked as #161.
+  **Neither of those two defects exposed anything** in the sense of an attacker
+  gaining access they did not have: both failed to *withdraw* authorization
+  rather than conferring it. What was wrong is that a revocation you performed
+  did less than its message said.
 
-  **No release was exposed** in the sense of an attacker gaining access they did
-  not have: these defects failed to *withdraw* authorization rather than
-  conferring it. What was wrong is that a revocation you performed did less than
-  its message said. Present in every released version; the ordering predates the
-  capability gate.
+  **Introduced in 0.7.7, with certificate revocation itself.** Earlier releases
+  have no `revoke --certificate` and are unaffected — you cannot have a defect in
+  revocation in a release that has no revocation.
+
+  **A residual remains and is not fixed here, and it IS an exposure.** Revocation
+  binds once the peer's identity resolves. On the one-shot code path a revoked
+  device can still complete a *first* operation — that is a revoked device doing
+  something revocation was invoked to stop. It is bounded by its precondition:
+  the receiver must accept a fresh pairing code from that device, and the device
+  cannot initiate this unaided, because the pairing words must be obtained out of
+  band and typed by the receiver. A revoked device reconnecting on its own, using
+  the pair secret it already holds, resolves identity at admission and **is**
+  denied, on every transport. The relay path is untested in both directions. The
+  link-setup ordering behind this is older than 0.7.7, but it is only a
+  revocation bypass where revocation exists. Tracked as #161.
 
   Both messages that described the old behaviour are corrected. The pre-action
   warning no longer claims revocation removes access "entirely", and the success
@@ -79,10 +85,12 @@ the GitHub release notes.
   Separately, its "cone" proof measured endpoint-independent *mapping* only;
   cone requires endpoint-independent mapping **and** filtering, and Linux
   `MASQUERADE` is EI mapping with ED filtering, so a correct measurement of one
-  property was being read as a claim about another. **This removes a signal
-  rather than fixing one:** cone-NAT traversal is now unverified rather than
-  falsely verified. The mapping probe that was correct is kept and still
-  classifies both mapping types.
+  property was being read as a claim about another. To be precise about what is
+  lost: the transfer assertion **ran and failed** under NAT rather than being
+  skipped, so the gate was never silently reporting success — it simply could
+  never demonstrate the thing it existed to demonstrate. Cone-NAT traversal was
+  not verified before this change and is not verified after it. The mapping probe
+  that was correct is kept and still classifies both mapping types.
 
 ## [0.7.7] - 2026-08-06
 
