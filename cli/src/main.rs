@@ -4676,9 +4676,10 @@ async fn invite_cmd(
         "filament-invite:v1:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle)?)
     ));
-    if crate::ctl::try_arm(hex::encode(auth_key.enroll_pub), auth_key.expires).await.is_none() {
-        bail!("the background receiver is not running; start `filament receive --background` before inviting")
-    }
+    // #176: minting a bounded invitation is a local act (signing + printing);
+    // the always-on receiver is only needed when someone CLAIMS it. Arm the
+    // enrollment room best-effort; never block minting on the daemon.
+    let armed = crate::ctl::try_arm(hex::encode(auth_key.enroll_pub), auth_key.expires).await.is_some();
 
     if let Some(path) = out.as_deref() {
         write_owner_only_file(path, token.as_str())?;
@@ -4697,6 +4698,7 @@ async fn invite_cmd(
         eprintln!("  Whoever captures this can join until it is used or expires.");
         eprintln!("{}", ui::qr(token.as_str()));
         eprintln!("{}", token.as_str());
+        eprintln!("  keep this window open until the other device claims it");
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
         let _ = execute!(err, terminal::LeaveAlternateScreen);
         result?;
@@ -4713,6 +4715,12 @@ async fn invite_cmd(
     } else if let Some(path) = out {
         ui::say(&format!("  {} invitation written to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), path.display()));
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
+    }
+    if !armed {
+        ui::say(&ui::paint(
+            ui::Tone::Warn,
+            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament receive --background`, then the other device can join.",
+        ));
     }
     Ok(())
 }
@@ -6517,6 +6525,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     ui::say(&ui::qr(&full));
                 }
                 ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament add <code>`"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  keep this window open until the other device claims it"));
                 ui::say(&ui::paint(ui::Tone::Dim, "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)"));
             }
             Ev::PairCode(v) => {
