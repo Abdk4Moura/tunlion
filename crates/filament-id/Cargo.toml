@@ -9,7 +9,7 @@
 # and passes it to `UserKey::generate` / `UserKey::load`.
 [package]
 name = "filament-id"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"

@@ -8,7 +8,7 @@
 # the CLI passes `crate::settings::config_dir()`).
 [package]
 name = "authkeys-managed"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
 edition = "2021"
 license = "MIT"
