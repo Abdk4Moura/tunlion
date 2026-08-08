@@ -12,17 +12,17 @@ pub fn render_same_person_banner(device_name: &str) -> String {
     format!(
         "{rule}\n{banner}\n{rule}\n\n{msg}\n\n{will}\n{wont}\n{meta}\n\n{btns}",
         rule = ui::paint(Tone::Brand, double_rule()),
-        banner = format!("  {}  SAME PERSON  ·  this is you", ui::paint(Tone::Brand, ui::glyph_fleet())),
+        banner = format!("  {}  SAME PERSON  /  this is you", ui::paint(Tone::Brand, ui::glyph_fleet())),
         msg = format!("  \"{}\" is signed by your identity. Adding it to your fleet.", device_name),
         will = format!(
             "  This device will:  {}",
-            ui::paint(Tone::Ok, "send/receive with your fleet · reach exposed ports · read ~/share")
+            ui::paint(Tone::Ok, "send/receive with your fleet / reach exposed ports / read the configured share root")
         ),
         wont = format!(
             "  It will not:       {}",
-            ui::paint(Tone::Dim, "owner-equivalent shell · write to disk   (grant those later if you want)")
+            ui::paint(Tone::Dim, "owner-equivalent shell / write to disk   (grant those later if you want)")
         ),
-        meta = meta(&format!("{} fleet · certs auto-renew · Proven", ui::glyph_fleet())),
+        meta = meta(&format!("{} fleet / cryptographically Proven", ui::glyph_fleet())),
         btns = format!(
             "        {}   {}",
             ui::paint(Tone::Bold, "[ Add to my fleet ]"),
@@ -37,7 +37,7 @@ pub fn render_same_person_success(device_name: &str) -> String {
         "{ok} {name} joined your fleet.\n{echo}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
         name = device_name,
-        echo = echo_cmd(&format!("filament pair --fleet --name {device_name}")),
+        echo = echo_cmd("filament add"),
     )
 }
 
@@ -46,8 +46,8 @@ pub fn render_someone_else_banner() -> String {
     format!(
         "{rule}\n{banner}\n{rule}\n\n{msg}",
         rule = ui::paint(Tone::Warn, double_rule()),
-        banner = format!("  {}  SOMEONE ELSE  ·  not your identity", ui::paint(Tone::Warn, ui::glyph_extern())),
-        msg = ui::paint(Tone::Dim, "  This is not you. Nothing is shared yet — you decide exactly what, and for how long."),
+        banner = format!("  {}  SOMEONE ELSE  /  not your identity", ui::paint(Tone::Warn, ui::glyph_extern())),
+        msg = ui::paint(Tone::Dim, "  This is not you. Nothing is shared yet; you decide exactly what, and for how long."),
     )
 }
 
@@ -69,14 +69,14 @@ pub fn render_pake_words(sas: &SpokenSas) -> String {
             ui::paint(Tone::Bold, "[ Yes, they match ]"),
             ui::paint(Tone::Err, "[ No / stop ]")
         ),
-        fingerprint = ui::paint(Tone::Dim, "  Fingerprint 7f3a 9c21 4b…  [compare]  — informational; the words are the trust."),
+        fingerprint = ui::paint(Tone::Dim, "  Fingerprint 7f3a 9c21 4b...  [compare]  / informational; the words are the trust."),
     )
 }
 
 /// Render the PAKE mismatch (No / stop) message.
 pub fn render_pake_mismatch() -> String {
     format!(
-        "{err} Stopped. If the words didn't match, someone may be in the middle — don't retry\n  on the same channel. Get a fresh code from them and try again.",
+        "{err} Stopped. If the words didn't match, someone may be in the middle. Don't retry\n  on the same channel. Get a fresh code from them and try again.",
         err = ui::paint(Tone::Err, ui::glyph_err()),
     )
 }
@@ -88,7 +88,7 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
          {send} {port}\n\
          {read} {shell}\n\
          Direction:  {dir_out}    {dir_both}\n\
-         Ends in:    [ 1h ]  ◀──●─────▶   (max 24h)\n\n\
+         Ends in:    [ 1h ]  <---o----->   (max 24h)\n\n\
          {rule}\n\
          {can}\n\
          {cannot}\n\
@@ -104,12 +104,12 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
         rule = super::rule(),
         can = format!("  {} {}: send files", ui::paint(Tone::Ok, ui::glyph_ok()), peer_name),
         cannot = format!(
-            "  {} you → {}: nothing · {} cannot shell, mount, or reach other ports",
+            "  {} you -> {}: nothing / {} cannot shell, mount, or reach other ports",
             ui::paint(Tone::Err, ui::glyph_err()),
             peer_name,
             peer_name
         ),
-        meta = meta(&format!("{} external · one-way · expires 14:41 (in 1h) · no auto-renew", ui::glyph_extern())),
+        meta = meta(&format!("{} external / one-way / expires 14:41 (in 1h) / no auto-renew", ui::glyph_extern())),
         grant = ui::paint(Tone::Bold, "[ Grant ]"),
         cancel = ui::paint(Tone::Dim, "[ Cancel ]"),
     )
@@ -131,13 +131,13 @@ pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> St
     )
 }
 
-/// Non-TTY refusal: pair is interactive.
+/// Non-TTY refusal: add is interactive.
 pub fn err_pair_interactive() -> (String, i32) {
     (
         format!(
-            "{err} pair is interactive (it needs the spoken-words step). For automation, mint a key instead:\n  {fix}",
+            "{err} add is interactive (it needs consent on both ends). For automation, create a bounded invitation instead:\n  {fix}",
             err = ui::paint(Tone::Err, ui::glyph_err()),
-            fix = "filament mint --external carol --ttl 1h --allow transfer",
+            fix = "filament invite",
         ),
         super::EXIT_BAD_ARG,
     )
@@ -180,7 +180,7 @@ mod tests {
     fn pake_mismatch_honest_copy() {
         let s = render_pake_mismatch();
         assert!(s.contains("someone may be in the middle"), "must explain the risk");
-        assert!(s.contains("don't retry"), "must advise against retry");
+        assert!(s.to_lowercase().contains("don't retry"), "must advise against retry");
     }
 
     #[test]
@@ -204,7 +204,7 @@ mod tests {
     fn err_pair_interactive_exit_code() {
         let (msg, code) = err_pair_interactive();
         assert!(msg.contains("interactive"), "must explain why");
-        assert!(msg.contains("mint"), "must suggest alternative");
+        assert!(msg.contains("invite"), "must suggest alternative");
         assert_eq!(code, 2, "bad-arg = exit 2");
     }
 

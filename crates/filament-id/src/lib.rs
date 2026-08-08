@@ -1,13 +1,20 @@
 //! User identity layer: SSH-CA shaped user-key over device-certs.
 use anyhow::{anyhow, bail, Context, Result};
+use bip39::{Language, Mnemonic};
+use hkdf::Hkdf;
 use ring::rand::SystemRandom;
+use ring::rand::SecureRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::{json, Value};
+use sha2_pake::Sha256;
+use zeroize::{Zeroize, Zeroizing};
 
 use std::path::{Path, PathBuf};
 
 pub const CERT_TTL_SECS: u64 = 90 * 24 * 3600;
 const CERT_SIGN_DOMAIN: &[u8] = b"filament/identity-device-cert/v1";
+const RECOVERY_KEY_DOMAIN: &[u8] = b"filament/user-identity/recovery/v1";
+const RECOVERY_SEED_PREFIX: &[u8] = b"filament-id-seed-v1\0";
 
 /// Host-provided key persistence, injected so this crate stays decoupled from
 /// the CLI's platform module. The CLI's `PlatformKeyStore` forwards to
@@ -29,6 +36,65 @@ pub struct UserKey {
     keypair: Ed25519KeyPair,
 }
 
+/// A recoverable identity that does not exist on disk until the recovery
+/// phrase has been shown and checked by the caller.
+pub struct PendingIdentity {
+    user_key: UserKey,
+    mnemonic: Mnemonic,
+    seed: Zeroizing<[u8; 32]>,
+}
+
+impl PendingIdentity {
+    pub fn generate() -> Result<Self> {
+        let rng = SystemRandom::new();
+        let mut entropy = Zeroizing::new([0u8; 16]);
+        rng.fill(entropy.as_mut())
+            .map_err(|_| anyhow!("failed to generate recovery entropy"))?;
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy.as_ref())
+            .map_err(|_| anyhow!("failed to encode recovery phrase"))?;
+        let seed = Zeroizing::new(recovery_seed(entropy.as_ref())?);
+        let keypair = Ed25519KeyPair::from_seed_unchecked(seed.as_ref())
+            .map_err(|_| anyhow!("failed to derive user identity key"))?;
+        Ok(PendingIdentity {
+            user_key: UserKey { keypair },
+            mnemonic,
+            seed,
+        })
+    }
+
+    pub fn mnemonic(&self) -> &Mnemonic {
+        &self.mnemonic
+    }
+
+    pub fn fingerprint(&self) -> String {
+        self.user_key.fingerprint()
+    }
+
+    /// Persist the identity only after the caller completes its recovery check.
+    pub fn commit(mut self, store: &dyn KeyStore) -> Result<UserKey> {
+        let path = user_key_path(store);
+        if path.exists() {
+            bail!("a user identity already exists ({})", path.display());
+        }
+        let mut encoded = Zeroizing::new(Vec::with_capacity(RECOVERY_SEED_PREFIX.len() + self.seed.len()));
+        encoded.extend_from_slice(RECOVERY_SEED_PREFIX);
+        encoded.extend_from_slice(self.seed.as_ref());
+        store
+            .write_secret(&path, &encoded)
+            .with_context(|| format!("write user identity to {}", path.display()))?;
+        self.seed.zeroize();
+        Ok(self.user_key)
+    }
+}
+
+fn recovery_seed(entropy: &[u8]) -> Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(RECOVERY_KEY_DOMAIN), entropy);
+    let mut seed = [0u8; 32];
+    hk.expand(b"ed25519-user-key", &mut seed)
+        .map_err(|_| anyhow!("failed to derive identity seed"))?;
+    Ok(seed)
+}
+
 impl UserKey {
     pub fn generate(store: &dyn KeyStore) -> Result<Self> {
         let path = user_key_path(store);
@@ -48,11 +114,44 @@ impl UserKey {
     pub fn load(store: &dyn KeyStore) -> Result<Option<Self>> {
         let path = user_key_path(store);
         if !path.exists() { return Ok(None); }
-        let pkcs8 = store.read(&path)
-            .with_context(|| format!("read user identity from {}", path.display()))?;
-        let keypair = Ed25519KeyPair::from_pkcs8(&pkcs8)
-            .map_err(|_| anyhow!("user identity key is corrupt"))?;
+        let pkcs8 = Zeroizing::new(
+            store.read(&path)
+                .with_context(|| format!("read user identity from {}", path.display()))?,
+        );
+        let keypair = if let Some(seed) = pkcs8.strip_prefix(RECOVERY_SEED_PREFIX) {
+            if seed.len() != 32 {
+                bail!("recoverable user identity seed is corrupt");
+            }
+            Ed25519KeyPair::from_seed_unchecked(seed)
+                .map_err(|_| anyhow!("user identity key is corrupt"))?
+        } else {
+            Ed25519KeyPair::from_pkcs8(&pkcs8)
+                .map_err(|_| anyhow!("user identity key is corrupt"))?
+        };
         Ok(Some(UserKey { keypair }))
+    }
+
+    pub fn restore(store: &dyn KeyStore, phrase: &str) -> Result<Self> {
+        let path = user_key_path(store);
+        if path.exists() {
+            bail!("a user identity already exists ({})", path.display());
+        }
+        let mnemonic = Mnemonic::parse_in(Language::English, phrase)
+            .map_err(|_| anyhow!("recovery phrase is invalid"))?;
+        if mnemonic.word_count() != 12 {
+            bail!("recovery phrase must contain exactly 12 words");
+        }
+        let entropy = Zeroizing::new(mnemonic.to_entropy());
+        let seed = Zeroizing::new(recovery_seed(entropy.as_ref())?);
+        let keypair = Ed25519KeyPair::from_seed_unchecked(seed.as_ref())
+            .map_err(|_| anyhow!("failed to restore user identity key"))?;
+        let mut encoded = Zeroizing::new(Vec::with_capacity(RECOVERY_SEED_PREFIX.len() + seed.len()));
+        encoded.extend_from_slice(RECOVERY_SEED_PREFIX);
+        encoded.extend_from_slice(seed.as_ref());
+        store
+            .write_secret(&path, &encoded)
+            .with_context(|| format!("write restored identity to {}", path.display()))?;
+        Ok(UserKey { keypair })
     }
 
     pub fn public_key_bytes(&self) -> [u8; 32] {
@@ -443,6 +542,21 @@ impl ring::aead::NonceSequence for OneNonce {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TempStore(tempfile::TempDir);
+    impl TempStore {
+        fn new() -> Self { Self(tempfile::tempdir().unwrap()) }
+    }
+    impl KeyStore for TempStore {
+        fn write_secret(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+            std::fs::write(path, data)
+        }
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            std::fs::read(path)
+        }
+        fn config_path(&self, relative: &str) -> PathBuf {
+            self.0.path().join(relative)
+        }
+    }
     fn make_user() -> UserKey {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
@@ -457,6 +571,21 @@ mod tests {
         let mut pubkey = [0u8; 32];
         pubkey.copy_from_slice(keypair.public_key().as_ref());
         (keypair, pubkey)
+    }
+
+    #[test]
+    fn recoverable_identity_is_atomic_and_roundtrips() {
+        let store = TempStore::new();
+        let pending = PendingIdentity::generate().unwrap();
+        assert_eq!(pending.mnemonic().word_count(), 12);
+        assert!(!user_key_path(&store).exists());
+        let phrase = pending.mnemonic().to_string();
+        let fingerprint = pending.fingerprint();
+        pending.commit(&store).unwrap();
+        assert_eq!(UserKey::load(&store).unwrap().unwrap().fingerprint(), fingerprint);
+
+        std::fs::remove_file(user_key_path(&store)).unwrap();
+        assert_eq!(UserKey::restore(&store, &phrase).unwrap().fingerprint(), fingerprint);
     }
 
     fn sign_possession(keypair: &Ed25519KeyPair, msg: &[u8]) -> [u8; 64] {
@@ -1076,4 +1205,3 @@ mod tests {
         assert!(verify_possession_sig(&device_pub, &msg_caps_tamper, &sig_user).is_err(), "caps disagreement must FAIL");
     }
 }
-

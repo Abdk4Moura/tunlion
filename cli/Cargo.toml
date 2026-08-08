@@ -96,6 +96,7 @@ rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pe
 # rustls/quinn/rcgen; this is a direct handle for Ed25519 sign/verify + CSPRNG, so
 # we never hand-roll the crypto.
 ring = "0.17"
+zeroize = "1.8"
 socket2 = { version = "0.5", features = ["all"] }
 # Userspace L3 netstack: an in-process TCP/IP stack so a zero-privilege node (no
 # CAP_NET_ADMIN, no /dev/net/tun, e.g. a container) is a first-class overlay member.

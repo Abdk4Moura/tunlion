@@ -43,7 +43,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Brand, ui::glyph_fleet()),
-            ui::paint(Tone::Brand, "FLEET  — your devices, permissive within scope, self-renewing")
+            ui::paint(Tone::Brand, "FLEET  /  your devices, permissive within scope")
         ));
         for d in &fleet {
             lines.push(render_device_row(d));
@@ -57,7 +57,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Dim, ui::glyph_extern()),
-            ui::paint(Tone::Dim, "EXTERNAL  — other people, time-boxed, deny-by-default")
+            ui::paint(Tone::Dim, "EXTERNAL  /  other people, time-boxed, deny-by-default")
         ));
         for d in &externs {
             lines.push(render_device_row(d));
@@ -71,7 +71,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Warn, ui::glyph_review()),
-            ui::paint(Tone::Warn, "NEEDS REVIEW  — paired before scoped trust; promote to sort into a tier")
+            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired before scoped trust; promote to sort into a tier")
         ));
         for d in &review {
             lines.push(render_device_row(d));
@@ -123,8 +123,8 @@ fn render_device_row(d: &DeviceEntry) -> String {
 pub fn render_empty() -> String {
     format!(
         "No devices yet.\n\
-         Add your own:     filament pair             (run on both, same identity)\n\
-         Let someone in:   filament mint --external <them> --ttl 1h --allow transfer"
+         Add in person:    filament add\n\
+         Invite securely:  filament invite"
     )
 }
 
@@ -136,8 +136,8 @@ pub fn render_degraded(offline_primaries: &[(&str, &str)], expiry: &str) -> Stri
         .join(", ");
 
     format!(
-        "{warn} No primary online. Your devices keep working and auto-renew\n\
-         {until} Bring a primary online before then to keep them fresh.\n\
+        "{warn} No primary online. Existing grants keep working until their certificate expires.\n\
+         {until} Bring a primary online before then to issue a fresh invitation.\n\
          {primaries}",
         warn = ui::paint(Tone::Warn, ui::glyph_extern()),
         until = format!("     until {expiry}"),
@@ -158,8 +158,8 @@ pub fn render_falling_out(name: &str, expiry: &str) -> String {
 /// Render a lapsed device (dimmed "left" line).
 pub fn render_lapsed(name: &str, expiry: &str) -> String {
     format!(
-        "     · {name:<16} —        —        {}",
-        ui::paint(Tone::Dim, &format!("left: cert expired {expiry} · re-pair to restore"))
+        "     . {name:<16} -        -        {}",
+        ui::paint(Tone::Dim, &format!("left: cert expired {expiry} / invite again to restore"))
     )
 }
 
@@ -172,8 +172,8 @@ pub fn render_promote(device_name: &str) -> String {
             {promote}   {cancel}",
         warn = ui::paint(Tone::Warn, ui::glyph_review()),
         name = device_name,
-        fleet = format!("     {} fleet — my own device, permissive within scope", ui::paint(Tone::Dim, "(o)")),
-        external = format!("     {} external — someone else, pick caps + an expiry", ui::paint(Tone::Dim, "( )")),
+        fleet = format!("     {} fleet / my own device, permissive within scope", ui::paint(Tone::Dim, "(o)")),
+        external = format!("     {} external / someone else, pick caps + an expiry", ui::paint(Tone::Dim, "( )")),
         promote = ui::paint(Tone::Bold, "[ Promote ]"),
         cancel = ui::paint(Tone::Dim, "[ Cancel ]"),
     )
@@ -182,7 +182,7 @@ pub fn render_promote(device_name: &str) -> String {
 /// Render the promote success.
 pub fn render_promote_success(device_name: &str) -> String {
     format!(
-        "{ok} {name} is now a fleet device. Certs will auto-renew.",
+        "{ok} {name} is now a fleet device. Its certificate remains time-bounded.",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
         name = device_name,
     )
@@ -196,8 +196,8 @@ mod tests {
     fn empty_devices() {
         let s = render_empty();
         assert!(s.contains("No devices yet"), "must show empty message");
-        assert!(s.contains("filament pair"), "must suggest pair");
-        assert!(s.contains("filament mint --external"), "must suggest mint");
+        assert!(s.contains("filament add"), "must suggest add");
+        assert!(s.contains("filament invite"), "must suggest invite");
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
     fn lapsed_device() {
         let s = render_lapsed("ci-box", "Aug 3");
         assert!(s.contains("left: cert expired"), "must show lapsed reason");
-        assert!(s.contains("re-pair to restore"), "must show restore hint");
+        assert!(s.contains("invite again to restore"), "must show restore hint");
     }
 
     #[test]

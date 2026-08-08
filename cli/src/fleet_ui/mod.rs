@@ -55,7 +55,7 @@ pub fn confirm_mistype(token: &str) -> String {
     format!(
         "{} {}",
         ui::paint(Tone::Warn, ui::glyph_warn()),
-        format!("didn't match \"{token}\" — left off.")
+        format!("didn't match \"{token}\" / left off.")
     )
 }
 

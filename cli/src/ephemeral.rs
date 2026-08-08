@@ -19,6 +19,7 @@ pub use filament_cap::ephemeral::*;
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use zeroize::Zeroize;
 
 // ---------------------------------------------------------------------------
 // Pending enrollment state (enroller side)
@@ -26,9 +27,14 @@ use std::sync::{Mutex, OnceLock};
 
 struct PendingEnroll {
     enroll_seed: [u8; 32],
-    device_seed: [u8; 32],
     device_pub: [u8; 32],
     auth_key: AuthKey,
+}
+
+impl Drop for PendingEnroll {
+    fn drop(&mut self) {
+        self.enroll_seed.zeroize();
+    }
 }
 
 static PENDING_ENROLLS: OnceLock<Mutex<HashMap<String, PendingEnroll>>> = OnceLock::new();
@@ -37,12 +43,11 @@ static PENDING_ENROLLS: OnceLock<Mutex<HashMap<String, PendingEnroll>>> = OnceLo
 pub fn register_enrollment(
     peer_id: String,
     enroll_seed: [u8; 32],
-    device_seed: [u8; 32],
     device_pub: [u8; 32],
     auth_key: AuthKey,
 ) {
     let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    store.insert(peer_id, PendingEnroll { enroll_seed, device_seed, device_pub, auth_key });
+    store.insert(peer_id, PendingEnroll { enroll_seed, device_pub, auth_key });
 }
 
 /// Take a pending enrollment and build the response to the daemon's challenge.
@@ -87,17 +92,19 @@ pub fn build_enrollment_response(
 
     // ALL checks passed — now remove from store and build.
     let pe = store.remove(peer_id)?;
-    let ak = pe.auth_key;
+    let ak = pe.auth_key.clone();
     let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.enroll_seed).ok()?;
-    let device_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.device_seed).ok()?;
-    let payload = EnrollmentPayload::build(
-        ak.clone(),
-        pe.device_pub,
-        &enroll_kp,
-        &device_kp,
-        nonce,
-        verifier_pub,
-    );
+    let message = enrollment_possession_msg(&nonce, &pe.device_pub, &verifier_pub);
+    let enroll_signature = enroll_kp.sign(&message);
+    let mut enroll_possession_sig = [0u8; 64];
+    enroll_possession_sig.copy_from_slice(enroll_signature.as_ref());
+    let device_possession_sig = crate::overlay::overlay_sign_possession(&message).ok()?;
+    let payload = EnrollmentPayload {
+        auth_key: ak.clone(),
+        device_pub: pe.device_pub,
+        enroll_possession_sig,
+        device_possession_sig,
+    };
     Some(serde_json::json!({
         "auth_key": payload.auth_key.to_json(),
         "device_pub": hex::encode(payload.device_pub),

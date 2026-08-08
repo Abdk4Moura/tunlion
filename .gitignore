@@ -48,3 +48,4 @@ cli/target
 *.bin.part.meta
 b200.bin
 /b*.bin
+target-ux/

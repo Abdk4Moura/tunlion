@@ -26,6 +26,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
+
 const CODE_WORD: &str = "gigantic-element-tango";
 const BUILD_PROFILE: &str = env!("FILAMENT_BUILD_PROFILE");
 
@@ -330,6 +332,31 @@ impl Harness {
             panic!("backend did not start within 45s at {server_url}");
         }
 
+        // 0.8.0 surface is init-first: peers are real devices with an identity
+        // cert, so the typed-code possession ceremony can resolve the sender's
+        // cert and revocation binds. Init each config dir before any test uses
+        // it. Recovery phrases go to owner-only files inside each dir.
+        let bin = binary();
+        for (dir, name) in [(&a_dir, "test-a"), (&b_dir, "test-b")] {
+            std::fs::create_dir_all(dir).expect("create peer dir");
+            let rec = dir.join(format!("{name}-recovery.txt"));
+            let out = Command::new(&bin)
+                .env("FILAMENT_CONFIG_DIR", dir)
+                .arg("init")
+                .arg("--name")
+                .arg(name)
+                .arg("--recovery-file")
+                .arg(&rec)
+                .arg("--yes")
+                .output()
+                .expect("init peer");
+            assert!(
+                out.status.success(),
+                "init {name} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
         Harness {
             backend,
             backend_port: port,
@@ -572,7 +599,7 @@ fn pair_and_transfer_smoke() {
     )
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .arg("recv")
+        .arg("receive")
         .arg(&full_code)
         .arg("--yes")
         .arg("--dir")
@@ -618,6 +645,137 @@ fn pair_and_transfer_smoke() {
     assert_eq!(
         received_data[1], 0x0A,
         "byte 1 = 0x0A lost (LF)"
+    );
+}
+
+/// #161: a REVOKED device's FIRST gated operation is denied, not a later one.
+/// Pair A and B (so B holds A's device record), durably revoke A on B, then A
+/// sends a one-shot code transfer: the receiver's gate must resolve A's
+/// identity via the possession ceremony and deny before any bytes land.
+#[test]
+fn revoked_device_first_transfer_is_denied() {
+    // No live pairing ceremony here (it was the flaky part on cold runners):
+    // B's record for A is constructed directly from A's device cert. The
+    // remaining flow is the same code-transfer path pair_and_transfer_smoke
+    // uses, which is verified on all three platforms, so no macOS skip is
+    // needed.
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+    let direct_flag =
+        std::env::var("FILAMENT_DIRECT_PER_OS").unwrap_or_else(|_| "1".into());
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    let base_env = [
+        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
+        ("FILAMENT_DIRECT", &direct_flag),
+        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
+        ("FILAMENT_L3_USERSPACE", "1"),
+    ];
+
+    // 1. B holds A's device record (cert + secret). Construct it directly from
+    // A's own device cert rather than running a live pairing ceremony: the
+    // ceremony's code mint is slow on cold CI runners (it timed out on macOS
+    // and ubuntu within 60s), and the pairing itself is not what this test
+    // asserts. What matters is that B can resolve A's cert from the store.
+    let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
+    let a_cert_raw = std::fs::read_to_string(&a_cert_path).expect("a device cert");
+    let a_cert_val: Value =
+        serde_json::from_str(&a_cert_raw).expect("parse a device cert");
+    let a_cert = &a_cert_val["cert"];
+    assert!(
+        a_cert["devicePub"].as_str().is_some(),
+        "A's device cert has a devicePub"
+    );
+    let a_record = serde_json::json!([{
+        "name": "test-a",
+        "secret": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "deviceCert": a_cert,
+        "caps": ["transfer"],
+    }]);
+    std::fs::write(
+        h.b_dir.join("devices.json"),
+        serde_json::to_string_pretty(&a_record).unwrap(),
+    )
+    .expect("write b devices.json");
+
+    // 2. Durable revoke: A is no longer recognized on B.
+    let revoke = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["devices", "revoke", "test-a", "--yes"])
+        .output()
+        .expect("revoke");
+    assert!(
+        revoke.status.success(),
+        "devices revoke failed: {}",
+        String::from_utf8_lossy(&revoke.stderr)
+    );
+
+    // 3. A sends a one-shot code transfer; B's FIRST gated operation must deny.
+    let test_file = h.work_dir.join("revoked-payload.bin");
+    std::fs::write(&test_file, b"secret bytes that must never land").unwrap();
+    let mut send_proc = Command::new(&bin)
+        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .arg("send")
+        .arg(&test_file)
+        .arg("--word")
+        .arg("revoked-transfer-code")
+        .arg("--server")
+        .arg(&server)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("send");
+
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    let stderr = send_proc.stderr.take().unwrap();
+    let code_word = "revoked-transfer-code".to_string();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            let lower = line.to_lowercase();
+            if let Some(start) = lower.find(&code_word.to_lowercase()) {
+                let rest = &line[start..];
+                let end = rest
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(rest.len());
+                let _ = code_tx.send(line[start..start + end].to_lowercase().to_string());
+            }
+        }
+    });
+    let full_code = code_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("send did not mint a code within 30s");
+    let recv_dir = h.b_dir.join("received");
+    std::fs::create_dir_all(&recv_dir).unwrap();
+    let mut recv_proc = Command::new(&bin)
+        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .arg("receive")
+        .arg(&full_code)
+        .arg("--yes")
+        .arg("--dir")
+        .arg(&recv_dir)
+        .arg("--server")
+        .arg(&server)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("receive");
+    let recv_out = recv_proc.wait_with_output().expect("recv result");
+    let recv_stderr = String::from_utf8_lossy(&recv_out.stderr);
+    let _ = send_proc.wait_with_output().expect("send result");
+
+    // The FIRST gated operation is denied: no file lands, and the receiver
+    // reports the decline (revocation, not a consent prompt - we passed --yes).
+    assert!(
+        !recv_dir.join("revoked-payload.bin").exists(),
+        "a revoked device's first transfer must be denied; file landed"
+    );
+    assert!(
+        recv_stderr.contains("declined") || recv_stderr.contains("revoked"),
+        "expected a revocation decline in receiver stderr, got: {recv_stderr}"
     );
 }
 
@@ -702,7 +860,7 @@ fn direct_blocked_falls_back_to_webrtc_promptly() {
         .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback)
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .arg("recv").arg(&full_code)
+        .arg("receive").arg(&full_code)
         .arg("--yes")
         .arg("--dir").arg(&recv_dir)
         .arg("--server").arg(&server);
@@ -849,7 +1007,7 @@ fn pty_one_shot_exec_smoke() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-a")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pair", "--word", &pair_word])
+        .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -888,7 +1046,7 @@ fn pty_one_shot_exec_smoke() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-b")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .args(["--server", &server, "pair", &pair_code])
+        .args(["--server", &server, "add", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1049,7 +1207,7 @@ fn shell_daemon_live_pairing_no_restart() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-a")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pair", "--word", &pair_word])
+        .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1088,7 +1246,7 @@ fn shell_daemon_live_pairing_no_restart() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-b")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .args(["--server", &server, "pair", &pair_code])
+        .args(["--server", &server, "add", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1198,7 +1356,7 @@ fn warm_all_makes_first_contact_warm() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-a")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pair", "--word", &pair_word])
+        .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1237,7 +1395,7 @@ fn warm_all_makes_first_contact_warm() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-b")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .args(["--server", &server, "pair", &pair_code])
+        .args(["--server", &server, "add", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1468,7 +1626,7 @@ fn warm_one_shot_pty_reuse() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-a")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pair", "--word", &pair_word])
+        .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1507,7 +1665,7 @@ fn warm_one_shot_pty_reuse() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-b")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .args(["--server", &server, "pair", &pair_code])
+        .args(["--server", &server, "add", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1732,7 +1890,7 @@ fn freeze_stall_detector_classification() {
         .env("FILAMENT_STALL_MS", "2500")
         .env("FILAMENT_WARM_STANDBY", "0")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .arg("recv").arg(&code).arg("--yes").arg("--dir").arg(&recv_dir)
+        .arg("receive").arg(&code).arg("--yes").arg("--dir").arg(&recv_dir)
         .arg("--server").arg(&server);
     let recv = spawn_captured(recv).expect("spawn measured receiver");
     let deadline_secs = std::env::var("FILAMENT_STALL_MEASUREMENT_DEADLINE_SECS")
@@ -1829,7 +1987,7 @@ fn warm_one_shot_pty_instant_eof() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-a")
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .args(["--server", &server, "pair", "--word", &pair_word])
+        .args(["--server", &server, "add", "--word", &pair_word])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1868,7 +2026,7 @@ fn warm_one_shot_pty_instant_eof() {
         .env("FILAMENT_L3_USERSPACE", "1")
         .env("FILAMENT_NAME", "test-b")
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .args(["--server", &server, "pair", &pair_code])
+        .args(["--server", &server, "add", &pair_code])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

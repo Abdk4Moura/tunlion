@@ -321,6 +321,9 @@ pub struct MountClient {
     /// Server capabilities advertised at mount-open time. Used by the FUSE
     /// adapters to honor transport limits and OS-specific restrictions.
     pub caps: MountCaps,
+    /// A local, restrictive override. The server still enforces its own grant;
+    /// this prevents a read-only user choice from ever emitting a write op.
+    read_only: bool,
 }
 
 impl MountClient {
@@ -353,7 +356,7 @@ impl MountClient {
                 }
             }
         });
-        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false, caps: MountCaps::default() }
+        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false, caps: MountCaps::default(), read_only: false }
     }
 
     /// Create a MountClient with binary frame support enabled (protocol v2+).
@@ -376,6 +379,7 @@ impl MountClient {
 
     /// Send a request and await its response (async).
     pub async fn call(&mut self, op: MountOp) -> Result<MountResponse> {
+        self.refuse_local_write(&op)?;
         let id = self.next_id;
         self.next_id += 1;
         let req = MountRequest { id, bin: None, op };
@@ -439,6 +443,7 @@ impl MountClient {
         op: MountOp,
         data: Option<&[u8]>,
     ) -> Result<(MountResponse, Option<Bytes>)> {
+        self.refuse_local_write(&op)?;
         let id = self.next_id;
         self.next_id += 1;
         let has_data = data.is_some();
@@ -482,6 +487,34 @@ impl MountClient {
                 None => anyhow::bail!("mount channel closed"),
             }
         }
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    fn refuse_local_write(&self, op: &MountOp) -> Result<()> {
+        if !self.read_only {
+            return Ok(());
+        }
+        if mount_op_writes(op) {
+            anyhow::bail!("read-only mount refused a local write operation");
+        }
+        Ok(())
+    }
+}
+
+fn mount_op_writes(op: &MountOp) -> bool {
+    match op {
+        MountOp::Open { flags, .. } => flags & 0b11 != 0,
+        MountOp::Write { .. }
+        | MountOp::Create { .. }
+        | MountOp::Unlink { .. }
+        | MountOp::MkDir { .. }
+        | MountOp::RmDir { .. }
+        | MountOp::Rename { .. }
+        | MountOp::Truncate { .. } => true,
+        _ => false,
     }
 }
 
@@ -1451,6 +1484,21 @@ mod tests {
         assert_eq!(rdonly & O_ACCMODE, O_RDONLY);
         assert_eq!(wronly & O_ACCMODE, O_WRONLY);
         assert_eq!(rdwr & O_ACCMODE, O_RDWR);
+    }
+
+    #[test]
+    fn local_read_only_classification_covers_every_mutation() {
+        let path = String::new();
+        assert!(!mount_op_writes(&MountOp::GetAttr { path: path.clone() }));
+        assert!(!mount_op_writes(&MountOp::Open { path: path.clone(), flags: O_RDONLY }));
+        assert!(mount_op_writes(&MountOp::Open { path: path.clone(), flags: O_RDWR }));
+        assert!(mount_op_writes(&MountOp::Write { fh: 1, offset: 0, size: 1 }));
+        assert!(mount_op_writes(&MountOp::Create { path: path.clone(), mode: 0, flags: 0 }));
+        assert!(mount_op_writes(&MountOp::Unlink { path: path.clone() }));
+        assert!(mount_op_writes(&MountOp::MkDir { path: path.clone(), mode: 0 }));
+        assert!(mount_op_writes(&MountOp::RmDir { path: path.clone() }));
+        assert!(mount_op_writes(&MountOp::Rename { from: path.clone(), to: path.clone() }));
+        assert!(mount_op_writes(&MountOp::Truncate { path, size: 0 }));
     }
 
     #[test]
