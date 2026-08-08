@@ -8,17 +8,91 @@ the GitHub release notes.
 
 ### Breaking
 
-- **The invitation token is compact now.** The old `filament-invite:v1:`
-  token was hex-inside-JSON inside base64: ~530 bytes of serialization for
-  ~116 bytes of content, which rendered a QR too wide for a normal terminal.
-  The v2 token is a self-contained binary blob, base64url-encoded: 227
-  characters instead of 780, and the QR fits an 80-column terminal. The
-  owner is selected by an 8-byte key fingerprint and the signature still
-  binds offline; the enrollment channel derives from the fingerprint, so a
-  joiner holding only the token can subscribe without the full owner key.
-  Old v1 tokens are refused with a clear message. Invitations minted before
-  0.8.4 cannot be claimed; mint a new one with `filament add --for`.
+- **Invitation tokens are 184 characters, down from 780.** The old token was
+  serialized as JSON with hex-encoded binary fields and then base64-encoded,
+  so roughly three quarters of it was encoding rather than content. It is now
+  a compact binary form: the same signature, the same enrollment key, an
+  8-byte issuer fingerprint that selects which owner key to check (the
+  signature is what binds), and packed capability, expiry, budget and reuse
+  fields. The enrollment channel derives from the fingerprint, so a joiner
+  holding only the token can subscribe without the full owner key.
 
+  The invitation QR now fits an 80-column terminal (68 columns, down from 104)
+  **and** carries stronger error correction than before. The QR was never
+  independently oversized; it was a faithful rendering of an oversized token,
+  and the error-correction level had been lowered to buy back space. Fixing
+  the payload made that unnecessary.
+
+  **Invitations minted before 0.8.4 cannot be claimed.** They are refused with
+  a message saying so rather than failing to parse. Mint a new one with
+  `filament add --for`.
+
+### Fixed
+
+- **Windows: setting up background receive now actually starts receiving.**
+  `filament receive --background` installed the autostart entry and reported
+  success, but started nothing. The entry only fires at logon, so the receiver
+  stayed down, `filament status` correctly said "not running", and an
+  invitation minted on that machine could never be claimed: the joining device
+  waited and then failed with `enrollment timed out after 60s`. Three commands
+  each behaved correctly on their own and the product could not pair.
+
+  The receiver is now started immediately as well as registered for logon,
+  which is what `systemctl --user enable --now` and a bootstrapped LaunchAgent
+  already did on the other platforms. The message says "receiving now, and at
+  every logon" rather than describing only the part that happens later.
+
+- **Your inbox is no longer relative to the directory you ran filament from.**
+  On Windows the inbox resolved to `.\Filament` and the fleet share root to
+  `.\filament-share`, because four call sites read the `HOME` environment
+  variable directly. Windows does not set `HOME`, so each fell back to the
+  current directory. Received files landed wherever the command happened to be
+  invoked, and the receiver started at logon disagreed with the CLI about where
+  the inbox was.
+
+  All four now use the platform helper that was already present and already
+  correct (`%USERPROFILE%` on Windows). The fleet share root matters most: it
+  is the directory a same-owner device may mount read-only without an explicit
+  grant, and a trust boundary that moves with the working directory is not one
+  anyone can reason about. A test now fails the build if `HOME` is read outside
+  a Unix-only path, so this class cannot return quietly.
+
+- **Windows devices are no longer all called "cli".** The default device name
+  was built from `USER` and `/etc/hostname`, neither of which exists on
+  Windows, so every machine was offered the same meaningless fallback. Windows
+  now uses its own username and computer name. The settings help no longer
+  promises a default the platform cannot produce.
+
+- **The join screen is readable and lets you name the device.** It printed the
+  expiry as a raw Unix timestamp on the one screen where a person decides
+  whether to accept a grant, and offered no way to set the device name, so a
+  device joined under whatever default it had. It now shows a formatted expiry
+  and prompts for a name, as `init` does.
+
+- **A failed install no longer suggests a command that cannot work.** After a
+  successful per-user install, a note recommended `filament up --install-system`
+  for a machine-wide service. That path registers a plain executable as a
+  Windows service, which can never start, so following the advice turned a
+  working install into a failure. The note is gone until a real service entry
+  point exists.
+
+### Security
+
+- **An invitation's secret half no longer travels to the device verifying it.**
+  While shortening the token, the enrollment payload briefly carried the
+  enrollment private key to the verifier, because the token form and the wire
+  form were the same structure. That would have made the possession proof
+  decorative, since anyone holding the payload could produce it, and would
+  have exposed a reusable invitation's secret on every claim. It was caught in
+  review and never shipped in a release.
+
+  The two forms are now distinct: the token given to the joining device carries
+  the secret, and the payload sent to the verifier carries only the derived
+  public key. The signature covers the public key, so the verifier can check
+  everything it needs without ever seeing the secret, and a device that parses
+  a payload holds a zeroed secret field and cannot mint a possession proof.
+  Four tests assert the properties directly, including that an intercepted
+  payload cannot be replayed by whoever intercepted it.
 ## [0.8.3] - 2026-08-08
 
 ### Breaking
