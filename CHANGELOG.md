@@ -4,6 +4,44 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.8.2] - 2026-08-08
+
+### Fixed
+
+- **Windows: no more "repaired permissions" on every command.** Every
+  invocation, including `--version` and `--help`, began with
+  `filament: repaired permissions on 4 sensitive config path(s)`. Nothing was
+  being repaired. The Windows arm of the check reasserted the owner-only ACL
+  and reported a repair unconditionally, so the number was simply how many
+  sensitive files existed.
+
+  The sweep is a migration: files this version writes already get the right
+  ACL when created, and the sweep exists only to catch files from older
+  releases. It now runs once, records a version stamp, and is skipped
+  entirely after that. A security-flavoured message printed on every command
+  is worse than useless, because a real permissions problem would have been
+  invisible inside noise the tool had always emitted.
+
+- **Windows: a failed install no longer reports success.** Setting up
+  background receive printed `installed as a system service (autostart at
+  boot)` immediately after Windows had refused to start the service. Neither
+  half was true. Exit statuses are now checked, so a failure is reported as
+  one, and `sc` output is captured instead of leaking raw `[SC]` text.
+
+- **Creating an invitation no longer requires a running receiver.** `invite`
+  refused to mint unless the background receiver was already up, and sent the
+  user to a command that could not succeed on Windows, so one broken installer
+  disabled the whole flow. Minting an invitation is a local act: it produces a
+  bounded key. The receiver matters when someone claims it. `invite` now mints
+  and arms the receiver when it can, with a note when it cannot. The
+  precondition is also no longer checked after the interactive prompt, so the
+  flow cannot ask a question and then discard the answer.
+
+- **The pairing screen says to keep the window open.** `add` and `invite`
+  printed a code and a QR without mentioning that the command must keep
+  running until the other device claims it. Leaving the screen cancelled the
+  pairing with `Error: interrupted` and no explanation.
+
 ## [0.8.1] - 2026-08-08
 
 ### Fixed
