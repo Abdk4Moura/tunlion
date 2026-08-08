@@ -42,8 +42,31 @@ impl Paths {
     /// Repair permissions on sensitive state left by older releases. This is
     /// intentionally separate from SecretFile::write: an unchanged legacy
     /// file is otherwise never rewritten and never gets its mode repaired.
+    ///
+    /// #178: this is a MIGRATION, so it runs ONCE per version, stamped in the
+    /// config dir. SecretFile applies the owner-only ACL at write time, so
+    /// every file this version creates is correct when created; the sweep
+    /// exists solely to catch files written by older releases. Without the
+    /// stamp it would (on Windows) shell out to icacls for every sensitive
+    /// file on every command, adding 150-600ms to `--version`, `--help`, and
+    /// everything else. Steady state after the stamp: zero process spawns,
+    /// zero stat calls, no message. The stamp is a version number, not a
+    /// boolean, so a future migration can bump it and re-run.
     pub fn repair_sensitive_permissions() -> std::io::Result<usize> {
-        repair_sensitive_permissions_in(&Self::config_dir())
+        const MIGRATION_VERSION: u32 = 1;
+        let dir = Self::config_dir();
+        let stamp = dir.join("permissions-migration");
+        let current = std::fs::read_to_string(&stamp)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        if current == Some(MIGRATION_VERSION) {
+            return Ok(0);
+        }
+        let repaired = repair_sensitive_permissions_in(&dir)?;
+        // Best-effort stamp: a failure to write it just means the sweep runs
+        // once more next time, which is acceptable for a migration.
+        let _ = std::fs::write(&stamp, MIGRATION_VERSION.to_string());
+        Ok(repaired)
     }
 
     /// Migrate state from a legacy `$HOME/.config/filament` directory (the
@@ -225,7 +248,10 @@ fn repair_sensitive_file(path: &Path) -> std::io::Result<bool> {
     #[cfg(windows)]
     {
         // Reassert the owner-only ACL on existing files. APPDATA is already
-        // user-scoped, but old files may predate the SecretFile writer.
+        // user-scoped, but old files may predate the SecretFile writer. This
+        // arm of the sweep is only reached by the one-time migration stamp
+        // (repair_sensitive_permissions skips the sweep entirely once it has
+        // run for this version), so its cost is not on the command hot path.
         SecretFile::restrict(path)?;
         return Ok(true);
     }
@@ -392,14 +418,20 @@ impl ServiceHost {
             ServiceHost::WindowsService => {
                 // Quote the exe inside binPath so a spaced install path (e.g.
                 // C:\Program Files\...) is parsed as one program, not split.
-                let status = std::process::Command::new("sc")
+                // #177: capture stderr so sc's raw [SC] text never reaches the
+                // user; a failed create reports a clean message, not noise.
+                let out = std::process::Command::new("sc")
                     .args(["create", "filament", "binPath=", &format!("\"{}\" up{}", exe.display(), shell_args),
                            "start=", "auto", "obj=", "LocalSystem"])
-                    .status()?;
-                if !status.success() {
-                    anyhow::bail!("sc create failed");
+                    .output()?;
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    anyhow::bail!(
+                        "sc create failed ({})",
+                        if err.is_empty() { "exit {}".to_string() } else { err }
+                    );
                 }
-                let _ = std::process::Command::new("sc").args(["start", "filament"]).status();
+                let _ = std::process::Command::new("sc").args(["start", "filament"]).output();
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
@@ -517,47 +549,87 @@ impl ServiceHost {
             use std::os::windows::ffi::OsStrExt;
 
             unsafe extern "system" {
-                fn ShellExecuteW(
-                    hwnd: isize,
-                    lpOperation: *const u16,
-                    lpFile: *const u16,
-                    lpParameters: *const u16,
-                    lpDirectory: *const u16,
-                    nShowCmd: i32,
-                ) -> isize;
+                fn ShellExecuteExW(pExecInfo: *mut SHELLEXECUTEINFOW) -> i32;
+                fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+                fn GetExitCodeProcess(h: isize, code: *mut u32) -> i32;
+                fn CloseHandle(h: isize) -> i32;
                 fn GetLastError() -> u32;
             }
 
+            // SHELLEXECUTEINFOW, fields through hProcess. repr(C) keeps the
+            // Windows x64 layout (int nShow is followed by pointer alignment).
+            #[repr(C)]
+            struct SHELLEXECUTEINFOW {
+                cb_size: u32,
+                f_mask: u32,
+                hwnd: isize,
+                lp_verb: *const u16,
+                lp_file: *const u16,
+                lp_parameters: *const u16,
+                lp_directory: *const u16,
+                n_show: i32,
+                h_inst_app: isize,
+                lp_id_list: isize,
+                lp_class: *const u16,
+                hkey_class: isize,
+                dw_hot_key: u32,
+                h_icon: isize,
+                h_process: isize,
+            }
+
+            const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
             const SW_HIDE: i32 = 0;
 
             let exe_win: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-
             let args = format!("--install-system {shell_args}");
             let args_win: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
-
             let verb: Vec<u16> = "runas\0".encode_utf16().collect();
 
-            let ret = unsafe {
-                ShellExecuteW(
-                    0, // hwnd
-                    verb.as_ptr(),
-                    exe_win.as_ptr(),
-                    args_win.as_ptr(),
-                    std::ptr::null(),
-                    SW_HIDE,
-                )
+            let mut sei = SHELLEXECUTEINFOW {
+                cb_size: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+                f_mask: SEE_MASK_NOCLOSEPROCESS,
+                hwnd: 0,
+                lp_verb: verb.as_ptr(),
+                lp_file: exe_win.as_ptr(),
+                lp_parameters: args_win.as_ptr(),
+                lp_directory: std::ptr::null(),
+                n_show: SW_HIDE,
+                h_inst_app: 0,
+                lp_id_list: 0,
+                lp_class: std::ptr::null(),
+                hkey_class: 0,
+                dw_hot_key: 0,
+                h_icon: 0,
+                h_process: 0,
             };
 
-            // ShellExecuteW returns HINSTANCE > 32 on success.
-            if ret as usize > 32 {
-                return Ok(true);
+            let ret = unsafe { ShellExecuteExW(&mut sei) };
+            if ret == 0 {
+                let code = unsafe { GetLastError() };
+                if code == 1223 {
+                    // ERROR_CANCELLED — user declined UAC
+                    return Ok(false);
+                }
+                anyhow::bail!("elevation failed to launch: {}", code);
             }
-            let code = unsafe { GetLastError() };
-            if code == 1223 {
-                // ERROR_CANCELLED — user declined UAC
+            let h = sei.h_process;
+            if h == 0 {
                 return Ok(false);
             }
-            anyhow::bail!("ShellExecuteW failed: {}", code);
+            // #177: wait for the elevated child and read its exit code. The
+            // old ShellExecuteW returned the moment the UAC prompt was shown,
+            // so the parent claimed "installed as a system service" before the
+            // child had even run. A failed install must never print success.
+            unsafe {
+                WaitForSingleObject(h, 120_000); // generous bound; sc create is fast
+                let mut exit_code: u32 = 0;
+                GetExitCodeProcess(h, &mut exit_code);
+                CloseHandle(h);
+                if exit_code == 0 {
+                    return Ok(true);
+                }
+            }
+            anyhow::bail!("elevated install failed; the service was not created")
         }
         #[cfg(target_os = "macos")]
         {

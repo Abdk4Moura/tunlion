@@ -50,6 +50,10 @@ impl SecretFile {
         {
             restrict_dacl(path)?;
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = path;
+        }
         Ok(())
     }
 
