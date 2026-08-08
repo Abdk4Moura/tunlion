@@ -3221,8 +3221,6 @@ async fn up_cmd(
         if cfg!(windows) {
             host.install_user(&exe, &up_args)?;
             ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-            ui::say(&format!("  {} run `filament up --install-system` for a machine-wide service that starts before logon",
-                ui::paint(ui::Tone::Dim, "note:")));
         } else {
             match host.install_system(&exe, &up_args) {
                 Ok(platform::InstallResult::System) => {
