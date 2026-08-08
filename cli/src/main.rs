@@ -514,7 +514,7 @@ struct Cli {
     /// relay. Conflicts with --relay (which forces relay).
     #[arg(long, global = true, conflicts_with = "relay")]
     no_relay: bool,
-    /// Display name shown to peers (default: config file, then user@host)
+    /// Display name shown to peers (default: config file, then your platform username@hostname)
     #[arg(long, global = true)]
     name_as: Option<String>,
     /// Verbose output: -v shows resilience internals (stalls, repairs,
@@ -1341,11 +1341,23 @@ pub(crate) fn display_name() -> String {
 /// The computed display name when nothing is configured (user@host). Kept
 /// separate so the settings readout can show the true default.
 pub(crate) fn default_display_name() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-    let host = std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "cli".into());
-    format!("{user}@{host}")
+    // #183.1: USER and /etc/hostname are UNIX-only. On Windows the platform
+    // provides USERNAME and COMPUTERNAME and no /etc/hostname, so the unix
+    // read would offer every device the literal name "cli".
+    #[cfg(not(target_os = "windows"))]
+    {
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let host = std::fs::read_to_string("/etc/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "cli".into());
+        format!("{user}@{host}")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into());
+        format!("{user}@{host}")
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -2738,8 +2750,7 @@ fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
 /// The built-in drop directory when nothing is configured (~/Filament). Shared
 /// with the settings readout so it shows the true default.
 pub(crate) fn default_drop_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join("Filament")
+    platform::Paths::home_dir().join("Filament")
 }
 
 /// The read-only SHARE ROOT a same-owner fleet device may mount without an
@@ -2759,8 +2770,7 @@ pub(crate) fn default_drop_dir() -> PathBuf {
 /// out of the share root at open time (see the beneath-root hardening).
 pub(crate) fn fleet_share_root() -> PathBuf {
     config_get("share").map(PathBuf::from).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join("filament-share")
+        platform::Paths::home_dir().join("filament-share")
     })
 }
 
@@ -3222,9 +3232,45 @@ async fn up_cmd(
         // first-run wizard must not demand UAC.
         if cfg!(windows) {
             host.install_user(&exe, &up_args)?;
+            // #182: HKCU Run only fires at logon. The user asked for the
+            // inbox NOW (the other platforms' service managers do `enable
+            // --now` / bootstrap). Start the receiver now, detached, and
+            // confirm it is live before printing.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                const DETACHED_PROCESS: u32 = 0x00000008;
+                let mut child = std::process::Command::new(&exe)
+                    .arg("up")
+                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                let started = match child {
+                    Ok(_) => {
+                        // Give the receiver a moment to write its pidfile.
+                        let mut live = false;
+                        for _ in 0..40 {
+                            if daemon_alive().is_some() {
+                                live = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
+                        live
+                    }
+                    Err(_) => false,
+                };
+                if started {
+                    ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                } else {
+                    ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
+                        ui::paint(ui::Tone::Warn, "!")));
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
             ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-            ui::say(&format!("  {} run `filament up --install-system` for a machine-wide service that starts before logon",
-                ui::paint(ui::Tone::Dim, "note:")));
         } else {
             match host.install_system(&exe, &up_args) {
                 Ok(platform::InstallResult::System) => {
@@ -4378,13 +4424,17 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
         }
         EphemeralAction::Enroll { auth_key_file, to } => {
             let auth_key = Zeroizing::new(read_owner_only_file(&auth_key_file)?);
-            enroll_cmd(server, auth_key.as_str(), to, relay, None, false).await
+            // #186: the claim token is now the compact v2 invitation.
+            let inv = parse_invitation_v2(auth_key.as_str())?;
+            if inv.expires <= identity::now_secs() {
+                bail!("this invitation has expired");
+            }
+            enroll_cmd(server, inv, to, relay, None, false).await
         }
     }
 }
 
-fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<String> {
-    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
+fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<String> {    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!("this device already holds an identity key; join only from a clean Filament identity");
     }
     if local_device_cert_path().exists() {
@@ -4425,6 +4475,73 @@ fn persist_join_ack(v: &Value, auth_key: &crate::ephemeral::AuthKey) -> Result<S
         bail!("join acknowledgement carried an invalid local device certificate");
     }
     if owner_cert.user_pub != auth_key.issuer || owner_cert.verify(identity::now_secs()).is_err() {
+        bail!("join acknowledgement carried an invalid owner certificate");
+    }
+    let cert_path = local_device_cert_path();
+    crate::platform::SecretFile::write_str(
+        &cert_path,
+        &serde_json::to_string_pretty(&json!({ "name": assigned_name, "cert": local_cert.to_json() }))?,
+    )?;
+    let transfer_caps = vec!["transfer".to_string()];
+    devices_upsert_atomic(
+        owner_name,
+        Some(secret),
+        Some(&owner_cert),
+        Some(&transfer_caps),
+        Some(identity::IntroScope::Device.to_byte()),
+        None,
+        None,
+    )?;
+    config_set("name", assigned_name)?;
+    Ok(assigned_name.to_string())
+}
+
+/// #186: the join-ack validation for a COMPACT (v2) invitation. The owner is
+/// verified by the 8-byte fingerprint of the cert's user key (the joiner only
+/// holds the fp); the bound checks are identical to persist_join_ack.
+fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::InvitationV2) -> Result<String> {
+    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
+        bail!("this device already holds an identity key; join only from a clean Filament identity");
+    }
+    if local_device_cert_path().exists() {
+        bail!("this device already holds a joined certificate; refusing to overwrite it");
+    }
+    let assigned_name = v["name"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
+    let owner_name = v["owner_name"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the owner name"))?;
+    let secret = v["secret"].as_str().ok_or_else(|| anyhow!("join acknowledgement omitted the reconnect secret"))?;
+    if hex::decode(secret).map(|bytes| bytes.len()).ok() != Some(32) {
+        bail!("join acknowledgement carried an invalid reconnect secret");
+    }
+    let expires = v["expires"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its expiry"))?;
+    let ceiling = v["ceiling"]
+        .as_array()
+        .ok_or_else(|| anyhow!("join acknowledgement omitted its capability ceiling"))?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string).ok_or_else(|| anyhow!("join ceiling contains a non-string capability")))
+        .collect::<Result<Vec<_>>>()?;
+    let max_offline = v["max_offline"].as_u64().ok_or_else(|| anyhow!("join acknowledgement omitted its offline budget ceiling"))?;
+    let persistent = v["persistent"].as_bool().unwrap_or(false);
+    if expires != inv.expires
+        || ceiling != inv.caps
+        || max_offline != inv.max_offline
+        || persistent != !inv.ephemeral
+    {
+        bail!("join acknowledgement changed a signed principal bound (ceiling, expiry, offline budget, or persistence)");
+    }
+    let local_cert = identity::DeviceCert::from_json(&v["device_cert"])
+        .ok_or_else(|| anyhow!("join acknowledgement omitted the local device certificate"))?;
+    let owner_cert = identity::DeviceCert::from_json(&v["owner_cert"])
+        .ok_or_else(|| anyhow!("join acknowledgement omitted the owner certificate"))?;
+    let overlay_pub = crate::overlay::overlay_pubkey_bytes()?;
+    let fp = crate::ephemeral::issuer_fingerprint(&owner_cert.user_pub);
+    if local_cert.device_pub != overlay_pub
+        || crate::ephemeral::issuer_fingerprint(&local_cert.user_pub) != inv.issuer_fp
+        || local_cert.expires != expires
+        || local_cert.verify(identity::now_secs()).is_err()
+    {
+        bail!("join acknowledgement carried an invalid local device certificate");
+    }
+    if fp != inv.issuer_fp || owner_cert.verify(identity::now_secs()).is_err() {
         bail!("join acknowledgement carried an invalid owner certificate");
     }
     let cert_path = local_device_cert_path();
@@ -4653,38 +4770,29 @@ async fn add_for_cmd(
     let mut enroll_seed = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut enroll_seed)
         .map_err(|_| anyhow!("failed to generate invitation possession key"))?;
-    let enroll_key = ring::signature::Ed25519KeyPair::from_seed_unchecked(&enroll_seed)
-        .map_err(|_| anyhow!("failed to create invitation possession key"))?;
-    let enroll_pub: [u8; 32] = ring::signature::KeyPair::public_key(&enroll_key)
-        .as_ref()
-        .try_into()
-        .map_err(|_| anyhow!("invitation public key has the wrong size"))?;
-    let auth_key = crate::ephemeral::AuthKey::mint_with_bounds(
+    // #186: the v2 invitation is a compact binary token (base64url) with a
+    // self-contained signature, not hex-inside-JSON-inside-base64. ~530 chars
+    // became ~210, and the QR fits a normal terminal.
+    let ttl_abs = identity::now_secs().saturating_add(ttl);
+    let inv = crate::ephemeral::InvitationV2::mint(
         owner_key.keypair(),
-        enroll_pub,
+        enroll_seed,
         ceiling.clone(),
-        Vec::new(),
-        ttl,
-        crate::ephemeral::Reuse::Once,
-        format!("join-{kind}"),
+        ttl_abs,
         30 * 24 * 3600,
+        crate::ephemeral::Reuse::Once,
         false,
+        display_name(),
     )?;
-    let bundle = json!({
-        "auth_key": auth_key.to_json(),
-        "enroll_private_key": hex::encode(enroll_seed),
-        "owner_name": display_name(),
-        "kind": kind.clone(),
-    });
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
-        "filament-invite:v1:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&bundle)?)
+        "filament-invite:v2:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
     // #176: minting a bounded invitation is a local act (signing + printing);
     // the always-on receiver is only needed when someone CLAIMS it. Arm the
     // enrollment room best-effort; never block minting on the daemon.
-    let armed = crate::ctl::try_arm(hex::encode(auth_key.enroll_pub), auth_key.expires).await.is_some();
+    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
 
     if let Some(path) = out.as_deref() {
         write_owner_only_file(path, token.as_str())?;
@@ -4696,8 +4804,8 @@ async fn add_for_cmd(
         eprintln!("  kind     {kind}");
         eprintln!("  ceiling  {}", ceiling.join(", "));
         eprintln!("  budget   {} (the key allows up to {})",
-            fmt_short_duration(auth_key.max_offline),
-            fmt_short_duration(auth_key.max_offline));
+            fmt_short_duration(inv.max_offline),
+            fmt_short_duration(inv.max_offline));
         eprintln!("  expires  {ttl_text}");
         eprintln!();
         eprintln!("  Whoever captures this can join until it is used or expires.");
@@ -4712,8 +4820,8 @@ async fn add_for_cmd(
         println!("{}", serde_json::to_string_pretty(&json!({
             "kind": kind,
             "ceiling": ceiling,
-            "maxOffline": auth_key.max_offline,
-            "expires": auth_key.expires,
+            "maxOffline": inv.max_offline,
+            "expires": inv.expires,
             "writtenTo": out,
             "invitationSecretPrinted": false,
         }))?);
@@ -4730,16 +4838,22 @@ async fn add_for_cmd(
     Ok(())
 }
 
-fn parse_invitation(raw: &str) -> Result<Value> {
+fn parse_invitation_v2(raw: &str) -> Result<crate::ephemeral::InvitationV2> {
     use base64::Engine;
     let token = raw.trim();
+    if token.starts_with("filament-invite:v1:") {
+        // #186: the v1 JSON token was replaced in 0.8.4. An old token is
+        // merely stale, so say so rather than failing to parse it.
+        bail!("this invitation uses the pre-0.8.4 format; ask the owner to mint a new one with `filament add --for`");
+    }
     let encoded = token
-        .strip_prefix("filament-invite:v1:")
+        .strip_prefix("filament-invite:v2:")
         .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
     let bytes = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_| anyhow!("invitation is not valid base64url"))?);
-    serde_json::from_slice(bytes.as_slice()).map_err(|_| anyhow!("invitation payload is not valid JSON"))
+    crate::ephemeral::InvitationV2::from_token(bytes.as_slice())
+        .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
 }
 
 async fn join_cmd(
@@ -4772,34 +4886,44 @@ async fn join_cmd(
     } else {
         bail!("non-interactive join requires --invite-file <path> or --invite-fd <fd>");
     });
-    let bundle = parse_invitation(invitation.as_str())?;
-    let auth_key = crate::ephemeral::AuthKey::from_json(&bundle["auth_key"])
-        .ok_or_else(|| anyhow!("invitation contains an invalid signed authorization"))?;
-    if auth_key.expires <= identity::now_secs() {
+    let inv = parse_invitation_v2(invitation.as_str())?;
+    if inv.expires <= identity::now_secs() {
         bail!("this invitation has expired");
     }
-    let owner_name = to.or_else(|| bundle["owner_name"].as_str().map(str::to_string));
-    let proposed_name = name.unwrap_or_else(l3::hostname);
+    let owner_name = to.or_else(|| Some(inv.owner_name.clone()));
+    let name_given = name.is_some();
+    let mut proposed_name = name.unwrap_or_else(l3::hostname);
     if caps.interactive {
+        // #183.3: join is the other first-run path; let the joined device name
+        // itself the way init does. The review below shows the chosen name,
+        // which is the name the owner sees in the device list.
+        if !name_given {
+            let answer = prompt_line(&format!("  name this device [{}]: ", proposed_name))?;
+            let trimmed = answer.trim();
+            if !trimmed.is_empty() {
+                proposed_name = trimmed.to_string();
+            }
+        }
         eprintln!();
         eprintln!("  {}", ui::paint(ui::Tone::Brand, "JOIN"));
         eprintln!("  as       {proposed_name}");
         eprintln!("  owner    {}", owner_name.as_deref().unwrap_or("invitation issuer"));
-        eprintln!("  ceiling  {}", capability_list_summary(&auth_key.caps));
+        eprintln!("  ceiling  {}", capability_list_summary(&inv.caps));
         eprintln!("  budget   {} (key allows up to {})",
-            fmt_short_duration(auth_key.max_offline),
-            fmt_short_duration(auth_key.max_offline));
-        eprintln!("  expires  {}", auth_key.expires);
+            fmt_short_duration(inv.max_offline),
+            fmt_short_duration(inv.max_offline));
+        // #183.2: a raw epoch on the one screen where a person decides whether
+        // to accept a grant is illegible; the mint side already formats it.
+        eprintln!("  expires  {}", format_approval_expiry(inv.expires));
         eprintln!("  proof    the ceiling and budget are persisted and reloaded before reconnect authorization");
         let confirmation = prompt_line("\n  Press Enter to join, or type cancel: ")?;
         if confirmation.eq_ignore_ascii_case("cancel") {
             bail!("cancelled");
         }
     }
-    let bundle_json = Zeroizing::new(serde_json::to_string(&bundle)?);
     enroll_cmd(
         server,
-        bundle_json.as_str(),
+        inv,
         owner_name,
         relay,
         Some(&proposed_name),
@@ -4810,45 +4934,30 @@ async fn join_cmd(
 
 async fn enroll_cmd(
     server: &str,
-    auth_key_json: &str,
+    inv: crate::ephemeral::InvitationV2,
     to_name: Option<String>,
     relay: bool,
     proposed_name: Option<&str>,
     json_output: bool,
 ) -> Result<()> {
-    use crate::ephemeral::AuthKey;
-
-    let v: serde_json::Value = {
-        let ak_str = if std::path::Path::new(auth_key_json).exists() {
-            std::fs::read_to_string(auth_key_json)?
-        } else {
-            auth_key_json.to_string()
-        };
-        serde_json::from_str(&ak_str)?
-    };
-    let ak = AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)).ok_or_else(|| anyhow::anyhow!("invalid auth key JSON"))?;
-    let enroll_seed = v.get("enroll_private_key")
-        .and_then(|s| s.as_str())
-        .and_then(|s| hex::decode(s).ok())
-        .ok_or_else(|| anyhow::anyhow!("missing enroll_private_key in auth key JSON"))?;
-    let enroll_seed: [u8; 32] = enroll_seed.try_into().map_err(|_| anyhow::anyhow!("bad enroll key seed"))?;
+    use base64::Engine;
+    let enroll_seed = inv.enroll_private_key;
     let device_pub = crate::overlay::overlay_pubkey_bytes()?;
 
     if !json_output {
-        ui::say(&format!("{} auth key loaded (caps: {}, issuer: {})",
+        ui::say(&format!("{} invitation loaded (caps: {})",
             ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-            capability_list_summary(&ak.caps),
-            hex::encode(&ak.issuer[..4])));
+            capability_list_summary(&inv.caps)));
     }
 
     let my_uid = mk_uid("e");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
-    // Join enrollment rendezvous channel derived from owner's public key.
-    // Enroller sets its own room (so signals route) + subscribes to the
-    // enrollment channel. Discovery via KnownPeer on shared channel.
-    let enroll_chan = crate::ephemeral::enroll_channel(&ak.issuer);
+    // Join enrollment rendezvous channel derived from the owner's key
+    // FINGERPRINT: the compact invitation carries only the 8-byte fp (#186),
+    // and the owner's daemon derives the same channel from its full key.
+    let enroll_chan = crate::ephemeral::enroll_channel_fp(&inv.issuer_fp);
     let local_name = proposed_name.map(str::to_string).unwrap_or_else(display_name);
     let mut sess = session::Session::new(&local_name, &my_uid);
     sess.room = Some(format!("enrollup-{}", fresh_secret()));
@@ -4962,15 +5071,14 @@ async fn enroll_cmd(
                     pid.clone(),
                     enroll_seed,
                     device_pub,
-                    ak.clone(),
+                    inv.clone(),
                 );
 
                 let _ = t.send_control(&json!({
                     "type": "identity-auth-key-enroll-request",
-                    "auth_key": ak.to_json(),
+                    "auth_key_v2": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_payload()),
                     "device_pub": hex::encode(device_pub),
                 })).await;
-
                 if !json_output {
                     ui::say(&format!("  {} sent enrollment request to {}",
                         ui::paint(ui::Tone::Dim, "->"),
@@ -4991,27 +5099,27 @@ async fn enroll_cmd(
                                 if let Some(response) = crate::ephemeral::build_enrollment_response(
                                     &pid, nonce_arr, verifier_pub, &device_cert,
                                 ) {
-                                    let _ = t.send_control(&json!({
-                                        "type": "identity-auth-key-enroll-response",
-                                        "auth_key": response["auth_key"],
-                                        "device_pub": response["device_pub"],
-                                        "enroll_possession_sig": response["enroll_possession_sig"],
-                                        "device_possession_sig": response["device_possession_sig"],
-                                    })).await;
+                                    let mut msg = json!({ "type": "identity-auth-key-enroll-response" });
+                                    if let Some(obj) = response.as_object() {
+                                        for (k, v) in obj {
+                                            msg[k] = v.clone();
+                                        }
+                                    }
+                                    let _ = t.send_control(&msg).await;
                                 }
                             }
                         }
                     }
                 }
                 Some("identity-auth-key-enroll-ack") => {
-                    let name = persist_join_ack(&v, &ak)?;
+                    let name = persist_join_ack_v2(&v, &inv)?;
                     if json_output {
                         println!("{}", serde_json::to_string_pretty(&json!({
                             "joined": true,
                             "name": name,
                             "devicePub": hex::encode(device_pub),
-                            "ceiling": ak.caps,
-                            "expires": ak.expires,
+                            "ceiling": inv.caps,
+                            "expires": inv.expires,
                             "persistsAcrossReconnect": true,
                         }))?);
                     } else {
@@ -5155,7 +5263,7 @@ async fn enroll_and_send_cmd(
                     l.presence = Presence::Ready;
                 }
                 if conn.active.is_none() { conn.active = Some(pid.clone()); }
-                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, device_pub, ak.clone());
+                crate::ephemeral::register_enrollment_legacy(pid.clone(), enroll_seed, device_pub, ak.clone());
                 let _ = t.send_control(&json!({
                     "type": "identity-auth-key-enroll-request",
                     "auth_key": ak.to_json(),
@@ -5388,7 +5496,7 @@ async fn enroll_and_netcat_cmd(
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) { l.transport = Some(t.clone()); l.presence = Presence::Ready; }
                 if conn.active.is_none() { conn.active = Some(pid.clone()); }
-                crate::ephemeral::register_enrollment(pid.clone(), enroll_seed, device_pub, ak.clone());
+                crate::ephemeral::register_enrollment_legacy(pid.clone(), enroll_seed, device_pub, ak.clone());
                 let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-request", "auth_key": ak.to_json()})).await;
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
@@ -5501,11 +5609,32 @@ async fn respond_to_auth_key_enroll_request(
     // that rationale is stale and it made the flagship join flow fail for a
     // default-configured owner. The joined device's ceiling binds either way.
 
-    let ak = match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
-        Some(ak) => ak,
-        None => {
-            let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-            return;
+    // #186: the enrollment request carries the compact v2 invitation
+    // (base64url). The legacy v1 mint/enroll path (hidden) still sends the
+    // `auth_key` JSON, and its joiner verifies the daemon by full-issuer, so
+    // both are accepted here.
+    let ak = {
+        use base64::Engine;
+        if let Some(v2_b64) = v.get("auth_key_v2").and_then(|x| x.as_str()) {
+            let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(v2_b64) else {
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                return;
+            };
+            match crate::ephemeral::InvitationV2::from_payload(&bytes) {
+                Some(inv) => crate::ephemeral::EnrollmentPrincipal::Compact(inv),
+                None => {
+                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                    return;
+                }
+            }
+        } else {
+            match crate::ephemeral::AuthKey::from_json(&v.get("auth_key").unwrap_or(&v)) {
+                Some(ak) => crate::ephemeral::EnrollmentPrincipal::Legacy(ak),
+                None => {
+                    let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                    return;
+                }
+            }
         }
     };
 
@@ -5526,11 +5655,32 @@ async fn respond_to_auth_key_enroll_request(
             return;
         }
     };
-    if let Err(e) = ak.verify_against_owner(&owner_pub, &verifier_pub) {
-        ui::debug(&format!("enroll request auth-key rejected: {e}"));
-        let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
-        return;
-    }
+    // Verify the principal under our trusted owner, then reconstruct the full
+    // auth key (Compact: fingerprint + compact signature; Legacy: full-issuer
+    // verify) for the principal registration that follows.
+    let ak = match &ak {
+        crate::ephemeral::EnrollmentPrincipal::Compact(inv) => {
+            if !inv.verify_against_owner(&owner_pub) {
+                ui::debug("enroll request auth-key rejected (fingerprint or signature)");
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                return;
+            }
+            if identity::now_secs() >= inv.expires {
+                ui::debug("enroll request auth-key expired");
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                return;
+            }
+            inv.to_auth_key(&owner_pub)
+        }
+        crate::ephemeral::EnrollmentPrincipal::Legacy(ak) => {
+            if ak.verify_against_owner(&owner_pub, &verifier_pub).is_err() {
+                ui::debug("enroll request legacy auth-key rejected");
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                return;
+            }
+            ak.clone()
+        }
+    };
 
     // Generate nonce challenge — include daemon's device cert so the enroller
     // can verify it chains to the auth key's issuer (mutual authentication).
@@ -13043,13 +13193,13 @@ async fn send_cmd(
                                 if let Some(response) = crate::ephemeral::build_enrollment_response(
                                     &pid, nonce_arr, verifier_pub, &device_cert,
                                 ) {
-                                    let _ = t.send_control(&json!({
-                                        "type": "identity-auth-key-enroll-response",
-                                        "auth_key": response["auth_key"],
-                                        "device_pub": response["device_pub"],
-                                        "enroll_possession_sig": response["enroll_possession_sig"],
-                                        "device_possession_sig": response["device_possession_sig"],
-                                    })).await;
+                                    let mut msg = json!({ "type": "identity-auth-key-enroll-response" });
+                                    if let Some(obj) = response.as_object() {
+                                        for (k, v) in obj {
+                                            msg[k] = v.clone();
+                                        }
+                                    }
+                                    let _ = t.send_control(&msg).await;
                                 }
                             }
                         }
@@ -20224,16 +20374,38 @@ mod tests {
     }
 
     #[test]
-    fn invitation_envelope_roundtrips_without_argv_parsing() {
+    fn invitation_v2_roundtrips_without_argv_parsing() {
+        // The v2 token is a compact binary envelope: it must round-trip through
+        // the mint and the claim-side parser, and a secret passed as a bare
+        // positional argument must be rejected (never parsed as an invitation).
         use base64::Engine;
-        let bundle = json!({"auth_key": {"issuer": "test"}, "enroll_private_key": "secret"});
+        use crate::ephemeral::{InvitationV2, Reuse};
+        use ring::signature::KeyPair;
+        let rng = ring::rand::SystemRandom::new();
+        let mut seed = [0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut seed).unwrap();
+        let owner_seed = [7u8; 32];
+        let owner = ring::signature::Ed25519KeyPair::from_seed_unchecked(&owner_seed).unwrap();
+        let inv = InvitationV2::mint(
+            &owner,
+            seed,
+            vec!["transfer".to_string()],
+            1_800_000_000,
+            86400,
+            Reuse::Once,
+            false,
+            "alice".into(),
+        )
+        .unwrap();
         let token = format!(
-            "filament-invite:v1:{}",
+            "filament-invite:v2:{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(serde_json::to_vec(&bundle).unwrap())
+                .encode(inv.to_token())
         );
-        assert_eq!(parse_invitation(&token).unwrap(), bundle);
-        assert!(parse_invitation("secret-as-a-positional-argument").is_err());
+        let parsed = parse_invitation_v2(&token).expect("a well-formed v2 token must parse");
+        assert_eq!(parsed.caps, inv.caps, "caps round-trip");
+        assert_eq!(parsed.enroll_pub, inv.enroll_pub, "derived pub round-trips");
+        assert!(parse_invitation_v2("secret-as-a-positional-argument").is_err());
     }
 
     #[test]

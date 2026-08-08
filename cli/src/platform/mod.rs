@@ -30,8 +30,9 @@ impl Paths {
         if let Some(proj) = directories::ProjectDirs::from("", "", "filament") {
             return proj.config_dir().to_path_buf();
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".config").join("filament")
+        // #184: route through home_dir() (USERPROFILE on Windows) instead of a
+        // bare HOME read that falls back to "." on Windows.
+        Self::home_dir().join(".config").join("filament")
     }
 
     /// Resolve a config-relative path (file or subdirectory).

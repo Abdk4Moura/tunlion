@@ -25,36 +25,81 @@ use zeroize::Zeroize;
 // Pending enrollment state (enroller side)
 // ---------------------------------------------------------------------------
 
-struct PendingEnroll {
-    enroll_seed: [u8; 32],
-    device_pub: [u8; 32],
-    auth_key: AuthKey,
+enum PendingEnroll {
+    /// #186 compact-invitation join: the full invitation (carries the 8-byte
+    /// owner fingerprint + the compact signature); the daemon reconstructs the
+    /// full issuer after the fingerprint matches.
+    Compact {
+        enroll_seed: [u8; 32],
+        device_pub: [u8; 32],
+        inv: InvitationV2,
+    },
+    /// Legacy mint/enroll path (hidden): a full AuthKey with its own issuer.
+    Legacy {
+        enroll_seed: [u8; 32],
+        device_pub: [u8; 32],
+        auth_key: AuthKey,
+    },
+}
+
+impl PendingEnroll {
+    fn enroll_seed(&self) -> [u8; 32] {
+        match self {
+            PendingEnroll::Compact { enroll_seed, .. } | PendingEnroll::Legacy { enroll_seed, .. } => *enroll_seed,
+        }
+    }
+    fn device_pub(&self) -> [u8; 32] {
+        match self {
+            PendingEnroll::Compact { device_pub, .. } | PendingEnroll::Legacy { device_pub, .. } => *device_pub,
+        }
+    }
+    fn zeroize_seed(&mut self) {
+        match self {
+            PendingEnroll::Compact { enroll_seed, .. } => enroll_seed.zeroize(),
+            PendingEnroll::Legacy { enroll_seed, .. } => enroll_seed.zeroize(),
+        }
+    }
 }
 
 impl Drop for PendingEnroll {
     fn drop(&mut self) {
-        self.enroll_seed.zeroize();
+        self.zeroize_seed();
     }
 }
 
 static PENDING_ENROLLS: OnceLock<Mutex<HashMap<String, PendingEnroll>>> = OnceLock::new();
 
-/// Register a pending enrollment attempt. Called by the ephemeral enroll CLI.
+/// Register a pending enrollment attempt for the COMPACT (v2) invitation path.
+/// The invitation carries the owner fingerprint + signature the daemon checks.
 pub fn register_enrollment(
+    peer_id: String,
+    enroll_seed: [u8; 32],
+    device_pub: [u8; 32],
+    inv: InvitationV2,
+) {
+    let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    store.insert(peer_id, PendingEnroll::Compact { enroll_seed, device_pub, inv });
+}
+
+/// Register a pending enrollment attempt for the LEGACY mint/enroll path,
+/// which carries a full AuthKey.
+pub fn register_enrollment_legacy(
     peer_id: String,
     enroll_seed: [u8; 32],
     device_pub: [u8; 32],
     auth_key: AuthKey,
 ) {
     let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    store.insert(peer_id, PendingEnroll { enroll_seed, device_pub, auth_key });
+    store.insert(peer_id, PendingEnroll::Legacy { enroll_seed, device_pub, auth_key });
 }
 
 /// Take a pending enrollment and build the response to the daemon's challenge.
-/// Verifies the daemon's device cert chains to the auth key's issuer (mutual
-/// authentication — the cert is MANDATORY) and that the verifier_pub is in the
-/// auth key's audience (mirror audience check). Removal from the store happens
-/// ONLY on success so a failed attempt doesn't burn a single-use key.
+/// Verifies the daemon's device cert carries a user key whose 8-byte
+/// fingerprint matches the invitation's owner fingerprint (mutual
+/// authentication — the cert is MANDATORY). #186: the compact invitation
+/// carries only the fp, so the cert's user_pub is compared by fingerprint
+/// (64-bit selection) rather than by full-key equality. Removal from the store
+/// happens ONLY on success so a failed attempt doesn't burn a single-use key.
 ///
 /// STAYS in the CLI (not filament-cap): it reads a `crate::identity::DeviceCert`,
 /// and the crate carries no filament-id dependency. It shares `PENDING_ENROLLS`
@@ -71,44 +116,44 @@ pub fn build_enrollment_response(
         Some(p) => p,
         None => return None,
     };
-    let issuer = pe.auth_key.issuer;
-    let audience = pe.auth_key.audience.clone();
-
-    // Mutual authentication: daemon's cert MUST chain to auth_key.issuer.
+    // Mutual authentication: daemon's cert MUST belong to the invitation's
+    // owner. Compact: an 8-byte fingerprint check. Legacy: full-issuer equality.
     // Cert is MANDATORY — no if-let bypass for a missing field.
     let cert = crate::identity::DeviceCert::from_json(device_cert)?;
-    if cert.user_pub != issuer
-        || cert.verify(now_secs()).is_err()
-        || cert.device_pub != verifier_pub
-    {
+    if cert.verify(now_secs()).is_err() || cert.device_pub != verifier_pub {
         return None;
     }
-
-    // Mirror audience check: the enroller verifies it was handed a verifier_pub
-    // that its auth key actually authorizes (audience-scoped protection).
-    if !(audience.is_empty() || audience.contains(&verifier_pub)) {
+    let owner_ok = match pe {
+        PendingEnroll::Compact { inv, .. } => {
+            filament_cap::ephemeral::issuer_fingerprint(&cert.user_pub) == inv.issuer_fp
+        }
+        PendingEnroll::Legacy { auth_key, .. } => cert.user_pub == auth_key.issuer,
+    };
+    if !owner_ok {
         return None;
     }
 
     // ALL checks passed — now remove from store and build.
     let pe = store.remove(peer_id)?;
-    let ak = pe.auth_key.clone();
-    let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.enroll_seed).ok()?;
-    let message = enrollment_possession_msg(&nonce, &pe.device_pub, &verifier_pub);
+    let enroll_kp = ring::signature::Ed25519KeyPair::from_seed_unchecked(&pe.enroll_seed()).ok()?;
+    let message = enrollment_possession_msg(&nonce, &pe.device_pub(), &verifier_pub);
     let enroll_signature = enroll_kp.sign(&message);
     let mut enroll_possession_sig = [0u8; 64];
     enroll_possession_sig.copy_from_slice(enroll_signature.as_ref());
     let device_possession_sig = crate::overlay::overlay_sign_possession(&message).ok()?;
-    let payload = EnrollmentPayload {
-        auth_key: ak.clone(),
-        device_pub: pe.device_pub,
+    let principal = match &pe {
+        PendingEnroll::Compact { inv, .. } => {
+            crate::ephemeral::EnrollmentPrincipal::Compact(inv.clone())
+        }
+        PendingEnroll::Legacy { auth_key, .. } => {
+            crate::ephemeral::EnrollmentPrincipal::Legacy(auth_key.clone())
+        }
+    };
+    let payload = crate::ephemeral::EnrollmentPayload {
+        principal,
+        device_pub: pe.device_pub(),
         enroll_possession_sig,
         device_possession_sig,
     };
-    Some(serde_json::json!({
-        "auth_key": payload.auth_key.to_json(),
-        "device_pub": hex::encode(payload.device_pub),
-        "enroll_possession_sig": hex::encode(payload.enroll_possession_sig),
-        "device_possession_sig": hex::encode(payload.device_possession_sig),
-    }))
+    Some(payload.to_json())
 }

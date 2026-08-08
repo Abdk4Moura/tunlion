@@ -2611,8 +2611,9 @@ fn forward_target_is_self(peer: &str) -> bool {
     }
     let dn = crate::display_name();
     let host_part = dn.rsplit('@').next().unwrap_or("").to_string();
-    let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
-    [dn.as_str(), host_part.as_str(), hostname.trim()]
+    // #184: /etc/hostname is UNIX-only; l3::hostname() handles Windows.
+    let hostname = crate::l3::hostname();
+    [dn.as_str(), host_part.as_str(), hostname.as_str()]
         .iter()
         .any(|c| !c.is_empty() && norm_device_name(c) == p)
 }

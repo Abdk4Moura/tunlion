@@ -4,6 +4,21 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.8.4] - 2026-08-08
+
+### Breaking
+
+- **The invitation token is compact now.** The old `filament-invite:v1:`
+  token was hex-inside-JSON inside base64: ~530 bytes of serialization for
+  ~116 bytes of content, which rendered a QR too wide for a normal terminal.
+  The v2 token is a self-contained binary blob, base64url-encoded: 227
+  characters instead of 780, and the QR fits an 80-column terminal. The
+  owner is selected by an 8-byte key fingerprint and the signature still
+  binds offline; the enrollment channel derives from the fingerprint, so a
+  joiner holding only the token can subscribe without the full owner key.
+  Old v1 tokens are refused with a clear message. Invitations minted before
+  0.8.4 cannot be claimed; mint a new one with `filament add --for`.
+
 ## [0.8.3] - 2026-08-08
 
 ### Breaking

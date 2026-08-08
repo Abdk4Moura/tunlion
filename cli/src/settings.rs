@@ -88,7 +88,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOnly,
             env: Some("FILAMENT_NAME"),
             daemon: true,
-            help: "Display name other devices see (default: user@host)",
+            help: "Display name other devices see (default: your platform username@hostname)",
         },
         Setting {
             key: "server",
@@ -613,8 +613,11 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
 
 fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        // #184: route through Paths::home_dir() (USERPROFILE on Windows);
+        // a bare HOME read is unset on Windows and leaves the literal "~".
+        let home = crate::platform::Paths::home_dir();
+        if home != Path::new(".") {
+            return home.join(rest);
         }
     }
     PathBuf::from(p)

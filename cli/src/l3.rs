@@ -530,9 +530,17 @@ const HOSTS_END: &str = "# END filament-mesh";
 
 /// Get this machine's hostname for MagicDNS.
 pub fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "cli".into())
+    // #183.1: /etc/hostname is UNIX-only; Windows provides COMPUTERNAME.
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::read_to_string("/etc/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "cli".into())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into())
+    }
 }
 
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
