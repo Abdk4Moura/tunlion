@@ -15,7 +15,8 @@ the GitHub release notes.
 
 ### Security
 
-- **Revocation binds before the first typed-code transfer, on both transports.**
+- **Revocation binds for a first typed-code transfer once the sender's
+  identity resolves, on both transports.**
   A revoked device that reconnects through a freshly minted code was authorized
   until its identity resolved, because shadow mode never issued the identity
   challenge and the first offer was decided before the DirectReady challenge.
@@ -34,6 +35,42 @@ the GitHub release notes.
   including 0.7.7 senders, answer the possession challenge and resolve within
   the window on a functioning link. The probe that found the window stays
   permanently: it goes quiet only when the ordering is fixed.
+
+
+- **Revoking a device now actually denies it.** `filament revoke <name>
+  --certificate` cut fleet auto-trust and nothing else. Two separate paths kept
+  authorizing a revoked device:
+
+  - an **explicit grant** for the attempted action authorized independently of
+    revocation. Grants are how the deliberate tier is reached (shell,
+    write-mount, out-of-scope reach), so revocation failed hardest for the
+    devices holding the most authority.
+  - in the **default (shadow) mode**, which is what ships, the decision falls
+    through to a caller-supplied `legacy_allowed` that never saw the revocation
+    at all. This was not gated behind `FILAMENT_CAP_AUTHORITATIVE`; it applied
+    with no flag set.
+
+  Revocation is now an absolute denial evaluated before any grant is consulted,
+  in both modes.
+
+  **Neither of those two defects exposed anything** in the sense of an attacker
+  gaining access they did not have: both failed to *withdraw* authorization
+  rather than conferring it. What was wrong is that a revocation you performed
+  did less than its message said.
+
+  **Introduced in 0.7.7, with certificate revocation itself.** Earlier releases
+  have no `revoke --certificate` and are unaffected: you cannot have a defect in
+  revocation in a release that has no revocation.
+
+  The one residual this fix left open, a revoked device completing a *first*
+  operation over a freshly typed pairing code before its identity resolved, is
+  closed by "Revocation binds before the first typed-code transfer" in this same
+  release. Both halves shipped together, so no release ever carried the absolute
+  denial without the ordering fix.
+
+  Both messages that described the old behaviour are corrected. The pre-action
+  warning no longer claims revocation removes access "entirely", and the success
+  line names the capability gate rather than "fleet access".
 
 ### Added
 
@@ -64,6 +101,51 @@ the GitHub release notes.
   replay command. Mounts default to read-only with an explicit
   `--read-write`; the remote side still enforces its share root and grant.
 
+### Fixed
+
+- **A device that was never revoked is no longer treated as revoked.**
+  `device_cert_revoked` returned "revoked" for four conditions, three correctly
+  fail-closed and one not: a **known** device record carrying no `certRevoked`
+  field. Nothing writes that field except an explicit revoke, so every device
+  enrolled normally read as revoked. Under `FILAMENT_CAP_AUTHORITATIVE=1` that
+  made fleet auto-trust (the same-owner recognition added in 0.7.4)
+  unreachable for every existing device. An unknown device, an unreadable store
+  and unparseable JSON still fail closed.
+
+- **An unidentified peer is no longer treated as a revoked one.** The gate
+  derived its revocation input as "no device identity ⇒ revoked". Harmless while
+  that only cut fleet auto-trust; once revocation became an absolute denial it
+  would have refused every peer before its identity resolved, breaking transfers
+  outright. The unknown-*device* case remains fail-closed where that judgement
+  belongs.
+
+- **Releases no longer publish stray repository files as assets.** The release
+  job began checking out the repository in 0.7.7 so notes could be generated from
+  this changelog, which put the working tree where two `filament-*` globs could
+  match it. `cli-v0.7.7` consequently shipped three unrelated repository
+  documents (`filament-status-2026-06-14.md`,
+  `filament-update-2026-06-14b.md` and
+  `filament-webshell-redesign-2026-06-15.md`, all ordinary session records) as
+  release assets and attested them in `SHA256SUMS`. Artifacts are now assembled
+  in a dedicated directory that the globs are scoped to, and a check refuses to
+  publish unless the asset set is exactly the four platform archives plus
+  `SHA256SUMS`. `cli-v0.7.7` is not regenerated: its manifest and its assets
+  agree with each other, and rewriting a published checksum file would break that.
+
+### Removed
+
+- **The cone-NAT gate is retired**, along with its STUN fixture. Its hole-punch
+  assertion had never passed on any NAT topology, only on the no-NAT control,
+  so it had no positive control **under NAT** and could not discriminate there.
+  Separately, its "cone" proof measured endpoint-independent *mapping* only;
+  cone requires endpoint-independent mapping **and** filtering, and Linux
+  `MASQUERADE` is EI mapping with ED filtering, so a correct measurement of one
+  property was being read as a claim about another. To be precise about what is
+  lost: the transfer assertion **ran and failed** under NAT rather than being
+  skipped, so the gate was never silently reporting success; it simply could
+  never demonstrate the thing it existed to demonstrate. Cone-NAT traversal was
+  not verified before this change and is not verified after it. The mapping probe
+  that was correct is kept and still classifies both mapping types.
 ## [0.7.7] - 2026-08-06
 
 ### Security
