@@ -452,9 +452,9 @@ const EXAMPLES: &str = "\
 COMMANDS
   Start
     init                   create your Filament identity and first device
-    add                    add a device with a human present
-    invite                 create a bounded invitation for a device or person
-    join                   join through a bounded invitation
+    add                    connect another device: mint a code, or add <code> to claim one
+    add --for <device|person>  mint a bounded invitation; the other side joins
+    join                   claim a bounded invitation
     id                     show your identity and certified devices
   Share
     send <file>            send files (mints a one-time code, or --to <device>)
@@ -477,7 +477,8 @@ EXAMPLES
   filament video.mp4                 send it; mints a speakable one-time code + QR
   filament receive clever-lynx-63    claim a code and receive
   filament send big.iso --to laptop  send to a remembered device, no code
-  filament add --name phone          add a device
+  filament add                       mint a code; the other device runs `filament add <code>`
+  filament add --for person          bounded invitation; the other device runs `filament join`
   filament receive --background     always-on inbox (drop target)
   filament shell laptop              open a shell on a known device
   filament reach laptop              check if a device is reachable
@@ -653,13 +654,14 @@ enum Cmd {
         /// least two words, e.g. --word "gigantic element".
         #[arg(long)]
         word: Option<String>,
-    },
-    /// Create a bounded invitation for a device or person.
-    Invite {
-        /// Invitation kind: device or person. Asked interactively when omitted.
-        #[arg(long, value_parser = ["device", "person"])]
-        kind: Option<String>,
-        /// Maximum capabilities. Defaults to transfer+mount for a device, transfer for a person.
+        /// Mint a bounded invitation FOR a device you control or for another
+        /// person (the other side claims it with `join`). Omit the value on a
+        /// terminal to be asked; omit the flag to mint a pairing code instead
+        /// (the other side claims it with `add <code>`).
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        for_: Option<String>,
+        /// Maximum capabilities for the bounded invitation. Defaults to
+        /// transfer+mount for a device, transfer for a person.
         #[arg(long, value_delimiter = ',')]
         allow: Vec<String>,
         /// Invitation and joined certificate lifetime, such as 1h or 30d.
@@ -4361,7 +4363,7 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
                 "enroll_private_key": hex::encode(seed),
             }))?);
             seed.fill(0);
-            let out = out.ok_or_else(|| anyhow!("secret output requires --out <new-owner-only-file>; use `filament invite` for the guided flow"))?;
+            let out = out.ok_or_else(|| anyhow!("secret output requires --out <new-owner-only-file>; use `filament add --for` for the guided flow"))?;
             write_owner_only_file(&out, json.as_str())?;
             eprintln!("{} auth key bundle written to {}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
@@ -4604,20 +4606,23 @@ async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
     Ok(())
 }
 
-async fn invite_cmd(
+async fn add_for_cmd(
     caps: &UiCapability,
-    mut kind: Option<String>,
+    for_: Option<String>,
     allow: Vec<String>,
     expires: Option<String>,
     out: Option<PathBuf>,
 ) -> Result<()> {
     use base64::Engine;
-    if kind.is_none() && caps.interactive {
+    // `--for` with no value (Some("")) means "ask me on a terminal"; the
+    // one-shot path requires an explicit device|person value.
+    let mut for_ = for_.filter(|v| !v.is_empty());
+    if for_.is_none() && caps.interactive {
         let choices = vec!["A device I control".to_string(), "Another person".to_string()];
-        kind = codeentry::pick("WHO IS JOINING", &choices)?
+        for_ = codeentry::pick("WHO IS JOINING", &choices)?
             .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() });
     }
-    let kind = kind.ok_or_else(|| anyhow!("non-interactive invite requires --kind device|person"))?;
+    let kind = for_.ok_or_else(|| anyhow!("non-interactive add --for requires device|person"))?;
     if kind != "device" && kind != "person" {
         bail!("invitation kind must be device or person");
     }
@@ -4641,7 +4646,7 @@ async fn invite_cmd(
         caps.confirm("include deliberate remote authority in this invitation ceiling")?;
     }
     if !caps.interactive && out.is_none() {
-        bail!("non-interactive invite requires --out <new-owner-only-file>");
+        bail!("non-interactive add --for requires --out <new-owner-only-file>");
     }
     let owner_key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?
         .ok_or_else(|| anyhow!("no identity. Run `filament init` first"))?;
@@ -5267,7 +5272,7 @@ async fn enroll_and_send_cmd(
         // needs a join invitation, which mints a persistent key.
         if ak.ephemeral {
             ui::say(&format!(
-                "  {} --remember cannot persist this enrollment: the key is signed ephemeral. For a remembered device, the owner invites it (`filament invite`) and it joins (`filament join`).",
+                "  {} --remember cannot persist this enrollment: the key is signed ephemeral. For a remembered device, the owner mints `filament add --for device` and it joins (`filament join`).",
                 ui::paint(ui::Tone::Warn, "·"),
             ));
         } else {
@@ -10822,6 +10827,9 @@ async fn main() -> Result<()> {
                         "recv" => Some("receive"),
                         "pair" => Some("add"),
                         "identity" => Some("id"),
+                        // 0.8.3: invite was absorbed into add --for <device|person>.
+                        // The did-you-mean teaches instead of silently routing.
+                        "invite" => Some("add --for"),
                         _ => None,
                     };
                     if let Some(h) = legacy {
@@ -10869,8 +10877,7 @@ async fn main() -> Result<()> {
                 ("Send something", "send"),
                 ("Receive something", "receive"),
                 ("Mount remote files", "mount"),
-                ("Add with a person present", "add"),
-                ("Invite a device or person", "invite"),
+                ("Connect another device", "add"),
                 ("See every device", "devices"),
                 ("View my identity", "id"),
             ]
@@ -10956,7 +10963,7 @@ async fn main() -> Result<()> {
         && !matches!(
             &cmd,
             Cmd::Init { .. }
-                | Cmd::Invite { .. }
+                | Cmd::Add { .. }
                 | Cmd::Join { .. }
                 | Cmd::Id { .. }
                 | Cmd::Status { .. }
@@ -11184,9 +11191,12 @@ async fn main() -> Result<()> {
         Cmd::Status { json } => status_cmd(json || ui_caps.json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
         Cmd::Reset => reset_cmd(&ui_caps),
-        Cmd::Add { code, name, word } => pair_cmd(&server, code, name, word, relay).await,
-        Cmd::Invite { kind, allow, expires, out } => {
-            invite_cmd(&ui_caps, kind, allow, expires, out).await
+        Cmd::Add { code, name, word, for_, allow, expires, out } => {
+            if for_.is_some() {
+                add_for_cmd(&ui_caps, for_, allow, expires, out).await
+            } else {
+                pair_cmd(&server, code, name, word, relay).await
+            }
         }
         Cmd::Join { invite_file, invite_fd, name, to } => {
             join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await

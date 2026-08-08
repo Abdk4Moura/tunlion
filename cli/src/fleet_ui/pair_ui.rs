@@ -137,7 +137,7 @@ pub fn err_pair_interactive() -> (String, i32) {
         format!(
             "{err} add is interactive (it needs consent on both ends). For automation, create a bounded invitation instead:\n  {fix}",
             err = ui::paint(Tone::Err, ui::glyph_err()),
-            fix = "filament invite",
+            fix = "filament add --for device",
         ),
         super::EXIT_BAD_ARG,
     )
@@ -204,7 +204,7 @@ mod tests {
     fn err_pair_interactive_exit_code() {
         let (msg, code) = err_pair_interactive();
         assert!(msg.contains("interactive"), "must explain why");
-        assert!(msg.contains("invite"), "must suggest alternative");
+        assert!(msg.contains("add --for"), "must suggest the bounded invitation");
         assert_eq!(code, 2, "bad-arg = exit 2");
     }
 

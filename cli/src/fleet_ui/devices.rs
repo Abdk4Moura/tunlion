@@ -123,8 +123,8 @@ fn render_device_row(d: &DeviceEntry) -> String {
 pub fn render_empty() -> String {
     format!(
         "No devices yet.\n\
-         Add in person:    filament add\n\
-         Invite securely:  filament invite"
+         Add in person:        filament add\n\
+         Invite securely:      filament add --for person"
     )
 }
 
@@ -159,7 +159,7 @@ pub fn render_falling_out(name: &str, expiry: &str) -> String {
 pub fn render_lapsed(name: &str, expiry: &str) -> String {
     format!(
         "     . {name:<16} -        -        {}",
-        ui::paint(Tone::Dim, &format!("left: cert expired {expiry} / invite again to restore"))
+        ui::paint(Tone::Dim, &format!("left: cert expired {expiry} / add again to restore"))
     )
 }
 
@@ -197,7 +197,7 @@ mod tests {
         let s = render_empty();
         assert!(s.contains("No devices yet"), "must show empty message");
         assert!(s.contains("filament add"), "must suggest add");
-        assert!(s.contains("filament invite"), "must suggest invite");
+        assert!(s.contains("filament add --for person"), "must suggest the bounded invite");
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
     fn lapsed_device() {
         let s = render_lapsed("ci-box", "Aug 3");
         assert!(s.contains("left: cert expired"), "must show lapsed reason");
-        assert!(s.contains("invite again to restore"), "must show restore hint");
+        assert!(s.contains("add again to restore"), "must show restore hint");
     }
 
     #[test]

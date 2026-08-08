@@ -4,6 +4,31 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.8.3] - 2026-08-08
+
+### Breaking
+
+- **The command surface changed twice in one week, and we are telling you why.**
+  0.8.0 shipped three verbs for connecting a device: `add`, `invite`, and
+  `join`. The person who designed them could not work out which to use,
+  standing in front of the QR code the command had just printed. Three
+  verbs with illegible boundaries are a worse product than one verb with a
+  clear split, and we would rather break the surface once more before anyone
+  depends on it than defend a confusing shape for a year.
+
+  The surface now has TWO roles, not three:
+
+  - **MINT** is `filament add`. It prints a code (the other device claims it
+    with `add <code>`) or, with `add --for <device|person>`, a bounded
+    invitation (the other device claims it with `join`).
+  - **CLAIM** is `add <code>` (a pairing code) or `join` (a bounded
+    invitation).
+
+  `invite` is gone. The bare verb errors with a did-you-mean to `add --for`,
+  not an alias: an alias silently works, a did-you-mean refuses and teaches.
+  The pairing protocol and the capability ceiling are unchanged; only the
+  surface over them moved.
+
 ## [0.8.2] - 2026-08-08
 
 ### Fixed
