@@ -4,6 +4,39 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.8.1] - 2026-08-08
+
+### Fixed
+
+- **Windows: setting up background receive no longer fails for a normal user.**
+  Answering yes to "Stay available in the background?" in the first-run wizard
+  aborted with `schtasks failed: ERROR: Access is denied.` for any account
+  without administrator rights, which is the default. No UAC prompt appeared,
+  because the code that raises one could not run.
+
+  Three things were wrong. `is_elevated()` returned true unconditionally on
+  Windows, on the assumption that its only caller was an already-elevated
+  re-launch; it is also the first, non-elevated call, so the elevation path was
+  unreachable. The advertised fallback to a user-level autostart dispatched to
+  the same function as the system install, so it retried the operation that had
+  just failed and reported the same error. And the task was created in the
+  Task Scheduler root, which requires administrator rights.
+
+  Background receive is now a per-user autostart
+  (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`) that needs no
+  elevation, matching what Linux and macOS already did with a systemd user
+  service and a LaunchAgent. Starting your own receiver when you log in is not
+  an administrative act. A machine-wide service that starts before login is
+  still available through `--install-system`, and that path now genuinely
+  elevates: `is_elevated()` reads the process token instead of assuming.
+
+  The `[SC] OpenSCManager FAILED 5` line printed alongside the error came from
+  an unconditional `sc delete` during cleanup. It now runs only when elevated,
+  so an ordinary uninstall is quiet.
+
+  Found by running the wizard on Windows as a non-administrator, which nothing
+  had done before.
+
 ## [0.8.0] - 2026-08-07
 
 ### Breaking
