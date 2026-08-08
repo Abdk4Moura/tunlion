@@ -10,7 +10,7 @@ curl -fsSL https://filament.autumated.com/install | sh
 winget install Abdk4Moura.Filament
 ```
 
-**Homebrew:** `brew install abdk4moura/tap/filament`
+**Homebrew:** `brew install abdk4moura/tap/filament` · **Cargo:** `cargo install filament-cli`
 
 Already installed? `filament update`
 
