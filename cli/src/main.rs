@@ -3214,16 +3214,27 @@ async fn up_cmd(
         }
         // Try privileged system install (elevation popup). On decline, fall
         // back to user-level autostart. Never fail hard.
-        match host.install_system(&exe, &up_args) {
-            Ok(platform::InstallResult::System) => {
-                ui::say(&format!("  {} installed as a system service (autostart at boot)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-            }
-            Ok(platform::InstallResult::User) | Err(_) => {
-                // Elevation declined: user-level autostart
-                host.install_user(&exe, &up_args)?;
-                ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                ui::say(&format!("  {} run `filament up --install` again to grant admin for kernel overlay",
-                    ui::paint(ui::Tone::Dim, "note:")));
+        // #173: on Windows the DEFAULT background receiver is per-user (HKCU
+        // Run, no elevation), matching systemd --user and the LaunchAgent. A
+        // machine-wide service is an explicit `--install-system` request; the
+        // first-run wizard must not demand UAC.
+        if cfg!(windows) {
+            host.install_user(&exe, &up_args)?;
+            ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            ui::say(&format!("  {} run `filament up --install-system` for a machine-wide service that starts before logon",
+                ui::paint(ui::Tone::Dim, "note:")));
+        } else {
+            match host.install_system(&exe, &up_args) {
+                Ok(platform::InstallResult::System) => {
+                    ui::say(&format!("  {} installed as a system service (autostart at boot)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                }
+                Ok(platform::InstallResult::User) | Err(_) => {
+                    // Elevation declined: user-level autostart
+                    host.install_user(&exe, &up_args)?;
+                    ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    ui::say(&format!("  {} run `filament up --install` again to grant admin for kernel overlay",
+                        ui::paint(ui::Tone::Dim, "note:")));
+                }
             }
         }
         #[cfg(target_os = "windows")]

@@ -340,7 +340,37 @@ impl ServiceHost {
         }
         #[cfg(windows)]
         {
-            true // try_elevate already ran via ShellExecute; this host is the elevated instance
+            // #173: this used to return true unconditionally, on the
+            // assumption that the only caller was an already-elevated
+            // re-launch. It is ALSO the first, non-elevated call, so the UAC
+            // re-launch could never run. Query the token elevation state
+            // instead.
+            unsafe {
+                unsafe extern "system" {
+                    fn GetCurrentProcess() -> isize;
+                    fn OpenProcessToken(h: isize, access: u32, tok: *mut isize) -> i32;
+                    fn GetTokenInformation(tok: isize, cls: u32, buf: *mut u8, len: u32, ret: *mut u32) -> i32;
+                    fn CloseHandle(h: isize) -> i32;
+                }
+                const TOKEN_QUERY: u32 = 0x0008;
+                const TOKEN_ELEVATION: u32 = 20;
+                let mut tok: isize = 0;
+                let h = GetCurrentProcess();
+                if OpenProcessToken(h, TOKEN_QUERY, &mut tok) == 0 {
+                    return false;
+                }
+                let mut elev: u32 = 0;
+                let mut ret: u32 = 0;
+                let ok = GetTokenInformation(
+                    tok,
+                    TOKEN_ELEVATION,
+                    (&mut elev as *mut u32).cast::<u8>(),
+                    std::mem::size_of::<u32>() as u32,
+                    &mut ret,
+                );
+                CloseHandle(tok);
+                ok != 0 && elev != 0
+            }
         }
         #[cfg(not(any(unix, windows)))]
         { false }
@@ -404,7 +434,12 @@ impl ServiceHost {
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
-                install_scheduled_task(exe, shell_args)
+                // #173: per-user autostart via HKCU Run. No elevation needed:
+                // autostarting a user's own file receiver at logon is not an
+                // administrative act, and the first-run wizard must not demand
+                // UAC for it (matches systemd --user and the LaunchAgent). A
+                // machine-wide service is the explicit --install-system path.
+                install_run_key(exe, shell_args)
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
@@ -428,11 +463,30 @@ impl ServiceHost {
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
-                let _ = std::process::Command::new("sc")
-                    .args(["delete", "filament"])
+                // #173: `sc delete` needs admin; only run it when elevated (the
+                // machine-wide service path). The per-user autostart is removed
+                // with the HKCU Run entry, which needs no elevation.
+                if self.is_elevated() {
+                    let _ = std::process::Command::new("sc")
+                        .args(["delete", "filament"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                let _ = std::process::Command::new("reg")
+                    .args([
+                        "delete",
+                        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                        "/v", "Filament",
+                        "/f",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status();
                 let _ = std::process::Command::new("schtasks")
                     .args(["/delete", "/tn", "Filament", "/f"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status();
             }
             #[cfg(target_os = "macos")]
@@ -550,6 +604,29 @@ fn install_systemd_user(exe: &Path, shell_args: &str) -> Result<()> {
         .map(|s| s.success()).unwrap_or(false);
     if !ok {
         anyhow::bail!("systemctl --user enable --now filament failed; run it manually or check journalctl --user -u filament");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_run_key(exe: &Path, shell_args: &str) -> Result<()> {
+    // Per-user autostart via HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
+    // Runs as the current user at logon with no elevation. This is the default
+    // background receiver on Windows.
+    let cmd = format!("\"{}\" up{}", exe.display(), shell_args);
+    let out = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v", "Filament",
+            "/t", "REG_SZ",
+            "/d", &cmd,
+            "/f",
+        ])
+        .output()?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("reg add HKCU Run failed: {}", stderr.trim());
     }
     Ok(())
 }
