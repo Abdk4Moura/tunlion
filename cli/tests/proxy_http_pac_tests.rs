@@ -21,7 +21,7 @@ fn proxy_help_shows_http_port_flag() {
     let bin = filament_bin();
 
     let output = Command::new(&bin)
-        .arg("reach")
+        .arg("forward")
         .arg("--help")
         .output()
         .expect("failed to execute filament");
@@ -43,8 +43,9 @@ fn proxy_http_port_zero_disables() {
     // Start proxy with http-port=0 (disabled), then kill it after a moment
     let mut child = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-proxy-test-disabled"))
-        .arg("reach")
+        .arg("forward")
         .arg("--socks")
+        .arg("localhost:9")
         .arg("--http-port")
         .arg("0")
         .arg("--port")
@@ -82,8 +83,9 @@ fn pac_file_returns_correct_socks_port() {
     // Start proxy with custom ports
     let mut child = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &config_dir)
-        .arg("reach")
+        .arg("forward")
         .arg("--socks")
+        .arg("localhost:9")
         .arg("--port")
         .arg(socks_port.to_string())
         .arg("--http-port")

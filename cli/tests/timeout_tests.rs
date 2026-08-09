@@ -72,7 +72,7 @@ fn netcat_unreachable_peer_exits_with_error() {
     let output = Command::new(&bin)
         .env("FILAMENT_CONNECT_SECS", connect_secs.to_string())
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-timeout-test-netcat"))
-        .arg("reach")
+        .arg("forward")
         .arg("definitely-unreachable-peer-12345:8080")
         .output()
         .expect("failed to execute filament");

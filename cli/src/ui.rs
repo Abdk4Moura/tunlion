@@ -585,6 +585,37 @@ pub fn qr(url: &str) -> String {
     out
 }
 
+/// Number of terminal rows the rendered QR needs (half-block: one row per two
+/// modules, plus the quiet zone). None when unicode is unavailable.
+pub fn qr_rows(url: &str) -> Option<usize> {
+    if !caps().unicode {
+        return None;
+    }
+    let Ok(code) = qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M) else {
+        return None;
+    };
+    Some((code.width() as usize + 4) / 2)
+}
+
+/// Render a QR if it fits the terminal height, else the payload plus the
+/// numbers. A QR whose top is cut off looks broken and cannot resolve; better
+/// to say so plainly (#190). `rows_used` is how many rows the surrounding text
+/// has already printed above the QR (review header etc).
+pub fn qr_or_text(url: &str, rows_used: usize) -> String {
+    let rows = match qr_rows(url) {
+        Some(r) => r,
+        None => return url.to_string(),
+    };
+    let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(usize::MAX);
+    if rows_used + rows <= term_h {
+        qr(url)
+    } else {
+        format!(
+            "  (the QR needs {rows} rows and this window has {term_h}; the top would be cut off)\n  {url}",
+        )
+    }
+}
+
 #[cfg(test)]
 mod verbosity_tests {
     use super::*;

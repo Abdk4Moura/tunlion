@@ -461,9 +461,14 @@ COMMANDS
     receive [code]         receive from a code or your nearby network
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     reach <device>         check if a device is reachable (direct/relay + rtt)
-    reach <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
+    forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
     mount <device>:<dir>   mount a remote folder over the mesh
+  Serve
+    up                     serve: receive, mount, shell (run attached)
+    up --install           the same, always-on (autostart at logon)
+    down                   stop the daemon
+    reset                  wipe this machine's state (destructive)
   Devices
     devices                list your known devices
     requests               approve or deny access others asked for
@@ -479,10 +484,10 @@ EXAMPLES
   filament send big.iso --to laptop  send to a remembered device, no code
   filament add                       mint a code; the other device runs `filament add <code>`
   filament add --for person          bounded invitation; the other device runs `filament join`
-  filament receive --background     always-on inbox (drop target)
+  filament up --install              always-on receiver (the daemon, autostart)
   filament shell laptop              open a shell on a known device
   filament reach laptop              check if a device is reachable
-  filament reach laptop:5432         tunnel to a peer's localhost port
+  filament forward laptop:5432       tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://filament.autumated.com
   Run `filament <command> --help` for details.";
@@ -702,7 +707,6 @@ enum Cmd {
         json: bool,
     },
     /// Always-on receiver: trusted known devices only, invisible to strangers
-    #[command(hide = true)]
     Up {
         /// Install + start a systemd user service instead of running attached
         #[arg(long)]
@@ -758,7 +762,6 @@ enum Cmd {
         no_proxy_fallback: bool,
     },
     /// Show whether the daemon runs and what it received recently
-    #[command(hide = true)]
     Status {
         /// Machine-readable JSON (for scripts): {running, pid, devices, exposed, recent}.
         #[arg(long)]
@@ -766,9 +769,7 @@ enum Cmd {
     },
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
-    #[command(hide = true)]
     Down,
-    /// Show or change settings (no args = show all).
     ///
     /// No args prints all settings with their value, scope, and where each came
     /// from (env > peer > config > default). Strictly imperative: `set` only
@@ -813,7 +814,7 @@ enum Cmd {
     },
     // ── Mesh ────────────────────────────────────────────────────────
     /// Show this machine's overlay address, or a device's info
-    #[command(hide = true, next_help_heading = "Mesh")]
+    #[command(next_help_heading = "Mesh")]
     Addr {
         /// Device name to show info for (omit for this machine's address).
         device: Option<String>,
@@ -859,14 +860,25 @@ enum Cmd {
     ///
     /// Local TCP listener; each connection becomes one stream to the peer's
     /// localhost:<rport>.
-    #[command(hide = true)]
     Forward {
-        /// Local port to listen on (127.0.0.1)
-        lport: u16,
-        /// Known device (petname) to tunnel through
-        peer: String,
-        /// Remote port on the peer's localhost
-        rport: u16,
+        /// `<device>:<port>` to tunnel to (e.g. laptop:5432); the local port is
+        /// the same as the remote one unless --lport says otherwise.
+        target: String,
+        /// Override the local listen port.
+        #[arg(long)]
+        lport: Option<u16>,
+        /// Run a local SOCKS5 proxy for mesh access from any app.
+        #[arg(long)]
+        socks: bool,
+        /// SOCKS5 proxy port (default: 1080)
+        #[arg(long, default_value_t = 1080)]
+        port: u16,
+        /// Proxy bind address (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// HTTP CONNECT proxy port (0 = disabled)
+        #[arg(long, default_value_t = 0)]
+        http_port: u16,
     },
     /// Publish a local port on this device's mesh address (peers reach it at
     /// <this-device>.mesh:<port>), like a Tailscale-served port.
@@ -876,12 +888,10 @@ enum Cmd {
     /// (`filament set tun-addr auto`). Persists across restarts.
     ///
     /// Use `filament expose <port> --off` to stop exposing a port.
-    #[command(hide = true)]
     Expose {
         /// Port to publish on the overlay. Omit together with --list or --off.
         port: Option<u16>,
         /// Local target: host:port, a bare port (127.0.0.1:PORT), or a bare host
-        /// (HOST:<port>). Default: 127.0.0.1:<port>.
         #[arg(long, value_name = "HOST:PORT")]
         to: Option<String>,
         /// Restrict to these paired devices (petnames, comma-separated). Default: any.
@@ -894,43 +904,30 @@ enum Cmd {
         #[arg(long)]
         off: bool,
     },
-    /// Reach a peer: check reachability, tunnel to a port, or run a mesh proxy.
+    /// Reach a peer: check whether it is reachable, and how (direct/relay + rtt).
     ///
-    /// `<dev>`: reachability probe (is the device reachable, and how: direct/relay + rtt).
-    /// `<dev>:<port>`: tunnels to the peer's localhost:<port> (the `reach` mental model).
-    /// `--socks`: runs a local SOCKS5 proxy for mesh access from any app.
-    #[command(hide = true)]
+    /// To TUNNEL to a peer's port, use `filament forward <device>:<port>`.
+    #[command(next_help_heading = "Mesh")]
     Reach {
-        /// Device to probe (e.g. laptop) or device:port to tunnel (e.g. laptop:5432)
-        dev_port: Option<String>,
-        /// Run a local SOCKS5 proxy instead
-        #[arg(long)]
-        socks: bool,
-        /// Machine-readable JSON output (for the bare `<device>` reachability probe)
+        /// Device to probe (omit for the environment preflight).
+        dev: Option<String>,
+        /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
-        /// SOCKS5 proxy port (default: 1080)
-        #[arg(long, default_value_t = 1080)]
-        port: u16,
-        /// Proxy bind address (default: 127.0.0.1)
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
-        /// HTTP CONNECT proxy port (0 = disabled)
-        #[arg(long, default_value_t = 0)]
-        http_port: u16,
+        /// Moved to `forward --socks`. Kept hidden so the old form teaches.
+        #[arg(long, hide = true)]
+        socks: bool,
     },
     /// Diagnose connect health: where SSH/L2 establishment is slow or stalls.
     ///
     /// With a device: run an "establish then drop" probe and print the per-phase
     /// ladder + verdict. Without a device: environment preflight.
-    #[command(hide = true)]
     Doctor {
         /// Known device (petname) to probe; omit for environment preflight
         device: Option<String>,
         /// Repeat the probe until interrupted-ish (a bounded default count)
         #[arg(long)]
         watch: bool,
-        /// Run the probe N times and print a distribution summary
         #[arg(long)]
         repeat: Option<u32>,
         /// Machine-readable JSON output (for scripting)
@@ -940,7 +937,6 @@ enum Cmd {
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
-    #[command(hide = true)]
     Grant {
         /// Known device (petname), or omit with --tag
         device: String,
@@ -951,7 +947,6 @@ enum Cmd {
         tag: Option<String>,
     },
     /// Revoke a capability or a fleet certificate from a known device.
-    #[command(hide = true)]
     Revoke {
         /// Known device (petname)
         device: String,
@@ -1045,7 +1040,6 @@ enum Cmd {
         args: Vec<String>,
     },
     /// List, approve, or deny pending consent requests from peers.
-    #[command(hide = true)]
     Requests {
         #[command(subcommand)]
         action: Option<RequestsAction>,
@@ -1098,7 +1092,6 @@ enum Cmd {
     ///
     /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
     /// from a non-TTY / scripts).
-    #[command(hide = true)]
     Reset,
 }
 
@@ -3511,7 +3504,7 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
         if qr.eq_ignore_ascii_case("qr") {
             eprintln!();
             eprintln!("  Anyone who captures this QR can become you.");
-            eprintln!("{}", ui::qr(&format!("filament-recovery:v1:{phrase}")));
+            eprintln!("{}", ui::qr_or_text(&format!("filament-recovery:v1:{phrase}"), 2));
             let _ = prompt_line("  Press Enter after saving it somewhere you control: ")?;
         }
         let fourth = prompt_line("  Word 4:  ")?;
@@ -3541,7 +3534,7 @@ async fn init_experience(
 ) -> Result<()> {
     let store = crate::platform::PlatformKeyStore;
     if caps.json && background {
-        bail!("init --json cannot install a service without mixing service output; run `filament receive --background` separately");
+        bail!("init --json cannot install a service without mixing service output; run `filament up --install` separately");
     }
     if let Some(existing) = identity::UserKey::load(&store)? {
         bail!("this device already has identity {}; see `filament id`", existing.fingerprint());
@@ -3619,7 +3612,7 @@ async fn init_experience(
     if start_background {
         ui::say(&format!("  {} available in the background", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
     } else {
-        ui::say(&ui::paint(ui::Tone::Dim, "  Stay available: filament receive --background"));
+        ui::say(&ui::paint(ui::Tone::Dim, "  Stay available: filament up --install"));
     }
     Ok(())
 }
@@ -3693,6 +3686,8 @@ fn tour_cmd() -> Result<()> {
         act("filament shell <device>", "open an authorized terminal");
     }
     act("filament receive", "receive once");
+    act("filament up", "serve: receive, mount, shell");
+    act("filament up --install", "the same, always-on");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  /  filament devices  /  filament id"));
     Ok(())
 }
@@ -4739,10 +4734,24 @@ async fn add_for_cmd(
         for_ = codeentry::pick("WHO IS JOINING", &choices)?
             .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() });
     }
-    let kind = for_.ok_or_else(|| anyhow!("non-interactive add --for requires device|person"))?;
-    if kind != "device" && kind != "person" {
-        bail!("invitation kind must be device or person");
-    }
+    // #187: `--for` reads like a name. A bare word that is not the literal
+    // device/person is a DEVICE NAME: select device-kind and pre-fill the
+    // invitation so the owner can name the invitee up front. The literals
+    // keep working for scripts.
+    let (kind, _invitee_name) = match for_.as_deref() {
+        None => {
+            let k = if caps.interactive {
+                let choices = vec!["A device I control".to_string(), "Another person".to_string()];
+                codeentry::pick("WHO IS JOINING", &choices)?
+                    .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() })
+            } else {
+                None
+            };
+            (k.ok_or_else(|| anyhow!("non-interactive add --for requires device|person or a device name"))?, None)
+        }
+        Some("device") | Some("person") => (for_.unwrap(), None),
+        Some(name) => ("device".to_string(), Some(name.to_string())),
+    };
     let mut ceiling = if allow.is_empty() {
         if kind == "device" {
             vec!["transfer".to_string(), "mount".to_string()]
@@ -4809,7 +4818,7 @@ async fn add_for_cmd(
         eprintln!("  expires  {ttl_text}");
         eprintln!();
         eprintln!("  Whoever captures this can join until it is used or expires.");
-        eprintln!("{}", ui::qr(token.as_str()));
+        eprintln!("{}", ui::qr_or_text(token.as_str(), 8));
         eprintln!("{}", token.as_str());
         eprintln!("  keep this window open until the other device claims it");
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
@@ -4832,7 +4841,7 @@ async fn add_for_cmd(
     if !armed {
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament receive --background`, then the other device can join.",
+            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament up --install`, then the other device can join.",
         ));
     }
     Ok(())
@@ -6677,7 +6686,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 ui::say("");
                 if interactive_allowed() {
                     ui::say(&ui::paint(ui::Tone::Dim, "  scan this in Filament, or enter the code below it"));
-                    ui::say(&ui::qr(&full));
+                    ui::say(&ui::qr_or_text(&full, 6));
                 }
                 ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament add <code>`"));
                 ui::say(&ui::paint(ui::Tone::Dim, "  keep this window open until the other device claims it"));
@@ -10923,13 +10932,15 @@ async fn main() -> Result<()> {
                     argv.insert(1, "receive".into());
                 }
                 BareTarget::Forward { lport, peer, rport } => {
-                    // `filament device:port` -> `filament forward lport peer rport`.
+                    // `filament device:port` -> `filament forward device:port`.
                     // The local and remote ports are the same number.
                     argv.remove(1);
                     argv.insert(1, "forward".into());
-                    argv.insert(2, lport);
-                    argv.insert(3, peer);
-                    argv.insert(4, rport);
+                    argv.insert(2, format!("{peer}:{rport}"));
+                    if lport != rport {
+                        argv.insert(3, "--lport".into());
+                        argv.insert(4, lport);
+                    }
                 }
                 BareTarget::Reach(dev_port) => {
                     // `filament device.mesh` or `filament device.mesh:port` ->
@@ -11028,6 +11039,7 @@ async fn main() -> Result<()> {
                 ("Receive something", "receive"),
                 ("Mount remote files", "mount"),
                 ("Connect another device", "add"),
+                ("Serve in the background", "up --install"),
                 ("See every device", "devices"),
                 ("View my identity", "id"),
             ]
@@ -11140,10 +11152,10 @@ async fn main() -> Result<()> {
         Cmd::Receive { code, dir, yes, room, to, keep_open, remember, output, background } => {
             let dir = drop_dir(dir);
             if background {
-                if code.is_some() || room.is_some() || to.is_some() || keep_open || remember.is_some() || output.is_some() {
-                    bail!("receive --background configures your standing inbox; code, room, sender, and output options are one-shot only");
-                }
-                up_cmd(&server, true, false, Some(dir), relay, false, None, None, None, false, false, false).await
+                // 0.8.5: receive --background was a second name for `up --install`
+                // (the same call), created because `up` was hidden. `up` is now
+                // visible, so the alias is gone. Teach, do not silently route.
+                bail!("`receive --background` was renamed: the always-on receiver is the daemon. Run `up --install` instead");
             } else {
                 recv_cmd(&server, code, dir, yes, room, to, keep_open, relay, remember, false, output, ShellPolicy::Granted, None, false).await
             }
@@ -11524,26 +11536,34 @@ async fn main() -> Result<()> {
                 l2::pty_cmd(&server, &peer, relay, args).await
             }
         },
-        Cmd::Reach { dev_port, socks, json, port, bind, http_port } => {
-            let json = json || ui_caps.json;
+        Cmd::Reach { dev, json, socks } => {
             if socks {
-                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
-            } else if let Some(dp) = dev_port {
-                let parts: Vec<&str> = dp.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    // `<device>:<port>`: localhost tunnel (the "reach my device's port" mental model)
-                    let peer = parts[0].to_string();
-                    let rport: u16 = parts[1].parse().map_err(|_| anyhow!("invalid port in '{}'", dp))?;
-                    l2::netcat_cmd(&server, &peer, rport, relay).await
-                } else {
-                    // Bare `<device>`: reachability probe (warm-link check, cold fallback)
-                    crate::ping::ping_cmd(&server, &dp, 1, json, relay).await
-                }
-            } else {
-                bail!("reach requires <device> or <device>:<port> or --socks. Run `filament reach --help` for usage.");
+                bail!("`reach --socks` moved to `forward --socks`: reach now probes only. Run `filament forward <device>:<port> --socks`");
+            }
+            let json = json || ui_caps.json;
+            match dev {
+                Some(d) if d.contains(':') => bail!(
+                    "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `filament forward {d}`"
+                ),
+                Some(d) => crate::ping::ping_cmd(&server, &d, 1, json, relay).await,
+                None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
             }
         },
-        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, relay).await,
+        Cmd::Forward { target, lport, socks, port, bind, http_port } => {
+            if socks {
+                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+            } else {
+                let (peer, rport) = match target.split_once(':') {
+                    Some((p, r)) => (
+                        p.to_string(),
+                        r.parse().map_err(|_| anyhow!("invalid port in '{target}'; expected <device>:<port>"))?,
+                    ),
+                    None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
+                };
+                let lport = lport.unwrap_or(rport);
+                l2::forward_cmd(&server, lport, &peer, rport, relay).await
+            }
+        },
         Cmd::Expose { port, to, peer, list, off } => {
             if off {
                 if let Some(p) = port {
@@ -12380,6 +12400,30 @@ async fn send_cmd(
         }
         paths.push(path);
     }
+    // #188: validate the first path NOW, before asking anything else. The old
+    // flow asked local-vs-code first and only then statted the file, so a typo
+    // at the prompt cost two questions and a raw syscall error. Validate and
+    // re-prompt once instead.
+    if !paths.iter().any(|p| p == "-") {
+        loop {
+            let first = paths.first().cloned().unwrap_or_default();
+            if first.is_empty() {
+                break;
+            }
+            match std::fs::metadata(&first) {
+                Ok(_) => break,
+                Err(_) if interactive_allowed() && paths.len() == 1 => {
+                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  no such file or directory: '{first}'")));
+                    let again = prompt_line("  What do you want to send? ")?;
+                    if again.is_empty() {
+                        bail!("cancelled");
+                    }
+                    paths[0] = again;
+                }
+                Err(e) => bail!("cannot send '{first}': {e}"),
+            }
+        }
+    }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
     // from stdin. First offer to pick a PAIRED DEVICE (arrow-key list); the last
     // item / Esc drops to the code path: Enter = local network, typed words mint a
@@ -12409,19 +12453,21 @@ async fn send_cmd(
             }
         }
         if !chose_device {
+            // #189: the old local-vs-code question was unanswerable at ask time
+            // (you cannot know whether anyone is nearby until you have waited).
+            // The full escalation (watch local AND mint a code, whoever arrives
+            // first wins) needs the sender reachable in two rendezvous points,
+            // which is a transport change - flagged, not pushed through. The
+            // non-transport half ships here: there is no question, the sender
+            // mints a code immediately and shows it, so `send` is discoverable
+            // by `receive <code>` from anywhere and a nearby receiver appears in
+            // the room on its own.
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                "  press enter to send over the local network, or type words to create a shareable code",
+                "  minting a shareable code (a nearby device can also appear automatically)",
             ));
-            let auto_np = crate::pake::words::mint_nameplate();
-            match codeentry::run("  send · code  ", codeentry::Mode::Create, "", &auto_np)? {
-                codeentry::Outcome::Submitted(words) => {
-                    use_code = true;
-                    word = Some(words);
-                }
-                codeentry::Outcome::Empty => { /* fall through to local-network send */ }
-                codeentry::Outcome::Cancelled => return Err(cancelled()),
-            }
+            use_code = true;
+            word = Some(crate::pake::words::mint_words());
         }
     }
     // --name overrides the offered name, but only makes sense for a SINGLE
@@ -20000,6 +20046,54 @@ mod tests {
             "certRevoked": true,
         }])).unwrap()).unwrap();
         assert!(device_cert_revoked(&[0x42u8; 32]), "a revoked record must refuse the gate on reconnect");
+    }
+
+    #[test]
+    fn help_banner_agrees_with_clap_visibility() {
+        // 0.8.5 (rec 5): the help COMMANDS banner is a hand-written list and a
+        // second source of truth. This test is the enforcement: every clap-
+        // visible subcommand appears in the banner, and every leading verb in
+        // the banner's COMMANDS section is a clap-visible subcommand. A command
+        // hidden from clap must not appear as discoverable, and a visible one
+        // must be listed. (Deriving the banner from clap outright is awkward
+        // because it is a grouped static const; the agreement test is the
+        // accepted second best.)
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let visible: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+        // Every visible subcommand is in the banner.
+        for name in &visible {
+            assert!(
+                EXAMPLES.contains(name.as_str()),
+                "visible command '{name}' must appear in the help banner"
+            );
+        }
+        // Every leading verb in the banner's COMMANDS section is visible.
+        let section = EXAMPLES.split("\nEXAMPLES").next().unwrap_or(EXAMPLES);
+        for line in section.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("COMMANDS") {
+                continue;
+            }
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            let verb = first.trim_end_matches(':');
+            // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
+            // not commands.
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh") {
+                continue;
+            }
+            if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
+                continue; // `add --for`, `add <code>`, `up --install` all key off add/up
+            }
+            assert!(
+                visible.contains(verb),
+                "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
+            );
+        }
     }
 
     #[test]

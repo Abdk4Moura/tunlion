@@ -417,22 +417,18 @@ impl ServiceHost {
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
-                // Quote the exe inside binPath so a spaced install path (e.g.
-                // C:\Program Files\...) is parsed as one program, not split.
-                // #177: capture stderr so sc's raw [SC] text never reaches the
-                // user; a failed create reports a clean message, not noise.
-                let out = std::process::Command::new("sc")
-                    .args(["create", "filament", "binPath=", &format!("\"{}\" up{}", exe.display(), shell_args),
-                           "start=", "auto", "obj=", "LocalSystem"])
-                    .output()?;
-                if !out.status.success() {
-                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    anyhow::bail!(
-                        "sc create failed ({})",
-                        if err.is_empty() { "exit {}".to_string() } else { err }
-                    );
-                }
-                let _ = std::process::Command::new("sc").args(["start", "filament"]).output();
+                // 0.8.5 (rec 4): a machine-wide Windows service cannot work yet.
+                // `sc create` registers the exe as an SCM service, but filament
+                // is a plain console program with no service protocol, so
+                // `sc start` always times out (exit 1053). Until that protocol
+                // exists, refuse clearly instead of half-installing. The default
+                // per-user autostart (HKCU Run) is unaffected and never reaches
+                // this path.
+                anyhow::bail!(
+                    "a machine-wide Windows service is not supported yet: filament has no service protocol, \
+                     so the installed service could never start. The per-user autostart (the default) is \
+                     already installed. See #177."
+                );
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {

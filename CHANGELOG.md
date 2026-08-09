@@ -4,6 +4,52 @@ All notable, user-facing changes to filament are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
+## [0.8.5] - 2026-08-08
+
+### Breaking
+
+- **The command surface got its one deliberate break.** The 0.8.3 collapse
+  fixed the connect verbs; this round fixes the serve and tunnel verbs, the
+  help surface, and three prompts that asked before they knew. Two names moved,
+  and both removed forms teach with a did-you-mean rather than an alias:
+
+  ```
+  receive --background   ->  up --install
+  reach <device>:<port>   ->  forward <device>:<port>
+  ```
+
+  `receive --background` was a second name for `up --install` (literally the
+  same call), created because `up` was hidden from help. `up` is now visible,
+  so the alias has no reason to exist. `reach` was both a probe and a tunnel
+  depending on whether a `:port` was present; `forward` is now the one tunnel
+  verb (accepting `<device>:<port>`, with `--socks` and the proxy flags), and
+  `reach` is the probe only.
+
+### Changed
+
+- **The help surface is one source of truth.** The banner's COMMANDS list is
+  now checked against clap's actual visibility by a test, so a command that
+  works but is invisible, or one that is listed but hidden, cannot drift. The
+  functional command set (up, down, reset, forward, reach, expose, status,
+  addr, doctor, grant, revoke, requests) is visible; config, update,
+  completions, man, mint, backup, ephemeral, depart, and set stay deliberately
+  hidden.
+- **`add --for` takes a name.** A bare word that is not the literal
+  `device`/`person` is treated as a device name and selects device-kind; the
+  literals still work for scripts.
+- **`send` validates the file before asking anything else.** A typo at the
+  "what do you want to send" prompt now costs one re-prompt, not two questions
+  and a raw syscall error.
+- **`send` no longer asks local-vs-code.** The question was unanswerable at ask
+  time (you cannot know whether anyone is nearby until you wait). The sender
+  mints a shareable code immediately. The full escalation (watch local AND
+  mint a code, whoever arrives first wins) needs the sender reachable in two
+  rendezvous points, a transport change, and is flagged rather than pushed
+  through.
+- **A machine-wide Windows service is refused until it can work.** `sc create`
+  on a plain console program can never start (exit 1053); the path now errors
+  with that explanation. The per-user autostart (the default) is unaffected.
+
 ## [0.8.4] - 2026-08-08
 
 ### Breaking
