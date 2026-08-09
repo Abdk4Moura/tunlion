@@ -11060,7 +11060,12 @@ async fn main() -> Result<()> {
         };
         let labels = actions.iter().map(|(label, _)| (*label).to_string()).collect::<Vec<_>>();
         match codeentry::pick(&header, &labels)? {
-            Some(index) => argv.push(actions[index].1.to_string()),
+            Some(index) => argv.extend(
+                actions[index]
+                    .1
+                    .split_whitespace()
+                    .map(str::to_string),
+            ),
             None => return tour_cmd(),
         }
     }
