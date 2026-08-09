@@ -5855,7 +5855,15 @@ async fn handle_auth_key_enroll_response(
 fn down_cmd() -> Result<()> {
     match daemon_alive() {
         Some(pid) => {
-            std::process::Command::new("kill").arg(pid.to_string()).status()?;
+            // #191: a managed service restarts a killed process. systemd's
+            // Restart=always reacts to an UNEXPECTED exit; a manual
+            // `systemctl stop` is authoritative and is not restarted. So stop
+            // through the manager first, and only fall back to a bare kill
+            // when no manager owns the daemon (a foreground `up`, or a
+            // non-service-managed box).
+            if !stop_managed_service() {
+                std::process::Command::new("kill").arg(pid.to_string()).status()?;
+            }
             let _ = std::fs::remove_file(pidfile());
             ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
             Ok(())
@@ -5865,6 +5873,42 @@ fn down_cmd() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Stop the daemon through its service manager, if one owns it. Returns true
+/// only when a manager stop actually succeeded. The system and per-user
+/// systemd units are tried first, then launchd on macOS; a box where the
+/// daemon is not a managed service (a foreground `up`, no systemd) falls back
+/// to a plain kill.
+fn stop_managed_service() -> bool {
+    if std::process::Command::new("systemctl")
+        .args(["stop", "filament"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if std::process::Command::new("systemctl")
+        .args(["--user", "stop", "filament"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if std::process::Command::new("launchctl")
+            .args(["bootout", "gui/501/autumated.filament"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------- reset -----
