@@ -467,7 +467,9 @@ COMMANDS
   Serve
     up                     serve: receive, mount, shell (run attached)
     up --install           the same, always-on (autostart at logon)
+    up --detach            the same, detached in the background (no service manager)
     down                   stop the daemon
+    logs                   follow the daemon's log (-f follows, ctrl-c detaches)
     reset                  wipe this machine's state (destructive)
   Devices
     devices                list your known devices
@@ -11254,7 +11256,8 @@ async fn main() -> Result<()> {
                 ("Send something", "send"),
                 ("Receive something", "receive"),
                 ("Mount remote files", "mount"),
-                ("Connect another device", "add"),
+                ("Connect a device with me now", "add"),
+                ("Invite a device or person", "add --for"),
                 ("Serve in the background", "up --install"),
                 ("See every device", "devices"),
                 ("View my identity", "id"),
