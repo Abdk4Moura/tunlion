@@ -142,3 +142,27 @@ jobs:
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
+
+      # Keep the binary, but only when someone asked for it. Debugging a report
+      # from a real machine needs the exact bytes that machine ran, and a
+      # version string cannot identify a build: every candidate for a release
+      # reports the same version as the release. This job already produces the
+      # shipping artifact for each target, so handing one out costs a step and
+      # removes the reason to test a locally cross-compiled binary whose
+      # toolchain differs from the released one.
+      #
+      # Manual dispatch only. On every push and PR this would add ~90MB across
+      # three targets, and on a public repo the result is an unsigned
+      # pre-release binary sitting downloadable on the Actions tab, where it can
+      # be mistaken for a release. Ask for a test build with
+      #   gh workflow run test.yml --ref <branch>
+      - name: Publish binary
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: filament-${{ matrix.target }}
+          path: |
+            cli/target/${{ matrix.target }}/release/filament
+            cli/target/${{ matrix.target }}/release/filament.exe
+          if-no-files-found: error
+          retention-days: 7
