@@ -711,6 +711,12 @@ enum Cmd {
         /// Install + start a systemd user service instead of running attached
         #[arg(long)]
         install: bool,
+        /// Run the daemon detached from this terminal (background). For
+        /// machines without a service manager, this is the middle between
+        /// attached-now and service-forever; the daemon survives closing the
+        /// terminal. Its output goes to {config}/daemon.log.
+        #[arg(long)]
+        detach: bool,
         /// With --install: install a SYSTEM service (root, one-time sudo) that gets
         /// CAP_NET_ADMIN from systemd via AmbientCapabilities. The overlay's kernel
         /// TUN then needs NO setcap on the binary, so `filament update` never prompts
@@ -770,6 +776,16 @@ enum Cmd {
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
     Down,
+    /// Follow the daemon's diagnostic timeline (diag.jsonl).
+    Logs {
+        /// Follow the log as new lines arrive (like docker logs -f).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Show only the last N lines before following/stopping (default 20;
+        /// 0 = live only, never replay history).
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
     ///
     /// No args prints all settings with their value, scope, and where each came
     /// from (env > peer > config > default). Strictly imperative: `set` only
@@ -3130,6 +3146,7 @@ async fn up_cmd(
     server: &str,
     install: bool,
     system: bool,
+    detach: bool,
     dir: Option<PathBuf>,
     relay: bool,
     shell: bool,
@@ -3284,7 +3301,16 @@ async fn up_cmd(
     }
     if let Some(pid) = daemon_alive() {
         dlog!("[up] already-up: pidfile={:?} pid={pid} cmdline={:?}", pidfile(), std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default());
-        bail!("already up (pid {pid}), `filament status` / `filament down`");
+        // #192: `up` twice should not dead-end. The daemon is already serving;
+        // follow its log. Ctrl-c detaches and leaves it running.
+        ui::say(&format!("  daemon already running (pid {pid}); following its log (ctrl-c to detach)"));
+        return logs_cmd(true, 20).await;
+    }
+    if detach {
+        // --detach: spawn the daemon in the background, redirect its console to
+        // {config}/daemon.log, return to the shell. The child writes the pidfile
+        // and serves detached (survives closing this terminal).
+        return detach_up(server, dir).await;
     }
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
@@ -3584,7 +3610,7 @@ async fn init_experience(
         false
     };
     if start_background {
-        up_cmd(server, true, false, Some(inbox.clone()), relay, false, None, None, None, false, false, false)
+        up_cmd(server, true, false, false, Some(inbox.clone()), relay, false, None, None, None, false, false, false)
             .await
             .context("install always-on receive service")?;
     }
@@ -5861,7 +5887,7 @@ fn down_cmd() -> Result<()> {
             // through the manager first, and only fall back to a bare kill
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
-            if !stop_managed_service() {
+            if !stop_managed_service(pid) {
                 std::process::Command::new("kill").arg(pid.to_string()).status()?;
             }
             let _ = std::fs::remove_file(pidfile());
@@ -5875,40 +5901,186 @@ fn down_cmd() -> Result<()> {
     }
 }
 
+/// Follow or tail the daemon's diagnostic timeline (diag.jsonl). The daemon
+/// writes structured JSONL connect spans here; `logs` renders them readably and
+/// refuses to flood: a bounded backlog (default 20 lines, --tail 0 = live
+/// only), then follows live with -f.
+async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
+    // The daemon's human console output goes to daemon.log when detached, and
+    // the diagnostic timeline is diag.jsonl. Follow whichever exists; prefer
+    // the console log when present (it is what a user means by "logs").
+    let console = crate::platform::Paths::config_path("daemon.log");
+    let path = if console.exists() { console } else { crate::platform::Paths::config_path("diag.jsonl") };
+    let read_tail = |count: usize| -> Result<()> {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            ui::say("  no log yet (the daemon writes it while it runs)");
+            return Ok(());
+        };
+        let lines: Vec<&str> = raw.lines().collect();
+        let start = lines.len().saturating_sub(count);
+        for line in &lines[start..] {
+            eprintln!("{line}");
+        }
+        Ok(())
+    };
+    if tail > 0 {
+        read_tail(tail)?;
+    }
+    if !follow {
+        return Ok(());
+    }
+    // Follow live: read new appended lines until ctrl-c. Ctrl-c must detach
+    // cleanly, never stop the daemon. The file may not exist yet (the daemon
+    // is still starting); poll for it instead of erroring.
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+    loop {
+        match tokio::fs::OpenOptions::new().read(true).open(&path).await {
+            Ok(f) => {
+                let mut file = f;
+                file.seek(std::io::SeekFrom::End(0)).await?;
+                let mut reader = tokio::io::BufReader::new(file);
+                let mut line = String::new();
+                loop {
+                    tokio::select! {
+                        res = reader.read_line(&mut line) => {
+                            if res? == 0 {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                continue;
+                            }
+                            eprintln!("{}", line.trim_end());
+                            line.clear();
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            ui::say("\n  detached (the daemon keeps running)");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+        }
+    }
+}
+
+/// this terminal. The detached child writes the pidfile and serves; its console
+/// output goes to {config}/daemon.log so `filament logs` can follow it. On
+/// unix we daemonize with setsid + redirected stdio; on Windows we use
+/// CREATE_NO_WINDOW + DETACHED_PROCESS (the same recipe as the #182 receiver
+/// spawn).
+async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let log_path = crate::platform::Paths::config_path("daemon.log");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let err = log.try_clone()?;
+        // Fork: the parent returns immediately, the child runs the daemon.
+        // setsid detaches from the controlling terminal; stdio is redirected
+        // to the log so closing the terminal cannot kill it.
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("up").arg("--server").arg(server);
+        if let Some(d) = dir.as_deref().and_then(|d| d.to_str()) {
+            cmd.arg("--dir").arg(d);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(log);
+        cmd.stderr(err);
+        let child = unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+        }
+        .spawn()?;
+        // Let the child write its pidfile before we return; poll briefly.
+        for _ in 0..50 {
+            if daemon_alive().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child;
+        ui::say(&format!(
+            "  {} daemon detached (pidfile at {}) - output: {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            pidfile().display(),
+            log_path.display()
+        ));
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("up").arg("--server").arg(server);
+        if let Some(d) = dir.as_deref().and_then(|d| d.to_str()) {
+            cmd.arg("--dir").arg(d);
+        }
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.spawn()?;
+        ui::say(&format!("  {} daemon detached (background)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+        return Ok(());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("--detach is not supported on this platform")
+    }
+}
+
 /// Stop the daemon through its service manager, if one owns it. Returns true
 /// only when a manager stop actually succeeded. The system and per-user
 /// systemd units are tried first, then launchd on macOS; a box where the
 /// daemon is not a managed service (a foreground `up`, no systemd) falls back
 /// to a plain kill.
-fn stop_managed_service() -> bool {
-    if std::process::Command::new("systemctl")
-        .args(["stop", "filament"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn stop_managed_service(pid: u32) -> bool {
+    // Only stop through the manager when THIS daemon is actually the managed
+    // unit's process. `systemctl stop filament` stops the named unit even when
+    // down targets a DIFFERENT daemon (a detached foreground `up` on another
+    // config), which killed another machine's service during development.
+    #[cfg(target_os = "linux")]
     {
-        return true;
-    }
-    if std::process::Command::new("systemctl")
-        .args(["--user", "stop", "filament"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if std::process::Command::new("launchctl")
-            .args(["bootout", "gui/501/autumated.filament"])
+        let in_unit = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .map(|c| c.contains("filament.service"))
+            .unwrap_or(false);
+        if !in_unit {
+            return false;
+        }
+        if std::process::Command::new("systemctl")
+            .args(["stop", "filament"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
             return true;
         }
+        return std::process::Command::new("systemctl")
+            .args(["--user", "stop", "filament"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
     }
-    false
+    #[cfg(target_os = "macos")]
+    {
+        // Same conflation risk: only bootout the launchd agent when the daemon
+        // is that agent's process. Without a cheap pid->label resolution the
+        // conservative choice is to fall back to kill for a detached daemon.
+        false
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
 }
 
 // ---------------------------------------------------------------- reset -----
@@ -11379,7 +11551,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback } => {
+        Cmd::Up { install, system, detach, userspace, dir, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -11397,10 +11569,11 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback).await
+            up_cmd(&server, install, system, detach, dir, relay, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback).await
         }
         Cmd::Status { json } => status_cmd(json || ui_caps.json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
+        Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
         Cmd::Add { code, name, word, for_, allow, expires, out } => {
             if for_.is_some() {
