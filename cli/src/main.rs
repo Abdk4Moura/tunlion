@@ -6045,43 +6045,70 @@ async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
 /// systemd units are tried first, then launchd on macOS; a box where the
 /// daemon is not a managed service (a foreground `up`, no systemd) falls back
 /// to a plain kill.
-fn stop_managed_service(pid: u32) -> bool {
-    // Only stop through the manager when THIS daemon is actually the managed
-    // unit's process. `systemctl stop filament` stops the named unit even when
-    // down targets a DIFFERENT daemon (a detached foreground `up` on another
-    // config), which killed another machine's service during development.
+/// Which systemd manager owns a daemon pid, if any. Two units can share the
+/// name `filament.service` (a system unit and a per-user unit under Linger),
+/// so the cgroup's SCOPE, not the unit name, decides which manager to ask:
+///   system unit:  /system.slice/filament.service
+///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/filament.service
+/// The unit name is matched as a cgroup segment (`/filament.service`), never as
+/// a substring, so a neighbouring unit (`my-filament.service`) cannot collide.
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceManager {
+    SystemdSystem,
+    SystemdUser,
+}
+
+fn service_manager_for_cgroup(cg: &str) -> Option<ServiceManager> {
+    // The unit name is matched as a cgroup segment (`/filament.service`), never
+    // as a substring, so a neighbouring unit (`my-filament.service`) cannot
+    // collide. The scope decides which manager.
+    if cg.contains("/system.slice/filament.service") {
+        return Some(ServiceManager::SystemdSystem);
+    }
+    if cg.contains("/app.slice/filament.service") && cg.contains("/user.slice/") {
+        return Some(ServiceManager::SystemdUser);
+    }
+    None
+}
+
+fn service_manager_for_pid(pid: u32) -> Option<ServiceManager> {
     #[cfg(target_os = "linux")]
     {
-        let in_unit = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-            .map(|c| c.contains("filament.service"))
-            .unwrap_or(false);
-        if !in_unit {
-            return false;
-        }
-        if std::process::Command::new("systemctl")
-            .args(["stop", "filament"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        return std::process::Command::new("systemctl")
-            .args(["--user", "stop", "filament"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|cg| service_manager_for_cgroup(&cg))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(not(target_os = "linux"))]
     {
-        // Same conflation risk: only bootout the launchd agent when the daemon
-        // is that agent's process. Without a cheap pid->label resolution the
-        // conservative choice is to fall back to kill for a detached daemon.
-        false
+        None
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        false
+}
+
+fn stop_managed_service(pid: u32) -> bool {
+    // Only stop through the manager when THIS daemon is actually the managed
+    // unit's process, AND the right manager. `systemctl stop filament` stops
+    // the named unit even when down targets a DIFFERENT daemon (a detached
+    // foreground `up` on another config), which killed another machine's
+    // service during development. Two units share the name here, so the cgroup
+    // scope decides which manager.
+    match service_manager_for_pid(pid) {
+        Some(ServiceManager::SystemdSystem) => {
+            std::process::Command::new("systemctl")
+                .args(["stop", "filament"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        Some(ServiceManager::SystemdUser) => {
+            std::process::Command::new("systemctl")
+                .args(["--user", "stop", "filament"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        // Not a managed daemon (a detached foreground `up`, or no systemd):
+        // the caller falls back to a plain kill.
+        None => false,
     }
 }
 
@@ -20319,6 +20346,24 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    #[test]
+    fn down_picks_the_right_systemd_manager_for_the_daemon_cgroup() {
+        // Two units can share the name filament.service (system + user under
+        // Linger). down must ask the manager whose cgroup actually owns the
+        // daemon, or it stops someone else's unit.
+        let system = "0::/system.slice/filament.service";
+        assert_eq!(service_manager_for_cgroup(system), Some(ServiceManager::SystemdSystem));
+        let user = "0::/user.slice/user-0.slice/user@0.service/app.slice/filament.service";
+        assert_eq!(service_manager_for_cgroup(user), Some(ServiceManager::SystemdUser));
+        // A neighbouring unit name must not collide (the name is matched as a
+        // cgroup segment, not a substring).
+        let neighbour = "0::/system.slice/my-filament.service";
+        assert_eq!(service_manager_for_cgroup(neighbour), None);
+        // A detached foreground daemon is not a managed service at all.
+        let detached = "0::/user.slice/user-0.slice/session-3.scope";
+        assert_eq!(service_manager_for_cgroup(detached), None);
     }
 
     #[test]
