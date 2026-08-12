@@ -117,6 +117,21 @@ impl Term {
     /// Wait for `needle`, returning false on timeout rather than panicking, so
     /// a caller can report what it did see. A bare unwrap here would turn "the
     /// picker never drew" into a stack trace that hides the actual screen.
+    /// Wait for `needle` to appear in output produced AFTER byte offset `from`.
+    /// Searching the whole buffer would match the prompt that was already on
+    /// screen before the keypress and return instantly.
+    fn wait_for_from(&self, from: usize, needle: &str, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            let t = self.text();
+            if t.len() > from && t[from.min(t.len())..].contains(needle) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
     fn wait_for(&self, needle: &str, secs: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
@@ -176,12 +191,50 @@ fn prompts_after_leaving_picker(leave_key: &str, label: &str) -> usize {
     // Everything from here is what the interrupt produced.
     let before = t.text().len();
     t.send(leave_key);
-    t.settle(1200, 20);
 
-    let after = &t.text()[before.min(t.text().len())..];
+    // Wait for the shell to come back BEFORE settling. The first version
+    // settled on 1.2s of quiet and then counted, which returned ~1.25s after
+    // the keypress with nothing on screen yet: filament had not finished
+    // exiting, so every platform reported 0 prompts and the two cells could not
+    // be told apart. A quiet terminal is not the same as a finished one.
+    let returned = t.wait_for_from(before, &format!("{MARK}> "), 25);
+    // Only now let a possible SECOND prompt land.
+    t.settle(1500, 15);
+
+    let full = t.text();
+    let after = &full[before.min(full.len())..];
     let count = after.matches(&format!("{MARK}> ")).count();
-    eprintln!("--- {label}: {count} prompt(s) after leaving the picker ---\n{after}\n---");
+    if !returned {
+        eprintln!("--- {label}: shell never returned within 25s; screen tail:\n{}\n---", tail(after));
+    }
+    eprintln!("--- {label}: {count} prompt(s) after leaving the picker ---\n{}\n---", tail(after));
     count
+}
+
+/// Bounded, escape-stripped view. A raw pty dump is mostly control bytes and
+/// gets truncated by the log viewer, which is how the first Windows failure
+/// told me the picker never drew without letting me see what did.
+fn tail(s: &str) -> String {
+    let stripped: String = {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // Drop CSI/OSC sequences up to a plausible terminator.
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n.is_ascii_alphabetic() || n == '\u{7}' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let start = stripped.len().saturating_sub(2500);
+    stripped[start..].to_string()
 }
 
 #[test]
