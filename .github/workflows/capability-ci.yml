@@ -208,7 +208,7 @@ jobs:
       # paths, so unpack under a mirror of the path in PATHS.txt or it will exec
       # something that does not exist.
       - name: Stage harness artifacts
-        if: github.event_name == 'workflow_dispatch'
+        if: always() && github.event_name == 'workflow_dispatch'
         shell: bash
         working-directory: cli
         run: |
@@ -228,7 +228,7 @@ jobs:
           ls -la ../harness-out
 
       - name: Upload harness artifacts
-        if: github.event_name == 'workflow_dispatch'
+        if: always() && github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: harness-${{ matrix.os }}
