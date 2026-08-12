@@ -18285,7 +18285,10 @@ async fn recv_cmd(
                         continue;
                     }
                     if !ok {
-                        if !daemon && std::io::stdin().is_terminal() {
+                        if !daemon
+                            && std::io::stdin().is_terminal()
+                            && xfer_deny_reason.is_none()
+                        {
                             pending.push_back((pid.clone(), v.clone()));
                             question_open.store(true, std::sync::atomic::Ordering::Relaxed);
                             if pending.len() == 1 {
@@ -18299,9 +18302,20 @@ async fn recv_cmd(
                             }
                             continue; // decision arrives later via StdinLine
                         }
+                        // #213: surface the REAL gate reason. In shadow mode a
+                        // consent denial returns cap_reason None, so xfer_deny_reason
+                        // is Some exactly when the gate refused for a real reason
+                        // (revocation, ceiling, authoritative) - surface it. The tty
+                        // hint is ONLY for the None case: an unanswered consent
+                        // prompt on a non-tty, where passing -y genuinely changes the
+                        // outcome. Telling a user to pass a flag they already passed,
+                        // for a decision no flag can change, is how a green security
+                        // property turns unmeasurable.
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({})",
-                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") } else { "no tty, use -y to auto-accept" }
+                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") }
+                            else if let Some(reason) = xfer_deny_reason.as_deref() { reason }
+                            else { "no tty, use -y to auto-accept" }
                         )));
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
