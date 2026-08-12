@@ -22,7 +22,6 @@
 name: Capability CI
 
 on:
-  workflow_dispatch: {}
   push:
     branches: [main]        # deliberately UNfiltered: main pushes keep caches warm
   pull_request:
