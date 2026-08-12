@@ -22,6 +22,7 @@
 name: Capability CI
 
 on:
+  workflow_dispatch: {}
   push:
     branches: [main]        # deliberately UNfiltered: main pushes keep caches warm
   pull_request:
@@ -192,6 +193,49 @@ jobs:
           CC: ${{ runner.os != 'Windows' && 'sccache cc' || '' }}
           CXX: ${{ runner.os != 'Windows' && 'sccache c++' || '' }}
         timeout-minutes: 15
+
+      # Hand out the test-hooks build so the harness can run somewhere other than
+      # a GitHub runner. The capability rig cannot currently establish an
+      # enrollment link on a runner (#212): srflx only, no host candidate, ICE
+      # fails. Running these same binaries on a machine with real host
+      # candidates is how we get a verdict, and compiling test-hooks on that
+      # machine is not always an option (do-vm has OOM-killed builds and sits
+      # near a full disk).
+      #
+      # Manual dispatch only, same reasoning as the cross-build artifacts.
+      #
+      # NOTE for whoever consumes these: the test binary bakes
+      # CARGO_BIN_EXE_filament and CARGO_MANIFEST_DIR as the RUNNER's absolute
+      # paths, so unpack under a mirror of the path in PATHS.txt or it will exec
+      # something that does not exist.
+      - name: Stage harness artifacts
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        working-directory: cli
+        run: |
+          set -euo pipefail
+          mkdir -p ../harness-out
+          cp target/release/filament ../harness-out/ 2>/dev/null || \
+            cp target/release/filament.exe ../harness-out/
+          # --no-run reuses the build that already ran; it does not rebuild.
+          cargo test --features test-hooks --release --test capability_harness --no-run
+          # Pick the newest executable named capability_harness-<hash>, skipping
+          # the .d dependency files cargo writes alongside it.
+          bin=$(find target/release/deps -maxdepth 1 -type f -name 'capability_harness-*' \
+                  ! -name '*.d' ! -name '*.pdb' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          test -n "$bin"
+          cp "$bin" ../harness-out/
+          echo "${{ github.workspace }}" > ../harness-out/PATHS.txt
+          ls -la ../harness-out
+
+      - name: Upload harness artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-${{ matrix.os }}
+          path: harness-out/
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload harness log (macOS)
         if: runner.os == 'macOS' && always()
