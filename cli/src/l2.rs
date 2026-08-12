@@ -135,7 +135,7 @@ pub struct Mux {
     /// the caller that issued open_mount_stream. pump_initiator receives the ack
     /// control message, resolves the sid, and sends the caps; open_mount_stream
     /// awaits the receiver. Cleaned up on stream teardown.
-    mount_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+    mount_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>,
 }
 
 impl Mux {
@@ -282,10 +282,17 @@ impl Mux {
     /// Inbound l2-close. `err` set = RST/abort (drop, do NOT deliver clean EOF);
     /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
-    async fn on_close(&self, sid: u32, _err: Option<&str>) {
-        // Drop any pending mount-open-ack waiter for this sid so the caller
-        // gets a clean error rather than hanging on a oneshot that will never fire.
-        self.mount_ack_tx.lock().await.remove(&sid);
+    async fn on_close(&self, sid: u32, err: Option<&str>) {
+        // Deliver any pending mount-open waiter its denial: an l2-close is the
+        // peer saying NO (authorization, ceiling, stream cap), and the reason it
+        // carries must reach the caller as a denial, not as a mystery timeout.
+        // #206: the acceptor already sends `l2-close{err: not authorized: mount
+        // capability required}` on a ceiling refusal; before this, the reason
+        // was dropped here and the initiator read a generic channel-closed.
+        if let Some(tx) = self.mount_ack_tx.lock().await.remove(&sid) {
+            let reason = err.unwrap_or("connection closed by the peer").to_string();
+            let _ = tx.send(Err(reason));
+        }
         self.drop_stream(sid).await;
     }
 
@@ -1655,7 +1662,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                         let mut ack_map = mux.mount_ack_tx.lock().await;
                         if let Some(tx) = ack_map.remove(&sid) {
                             let caps = v.get("caps").cloned().unwrap_or(serde_json::Value::Null);
-                            let _ = tx.send(caps);
+                            let _ = tx.send(Ok(caps));
                         }
                     }
                 }
@@ -1799,6 +1806,11 @@ pub(crate) async fn open_mount_stream(
     .await
     .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
     .map_err(|_| anyhow::anyhow!("mount-open-ack channel closed"))?;
+    // #206: an l2-close from the acceptor is a DENIAL (authorization, ceiling,
+    // stream cap) carrying a reason. It must surface as a denial, never as a
+    // transport-shaped timeout. Silence still means timeout; a refusal is never
+    // silent.
+    let caps_value = caps_value.map_err(|reason| anyhow::anyhow!("mount denied by {reason}"))?;
     let caps = crate::mount_proto::parse_mount_caps(caps_value)?;
     // Send mount-cap-ack: the client confirms it accepts the server's caps.
     let _ = mux.transport.send_control(&json!({

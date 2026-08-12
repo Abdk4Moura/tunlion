@@ -347,13 +347,38 @@ impl UiCapability {
     pub fn confirm(&self, action: &str) -> Result<()> {
         if self.yes { return Ok(()); }
         if self.interactive {
-            use std::io::Write;
-            eprint!("{action} [y/N] ");
-            let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line).ok();
-            if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                anyhow::bail!("cancelled");
+            // #208: a confirmation should cost ONE keypress, not a key and an
+            // Enter. On a TTY read a single key with crossterm (raw mode); bare
+            // Enter takes the capitalised default (N). Scripts/pipes keep the
+            // line-reading path below, so `echo y | filament ...` is unchanged.
+            if std::io::stdin().is_terminal() {
+                use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
+                use std::io::Write as _;
+                eprint!("{action} [y/N] ");
+                let _ = std::io::stderr().flush();
+                // #208: read ONE key with crossterm in raw mode; bare Enter takes
+                // the capitalised default (N). The guard restores the terminal on
+                // every path, including a panic.
+                let _guard = crate::codeentry::RawGuard::enable().ok();
+                let answer = match read() {
+                    Ok(Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::NONE, .. }))
+                    | Ok(Event::Key(KeyEvent { code: KeyCode::Char('Y'), modifiers: KeyModifiers::NONE, .. })) => true,
+                    Ok(Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. })) => false,
+                    _ => false,
+                };
+                drop(_guard);
+                if !answer {
+                    anyhow::bail!("cancelled");
+                }
+            } else {
+                use std::io::Write;
+                eprint!("{action} [y/N] ");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).ok();
+                if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    anyhow::bail!("cancelled");
+                }
             }
         } else {
             anyhow::bail!("refusing {action} without --yes (non-interactive)");
@@ -2529,6 +2554,24 @@ fn l2_target_allowed(device: &str, host: &str, port: u16) -> bool {
 /// Returns None if the device isn't known.
 fn device_caps(name: &str) -> Option<Vec<String>> {
     device_caps_at(&devices_path(), name)
+}
+
+/// The persisted capability ceiling of a device record, when that record is a
+/// delegated (joined) device. None for an owner device or a plain pair, which
+/// are not ceiling-restricted.
+fn principal_ceiling_for(name: &str) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr = serde_json::from_str::<Value>(&raw).ok()?;
+    let record = arr.as_array()?.iter().find(|d| d["name"].as_str() == Some(name))?;
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
+    }
+    Some(
+        record["principalCeiling"]
+            .as_array()
+            .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+    )
 }
 
 /// Path-explicit core of `device_caps` (testable without touching the global
@@ -4888,6 +4931,36 @@ async fn add_for_cmd(
     // the always-on receiver is only needed when someone CLAIMS it. Arm the
     // enrollment room best-effort; never block minting on the daemon.
     let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
+    // #207: a minted code that nothing can claim is not an invitation, it is a
+    // lie with a QR on it. Check the receiver BEFORE printing the invitation,
+    // and offer to start it. The old flow warned AFTER the pause, so the
+    // sequence was: mint, wait for a claim, press Enter, learn nothing could
+    // have claimed it.
+    let mut armed = armed;
+    if !armed && caps.interactive {
+        use std::io::Write as _;
+        eprint!("  the always-on receiver is not running (or this platform has no control channel yet).\n  Start it now so this invitation can be claimed? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans).ok();
+        if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            let exe = std::env::current_exe()?;
+            let _ = std::process::Command::new(&exe)
+                .arg("up")
+                .arg("--install")
+                .spawn();
+            ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
+            // The receiver needs a moment to come up and subscribe; re-arm once.
+            for _ in 0..25 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
+                if armed { break; }
+            }
+            if !armed {
+                ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver did not confirm yet; if it fails to start, run `filament up --install` and mint this invitation again."));
+            }
+        }
+    }
 
     if let Some(path) = out.as_deref() {
         write_owner_only_file(path, token.as_str())?;
@@ -4917,7 +4990,7 @@ async fn add_for_cmd(
                 crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0));
         }
         eprintln!("{}", token.as_str());
-        eprintln!("  keep this window open until the other device claims it");
+        eprintln!("  keep this window open so the QR stays on screen; the other device scans it");
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
         let _ = execute!(err, terminal::LeaveAlternateScreen);
         result?;
@@ -4936,9 +5009,10 @@ async fn add_for_cmd(
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
     if !armed {
-        // #205: arming failed. On Unix that usually means the daemon is not
-        // running; on Windows the control channel does not exist yet, so arming
-        // fails even when the daemon IS running. Say both, not one.
+        // #205/#207: only reached when the pre-invitation check and the offer
+        // did not resolve it (non-interactive, or the user declined to start).
+        // The message says the weaker true thing: arming failed, which is not
+        // the same as knowing the daemon is down on a platform with no channel.
         ui::say(&ui::paint(
             ui::Tone::Warn,
             "  note: could not arm the always-on receiver (the daemon may not be running, or this platform has no control channel yet).\n  If the daemon is not running, start `filament up --install` first; until the receiver can subscribe, this invitation cannot be claimed.",
@@ -12293,6 +12367,19 @@ fn resolve_mount_plan(
         peer = Some(devices[selected].0.clone());
     }
     let peer = peer.unwrap();
+    // #206: a joined device knows its own ceiling (it printed it at join). If
+    // the ceiling excludes mount, say so BEFORE opening a stream, instead of
+    // letting the peer's denial come back as a ten-second transport timeout.
+    // The device's ceiling lives on its record; a peer with no delegated
+    // ceiling (an owner device or a plain pair) is not restricted here.
+    if let Some(caps) = principal_ceiling_for(&peer) {
+        if !caps.iter().any(|c| c == "mount") {
+            bail!(
+                "mount denied by {peer}: this device's invitation ceiling ({}) does not include mount",
+                caps.join(", ")
+            );
+        }
+    }
     let remote = match remote {
         Some(remote) => remote,
         None if caps.interactive => {
