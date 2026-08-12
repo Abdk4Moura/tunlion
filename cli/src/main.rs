@@ -4537,11 +4537,10 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             eprintln!("{} auth key bundle written to {}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
             // Arm the local daemon so it joins the enrollment room
-            if ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await.is_some() {
-                ui::debug("local daemon armed for enrollment");
-            } else {
-                ui::say(&format!("  {} no local daemon / enrollment room not armed (start 'filament up' first)",
-                    ui::paint(ui::Tone::Dim, "·")));
+            match ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await {
+                ctl::ArmOutcome::Armed => ui::debug("local daemon armed for enrollment"),
+                _ => ui::say(&format!("  {} local daemon not confirmed for the enrollment room (start 'filament up' first)",
+                    ui::paint(ui::Tone::Dim, "·"))),
             }
             Ok(())
         }
@@ -4930,13 +4929,12 @@ async fn add_for_cmd(
     // #176: minting a bounded invitation is a local act (signing + printing);
     // the always-on receiver is only needed when someone CLAIMS it. Arm the
     // enrollment room best-effort; never block minting on the daemon.
-    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
+    let mut armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
     // #207: a minted code that nothing can claim is not an invitation, it is a
     // lie with a QR on it. Check the receiver BEFORE printing the invitation,
     // and offer to start it. The old flow warned AFTER the pause, so the
     // sequence was: mint, wait for a claim, press Enter, learn nothing could
     // have claimed it.
-    let mut armed = armed;
     if !armed && caps.interactive {
         use std::io::Write as _;
         eprint!("  the always-on receiver is not running (or this platform has no control channel yet).\n  Start it now so this invitation can be claimed? [y/N] ");
@@ -4953,7 +4951,7 @@ async fn add_for_cmd(
             // The receiver needs a moment to come up and subscribe; re-arm once.
             for _ in 0..25 {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
+                armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
                 if armed { break; }
             }
             if !armed {
@@ -5009,14 +5007,25 @@ async fn add_for_cmd(
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
     if !armed {
-        // #205/#207: only reached when the pre-invitation check and the offer
-        // did not resolve it (non-interactive, or the user declined to start).
-        // The message says the weaker true thing: arming failed, which is not
-        // the same as knowing the daemon is down on a platform with no channel.
-        ui::say(&ui::paint(
-            ui::Tone::Warn,
-            "  note: could not arm the always-on receiver (the daemon may not be running, or this platform has no control channel yet).\n  If the daemon is not running, start `filament up --install` first; until the receiver can subscribe, this invitation cannot be claimed.",
-        ));
+        // #205/#207/#211: only reached when the pre-invitation check and the
+        // offer did not resolve it. Say the SPECIFIC true thing, from the
+        // outcome the arm returned, not a blended hedge.
+        let outcome = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await;
+        let note = match outcome {
+            crate::ctl::ArmOutcome::NoDaemon => {
+                "the daemon is not running; start `filament up --install` first. Until the receiver subscribes, this invitation cannot be claimed."
+            }
+            crate::ctl::ArmOutcome::NoControlChannel => {
+                "this platform has no control channel yet, so the receiver could not be asked to subscribe; this invitation may be unclaimable here."
+            }
+            crate::ctl::ArmOutcome::NotServingYet => {
+                "the receiver was still starting; wait a moment, then mint this invitation again."
+            }
+            _ => {
+                "the receiver could not be armed; this invitation may be unclaimable."
+            }
+        };
+        ui::say(&ui::paint(ui::Tone::Warn, &format!("  note: {note}")));
     }
     Ok(())
 }
@@ -14853,6 +14862,29 @@ async fn recv_cmd(
     // concurrent candidate ceremonies; further candidates are ignored (the real
     // sender is, in practice, among the first to share the room with the claimer).
     const RECV_MAX_CANDIDATES: usize = 8;
+    // #211: the control socket must be ACCEPTING before "filament up" is printed.
+    // A sibling `mint` can race the bind and silently fail to arm otherwise.
+    // Create the control channel here (before the banner) and spawn the server
+    // with a readiness signal the banner awaits. `ctl_tx` is held for the loop's
+    // life so `ctl_rx` stays open (recv pends, never spins) even when we are not
+    // the daemon and `serve` was not spawned.
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
+    let mut ctl_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    #[cfg(unix)]
+    {
+        if daemon && daemon_alive() == Some(std::process::id()) {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            ctl_ready = Some(ready_rx);
+            let ctl_tx = ctl_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ctl::serve_at(crate::ctl::control_sock_path(), ctl_tx, Some(ready_tx)).await {
+                    crate::ui::trace(&format!("filament: control socket disabled: {e}"));
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = &ctl_tx;
     match &code {
         Some(c) => {
             // Split the typed code into (nameplate, words); send ONLY the
@@ -14878,6 +14910,13 @@ async fn recv_cmd(
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
+            // #211: the banner means SERVING, not "process started". Wait
+            // (bounded) for the control socket to accept before announcing up;
+            // a sibling `mint` that arms right after this line must not race a
+            // socket that is not listening yet.
+            if let Some(ready) = ctl_ready.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
+            }
             if crate::ephemeral::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
@@ -15253,26 +15292,13 @@ async fn recv_cmd(
     // socket (a short-lived `recv`/`send` must never bind it and steal the
     // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
     // reach a peer we already hold a link to, we open a new L2 stream over that
-    // warm link instead of making the sibling establish a fresh one. `ctl_tx` is
-    // held for the loop's life so the channel stays open (recv pends, never spins)
-    // even when we are not the daemon and `serve` was not spawned.
-    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
-    // The control socket is a unix-domain socket, so warm-link reuse is unix-only.
-    #[cfg(unix)]
-    {
-        if daemon_alive() == Some(std::process::id()) {
-            let ctl_tx = ctl_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = ctl::serve(ctl_tx).await {
-                    crate::ui::trace(&format!("filament: control socket disabled: {e}"));
-                }
-            });
-        }
-    }
+    // warm link instead of making the sibling establish a fresh one. `ctl_tx`
+    // was created (and `serve` spawned, when we are the daemon) before the
+    // banner, so a mint racing the bind cannot happen; `ctl_rx` is consumed
+    // below.
+
     // Hold `ctl_tx` for the loop's life so `ctl_rx` stays open (recv pends, never
     // spins) even when `serve` was not spawned (non-unix, or not the daemon).
-    #[cfg(not(unix))]
-    let _ = &ctl_tx;
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
     // DETACHES (does not kill) the shell; a reconnect with the same session id

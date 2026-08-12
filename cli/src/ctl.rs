@@ -39,13 +39,24 @@ pub fn reuse_disabled() -> bool {
     std::env::var("FILAMENT_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
 }
 
+/// The outcome of arming the local daemon for enrollment, distinguished so the
+/// caller can say the SPECIFIC true thing. #211: three facts used to collapse
+/// into a silent None.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArmOutcome {
+    Armed,
+    NoDaemon,
+    NoControlChannel,
+    NotServingYet,
+}
+
 #[cfg(unix)]
-    pub use imp::{
-        daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-        try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-        try_arm, try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
-        try_reload_expose, try_resize, try_unmount, Req, ReqKind,
-    };
+pub use imp::{
+    daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
+    try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
+    try_arm, try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+    try_reload_expose, try_resize, try_unmount, Req, ReqKind,
+};
 
 #[cfg(not(unix))]
 pub use stub::{
@@ -56,7 +67,7 @@ pub use stub::{
 // --------------------------------------------------------------- unix impl ----
 #[cfg(unix)]
 mod imp {
-    use super::{control_sock_path, reuse_disabled};
+    use super::{control_sock_path, reuse_disabled, ArmOutcome};
     use anyhow::{anyhow, Result};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
@@ -261,19 +272,45 @@ mod imp {
 
     /// Arm the local daemon for enrollment: tell it an auth key is outstanding.
     /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
-    pub async fn try_arm(key_id: String, expiry: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "arm", "key_id": key_id, "expiry": expiry });
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
-            .await
-            .ok()?
-            .ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(v)
+    ///
+    /// #211: the caller must be able to say something TRUE about the outcome.
+    /// Three different facts used to collapse into None. `NotServingYet` is the
+    /// startup race (the socket file exists but the daemon is still binding),
+    /// retried briefly inside; the other two want distinct handling.
+    pub async fn try_arm(key_id: String, expiry: u64) -> ArmOutcome {
+        let path = control_sock_path();
+        // #211: a missing socket file means NO daemon; a socket that exists but
+        // refuses is the STARTUP RACE (the `up` banner and the control socket
+        // bind are not the same moment), which deserves a brief retry, not a
+        // silent None. The daemon binds the socket before it prints anything;
+        // a few hundred ms of retry covers the gap.
+        if !path.exists() {
+            return ArmOutcome::NoDaemon;
+        }
+        for _ in 0..10 {
+            if let Ok(mut s) = UnixStream::connect(&path).await {
+                let req = json!({ "op": "arm", "key_id": key_id.clone(), "expiry": expiry });
+                let mut line = match serde_json::to_vec(&req) {
+                    Ok(l) => l,
+                    Err(_) => return ArmOutcome::NoDaemon,
+                };
+                line.push(b'\n');
+                let _ = s.write_all(&line).await;
+                let _ = s.flush().await;
+                let reply = match tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096)).await {
+                    Ok(Ok(r)) => r,
+                    _ => return ArmOutcome::NoDaemon,
+                };
+                if let Ok(v) = serde_json::from_str::<Value>(&reply) {
+                    if v["ok"].as_bool() == Some(true) {
+                        return ArmOutcome::Armed;
+                    }
+                }
+                return ArmOutcome::NoDaemon;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        ArmOutcome::NotServingYet
     }
 
     /// Ask the running daemon to re-read `expose.json` and reconcile its overlay
@@ -589,11 +626,15 @@ mod imp {
     /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
     /// already guards against two live daemons. Sets mode 0600.
     pub async fn serve(tx: mpsc::UnboundedSender<Req>) -> Result<()> {
-        serve_at(control_sock_path(), tx).await
+        serve_at(control_sock_path(), tx, None).await
     }
 
     /// `serve` against an explicit socket path (tests pass a hermetic path).
-    pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>) -> Result<()> {
+    /// `ready`, when given, fires the moment the listener has BOUND: the socket
+    /// is accepting from that instant. #211: callers who print "the daemon is
+    /// up" must not print it until this fires, or a sibling process races the
+    /// bind.
+    pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -602,6 +643,9 @@ mod imp {
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Some(ready) = ready {
+            let _ = ready.send(());
         }
         crate::ui::trace(&format!("filament: control socket at {}", path.display()));
         loop {
@@ -721,7 +765,7 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = PathBuf::from(&dir).join("control.sock");
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
-            let server = tokio::spawn(serve_at(path.clone(), tx));
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let p = path.clone();
@@ -759,7 +803,7 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = PathBuf::from(&dir).join("control.sock");
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
-            let server = tokio::spawn(serve_at(path.clone(), tx));
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let p = path.clone();
@@ -790,7 +834,7 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = PathBuf::from(&dir).join("control.sock");
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
-            let server = tokio::spawn(serve_at(path.clone(), tx));
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let p = path.clone();
             let client = tokio::spawn(async move { try_open_at(&p, "nope", 22).await });
@@ -807,6 +851,7 @@ mod imp {
 // -------------------------------------------------------- non-unix fallback ----
 #[cfg(not(unix))]
 mod stub {
+    use super::ArmOutcome;
     use serde_json::Value;
     /// Warm-link reuse needs a unix-domain socket, which this platform lacks, so
     /// `Req` is uninhabited: the daemon never spawns `serve`, the channel never
@@ -860,7 +905,9 @@ mod stub {
     /// No control socket here, so there is no local daemon to arm for an
     /// enrollment room. Callers treat `None` as "no local daemon" and degrade
     /// gracefully. Present so the unconditional call site compiles on non-unix.
-    pub async fn try_arm(_key_id: String, _expiry: u64) -> Option<Value> {
-        None
+    pub async fn try_arm(_key_id: String, _expiry: u64) -> ArmOutcome {
+        // #205/#211: this platform has NO control channel (not "the daemon is
+        // down"). The caller must not report that as a dead receiver.
+        ArmOutcome::NoControlChannel
     }
 }
