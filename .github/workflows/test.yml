@@ -166,3 +166,29 @@ jobs:
             cli/target/${{ matrix.target }}/release/filament.exe
           if-no-files-found: error
           retention-days: 7
+
+  # Interactive flows through a real pty, including ConPTY on Windows.
+  #
+  # Manual dispatch and non-gating on purpose. These cells currently include the
+  # #197 discriminator, whose Ctrl-C case is EXPECTED to fail on Windows: that
+  # failure is the finding. Gating on it would turn a diagnosis into a blocked
+  # board, and marking it green would hide the bug we are trying to name.
+  # Read the two cells together, per the header of cli/tests/pty_flows.rs.
+  pty-flows:
+    name: pty flows (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Interactive cells
+        working-directory: cli
+        shell: bash
+        run: cargo test --release --test pty_flows -- --ignored --nocapture --test-threads=1
