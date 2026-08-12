@@ -179,7 +179,14 @@ fn prompts_after_leaving_picker(leave_key: &str, label: &str) -> usize {
     assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
 
     let exe = env!("CARGO_BIN_EXE_filament");
-    t.send(&format!("\"{exe}\" add --for\r"));
+    // The call operator is required on PowerShell. A line that STARTS with a
+    // quoted string is parsed as a string expression, not a command, so
+    //   "C:\...\filament.exe" add --for
+    // fails with "Unexpected token 'add' in expression or statement" and the
+    // program never runs. That, not any product bug, is why the Windows cell
+    // reported "picker never drew" three runs in a row.
+    let invoke = if cfg!(windows) { format!("& \"{exe}\" add --for\r") } else { format!("\"{exe}\" add --for\r") };
+    t.send(&invoke);
 
     // The picker's own heading. If this never appears the test has not reached
     // the thing it claims to measure, and saying so beats asserting on a
