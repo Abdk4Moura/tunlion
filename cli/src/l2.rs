@@ -3562,7 +3562,7 @@ fn spawn_ssh(
     if relay {
         proxy.push_str(" --relay");
     }
-    proxy.push_str(&format!(" netcat {peer} {rport}"));
+    proxy.push_str(&format!(" forward {peer}:{rport} --stdio"));
 
     let key = crate::sshkeys::managed_key_path();
     let kh = crate::sshkeys::known_hosts_path();
@@ -3736,7 +3736,7 @@ pub(crate) fn ssh_transport_args(info: &PeerSshInfo, server: &str, peer: &str, r
     if relay {
         proxy.push_str(" --relay");
     }
-    proxy.push_str(&format!(" netcat {peer} {}", info.rport));
+    proxy.push_str(&format!(" forward {peer}:{} --stdio", info.rport));
     args.push("-o".into());
     args.push(format!("ProxyCommand={proxy}"));
     args

@@ -333,7 +333,7 @@ pub async fn mount_cmd(
         if relay {
             proxy.push_str(" --relay");
         }
-        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        proxy.push_str(&format!(" forward {peer_name}:{} --stdio", info.rport));
         cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
         let dest_token = format!("{}@{}", info.login, info.host);
         cmd.arg(format!("{dest_token}:{remote_path}"));

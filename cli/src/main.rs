@@ -728,7 +728,7 @@ enum Cmd {
         /// Force the ZERO-PRIVILEGE userspace overlay (an in-process smoltcp netstack
         /// instead of a kernel TUN): no CAP_NET_ADMIN, no /dev/net/tun, works in a
         /// container. Note: host firewall rules do not apply and native tools reach
-        /// <peer>.mesh only via `filament proxy`/`dial`. Default is auto (kernel TUN
+        /// <peer>.mesh only via `filament forward <peer>:<port> --socks`. Default is auto (kernel TUN
         /// when available, userspace otherwise).
         #[arg(long)]
         userspace: bool,
@@ -885,6 +885,11 @@ enum Cmd {
         /// Override the local listen port.
         #[arg(long)]
         lport: Option<u16>,
+        /// Pipe instead of listen: attach stdin/stdout to the peer's port (the
+        /// `netcat` shape, used as an ssh ProxyCommand). This is the transport
+        /// an external process expects on its own stdio.
+        #[arg(long)]
+        stdio: bool,
         /// Run a local SOCKS5 proxy for mesh access from any app.
         #[arg(long)]
         socks: bool,
@@ -897,6 +902,14 @@ enum Cmd {
         /// HTTP CONNECT proxy port (0 = disabled)
         #[arg(long, default_value_t = 0)]
         http_port: u16,
+    },
+    /// (hidden for one release) The netcat shape moved into `forward --stdio`.
+    #[command(hide = true)]
+    Netcat {
+        /// Known device (petname) whose port to reach
+        peer: String,
+        /// Remote port on the peer's localhost
+        rport: u16,
     },
     /// Publish a local port on this device's mesh address (peers reach it at
     /// <this-device>.mesh:<port>), like a Tailscale-served port.
@@ -4755,27 +4768,28 @@ async fn add_for_cmd(
 ) -> Result<()> {
     use base64::Engine;
     // `--for` with no value (Some("")) means "ask me on a terminal"; the
-    // one-shot path requires an explicit device|person value.
+    // one-shot path requires an explicit device|person value. The interactive
+    // prompt lives in the match below (the None arm), exactly once - a
+    // cancelled (Ctrl-C) picker must NOT re-prompt (#203).
     let mut for_ = for_.filter(|v| !v.is_empty());
-    if for_.is_none() && caps.interactive {
-        let choices = vec!["A device I control".to_string(), "Another person".to_string()];
-        for_ = codeentry::pick("WHO IS JOINING", &choices)?
-            .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() });
-    }
     // #187: `--for` reads like a name. A bare word that is not the literal
     // device/person is a DEVICE NAME: select device-kind and pre-fill the
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
     let (kind, _invitee_name) = match for_.as_deref() {
         None => {
-            let k = if caps.interactive {
+            if caps.interactive {
+                // A cancelled picker (Ctrl-C / Esc) is a cancellation, not a
+                // missing argument (#203): exit cleanly instead of reporting
+                // the non-interactive requirement.
                 let choices = vec!["A device I control".to_string(), "Another person".to_string()];
-                codeentry::pick("WHO IS JOINING", &choices)?
-                    .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() })
+                match codeentry::pick("WHO IS JOINING", &choices)? {
+                    Some(index) => ((if index == 0 { "device".to_string() } else { "person".to_string() }), None),
+                    None => return Err(cancelled()),
+                }
             } else {
-                None
-            };
-            (k.ok_or_else(|| anyhow!("non-interactive add --for requires device|person or a device name"))?, None)
+                bail!("non-interactive add --for requires device|person or a device name");
+            }
         }
         Some("device") | Some("person") => (for_.unwrap(), None),
         Some(name) => ("device".to_string(), Some(name.to_string())),
@@ -10531,7 +10545,7 @@ async fn handle_mount(
         if relay {
             proxy.push_str(" --relay");
         }
-        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        proxy.push_str(&format!(" forward {peer_name}:{} --stdio", info.rport));
         args.push("-o".into());
         args.push(format!("ProxyCommand={proxy}"));
         format!("{}@{}", info.login, info.host)
@@ -11801,20 +11815,29 @@ async fn main() -> Result<()> {
                 None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
             }
         },
-        Cmd::Forward { target, lport, socks, port, bind, http_port } => {
-            if socks {
+        Cmd::Forward { target, lport, stdio, socks, port, bind, http_port } => {
+            let (peer, rport) = match target.split_once(':') {
+                Some((p, r)) => (
+                    p.to_string(),
+                    r.parse().map_err(|_| anyhow!("invalid port in '{target}'; expected <device>:<port>"))?,
+                ),
+                None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
+            };
+            if stdio {
+                // #202: the netcat shape - pipe stdio to the peer's port (the
+                // ssh ProxyCommand contract). `forward` owns the role; --stdio
+                // is the second plumbing.
+                l2::netcat_cmd(&server, &peer, rport, relay).await
+            } else if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else {
-                let (peer, rport) = match target.split_once(':') {
-                    Some((p, r)) => (
-                        p.to_string(),
-                        r.parse().map_err(|_| anyhow!("invalid port in '{target}'; expected <device>:<port>"))?,
-                    ),
-                    None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
-                };
                 let lport = lport.unwrap_or(rport);
                 l2::forward_cmd(&server, lport, &peer, rport, relay).await
             }
+        },
+        Cmd::Netcat { peer, rport } => {
+            // Hidden one-release alias for the netcat shape, now forward --stdio.
+            l2::netcat_cmd(&server, &peer, rport, relay).await
         },
         Cmd::Expose { port, to, peer, list, off } => {
             if off {
@@ -14919,7 +14942,7 @@ async fn recv_cmd(
                                 ));
                                 ui::say(&ui::paint(ui::Tone::Warn,
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
-                                ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
+                                ui::say("    native tools reach <peer>.mesh via `filament forward <peer>:<port> --socks` (no kernel route in userspace)");
                                 // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
                                 // Opt-out via --no-proxy-fallback or `filament set auto-proxy off`.
                                 let auto_proxy = settings::get_bool("auto-proxy", None)
@@ -20364,6 +20387,61 @@ mod tests {
         // A detached foreground daemon is not a managed service at all.
         let detached = "0::/user.slice/user-0.slice/session-3.scope";
         assert_eq!(service_manager_for_cgroup(detached), None);
+    }
+
+    #[test]
+    fn internal_subcommand_invocations_name_real_verbs() {
+        // #202 inward audit: the banner-vs-clap test asks what a PERSON can
+        // type. Nothing asked what filament types AT ITSELF, which is how a
+        // dead verb (netcat) survived in six internal ProxyCommand call sites
+        // and one printed hint. Scan the source for format!-built subcommand
+        // invocations (a quoted verb, a space, then an interpolation brace) and
+        // assert each names a verb clap accepts.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let valid: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .flat_map(|sc| {
+                let mut v = vec![sc.get_name().to_string()];
+                v.extend(sc.get_all_aliases().map(str::to_string));
+                v
+            })
+            .collect();
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let sources = ["src/main.rs", "src/mount.rs", "src/backup.rs", "src/l2.rs"];
+        let mut checked = 0usize;
+        for f in sources {
+            let Ok(text) = std::fs::read_to_string(format!("{manifest}/{f}")) else { continue };
+            for line in text.lines() {
+                let bytes = line.as_bytes();
+                let mut i = 0usize;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'"' && bytes[i + 1] == b' ' {
+                        let mut j = i + 2;
+                        while j < bytes.len() && bytes[j].is_ascii_lowercase() {
+                            j += 1;
+                        }
+                        if j > i + 2
+                            && j < bytes.len()
+                            && bytes[j] == b' '
+                            && j + 1 < bytes.len()
+                            && bytes[j + 1] == b'{'
+                        {
+                            let verb = &line[i + 2..j];
+                            assert!(
+                                valid.contains(verb),
+                                "internal subcommand invocation names '{verb}', which clap does not accept ({f}: {line})"
+                            );
+                            checked += 1;
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
     }
 
     #[test]
