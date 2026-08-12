@@ -15,12 +15,6 @@ categories = ["command-line-utilities", "network-programming"]
 name = "filament"
 path = "src/main.rs"
 
-[dev-dependencies]
-# A real pty, including ConPTY on Windows, so the interactive tests in
-# tests/pty_flows.rs run on the platform whose console behaviour they are about.
-# dev-only: never reaches a published binary.
-portable-pty = "0.9"
-
 [features]
 # Fully static builds (musl): compile OpenSSL from source instead of linking
 # the system one. rust_socketio hard-depends on native-tls, so a rustls-only
