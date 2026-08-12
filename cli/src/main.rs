@@ -2876,8 +2876,52 @@ fn up_log() -> PathBuf {
 
 fn daemon_alive() -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
-    let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
-    cmd.contains("filament").then_some(pid)
+    is_filament_process(pid).then_some(pid)
+}
+
+/// True when the pid is a live filament process. The pidfile alone can hold a
+/// recycled pid, so the process is confirmed by inspecting it, not by trusting
+/// the file. Unix reads /proc/<pid>/cmdline; Windows opens the process and
+/// reads its image name (there is no /proc there - a missing variant made
+/// daemon_alive constant-false on Windows, which silently disabled the 0.8.6
+/// up-follows, --detach, and down features on that platform).
+#[cfg(unix)]
+fn is_filament_process(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|cmd| cmd.contains("filament"))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_filament_process(pid: u32) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return false;
+        }
+        let mut buf = [0u16; 512];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        path.to_lowercase().contains("filament")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_filament_process(pid: u32) -> bool {
+    let _ = pid;
+    false
 }
 
 /// The argv for a web-shell PTY.
@@ -4860,7 +4904,18 @@ async fn add_for_cmd(
         eprintln!("  expires  {ttl_text}");
         eprintln!();
         eprintln!("  Whoever captures this can join until it is used or expires.");
-        eprintln!("{}", ui::qr_or_text(token.as_str(), 8));
+        // The token is printed ONCE, on its own line. qr_or_text's fallback
+        // embeds the text, which would double it here; so render the QR only
+        // when it fits and let the note stand alone otherwise (the other QR
+        // callers rely on the fallback embedding the text, so the helper is
+        // not changed - this call site prints the token separately).
+        if ui::qr_fits(token.as_str(), 8) {
+            eprintln!("{}", ui::qr(token.as_str()));
+        } else {
+            eprintln!("  (the QR needs {} rows and this window has {}; the top would be cut off - the code is below)",
+                ui::qr_rows(token.as_str()).unwrap_or(0),
+                crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0));
+        }
         eprintln!("{}", token.as_str());
         eprintln!("  keep this window open until the other device claims it");
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
@@ -4881,9 +4936,12 @@ async fn add_for_cmd(
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
     if !armed {
+        // #205: arming failed. On Unix that usually means the daemon is not
+        // running; on Windows the control channel does not exist yet, so arming
+        // fails even when the daemon IS running. Say both, not one.
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament up --install`, then the other device can join.",
+            "  note: could not arm the always-on receiver (the daemon may not be running, or this platform has no control channel yet).\n  If the daemon is not running, start `filament up --install` first; until the receiver can subscribe, this invitation cannot be claimed.",
         ));
     }
     Ok(())
@@ -6016,19 +6074,29 @@ async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
         }
         .spawn()?;
         // Let the child write its pidfile before we return; poll briefly.
+        let mut came_up = false;
         for _ in 0..50 {
             if daemon_alive().is_some() {
+                came_up = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         let _ = child;
-        ui::say(&format!(
-            "  {} daemon detached (pidfile at {}) - output: {}",
-            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-            pidfile().display(),
-            log_path.display()
-        ));
+        if came_up {
+            ui::say(&format!(
+                "  {} daemon detached (pidfile at {}) - output: {}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                pidfile().display(),
+                log_path.display()
+            ));
+        } else {
+            ui::say(&format!(
+                "  {} spawned the daemon but it did not come up within 5s - output: {}",
+                ui::paint(ui::Tone::Warn, "!"),
+                log_path.display()
+            ));
+        }
         return Ok(());
     }
     #[cfg(windows)]
@@ -20442,6 +20510,19 @@ mod tests {
             }
         }
         assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
+    }
+
+    #[test]
+    fn daemon_alive_recognises_this_process_on_every_platform() {
+        // #204: daemon_alive() was Unix-only (/proc read), so it was
+        // constant-false on Windows and silently disabled up-follows, --detach
+        // and down there. The process check must confirm the CURRENT process is
+        // a filament process on all platforms (the test binary itself is one).
+        let pid = std::process::id();
+        assert!(
+            is_filament_process(pid),
+            "this filament process (pid {pid}) must be recognised by daemon_alive's process check"
+        );
     }
 
     #[test]
