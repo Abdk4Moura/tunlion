@@ -220,8 +220,15 @@ jobs:
           cargo test --features test-hooks --release --test capability_harness --no-run
           # Pick the newest executable named capability_harness-<hash>, skipping
           # the .d dependency files cargo writes alongside it.
-          bin=$(find target/release/deps -maxdepth 1 -type f -name 'capability_harness-*' \
-                  ! -name '*.d' ! -name '*.pdb' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+          # No `find -printf` here: that is a GNU extension and macOS ships BSD
+          # find, which fails with "unknown primary or operator". Plain glob plus
+          # -nt is portable across all three runners.
+          bin=""
+          for f in target/release/deps/capability_harness-*; do
+            case "$f" in *.d|*.pdb) continue;; esac
+            [ -f "$f" ] || continue
+            if [ -z "$bin" ] || [ "$f" -nt "$bin" ]; then bin="$f"; fi
+          done
           test -n "$bin"
           cp "$bin" ../harness-out/
           echo "${{ github.workspace }}" > ../harness-out/PATHS.txt
