@@ -25,7 +25,17 @@
 //! to the console group, and the fix belongs in signal handling. Those are
 //! different repairs, and running one cell alone cannot tell them apart.
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize, PtySystem};
+// portable-pty is already a normal dependency (src/l2.rs uses it for `shell`),
+// and integration tests link the crate's [dependencies] as well as its
+// dev-dependencies, so there is nothing to add. Adding it as a dev-dependency
+// at a different 0.x range is what produced E0464 "multiple candidates for
+// rlib dependency portable_pty": 0.8 and 0.9 are separate compatibility
+// ranges, so cargo built both and rustc refused to choose.
+//
+// No `PtySystem` import: openpty is called on a trait object, whose methods
+// resolve through the vtable, so importing the trait would be an unused import
+// and the warning ratchet would reject it. src/l2.rs does the same.
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
