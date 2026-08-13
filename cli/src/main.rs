@@ -4945,34 +4945,49 @@ async fn add_for_cmd(
     // #176: minting a bounded invitation is a local act (signing + printing);
     // the always-on receiver is only needed when someone CLAIMS it. Arm the
     // enrollment room best-effort; never block minting on the daemon.
-    let mut armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
-    // #207: a minted code that nothing can claim is not an invitation, it is a
-    // lie with a QR on it. Check the receiver BEFORE printing the invitation,
-    // and offer to start it. The old flow warned AFTER the pause, so the
-    // sequence was: mint, wait for a claim, press Enter, learn nothing could
-    // have claimed it.
+    let arm_outcome = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await;
+    let mut armed = arm_outcome == crate::ctl::ArmOutcome::Armed;
+    // #207/#211/#205: a minted code that nothing can claim is not an
+    // invitation, it is a lie with a QR on it. Check the receiver BEFORE
+    // printing the invitation, and offer to start it ONLY where that remedy can
+    // work. On a platform with no control channel (Windows today) the remedy
+    // cannot, and offering it starts a second receiver for nothing - say the
+    // accurate thing instead. #211's four outcomes must be used consistently.
     if !armed && caps.interactive {
-        use std::io::Write as _;
-        eprint!("  the always-on receiver is not running (or this platform has no control channel yet).\n  Start it now so this invitation can be claimed? [y/N] ");
-        let _ = std::io::stderr().flush();
-        let mut ans = String::new();
-        std::io::stdin().read_line(&mut ans).ok();
-        if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            let exe = std::env::current_exe()?;
-            let _ = std::process::Command::new(&exe)
-                .arg("up")
-                .arg("--install")
-                .spawn();
-            ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
-            // The receiver needs a moment to come up and subscribe; re-arm once.
-            for _ in 0..25 {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
-                if armed { break; }
+        match arm_outcome {
+            crate::ctl::ArmOutcome::NoDaemon if daemon_alive().is_none() => {
+                use std::io::Write as _;
+                eprint!("  the always-on receiver is not running.\n  Start it now so this invitation can be claimed? [y/N] ");
+                let _ = std::io::stderr().flush();
+                let mut ans = String::new();
+                std::io::stdin().read_line(&mut ans).ok();
+                if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    let exe = std::env::current_exe()?;
+                    let _ = std::process::Command::new(&exe)
+                        .arg("up")
+                        .arg("--install")
+                        .spawn();
+                    ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
+                    // The receiver needs a moment to come up and subscribe; re-arm once.
+                    for _ in 0..25 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
+                        if armed { break; }
+                    }
+                    if !armed {
+                        ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver did not confirm yet; if it fails to start, run `filament up --install` and mint this invitation again."));
+                    }
+                }
             }
-            if !armed {
-                ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver did not confirm yet; if it fails to start, run `filament up --install` and mint this invitation again."));
+            crate::ctl::ArmOutcome::NoControlChannel => {
+                // #205: the remedy cannot work here; say the accurate line and
+                // offer nothing (starting a second receiver would not arm either).
+                ui::say(&ui::paint(ui::Tone::Warn, "  note: this platform has no control channel yet, so the receiver could not be asked to subscribe; this invitation may be unclaimable here."));
             }
+            crate::ctl::ArmOutcome::NotServingYet => {
+                ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver was still starting; wait a moment, then mint this invitation again."));
+            }
+            _ => {}
         }
     }
 
@@ -5022,10 +5037,10 @@ async fn add_for_cmd(
         ui::say(&format!("  {} invitation written to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), path.display()));
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
-    if !armed {
-        // #205/#207/#211: only reached when the pre-invitation check and the
-        // offer did not resolve it. Say the SPECIFIC true thing, from the
-        // outcome the arm returned, not a blended hedge.
+    // The interactive pre-mint check (above) already printed the accurate
+    // outcome and offered the remedy only where it can work; this trailing
+    // block covers the non-interactive path, which had no offer.
+    if !armed && !caps.interactive {
         let outcome = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await;
         let note = match outcome {
             crate::ctl::ArmOutcome::NoDaemon => {
