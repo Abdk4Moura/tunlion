@@ -759,6 +759,53 @@ pub fn add_firewall_rule(exe: &Path) {
         .output();
 }
 
+/// Spawn `exe` with `args` detached from this process's terminal, its stdout
+/// and stderr appended to `log`. One portable operation with two arms, written
+/// together: the unix arm detaches with `setsid`, the Windows arm with
+/// `CREATE_NO_WINDOW | DETACHED_PROCESS`; both redirect the child's console to
+/// the same log file. The caller polls the pidfile itself for "is it up yet"
+/// (`daemon_alive` is portable since #204).
+///
+/// The two arms MUST ship together. #215 was a half-written detach: the
+/// Windows arm computed the log path and then discarded it, so `logs`,
+/// `up`-follows and `--detach` all dead-ended on a file that never appeared.
+pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::process::Child> {
+    if let Some(parent) = log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(log_file.try_clone()?));
+    cmd.stderr(std::process::Stdio::from(log_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("detached spawn is not supported on this platform");
+    }
+    Ok(cmd.spawn()?)
+}
+
 // ------------------------------------------------------- InstallSource --
 
 /// How filament was installed. Used to gate `filament update`:

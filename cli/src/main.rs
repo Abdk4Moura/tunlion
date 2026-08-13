@@ -3347,58 +3347,31 @@ async fn up_cmd(
             // #182: HKCU Run only fires at logon. The user asked for the
             // inbox NOW (the other platforms' service managers do `enable
             // --now` / bootstrap). Start the receiver now, detached, and
-            // confirm it is live before printing.
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                const DETACHED_PROCESS: u32 = 0x00000008;
-                // #215: the receiver's console must go to daemon.log (same as
-                // --detach), or `logs` / up-follows dead-end on the file that
-                // never appears. Open it and pass it as both handles; if the
-                // log path cannot be opened, fall back to null rather than
-                // failing the whole install over a log file.
-                let log_path = crate::platform::Paths::config_path("daemon.log");
-                let log = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path);
-                let child = match log {
-                    Ok(log) => std::process::Command::new(&exe)
-                        .arg("up")
-                        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                        .stdout(std::process::Stdio::from(log.try_clone()?))
-                        .stderr(std::process::Stdio::from(log))
-                        .spawn(),
-                    Err(_) => std::process::Command::new(&exe)
-                        .arg("up")
-                        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                        .spawn(),
-                };
-                let started = match child {
-                    Ok(_) => {
-                        // Give the receiver a moment to write its pidfile.
-                        let mut live = false;
-                        for _ in 0..40 {
-                            if daemon_alive().is_some() {
-                                live = true;
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(250));
+            // confirm it is live before printing. The detach is the SAME
+            // portable operation as `up --detach` (platform::spawn_detached),
+            // so the receiver's console lands in daemon.log.
+            let log_path = crate::platform::Paths::config_path("daemon.log");
+            let started = match crate::platform::spawn_detached(&exe, &["up"], &log_path) {
+                Ok(_) => {
+                    // Give the receiver a moment to write its pidfile.
+                    let mut live = false;
+                    for _ in 0..40 {
+                        if daemon_alive().is_some() {
+                            live = true;
+                            break;
                         }
-                        live
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                     }
-                    Err(_) => false,
-                };
-                if started {
-                    ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                } else {
-                    ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
-                        ui::paint(ui::Tone::Warn, "!")));
+                    live
                 }
+                Err(_) => false,
+            };
+            if started {
+                ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            } else {
+                ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
+                    ui::paint(ui::Tone::Warn, "!")));
             }
-            #[cfg(not(target_os = "windows"))]
-            ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
         } else {
             match host.install_system(&exe, &up_args) {
                 Ok(platform::InstallResult::System) => {
@@ -6158,93 +6131,45 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
 }
 
 /// this terminal. The detached child writes the pidfile and serves; its console
-/// output goes to {config}/daemon.log so `filament logs` can follow it. On
-/// unix we daemonize with setsid + redirected stdio; on Windows we use
-/// CREATE_NO_WINDOW + DETACHED_PROCESS (the same recipe as the #182 receiver
-/// spawn).
+/// output goes to {config}/daemon.log so `filament logs` can follow it. The
+/// detach itself is one portable operation in `platform::spawn_detached`, whose
+/// two arms ship together (#215 was the half-written version: the Windows arm
+/// computed the log path and threw it away).
 async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_path = crate::platform::Paths::config_path("daemon.log");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let err = log.try_clone()?;
-        // Fork: the parent returns immediately, the child runs the daemon.
-        // setsid detaches from the controlling terminal; stdio is redirected
-        // to the log so closing the terminal cannot kill it.
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("up").arg("--server").arg(server);
-        if let Some(d) = dir.as_deref().and_then(|d| d.to_str()) {
-            cmd.arg("--dir").arg(d);
-        }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(log);
-        cmd.stderr(err);
-        let child = unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            })
-        }
-        .spawn()?;
-        // Let the child write its pidfile before we return; poll briefly.
-        let mut came_up = false;
-        for _ in 0..50 {
-            if daemon_alive().is_some() {
-                came_up = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = child;
-        if came_up {
-            ui::say(&format!(
-                "  {} daemon detached (pidfile at {}) - output: {}",
-                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                pidfile().display(),
-                log_path.display()
-            ));
-        } else {
-            ui::say(&format!(
-                "  {} spawned the daemon but it did not come up within 5s - output: {}",
-                ui::paint(ui::Tone::Warn, "!"),
-                log_path.display()
-            ));
-        }
-        return Ok(());
+    let dir_arg: Option<String> = dir.as_deref().and_then(|d| d.to_str()).map(str::to_string);
+    let mut args: Vec<&str> = vec!["up", "--server", server];
+    if let Some(d) = dir_arg.as_deref() {
+        args.push("--dir");
+        args.push(d);
     }
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("up").arg("--server").arg(server);
-        if let Some(d) = dir.as_deref().and_then(|d| d.to_str()) {
-            cmd.arg("--dir").arg(d);
+    let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
+    // Let the child write its pidfile before we return; poll briefly.
+    let mut came_up = false;
+    for _ in 0..50 {
+        if daemon_alive().is_some() {
+            came_up = true;
+            break;
         }
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-        // #215: redirect the child's console to daemon.log, same as unix. The
-        // file handle converts into Stdio on Windows; without this the daemon's
-        // output went nowhere and `logs`, up-follows and --detach all dead-ended.
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        cmd.stdout(std::process::Stdio::from(log.try_clone()?));
-        cmd.stderr(std::process::Stdio::from(log));
-        cmd.spawn()?;
-        ui::say(&format!("  {} daemon detached (background) - output: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), log_path.display()));
-        return Ok(());
+        std::thread::sleep(Duration::from_millis(100));
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        anyhow::bail!("--detach is not supported on this platform")
+    let _ = child;
+    if came_up {
+        ui::say(&format!(
+            "  {} daemon detached (pidfile at {}) - output: {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            pidfile().display(),
+            log_path.display()
+        ));
+    } else {
+        ui::say(&format!(
+            "  {} spawned the daemon but it did not come up within 5s - output: {}",
+            ui::paint(ui::Tone::Warn, "!"),
+            log_path.display()
+        ));
     }
+    Ok(())
 }
 
 /// Stop the daemon through its service manager, if one owns it. Returns true
