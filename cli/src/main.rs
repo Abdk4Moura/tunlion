@@ -3353,12 +3353,28 @@ async fn up_cmd(
                 use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x08000000;
                 const DETACHED_PROCESS: u32 = 0x00000008;
-                let mut child = std::process::Command::new(&exe)
-                    .arg("up")
-                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+                // #215: the receiver's console must go to daemon.log (same as
+                // --detach), or `logs` / up-follows dead-end on the file that
+                // never appears. Open it and pass it as both handles; if the
+                // log path cannot be opened, fall back to null rather than
+                // failing the whole install over a log file.
+                let log_path = crate::platform::Paths::config_path("daemon.log");
+                let log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path);
+                let child = match log {
+                    Ok(log) => std::process::Command::new(&exe)
+                        .arg("up")
+                        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                        .stdout(std::process::Stdio::from(log.try_clone()?))
+                        .stderr(std::process::Stdio::from(log))
+                        .spawn(),
+                    Err(_) => std::process::Command::new(&exe)
+                        .arg("up")
+                        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                        .spawn(),
+                };
                 let started = match child {
                     Ok(_) => {
                         // Give the receiver a moment to write its pidfile.
@@ -6070,7 +6086,11 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     let path = if console.exists() { console } else { crate::platform::Paths::config_path("diag.jsonl") };
     let read_tail = |count: usize| -> Result<()> {
         let Ok(raw) = std::fs::read_to_string(&path) else {
-            ui::say("  no log yet (the daemon writes it while it runs)");
+            // Say what is true now, not what will happen later: nothing has
+            // been written yet. Whether it WILL appear depends on the daemon
+            // actually running (and, on some platforms, having a place to
+            // write), which this process cannot establish.
+            ui::say("  no log yet (nothing written so far)");
             return Ok(());
         };
         let lines: Vec<&str> = raw.lines().collect();
@@ -6193,10 +6213,17 @@ async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        // #215: redirect the child's console to daemon.log, same as unix. The
+        // file handle converts into Stdio on Windows; without this the daemon's
+        // output went nowhere and `logs`, up-follows and --detach all dead-ended.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        cmd.stdout(std::process::Stdio::from(log.try_clone()?));
+        cmd.stderr(std::process::Stdio::from(log));
         cmd.spawn()?;
-        ui::say(&format!("  {} daemon detached (background)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+        ui::say(&format!("  {} daemon detached (background) - output: {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), log_path.display()));
         return Ok(());
     }
     #[cfg(not(any(unix, windows)))]
