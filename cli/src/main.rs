@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod codeentry;
+mod armed;
 mod ctl;
 mod diag;
 mod direct;
@@ -4525,11 +4526,12 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             write_owner_only_file(&out, json.as_str())?;
             eprintln!("{} auth key bundle written to {}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
-            // Arm the local daemon so it joins the enrollment room
-            match ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await {
-                ctl::ArmOutcome::Armed => ui::debug("local daemon armed for enrollment"),
-                _ => ui::say(&format!("  {} local daemon not confirmed for the enrollment room (start 'filament up' first)",
-                    ui::paint(ui::Tone::Dim, "·"))),
+            // Arm: a file write (armed.json), not IPC. The daemon's arm-gate
+            // picks it up on the next tick.
+            crate::armed::arm(hex::encode(ak.enroll_pub), ak.expires);
+            if daemon_alive().is_none() {
+                ui::say(&format!("  {} no local daemon running yet (start 'filament up' before this key is claimed)",
+                    ui::paint(ui::Tone::Dim, "·")));
             }
             Ok(())
         }
@@ -4915,52 +4917,28 @@ async fn add_for_cmd(
         "filament-invite:v2:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
-    // #176: minting a bounded invitation is a local act (signing + printing);
-    // the always-on receiver is only needed when someone CLAIMS it. Arm the
-    // enrollment room best-effort; never block minting on the daemon.
-    let arm_outcome = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await;
-    let mut armed = arm_outcome == crate::ctl::ArmOutcome::Armed;
-    // #207/#211/#205: a minted code that nothing can claim is not an
-    // invitation, it is a lie with a QR on it. Check the receiver BEFORE
-    // printing the invitation, and offer to start it ONLY where that remedy can
-    // work. On a platform with no control channel (Windows today) the remedy
-    // cannot, and offering it starts a second receiver for nothing - say the
-    // accurate thing instead. #211's four outcomes must be used consistently.
-    if !armed && caps.interactive {
-        match arm_outcome {
-            crate::ctl::ArmOutcome::NoDaemon if daemon_alive().is_none() => {
-                use std::io::Write as _;
-                eprint!("  the always-on receiver is not running.\n  Start it now so this invitation can be claimed? [y/N] ");
-                let _ = std::io::stderr().flush();
-                let mut ans = String::new();
-                std::io::stdin().read_line(&mut ans).ok();
-                if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                    let exe = std::env::current_exe()?;
-                    let _ = std::process::Command::new(&exe)
-                        .arg("up")
-                        .arg("--install")
-                        .spawn();
-                    ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
-                    // The receiver needs a moment to come up and subscribe; re-arm once.
-                    for _ in 0..25 {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
-                        if armed { break; }
-                    }
-                    if !armed {
-                        ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver did not confirm yet; if it fails to start, run `filament up --install` and mint this invitation again."));
-                    }
-                }
-            }
-            crate::ctl::ArmOutcome::NoControlChannel => {
-                // #205: the remedy cannot work here; say the accurate line and
-                // offer nothing (starting a second receiver would not arm either).
-                ui::say(&ui::paint(ui::Tone::Warn, "  note: this platform has no control channel yet, so the receiver could not be asked to subscribe; this invitation may be unclaimable here."));
-            }
-            crate::ctl::ArmOutcome::NotServingYet => {
-                ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver was still starting; wait a moment, then mint this invitation again."));
-            }
-            _ => {}
+    // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in
+    // armed.json directly; the daemon's per-tick arm-gate reads it. No socket,
+    // no bind race, no platform branch, no control channel. The only thing the
+    // mint cannot guarantee is that a RECEIVER is actually running to pick the
+    // key up - check that, and offer to start one.
+    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
+    // #207: a minted code that nothing can claim is not an invitation, it is a
+    // lie with a QR on it. The receiver is what claims; if none is running,
+    // say so before printing and offer to start one.
+    if caps.interactive && daemon_alive().is_none() {
+        use std::io::Write as _;
+        eprint!("  the always-on receiver is not running.\n  Start it now so this invitation can be claimed? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans).ok();
+        if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            let exe = std::env::current_exe()?;
+            let _ = std::process::Command::new(&exe)
+                .arg("up")
+                .arg("--install")
+                .spawn();
+            ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
         }
     }
 
@@ -5010,26 +4988,14 @@ async fn add_for_cmd(
         ui::say(&format!("  {} invitation written to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), path.display()));
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
-    // The interactive pre-mint check (above) already printed the accurate
-    // outcome and offered the remedy only where it can work; this trailing
-    // block covers the non-interactive path, which had no offer.
-    if !armed && !caps.interactive {
-        let outcome = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await;
-        let note = match outcome {
-            crate::ctl::ArmOutcome::NoDaemon => {
-                "the daemon is not running; start `filament up --install` first. Until the receiver subscribes, this invitation cannot be claimed."
-            }
-            crate::ctl::ArmOutcome::NoControlChannel => {
-                "this platform has no control channel yet, so the receiver could not be asked to subscribe; this invitation may be unclaimable here."
-            }
-            crate::ctl::ArmOutcome::NotServingYet => {
-                "the receiver was still starting; wait a moment, then mint this invitation again."
-            }
-            _ => {
-                "the receiver could not be armed; this invitation may be unclaimable."
-            }
-        };
-        ui::say(&ui::paint(ui::Tone::Warn, &format!("  note: {note}")));
+    // Non-interactive (--out or a pipe): no offer was printed above. Warn that a
+    // receiver must be running to claim, which is the one thing the file write
+    // cannot guarantee.
+    if !caps.interactive && daemon_alive().is_none() {
+        ui::say(&ui::paint(
+            ui::Tone::Warn,
+            "  note: the always-on receiver is not running; start `filament up --install` before anyone claims this invitation.",
+        ));
     }
     Ok(())
 }
@@ -10565,10 +10531,8 @@ async fn handle_warm_req(
         // Reconfigure is handled inline in the daemon loop (it mutates loop state),
         // so it never reaches this dispatcher; answer defensively if it ever does.
         ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
-        ctl::ReqKind::Arm { key_id, expiry } => {
-            crate::ephemeral::arm(key_id.clone(), *expiry);
-            req.reply(&json!({ "ok": true })).await;
-        }
+        // ReqKind::Arm is gone: the mint writes armed.json directly (no IPC),
+        // and the per-tick arm-gate reads it. See cli/src/armed.rs.
         // ReloadExpose is likewise handled inline in the daemon loop (it owns the
         // Exposer); answer defensively if it ever reaches here.
         ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
@@ -14884,14 +14848,14 @@ async fn recv_cmd(
             if let Some(ready) = ctl_ready.take() {
                 let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
             }
-            if crate::ephemeral::is_armed() {
+            if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
                 ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
-            if crate::ephemeral::is_armed() {
+            if crate::armed::is_armed() {
                 if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                     if !c.contains(&ek) { c.push(ek); }
@@ -15750,7 +15714,7 @@ async fn recv_cmd(
         // would otherwise never subscribe and no ephemeral device could enroll.
         if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
             let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-            let armed = crate::ephemeral::is_armed();
+            let armed = crate::armed::is_armed();
             let subscribed = sess.channels.contains(&ek);
             if armed && !subscribed {
                 sess.channels.push(ek.clone());

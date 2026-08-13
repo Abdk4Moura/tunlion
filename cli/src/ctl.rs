@@ -39,35 +39,24 @@ pub fn reuse_disabled() -> bool {
     std::env::var("FILAMENT_NO_WARM_REUSE").map(|v| v == "1").unwrap_or(false)
 }
 
-/// The outcome of arming the local daemon for enrollment, distinguished so the
-/// caller can say the SPECIFIC true thing. #211: three facts used to collapse
-/// into a silent None.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ArmOutcome {
-    Armed,
-    NoDaemon,
-    NoControlChannel,
-    NotServingYet,
-}
-
 #[cfg(unix)]
 pub use imp::{
     daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
     try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-    try_arm, try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_arm, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
+    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
     Req,
 };
 
 // --------------------------------------------------------------- unix impl ----
 #[cfg(unix)]
 mod imp {
-    use super::{control_sock_path, reuse_disabled, ArmOutcome};
+    use super::{control_sock_path, reuse_disabled};
     use anyhow::{anyhow, Result};
     use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
@@ -273,45 +262,11 @@ mod imp {
     /// Arm the local daemon for enrollment: tell it an auth key is outstanding.
     /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
     ///
-    /// #211: the caller must be able to say something TRUE about the outcome.
-    /// Three different facts used to collapse into None. `NotServingYet` is the
-    /// startup race (the socket file exists but the daemon is still binding),
-    /// retried briefly inside; the other two want distinct handling.
-    pub async fn try_arm(key_id: String, expiry: u64) -> ArmOutcome {
-        let path = control_sock_path();
-        // #211: a missing socket file means NO daemon; a socket that exists but
-        // refuses is the STARTUP RACE (the `up` banner and the control socket
-        // bind are not the same moment), which deserves a brief retry, not a
-        // silent None. The daemon binds the socket before it prints anything;
-        // a few hundred ms of retry covers the gap.
-        if !path.exists() {
-            return ArmOutcome::NoDaemon;
-        }
-        for _ in 0..10 {
-            if let Ok(mut s) = UnixStream::connect(&path).await {
-                let req = json!({ "op": "arm", "key_id": key_id.clone(), "expiry": expiry });
-                let mut line = match serde_json::to_vec(&req) {
-                    Ok(l) => l,
-                    Err(_) => return ArmOutcome::NoDaemon,
-                };
-                line.push(b'\n');
-                let _ = s.write_all(&line).await;
-                let _ = s.flush().await;
-                let reply = match tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096)).await {
-                    Ok(Ok(r)) => r,
-                    _ => return ArmOutcome::NoDaemon,
-                };
-                if let Ok(v) = serde_json::from_str::<Value>(&reply) {
-                    if v["ok"].as_bool() == Some(true) {
-                        return ArmOutcome::Armed;
-                    }
-                }
-                return ArmOutcome::NoDaemon;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        ArmOutcome::NotServingYet
-    }
+    /// REMOVED (#205/#211): arming no longer goes through IPC at all. The mint
+    /// writes armed.json directly and the daemon's per-tick arm-gate reads it,
+    /// so this function (and the Arm ReqKind, and the ArmOutcome enum) are gone.
+    /// The #211 ready-banner work (serve_at's ready oneshot) stays: that is
+    /// about the banner meaning "serving", not about arming.
 
     /// Ask the running daemon to re-read `expose.json` and reconcile its overlay
     /// listeners (used by `filament expose`/`unexpose`). Returns the daemon reply
@@ -574,10 +529,6 @@ mod imp {
         ApproveRequest { id: u64, allow: String, expires: u64 },
         /// Deny a pending request by id.
         DenyRequest { id: u64 },
-        /// Arm the daemon for enrollment: a minted auth key is outstanding.
-        /// The daemon joins the enrollment room for the key's TTL.
-        /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
-        Arm { key_id: String, expiry: u64 },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -704,11 +655,6 @@ mod imp {
                     Some("reconfigure") => {
                         let Some(key) = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).map(str::to_string) else { return };
                         ReqKind::Reconfigure { key }
-                    }
-                    Some("arm") => {
-                        let Some(key_id) = v["key_id"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string) else { return };
-                        let Some(expiry) = v["expiry"].as_u64() else { return };
-                        ReqKind::Arm { key_id, expiry }
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
                     Some("reload") => ReqKind::Reload,
@@ -851,7 +797,6 @@ mod imp {
 // -------------------------------------------------------- non-unix fallback ----
 #[cfg(not(unix))]
 mod stub {
-    use super::ArmOutcome;
     use serde_json::Value;
     /// Warm-link reuse needs a unix-domain socket, which this platform lacks, so
     /// `Req` is uninhabited: the daemon never spawns `serve`, the channel never
@@ -900,14 +845,5 @@ mod stub {
     /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_deny_request(_id: u64) -> Option<Value> {
         None
-    }
-
-    /// No control socket here, so there is no local daemon to arm for an
-    /// enrollment room. Callers treat `None` as "no local daemon" and degrade
-    /// gracefully. Present so the unconditional call site compiles on non-unix.
-    pub async fn try_arm(_key_id: String, _expiry: u64) -> ArmOutcome {
-        // #205/#211: this platform has NO control channel (not "the daemon is
-        // down"). The caller must not report that as a dead receiver.
-        ArmOutcome::NoControlChannel
     }
 }
