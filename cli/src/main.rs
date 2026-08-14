@@ -489,9 +489,9 @@ COMMANDS
     reach <device>         check if a device is reachable (direct/relay + rtt)
     forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
-    mount <device> <dir>   mount a remote folder over the mesh
+    mount <device> <dir> [local]  mount a remote folder over the mesh
   Serve
-    up                     serve: receive, mount, shell (run attached)
+    up                     serve: receive, mount (run attached; shell with --shell)
     up --install           the same, always-on (autostart at logon)
     up --detach            the same, detached in the background (no service manager)
     down                   stop the daemon
@@ -5320,7 +5320,15 @@ async fn enroll_cmd(
                     return Ok(());
                 }
                 Some("identity-auth-key-enroll-error") => {
-                    bail!("enrollment rejected: {}", v["reason"].as_str().unwrap_or("unknown reason"));
+                    // #222: name the reason the way the expired path does. The
+                    // server sends a specific fact (already used / use limit
+                    // reached / rate-limited) instead of a generic denial.
+                    let reason = v["reason"].as_str().unwrap_or("unknown");
+                    bail!(match reason {
+                        "already used" => "this invitation has already been used".to_string(),
+                        "use limit reached" => "this invitation has reached its use limit".to_string(),
+                        _ => format!("enrollment denied: {reason}"),
+                    });
                 }
                 _ => {}
             },
@@ -5939,7 +5947,21 @@ async fn handle_auth_key_enroll_response(
             // Burn ON SUCCESS only (never-reset counter)
             if let Err(e) = crate::ephemeral::burn_auth_key(&enroll_pub, &ak.reuse) {
                 ui::debug(&format!("enroll response burn failed: {e}"));
-                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                // #222: the burn state knows WHY it refused (already used,
+                // use limit reached, rate-limited). Send that specific fact,
+                // not the generic "enrollment denied", so the joiner can say
+                // it the way the expired path does.
+                let msg = e.to_string();
+                let reason = if msg.contains("already used") {
+                    "already used"
+                } else if msg.contains("exhausted") {
+                    "use limit reached"
+                } else if msg.contains("rate-limited") {
+                    "rate-limited"
+                } else {
+                    "enrollment denied"
+                };
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": reason})).await;
                 return;
             }
             // #155: the enrollment side READS the signed `ephemeral` flag. An

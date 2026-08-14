@@ -302,7 +302,7 @@ pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
             KeyCode::Char('\u{3}') => return Ok(None),
             KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
-            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => return Ok(Some(sel)),
+            KeyCode::Enter => return Ok(Some(sel)),
             KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
             _ => {}
         }
@@ -347,7 +347,7 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
                 }
             }
             KeyCode::Esc => return Ok(Outcome::Cancelled),
-            KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
+            KeyCode::Enter => {
                 let j = judge(&buf, mode, auto_nameplate);
                 match j.level {
                     Level::Ready => {
