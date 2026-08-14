@@ -489,7 +489,7 @@ COMMANDS
     reach <device>         check if a device is reachable (direct/relay + rtt)
     forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
-    mount <device>:<dir>   mount a remote folder over the mesh
+    mount <device> <dir>   mount a remote folder over the mesh
   Serve
     up                     serve: receive, mount, shell (run attached)
     up --install           the same, always-on (autostart at logon)
@@ -3657,11 +3657,23 @@ async fn init_experience(
     if let Some(existing) = identity::UserKey::load(&store)? {
         bail!("this device already has identity {}; see `filament id`", existing.fingerprint());
     }
-    if !caps.interactive && recovery_file.is_none() && recovery_fd.is_none() {
-        bail!("non-interactive init requires --recovery-file <new-path> or --recovery-fd <fd>");
-    }
-    if !caps.interactive && !caps.yes {
-        bail!("non-interactive init requires --yes after naming a recovery destination");
+    // Non-interactive init names EVERYTHING it needs in one message, so a
+    // script learns the full contract in one round trip instead of two
+    // (--recovery-file, then --yes, then --name).
+    if !caps.interactive {
+        let mut missing: Vec<&str> = Vec::new();
+        if recovery_file.is_none() && recovery_fd.is_none() {
+            missing.push("--recovery-file <path> (or --recovery-fd <fd>)");
+        }
+        if !caps.yes {
+            missing.push("--yes");
+        }
+        if name.is_none() {
+            missing.push("--name <device>");
+        }
+        if !missing.is_empty() {
+            bail!("non-interactive init needs: {}", missing.join(", "));
+        }
     }
 
     let device_name = match name {
@@ -4156,10 +4168,21 @@ fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity:
             _ => format!("expired {date}"),
         };
     }
-    let minutes = (cert.expires - now).saturating_add(59) / 60;
+    // Round UP to the nearest whole unit, so a cert issued for 90 days reads
+    // "90d", not "129600m" or a seconds figure a few seconds short of the day.
+    let secs = cert.expires - now;
+    let text = if secs >= 86400 {
+        format!("{}d", (secs + 86399) / 86400)
+    } else if secs >= 3600 {
+        format!("{}h", (secs + 3599) / 3600)
+    } else if secs >= 60 {
+        format!("{}m", (secs + 59) / 60)
+    } else {
+        format!("{secs}s")
+    };
     match tier {
-        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {minutes}m"),
-        _ => format!("expires in {minutes}m"),
+        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {text}"),
+        _ => format!("expires in {text}"),
     }
 }
 
@@ -11870,6 +11893,18 @@ async fn main() -> Result<()> {
                 }
                 None => bail!("shell needs a device in non-interactive mode: filament shell <device>"),
             };
+            // #219: a device whose invitation ceiling excludes shell can never
+            // serve one, and the denial was surfacing as a silent hang (the
+            // acceptor's l2-close is only sent when the acceptor is ON). Say so
+            // before opening anything, matching the #206 mount pre-check.
+            if let Some(caps) = principal_ceiling_for(&peer) {
+                if !caps.iter().any(|c| c == "shell") {
+                    bail!(
+                        "shell denied by {peer}: this device's invitation ceiling ({}) does not include shell",
+                        caps.join(", ")
+                    );
+                }
+            }
             if opened_flow {
                 eprintln!();
                 eprintln!("  {}", ui::paint(ui::Tone::Brand, "REMOTE TERMINAL"));
@@ -12796,6 +12831,18 @@ async fn send_cmd(
                 }
                 Err(e) => bail!("cannot send '{first}': {e}"),
             }
+        }
+    }
+    // #221: --to must name a device we actually know. Falling back to local
+    // discovery silently turned a targeted, identity-verified send into a
+    // discoverable one, and a mistyped name cost a minute of silence before the
+    // timeout. Reject up front, like mount does.
+    if let Some(target) = to.as_deref() {
+        let known = devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(target));
+        if !known {
+            bail!(
+                "send --to '{target}': no known device by that name; run `filament devices` to see who you can reach"
+            );
         }
     }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
@@ -17295,8 +17342,19 @@ async fn recv_cmd(
                 // bridge it to a sid stream. Same deny-by-default gate as
                 // shell-bootstrap, a PTY is a superset of ssh-key access, so it
                 // reuses the `shell` cap / --shell policy and requires `trusted`.
-                Some("pty-open") if l2_enabled => {
+                Some("pty-open") => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
+                    // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
+                    // no FILAMENT_L2). The peer is visibly up but cannot serve a
+                    // shell, and dropping the open silently made `shell` hang with
+                    // no output. Say so, so the initiator errors instead of waiting.
+                    if !l2_enabled {
+                        let sid = l2::wire_sid(&v).unwrap_or(0);
+                        let _ = t
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell acceptor off on this device; run `filament up --shell` here to serve shells" }))
+                            .await;
+                        continue;
+                    }
                     // wire_sid rejects a missing OR out-of-range sid instead of
                     // defaulting to 0 / wrapping into a forged is_l2_sid value.
                     let Some(sid) = l2::wire_sid(&v) else { continue };
