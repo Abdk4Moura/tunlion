@@ -29,7 +29,7 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // Where every bug listed above came from. Pay this down first: process
         // liveness and daemon control, then the ctl channel, then path
         // stragglers.
-        ("main.rs", 97),
+        ("main.rs", 92),
         // Largely irreducible: path encoding genuinely differs across platforms
         // and flattening it loses data. Not a target.
         ("mount_proto.rs", 47),

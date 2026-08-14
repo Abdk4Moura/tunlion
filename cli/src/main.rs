@@ -4294,7 +4294,11 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
             fleet_ui::devices::DeviceEntry {
                 name: name.clone(),
                 tier,
-                online: warm_names.contains(&name),
+                // #217: online is authoritative only when the warm-link reply is
+                // present. On a platform with no control channel (or no daemon)
+                // `warm` is None and the row omits the status instead of
+                // rendering "offline" for every device always.
+                online: warm.map(|_| warm_names.contains(&name)),
                 caps_summary,
                 countdown: match delegated_device_state(&name, cert.as_ref(), now, &records) {
                     Some((text, tone)) => ui::paint(tone, &text),

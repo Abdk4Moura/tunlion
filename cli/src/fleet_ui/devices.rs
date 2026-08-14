@@ -9,7 +9,10 @@ use crate::ui::{self, Tone};
 pub struct DeviceEntry {
     pub name: String,
     pub tier: DeviceTier,
-    pub online: bool,
+    /// A warm link is held open RIGHT NOW. `None` = the warm-link data is
+    /// unavailable on this platform/daemon (no control channel), so the row
+    /// omits the status rather than asserting a falsehood (#217).
+    pub online: Option<bool>,
     pub caps_summary: String,    // e.g. "OWNER-EQUIVALENT shell reach:8080 inbox"
     pub countdown: String,       // e.g. "renews in 9m" or "expires in 4m"
     pub last_seen: Option<String>, // e.g. "2h ago"
@@ -101,10 +104,13 @@ fn render_device_row(d: &DeviceEntry) -> String {
         DeviceTier::External => ui::paint(Tone::Dim, ui::glyph_extern()),
         DeviceTier::NeedsReview => ui::paint(Tone::Warn, ui::glyph_review()),
     };
-    let status = if d.online {
-        ui::paint(Tone::Ok, "online")
-    } else {
-        ui::paint(Tone::Dim, "offline")
+    let status = match d.online {
+        Some(true) => ui::paint(Tone::Ok, "online"),
+        // #217: "a warm link is NOT held open right now" is the normal, healthy
+        // idle state, not an absence. "offline" promised far more than the value
+        // supports and read as a failure next to "last seen just now".
+        Some(false) => ui::paint(Tone::Dim, "idle"),
+        None => "".to_string(),
     };
     let mut line = format!(
         "     {glyph} {:<16} {:<8} {:<24} {}",
@@ -206,7 +212,7 @@ mod tests {
             DeviceEntry {
                 name: "pixel-7".into(),
                 tier: DeviceTier::Fleet,
-                online: true,
+                online: Some(true),
                 caps_summary: "OWNER-EQUIVALENT shell reach:8080 inbox".into(),
                 countdown: "renews in 9m".into(),
                 last_seen: None,
@@ -215,7 +221,7 @@ mod tests {
             DeviceEntry {
                 name: "carol".into(),
                 tier: DeviceTier::External,
-                online: true,
+                online: Some(true),
                 caps_summary: "send→you".into(),
                 countdown: "expires in 4m".into(),
                 last_seen: None,
@@ -235,7 +241,7 @@ mod tests {
             DeviceEntry {
                 name: "old-laptop".into(),
                 tier: DeviceTier::NeedsReview,
-                online: false,
+                online: Some(false),
                 caps_summary: "(full legacy trust)".into(),
                 countdown: "promote to continue".into(),
                 last_seen: None,
