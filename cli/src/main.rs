@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod codeentry;
+mod armed;
 mod ctl;
 mod diag;
 mod direct;
@@ -3347,42 +3348,31 @@ async fn up_cmd(
             // #182: HKCU Run only fires at logon. The user asked for the
             // inbox NOW (the other platforms' service managers do `enable
             // --now` / bootstrap). Start the receiver now, detached, and
-            // confirm it is live before printing.
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                const DETACHED_PROCESS: u32 = 0x00000008;
-                let mut child = std::process::Command::new(&exe)
-                    .arg("up")
-                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                let started = match child {
-                    Ok(_) => {
-                        // Give the receiver a moment to write its pidfile.
-                        let mut live = false;
-                        for _ in 0..40 {
-                            if daemon_alive().is_some() {
-                                live = true;
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(250));
+            // confirm it is live before printing. The detach is the SAME
+            // portable operation as `up --detach` (platform::spawn_detached),
+            // so the receiver's console lands in daemon.log.
+            let log_path = crate::platform::Paths::config_path("daemon.log");
+            let started = match crate::platform::spawn_detached(&exe, &["up"], &log_path) {
+                Ok(_) => {
+                    // Give the receiver a moment to write its pidfile.
+                    let mut live = false;
+                    for _ in 0..40 {
+                        if daemon_alive().is_some() {
+                            live = true;
+                            break;
                         }
-                        live
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                     }
-                    Err(_) => false,
-                };
-                if started {
-                    ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                } else {
-                    ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
-                        ui::paint(ui::Tone::Warn, "!")));
+                    live
                 }
+                Err(_) => false,
+            };
+            if started {
+                ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            } else {
+                ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
+                    ui::paint(ui::Tone::Warn, "!")));
             }
-            #[cfg(not(target_os = "windows"))]
-            ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
         } else {
             match host.install_system(&exe, &up_args) {
                 Ok(platform::InstallResult::System) => {
@@ -4536,11 +4526,12 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             write_owner_only_file(&out, json.as_str())?;
             eprintln!("{} auth key bundle written to {}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
-            // Arm the local daemon so it joins the enrollment room
-            match ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await {
-                ctl::ArmOutcome::Armed => ui::debug("local daemon armed for enrollment"),
-                _ => ui::say(&format!("  {} local daemon not confirmed for the enrollment room (start 'filament up' first)",
-                    ui::paint(ui::Tone::Dim, "·"))),
+            // Arm: a file write (armed.json), not IPC. The daemon's arm-gate
+            // picks it up on the next tick.
+            crate::armed::arm(hex::encode(ak.enroll_pub), ak.expires);
+            if daemon_alive().is_none() {
+                ui::say(&format!("  {} no local daemon running yet (start 'filament up' before this key is claimed)",
+                    ui::paint(ui::Tone::Dim, "·")));
             }
             Ok(())
         }
@@ -4926,18 +4917,18 @@ async fn add_for_cmd(
         "filament-invite:v2:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
-    // #176: minting a bounded invitation is a local act (signing + printing);
-    // the always-on receiver is only needed when someone CLAIMS it. Arm the
-    // enrollment room best-effort; never block minting on the daemon.
-    let mut armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
+    // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in
+    // armed.json directly; the daemon's per-tick arm-gate reads it. No socket,
+    // no bind race, no platform branch, no control channel. The only thing the
+    // mint cannot guarantee is that a RECEIVER is actually running to pick the
+    // key up - check that, and offer to start one.
+    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
     // #207: a minted code that nothing can claim is not an invitation, it is a
-    // lie with a QR on it. Check the receiver BEFORE printing the invitation,
-    // and offer to start it. The old flow warned AFTER the pause, so the
-    // sequence was: mint, wait for a claim, press Enter, learn nothing could
-    // have claimed it.
-    if !armed && caps.interactive {
+    // lie with a QR on it. The receiver is what claims; if none is running,
+    // say so before printing and offer to start one.
+    if caps.interactive && daemon_alive().is_none() {
         use std::io::Write as _;
-        eprint!("  the always-on receiver is not running (or this platform has no control channel yet).\n  Start it now so this invitation can be claimed? [y/N] ");
+        eprint!("  the always-on receiver is not running.\n  Start it now so this invitation can be claimed? [y/N] ");
         let _ = std::io::stderr().flush();
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans).ok();
@@ -4948,15 +4939,6 @@ async fn add_for_cmd(
                 .arg("--install")
                 .spawn();
             ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
-            // The receiver needs a moment to come up and subscribe; re-arm once.
-            for _ in 0..25 {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await == crate::ctl::ArmOutcome::Armed;
-                if armed { break; }
-            }
-            if !armed {
-                ui::say(&ui::paint(ui::Tone::Warn, "  note: the receiver did not confirm yet; if it fails to start, run `filament up --install` and mint this invitation again."));
-            }
         }
     }
 
@@ -5006,26 +4988,14 @@ async fn add_for_cmd(
         ui::say(&format!("  {} invitation written to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), path.display()));
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
-    if !armed {
-        // #205/#207/#211: only reached when the pre-invitation check and the
-        // offer did not resolve it. Say the SPECIFIC true thing, from the
-        // outcome the arm returned, not a blended hedge.
-        let outcome = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await;
-        let note = match outcome {
-            crate::ctl::ArmOutcome::NoDaemon => {
-                "the daemon is not running; start `filament up --install` first. Until the receiver subscribes, this invitation cannot be claimed."
-            }
-            crate::ctl::ArmOutcome::NoControlChannel => {
-                "this platform has no control channel yet, so the receiver could not be asked to subscribe; this invitation may be unclaimable here."
-            }
-            crate::ctl::ArmOutcome::NotServingYet => {
-                "the receiver was still starting; wait a moment, then mint this invitation again."
-            }
-            _ => {
-                "the receiver could not be armed; this invitation may be unclaimable."
-            }
-        };
-        ui::say(&ui::paint(ui::Tone::Warn, &format!("  note: {note}")));
+    // Non-interactive (--out or a pipe): no offer was printed above. Warn that a
+    // receiver must be running to claim, which is the one thing the file write
+    // cannot guarantee.
+    if !caps.interactive && daemon_alive().is_none() {
+        ui::say(&ui::paint(
+            ui::Tone::Warn,
+            "  note: the always-on receiver is not running; start `filament up --install` before anyone claims this invitation.",
+        ));
     }
     Ok(())
 }
@@ -6070,7 +6040,11 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     let path = if console.exists() { console } else { crate::platform::Paths::config_path("diag.jsonl") };
     let read_tail = |count: usize| -> Result<()> {
         let Ok(raw) = std::fs::read_to_string(&path) else {
-            ui::say("  no log yet (the daemon writes it while it runs)");
+            // Say what is true now, not what will happen later: nothing has
+            // been written yet. Whether it WILL appear depends on the daemon
+            // actually running (and, on some platforms, having a place to
+            // write), which this process cannot establish.
+            ui::say("  no log yet (nothing written so far)");
             return Ok(());
         };
         let lines: Vec<&str> = raw.lines().collect();
@@ -6123,86 +6097,45 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
 }
 
 /// this terminal. The detached child writes the pidfile and serves; its console
-/// output goes to {config}/daemon.log so `filament logs` can follow it. On
-/// unix we daemonize with setsid + redirected stdio; on Windows we use
-/// CREATE_NO_WINDOW + DETACHED_PROCESS (the same recipe as the #182 receiver
-/// spawn).
+/// output goes to {config}/daemon.log so `filament logs` can follow it. The
+/// detach itself is one portable operation in `platform::spawn_detached`, whose
+/// two arms ship together (#215 was the half-written version: the Windows arm
+/// computed the log path and threw it away).
 async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_path = crate::platform::Paths::config_path("daemon.log");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let err = log.try_clone()?;
-        // Fork: the parent returns immediately, the child runs the daemon.
-        // setsid detaches from the controlling terminal; stdio is redirected
-        // to the log so closing the terminal cannot kill it.
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("up").arg("--server").arg(server);
-        if let Some(d) = dir.as_deref().and_then(|d| d.to_str()) {
-            cmd.arg("--dir").arg(d);
-        }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(log);
-        cmd.stderr(err);
-        let child = unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            })
-        }
-        .spawn()?;
-        // Let the child write its pidfile before we return; poll briefly.
-        let mut came_up = false;
-        for _ in 0..50 {
-            if daemon_alive().is_some() {
-                came_up = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let _ = child;
-        if came_up {
-            ui::say(&format!(
-                "  {} daemon detached (pidfile at {}) - output: {}",
-                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                pidfile().display(),
-                log_path.display()
-            ));
-        } else {
-            ui::say(&format!(
-                "  {} spawned the daemon but it did not come up within 5s - output: {}",
-                ui::paint(ui::Tone::Warn, "!"),
-                log_path.display()
-            ));
-        }
-        return Ok(());
+    let dir_arg: Option<String> = dir.as_deref().and_then(|d| d.to_str()).map(str::to_string);
+    let mut args: Vec<&str> = vec!["up", "--server", server];
+    if let Some(d) = dir_arg.as_deref() {
+        args.push("--dir");
+        args.push(d);
     }
-    #[cfg(windows)]
-    {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("up").arg("--server").arg(server);
-        if let Some(d) = dir.as_deref().and_then(|d| d.to_str()) {
-            cmd.arg("--dir").arg(d);
+    let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
+    // Let the child write its pidfile before we return; poll briefly.
+    let mut came_up = false;
+    for _ in 0..50 {
+        if daemon_alive().is_some() {
+            came_up = true;
+            break;
         }
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        cmd.spawn()?;
-        ui::say(&format!("  {} daemon detached (background)", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-        return Ok(());
+        std::thread::sleep(Duration::from_millis(100));
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        anyhow::bail!("--detach is not supported on this platform")
+    let _ = child;
+    if came_up {
+        ui::say(&format!(
+            "  {} daemon detached (pidfile at {}) - output: {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            pidfile().display(),
+            log_path.display()
+        ));
+    } else {
+        ui::say(&format!(
+            "  {} spawned the daemon but it did not come up within 5s - output: {}",
+            ui::paint(ui::Tone::Warn, "!"),
+            log_path.display()
+        ));
     }
+    Ok(())
 }
 
 /// Stop the daemon through its service manager, if one owns it. Returns true
@@ -10598,10 +10531,8 @@ async fn handle_warm_req(
         // Reconfigure is handled inline in the daemon loop (it mutates loop state),
         // so it never reaches this dispatcher; answer defensively if it ever does.
         ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
-        ctl::ReqKind::Arm { key_id, expiry } => {
-            crate::ephemeral::arm(key_id.clone(), *expiry);
-            req.reply(&json!({ "ok": true })).await;
-        }
+        // ReqKind::Arm is gone: the mint writes armed.json directly (no IPC),
+        // and the per-tick arm-gate reads it. See cli/src/armed.rs.
         // ReloadExpose is likewise handled inline in the daemon loop (it owns the
         // Exposer); answer defensively if it ever reaches here.
         ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
@@ -14917,14 +14848,14 @@ async fn recv_cmd(
             if let Some(ready) = ctl_ready.take() {
                 let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
             }
-            if crate::ephemeral::is_armed() {
+            if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
                 ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
-            if crate::ephemeral::is_armed() {
+            if crate::armed::is_armed() {
                 if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                     if !c.contains(&ek) { c.push(ek); }
@@ -15783,7 +15714,7 @@ async fn recv_cmd(
         // would otherwise never subscribe and no ephemeral device could enroll.
         if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
             let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-            let armed = crate::ephemeral::is_armed();
+            let armed = crate::armed::is_armed();
             let subscribed = sess.channels.contains(&ek);
             if armed && !subscribed {
                 sess.channels.push(ek.clone());
