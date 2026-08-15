@@ -1,10 +1,111 @@
 # Mesh networking: why filament stays pairwise
 
-> Status: decided (2026-07-16). This note records a design question that was
-> taken seriously, explored exhaustively, and deliberately answered "no." It
-> exists so the next person (or agent) who proposes a mesh control plane can see
-> the reasoning already done, rather than re-run it. The near-term build list at
-> the bottom is the actionable part.
+> Status: **partly superseded (2026-08-15).** The 2026-07-16 analysis below
+> answered "should filament grow an open mesh control plane" and answered no.
+> That answer stands for what it was asked about. It was then read as "filament
+> is not a mesh", which is no longer the decision. Read the reconciliation
+> first; the original note is kept unedited underneath because its reasoning
+> about federation and transitive trust is still the reasoning we hold.
+
+## Reconciliation, 2026-08-15
+
+**filament is a mesh.** Specifically: every user has their own personal, private
+mesh. Two meshes can be connected, by a user sharing one device into another
+mesh. Two meshes can be merged. That is the model, and the line below saying
+"filament will not build a mesh" is stale.
+
+Sybil resistance is what the bounded shape buys. Membership in a mesh requires a
+signature from that mesh's owner, so nothing can insert itself. There is no open
+join, no admission policy to subvert, and no coordinator to compromise into
+membership. The mesh is bounded by whose key signed you in, which is the same
+property that makes the rest of the authorization model work.
+
+### What the original note got right and still holds
+
+- **No hub federation.** Unchanged.
+- **No transitive trust.** A device does not gain reach to a peer because two
+  hubs were paired. Connecting two meshes is an explicit act by an owner
+  sharing a specific device, not an emergent consequence of adjacency.
+- **No coordinator.** The meeting point still authorizes nobody and routes
+  nothing.
+- **The reachability layer is the private graph**, not an open substrate. That
+  is more true now, not less.
+
+### The premise that broke
+
+The note's sharpest argument against a control plane was this:
+
+> **The gossip has nothing to carry.** With authorization strictly device-level,
+> rosters and capabilities are per-pair [...] So the control plane has no job.
+
+That was sound when it was written. It is not sound now. Bounded invitations
+introduced a delegated principal whose authority comes from an owner-signed
+ceiling rather than from a pairing, so **membership now exists as an object**:
+the set of devices under an owner key, with their ceilings. That is exactly the
+payload the note said did not exist.
+
+Observed today on `b9808062`: alpha enrolled bravo, foxtrot and india. Each of
+the three lists only alpha, and each files alpha under `EXTERNAL / other people,
+deny-by-default`. So a spoke does not currently know it is in a mesh at all. The
+membership object exists only in the issuer's local index. That is the gap, and
+it is a real one now that meshes are meant to connect and merge.
+
+### The open question: O(1) without gossip
+
+Requirement: per-machine cost stays O(1) as a mesh grows. Note what that rules
+out.
+
+**Gossip is what breaks O(1), not what delivers it.** A gossiped roster means
+every node holds every member (O(N) state) and pays for every membership change
+(O(N) churn). It is the wrong tool for the stated requirement, which is a
+stronger reason to decline it than the one in the original note.
+
+O(1) per machine comes from resolving on demand instead of replicating. A device
+holds its own certificate plus a cache, and asks when it needs to reach someone.
+
+That leaves a three-way tension, and it is genuinely unresolved:
+
+1. O(1) state per machine, so no replicated roster.
+2. No gossip, so no peer-to-peer propagation.
+3. The meeting point holds no roster, per the constraint at the bottom of this
+   note, so it cannot answer membership queries either.
+
+All three cannot hold with a naive design. Options worth thinking through, none
+chosen:
+
+- **Owner's primary as the authority.** Membership queries go to the owner's
+  primary device. O(1) for every other device; O(N) at one machine the user
+  already controls. Fails when the primary is offline.
+- **Signed roster blob at the meeting point.** The owner authors a roster,
+  signs it, and the meeting point stores it as bytes it can neither read nor
+  forge. This arguably does not violate constraint 3: the server is not a source
+  of truth, it is carrying an object whose authority lives entirely under the
+  owner's key. Encrypting it to the members closes the metadata leak the note
+  worries about. Devices fetch on demand and cache, so steady state stays O(1).
+- **Connecting two meshes is an edge, not a merge of rosters.** A device shared
+  into another mesh is a cross-signed grant. The other mesh's members resolve it
+  the same way, against a scoped subset the owner chose to expose. Merging two
+  meshes is the harder case and needs its own treatment.
+
+The second option is the one that appears to thread all three constraints, and
+it is the one to attack first when this is picked up. It is written here as a
+candidate, not a decision.
+
+### Consequence for the near-term build list
+
+Nothing in the "Build" list below is invalidated. The "Do not build" list keeps
+hub federation, transitive trust, third-party store-and-forward, the centralized
+coordinator and the full decentralized overlay. What moves out of "do not build"
+is membership itself, which is now a first-class object and needs a home.
+
+`/root/filament-l3-plan.md` step 3 is titled "roster gossip via C30". Given the
+above, the title is wrong for the requirement even if the step is right: what is
+needed is roster *resolution*, and gossip is the implementation that O(1) rules
+out.
+
+---
+
+*Everything below is the original 2026-07-16 note, unedited.*
 
 ## Summary / decision
 
