@@ -3816,7 +3816,7 @@ fn tour_cmd() -> Result<()> {
         act("filament shell <device>", "open an authorized terminal");
     }
     act("filament receive", "receive once");
-    act("filament up", "serve: receive, mount, shell");
+    act("filament up", "serve: receive, mount (shell with --shell)");
     act("filament up --install", "the same, always-on");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  /  filament devices  /  filament id"));
     Ok(())
@@ -20579,6 +20579,119 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    #[test]
+    fn descriptions_of_a_verb_do_not_contradict_each_other() {
+        // Three fixes in a row landed in one of several copies of the same
+        // sentence and left the others. #202: `netcat` survived in six internal
+        // call sites. #220: the banner taught `mount <device>:<dir>`, a form
+        // mount rejects. #219: the banner was corrected to say `up` serves shell
+        // only with --shell, and tour_cmd went on promising "serve: receive,
+        // mount, shell" underneath it.
+        //
+        // The invariant is narrow enough to decide mechanically. Naming verb V
+        // inside the description of verb S is a promise that S provides V. If
+        // any surface qualifies that promise with the flag that buys it
+        // (`--shell`), no other surface may make it bare: one of the two is
+        // telling the user they get V for free when they do not.
+        //
+        // A surface is allowed to say LESS. The tour calls `send` "send
+        // something" where the banner mentions --to, and a summary is not a
+        // contradiction. Only bare-versus-flagged about the SAME verb is a lie,
+        // and that is the only thing asserted here.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let verbs: Vec<String> = cmd
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+
+        /// A bare occurrence: the verb as a whole word, so `--shell` (preceded
+        /// by a dash) and `shell-only` do not count as promising `shell`.
+        fn mentions_bare(desc: &str, verb: &str) -> bool {
+            let edge = |c: Option<char>| match c {
+                Some(c) => !(c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                None => true,
+            };
+            desc.match_indices(verb).any(|(i, _)| {
+                edge(desc[..i].chars().next_back()) && edge(desc[i + verb.len()..].chars().next())
+            })
+        }
+
+        // (surface name, subject verb, description)
+        let mut described: Vec<(&str, String, String)> = Vec::new();
+
+        // The help banner's COMMANDS section: a command column, two or more
+        // spaces, then the description.
+        let section = EXAMPLES.split("\nEXAMPLES").next().unwrap_or(EXAMPLES);
+        for line in section.lines() {
+            let t = line.trim();
+            let Some(gap) = t.find("  ") else { continue };
+            let (lhs, rhs) = t.split_at(gap);
+            let desc = rhs.trim();
+            let subject = lhs.split_whitespace().next().unwrap_or("");
+            if desc.is_empty() || !verbs.iter().any(|v| v == subject) {
+                continue;
+            }
+            described.push(("help banner", subject.to_string(), desc.to_string()));
+        }
+
+        // tour_cmd's `act("filament <verb> ...", "<desc>")` lines, read from the
+        // source: the tour is printed, not returned, so there is nothing to call.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let src = std::fs::read_to_string(format!("{manifest}/src/main.rs")).expect("read main.rs");
+        let tour = src
+            .split("fn tour_cmd")
+            .nth(1)
+            .expect("tour_cmd must exist for this test to mean anything");
+        for line in tour.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("act(\"filament ") else { continue };
+            let Some((lhs, rest)) = rest.split_once("\", \"") else { continue };
+            let Some((desc, _)) = rest.split_once('"') else { continue };
+            let subject = lhs.split_whitespace().next().unwrap_or("");
+            if !verbs.iter().any(|v| v == subject) {
+                continue;
+            }
+            described.push(("tour", subject.to_string(), desc.to_string()));
+        }
+
+        assert!(
+            described.iter().any(|(s, _, _)| *s == "tour"),
+            "no tour descriptions were parsed; the scan has drifted from the source and this test now proves nothing"
+        );
+
+        // For each subject, which verbs does some surface say cost a flag?
+        let mut flagged: std::collections::BTreeSet<(String, String)> = Default::default();
+        for (_, subject, desc) in &described {
+            for v in &verbs {
+                if v != subject && desc.contains(&format!("--{v}")) {
+                    flagged.insert((subject.clone(), v.clone()));
+                }
+            }
+        }
+
+        let mut bad = Vec::new();
+        for (surface, subject, desc) in &described {
+            for v in &verbs {
+                if v == subject || !flagged.contains(&(subject.clone(), v.clone())) {
+                    continue;
+                }
+                if mentions_bare(desc, v) && !desc.contains(&format!("--{v}")) {
+                    bad.push(format!(
+                        "  {surface}: '{subject}' is described as \"{desc}\", which promises '{v}' \
+                         with no flag, while another surface says '{v}' needs --{v}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "surfaces disagree about what a command provides:\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]
