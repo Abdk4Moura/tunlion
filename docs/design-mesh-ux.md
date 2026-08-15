@@ -1,8 +1,17 @@
 # Mesh membership: what the user sees
 
-> Status: proposed (2026-08-15). The model is in `docs/design-mesh-network.md`
-> (reconciliation section). This note is only the surface: what a person types,
-> what they read, and which sentences we are allowed to print.
+> Status: **proposed, and failed an adversarial review (2026-08-15). Do not
+> build from this yet.** Six screens below assert things the program cannot
+> establish, and two adjacent screens state opposite rules for promote and
+> demote. Findings are on the red-team review; the blocking question is how many
+> primaries there are and whether a primary may promote or demote, because
+> everything else is downstream of that answer. The model is in
+> `docs/design-mesh-network.md` (reconciliation section).
+>
+> Note also `docs/design-pairing-ux.md` rule 3, which this note reverses without
+> arguing the reversal: "'Primary' is a security role, not a convenience one,
+> resist the natural drift of making every device a primary 'so joining is
+> easier,' which dissolves the containment."
 
 The promise, in one line: **you add a device once and every other device knows
 it.** Everything below exists to make that true and to be honest on the
