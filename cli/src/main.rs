@@ -382,7 +382,14 @@ impl UiCapability {
                 }
             }
         } else {
-            anyhow::bail!("refusing {action} without --yes (non-interactive)");
+            // "to" belongs here, not in the callers. `action` is also the
+            // interactive prompt ("shut down the daemon [y/N]"), where an
+            // infinitive would read wrong, so one string is being asked to fit
+            // two grammars and only this side needs the particle. Without it
+            // every caller is ungrammatical in exactly one of the two modes:
+            // "refusing shut down the daemon", "refusing include deliberate
+            // remote authority in this invitation ceiling".
+            anyhow::bail!("refusing to {action} without --yes (non-interactive)");
         }
         Ok(())
     }
@@ -20198,6 +20205,20 @@ mod tests {
     fn confirm_non_interactive_without_yes_fails() {
         let caps = UiCapability { interactive: false, json: false, yes: false, color: false };
         assert!(caps.confirm("delete it").is_err());
+    }
+
+    #[test]
+    fn the_refusal_reads_as_a_sentence() {
+        // Shipped in 0.8.5 as "refusing shut down the daemon without --yes" and
+        // "refusing include deliberate remote authority in this invitation
+        // ceiling without --yes". One `action` string feeds both the imperative
+        // prompt and this infinitive refusal, so the particle has to live here.
+        let caps = UiCapability { interactive: false, json: false, yes: false, color: false };
+        let msg = caps.confirm("shut down the daemon").unwrap_err().to_string();
+        assert!(
+            msg.starts_with("refusing to "),
+            "the refusal must read as a sentence, got: {msg}"
+        );
     }
 
     #[test]
