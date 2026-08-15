@@ -14,7 +14,8 @@ pub struct DeviceEntry {
     /// omits the status rather than asserting a falsehood (#217).
     pub online: Option<bool>,
     pub caps_summary: String,    // e.g. "OWNER-EQUIVALENT shell reach:8080 inbox"
-    pub countdown: String,       // e.g. "renews in 9m" or "expires in 4m"
+    pub countdown: String,       // e.g. "expires in 4m" or "expired 2026-05-01"
+                                 // Not "renews in ...": nothing renews (#236).
     pub last_seen: Option<String>, // e.g. "2h ago"
     pub needs_promote: bool,
 }
@@ -214,7 +215,7 @@ mod tests {
                 tier: DeviceTier::Fleet,
                 online: Some(true),
                 caps_summary: "OWNER-EQUIVALENT shell reach:8080 inbox".into(),
-                countdown: "renews in 9m".into(),
+                countdown: "expires in 9m".into(),
                 last_seen: None,
                 needs_promote: false,
             },
