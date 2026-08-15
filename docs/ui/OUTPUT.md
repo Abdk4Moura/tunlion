@@ -31,6 +31,61 @@ The test for a line: **what would have to be true for this sentence to be a
 lie, and does the code rule that out?** If it does not rule it out, weaken the
 sentence or strengthen the check.
 
+## A true sentence can still be the bug
+
+The rule above catches false statements. This one catches the harder case: a
+statement that is **exactly true** and creates a false belief anyway. It passes
+review, because review asks whether the sentence is true and it is.
+
+The example is `revoke`, which printed:
+
+```
+revoked 'laptop'; it is denied on reconnect
+```
+
+Every word is accurate. It is also the whole of #235: a device that never
+disconnects is never denied, so a held-open mount kept serving files created
+after the revoke. The limitation was stated, precisely, in the success message
+of the verb, and everyone who read it, including the person who later quoted it
+as evidence the mitigation worked, read it as a guarantee.
+
+Two names worth knowing, because the fix differs at each layer. **Paltering** is
+the deception-literature term for a true statement chosen because the impression
+it leaves is false; the finding that matters is that people who palter judge
+themselves honest, because they check their sentence rather than the belief it
+produced. **Vacuous truth** is the formal version: a property over an empty set
+holds and asserts nothing.
+
+### The question to ask, which is checkable
+
+"Is this misleading?" is useless in review, because it requires the reviewer to
+already know the answer. This is not:
+
+> **A guarantee conditioned on an event is only as strong as your control over
+> that event.** Any security statement of the form "X happens on E" must name who
+> controls E. If the adversary does, the statement is vacuous at their
+> discretion.
+
+"Denied on reconnect" is universally quantified over reconnections and the
+attacker decides whether any occur. "Will learn about it when it next connects"
+has the same shape. So does any future "revoked everywhere" that depends on
+delivery.
+
+Where the honest sentence cannot be unconditional, state the bound you can
+actually deliver. "Loses access within 10 minutes of hearing, or when its roster
+expires" is worth more than "denied on reconnect", because the reader can act on
+a number and cannot act on a condition they do not control.
+
+### It is the same defect as an unfalsifiable test
+
+`cli/src/main.rs` once asserted `is_filament_process(std::process::id())` where
+the test binary is named `filament-<hash>`, so the input could not fail and the
+check was never exercised (#224). **A test that cannot fail and a sentence that
+cannot be false are the same defect in different materials.**
+
+The red-before-green rule on the gate board catches the executable case. Nothing
+automatic catches the prose case, which is why it is written down here.
+
 ## stdout and stderr are different audiences
 
 **stdout is for machines.** JSON under `--json`, tokens, paths, anything a user
