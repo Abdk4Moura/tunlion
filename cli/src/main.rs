@@ -17429,8 +17429,14 @@ async fn recv_cmd(
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
                         enqueue_if_requestable(who, "shell");
+                        // Carry the specific cap reason (e.g. "not in auth key caps",
+                        // "device revoked") to the peer; the generic string was
+                        // produced and then thrown away before it crossed the wire,
+                        // so the initiator read an empty success instead of the
+                        // refusal. The fallback stays coarse on purpose.
+                        let reason = granted.deny_reason("shell capability not granted");
                         let _ = t
-                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
                             .await;
                         continue;
                     }

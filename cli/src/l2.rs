@@ -117,6 +117,22 @@ impl Drop for PtyGuard {
     }
 }
 
+/// What the acceptor answered to an initiator's open (mount-open / pty-open).
+/// One channel per stream id, shared by every verb, so a new open kind inherits
+/// the denial path instead of silently starting without one (the lesson of the
+/// mount-only `mount_ack_tx`, which left pty with no way to learn why it was
+/// refused).
+enum OpenOutcome {
+    /// The acceptor acked the open. The carried control JSON is the verb's ack
+    /// payload (mount-open-ack carries `caps`; pty-open-ack carries nothing).
+    Opened(serde_json::Value),
+    /// The acceptor closed the stream with an explicit reason (a real refusal).
+    Refused(String),
+    /// The stream closed with no ack and no reason: we never established that
+    /// the peer opened anything.
+    ClosedWithoutAck,
+}
+
 /// The multiplexer: routes inbound control/data frames to per-stream pipes and
 /// owns stream-id allocation. Transport-agnostic, it rides above the trait.
 pub struct Mux {
@@ -131,11 +147,14 @@ pub struct Mux {
     /// inbound `l2-close` (`on_close`), the session task exit (`drop_pty`), and
     /// link/mux death (`shutdown_all`), closing the resizer-map leak.
     resizers: Mutex<HashMap<u32, mpsc::UnboundedSender<(u16, u16)>>>,
-    /// mount: per-sid oneshot senders for delivering mount-open-ack caps back to
-    /// the caller that issued open_mount_stream. pump_initiator receives the ack
-    /// control message, resolves the sid, and sends the caps; open_mount_stream
-    /// awaits the receiver. Cleaned up on stream teardown.
-    mount_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>>>,
+    /// per-sid oneshot senders delivering the acceptor's answer to an open back
+    /// to the caller that issued it (mount-open via `open_mount_stream`, pty-open
+    /// via `pty_attach_once`). pump_initiator receives the ack control message
+    /// (mount-open-ack / pty-open-ack), resolves the sid, and sends `Opened`;
+    /// an inbound l2-close (`on_close`) sends `Refused`/`ClosedWithoutAck`. The
+    /// caller awaits the receiver. Shared across verbs and keyed by stream id, so
+    /// a denial carries a reason for every open kind instead of just mount.
+    open_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<OpenOutcome>>>,
 }
 
 impl Mux {
@@ -146,7 +165,7 @@ impl Mux {
             next_sid: AtomicU32::new(0),
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
-            mount_ack_tx: Mutex::new(HashMap::new()),
+            open_ack_tx: Mutex::new(HashMap::new()),
         })
     }
 
@@ -224,6 +243,7 @@ impl Mux {
     /// resize sender for this sid (H-1: no resizer outlives its stream).
     async fn drop_stream(&self, sid: u32) {
         self.resizers.lock().await.remove(&sid);
+        self.open_ack_tx.lock().await.remove(&sid);
         if let Some(s) = self.streams.lock().await.remove(&sid) {
             if let Some(h) = s.read_pump {
                 h.abort();
@@ -283,15 +303,21 @@ impl Mux {
     /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
     async fn on_close(&self, sid: u32, err: Option<&str>) {
-        // Deliver any pending mount-open waiter its denial: an l2-close is the
-        // peer saying NO (authorization, ceiling, stream cap), and the reason it
-        // carries must reach the caller as a denial, not as a mystery timeout.
-        // #206: the acceptor already sends `l2-close{err: not authorized: mount
-        // capability required}` on a ceiling refusal; before this, the reason
-        // was dropped here and the initiator read a generic channel-closed.
-        if let Some(tx) = self.mount_ack_tx.lock().await.remove(&sid) {
-            let reason = err.unwrap_or("connection closed by the peer").to_string();
-            let _ = tx.send(Err(reason));
+        // Deliver any pending open waiter its answer: an l2-close is the peer
+        // saying NO (authorization, ceiling, stream cap, acceptor off), and the
+        // reason it carries must reach the caller as a denial, not as a mystery
+        // timeout. #206: the acceptor sends `l2-close{err: ...}` on a refusal;
+        // before this, the reason was dropped here and the initiator read a
+        // generic channel-closed. A close WITHOUT an err is a different fact
+        // (we never established the peer opened anything) and is delivered as
+        // `ClosedWithoutAck` so the caller can say that instead of inventing a
+        // cause.
+        if let Some(tx) = self.open_ack_tx.lock().await.remove(&sid) {
+            let outcome = match err {
+                Some(reason) => OpenOutcome::Refused(reason.to_string()),
+                None => OpenOutcome::ClosedWithoutAck,
+            };
+            let _ = tx.send(outcome);
         }
         self.drop_stream(sid).await;
     }
@@ -300,7 +326,7 @@ impl Mux {
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
-        self.mount_ack_tx.lock().await.clear();
+        self.open_ack_tx.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -1657,12 +1683,11 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                         mux.on_open_ack(sid).await;
                     }
                 }
-                Some("mount-open-ack") => {
+                Some("mount-open-ack") | Some("pty-open-ack") => {
                     if let Some(sid) = wire_sid(&v) {
-                        let mut ack_map = mux.mount_ack_tx.lock().await;
+                        let mut ack_map = mux.open_ack_tx.lock().await;
                         if let Some(tx) = ack_map.remove(&sid) {
-                            let caps = v.get("caps").cloned().unwrap_or(serde_json::Value::Null);
-                            let _ = tx.send(Ok(caps));
+                            let _ = tx.send(OpenOutcome::Opened(v.clone()));
                         }
                     }
                 }
@@ -1793,15 +1818,15 @@ pub(crate) async fn open_mount_stream(
         .register(sid)
         .await
         .ok_or_else(|| anyhow!("mount open: sid {sid:#x} already in use"))?;
-    let (tx, caps_rx) = tokio::sync::oneshot::channel();
-    mux.mount_ack_tx.lock().await.insert(sid, tx);
+    let (tx, outcome_rx) = tokio::sync::oneshot::channel();
+    mux.open_ack_tx.lock().await.insert(sid, tx);
     let encoded = crate::mount_proto::path_encode(std::path::Path::new(root));
     mux.transport
         .send_control(&json!({ "type": "mount-open", "sid": sid, "root": encoded }))
         .await?;
-    let caps_value = tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        caps_rx,
+        outcome_rx,
     )
     .await
     .map_err(|_| anyhow::anyhow!("mount-open-ack not received (timed out)"))?
@@ -1810,7 +1835,11 @@ pub(crate) async fn open_mount_stream(
     // stream cap) carrying a reason. It must surface as a denial, never as a
     // transport-shaped timeout. Silence still means timeout; a refusal is never
     // silent.
-    let caps_value = caps_value.map_err(|reason| anyhow::anyhow!("mount denied by {reason}"))?;
+    let caps_value = match outcome {
+        OpenOutcome::Opened(v) => v.get("caps").cloned().unwrap_or(serde_json::Value::Null),
+        OpenOutcome::Refused(reason) => return Err(anyhow!("mount denied by {reason}")),
+        OpenOutcome::ClosedWithoutAck => return Err(anyhow!("mount denied by connection closed by the peer")),
+    };
     let caps = crate::mount_proto::parse_mount_caps(caps_value)?;
     // Send mount-cap-ack: the client confirms it accepts the server's caps.
     let _ = mux.transport.send_control(&json!({
@@ -2162,6 +2191,13 @@ enum PtyOutcome {
     /// The link died under us (transport not alive) - the remote PTY session may
     /// still be alive on the acceptor; reconnect and REATTACH the same session.
     Dropped,
+    /// The acceptor refused the open with an explicit reason (no shell cap,
+    /// acceptor off, stream cap, ...). Nonzero, print the reason.
+    Refused(String),
+    /// The stream closed (or never answered) before we could confirm the peer
+    /// opened a shell. Nonzero, with a weaker sentence rather than a confident
+    /// wrong one.
+    Unconfirmed(String),
 }
 
 /// A single, process-lifetime reader of fd0 for the resumable pty client.
@@ -2264,6 +2300,18 @@ async fn pty_attach_once(
         .await
         .ok_or_else(|| anyhow!("pty open: sid {sid:#x} already in use"))?;
 
+    // Register the open waiter BEFORE the pty-open goes out, so an ack/close that
+    // races back cannot be lost. Only the FIRST attach needs this: a resume that
+    // finds no session is a clean end (the acceptor says "no such session"), not a
+    // denial, and exit 0 is correct there.
+    let ack_rx = if resume {
+        None
+    } else {
+        let (tx, rx) = tokio::sync::oneshot::channel::<OpenOutcome>();
+        mux.open_ack_tx.lock().await.insert(sid, tx);
+        Some(rx)
+    };
+
     // Real terminal: query the ACTUAL tty size (crossterm asks the tty via
     // ioctl), NOT the COLUMNS/LINES shell vars which are usually unexported and
     // leave a TUI rendering at a stale size. Fall back to env/defaults for a pipe.
@@ -2291,6 +2339,43 @@ async fn pty_attach_once(
         })
         .await?;
     diag.up("tunnel", "datachannel-or-direct");
+
+    // Exit 0 must mean "the peer told me it opened". Wait (bounded) for the
+    // pty-open-ack before committing to the session, so a refusal, a silent
+    // close, or a black hole all become nonzero instead of an empty-success.
+    // `-- true` stays exit 0: the ack arrives, then the clean l2-close follows.
+    if let Some(ack_rx) = ack_rx {
+        let outcome = tokio::time::timeout(Duration::from_secs(10), ack_rx).await;
+        match outcome {
+            Ok(Ok(OpenOutcome::Opened(_))) => {}
+            Ok(Ok(OpenOutcome::Refused(reason))) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Refused(reason));
+            }
+            Ok(Ok(OpenOutcome::ClosedWithoutAck)) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Unconfirmed(format!(
+                    "could not confirm '{peer}' opened a shell (the connection closed before it answered)"
+                )));
+            }
+            Ok(Err(_)) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Unconfirmed(format!(
+                    "could not confirm '{peer}' opened a shell (the link closed)"
+                )));
+            }
+            Err(_) => {
+                mux.drop_stream(sid).await;
+                pump.abort();
+                return Ok(PtyOutcome::Unconfirmed(format!(
+                    "no answer from '{peer}' - it may be unresponsive or running a build that does not ack shell opens"
+                )));
+            }
+        }
+    }
 
     // Enable raw mode LAZILY, AFTER the establishment status lines have printed in
     // cooked mode (so `\n` still does CR+LF and they don't "staircase"). Held in
@@ -2528,6 +2613,25 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
         let resume = ever_connected || warm_ended;
         match pty_attach_once(server, peer, relay, role, &session_id, &term, &one_shot, interactive, resume, &mut raw, &mut stdin_rx, &mut pending).await {
             Ok(PtyOutcome::Exited) => return Ok(()),
+            Ok(PtyOutcome::Refused(reason)) => {
+                // The peer is up and said no. Nonzero with the reason; never a
+                // false success that would carry a `&&` pipeline forward.
+                crate::ui::problem(
+                    &format!("shell refused by '{peer}'"),
+                    &reason,
+                    &[format!(
+                        "grant shell on the peer: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament grant <this-device> shell"))
+                    )],
+                );
+                std::process::exit(1);
+            }
+            Ok(PtyOutcome::Unconfirmed(reason)) => {
+                // We could not establish that the peer opened a shell. Say the
+                // weaker true sentence rather than a confident wrong one.
+                crate::ui::problem(&format!("shell could not be confirmed on '{peer}'"), &reason, &[]);
+                std::process::exit(1);
+            }
             Ok(PtyOutcome::Dropped) => {
                 // Non-tty (scripted) sessions don't resume; a drop is the end.
                 if !interactive {
