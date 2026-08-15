@@ -14,11 +14,28 @@ mesh. Two meshes can be connected, by a user sharing one device into another
 mesh. Two meshes can be merged. That is the model, and the line below saying
 "filament will not build a mesh" is stale.
 
-Sybil resistance is what the bounded shape buys. Membership in a mesh requires a
-signature from that mesh's owner, so nothing can insert itself. There is no open
-join, no admission policy to subvert, and no coordinator to compromise into
-membership. The mesh is bounded by whose key signed you in, which is the same
-property that makes the rest of the authorization model work.
+**There is no open join.** Membership in a mesh requires a signature descending
+from that mesh's owner, so nothing can insert itself. No admission policy to
+subvert, no coordinator to compromise into membership. The mesh is bounded by
+whose key signed you in, which is the same property that makes the rest of the
+authorization model work.
+
+That is the true claim and it is deliberately weaker than the one that stood
+here until 2026-08-15, which said "Sybil resistance is what the bounded shape
+buys." Adversarial review took that apart three ways and it was right each time.
+It is **vacuous today**, because Sybil resistance only means something relative
+to something that counts identities, and nothing in the mesh counts: no vote, no
+quorum, no majority. It **breaks exactly where counting arrives**, because once
+k-of-n primaries exist, a single compromised primary can add devices and promote
+them, each descending from an owner-delegated signer and each a distinct
+identity, so k-of-n resists a compromised primary no better than 1-of-n. And it
+**does not survive a merge**, because any owner may legitimately sign unlimited
+devices into their own mesh, so merging with them imports that unbounded minting
+capability. Owner-signature resistance is a per-mesh property; merge is a
+cross-mesh operation.
+
+No-open-join holds, is worth having, and does not imply the rest. Do not restore
+the stronger sentence without a mechanism that counts and a reason it is safe.
 
 ### What the original note got right and still holds
 
@@ -49,6 +66,33 @@ the three lists only alpha, and each files alpha under `EXTERNAL / other people,
 deny-by-default`. So a spoke does not currently know it is in a mesh at all. The
 membership object exists only in the issuer's local index. That is the gap, and
 it is a real one now that meshes are meant to connect and merge.
+
+### A ceiling belongs to a (mesh, device) pair, never to a device
+
+Stated separately because an implementer reading "membership is a set of
+devices with their ceilings" will key on the device public key, and that is a
+defect rather than a shortcut.
+
+Alice shares device D into Bob's mesh, so D appears in both rosters. Alice's
+ceiling on D and Bob's ceiling on D constrain different things: what D may do
+*in Alice's mesh* and what D may do *in Bob's*. Key a roster on the device and
+any merge rule that takes the narrower of two ceilings will apply Bob's across
+the boundary. Concretely, Alice shares her NAS into Bob's mesh so he can drop
+files, Bob narrows its ceiling inside his own mesh as he is entitled to do, and
+**Alice can no longer mount her own NAS**. An outsider turned off a capability
+inside her mesh without compromising anything.
+
+So a roster is a set of `(issuing root, device, ceiling)` triples, and there is
+no cross-mesh comparison of ceilings at all.
+
+The general lesson is worth keeping in front of whoever builds this: that
+failure is #226 and #228 in their purest form, two places computing authority
+for what looks like the same subject while using different keys for identity.
+
+It also refutes a rule of thumb that sounds safe. "When two statements disagree,
+take the lesser authority" is wrong when the capability being removed is itself
+a recovery path. Availability is a security property when the unavailable thing
+is what you recover with.
 
 ### The open question: O(1) without gossip
 
