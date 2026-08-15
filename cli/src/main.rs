@@ -4161,8 +4161,26 @@ fn format_approval_expiry(expires: u64) -> String {
         .unwrap_or_else(|| expires.to_string())
 }
 
-fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
+/// How long this device's certificate has left, in the words of what actually
+/// happens to it.
+///
+/// #236: Fleet used to get "renews in 87d", and an already-expired Fleet cert
+/// got "renews until <a date in the past>" while External got "expired" for the
+/// same condition. Nothing renews. `DeviceCert::certify` is reached only from
+/// init, recover, enrollment/join and pairing cert storage: no timer, no
+/// opportunistic-on-connect path, no verb. The wording came from
+/// docs/design-pairing-ux.md rule 2, "auto-renewed by a primary while the device
+/// is in good standing", which was designed and never built, so the string was
+/// describing a security model the product does not have. Meanwhile the gate
+/// fails the cert at exactly the moment the screen said it would renew.
+///
+/// The tier no longer changes the sentence, because the tier does not change
+/// the fact. If renewal is ever built, this is where the distinction earns its
+/// way back, and not before.
+fn device_countdown(_tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
     let Some(cert) = cert else {
+        // #191: `devices promote` does not exist yet. Left as-is deliberately;
+        // it is entangled with an open decision about primaries.
         return "promote to continue".to_string();
     };
     let now = identity::now_secs();
@@ -4170,10 +4188,7 @@ fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity:
         let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
             .map(|at| at.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "expired".to_string());
-        return match tier {
-            fleet_ui::devices::DeviceTier::Fleet => format!("renews until {date}"),
-            _ => format!("expired {date}"),
-        };
+        return format!("expired {date}");
     }
     // Round UP to the nearest whole unit, so a cert issued for 90 days reads
     // "90d", not "129600m" or a seconds figure a few seconds short of the day.
@@ -4187,10 +4202,7 @@ fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity:
     } else {
         format!("{secs}s")
     };
-    match tier {
-        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {text}"),
-        _ => format!("expires in {text}"),
-    }
+    format!("expires in {text}")
 }
 
 fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
@@ -20205,6 +20217,51 @@ mod tests {
     fn confirm_non_interactive_without_yes_fails() {
         let caps = UiCapability { interactive: false, json: false, yes: false, color: false };
         assert!(caps.confirm("delete it").is_err());
+    }
+
+    #[test]
+    fn the_countdown_does_not_promise_a_renewal() {
+        // #236: `device_countdown` told Fleet devices "renews in 87d" when
+        // nothing renews, and told an ALREADY EXPIRED cert "renews until
+        // <date>" with a date in the past, in a branch guarded by
+        // `cert.expires <= now`. The External arm of the same match said
+        // "expired", correctly, so one function described the same fact two
+        // ways depending on the tier.
+        //
+        // There is no renewal. `DeviceCert::certify` is reached only from init,
+        // recover, enrollment/join and pairing cert storage: no timer, no
+        // opportunistic-on-connect path, no verb. The copy was written to
+        // docs/design-pairing-ux.md rule 2, which was never built, so the string
+        // was the last surviving trace of a security model the product does not
+        // have, reassuring users about the mechanism that model promised would
+        // protect them.
+        use fleet_ui::devices::DeviceTier;
+        let mk = |expires: u64| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([0x42u8; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": expires,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let now = identity::now_secs();
+        let live = mk(now + 87 * 86400);
+        let dead = mk(now.saturating_sub(86400));
+
+        for tier in [DeviceTier::Fleet, DeviceTier::External] {
+            for cert in [&live, &dead] {
+                let s = device_countdown(tier, Some(cert));
+                assert!(
+                    !s.contains("renew"),
+                    "the countdown must not promise a renewal that nothing performs, got {s:?}"
+                );
+            }
+        }
+        // And the expired case must read as expired rather than as a future
+        // promise about a date that has gone.
+        let s = device_countdown(DeviceTier::Fleet, Some(&dead));
+        assert!(s.starts_with("expired"), "an expired cert must read as expired, got {s:?}");
     }
 
     #[test]
