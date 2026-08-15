@@ -37,6 +37,58 @@ cross-mesh operation.
 No-open-join holds, is worth having, and does not imply the rest. Do not restore
 the stronger sentence without a mechanism that counts and a reason it is safe.
 
+### Decided 2026-08-15: enrolment and primacy are two rights, not one
+
+**Changing the set of primaries always needs the root. Changing the set of
+devices never does.**
+
+- **Enrolment delegation.** May add ordinary devices within a ceiling.
+  Short-lived, root-signed, held by as many devices as the owner likes. Cannot
+  touch the primary set.
+- **The primary right.** May change who is a primary. Root only, which in
+  practice means the recovery phrase. A primary may neither promote nor demote.
+- **Two primaries** by default. Not for convenience, which enrolment
+  delegations now cover, but so that losing one device does not drop the owner
+  into recovery-phrase-only operation.
+
+This started as a conflict and turned out not to be one. `design-pairing-ux.md`
+rule 3 says primary is a security role and warns against making every device one
+"so joining is easier". The owner's requirement is that adding a device works
+from whatever machine is in his hand. Those only collide while "may add a
+device" and "may change who may add devices" are the same right. Split them and
+both hold in full: enrolment works everywhere, and the containment rule 3 is
+protecting is untouched.
+
+Why each half is closed rather than merely chosen:
+
+**A primary may not promote.** Otherwise a stolen primary promotes a device the
+root has never seen, and demoting the stolen primary leaves the promoted one
+signing, which promotes another. Demotion stops being a bounded operation, and
+the recovery phrase does not recover the mesh.
+
+**A primary may not demote.** Otherwise a stolen primary demotes every other
+primary and becomes the sole remaining signer, and the root's removal then has
+to be delivered through a mesh where the attacker is the only authority left.
+
+**Two, not more.** Removal must reach every primary; renewal needs only one to
+have missed it. An expired device shops for the primary that has not heard about
+its removal, and the attacker chooses which one to ask, so the defender needs
+unanimity while the attacker needs a single stale observer. Each additional
+primary is another sampling point. Under "possibly every device is a primary"
+this is trivially exploitable, which is the second independent argument against
+the drift rule 3 warns about.
+
+**k-of-n is not being built.** It is the right long-term answer to coercion, it
+costs k devices awake for every membership change, and per the Sybil section
+above it buys no resistance against a compromised primary. It is a coercion
+mitigation wearing a Sybil costume. Later, deliberately, or not at all.
+
+Availability cost, which is the question that prompted this: promote and demote
+need the recovery phrase, both are rare, and both already have their ceremony
+designed. With every primary offline the owner can still **add devices**, since
+that is an enrolment delegation and not a primary right. So the cost falls
+entirely on rare operations and the common path is untouched.
+
 ### What the original note got right and still holds
 
 - **No hub federation.** Unchanged.
