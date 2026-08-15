@@ -2582,6 +2582,18 @@ fn principal_ceiling_for(name: &str) -> Option<Vec<String>> {
     )
 }
 
+/// The capabilities enforcement actually honours for this device: the enrollment
+/// ceiling for a delegated device (grant writes never widen it), or the grant
+/// store for a non-delegated device. The devices display renders from this, and
+/// `grant`/`revoke` consult the same `principal_ceiling_for` source, so none of
+/// the three surfaces hand-writes the delegated/ceiling verdict and drifts.
+fn effective_device_caps(name: &str) -> Vec<String> {
+    match principal_ceiling_for(name) {
+        Some(ceiling) => ceiling,
+        None => device_caps(name).unwrap_or_else(|| vec!["transfer".to_string()]),
+    }
+}
+
 /// Path-explicit core of `device_caps` (testable without touching the global
 /// config-dir env var).
 #[allow(dead_code)]
@@ -4296,7 +4308,7 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                 Some(cert) if owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
                 Some(_) => fleet_ui::devices::DeviceTier::External,
             };
-            let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+            let caps = effective_device_caps(&name);
             let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
             let address = stored_v6.or(stored_v4);
             let last_seen = (last_seen > 0).then(|| {
@@ -11582,7 +11594,7 @@ async fn main() -> Result<()> {
                 let Some((_, secret)) = entry else {
                     bail!("no device named '{name}', see `filament devices`");
                 };
-                let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+                let caps = effective_device_caps(&name);
                 let channel = channel_of(secret);
                 // Load lastSeen and overlay addresses from the device store.
                 let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
@@ -11782,7 +11794,7 @@ async fn main() -> Result<()> {
                                 json!({
                                     "name": n,
                                     "channel": channel_of(s),
-                                    "caps": device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]),
+                                    "caps": effective_device_caps(n),
                                     "lastSeen": last_seen,
                                     "address": addr,
                                     "mesh": mesh,
@@ -12037,6 +12049,21 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             // Original device grant path (unchanged)
+            // A delegated device's authority comes from its enrollment ceiling,
+            // which enforcement reads from its fleet certificate; a grant targets
+            // a key the device never presents, so it cannot bind. Refuse rather
+            // than report a success enforcement will not honour.
+            if let Some(ceiling) = principal_ceiling_for(&device) {
+                if ceiling.iter().any(|c| c == &capability) {
+                    bail!(
+                        "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
+                    );
+                }
+                bail!(
+                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  filament add --for {device} --allow {capability} --yes",
+                    ceiling.join(", ")
+                );
+            }
             device_set_cap(&device, &capability, true, None)?;
             // If identity layer is active, also issue an owner-signed CapOp
             if let Ok(Some(user_key)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
@@ -12175,6 +12202,20 @@ async fn main() -> Result<()> {
             let capability = capability
                 .ok_or_else(|| anyhow!("capability is required unless --certificate is set"))?;
             let capability = crate::capability::canonical_capability(&capability)?;
+            // A delegated device's authority comes from its enrollment ceiling, not
+            // a grant, so revoking a capability from it cannot bind. Name the thing
+            // that does work: revoking the certificate.
+            if let Some(ceiling) = principal_ceiling_for(&device) {
+                if ceiling.iter().any(|c| c == &capability) {
+                    bail!(
+                        "'{capability}' cannot be revoked from {device}: its access comes from the enrollment ceiling on its fleet certificate, not from a grant. Revoke the certificate:\n  filament revoke {device} --certificate"
+                    );
+                }
+                bail!(
+                    "'{capability}' is not granted to {device} (its invitation ceiling is {}); nothing to revoke",
+                    ceiling.join(", ")
+                );
+            }
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false, None)?;
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so
