@@ -1550,6 +1550,28 @@ fn devices_path() -> PathBuf {
     crate::platform::Paths::config_path("devices.json")
 }
 
+/// Lock, read, mutate, and atomically write devices.json. The read-modify-write
+/// is atomic across processes via the `devices.json.lock` sidecar (#238), so the
+/// daemon's liveness sweep and a concurrent `grant`/`revoke`/`add`/`join` cannot
+/// lose each other's update (a lost update is a revoke that reports success and
+/// does not persist). The closure runs on the freshly-read array; if it returns
+/// Err the file is NOT written (a bail must not clobber a valid store), and if
+/// the store cannot be read or parsed the write is skipped too.
+fn with_devices_mut<T>(f: impl FnOnce(&mut Vec<Value>) -> Result<T>) -> Result<T> {
+    let _lock = crate::platform::DevicesFileLock::acquire()?;
+    let p = devices_path();
+    let mut arr: Vec<Value> = match std::fs::read_to_string(&p) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse devices.json: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(anyhow::anyhow!("read devices.json: {e}")),
+    };
+    let out = f(&mut arr)?;
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
+        .context("atomic write devices.json")?;
+    Ok(out)
+}
+
 /// Pure merge step (no I/O): upsert the (secret, cert, caps, scope) fields for `name`
 /// into `arr` as ONE record, returning the final stored name (auto-suffixed on a
 /// new-name collision). This is the atomicity-relevant step: secret and cert land in
@@ -1664,15 +1686,10 @@ pub(crate) fn devices_upsert_atomic(
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).context("create config dir")?;
     }
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    let final_name = upsert_peer_record(&mut arr, name, secret, cert, caps, scope, user_key_hex, delegated);
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).context("serialize devices")?)
-        .context("atomic write devices.json")?;
-    Ok(final_name)
+    with_devices_mut(|arr| {
+        let final_name = upsert_peer_record(arr, name, secret, cert, caps, scope, user_key_hex, delegated);
+        Ok(final_name)
+    })
 }
 
 pub(crate) fn devices_load() -> Vec<(String, String)> {
@@ -1982,16 +1999,13 @@ impl RevokeRecheck {
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
 fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).unwrap_or_default();
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
-        bail!("device '{name}' is not in the device store");
-    };
-    device["certRevoked"] = json!(revoked);
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
-        .context("atomic write devices.json")?;
-    Ok(())
+    with_devices_mut(|arr| {
+        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+            bail!("device '{name}' is not in the device store");
+        };
+        device["certRevoked"] = json!(revoked);
+        Ok(())
+    })
 }
 
 /// Terminal principal states written to `principalState` on a device record.
@@ -2027,29 +2041,26 @@ fn enrollment_refusal(prior: &Value) -> Option<String> {
 /// on every reconnect, and a cert renewal must not clear it (the writer has no
 /// clearing line). `principalState`/`revokedAt` are display only.
 fn set_device_revoked(name: &str, revoked: bool) -> Result<()> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).unwrap_or_default();
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
-        bail!("device '{name}' is not in the device store");
-    };
-    device["certRevoked"] = json!(revoked);
-    if revoked {
-        device["revokedAt"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
-        device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
-    } else {
-        if let Some(map) = device.as_object_mut() {
-            map.remove("revokedAt");
+    with_devices_mut(|arr| {
+        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+            bail!("device '{name}' is not in the device store");
+        };
+        device["certRevoked"] = json!(revoked);
+        if revoked {
+            device["revokedAt"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+            device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
+        } else {
+            if let Some(map) = device.as_object_mut() {
+                map.remove("revokedAt");
+            }
+            // Restore returns the device to its pre-revoke state: if it was lapsed
+            // the sweeper's marker stays, otherwise clear the terminal state.
+            if device["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
+                device["principalState"] = Value::Null;
+            }
         }
-        // Restore returns the device to its pre-revoke state: if it was lapsed
-        // the sweeper's marker stays, otherwise clear the terminal state.
-        if device["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
-            device["principalState"] = Value::Null;
-        }
-    }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
-        .context("atomic write devices.json")?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Mark delegated records whose effective deadline has passed as lapsed.
@@ -2085,14 +2096,7 @@ fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 /// Sweep the device store for lapsed delegated records. Called periodically by
 /// the daemon. Returns how many records newly lapsed.
 fn devices_sweep_lapsed(now: u64) -> usize {
-    let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return 0 };
-    let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return 0 };
-    let changed = sweep_lapsed(&mut arr, now);
-    if changed > 0 {
-        let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
-    }
-    changed
+    with_devices_mut(|arr| Ok(sweep_lapsed(arr, now))).unwrap_or(0)
 }
 
 fn load_owner_key() -> Option<crate::identity::UserKey> {
@@ -2487,26 +2491,23 @@ fn clear_provisional_identity(name: &str) {
 /// Called on each connect so `filament addr <device>` can show recency and addresses.
 fn devices_touch(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    devices_touch_at(name, v6, v4, now);
+    let _ = devices_touch_at(name, v6, v4, now);
 }
 
 /// Clock-injectable form of `devices_touch` so the liveness tests can advance
 /// time without sleeping. The production call site passes the real wall clock.
-fn devices_touch_at(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>, now: u64) {
-    let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return };
-    let Ok(val) = serde_json::from_str::<Value>(&raw) else { return };
-    let Some(arr) = val.as_array() else { return };
-    let mut arr = arr.clone();
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(name) {
-            d["lastSeen"] = json!(now);
-            if let Some(v6) = v6 { d["overlayV6"] = json!(v6.to_string()); }
-            if let Some(v4) = v4 { d["overlayV4"] = json!(v4.to_string()); }
-            break;
+fn devices_touch_at(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>, now: u64) -> Result<()> {
+    with_devices_mut(|arr| {
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some(name) {
+                d["lastSeen"] = json!(now);
+                if let Some(v6) = v6 { d["overlayV6"] = json!(v6.to_string()); }
+                if let Some(v4) = v4 { d["overlayV4"] = json!(v4.to_string()); }
+                break;
+            }
         }
-    }
-    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
+        Ok(())
+    })
 }
 
 /// Read the `lastSeen` timestamp and overlay addresses for a known device.
@@ -2703,71 +2704,63 @@ fn device_allows(name: &str, capability: &str) -> bool {
 /// Returns Err if the device is unknown (you can't grant a stranger a shell).
 fn device_set_cap(name: &str, capability: &str, grant: bool, expires: Option<u64>) -> Result<()> {
     let capability = crate::capability::canonical_capability(capability)?;
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p)
-        .map_err(|_| anyhow::anyhow!("no known device named '{name}', pair first"))?;
-    let mut arr: Vec<Value> = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
     let mut found = false;
-    for d in arr.iter_mut() {
-        if d["name"].as_str() != Some(name) {
-            continue;
-        }
-        found = true;
-        // Current caps: v1 (absent) reads as the transfer baseline.
-        let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
-            Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
-            None => vec!["transfer".to_string()],
-        };
-        caps.retain(|c| c != &capability);
-        if grant {
-            caps.push(capability.to_string());
-        }
-        if let Some(obj) = d.as_object_mut() {
-            obj.insert("v".into(), json!(2));
-            obj.insert("caps".into(), json!(caps));
-            let mut cap_expires = obj.get("capExpires").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    with_devices_mut(|arr| {
+        for d in arr.iter_mut() {
+            if d["name"].as_str() != Some(name) {
+                continue;
+            }
+            found = true;
+            // Current caps: v1 (absent) reads as the transfer baseline.
+            let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
+                Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
+                None => vec!["transfer".to_string()],
+            };
+            caps.retain(|c| c != &capability);
             if grant {
-                if let Some(expiry) = expires {
-                    cap_expires.insert(capability.to_string(), json!(expiry));
+                caps.push(capability.to_string());
+            }
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("v".into(), json!(2));
+                obj.insert("caps".into(), json!(caps));
+                let mut cap_expires = obj.get("capExpires").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                if grant {
+                    if let Some(expiry) = expires {
+                        cap_expires.insert(capability.to_string(), json!(expiry));
+                    } else {
+                        cap_expires.remove(&capability);
+                    }
                 } else {
                     cap_expires.remove(&capability);
                 }
-            } else {
-                cap_expires.remove(&capability);
+                obj.insert("capExpires".into(), json!(cap_expires));
+                let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                if grant && expires.is_some() {
+                    sources.insert(capability.to_string(), json!("legacy"));
+                } else {
+                    sources.remove(&capability);
+                }
+                obj.insert("capSources".into(), json!(sources));
             }
-            obj.insert("capExpires".into(), json!(cap_expires));
-            let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            if grant && expires.is_some() {
-                sources.insert(capability.to_string(), json!("legacy"));
-            } else {
-                sources.remove(&capability);
-            }
-            obj.insert("capSources".into(), json!(sources));
         }
-    }
-    if !found {
-        return Err(anyhow::anyhow!(
-            "no known device named '{name}', run `filament devices` to see who you've paired"
-        ));
-    }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
-    Ok(())
+        if !found {
+            return Err(anyhow::anyhow!(
+                "no known device named '{name}', run `filament devices` to see who you've paired"
+            ));
+        }
+        Ok(())
+    })
 }
 
 fn mark_bounded_cap_source(name: &str, capability: &str, source: &str) -> Result<()> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p)?;
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else { bail!("unknown device '{name}'") };
-    let obj = device.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid device record"))?;
-    let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-    sources.insert(capability.to_string(), json!(source));
-    obj.insert("capSources".into(), json!(sources));
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
-    Ok(())
+    with_devices_mut(|arr| {
+        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else { bail!("unknown device '{name}'") };
+        let obj = device.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid device record"))?;
+        let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        sources.insert(capability.to_string(), json!(source));
+        obj.insert("capSources".into(), json!(sources));
+        Ok(())
+    })
 }
 
 /// Add the authoritative owner-signed bounded grant when the peer is certified.
@@ -2814,14 +2807,10 @@ fn devices_remove(name: &str) -> Result<()> {
     // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
     // addedAt). The old tuple round-trip rewrote every survivor as bare
     // {name, secret}, silently wiping their `shell` grants on any forget.
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    arr.retain(|d| d["name"].as_str() != Some(name));
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
-    Ok(())
+    with_devices_mut(|arr| {
+        arr.retain(|d| d["name"].as_str() != Some(name));
+        Ok(())
+    })
 }
 
 pub(crate) fn channel_of(secret: &str) -> String {
@@ -4790,22 +4779,21 @@ fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::InvitationV2) -> Resul
 /// Mark a device record lapsed immediately (advisory depart, or manual). The
 /// record is KEPT (option b): evidence survives. Returns the device name.
 fn mark_lapsed_now(device_pub: &[u8; 32]) -> Option<String> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).ok()?;
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
     let key = hex::encode(device_pub);
-    let name = arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
-        .and_then(|d| d["name"].as_str().map(str::to_string))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(&name) {
-            d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
-            d["lapsedAt"] = json!(now);
-            break;
+    with_devices_mut(|arr| {
+        let name = arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+            .and_then(|d| d["name"].as_str().map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("device not in the store"))?;
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some(&name) {
+                d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
+                d["lapsedAt"] = json!(now);
+                break;
+            }
         }
-    }
-    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
-    Some(name)
+        Ok(name)
+    }).ok()
 }
 
 /// The joined device's owner record: the stored device whose cert chains to our
@@ -11909,24 +11897,20 @@ async fn main() -> Result<()> {
                 Some(DevicesAction::Rename { old, new }) => {
                     // Rename in place on the raw record so caps/v2 fields ride
                     // along (remove+store dropped the renamed device's caps).
-                    let p = devices_path();
-                    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-                        .ok()
-                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default();
-                    if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
-                        bail!("no device named '{old}', see `filament devices`");
-                    }
-                    if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
-                        bail!("'{new}' already exists, forget it first or pick another name");
-                    }
-                    for d in arr.iter_mut() {
-                        if d["name"].as_str() == Some(old.as_str()) {
-                            d["name"] = json!(new);
+                    with_devices_mut(|arr| {
+                        if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
+                            bail!("no device named '{old}', see `filament devices`");
                         }
-                    }
-                    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+                        if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
+                            bail!("'{new}' already exists, forget it first or pick another name");
+                        }
+                        for d in arr.iter_mut() {
+                            if d["name"].as_str() == Some(old.as_str()) {
+                                d["name"] = json!(new);
+                            }
+                        }
+                        Ok(())
+                    })?;
                     println!("renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)");
                 }
                 Some(DevicesAction::Vouch { a, b }) => {
@@ -17058,23 +17042,17 @@ async fn recv_cmd(
                                                 }
                                                 // Check takeover guard and scope-aware anchor before promoting
                                                 {
-                                                    let p = devices_path();
-                                                    if let Ok(raw) = std::fs::read_to_string(&p) {
-                                                        if let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) {
-                                                            // For promote, use Device-scope as fixed convention for pair
-                                                            let scope = crate::identity::IntroScope::Device.to_byte();
-                                                            match identity::apply_peer_identity(&mut arr, &who, &prov_cert, scope) {
-                                                                Ok(_) => {
-                                                                    // Write durable anchor only after overlay assertion passes
-                                                                    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
-                                                                    clear_provisional_identity(&who);
-                                                                }
-                                                                Err(e) => {
-                                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  takeover guard at overlay establishment: {}", e)));
-                                                                    clear_provisional_identity(&who);
-                                                                    continue;
-                                                                }
-                                                            }
+                                                    // For promote, use Device-scope as fixed convention for pair
+                                                    let scope = crate::identity::IntroScope::Device.to_byte();
+                                                    match with_devices_mut(|arr| identity::apply_peer_identity(arr, &who, &prov_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))) {
+                                                        Ok(_) => {
+                                                            // Write durable anchor only after overlay assertion passes
+                                                            clear_provisional_identity(&who);
+                                                        }
+                                                        Err(e) => {
+                                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  takeover guard at overlay establishment: {}", e)));
+                                                            clear_provisional_identity(&who);
+                                                            continue;
                                                         }
                                                     }
                                                 }
@@ -20530,14 +20508,14 @@ mod tests {
 
         // t0: the link comes up. The connect handler observes it once.
         let t0 = 1_000_000u64;
-        devices_touch_at("quietbox", None, None, t0);
+        devices_touch_at("quietbox", None, None, t0).unwrap();
         let (last_seen, _, _) = devices_info("quietbox").unwrap();
         assert_eq!(last_seen, t0);
 
         // Hold the link open with ZERO traffic for 15s, longer than the 10s
         // budget. The periodic observation (link still up) refreshes lastSeen.
         let t1 = t0 + 15;
-        devices_touch_at("quietbox", None, None, t1);
+        devices_touch_at("quietbox", None, None, t1).unwrap();
         let (last_seen, _, _) = devices_info("quietbox").unwrap();
         assert_eq!(last_seen, t1, "the periodic observation advanced lastSeen with no traffic at all");
         let (deadline, clock) = effective_principal_deadline(far, Some(far), Some(last_seen), Some(budget));

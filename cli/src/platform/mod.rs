@@ -289,6 +289,94 @@ impl filament_id::KeyStore for PlatformKeyStore {
     }
 }
 
+// --------------------------------------------------------- DevicesFileLock --
+
+/// An exclusive advisory lock on the `devices.json.lock` sidecar, held for the
+/// lifetime of the guard. Coordinates the read-modify-write of `devices.json`
+/// across processes (#238): the store itself is written by atomic replace
+/// (temp + rename), so a lock on the store inode would be replaced out from
+/// under a holder. The sidecar is never replaced.
+///
+/// Unix: flock(LOCK_EX). Windows: LockFileEx. Other platforms: the file is
+/// opened but not locked (filament targets unix + windows).
+pub struct DevicesFileLock {
+    _file: std::fs::File,
+}
+
+impl DevicesFileLock {
+    /// Acquire the lock, blocking until it is available.
+    pub fn acquire() -> anyhow::Result<Self> {
+        let path = Paths::config_dir().join("devices.json.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(anyhow::anyhow!(
+                    "flock devices.json.lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::LockFileEx;
+            let handle = file.as_raw_handle() as HANDLE;
+            // Lock the first u32::MAX bytes at offset 0 (a zeroed OVERLAPPED).
+            // Blocking (no LOCKFILE_FAIL_IMMEDIATELY).
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            let ok = unsafe {
+                LockFileEx(
+                    handle,
+                    windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    overlapped.as_mut_ptr(),
+                )
+            };
+            if ok == 0 {
+                return Err(anyhow::anyhow!(
+                    "LockFileEx devices.json.lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(DevicesFileLock { _file: file })
+    }
+}
+
+impl Drop for DevicesFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self._file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+            let handle = self._file.as_raw_handle() as HANDLE;
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, overlapped.as_mut_ptr()) };
+        }
+    }
+}
+
 // --------------------------------------------------------- ServiceHost --
 
 /// The detected service manager on this platform.
