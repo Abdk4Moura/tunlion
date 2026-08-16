@@ -1922,7 +1922,7 @@ fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
 /// must judge by binding strength, trust floor and grants. An unknown DEVICE
 /// (a device_pub with no record) is likewise not revoked; it is a fresh peer
 /// the normal gate decides by consent and grants.
-fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
+pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
 
@@ -17698,7 +17698,10 @@ async fn recv_cmd(
                     let transport = t.clone();
                     let spawn_sid = sid;
                     let proto_version = caps.protocol_version;
-                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version, read_only);
+                    // #235: hand the peer's device key down so the live session can re-ask
+                    // the gate. Resolved above for the open decision; the same value.
+                    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version, read_only, spawn_idev);
                 }
                 Some("pty-resize") if l2_enabled => {
                     let Some(sid) = l2::wire_sid(&v) else { continue };
