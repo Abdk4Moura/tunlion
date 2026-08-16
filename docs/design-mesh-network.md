@@ -300,13 +300,46 @@ hijack by a peer advertising a prefix it should not serve.
 `0.0.0.0/0`, which is what an exit node is, requires a separate and louder
 decision than a `/24`. Same mechanism, different consent.
 
-#### Exit nodes: yes, second, and same-mesh only
+#### Exit nodes: yes, and the cross-mesh case is already solved
 
 Technically an exit node is a subnet router advertising a default route, so it is
-nearly free once the prefix work exists. The risk profile is not free: the
-operator observes all traffic that is not otherwise encrypted. Inside your own
-mesh that is a machine you own. Across a connected mesh it is someone else, so a
-**cross-mesh exit node is forbidden**, not discouraged.
+nearly free once the prefix work exists. The risk is not free: the operator
+observes all traffic that is not otherwise encrypted.
+
+An earlier draft said a cross-mesh exit node is **forbidden**. That was wrong,
+and wrong twice. It is paternalistic, since people knowingly route traffic
+through operators they have chosen every time they use a VPN. And it is
+unnecessary, because the mechanism for the legitimate case already exists.
+
+**If Bob wants to give Alice egress, Bob shares that device into Alice's mesh.**
+Sharing a device is already a primitive, it already carries per-mesh ceilings
+keyed `(issuing root, device, ceiling)`, and the act of sharing is the explicit
+two-sided consent that a cross-boundary route otherwise lacks. From Alice's side
+it is then an ordinary intra-mesh exit node, governed by the rules above. No new
+concept, and the consent is a deliberate act rather than a checkbox.
+
+So the rule is not a prohibition, it is a placement:
+
+> **L3 crosses no mesh boundary. What crosses a boundary is either a shared
+> device, which becomes intra-mesh, or an L4 service, which is
+> capability-governed.**
+
+That line is principled rather than arbitrary. An L3 destination behind a router
+has no identity, so it can only be governed by prefix policy. An L4 service sits
+on an identified peer, so the capability system governs it and revocation works
+through the path that already exists. **Crossing a trust boundary should use the
+model that has identity in it.**
+
+**And for narrower cases there is already a tool.** `filament forward
+<peer>:<port> --socks` runs a SOCKS5 proxy through a peer. That is
+per-application rather than device-wide, does not capture DNS by default, is a
+service on an identified device so the capability system covers it, and is
+revocable through the normal path. Anyone who wants "route this one tool through
+my friend's connection" should get that, not a default route.
+
+The ergonomic cost is real and worth stating: cross-mesh egress is per-application
+unless the device is shared. That is the intended shape, since device-wide egress
+through someone else's machine should require them to have handed you the machine.
 
 #### What this reopens, stated honestly
 
