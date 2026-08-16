@@ -242,6 +242,85 @@ the shape `docs/ui/OUTPUT.md` now names.
 who needs to reach a printer that will never run filament needs a different tool.
 That half is accurate and does real work by naming what is excluded.
 
+### Decided 2026-08-16: subnet routers and exit nodes are IN scope
+
+This **reverses** the founding scope decision at the bottom of this note, which
+declined both. Recording the argument rather than letting the old line quietly
+disappear, because a guardrail that goes missing instead of being overturned is
+how #198 shipped and how `design-pairing-ux.md` rule 3 nearly went.
+
+**What the old decision got right, and why it no longer decides this.** The
+argument was: anything needing multi-hop segmented routing is out of scope,
+because "if two nodes already share a tailnet, that mesh has already connected
+them and filament adds nothing between them". That reasoning is about filament
+stacking *onto* another mesh to gain reach. Subnet routing is the opposite case:
+filament *being* the mesh, for devices that will never run it. A printer, a
+camera, a NAS appliance, a landlord's thermostat. The old argument does not
+address that case, it addresses a different one.
+
+**And the mechanism now exists.** `l3.rs` already runs a TUN with a route table
+that maps a destination to a peer transport and cryptokey-routes packets to it.
+It is keyed on a single `IpAddr`, so today it does host routes only. Subnet
+routing is that table keyed on a prefix with longest-match, not a new subsystem.
+`expose` and `forward` already do this one port at a time at L4; this is the same
+idea at L3.
+
+**Order: after revocation, not before.** Subnet routing multiplies the
+consequence of every revocation defect currently open. A revoked device that
+keeps an established session (#235) today keeps a mount; with a subnet route it
+keeps a path into a LAN. Widening reach before revocation binds is the wrong
+sequence, so this lands after #235, renewal, and membership distribution.
+
+#### The constraint that must not be relaxed
+
+**Destinations behind a subnet router have no filament identity, so the
+capability system cannot govern them.** A printer at `192.168.1.50` has no key,
+no certificate and no ceiling. Access to it can only be governed by prefix policy
+on the router.
+
+That means a **second authorization model**, living beside the first. Given that
+#226 and #228 were both literally "two places compute authority and disagree",
+this has to be structurally separated rather than carefully coordinated:
+
+- Prefix policy on the router is the **sole** authority for identity-less
+  destinations.
+- It must be impossible to express a capability grant that resolves to a bare IP.
+- A device's ceiling governs what it may ask *the router* to do, and never what
+  lies behind it.
+
+If those three cannot be enforced by construction, this should not ship.
+
+#### Route acceptance is local, explicit, and never automatic
+
+An advertisement is an **offer**. Acceptance is local configuration. This keeps
+the invariant that the roster is never an authorization input, since the roster
+may carry the offer while only local state decides, and it forecloses route
+hijack by a peer advertising a prefix it should not serve.
+
+`0.0.0.0/0`, which is what an exit node is, requires a separate and louder
+decision than a `/24`. Same mechanism, different consent.
+
+#### Exit nodes: yes, second, and same-mesh only
+
+Technically an exit node is a subnet router advertising a default route, so it is
+nearly free once the prefix work exists. The risk profile is not free: the
+operator observes all traffic that is not otherwise encrypted. Inside your own
+mesh that is a machine you own. Across a connected mesh it is someone else, so a
+**cross-mesh exit node is forbidden**, not discouraged.
+
+#### What this reopens, stated honestly
+
+The old note declined hub federation partly on the grounds that federation's
+value "genuinely reappears in one place: segmented / enterprise networks [...]
+That is precisely the subnet-router / exit-node space filament chose not to
+enter." Entering that space removes that justification.
+
+Federation is still declined, on the surviving argument rather than that one:
+accepting a route is a local decision by a device about a peer it already
+authorized, which is delegated reachability. It is not transitive trust, because
+no device gains authority over a new principal, and nothing is authorized on
+anyone's behalf.
+
 ### A ceiling belongs to a (mesh, device) pair, never to a device
 
 Stated separately because an implementer reading "membership is a set of
