@@ -130,11 +130,13 @@ reachable, that peer is the rendezvous for the mesh. The hosted server is a hard
 fallback, not the normal path. A user may change which hosted server is their
 fallback, and `--server` / `FILAMENT_SERVER` already allows this.
 
-**Optional, and separable.** A user may additionally volunteer their public peer
-as a rendezvous for strangers. Nothing depends on anyone doing this.
+**Considered and dropped.** Volunteering a public peer as a rendezvous for
+strangers was part of the original proposal. It does not survive #237 and is not
+being built; the reasoning is below, because it is the kind of idea that returns.
 
 Preference order: public peers in your own mesh, then any rendezvous explicitly
-configured, then the hosted fallback.
+configured, then the hosted fallback. Volunteering to strangers was considered
+and dropped; see below.
 
 #### Why this is worth doing beyond ideology
 
@@ -169,18 +171,36 @@ self-declaration, and the verification result is per-observer.
 nobody notices, which is the same never-flaky discipline as the transport work,
 applied to a new dependency.
 
-**The one that looks solved.** Volunteering for strangers seems to need a trust
-decision and does not: rendezvous cannot read or forge anything, so a malicious
-volunteer can only deny service or observe metadata, and metadata observation is
-what the user is escaping by not using a hosted server in the first place. So
-volunteering is a **capacity** question, not a trust question.
+**The one that looked solved, and does not.** Volunteering appeared to need no
+trust decision, on the reasoning that a rendezvous can neither read nor forge, so
+a hostile one could only deny service or observe metadata. That is wrong, and
+`#237` is why: the rendezvous is not a courier in this protocol, it is an
+**oracle**. `direct.rs` asks it for our own public address over `/api/whoami` and
+advertises the answer as a candidate unchecked, so a wrong answer kills the
+direct path and lands the pair on relay. If the same party relays, it has
+converted a signalling position into a data-path position: a rendezvous learns
+"A wanted B at time T" once, a relay observes volume and timing continuously.
 
-What it does need is discovery, and **discovery is where centralisation comes
-back in through the side door.** A directory of volunteered rendezvous is a
-coordinator with a different name, and it would hold exactly the kind of
-persistent state item 3 below rules out. Until someone has an answer, a
-volunteered address is passed out of band and configured explicitly, which keeps
-the optional case genuinely optional and adds no infrastructure.
+That changes the character of the third leg completely. Today, occupying that
+position requires being the hosted server, which is one known party. Volunteering
+makes it self-service, so **anyone who wants to sit on strangers' paths can opt
+in by running a peer and offering it.** That inverts the trust story rather than
+decentralising it.
+
+**So the third leg is dropped.** Own public peers need no discovery, because you
+already know them. Explicitly configured needs none, because the user chose it.
+Only strangers need a directory, and strangers are also the only case with the
+trust problem above, so cutting one optional feature removes both. Passing a
+volunteer's address out of band is not a neutral deferral either: it is
+trust-on-first-use with no authentication and no revocation path, on a party with
+path-selection power.
+
+If it is ever revisited, the peer-reflexive fix in #237 is a precondition and not
+a follow-up.
+
+**#237 is independent of all of this and should be fixed regardless**, because
+the hosted rendezvous has the same power today and the hosted relay is run by the
+same party.
 
 #### Relay gets the same treatment, separately
 
@@ -192,14 +212,35 @@ the same dependency wearing a different hat.
 
 #### Honest parity scorecard
 
-With this, filament matches Tailscale on **coordination decentralisation** and is
-ahead of it on trust model, since a Tailscale coordination server distributes
-policy and holds the node registry while a filament rendezvous holds neither.
+Written carefully, because this is the paragraph most likely to end up in launch
+copy and two earlier drafts of it overclaimed.
 
-It does not match Tailscale on **subnet routers and exit nodes**, which this note
-declines on purpose and still declines. "Tailscale replacement" is therefore true
-for a personal or small-team mesh of devices that each run filament, and false
-for someone who needs to reach a printer that never will. Say the true version.
+**What is true.** This removes a rendezvous dependency that Tailscale requires.
+A filament rendezvous holds no policy and no node registry.
+
+**What that is not.** It is not "matching Tailscale on coordination
+decentralisation". A Tailscale coordination server does rendezvous *and*
+distributes the node registry and keys. This decentralises rendezvous only.
+filament does not decentralise membership distribution because filament does not
+do membership distribution at all: on `b9808062` each spoke lists only the
+issuer. The scope is smaller, not the achievement larger.
+
+**And it is not "ahead of Tailscale on trust model", in the present tense.** Their
+coordination server holds a registry because something has to hold membership.
+When filament solves membership it will hold something too. The current candidate,
+an encrypted blob at a meeting point, genuinely is better, and it does not exist.
+
+**On "a Tailscale replacement for a personal mesh".** Defensible as an
+architectural statement, and dangerous as product copy, because a Tailscale user's
+baseline expectation is that removing a device removes its access, and today
+filament has no renewal, no membership distribution, and a revocation that does
+not tear down an established session (#235, live in 0.8.5). That sentence would
+be true about the architecture and read as a claim about the product, which is
+the shape `docs/ui/OUTPUT.md` now names.
+
+**What to keep saying:** filament declines subnet routers and exit nodes. Anyone
+who needs to reach a printer that will never run filament needs a different tool.
+That half is accurate and does real work by naming what is excluded.
 
 ### A ceiling belongs to a (mesh, device) pair, never to a device
 
