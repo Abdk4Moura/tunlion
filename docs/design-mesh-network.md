@@ -119,6 +119,88 @@ deny-by-default`. So a spoke does not currently know it is in a mesh at all. The
 membership object exists only in the issuer's local index. That is the gap, and
 it is a real one now that meshes are meant to connect and merge.
 
+### Rendezvous: prefer your own public peers, fall back to a hosted one
+
+Decided in principle 2026-08-16, mechanism open. This is items 1 and 2 of the
+signaling trajectory at the bottom of this note, promoted from "eventual" to
+"the default behaviour", plus one rule that was not there before.
+
+**The rule that is not optional.** If a mesh contains a peer that is publicly
+reachable, that peer is the rendezvous for the mesh. The hosted server is a hard
+fallback, not the normal path. A user may change which hosted server is their
+fallback, and `--server` / `FILAMENT_SERVER` already allows this.
+
+**Optional, and separable.** A user may additionally volunteer their public peer
+as a rendezvous for strangers. Nothing depends on anyone doing this.
+
+Preference order: public peers in your own mesh, then any rendezvous explicitly
+configured, then the hosted fallback.
+
+#### Why this is worth doing beyond ideology
+
+The hosted server's only powers are denial of service and metadata observation
+(see the trajectory below). Denial of service is already handled by fallback.
+**Metadata observation is the one that does not have an answer today**, and it is
+the whole of it: a hosted rendezvous sees who wants to connect to whom, across
+every mesh at once. Moving rendezvous onto a peer the user already owns removes
+that observation for that user entirely, rather than moving it somewhere more
+trustworthy. That is a categorical improvement, not an incremental one.
+
+#### Four things that have to be solved, and one that looks solved and is not
+
+**1. Both ends must choose the same rendezvous.** This is the one that breaks
+implementations. Signaling only works if both peers meet at the same place, so
+this cannot be a per-device preference: if A prefers A's public peer and B
+prefers B's, they never meet. It has to be a per-**mesh** ordered set, carried in
+the roster, so every member computes the same answer. Cross-mesh, the connection
+itself has to name one, because two meshes have two sets.
+
+**2. A new device has no roster.** It holds an invitation and nothing else, so
+the invitation is the bootstrap and must carry the rendezvous hint. That is a
+natural home for it and it means the invitation format has to change before any
+of this ships.
+
+**3. "Public" is a claim, and it is not binary.** A peer reachable from one
+network is not reachable from another, and a peer that advertises public and is
+not breaks rendezvous for the whole mesh. It needs verification rather than
+self-declaration, and the verification result is per-observer.
+
+**4. Availability.** A public peer that goes down must fail over fast enough that
+nobody notices, which is the same never-flaky discipline as the transport work,
+applied to a new dependency.
+
+**The one that looks solved.** Volunteering for strangers seems to need a trust
+decision and does not: rendezvous cannot read or forge anything, so a malicious
+volunteer can only deny service or observe metadata, and metadata observation is
+what the user is escaping by not using a hosted server in the first place. So
+volunteering is a **capacity** question, not a trust question.
+
+What it does need is discovery, and **discovery is where centralisation comes
+back in through the side door.** A directory of volunteered rendezvous is a
+coordinator with a different name, and it would hold exactly the kind of
+persistent state item 3 below rules out. Until someone has an answer, a
+volunteered address is passed out of band and configured explicitly, which keeps
+the optional case genuinely optional and adds no infrastructure.
+
+#### Relay gets the same treatment, separately
+
+Rendezvous and relay are different services and item 4 below already forbids
+assuming one implies the other. A public peer may serve either, both, or
+neither, and the preference order is computed per service. Tailscale parity needs
+both decentralised, since a DERP-equivalent that is always the hosted relay is
+the same dependency wearing a different hat.
+
+#### Honest parity scorecard
+
+With this, filament matches Tailscale on **coordination decentralisation** and is
+ahead of it on trust model, since a Tailscale coordination server distributes
+policy and holds the node registry while a filament rendezvous holds neither.
+
+It does not match Tailscale on **subnet routers and exit nodes**, which this note
+declines on purpose and still declines. "Tailscale replacement" is therefore true
+for a personal or small-team mesh of devices that each run filament, and false
+for someone who needs to reach a printer that never will. Say the true version.
+
 ### A ceiling belongs to a (mesh, device) pair, never to a device
 
 Stated separately because an implementer reading "membership is a set of
