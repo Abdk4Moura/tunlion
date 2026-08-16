@@ -41,6 +41,11 @@ pub const CAP_SHELL: &str = "shell";
 pub const CAP_TRANSFER: &str = "transfer";
 pub const CAP_MOUNT: &str = "mount";
 
+/// The wire reason a live session is closed with when the peer's certificate is
+/// revoked mid-session (#235/#235-shape). The initiator keys its remedy on this
+/// exact string, so it must be one shared value, never a substring sniff.
+pub const REVOKED_REASON: &str = "access revoked";
+
 pub const CANONICAL_CAPABILITIES: &[&str] = &[CAP_SHELL, CAP_TRANSFER, CAP_MOUNT];
 
 /// Scoped-default actions classified by the fleet gate.

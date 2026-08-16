@@ -155,6 +155,12 @@ pub struct Mux {
     /// caller awaits the receiver. Shared across verbs and keyed by stream id, so
     /// a denial carries a reason for every open kind instead of just mount.
     open_ack_tx: Mutex<HashMap<u32, tokio::sync::oneshot::Sender<OpenOutcome>>>,
+    /// A reason an inbound `l2-close` carried for a stream whose open waiter was
+    /// already consumed (i.e. a mid-session close). A revoked peer loses a live
+    /// shell/stream this way; the reason must reach the caller as a denial, not
+    /// be swallowed into a clean close. Entries for streams that never read them
+    /// linger only until link death (`shutdown_all`), bounded and harmless.
+    close_err: Mutex<HashMap<u32, String>>,
 }
 
 impl Mux {
@@ -166,6 +172,7 @@ impl Mux {
             accepted: Mutex::new(HashMap::new()),
             resizers: Mutex::new(HashMap::new()),
             open_ack_tx: Mutex::new(HashMap::new()),
+            close_err: Mutex::new(HashMap::new()),
         })
     }
 
@@ -318,8 +325,28 @@ impl Mux {
                 None => OpenOutcome::ClosedWithoutAck,
             };
             let _ = tx.send(outcome);
+        } else if let Some(reason) = err {
+            // Mid-session close: the open waiter is already consumed, so record
+            // the reason where the caller (the pty IO loop) can read it. A revoked
+            // peer loses a live session this way; the reason must surface as a
+            // denial, never a clean exit.
+            //
+            // Why this needs no buffer: this insert happens BEFORE drop_stream,
+            // and dropping the stream is what closes the pipe the consumer awaits,
+            // so the write happens-before the close the reader keys on, in program
+            // order. Do NOT "simplify" this by re-arming the open_ack_tx one-shot
+            // here: a one-shot slot can be empty at the instant on_close fires, and
+            // a denial delivered into that gap is silently lost. The always-present
+            // map, written before the close, cannot lose it.
+            self.close_err.lock().await.insert(sid, reason.to_string());
         }
         self.drop_stream(sid).await;
+    }
+
+    /// Take the mid-session close reason for a stream, if one was recorded, so the
+    /// caller can distinguish "the peer revoked us" from "the shell exited".
+    pub async fn take_close_err(&self, sid: u32) -> Option<String> {
+        self.close_err.lock().await.remove(&sid)
     }
 
     /// Data-channel died (or a send errored): tear down EVERY live stream so no
@@ -327,6 +354,7 @@ impl Mux {
     pub async fn shutdown_all(&self) {
         self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
         self.open_ack_tx.lock().await.clear();
+        self.close_err.lock().await.clear();
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -407,6 +435,10 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     rx: mpsc::Receiver<PipeItem>,
     send_close: bool,
     first: Option<PipeItem>,
+    // The peer's device key, for the acceptor's live-stream revocation re-check.
+    // `None` for the warm/initiator bridges, which do not gate the peer's
+    // liveness.
+    idev: Option<[u8; 32]>,
 ) {
     // Caller sets TCP_NODELAY where applicable (a unix socket has none); split
     // generically so the same plumbing serves a TcpStream OR a local UnixStream
@@ -441,6 +473,12 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     ticker.tick().await; // consume the immediate tick
     let mut reader_done = false;
     let mut read_result = None;
+    // #235-shape: a dedicated recheck ticker at the shared interval, so the
+    // revoke bound is not floored by the 2s liveness tick. The tick IS the
+    // cadence; the verdict is re-asked directly.
+    let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
+    revoke_ticker.tick().await; // consume the immediate first tick
+    let mut revoked_reason: Option<&'static str> = None;
     loop {
         tokio::select! {
             r = async { reader.as_mut().unwrap().await }, if !reader_done => {
@@ -468,18 +506,35 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     break;
                 }
             }
+            _ = revoke_ticker.tick() => {
+                // Re-ask the gate. A revoked peer loses the live forward; the
+                // denial is a close-with-reason so the client's connection breaks
+                // instead of hanging.
+                if crate::cert_revoked_for(idev.as_ref()) {
+                    crate::ui::critical("l2: peer revoked, closing the live stream");
+                    revoked_reason = Some(crate::capability::REVOKED_REASON);
+                    if let Some(r) = reader.take() { r.abort(); }
+                    writer.abort();
+                    read_result = None;
+                    break;
+                }
+            }
         }
     }
     // The stream may already be gone (teardown). Remove if still present.
     mux.streams.lock().await.remove(&sid);
     if send_close {
-        let close = match read_result {
-            Some(Ok(Ok(()))) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
-            Some(Ok(Err(e))) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
-            Some(Err(_aborted)) => return, // teardown owns the close; don't double-send
-            // Peer FIN or link death: ack a close so the peer reaps its half (a
-            // no-op if the transport is already gone).
-            None => json!({ "type": "l2-close", "sid": sid }),
+        let close = if let Some(reason) = revoked_reason {
+            json!({ "type": "l2-close", "sid": sid, "err": reason })
+        } else {
+            match read_result {
+                Some(Ok(Ok(()))) => json!({ "type": "l2-close", "sid": sid }), // clean FIN
+                Some(Ok(Err(e))) => json!({ "type": "l2-close", "sid": sid, "err": e.to_string() }),
+                Some(Err(_aborted)) => return, // teardown owns the close; don't double-send
+                // Peer FIN or link death: ack a close so the peer reaps its half (a
+                // no-op if the transport is already gone).
+                None => json!({ "type": "l2-close", "sid": sid }),
+            }
         };
         let _ = mux.transport.send_control(&close).await;
     }
@@ -677,6 +732,9 @@ pub async fn spawn_pty_session(
     term: &str,
     argv: Vec<String>,
     pty_guard: PtyGuard,
+    // The peer's device key, for the live session's revocation re-check. `None`
+    // (no resolved identity) is treated as not-revoked by `cert_revoked_for`.
+    idev: Option<[u8; 32]>,
 ) -> Option<PtySessionHandle> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read as _, Write as _};
@@ -769,6 +827,13 @@ pub async fn spawn_pty_session(
         // 5s tick to enforce the idle/lifetime caps without busy-waiting.
         let mut reaper = tokio::time::interval(Duration::from_secs(5));
         reaper.tick().await; // consume the immediate first tick
+        // #235-shape: a dedicated recheck ticker at the shared interval, so the
+        // revoke bound is NOT floored by the 5s reaper. The tick IS the cadence;
+        // the verdict is re-asked directly. The denial must reach the initiator
+        // as a denial (a reason + nonzero exit), never as a clean shell exit.
+        let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
+        revoke_ticker.tick().await; // consume the immediate first tick
+        let mut revoked_reason: Option<&'static str> = None;
 
         loop {
             tokio::select! {
@@ -853,16 +918,35 @@ pub async fn spawn_pty_session(
                         break;
                     }
                 }
+                _ = revoke_ticker.tick() => {
+                    // Re-ask the gate. A revoked peer loses the live shell: tell
+                    // the terminal, then close with a reason so the initiator
+                    // surfaces a nonzero exit rather than a clean one (#223).
+                    if crate::cert_revoked_for(idev.as_ref()) {
+                        crate::ui::critical("pty: peer revoked, closing the live session");
+                        revoked_reason = Some(crate::capability::REVOKED_REASON);
+                        if let Some(b) = &bind {
+                            let msg = format!("\r\n[filament: {}]\r\n", crate::capability::REVOKED_REASON);
+                            let _ = b.transport.send_frame(b.sid, 0, msg.as_bytes()).await;
+                        }
+                        break;
+                    }
+                }
             }
         }
 
-        // Teardown (shell exit, reap, or store removal): kill the shell, tell the
-        // currently-attached link (if any) the session ended, drop from the store.
+        // Teardown (shell exit, reap, revoke, or store removal): kill the shell,
+        // tell the currently-attached link (if any) the session ended, drop from
+        // the store.
         let _ = child.kill();
         let _ = child.wait();
         dead.store(true, Ordering::Release);
         if let Some(b) = &bind {
-            let _ = b.transport.send_control(&json!({ "type": "l2-close", "sid": b.sid })).await;
+            let close = match revoked_reason {
+                Some(reason) => json!({ "type": "l2-close", "sid": b.sid, "err": reason }),
+                None => json!({ "type": "l2-close", "sid": b.sid }),
+            };
+            let _ = b.transport.send_control(&close).await;
         }
         sessions_for_task.remove(&session_id_for_task).await;
     });
@@ -989,7 +1073,14 @@ impl Mux {
     /// Acceptor: dial the localhost target for an accepted open and relay. Sends
     /// l2-open-ack on success, l2-close{err} on dial failure. Runs as its own
     /// task (the event loop spawns it) so the dial never blocks routing.
-    pub async fn dial_and_serve(self: Arc<Self>, sid: u32, host: String, port: u16, rx: mpsc::Receiver<PipeItem>) {
+    pub async fn dial_and_serve(
+        self: Arc<Self>,
+        sid: u32,
+        host: String,
+        port: u16,
+        rx: mpsc::Receiver<PipeItem>,
+        idev: Option<[u8; 32]>,
+    ) {
         match TcpStream::connect((host.as_str(), port)).await {
             Ok(sock) => {
                 let _ = sock.set_nodelay(true);
@@ -1000,7 +1091,7 @@ impl Mux {
                     .transport
                     .send_control(&json!({ "type": "l2-open-ack", "sid": sid, "credit": 0 }))
                     .await;
-                serve_stream(self.clone(), sid, sock, rx, true, None).await;
+                serve_stream(self.clone(), sid, sock, rx, true, None, idev).await;
                 self.accepted.lock().await.remove(&sid);
             }
             Err(e) => {
@@ -1801,7 +1892,7 @@ pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Se
     first: PipeItem,
     rx: mpsc::Receiver<PipeItem>,
 ) {
-    serve_stream(mux, sid, sock, rx, true, Some(first)).await;
+    serve_stream(mux, sid, sock, rx, true, Some(first), None).await;
 }
 
 /// Open a mesh-native mount stream to the peer, sending `mount-open` with the
@@ -1908,7 +1999,7 @@ pub(crate) async fn serve_opened_stream<S: AsyncRead + AsyncWrite + Unpin + Send
     stream: S,
     rx: mpsc::Receiver<PipeItem>,
 ) {
-    serve_stream(mux, sid, stream, rx, true, None).await;
+    serve_stream(mux, sid, stream, rx, true, None, None).await;
 }
 
 /// Pump this process's stdio over a connected warm-reuse socket: stdin -> sock,
@@ -2435,6 +2526,7 @@ async fn pty_attach_once(
     ticker.tick().await; // consume the immediate tick
     let mut stdin_done = false; // fd0 hit EOF: stop reading it, keep pumping stdout
     let dropped;
+    let mut close_reason: Option<String> = None;
     loop {
         tokio::select! {
             item = rx_pipe.recv() => match item {
@@ -2442,8 +2534,13 @@ async fn pty_attach_once(
                     stdout.write_all(&bytes).await?;
                     stdout.flush().await?;
                 }
-                // Pipe closed: clean exit (l2-close, link still alive) vs drop.
-                _ => { dropped = !mux.transport().is_alive(); break; }
+                // Pipe closed: clean exit (l2-close, link still alive), a mid-session
+                // denial (l2-close{err}, the revoke case), or a drop.
+                _ => {
+                    dropped = !mux.transport().is_alive();
+                    close_reason = mux.take_close_err(sid).await;
+                    break;
+                }
             },
             chunk = stdin_rx.recv(), if !stdin_done => match chunk {
                 // Empty Vec = fd0 EOF: send the FIN once, then stop reading stdin but
@@ -2478,7 +2575,13 @@ async fn pty_attach_once(
         let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
     }
     pump.abort();
-    Ok(if dropped { PtyOutcome::Dropped } else { PtyOutcome::Exited })
+    match close_reason {
+        // A mid-session denial (revoke): nonzero with the reason, never a clean
+        // exit that would carry a `&&` pipeline forward (#223).
+        Some(reason) => Ok(PtyOutcome::Refused(reason)),
+        None if dropped => Ok(PtyOutcome::Dropped),
+        None => Ok(PtyOutcome::Exited),
+    }
 }
 
 /// Warm fast path for `filament pty`: if the local daemon already holds a link to
@@ -2616,13 +2719,23 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             Ok(PtyOutcome::Refused(reason)) => {
                 // The peer is up and said no. Nonzero with the reason; never a
                 // false success that would carry a `&&` pipeline forward.
+                // The remedy depends on WHICH refusal: a revoked certificate is
+                // not repaired by a grant, so the hint must not say "grant".
+                let hint = if reason == crate::capability::REVOKED_REASON {
+                    format!(
+                        "the peer's certificate was revoked; restore it with {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, "filament devices restore <this-device>")
+                    )
+                } else {
+                    format!(
+                        "grant shell on the peer: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament grant <this-device> shell"))
+                    )
+                };
                 crate::ui::problem(
                     &format!("shell refused by '{peer}'"),
                     &reason,
-                    &[format!(
-                        "grant shell on the peer: {}",
-                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament grant <this-device> shell"))
-                    )],
+                    &[hint],
                 );
                 std::process::exit(1);
             }
@@ -3344,7 +3457,7 @@ async fn serve_cold_connection(
         };
         match open_stream(&mux, rport).await {
             Ok((sid, rx_pipe)) => {
-                serve_stream(mux, sid, sock, rx_pipe, true, None).await;
+                serve_stream(mux, sid, sock, rx_pipe, true, None, None).await;
                 return;
             }
             Err(_) => {
@@ -4340,7 +4453,7 @@ mod h1_tests {
         // A duplex pair: one half is the bridge's "client socket", the other we keep
         // and NEVER write to, so the reader stays parked (the deadlock precondition).
         let (client, server_side) = tokio::io::duplex(1024);
-        let bridge = tokio::spawn(serve_stream(mux.clone(), sid, server_side, rx, true, None));
+        let bridge = tokio::spawn(serve_stream(mux.clone(), sid, server_side, rx, true, None, None));
         tokio::time::sleep(Duration::from_millis(50)).await; // let the reader park
         t.kill(); // transport dies with no clean FIN and no client input
         let r = tokio::time::timeout(Duration::from_secs(4), bridge).await;
@@ -4395,6 +4508,7 @@ mod h1_tests {
             "xterm-256color",
             vec!["/bin/cat".to_string()],
             guard,
+            None,
         )
         .await
         .expect("spawn");

@@ -1926,6 +1926,59 @@ pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
 }
 
+/// The revocation re-check interval, overridable for tests. Clamped so a
+/// misconfiguration cannot make the re-check effectively never run, or spin on a
+/// read-heavy stream by re-reading the device store every operation.
+pub(crate) fn revoke_recheck_interval() -> std::time::Duration {
+    let ms = std::env::var("FILAMENT_REVOKE_RECHECK_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0) // 0 and garbage mean "default", never "never re-check"
+        .unwrap_or(5_000);
+    std::time::Duration::from_millis(ms.clamp(250, 300_000))
+}
+
+/// Re-checks a live session's authorization on a bounded interval, so a revoked
+/// peer loses a long-lived stream (mount, pty, l2) without re-reading the device
+/// store per operation. The interval-and-verdict decision lives here, once,
+/// instead of being re-derived in each serve loop where it can drift (the shape
+/// of #226 and #228).
+///
+/// The caller MUST deliver the denial in a form its client can act on, then
+/// close. Returning silently is not enough: a client that just stops receiving
+/// parks where no signal lands (see #235's FUSE D-state).
+pub(crate) struct RevokeRecheck {
+    last: std::time::Instant,
+    interval: std::time::Duration,
+}
+
+impl RevokeRecheck {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            interval: revoke_recheck_interval(),
+        }
+    }
+
+    /// The re-check interval. Timer-driven loops (pty, l2) build a ticker at this
+    /// cadence and re-ask the verdict directly; the request-shaped mount uses
+    /// [`Self::revoked`] instead.
+    pub(crate) fn interval(&self) -> std::time::Duration {
+        self.interval
+    }
+
+    /// True when the interval has elapsed AND the peer is now revoked. The
+    /// caller re-checks at its natural cadence (per request for mount); the
+    /// interval bound inside keeps that cadence cheap.
+    pub(crate) fn revoked(&mut self, idev: Option<&[u8; 32]>) -> bool {
+        if self.last.elapsed() < self.interval {
+            return false;
+        }
+        self.last = std::time::Instant::now();
+        cert_revoked_for(idev)
+    }
+}
+
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
 fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
@@ -17227,7 +17280,11 @@ async fn recv_cmd(
                             .clone();
                         match mux.accept_control(&v, trusted, allow_nonloopback).await {
                             l2::OpenVerdict::Accept { sid, host, port, rx } => {
-                                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
+                                // The peer's device key, resolved again for the live
+                                // stream's revocation re-check (the gate above resolved
+                                // the same value for the open decision).
+                                let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx, spawn_idev));
                             }
                             l2::OpenVerdict::Deny { sid, err } => {
                                 // Log refused dials at INFO (visible by default,
@@ -17606,6 +17663,10 @@ async fn recv_cmd(
                     } else {
                         host.exec_cmd_args(&pty_cmd)
                     };
+                    // The peer's device key, resolved again for the live session's
+                    // revocation re-check (the gate above resolved the same value for
+                    // the open decision; this is that same value).
+                    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
                     match l2::spawn_pty_session(
                         pty_sessions.clone(),
                         session_id.clone(),
@@ -17616,6 +17677,7 @@ async fn recv_cmd(
                         &term,
                         argv,
                         pty_guard,
+                        spawn_idev,
                     )
                     .await
                     {

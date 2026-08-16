@@ -582,20 +582,6 @@ pub fn path_decode(encoded: &str) -> Result<PathBuf, MountError> {
 /// `proto_version` is the negotiated protocol version (advertised in
 /// mount-open-ack). v2+ uses binary data frames for Read/Write; v1 uses
 /// base64-inside-JSON (legacy, no server speaks this by default).
-/// How often a live mount re-asks whether the peer is still authorized.
-///
-/// #235: the capability gate runs once, at `mount-open`, and a mount is a
-/// long-lived channel whose file operations never re-enter it. So a revoked
-/// device kept reading, including files created after the revocation, until it
-/// chose to disconnect. Re-asking per operation would read `devices.json` on
-/// every `read`, so the verdict is cached for this long instead.
-///
-/// This is the bound the product can actually promise. "Immediately" is not
-/// deliverable and "on reconnect" is what the revoke message used to say, which
-/// was exactly true and read as a guarantee while the attacker controlled the
-/// condition. Whatever this value is, it belongs in that message.
-const REVOKE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
-
 pub fn spawn_mount_server(
     root: PathBuf,
     transport: Arc<dyn Transport>,
@@ -609,7 +595,7 @@ pub fn spawn_mount_server(
     idev: Option<[u8; 32]>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_check = std::time::Instant::now();
+        let mut recheck = crate::RevokeRecheck::new();
         let mut open_files: HashMap<u64, (std::fs::File, PathBuf)> = HashMap::new();
         let mut next_fh: u64 = 1;
         let mut buf = Vec::new();
@@ -651,46 +637,43 @@ pub fn spawn_mount_server(
                         continue;
                     }
                 };
-                // Re-ask the gate. Not per request: the verdict is cached for
-                // REVOKE_RECHECK so a read-heavy mount does not re-read the
-                // device store per operation.
-                if last_check.elapsed() >= REVOKE_RECHECK {
-                    last_check = std::time::Instant::now();
-                    if crate::cert_revoked_for(idev.as_ref()) {
-                        crate::ui::critical(&format!(
-                            "mount: peer revoked, closing the live session (sid {sid})"
-                        ));
-                        // Answer the in-flight request before tearing the stream
-                        // down, and then say so on the control channel. Returning
-                        // silently is NOT enough: the client is a FUSE filesystem
-                        // blocked in `request_wait_answer`, and a server that just
-                        // stops replying leaves every process touching the
-                        // mountpoint in uninterruptible D state, unkillable and
-                        // not even `fusermount -u`-able. Denial has to arrive as a
-                        // denial. EACCES gives the user "Permission denied"; the
-                        // l2-close ends the stream so later operations fail fast
-                        // instead of waiting for a reply that will never come.
-                        let resp = MountResponse {
-                            id: req.id,
-                            bin: None,
-                            result: MountResult::Err(MountError {
-                                code: EACCES,
-                                msg: "access revoked".into(),
-                            }),
-                        };
-                        let mut p = serde_json::to_vec(&resp).unwrap_or_default();
-                        p.push(b'\n');
-                        let payload = if v2 { encode_frame(&p, None) } else { p };
-                        let _ = transport.send_frame(sid, 0, &payload).await;
-                        let _ = transport
-                            .send_control(&serde_json::json!({
-                                "type": "l2-close",
-                                "sid": sid,
-                                "err": "access revoked",
-                            }))
-                            .await;
-                        return;
-                    }
+                // Re-ask the gate, rate-limited by the shared interval helper so a
+                // read-heavy mount does not re-read the device store per operation
+                // (#235).
+                if recheck.revoked(idev.as_ref()) {
+                    crate::ui::critical(&format!(
+                        "mount: peer revoked, closing the live session (sid {sid})"
+                    ));
+                    // Answer the in-flight request before tearing the stream
+                    // down, and then say so on the control channel. Returning
+                    // silently is NOT enough: the client is a FUSE filesystem
+                    // blocked in `request_wait_answer`, and a server that just
+                    // stops replying leaves every process touching the
+                    // mountpoint in uninterruptible D state, unkillable and
+                    // not even `fusermount -u`-able. Denial has to arrive as a
+                    // denial. EACCES gives the user "Permission denied"; the
+                    // l2-close ends the stream so later operations fail fast
+                    // instead of waiting for a reply that will never come.
+                    let resp = MountResponse {
+                        id: req.id,
+                        bin: None,
+                        result: MountResult::Err(MountError {
+                            code: EACCES,
+                            msg: crate::capability::REVOKED_REASON.into(),
+                        }),
+                    };
+                    let mut p = serde_json::to_vec(&resp).unwrap_or_default();
+                    p.push(b'\n');
+                    let payload = if v2 { encode_frame(&p, None) } else { p };
+                    let _ = transport.send_frame(sid, 0, &payload).await;
+                    let _ = transport
+                        .send_control(&serde_json::json!({
+                            "type": "l2-close",
+                            "sid": sid,
+                            "err": crate::capability::REVOKED_REASON,
+                        }))
+                        .await;
+                    return;
                 }
                 let (resp_body, resp_data) =
                     handle_mount_request(&root, &mut open_files, &mut next_fh, &req, bin.as_deref(), v2, read_only).await;
