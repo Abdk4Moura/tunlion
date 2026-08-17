@@ -6151,6 +6151,47 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     // the diagnostic timeline is diag.jsonl. Follow whichever exists; prefer
     // the console log when present (it is what a user means by "logs").
     let console = crate::platform::Paths::config_path("daemon.log");
+
+    // A daemon under a service manager writes to the journal, not to a file we
+    // own, so there is nothing here to read and there never will be. That is
+    // the DEFAULT path: first-run offers "Stay available in the background?"
+    // and installs a service, after which `filament logs` said "no log yet (the
+    // daemon writes it while it runs)" forever, on a daemon that was running
+    // and was writing plenty. The sentence blamed timing for a condition that
+    // does not change. Hand the user the journal instead.
+    if !console.exists() {
+        if let Some(pid) = daemon_alive() {
+            if let Some(mgr) = service_manager_for_pid(pid) {
+                let scope = match mgr {
+                    ServiceManager::SystemdSystem => "",
+                    ServiceManager::SystemdUser => "--user ",
+                };
+                let n = tail.max(1);
+                let follow_flag = if follow { "-f " } else { "" };
+                let cmd = format!("journalctl {scope}-u filament {follow_flag}-n {n} --no-pager");
+                ui::say(&format!(
+                    "  this daemon runs as a service (pid {pid}); its output goes to the journal"
+                ));
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
+                let status = std::process::Command::new("journalctl")
+                    .args(scope.split_whitespace())
+                    .args(["-u", "filament"])
+                    .args(if follow { vec!["-f"] } else { vec![] })
+                    .args(["-n", &n.to_string(), "--no-pager"])
+                    .status();
+                return match status {
+                    Ok(st) if st.success() => Ok(()),
+                    // Say which step failed. "no log yet" would be a third
+                    // wrong explanation for the same situation.
+                    _ => {
+                        ui::say("  could not read the journal here; run the command above directly");
+                        Ok(())
+                    }
+                };
+            }
+        }
+    }
+
     let path = if console.exists() { console } else { crate::platform::Paths::config_path("diag.jsonl") };
     let read_tail = |count: usize| -> Result<()> {
         let Ok(raw) = std::fs::read_to_string(&path) else {
