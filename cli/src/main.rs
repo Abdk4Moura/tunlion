@@ -12909,6 +12909,15 @@ async fn send_cmd(
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
+    // #230: `filament send <file>` with no --to and no --code used to fall
+    // through to local-network discovery and print a raw room id, while the bare
+    // `filament <file>` minted a speakable code. Same intent, two different
+    // experiences, and the banner documented the code on the verb that lacked
+    // it. The verb is the form people type, so default it to the code.
+    // Local discovery is still reachable with an explicit --room.
+    if !use_code && to.is_none() && room.is_none() {
+        use_code = true;
+    }
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
     if paths.is_empty() {

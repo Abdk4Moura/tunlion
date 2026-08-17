@@ -266,7 +266,7 @@ pub async fn mount_cmd(
             if let Some(g) = mp_guard.as_mut() { g.disarm(); }
             crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
             crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
-            crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+            crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
             return Ok(());
         }
         // Daemon not available or mount failed, fall through to direct spawn.
@@ -358,7 +358,7 @@ pub async fn mount_cmd(
             Ok(s) if s.success() => {
                 if let Some(g) = mp_guard.as_mut() { g.disarm(); }
                 crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path}"));
-                crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+                crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
                 Ok(())
             }
             Ok(s) => {
@@ -407,7 +407,7 @@ pub async fn mount_cmd(
         if let Some(g) = mp_guard.as_mut() { g.disarm(); }
         crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (id: {mount_id})"));
         crate::ui::say(&format!("  check with: filament mount --check {mount_id}"));
-        crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+        crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
 
         // Spawn monitor thread (not tokio, because we use std::process::Command).
         let monitor_local = local_path.clone();

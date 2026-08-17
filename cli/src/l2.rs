@@ -2886,7 +2886,7 @@ impl ForwardActivity {
         self.active.fetch_add(1, Relaxed);
         if !self.first.swap(true, Relaxed) {
             crate::ui::say(&format!(
-                "filament: first connection forwarded to {}:{} - the link is live",
+                "filament: first connection forwarded to {}:{}",
                 self.peer, self.rport
             ));
         }
