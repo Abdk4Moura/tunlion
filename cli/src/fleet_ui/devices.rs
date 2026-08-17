@@ -75,11 +75,13 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         lines.push(format!(
             "  {} {}",
             ui::paint(Tone::Warn, ui::glyph_review()),
-            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired before scoped trust; promote to sort into a tier")
+            ui::paint(Tone::Warn, "NEEDS REVIEW  /  paired without a certified identity, so trusted in full")
         ));
         for d in &review {
             lines.push(render_device_row(d));
-            lines.push(ui::paint(Tone::Dim, &format!("       ↳ filament devices promote {}", d.name)));
+            // #240: was `↳ filament devices promote <name>`, a verb that does
+            // not exist, rendered as the prescribed next step.
+            lines.push(ui::paint(Tone::Dim, "       ↳ its identity was never certified; re-pair to scope it"));
         }
         lines.push(String::new());
     }

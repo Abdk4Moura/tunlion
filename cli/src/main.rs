@@ -1933,6 +1933,38 @@ fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     }
 }
 
+/// Reject a peer name that is not in the device store, and say what IS.
+///
+/// #241: `reach DGMFA` on a name that had never been paired reported
+/// "unreachable, gave up at the establishing phase (~0ms) — DGMFA may be
+/// offline, or not running `filament up`". It described a lookup miss as a
+/// reachability outcome and sent the user to go and check a machine that was
+/// not in their store. The `~0ms` was the tell: it gave up instantly because
+/// there was nothing to look up.
+///
+/// The realistic case is a stale name, not a typo. A device that existed before
+/// a `filament reset` and came back under a different name is exactly what
+/// someone reaches for.
+///
+/// This is #221 in another verb. That one was fixed for `send --to` and left
+/// everywhere else, so the resolution lives here now and the verbs share it.
+///
+/// Listing the known names is the part that makes it a fix rather than a better
+/// error: the next question is always "then what is it called".
+pub(crate) fn require_known_device(name: &str) -> Result<()> {
+    let known: Vec<String> = devices_load().into_iter().map(|(n, _)| n).collect();
+    if known.iter().any(|n| n == name) {
+        return Ok(());
+    }
+    if known.is_empty() {
+        bail!("no device named '{name}'. You have not paired any devices yet: `filament add` to pair one");
+    }
+    bail!(
+        "no device named '{name}'. Known devices: {}\n  filament devices   to see them\n  filament add       to pair a new one",
+        known.join(", ")
+    )
+}
+
 /// #157 call-site derivation for the gate's `cert_revoked` input. A peer with
 /// NO resolved device identity is UNIDENTIFIED, not revoked: revocation is a
 /// decision about a KNOWN device, and an unidentified peer is one the gate
@@ -4226,9 +4258,11 @@ fn format_approval_expiry(expires: u64) -> String {
 /// way back, and not before.
 fn device_countdown(_tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
     let Some(cert) = cert else {
-        // #191: `devices promote` does not exist yet. Left as-is deliberately;
-        // it is entangled with an open decision about primaries.
-        return "promote to continue".to_string();
+        // #240: was "promote to continue", the SECOND source of that string
+        // after the row flag. No certificate means there is no expiry to count
+        // down to, and nothing is blocked, so the column says what is true and
+        // the tier heading carries the explanation.
+        return "no certificate".to_string();
     };
     let now = identity::now_secs();
     if cert.expires <= now {
@@ -4370,9 +4404,23 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                     format!("{}d ago", ago / 86400)
                 }
             });
-            let needs_promote = tier == fleet_ui::devices::DeviceTier::NeedsReview;
-            let caps_summary = if needs_promote {
-                "(full legacy trust)".to_string()
+            // #240: this tier is reached whenever a device has no stored
+            // certificate, which every code-flow pairing does. The row used to
+            // say "promote to continue" and print `filament devices promote
+            // <name>` underneath. Three things wrong at once: the verb does not
+            // exist (#191), nothing is blocked (a transfer to such a device
+            // works immediately, verified between two machines), and the tier
+            // heading blamed "paired before scoped trust" for a pairing made
+            // minutes earlier on the current build.
+            //
+            // So the row now states the condition and prescribes nothing. What
+            // is TRUE is that the peer's identity was never certified, so it is
+            // trusted in full rather than scoped. The tier's own design is #191
+            // and #195 and is not settled here; this only stops the screen
+            // asserting a blocked state and an impossible remedy.
+            let needs_promote = false;
+            let caps_summary = if tier == fleet_ui::devices::DeviceTier::NeedsReview {
+                "uncertified · trusted in full".to_string()
             } else {
                 device_caps_summary(&caps, tier)
             };
@@ -12056,7 +12104,10 @@ async fn main() -> Result<()> {
                 Some(d) if d.contains(':') => bail!(
                     "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `filament forward {d}`"
                 ),
-                Some(d) => crate::ping::ping_cmd(&server, &d, 1, json, relay).await,
+                Some(d) => {
+                    require_known_device(&d)?;
+                    crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                }
                 None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
             }
         },
