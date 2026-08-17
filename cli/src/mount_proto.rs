@@ -324,7 +324,33 @@ pub struct MountClient {
     /// A local, restrictive override. The server still enforces its own grant;
     /// this prevents a read-only user choice from ever emitting a write op.
     read_only: bool,
+    /// Runtime handle, captured at construction, so the blocking FUSE thread can
+    /// wait on the response channel WITH A DEADLINE (#239). `blocking_recv()`
+    /// has no timeout, so a peer that stops answering without closing parked the
+    /// call forever.
+    rt: tokio::runtime::Handle,
 }
+
+/// How long one mount operation waits for its response before giving up.
+///
+/// #239: there was no timeout anywhere on this path. `mount_proto.rs` contained
+/// zero occurrences of the word, and the EIO mapping in `mount_fuse.rs` only
+/// fires when the transport RETURNS AN ERROR. A peer that stops answering
+/// without closing returns nothing, so the call blocked rather than failing, in
+/// uninterruptible `D` state on `request_wait_answer`, where SIGKILL does not
+/// land and `fusermount -u` returns EBUSY.
+///
+/// It needed no attacker: a sleeping laptop, a dropped link or a killed daemon
+/// did it. And it took the whole mountpoint, not one call, because `call_data`
+/// holds the client mutex across the request.
+///
+/// The only other timeout in the stack is the FUSE option `daemon_timeout=60`,
+/// which is macFUSE and FreeBSD; Linux FUSE does not implement it, so there was
+/// no bound at the kernel layer either.
+///
+/// Generous on purpose: this is a ceiling that turns "forever" into "an error",
+/// not a latency target. A slow large read over a relay must not trip it.
+const MOUNT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl MountClient {
     /// Create a MountClient that bridges over an L2 mux stream.
@@ -356,7 +382,19 @@ impl MountClient {
                 }
             }
         });
-        MountClient { tx: tx_bytes, rx: rx_in, buf: Vec::new(), next_id: 1, binary_frames: false, caps: MountCaps::default(), read_only: false }
+        MountClient {
+            tx: tx_bytes,
+            rx: rx_in,
+            buf: Vec::new(),
+            next_id: 1,
+            binary_frames: false,
+            caps: MountCaps::default(),
+            read_only: false,
+            // Captured here because this constructor runs inside the runtime,
+            // while call_sync_inner runs on a blocking FUSE thread where
+            // Handle::current() is unavailable.
+            rt: tokio::runtime::Handle::current(),
+        }
     }
 
     /// Create a MountClient with binary frame support enabled (protocol v2+).
@@ -482,9 +520,20 @@ impl MountClient {
                     continue;
                 }
             }
-            match self.rx.blocking_recv() {
-                Some(bytes) => self.buf.extend_from_slice(&bytes),
-                None => anyhow::bail!("mount channel closed"),
+            // Bounded wait. See MOUNT_CALL_TIMEOUT: an unbounded blocking_recv
+            // here is what made a gone-away peer wedge the mountpoint forever.
+            // Returning Err lets the existing `Err(_) => Err(EIO)` mapping in
+            // mount_fuse.rs do its job, so the kernel finally gets an answer.
+            let got = self
+                .rt
+                .block_on(async { tokio::time::timeout(MOUNT_CALL_TIMEOUT, self.rx.recv()).await });
+            match got {
+                Ok(Some(bytes)) => self.buf.extend_from_slice(&bytes),
+                Ok(None) => anyhow::bail!("mount channel closed"),
+                Err(_) => anyhow::bail!(
+                    "mount operation timed out after {}s: the peer stopped answering",
+                    MOUNT_CALL_TIMEOUT.as_secs()
+                ),
             }
         }
     }
