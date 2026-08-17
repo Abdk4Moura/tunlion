@@ -18975,7 +18975,18 @@ async fn recv_cmd(
             }
             Ev::Interrupted => {
                 flush_inflight(&mut by_sid).await;
-                ui::say(&format!("  {} interrupted, partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                // One string served two situations. "partials kept; run the
+                // same command to resume" is exactly right for an interrupted
+                // transfer and meaningless for a daemon, which has no partials
+                // to keep: Ctrl-C out of `filament up` printed a transfer's
+                // recovery advice. Observed on two machines. The daemon's own
+                // banner already says "Ctrl-C or `filament down` to stop", so
+                // say the thing that banner promised.
+                if daemon {
+                    ui::say(&format!("  {} stopped serving; `filament up` starts again", ui::paint(ui::Tone::Dim, "·")));
+                } else {
+                    ui::say(&format!("  {} interrupted, partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                }
                 if let Some(g) = &tty_guard {
                     g.restore(); // process::exit skips Drop
                 }
