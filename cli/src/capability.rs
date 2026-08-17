@@ -253,7 +253,7 @@ pub fn cap_shadow_counts() -> ShadowCounts {
 /// volume already lives in the counters. The dedup set is CAPPED, because a key
 /// space like distinct device_pubs is unbounded; past the cap, new keys stop logging
 /// (their count is still counted), bounding memory.
-fn log_once(key: String, msg: &str) {
+fn log_once(key: String, msg: &str, verbose: bool) {
     const LOG_ONCE_CAP: usize = 4096;
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -263,7 +263,13 @@ fn log_once(key: String, msg: &str) {
             return;
         }
         g.insert(key);
-        eprintln!("{msg}");
+        if verbose {
+            // Expected-state shadow diagnostics are internal telemetry, not user
+            // narration: shown only at -v (ui::debug), never on the flagship path.
+            crate::ui::debug(msg);
+        } else {
+            eprintln!("{msg}");
+        }
     }
 }
 
@@ -470,6 +476,7 @@ pub fn cap_gate_effective(
                 "CAP-INFERRED-GRANT: fleet device dev={} authorized '{action}' via an explicit grant on a {binding:?} (non-Proven) binding. Fleet auto-trust requires Proven; explicit grants are still honored on Inferred pending universal identity-expose. Measured so Proven can be required for grants without silently revoking established devices.",
                 hex::encode(dev),
             ),
+            false,
         );
     }
     let base_outcome = if same_owner {
@@ -565,6 +572,7 @@ pub fn cap_gate_effective(
                 &format!(
                     "CAP-SHADOW [unprovisioned]: resource '{resource}' has no capability header; opens rely on legacy authz. Expected until you provision (filament grant/init); not a disagreement."
                 ),
+                true,
             ),
             // Dedupe WIDENING by the (action, resource, device) triple: the reviewer
             // needs the distinct SET to enumerate, not one line per retry, and the
@@ -578,6 +586,7 @@ pub fn cap_gate_effective(
                     hex::encode(dev),
                     hex::encode(usr),
                 ),
+                false,
             ),
             _ => {}
         }
