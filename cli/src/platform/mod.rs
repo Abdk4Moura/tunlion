@@ -894,6 +894,74 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     Ok(cmd.spawn()?)
 }
 
+// --------------------------------------------------- process identity --
+
+/// The absolute path of the executable backing a live process, or `None` when
+/// the pid does not name a process we can inspect (a dead or recycled pid).
+/// This is the identity check behind `daemon_alive`: a command-line substring
+/// can be defeated by renaming the binary, the executable path cannot.
+///
+/// Linux reads the `/proc/<pid>/exe` symlink, macOS asks libproc for the pid's
+/// image path, and Windows asks the kernel for the full image name (there is no
+/// /proc on either). The arms must ship together; a missing variant makes
+/// `daemon_alive` constant-false on that platform, which is the #204 bug this
+/// predicate exists to close for good.
+#[cfg(target_os = "linux")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    // proc_pidpath may include the NUL terminator in its return count.
+    let mut end = (n as usize).min(buf.len());
+    if end > 0 && buf[end - 1] == 0 {
+        end -= 1;
+    }
+    String::from_utf8(buf[..end].to_vec()).ok().map(PathBuf::from)
+}
+
+#[cfg(target_os = "windows")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    unsafe {
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 // ------------------------------------------------------- InstallSource --
 
 /// How filament was installed. Used to gate `filament update`:

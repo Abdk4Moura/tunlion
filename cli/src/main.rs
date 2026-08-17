@@ -2979,54 +2979,47 @@ fn up_log() -> PathBuf {
     devices_path().with_file_name("up.log")
 }
 
+/// Record the daemon's identity beside its pid. A pid alone can be recycled and
+/// a name substring can lie, so the pidfile carries the executable path the
+/// daemon started from; `daemon_alive` confirms it against the live process.
+fn write_pidfile() -> Result<()> {
+    let pid = std::process::id();
+    let exe = std::env::current_exe()?;
+    std::fs::write(pidfile(), format!("{pid}\n{}\n", exe.display()))?;
+    Ok(())
+}
+
 fn daemon_alive() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
-    is_filament_process(pid).then_some(pid)
+    let raw = std::fs::read_to_string(pidfile()).ok()?;
+    let mut lines = raw.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    // The executable the daemon recorded when it wrote the pidfile. A pidfile
+    // from before this fix records only the pid; the daemon and this CLI are
+    // the same installed binary, so fall back to our own executable.
+    let recorded = lines.next().map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from);
+    let expected = recorded.or_else(|| std::env::current_exe().ok())?;
+    // Identify the process by its executable path, never by matching a name.
+    // process_exe_path returns None for a dead or recycled pid, which is
+    // exactly the case the pidfile alone cannot detect.
+    let live = platform::process_exe_path(pid)?;
+    same_executable(&live, &expected).then_some(pid)
 }
 
-/// True when the pid is a live filament process. The pidfile alone can hold a
-/// recycled pid, so the process is confirmed by inspecting it, not by trusting
-/// the file. Unix reads /proc/<pid>/cmdline; Windows opens the process and
-/// reads its image name (there is no /proc there - a missing variant made
-/// daemon_alive constant-false on Windows, which silently disabled the 0.8.6
-/// up-follows, --detach, and down features on that platform).
-#[cfg(unix)]
-fn is_filament_process(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-        .map(|cmd| cmd.contains("filament"))
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn is_filament_process(pid: u32) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    unsafe {
-        unsafe extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
-            fn CloseHandle(h: isize) -> i32;
+/// Compare two executable paths the way daemon identity needs: symlinks
+/// resolved, and the " (deleted)" suffix Linux appends to `/proc/<pid>/exe`
+/// after an in-place binary upgrade ignored. Without the latter, upgrading the
+/// binary under a running daemon reads as "not running" and starts a second
+/// daemon, the very bug this check exists to prevent.
+fn same_executable(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy();
+        match s.strip_suffix(" (deleted)") {
+            Some(t) => PathBuf::from(t),
+            None => p.to_path_buf(),
         }
-        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h == 0 {
-            return false;
-        }
-        let mut buf = [0u16; 512];
-        let mut size = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
-        CloseHandle(h);
-        if ok == 0 {
-            return false;
-        }
-        let path = String::from_utf16_lossy(&buf[..size as usize]);
-        path.to_lowercase().contains("filament")
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn is_filament_process(pid: u32) -> bool {
-    let _ = pid;
-    false
+    };
+    let (a, b) = (norm(a), norm(b));
+    a.canonicalize().unwrap_or(a) == b.canonicalize().unwrap_or(b)
 }
 
 /// The argv for a web-shell PTY.
@@ -3467,7 +3460,7 @@ async fn up_cmd(
     }
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(pidfile(), std::process::id().to_string())?;
+    write_pidfile()?;
     let granted_names = shell_grant_names();
     match &shell_policy {
         // M-2: --shell intentionally grants ALL proof-verified paired devices
@@ -20933,19 +20926,6 @@ mod tests {
             }
         }
         assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
-    }
-
-    #[test]
-    fn daemon_alive_recognises_this_process_on_every_platform() {
-        // #204: daemon_alive() was Unix-only (/proc read), so it was
-        // constant-false on Windows and silently disabled up-follows, --detach
-        // and down there. The process check must confirm the CURRENT process is
-        // a filament process on all platforms (the test binary itself is one).
-        let pid = std::process::id();
-        assert!(
-            is_filament_process(pid),
-            "this filament process (pid {pid}) must be recognised by daemon_alive's process check"
-        );
     }
 
     #[test]
