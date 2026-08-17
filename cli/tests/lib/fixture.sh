@@ -8,6 +8,41 @@
 # caller, because pty-open / mount-open / l2-open are all gated on `l2_enabled`
 # and a plain `up` leaves it off with a failure that is silent on both sides.
 
+# TWO HAZARDS THIS BOX HAS ALREADY CHARGED US FOR, both of which degrade to a
+# plausible WRONG ANSWER rather than an error, which is what makes them expensive:
+#
+#   1. PORT COLLISION. Several worktrees run gates here at once. A gate whose
+#      fixture port is already held by another worktree's backend will happily
+#      health-check the STRANGER's process and proceed, and every result after
+#      that is about someone else's server. Call `claim_port` for every port you
+#      intend to own, before binding anything. And when a gate stands up its own
+#      fake service, have it identify itself with something only it could produce
+#      (a custom header, say) and verify THAT, not the response body: a real
+#      backend also answers /api/whoami with an IP, so the body cannot tell the
+#      two apart.
+#
+#   2. THE BINARY'S NAME MUST CONTAIN "filament". `daemon_alive()` confirms the
+#      pidfile's pid by reading /proc/<pid>/cmdline and testing it CONTAINS the
+#      literal string "filament" (main.rs, `is_filament_process`). A gate that
+#      copies the binary to, say, `fil-237-base` gets `daemon_alive() == None`,
+#      so `up` never creates its control.sock, so every `reach`/warm-link lookup
+#      silently falls back to a cold probe whose JSON has no `route` field at
+#      all. It looks exactly like "the peers won't link". Name reference binaries
+#      `filament-<something>`. (Tracked as #224.)
+
+# Refuse to start if a port we intend to own is already taken. Exits 2 rather
+# than returning, because every later assertion would be unattributable.
+claim_port() {
+  for p in "$@"; do
+    if ss -tln 2>/dev/null | grep -q ":$p "; then
+      echo "port $p is already in use by another process; refusing to run."
+      echo "  another worktree's gate probably owns it - pick a free port rather than"
+      echo "  sharing one: a gate that talks to a stranger's backend proves nothing."
+      exit 2
+    fi
+  done
+}
+
 # --- assertion bookkeeping ---
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
@@ -29,6 +64,14 @@ start_backend() {
   FIX_PIDS+=($!)
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
   curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
+  # Record the pid that actually HOLDS the port, not just the subshell we
+  # backgrounded. `( cd ... ) &` gives us the subshell's pid; killing that leaves
+  # the python child orphaned and still listening, which is how a box ends up
+  # with a row of fixture ports held by dead gates and the next run silently
+  # health-checking a stranger.
+  for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do
+    FIX_PIDS+=("$pid")
+  done
   [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }
 }
 
