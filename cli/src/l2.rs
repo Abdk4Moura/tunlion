@@ -14,7 +14,7 @@
 // Three surfaces, smallest-primitive-first (each is sugar over the one below):
 //   * `filament netcat <peer> <rport>`            stdio  <-> one L2 stream
 //   * `filament forward <lport> <peer> <rport>`   local TCP listener; conn=stream
-//   * `filament ssh <peer> [args...]`             real ssh -o ProxyCommand=netcat
+//   * `filament shell --ssh <peer> [args...]`             real ssh -o ProxyCommand=netcat
 //
 // The ACCEPTOR (the side that dials the localhost target) is NOT a subcommand:
 // it lives inside `filament up` / `filament recv`, gated on the existing
@@ -1205,7 +1205,7 @@ async fn bring_up_to_known(
     // `connect_signaling` returns, it can land before the socket.io connection is
     // fully ready and be silently dropped, the server then never runs `_do_join`,
     // never emits `welcome`, and this loop waits for a Welcome that never comes,
-    // stranding `filament ssh` in "waiting for known device" (~30% of attempts in
+    // stranding `filament shell --ssh` in "waiting for known device" (~30% of attempts in
     // the isolated repro). So we RE-EMIT join on the same cadence as the
     // re-subscribe below until Welcome lands (idempotent: a repeat join to the
     // same solo room is a no-op server-side once it took).
@@ -1247,7 +1247,7 @@ async fn bring_up_to_known(
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
     // consume this endpoint into the race. UNCONDITIONAL here: `bring_up_to_known`
     // only ever serves L2 (netcat/ssh/forward), which always wants direct, and
-    // `filament ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
+    // `filament shell --ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
@@ -1268,7 +1268,7 @@ async fn bring_up_to_known(
     };
 
     // Distinct wording for the shell-auth pre-flight so the two sequential
-    // bring-ups of `filament ssh` (the bootstrap link, then the netcat data link)
+    // bring-ups of `filament shell --ssh` (the bootstrap link, then the netcat data link)
     // do not read as a flap/retry of one connection. "bootstrap" has its own
     // wording; "reconnect" is silent (post-warm resume check — the link was
     // already up; re-reporting it after a clean logout is noise).
@@ -1656,7 +1656,7 @@ pub struct ProbeOutcome {
     pub error: Option<String>,
     /// On success, the path the probe link actually took (interface, address
     /// class, endpoints) - so `filament doctor` shows the route in the same fine
-    /// detail as `filament ping`. `None` when the link never came up.
+    /// detail as `filament reach`. `None` when the link never came up.
     pub path: Option<crate::net::PathInfo>,
 }
 
@@ -2067,7 +2067,7 @@ async fn pump_warm_pty_stdio(
 
 /// Pump a one-shot warm pty: stream output to stdout until the command exits.
 /// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
-/// cold path parity (supports `echo hi | filament pty peer -- cat`).
+/// cold path parity (supports `echo hi | filament shell peer -- cat`).
 #[cfg(unix)]
 async fn pump_warm_pty_one_shot(
     sock: tokio::net::UnixStream,
@@ -2130,7 +2130,7 @@ async fn pump_warm_pty_one_shot(
     Ok(())
 }
 
-/// `filament dial <peer> <port>`: wire this process's stdio to a service the peer
+/// `filament forward <peer> <port>`: wire this process's stdio to a service the peer
 /// EXPOSED on its overlay address, over L3 (the overlay-port counterpart of
 /// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
 /// local daemon, which resolves the peer to its verified overlay address and dials
@@ -2147,7 +2147,7 @@ pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
 
 #[cfg(not(unix))]
 pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("filament dial needs the local daemon's control socket (unix only)")
+    bail!("filament forward needs the local daemon's control socket (unix only)")
 }
 
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
@@ -2186,7 +2186,7 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
                     "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
-                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
+                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))),
                     format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
                 ],
             );
@@ -2415,7 +2415,7 @@ async fn pty_attach_once(
         )
     };
     // `session` makes reconnects REATTACH the same shell (acceptor keys it per
-    // verified device); a fresh per-invocation id means two `filament pty` runs
+    // verified device); a fresh per-invocation id means two `filament shell` runs
     // never collide. `term` is forwarded so the remote matches THIS terminal.
     mux.transport()
         .send_control(&{
@@ -2584,7 +2584,7 @@ async fn pty_attach_once(
     }
 }
 
-/// Warm fast path for `filament pty`: if the local daemon already holds a link to
+/// Warm fast path for `filament shell`: if the local daemon already holds a link to
 /// `peer`, open the PTY over it (via the control socket) and bridge this process's
 /// stdio to it - raw mode + SIGWINCH forwarded as a `resize` op. Returns
 /// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
@@ -2638,14 +2638,14 @@ async fn try_warm_pty(
     }
 }
 
-/// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
+/// `filament shell <peer>`: open a PTY shell on the peer and bridge it to this
 /// terminal (the CLI sibling of the browser web-shell). On a real terminal it is
 /// a FULL interactive client - real tty size, raw mode, SIGWINCH, $TERM - AND
 /// RESUMABLE: a per-invocation random session id lets a dropped link reconnect
 /// and reattach the SAME live shell (mosh/tmux-style, the acceptor replays its
 /// output buffer), so a flaky link (e.g. a Coder workspace reconnecting every
 /// ~90s) no longer loses the session. The session id lives only in THIS process,
-/// so a separate `filament pty` run always gets a fresh shell, never this one.
+/// so a separate `filament shell` run always gets a fresh shell, never this one.
 /// A non-tty stdio (a pipe) keeps the plain cooked, non-resuming bridge.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) -> Result<()> {
     let one_shot = cmd.join(" ");
@@ -2768,12 +2768,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         .filter(|n| *n > 0)
                         .unwrap_or(45);
                     crate::ui::problem(
-                        &format!("filament pty: can't reach '{peer}'"),
+                        &format!("filament shell: can't reach '{peer}'"),
                         &format!(
                             "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                         ),
                         &[
-                            format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
+                            format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))),
                             format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
                         ],
                     );
@@ -3011,7 +3011,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
             }
             None => {
                 crate::ui::say(&format!(
-                    "filament: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `filament ping {peer}`)"
+                    "filament: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `filament reach {peer}`)"
                 ));
             }
         }
@@ -3026,7 +3026,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
         // Wait for the first link so "ready" is honest.
         while rx.borrow().is_none() {
             if rx.changed().await.is_err() {
-                bail!("filament: could not establish the link to {peer}; is it online? check with `filament ping {peer}` (or `filament devices`)");
+                bail!("filament: could not establish the link to {peer}; is it online? check with `filament reach {peer}` (or `filament devices`)");
             }
         }
         crate::ui::say(&format!(
@@ -3541,7 +3541,7 @@ async fn manage_cold_link(
 /// fall through to a key-less ssh attempt (that would be a muddy auth failure
 /// instead of a clear "zero shell" denial).
 /// Result of installing our managed key on a peer (warm or cold path). `sshd` is
-/// the peer's report of whether an sshd is listening on the port `filament ssh`
+/// the peer's report of whether an sshd is listening on the port `filament shell --ssh`
 /// will dial: `Some(true)` reachable, `Some(false)` nothing there (so ssh would
 /// fail blindly - caller bails with a clear message), `None` when the peer is an
 /// older build that didn't report it (caller proceeds, status unknown).
@@ -3572,12 +3572,12 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
         Ok(inner) => inner?,
         Err(_) => {
             crate::ui::problem(
-                &format!("filament ssh: can't reach '{peer}'"),
+                &format!("filament shell --ssh: can't reach '{peer}'"),
                 &format!(
                     "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
-                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament ping {peer}"))),
+                    format!("check it's reachable: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))),
                     format!("diagnose the connect: {}", crate::ui::paint(crate::ui::Tone::Brand, &format!("filament doctor {peer}"))),
                 ],
             );
@@ -3648,7 +3648,7 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
 /// run the `shell-bootstrap` over its already-established link (instant, no cold
 /// establish), and fall back to a fresh `shell_bootstrap` on a miss/deny/timeout,
 /// under `--relay`, or off-unix. This is what closes the last gap that left
-/// `filament ssh` slow while `pty` was already warm: the bootstrap was the only
+/// `filament shell --ssh` slow while `pty` was already warm: the bootstrap was the only
 /// remaining cold establish in the ssh path.
 async fn bootstrap_key(server: &str, peer: &str, relay: bool, ssh_port: u16) -> Result<BootstrapInfo> {
     #[cfg(unix)]
@@ -3829,7 +3829,7 @@ fn spawn_ssh(
     Ok(cmd.status()?.code().unwrap_or(1))
 }
 
-/// `filament ssh <peer> [args...]`: seamless shell over the trusted channel.
+/// `filament shell --ssh <peer> [args...]`: seamless shell over the trusted channel.
 ///
 /// With zero pre-existing ssh setup: bootstrap our managed key + the peer's host
 /// key over the authenticated filament channel, pin them, then run ssh pointed
@@ -4051,18 +4051,18 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
         return;
     }
     crate::ui::problem(
-        &format!("filament ssh: no sshd on '{peer}'"),
+        &format!("filament shell --ssh: no sshd on '{peer}'"),
         &format!(
             "'{peer}' is reachable, but nothing is listening on localhost:{rport} for ssh. \
              (sshd may be bound to a non-localhost address like the mesh ULA — \
-             `filament ssh` connects to localhost:{rport} on the peer.)",
+             `filament shell --ssh` connects to localhost:{rport} on the peer.)",
         ),
         &[
             format!("start an sshd on '{peer}' listening on localhost (or all interfaces)"),
             format!("set {} to a different port", crate::ui::paint(crate::ui::Tone::Brand, "FILAMENT_SSH_PORT")),
             format!(
                 "use {} for a shell that needs no sshd",
-                crate::ui::paint(crate::ui::Tone::Brand, &format!("filament pty {peer}"))
+                crate::ui::paint(crate::ui::Tone::Brand, &format!("filament shell {peer}"))
             ),
         ],
     );

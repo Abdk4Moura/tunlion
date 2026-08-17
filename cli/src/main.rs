@@ -768,7 +768,7 @@ enum Cmd {
         /// Drop directory (default: `filament config dir`, else ~/Filament)
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept seamless `filament ssh` from ANY paired (proof-verified) device,
+        /// Accept seamless `filament shell --ssh` from ANY paired (proof-verified) device,
         /// no per-device `grant` needed. Enables the tunnel acceptor too, so you
         /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
         /// required). Prints a security banner.
@@ -829,8 +829,8 @@ enum Cmd {
         filament set                          show every setting + where it came from\n  \
         filament set auto-extract on          change one setting (partial, never resets others)\n  \
         filament set shell on --peer laptop   per-device override\n  \
-        filament get drop-dir --show-origin   read one value (bare value on stdout)\n  \
-        filament unset relay                  revert one setting to its default\n\n\
+        filament set drop-dir                 read one value (bare value on stdout)\n  \
+        filament set relay --reset            revert settings to their defaults\n\n\
         Keys: name, server, drop-dir, relay, auto-extract, shell, shell-user")]
     Set {
         /// Setting name (run `filament set` to list them all)
@@ -999,7 +999,7 @@ enum Cmd {
         json: bool,
     },
     /// Grant a known device a capability (deny-by-default). `shell` permits
-    /// seamless `filament ssh` into THIS machine, a separate consent from
+    /// seamless `filament shell --ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
     Grant {
         /// Known device (petname), or omit with --tag
@@ -1065,7 +1065,7 @@ enum Cmd {
     },
     /// Sync files to/from a peer via rsync over the mesh.
     ///
-    /// Requires rsync on both ends. Uses `filament ssh` as the remote shell,
+    /// Requires rsync on both ends. Uses `filament shell --ssh` as the remote shell,
     /// so the same transport and bootstrap logic applies.
     #[command(hide = true)]
     Backup {
@@ -2526,7 +2526,7 @@ fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<String>)> {
 /// uses this to switch L2/shell ON even for a plain `filament up`: otherwise
 /// `filament grant <dev> shell` writes a grant the running daemon never consults
 /// (l2_enabled was set only by --shell/--shell-only at startup), so the grant
-/// silently did nothing and `filament ssh` timed out. With this, a grant alone is
+/// silently did nothing and `filament shell --ssh` timed out. With this, a grant alone is
 /// enough; the per-device cap gate (auto_allows || device_allows) still denies
 /// every non-granted device, so this does NOT broaden access, it only honors the
 /// grants that already exist.
@@ -3072,7 +3072,7 @@ fn spawn_session_pumps(
 }
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
-/// may `filament ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
+/// may `filament shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
 /// always enforced separately, this is purely the capability side.
 #[derive(Clone, Debug)]
 enum ShellPolicy {
@@ -3467,7 +3467,7 @@ async fn up_cmd(
         // (current AND any introduced later via pair-intro). This is a broad,
         // deliberate over-grant; --shell-only is the scoped, safer alternative.
         ShellPolicy::All => ui::say(&format!(
-            "  {} seamless shell ON, ANY paired device (now or paired later) can `filament ssh` into this machine",
+            "  {} seamless shell ON, ANY paired device (now or paired later) can `filament shell --ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
         )),
         ShellPolicy::Only(set) => {
@@ -3475,12 +3475,12 @@ async fn up_cmd(
             names.sort();
             let list = names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
             ui::say(&format!(
-                "  {} seamless shell ON for: {list}, they can `filament ssh` into this machine",
+                "  {} seamless shell ON for: {list}, they can `filament shell --ssh` into this machine",
                 ui::paint(ui::Tone::Warn, "!"),
             ));
         }
         ShellPolicy::Granted if !granted_names.is_empty() => ui::say(&format!(
-            "  {} seamless shell ON for: {}, they can `filament ssh` into this machine",
+            "  {} seamless shell ON for: {}, they can `filament shell --ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
             granted_names.join(", "),
         )),
@@ -7628,7 +7628,7 @@ struct RejoinState {
 }
 
 /// WARM-HOLD state: keeps connections alive to recently-used and explicitly
-/// configured peers so `filament ping`/`ssh` is instant.
+/// configured peers so `filament reach`/`ssh` is instant.
 ///
 /// Design:
 /// - EXPLICIT peers: from `filament set warm-peers dovm,popos` (always connected)
@@ -8110,7 +8110,7 @@ struct Conn {
     /// when multi-streaming is disabled (`direct_streams() == 1`).
     direct_endpoint: Option<quinn::Endpoint>,
     /// WARM-HOLD: keeps connections alive to recently-used and explicitly
-    /// configured peers so `filament ping`/`ssh` is instant. Tracked per-peer
+    /// configured peers so `filament reach`/`ssh` is instant. Tracked per-peer
     /// with LRU eviction and exponential backoff on failures.
     warm_hold: WarmHold,
     /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
@@ -10878,7 +10878,7 @@ async fn handle_mount_health(req: ctl::Req, daemon_mounts: &DaemonMounts) {
 }
 
 /// Is something listening on this host's own loopback `port` - i.e. an sshd a
-/// `filament ssh` initiator could actually reach? A fast connect probe: a
+/// `filament shell --ssh` initiator could actually reach? A fast connect probe: a
 /// successful connect means a listener (we close it at once); refused/timeout
 /// means nothing is there. Reported in the shell-bootstrap ack so the initiator
 /// fails fast with a clear message instead of ssh hanging on a dead port.
@@ -10906,7 +10906,7 @@ async fn sshd_listening(port: u16) -> bool {
     false
 }
 
-/// Answer a `filament ping`: report the daemon's warm link to `peer` (route,
+/// Answer a `filament reach`: report the daemon's warm link to `peer` (route,
 /// remote address, RTT, verified name). Synchronous - every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
@@ -11075,7 +11075,7 @@ async fn handle_warm_open(
 }
 
 /// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
-/// client's stdio socket (the `filament pty` fast path). Records the session->sid
+/// client's stdio socket (the `filament shell` fast path). Records the session->sid
 /// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
 #[cfg(unix)]
 async fn handle_warm_pty(
@@ -11164,7 +11164,7 @@ type PendingBootstraps =
 
 /// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
 /// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
-/// big win for `filament ssh` (pty already rode the warm link; the bootstrap was
+/// big win for `filament shell --ssh` (pty already rode the warm link; the bootstrap was
 /// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
 /// socket; the ack/deny handler completes it. A miss falls the client back to the
 /// cold `shell_bootstrap`.
@@ -12218,7 +12218,7 @@ async fn main() -> Result<()> {
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
-                    "OWNER-EQUIVALENT: they can act as you through `filament ssh` (their key is installed on first connect)."
+                    "OWNER-EQUIVALENT: they can act as you through `filament shell --ssh` (their key is installed on first connect)."
                 } else {
                     ""
                 }
@@ -12574,7 +12574,7 @@ async fn mount_fuse_cmd(
         if plan.read_only { "read only" } else { "read and write" }
     ));
     ui::say(&format!(
-        "  {} mounted. unmount with `filament unmount {local}` or ctrl-c",
+        "  {} mounted. unmount with `filament mount --off {local}` or ctrl-c",
         ui::paint(ui::Tone::Ok, ui::glyph_ok())
     ));
 
@@ -15108,7 +15108,7 @@ async fn recv_cmd(
         // L2/ssh acceptor, OR when this is the long-lived `up` daemon. Any acceptor
         // MUST answer the initiator's transport-offer (direct-QUIC over the
         // reachable host candidate, e.g. Tailscale) rather than build a colliding
-        // WebRTC peer (glare). For `up --shell` this kills the `filament ssh`
+        // WebRTC peer (glare). For `up --shell` this kills the `filament shell --ssh`
         // "stuck while connecting" failure; for a plain `up` it kills the up<->up
         // glare/supersede churn (two known daemons each racing to be the WebRTC
         // initiator). See `direct_ok_for`. One-shot send/recv/pair (daemon=false)
@@ -15393,7 +15393,7 @@ async fn recv_cmd(
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
-    // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
+    // daemon's path). When a sibling `filament shell --ssh`/`netcat`/`forward` asks to
     // reach a peer we already hold a link to, we open a new L2 stream over that
     // warm link instead of making the sibling establish a fresh one. `ctl_tx`
     // was created (and `serve` spawned, when we are the daemon) before the
@@ -15980,7 +15980,7 @@ async fn recv_cmd(
 
         // WARM-HOLD: periodically check for warm peers that need connections.
         // This keeps recently-used and explicitly configured peers connected
-        // so `filament ping`/`ssh` is instant. Runs every 10s, daemon-only.
+        // so `filament reach`/`ssh` is instant. Runs every 10s, daemon-only.
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
             // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
@@ -17430,7 +17430,7 @@ async fn recv_cmd(
                             let hostkeys = sshkeys::host_pubkeys();
                             let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
                             // Tell the initiator whether an sshd is actually
-                            // listening on the port `filament ssh` will dial here,
+                            // listening on the port `filament shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
                             // spawning ssh into a refused/black-holed connection.
                             let ssh_port = v["ssh_port"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(22);
@@ -20749,6 +20749,77 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    #[test]
+    fn printed_hints_name_verbs_that_exist() {
+        // #229, and the reason this test exists rather than a fifth point fix:
+        // `filament unmount` was printed after every successful mount and has
+        // never been a verb. It was corrected in three places and survived in
+        // FIVE more, including the one users actually hit, and the miss was
+        // found by reading a real mount on a real machine rather than by any
+        // test. Change one copy of a sentence, leave the others, and the wrong
+        // one is the one someone reads next.
+        //
+        // `internal_subcommand_invocations_name_real_verbs` covers what filament
+        // types AT ITSELF. This covers what filament tells the USER to type,
+        // which is the larger surface and the one with a person on the end of it.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let mut valid: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .flat_map(|sc| {
+                let mut v = vec![sc.get_name().to_string()];
+                v.extend(sc.get_all_aliases().map(str::to_string));
+                v
+            })
+            .collect();
+        // `filament <file>` is the bare-send form, and `filament --help` etc.
+        valid.insert("--help".into());
+        // "filament" is also an ordinary noun in our own prose: "the filament
+        // daemon", "local filament state", "no active filament mounts". These
+        // are the words that legitimately follow it there. A NEW one trips this
+        // test once and gets added deliberately, which is the point: the cost of
+        // adding a word is a moment's thought about whether it is prose or an
+        // instruction.
+        for prose in ["daemon", "state", "mounts", "was", "from", "video", "identity"] {
+            valid.insert(prose.into());
+        }
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mut bad = Vec::new();
+        for rel in ["src/main.rs", "src/mount.rs", "src/l2.rs", "src/ui.rs",
+                    "src/fleet_ui/devices.rs", "src/fleet_ui/requests.rs", "src/fleet_ui/mint.rs"] {
+            let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else { continue };
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // Comments explain history ("replaces `filament unmount`") and
+                // are not instructions to anyone.
+                if t.starts_with("//") {
+                    continue;
+                }
+                for (i, _) in line.match_indices("filament ") {
+                    let rest = &line[i + "filament ".len()..];
+                    let word: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                        .collect();
+                    // Not a verb position: a path, an interpolation, a flag we
+                    // do not model, or the bare-send form.
+                    if word.len() < 3 || word.starts_with('-') {
+                        continue;
+                    }
+                    if !valid.contains(&word) {
+                        bad.push(format!("  {rel}:{}: prints `filament {word}`, which clap does not accept\n    {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "printed hints name verbs that do not exist (see docs/ui/OUTPUT.md):\n{}",
+            bad.join("\n")
+        );
     }
 
     #[test]
