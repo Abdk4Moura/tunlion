@@ -13010,17 +13010,27 @@ async fn send_cmd(
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
-    // #230: `filament send <file>` with no --to and no --code used to fall
-    // through to local-network discovery and print a raw room id, while the bare
-    // `filament <file>` minted a speakable code. Same intent, two different
-    // experiences, and the banner documented the code on the verb that lacked
-    // it. The verb is the form people type, so default it to the code.
-    // Local discovery is still reachable with an explicit --room.
-    if !use_code && to.is_none() && room.is_none() {
-        use_code = true;
-    }
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
+
+    // #230: `filament send <file>` with no --to and no --code fell through to
+    // local-network discovery and printed a raw room id, while the bare
+    // `filament <file>` minted a speakable code. Same intent, two experiences,
+    // and the banner documented the code on the verb that lacked it.
+    //
+    // This defaulting must come AFTER opened_flow, and the first version of the
+    // fix did not: setting use_code above the gate made `!use_code` false, so
+    // the interactive picker could never open and a TTY user with paired
+    // devices lost "send to which device?" entirely. Caught in a flow sweep,
+    // not by any gate, because every gate tests a defect and none walks a
+    // session.
+    //
+    // So: ask when we can, and default to a code only when we are not going to
+    // ask. Non-interactive keeps the code instead of the room id, which was the
+    // actual complaint. Local discovery stays reachable with --room.
+    if !opened_flow && !use_code && to.is_none() && room.is_none() {
+        use_code = true;
+    }
     if paths.is_empty() {
         if !interactive_allowed() {
             bail!("nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin");
