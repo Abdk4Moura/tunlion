@@ -12065,6 +12065,7 @@ async fn main() -> Result<()> {
                 }
                 None => bail!("shell needs a device in non-interactive mode: filament shell <device>"),
             };
+            require_known_device(&peer)?;
             // #219: a device whose invitation ceiling excludes shell can never
             // serve one, and the denial was surfacing as a silent hang (the
             // acceptor's l2-close is only sent when the acceptor is ON). Say so
@@ -12123,16 +12124,19 @@ async fn main() -> Result<()> {
                 // #202: the netcat shape - pipe stdio to the peer's port (the
                 // ssh ProxyCommand contract). `forward` owns the role; --stdio
                 // is the second plumbing.
+                require_known_device(&peer)?;
                 l2::netcat_cmd(&server, &peer, rport, relay).await
             } else if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else {
+                require_known_device(&peer)?;
                 let lport = lport.unwrap_or(rport);
                 l2::forward_cmd(&server, lport, &peer, rport, relay).await
             }
         },
         Cmd::Netcat { peer, rport } => {
             // Hidden one-release alias for the netcat shape, now forward --stdio.
+            require_known_device(&peer)?;
             l2::netcat_cmd(&server, &peer, rport, relay).await
         },
         Cmd::Expose { port, to, peer, list, off } => {
@@ -12148,6 +12152,9 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Doctor { device, watch, repeat, json } => {
+            if let Some(d) = &device {
+                require_known_device(d)?;
+            }
             doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
@@ -12468,6 +12475,7 @@ async fn main() -> Result<()> {
                     bail!("--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount");
                 }
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
+                require_known_device(&plan.peer)?;
                 let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;
                 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
                 {
@@ -12486,6 +12494,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
+            require_known_device(&peer)?;
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
     }
@@ -19929,6 +19938,37 @@ mod tests {
         unsafe { std::env::set_var("FILAMENT_DIRECT", "0") };
         assert!(!direct_ok_for(false, false), "FILAMENT_DIRECT=0 disables direct");
         unsafe { std::env::remove_var("FILAMENT_DIRECT") };
+    }
+
+    #[test]
+    fn require_known_device_names_the_known_devices() {
+        // #221 in the peer-taking verbs: a stale name must read as a lookup
+        // miss that lists what IS known, not as "may be offline / unreachable".
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-known-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let sec = "b".repeat(64);
+        let p = dir.join("devices.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "popos", "secret": sec},
+                {"name": "pixel", "secret": "c".repeat(64)},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(require_known_device("popos").is_ok());
+        let err = require_known_device("zzz-not-a-device").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no device named 'zzz-not-a-device'"), "got: {msg}");
+        assert!(msg.contains("popos"), "known names missing: {msg}");
+        assert!(msg.contains("pixel"), "known names missing: {msg}");
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
