@@ -1,0 +1,77 @@
+# The frontend browser gates. These exist because a clean build is not a correct
+# UI: every one of them drives a real Chromium against the real components.
+#
+# They ran nowhere until now. All four were dead on hardcoded absolute paths
+# into worktrees that had been reaped (#250), and nothing in CI invoked them
+# even when they worked (#249). A gate that runs only when somebody remembers is
+# not enforcement, and this repo's standing rule is that frontend changes are
+# verified in a browser before they ship.
+#
+# Only the two that pass are wired. p1-relay-rebuild and p5-upgrade-prober
+# assert with regexes over SOURCE TEXT and are excluded on purpose: making them
+# green would mean updating the patterns, which restores the appearance of
+# coverage without restoring any. See #250. Wire them here once they assert
+# behaviour instead.
+name: Browser gates
+
+on:
+  push:
+    branches: [main, "integration/**"]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/browser-gates.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/browser-gates.yml"
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Chromium
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      # pake-ux drives the real backend, so it needs the Python side present.
+      # Versions match capability-ci.yml so the two jobs cannot drift apart.
+      - name: Install backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+
+      # pake-ux asserts the built app talks to its own origin, so the dist must
+      # be built WITHOUT a production API base. The gate checks this and says so.
+      - name: Build a same-origin dist
+        working-directory: frontend
+        env:
+          VITE_FILAMENT_API: ""
+        run: npm run build
+
+      - name: relay-honesty
+        run: node frontend/tests/relay-honesty.spec.cjs
+
+      - name: pake-ux
+        env:
+          FILAMENT_TEST_VENV: python3
+        run: node frontend/tests/pake-ux.spec.cjs
+
+      # Screenshots are the evidence a browser actually rendered, rather than the
+      # harness reporting on itself. Keep them when a gate fails.
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-gate-screenshots
+          path: frontend/tests/.*-shots/
+          if-no-files-found: ignore
