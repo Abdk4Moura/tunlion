@@ -2743,6 +2743,27 @@ fn device_allows(name: &str, capability: &str) -> bool {
 /// back-compat baseline `["transfer"]` first, so granting `shell` never silently
 /// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
 /// Returns Err if the device is unknown (you can't grant a stranger a shell).
+/// Has the owner explicitly revoked this capability from this device?
+///
+/// #244: `revoke <device> shell` wrote caps, and the blanket `up --shell`
+/// policy never read caps: `ShellPolicy::All => true`, name and caps ignored.
+/// So the command printed "revoked 'shell' from 'X'" and the shell kept
+/// working. Worse for a vouched record, which has no certificate, so
+/// `revoke --certificate` bailed too and NEITHER verb could reach it. The
+/// operator ran the security verb, got a success line, and lost nothing.
+///
+/// A grant is a capability. A revoke is a DECISION, and a decision has to
+/// outrank a policy default or it is not a decision. This is the durable record
+/// of that decision, and the blanket policy is now subordinate to it.
+fn device_capability_denied(name: &str, capability: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else { return false };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    arr.iter()
+        .find(|d| d["name"].as_str() == Some(name))
+        .and_then(|d| d["deniedCaps"].as_array())
+        .is_some_and(|list| list.iter().any(|c| c.as_str() == Some(capability)))
+}
+
 fn device_set_cap(name: &str, capability: &str, grant: bool, expires: Option<u64>) -> Result<()> {
     let capability = crate::capability::canonical_capability(capability)?;
     let mut found = false;
@@ -2752,6 +2773,24 @@ fn device_set_cap(name: &str, capability: &str, grant: bool, expires: Option<u64
                 continue;
             }
             found = true;
+            // #244: a revoke is a decision, not just the absence of a grant, so
+            // record it durably where the blanket shell policy can see it.
+            // Without this, `revoke <dev> shell` under `up --shell` printed
+            // success and changed nothing, because auto_allows reads no caps.
+            {
+                let mut denied: Vec<String> = d
+                    .get("deniedCaps")
+                    .and_then(|c| c.as_array())
+                    .map(|l| l.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                denied.retain(|c| c != &capability);
+                if !grant {
+                    denied.push(capability.clone());
+                }
+                denied.sort();
+                denied.dedup();
+                d["deniedCaps"] = json!(denied);
+            }
             // Current caps: v1 (absent) reads as the transfer baseline.
             let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
                 Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
@@ -12492,7 +12531,13 @@ async fn main() -> Result<()> {
                 }
                 ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
                 let cert = device_cert_for(&device)
-                    .ok_or_else(|| anyhow!("device '{device}' has no stored fleet certificate"))?;
+                    .ok_or_else(|| anyhow!(
+                            // #244: this used to end here, so an operator revoking a
+                            // vouched device got an error and no route. A record with no
+                            // certificate is removed by forgetting it, and nothing else
+                            // said so.
+                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `filament devices`).\n  To remove its access: filament devices forget {device}"
+                        ))?;
                 let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
                 if cert.user_pub != owner.public_key_bytes() {
                     bail!("device '{device}' certificate is not chained to this user identity");
@@ -17657,7 +17702,8 @@ async fn recv_cmd(
                     let legacy_ok = trusted
                         && dev
                             .as_deref()
-                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .map(|n| !device_capability_denied(n, "shell")
+                                 && (shell_policy.auto_allows(n) || device_allows(n, "shell")))
                             .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
@@ -17786,7 +17832,8 @@ async fn recv_cmd(
                     let legacy_ok = trusted
                         && dev
                             .as_deref()
-                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .map(|n| !device_capability_denied(n, "shell")
+                                 && (shell_policy.auto_allows(n) || device_allows(n, "shell")))
                             .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
