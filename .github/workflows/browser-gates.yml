@@ -69,16 +69,24 @@ jobs:
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
       #
-      # The path is spelled out rather than globbed. `.*-shots/` would have to
-      # match a LEADING DOT, which globs commonly refuse, and paired with
-      # if-no-files-found: ignore that fails silently: the step goes green while
-      # uploading nothing, and the absence reads as "no screenshots were taken".
-      # Only relay-honesty writes any; pake-ux takes none, so `warn` is the
-      # honest setting here and would go loud if relay-honesty stopped writing.
+      # Two settings here are load-bearing and both defaults are wrong for this.
+      #
+      # upload-artifact skips hidden files by DEFAULT, and `.relay-shots` is a
+      # dotted directory, so it was skipped even with the path named exactly.
+      # Measured twice: the gate logged both screenshots, the step went green,
+      # and the run produced no artifact at all. `include-hidden-files` is what
+      # actually fixes it; naming the path was not enough.
+      #
+      # And `if-no-files-found` must be `error`. Whatever the reason an upload
+      # ends up empty, a step that reports success while uploading nothing turns
+      # the absence of evidence into the appearance of it. These screenshots are
+      # the only proof a browser rendered rather than the harness reporting on
+      # itself, so their absence should be loud.
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: browser-gate-screenshots
           path: frontend/tests/.relay-shots/
-          if-no-files-found: warn
+          include-hidden-files: true
+          if-no-files-found: error
