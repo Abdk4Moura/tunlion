@@ -23,7 +23,7 @@ use std::path::Path;
 /// is not a why.
 fn budget() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
-        ("main.rs", 155),
+        ("main.rs", 154),
         ("mount.rs", 47),
         ("doctor.rs", 44),
         ("settings.rs", 37),
@@ -45,6 +45,20 @@ fn budget() -> BTreeMap<&'static str, usize> {
 /// `::println!` path form. Deliberately textual: the point is to notice new
 /// calls appearing, not to be a parser.
 fn count(src: &str) -> usize {
+    // Comments are prose about the code, not calls in it. A comment saying
+    // "use ui::say, not println!" counted as two bare prints and pushed main.rs
+    // over budget, which is the ratchet measuring the wrong thing: the docs it
+    // exists to enforce cannot be quoted in the code it guards.
+    //
+    // Stripping comment lines only ever LOWERS a count, so no budget can turn
+    // red from this; the slack is reported by the existing under-budget notice
+    // and paid off by lowering the numbers, which this commit does.
+    let src: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let src = src.as_str();
     let mut n = 0;
     for (i, _) in src.match_indices("println!") {
         // Skip when preceded by a word char or a colon: that is the tail of

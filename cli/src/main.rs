@@ -12299,12 +12299,15 @@ async fn main() -> Result<()> {
                     let roster_only = crate::roster::roster_device_names().iter().any(|n| n == &d)
                         && !devices_load().iter().any(|(n, _)| n == &d);
                     if roster_only {
-                        println!("{} {}", ui::paint(ui::Tone::Dim, "filament reach →"), ui::paint(ui::Tone::Brand, &d));
-                        println!(
+                        // Human narration goes through ui::, not println!: this is
+                        // stderr for a person, and println! would put it on stdout
+                        // where a script parsing `reach` output would collect it.
+                        ui::say(&format!("{} {}", ui::paint(ui::Tone::Dim, "filament reach →"), ui::paint(ui::Tone::Brand, &d)));
+                        ui::say(&format!(
                             "  {} {}",
                             ui::paint(ui::Tone::Brand, ui::glyph_mesh()),
                             ui::paint(ui::Tone::Dim, "in your mesh via the owner's roster; sibling connections are not in this release")
-                        );
+                        ));
                         return Ok(());
                     }
                     crate::ping::ping_cmd(&server, &d, 1, json, relay).await
