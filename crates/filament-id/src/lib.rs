@@ -240,6 +240,106 @@ impl DeviceCert {
     }
 }
 
+/// Signed mesh roster (v1): an owner's list of its OTHER devices, pushed over
+/// existing links so a spoke can SEE its mesh. Names and keys ONLY; no ceiling,
+/// no cert expiry; because a spoke cannot verify another device's effective
+/// authority, and a signed field reads as validated when it is only "the owner
+/// wrote it". ROSTER PRESENCE IS EVIDENCE OF NOTHING: the acceptor's
+/// authorization decision stays a pure function of (presented cert chain, local
+/// root, local tombstones) and must never take this object as an input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshRoster {
+    pub owner_pub: [u8; 32],
+    pub epoch: u64,
+    pub valid_until: u64,
+    pub devices: Vec<RosterDevice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RosterDevice {
+    pub device_pub: [u8; 32],
+    pub petname: String,
+}
+
+pub const ROSTER_SIGN_DOMAIN: &[u8] = b"filament/mesh-roster/v1";
+
+impl MeshRoster {
+    /// Deterministic signing bytes: domain, owner_pub, epoch, valid_until, then
+    /// devices sorted by device_pub (so a set ordered differently signs the
+    /// same), each as device_pub + u16-LE-length petname.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(
+            ROSTER_SIGN_DOMAIN.len() + 32 + 8 + 8 + self.devices.len() * (32 + 2 + 24),
+        );
+        v.extend_from_slice(ROSTER_SIGN_DOMAIN);
+        v.extend_from_slice(&self.owner_pub);
+        v.extend_from_slice(&self.epoch.to_le_bytes());
+        v.extend_from_slice(&self.valid_until.to_le_bytes());
+        let mut devs: Vec<&RosterDevice> = self.devices.iter().collect();
+        devs.sort_by(|a, b| a.device_pub.cmp(&b.device_pub));
+        for d in devs {
+            v.extend_from_slice(&d.device_pub);
+            let name = d.petname.as_bytes();
+            // A petname is sanitized at storage; a >65535 name is impossible but
+            // a length-prefix must never silently truncate or wrap.
+            let len = name.len().min(u16::MAX as usize) as u16;
+            v.extend_from_slice(&len.to_le_bytes());
+            v.extend_from_slice(&name[..len as usize]);
+        }
+        v
+    }
+
+    /// Sign with the owner key (Ed25519 over `canonical_bytes`).
+    pub fn sign(&self, owner_key: &Ed25519KeyPair) -> Result<[u8; 64]> {
+        let sig = owner_key.sign(&self.canonical_bytes());
+        let mut out = [0u8; 64];
+        out.copy_from_slice(sig.as_ref());
+        Ok(out)
+    }
+
+    /// Verify the signature against `self.owner_pub`.
+    pub fn verify(&self, sig: &[u8; 64]) -> Result<()> {
+        let peer_pub = UnparsedPublicKey::new(&ED25519, &self.owner_pub);
+        peer_pub
+            .verify(&self.canonical_bytes(), sig)
+            .map_err(|_| anyhow!("mesh roster signature invalid: not signed by the owner key"))
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "owner_pub": hex::encode(self.owner_pub),
+            "epoch": self.epoch,
+            "valid_until": self.valid_until,
+            "devices": self.devices.iter().map(|d| json!({
+                "device_pub": hex::encode(d.device_pub),
+                "petname": d.petname,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let owner = hex::decode(v["owner_pub"].as_str()?).ok()?;
+        let owner_pub: [u8; 32] = owner.try_into().ok()?;
+        let devices = v["devices"].as_array()?
+            .iter()
+            .map(|d| {
+                let dp = hex::decode(d["device_pub"].as_str()?).ok()?;
+                let device_pub: [u8; 32] = dp.try_into().ok()?;
+                Some(RosterDevice {
+                    device_pub,
+                    petname: d["petname"].as_str()?.to_string(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(MeshRoster {
+            owner_pub,
+            epoch: v["epoch"].as_u64()?,
+            valid_until: v["valid_until"].as_u64()?,
+            devices,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntroScope { User, Device }
 impl IntroScope {
@@ -625,6 +725,28 @@ mod tests {
         let mut cert = DeviceCert::certify(&user,[0x01;32],now_secs(),CERT_TTL_SECS).unwrap();
         cert.sig[0] ^= 1;
         assert!(cert.verify(now_secs()).is_err());
+    }
+
+    #[test]
+    fn roster_signing_is_order_independent() {
+        let user = make_user();
+        let up = user.public_key_bytes();
+        let d = |pubbyte: u8| RosterDevice { device_pub: [pubbyte; 32], petname: format!("d{pubbyte}") };
+        let a = MeshRoster { owner_pub: up, epoch: 1, valid_until: now_secs() + 100, devices: vec![d(2), d(1)] };
+        let b = MeshRoster { owner_pub: up, epoch: 1, valid_until: now_secs() + 100, devices: vec![d(1), d(2)] };
+        // Same set, different insertion order -> same canonical bytes.
+        assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+        let sig = a.sign(user.keypair()).unwrap();
+        assert!(b.verify(&sig).is_ok(), "a roster with the same set in another order must verify");
+    }
+
+    #[test]
+    fn roster_verify_rejects_wrong_key() {
+        let a = make_user();
+        let b = make_user();
+        let r = MeshRoster { owner_pub: a.public_key_bytes(), epoch: 1, valid_until: now_secs() + 100, devices: vec![] };
+        let sig = r.sign(b.keypair()).unwrap();
+        assert!(r.verify(&sig).is_err(), "a sig by a non-owner key must be refused");
     }
 
     #[test]

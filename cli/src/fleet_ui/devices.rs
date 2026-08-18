@@ -20,23 +20,29 @@ pub struct DeviceEntry {
     pub needs_promote: bool,
 }
 
-/// Device tier (fleet / external / needs-review).
+/// Device tier (fleet / external / needs-review / mesh-roster).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceTier {
     Fleet,
     External,
     NeedsReview,
+    /// A sibling learned from the owner-signed mesh roster: known by name and
+    /// key, but no direct channel yet (sibling-to-sibling is not in v1). Liveness
+    /// is unknown (#217), so the row must not assert online/idle/offline.
+    MeshRoster,
 }
 
-/// Render the full device list.
-pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> String {
-    if devices.is_empty() && pending_requests == 0 {
+/// Render the full device list. `roster_heading` is the already-honest heading
+/// for the mesh-roster section (epoch + when received, or the expired note);
+/// `Some` renders the section, `None` omits it.
+pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_heading: Option<String>) -> String {
+    if devices.is_empty() && pending_requests == 0 && roster_heading.is_none() {
         return render_empty();
     }
 
     let mut lines = vec![];
 
-    if devices.is_empty() {
+    if devices.is_empty() && roster_heading.is_none() {
         lines.push(ui::paint(Tone::Dim, "  No devices yet."));
         lines.push(String::new());
     }
@@ -65,6 +71,27 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize) -> Strin
         ));
         for d in &externs {
             lines.push(render_device_row(d));
+        }
+        lines.push(String::new());
+    }
+
+    // Mesh-roster section: siblings learned from the owner's signed roster.
+    // Rendered whenever a roster was received (fresh OR expired), so "no other
+    // devices in the mesh" and "roster expired" read differently from "no
+    // roster yet" (which omits the section entirely).
+    let roster: Vec<_> = devices.iter().filter(|d| d.tier == DeviceTier::MeshRoster).collect();
+    if let Some(heading) = roster_heading {
+        lines.push(format!(
+            "  {} {}",
+            ui::paint(Tone::Brand, ui::glyph_mesh()),
+            ui::paint(Tone::Brand, &heading)
+        ));
+        if roster.is_empty() {
+            lines.push(ui::paint(Tone::Dim, "     (no other devices listed)"));
+        } else {
+            for d in &roster {
+                lines.push(render_device_row(d));
+            }
         }
         lines.push(String::new());
     }
@@ -106,9 +133,14 @@ fn render_device_row(d: &DeviceEntry) -> String {
         DeviceTier::Fleet => ui::paint(Tone::Brand, ui::glyph_fleet()),
         DeviceTier::External => ui::paint(Tone::Dim, ui::glyph_extern()),
         DeviceTier::NeedsReview => ui::paint(Tone::Warn, ui::glyph_review()),
+        DeviceTier::MeshRoster => ui::paint(Tone::Brand, ui::glyph_mesh()),
     };
+    // #217 for the mesh: a sibling we have never contacted has UNKNOWN liveness,
+    // never "idle"/"offline". The roster carries name + key only, so the row says
+    // what is true (known via the owner, no direct channel yet) and nothing else.
     let status = match d.online {
         Some(true) => ui::paint(Tone::Ok, "online"),
+        Some(false) if d.tier == DeviceTier::MeshRoster => ui::paint(Tone::Dim, "via owner"),
         // #217: "a warm link is NOT held open right now" is the normal, healthy
         // idle state, not an absence. "offline" promised far more than the value
         // supports and read as a failure next to "last seen just now".
@@ -231,7 +263,7 @@ mod tests {
                 needs_promote: false,
             },
         ];
-        let s = render_devices(&devices, 0);
+        let s = render_devices(&devices, 0, None);
         assert!(s.contains("FLEET"), "must show fleet section");
         assert!(s.contains("EXTERNAL"), "must show external section");
         assert!(s.contains("pixel-7"), "must show fleet device");
@@ -251,7 +283,7 @@ mod tests {
                 needs_promote: true,
             },
         ];
-        let s = render_devices(&devices, 0);
+        let s = render_devices(&devices, 0, None);
         assert!(s.contains("NEEDS REVIEW"), "must show review section");
         assert!(s.contains("old-laptop"), "must show review device");
         assert!(s.contains("promote to continue"), "must show promote nudge");
@@ -259,7 +291,7 @@ mod tests {
 
     #[test]
     fn pending_requests_count() {
-        let s = render_devices(&[], 2);
+        let s = render_devices(&[], 2, None);
         assert!(s.contains("2"), "must show request count");
         assert!(s.contains("filament requests"), "must suggest filament requests");
     }

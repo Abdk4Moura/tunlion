@@ -200,6 +200,9 @@ pub fn glyph_extern() -> &'static str {
 pub fn glyph_review() -> &'static str {
     if caps().unicode { "◐" } else { "[review]" }
 }
+pub fn glyph_mesh() -> &'static str {
+    if caps().unicode { "◇" } else { "[mesh]" }
+}
 pub fn glyph_warn() -> &'static str {
     if caps().unicode { "⚠" } else { "!" }
 }

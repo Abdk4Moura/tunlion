@@ -51,6 +51,7 @@ mod platform;
 pub(crate) use filament_pair as pake;
 mod pake_ceremony;
 mod ping;
+mod roster;
 mod sdnotify;
 mod protocol;
 mod resilience;
@@ -1952,7 +1953,15 @@ fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
 /// Listing the known names is the part that makes it a fix rather than a better
 /// error: the next question is always "then what is it called".
 pub(crate) fn require_known_device(name: &str) -> Result<()> {
-    let known: Vec<String> = devices_load().into_iter().map(|(n, _)| n).collect();
+    let mut known: Vec<String> = devices_load().into_iter().map(|(n, _)| n).collect();
+    // Mesh siblings learned from the owner-signed roster are known NAMES (they
+    // resolve, and `devices` shows them), but they carry no reconnect secret, so
+    // they are recognised, not reachable: a connection to them is not in v1.
+    for n in crate::roster::roster_device_names() {
+        if !known.iter().any(|k| k == &n) {
+            known.push(n);
+        }
+    }
     if known.iter().any(|n| n == name) {
         return Ok(());
     }
@@ -4371,6 +4380,14 @@ fn delegated_device_state(name: &str, cert: Option<&identity::DeviceCert>, now: 
 fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
     let owner = load_owner_key().map(|key| key.public_key_bytes());
+    // The key that identifies "same mesh as me": my own owner key if I have one,
+    // else the issuer key held in my own device certificate (the owner I joined
+    // under). A device whose cert chains to THIS key is fleet, not external; so
+    // a spoke stops filing its owner under "other people".
+    let same_owner = owner
+        .as_ref()
+        .copied()
+        .or_else(|| local_device_cert().map(|c| c.user_pub));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -4386,7 +4403,7 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
             let cert = device_cert_for(&name);
             let tier = match cert.as_ref() {
                 None => fleet_ui::devices::DeviceTier::NeedsReview,
-                Some(cert) if owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
+                Some(cert) if same_owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
                 Some(_) => fleet_ui::devices::DeviceTier::External,
             };
             let caps = effective_device_caps(&name);
@@ -4446,6 +4463,41 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                 needs_promote,
             }
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .chain(crate::roster::stored_roster()
+            .and_then(|r| r["devices"].as_array().cloned())
+            .map(|arr| {
+                let self_pub = crate::overlay::overlay_pubkey_bytes().ok();
+                arr.into_iter().filter_map(move |d| {
+                    let name = d["petname"].as_str()?.to_string();
+                    // Skip a sibling that is ALREADY in the local store (it has a
+                    // secret and a real channel; the roster adds nothing).
+                    if devices_load().iter().any(|(n, _)| n == &name) {
+                        return None;
+                    }
+                    // Skip MYSELF: the roster lists the owner's devices, and on a
+                    // spoke that includes this device's own key, which must never
+                    // render as its own sibling.
+                    if let (Some(self_pub), Some(hex_pub)) = (self_pub.as_ref(), d["device_pub"].as_str()) {
+                        if let Ok(decoded) = hex::decode(hex_pub) {
+                            if decoded.as_slice() == self_pub {
+                                return None;
+                            }
+                        }
+                    }
+                    Some(fleet_ui::devices::DeviceEntry {
+                        name,
+                        tier: fleet_ui::devices::DeviceTier::MeshRoster,
+                        online: None, // unknown liveness (#217), never idle/offline
+                        caps_summary: "known via owner".to_string(),
+                        countdown: String::new(),
+                        last_seen: None,
+                        needs_promote: false,
+                    })
+                }).collect::<Vec<_>>()
+            })
+            .unwrap_or_default())
         .collect()
 }
 
@@ -6602,6 +6654,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     direct_endpoint: None,
     warm_hold: WarmHold::default(),
     worker_port_tx: HashMap::new(),
+    roster_pushed: None,
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -8233,6 +8286,10 @@ struct Conn {
     /// `worker-ports` control message handler delivers the acceptor's port list
     /// through it. Removed by the receiver on delivery (one-shot).
     worker_port_tx: HashMap<String, oneshot::Sender<Vec<u16>>>,
+    /// Owner-only roster push bookkeeping: the (epoch, valid_until) last pushed
+    /// and the live links it reached, so a re-push fires only on a membership
+    /// change (new epoch), a validity refresh (new valid_until), or a new link.
+    roster_pushed: Option<(u64, u64, HashSet<String>)>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -8392,6 +8449,7 @@ impl Conn {
             direct_endpoint: None,
             warm_hold: WarmHold::default(),
             worker_port_tx: HashMap::new(),
+            roster_pushed: None,
         }
     }
 
@@ -8412,6 +8470,52 @@ impl Conn {
     }
     fn transport_of(&self, pid: &str) -> Option<Arc<dyn Transport>> {
         self.links.get(pid).and_then(|l| l.transport.clone())
+    }
+
+    /// Owner-only: mint the current roster and push it to every live link whose
+    /// view is stale (membership changed = new epoch, validity refreshed = new
+    /// valid_until, or a newly-established link). A push that fails is dropped
+    /// silently here; the next tick re-tries because `roster_pushed` still holds
+    /// the old mark, so a lost push is not a fact we swallow.
+    async fn roster_maintenance(&mut self) {
+        let Some(owner) = load_owner_key() else { return };
+        let now = identity::now_secs();
+        let Ok((blob, _changed)) = crate::roster::mint_roster(&owner, now) else { return };
+        let epoch = blob["epoch"].as_u64().unwrap_or(0);
+        let until = blob["valid_until"].as_u64().unwrap_or(0);
+        let live: HashSet<String> = self
+            .links
+            .iter()
+            .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        let should_push = match &self.roster_pushed {
+            None => true,
+            Some((e, u, pids)) => *e != epoch || *u != until || *pids != live,
+        };
+        if !should_push {
+            return;
+        }
+        let mut msg = blob.clone();
+        msg["type"] = json!("roster");
+        let mut pushed_to: HashSet<String> = HashSet::new();
+        for pid in &live {
+            if let Some(t) = self.transport_of(pid) {
+                if t.send_control(&msg).await.is_ok() {
+                    pushed_to.insert(pid.clone());
+                }
+            }
+        }
+        if pushed_to.len() != live.len() {
+            // A failed push is a fact worth surfacing: a spoke that missed it
+            // stays stale until the next successful push. Re-tried next tick.
+            let missed = live.len() - pushed_to.len();
+            ui::say(&format!(
+                "  {} roster push did not reach {missed} device(s); will retry",
+                ui::paint(ui::Tone::Warn, ui::glyph_warn())
+            ));
+        }
+        self.roster_pushed = Some((epoch, until, pushed_to));
     }
 
     /// #28: is the link keyed by `pid` actively moving transfer bytes right now?
@@ -11966,9 +12070,25 @@ async fn main() -> Result<()> {
                     } else {
                         let warm = ctl::try_list_warm().await;
                         let pending = ctl::try_list_pending().await;
+                        let now = identity::now_secs();
+                        // Honest roster heading: show the epoch and when it was
+                        // received, never "current"; and distinguish an expired
+                        // roster (stale in both directions) from one never seen.
+                        let roster_heading = match crate::roster::roster_staleness(now) {
+                            crate::roster::RosterStaleness::Fresh { epoch, received_at } => {
+                                let ago = now.saturating_sub(received_at);
+                                let ago = if ago < 60 { "just now".to_string() } else if ago < 3600 { format!("{}m ago", ago / 60) } else { format!("{}h ago", ago / 3600) };
+                                Some(format!("MESH  /  your owner's other devices (epoch {epoch}, received {ago})"))
+                            }
+                            crate::roster::RosterStaleness::Expired => Some(
+                                "MESH  /  your owner's other devices (roster expired; reconnect to the owner to refresh)".to_string(),
+                            ),
+                            crate::roster::RosterStaleness::None => None,
+                        };
                         let rendered = fleet_ui::devices::render_devices(
                             &device_entries(warm.as_ref()),
                             pending_request_count(pending.as_ref()),
+                            roster_heading,
                         );
                         println!("{rendered}");
                     }
@@ -12133,6 +12253,21 @@ async fn main() -> Result<()> {
                 ),
                 Some(d) => {
                     require_known_device(&d)?;
+                    // A mesh sibling is a known NAME (via the owner's roster) but
+                    // carries no channel, so there is nothing to probe. Say so
+                    // honestly instead of reporting "may be offline" (#240/#241
+                    // shape) about a device this side has never contacted.
+                    let roster_only = crate::roster::roster_device_names().iter().any(|n| n == &d)
+                        && !devices_load().iter().any(|(n, _)| n == &d);
+                    if roster_only {
+                        println!("{} {}", ui::paint(ui::Tone::Dim, "filament reach →"), ui::paint(ui::Tone::Brand, &d));
+                        println!(
+                            "  {} {}",
+                            ui::paint(ui::Tone::Brand, ui::glyph_mesh()),
+                            ui::paint(ui::Tone::Dim, "in your mesh via the owner's roster; sibling connections are not in this release")
+                        );
+                        return Ok(());
+                    }
                     crate::ping::ping_cmd(&server, &d, 1, json, relay).await
                 }
                 None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
@@ -15622,6 +15757,9 @@ async fn recv_cmd(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    // Owner-only roster push: mint + push the mesh roster on membership change,
+    // validity refresh, or a newly-established link.
+    let mut last_roster_push = Instant::now();
 
     // systemd Type=notify: announce readiness once the serving loop is about to
     // run, then ping the watchdog below. No-op when not run under systemd.
@@ -16084,6 +16222,14 @@ async fn recv_cmd(
             if lapsed > 0 {
                 ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
             }
+        }
+
+        // ROSTER (v1, owner-only): push the mesh roster over live links on a
+        // membership change, a validity refresh, or a newly-established link.
+        // Runs faster than the sweep so a new link gets the roster promptly.
+        if daemon && last_roster_push.elapsed() >= Duration::from_secs(5) {
+            last_roster_push = Instant::now();
+            conn.roster_maintenance().await;
         }
 
         // Daemon-managed mount health check: periodically check all tracked
@@ -17283,6 +17429,24 @@ async fn recv_cmd(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                // Owner-signed mesh roster push (v1, display-only). Verify
+                // against the owner key held in OUR device certificate (the
+                // issuer), accept only a newer (epoch, valid_until), store for
+                // `devices` to render. The roster NEVER feeds an authorization
+                // decision, so a failed receipt (bad sig / wrong owner / replay /
+                // expired) is a silent no-op, logged at debug only.
+                Some("roster") => {
+                    if let Some(cert) = local_device_cert() {
+                        match crate::roster::verify_and_store_roster(&v, &cert.user_pub, identity::now_secs()) {
+                            Ok(true) => ui::debug(&format!(
+                                "roster: accepted epoch {} from owner",
+                                v["epoch"].as_u64().unwrap_or(0)
+                            )),
+                            Ok(false) => {}
+                            Err(e) => ui::debug(&format!("roster: rejected: {e}")),
                         }
                     }
                 }
@@ -20002,6 +20166,122 @@ mod tests {
         assert!(msg.contains("no device named 'zzz-not-a-device'"), "got: {msg}");
         assert!(msg.contains("popos"), "known names missing: {msg}");
         assert!(msg.contains("pixel"), "known names missing: {msg}");
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roster_is_newer_lexicographic() {
+        use crate::roster::roster_is_newer;
+        // Fresh accept (nothing seen).
+        assert!(roster_is_newer(1, 100, None, None));
+        // Strictly newer epoch.
+        assert!(roster_is_newer(2, 100, Some(1), Some(100)));
+        // Same epoch, later valid_until = a validity refresh, deliverable.
+        assert!(roster_is_newer(1, 200, Some(1), Some(100)));
+        // Replay (same epoch, same valid_until) rejected.
+        assert!(!roster_is_newer(1, 100, Some(1), Some(100)));
+        // Older epoch rejected even with a later valid_until.
+        assert!(!roster_is_newer(1, 999, Some(2), Some(100)));
+        // Same epoch, OLDER valid_until rejected.
+        assert!(!roster_is_newer(1, 50, Some(1), Some(100)));
+    }
+
+    #[test]
+    fn roster_wrong_key_rejected_and_epoch_monotone() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-roster-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+
+        let owner = Ed25519KeyPair::from_seed_unchecked(&[1u8; 32]).unwrap();
+        let attacker = Ed25519KeyPair::from_seed_unchecked(&[2u8; 32]).unwrap();
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let now = identity::now_secs();
+        let mk = |epoch: u64, until: u64| identity::MeshRoster {
+            owner_pub,
+            epoch,
+            valid_until: until,
+            devices: vec![identity::RosterDevice {
+                device_pub: [9u8; 32],
+                petname: "d1".to_string(),
+            }],
+        };
+        let signed = |r: &identity::MeshRoster, key: &Ed25519KeyPair| {
+            let sig = r.sign(key).unwrap();
+            let mut b = r.to_json();
+            b["sig"] = serde_json::json!(hex::encode(sig));
+            b
+        };
+
+        // Wrong owner field (signed by owner, claims attacker's key) -> reject.
+        let wrong_owner = identity::MeshRoster {
+            owner_pub: attacker.public_key().as_ref().try_into().unwrap(),
+            epoch: 1,
+            valid_until: now + 1000,
+            devices: vec![],
+        };
+        let b = signed(&wrong_owner, &owner);
+        assert!(crate::roster::verify_and_store_roster(&b, &owner_pub, now).is_err());
+
+        // Wrong signer (owner field correct, sig by attacker) -> reject.
+        let b = signed(&mk(1, now + 1000), &attacker);
+        assert!(crate::roster::verify_and_store_roster(&b, &owner_pub, now).is_err());
+
+        // Valid roster -> accepted and stored.
+        assert!(crate::roster::verify_and_store_roster(&signed(&mk(1, now + 1000), &owner), &owner_pub, now).unwrap());
+
+        // Older epoch (0 < 1) does not overwrite, even with a later valid_until.
+        assert!(!crate::roster::verify_and_store_roster(&signed(&mk(0, now + 9999), &owner), &owner_pub, now).unwrap());
+        // Replay (same epoch, same valid_until) rejected.
+        assert!(!crate::roster::verify_and_store_roster(&signed(&mk(1, now + 1000), &owner), &owner_pub, now).unwrap());
+        // Same epoch + later valid_until = refresh -> accepted.
+        assert!(crate::roster::verify_and_store_roster(&signed(&mk(1, now + 3000), &owner), &owner_pub, now).unwrap());
+        // Newer epoch -> accepted.
+        assert!(crate::roster::verify_and_store_roster(&signed(&mk(2, now + 1000), &owner), &owner_pub, now).unwrap());
+        // Expired (valid_until in the past) -> rejected, never stored.
+        assert!(!crate::roster::verify_and_store_roster(&signed(&mk(3, now.saturating_sub(1)), &owner), &owner_pub, now).unwrap());
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roster_snapshot_filters_revoked_devices() {
+        // A revoked device is no longer a mesh member: the owner's snapshot must
+        // not re-issue it to every spoke, even though its record still holds a
+        // cert chaining to the owner key (revocation is a tombstone on the same
+        // record). The acceptor refuses it independently; `devices` must not lie.
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-roster-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let owner = Ed25519KeyPair::from_seed_unchecked(&[1u8; 32]).unwrap();
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let now = identity::now_secs();
+        let cert = |pubbyte: u8| serde_json::json!({
+            "devicePub": hex::encode([pubbyte; 32]),
+            "userPub": hex::encode(owner_pub),
+            "expires": now + 1000,
+            "issued": now,
+            "sig": hex::encode([0u8; 64]),
+        });
+        let p = std::path::PathBuf::from(&dir).join("devices.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!([
+                {"name": "ok", "secret": "b".repeat(64), "deviceCert": cert(0x11)},
+                {"name": "revoked", "secret": "c".repeat(64), "deviceCert": cert(0x22), "certRevoked": true},
+            ])).unwrap(),
+        ).unwrap();
+
+        let names: Vec<String> = crate::roster::owner_snapshot(&owner_pub)
+            .into_iter().map(|d| d.petname).collect();
+        assert!(names.contains(&"ok".to_string()), "non-revoked device must be listed: {names:?}");
+        assert!(!names.contains(&"revoked".to_string()), "revoked device must be filtered: {names:?}");
 
         unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
