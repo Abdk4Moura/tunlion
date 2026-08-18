@@ -42,7 +42,12 @@ function buildHarness() {
   const out = path.join(__dirname, '.p1-relay-bundle.js');
   const r = spawnSync(path.join(FRONT, 'node_modules', '.bin', 'esbuild'),
     [path.join(__dirname, 'p1-relay-rebuild-harness.jsx'), '--bundle', '--format=iife',
-      `--outfile=${out}`, '--loader:.js=jsx', '--jsx=automatic', '--define:process.env.NODE_ENV="production"'],
+      `--outfile=${out}`, '--loader:.js=jsx', '--jsx=automatic', '--define:process.env.NODE_ENV="production"',
+      // #250: `import x from '*.wasm?url'` is Vite syntax esbuild has no
+      // loader for, and iife has no `import.meta`, so the bundle failed and
+      // then the component threw reading import.meta.env. Same-origin is
+      // what a harness wants: an empty base keeps requests local.
+      '--loader:.wasm=file', '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;
