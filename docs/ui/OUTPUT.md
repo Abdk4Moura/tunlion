@@ -103,11 +103,21 @@ screen currently prints its body with `eprintln!` and its footer with
 - `ui::critical` — must-see even under `-q`. Route label, relay banner, a path
   changing under the user, fatal errors. Use sparingly; everything cannot be critical.
 - `ui::say` — the default. Normal useful narration. Suppressed by `-q`.
-- `ui::trace` — resilience internals: stalls, repairs, reconnects, upgrade
-  probes. Shown at `-v`.
+- `ui::debug` — internals a user may want on demand: resilience events, stalls,
+  repairs, reconnects, upgrade probes, and diagnostics addressed to us rather
+  than to them. Shown at `-v`.
+- `ui::trace` — the noisy layer: ICE candidates, per-frame detail. Shown at
+  `-vv`.
 
 If a line is worth printing at all, it belongs at exactly one of these. Deciding
 is part of writing the feature, not a finishing pass.
+
+This list said `ui::trace` was the `-v` level until 2026-08-18, when someone
+implementing #231 read the doc, wrote the fix to it, and found the code maps
+`-v` to `ui::debug` and `-vv` to `ui::trace`. A doc that misstates a level sends
+diagnostics one notch quieter or louder than intended and nothing catches it,
+which is how internal telemetry ended up on the flagship receive path in the
+first place.
 
 ## Styling
 
