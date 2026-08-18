@@ -250,6 +250,13 @@
       ]
     },
     {
+      "path": "cli/tests/whoami-candidate-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
+      "owner": "new-age-agent",
+      "expires": "2026-09-17"
+    },
+    {
       "path": "deploy/assert-oom-shield.sh",
       "disposition": "operational",
       "entrypoint": "bash deploy/assert-oom-shield.sh",

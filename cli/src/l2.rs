@@ -26,7 +26,7 @@ use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1254,7 +1254,7 @@ async fn bring_up_to_known(
     // Candidates gathered once at first bind; re-advertised to each new
     // candidate peer we rotate to (the endpoint accepts from any of them,
     // the QUIC race is pair-secret-authenticated either way).
-    let mut direct_cands: Option<Vec<String>> = None;
+    let mut direct_cands: Option<(Vec<String>, Option<String>)> = None;
     // The acceptor re-sends its transport-offer (a late initiator can miss the
     // first). Race only the FIRST offer we get; later re-sends are duplicates.
     let mut direct_racing = false;
@@ -1353,8 +1353,7 @@ async fn bring_up_to_known(
                     if endpoint.is_none() {
                         match crate::direct::bind_endpoint() {
                             Ok((ep, port)) => {
-                                direct_cands =
-                                    Some(crate::direct::gather_candidates(server, port).await);
+                                direct_cands = Some(crate::direct::gather_candidates(server, port).await);
                                 endpoint = Some(ep);
                                 // TRACE, direct-offer detail.
                                 crate::ui::trace(&format!("filament: DIRECT-OFFER sent to '{peer_name}', port {port}"));
@@ -1365,9 +1364,16 @@ async fn bring_up_to_known(
                         }
                     }
                     if endpoint.is_some() {
-                        if let Some(c) = &direct_cands {
-                            let offer =
-                                json!({ "type": "transport-offer", "v": 1, "addrs": c });
+                        if let Some((c, server_public)) = &direct_cands {
+                            // #237: advertise the address adopted on the server's
+                            // say-so (the peer dials it and may have to name it)
+                            // and our protocol version (gates the observed-address
+                            // exchange on both sides).
+                            let mut offer =
+                                json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": c });
+                            if let Some(s) = server_public {
+                                offer["server_public"] = json!(s);
+                            }
                             sio.emit("signal", json!({ "to": pid, "data": offer })).await.ok();
                         }
                     }
@@ -1481,6 +1487,17 @@ async fn bring_up_to_known(
                             .as_array()
                             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                             .unwrap_or_default();
+                        // #237: the initiated race only runs the observed-address
+                        // exchange when the PEER's offer says it speaks it; the
+                        // peer makes the same decision from OUR offer (we always
+                        // advertise proto 2), so both ends skip or both run.
+                        let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
+                        let exchange = peer_proto >= 2;
+                        // The L2 initiator has no fallback to attribute, and
+                        // does not track the peer's claimed server-asserted
+                        // address (dial-tracking is unused here, held so the
+                        // shared race keeps a single signature).
+                        let l2_dialed = Arc::new(AtomicBool::new(false));
                         // DEBUG, resilience/direct internal (racing a direct path).
                         crate::ui::debug(&format!(
                             "filament: got transport-offer ({} cand), racing direct-quic",
@@ -1505,6 +1522,7 @@ async fn bring_up_to_known(
                             if let Some(t) = crate::direct::race_connect_labeled(
                                 ep, peer_cands, &secret, pid.clone(), my_uid_for_race,
                                 peer_uid_for_race, my_id_for_race, tx.clone(), "direct-quic",
+                                exchange, None, l2_dialed,
                             )
                             .await
                             {
