@@ -68,10 +68,17 @@ jobs:
 
       # Screenshots are the evidence a browser actually rendered, rather than the
       # harness reporting on itself. Keep them when a gate fails.
+      #
+      # The path is spelled out rather than globbed. `.*-shots/` would have to
+      # match a LEADING DOT, which globs commonly refuse, and paired with
+      # if-no-files-found: ignore that fails silently: the step goes green while
+      # uploading nothing, and the absence reads as "no screenshots were taken".
+      # Only relay-honesty writes any; pake-ux takes none, so `warn` is the
+      # honest setting here and would go loud if relay-honesty stopped writing.
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: browser-gate-screenshots
-          path: frontend/tests/.*-shots/
-          if-no-files-found: ignore
+          path: frontend/tests/.relay-shots/
+          if-no-files-found: warn
