@@ -5011,9 +5011,35 @@ async fn add_for_cmd(
         Some("device") | Some("person") => (for_.unwrap(), None),
         Some(name) => ("device".to_string(), Some(name.to_string())),
     };
+    // The ergonomic gap behind "I want to shell into my own devices": shell has
+    // to be in the invitation ceiling, because a grant cannot widen one later
+    // (#226, which now refuses honestly instead of pretending). So the only way
+    // to get it was `--allow shell`, a flag you had to already know about, on a
+    // path the interactive flow never mentioned. Ask instead.
+    //
+    // Offered only for a device you control, only when the user did not pass
+    // --allow, and only interactively. A person gets transfer and is not asked,
+    // because owner-equivalent access to a stranger should stay a deliberate
+    // flag rather than a menu item one keypress away.
+    let mut interactive_shell = false;
+    if allow.is_empty() && kind == "device" && caps.interactive {
+        let choices = vec![
+            "Send files, and mount my folders".to_string(),
+            "...and open a terminal here  (OWNER-EQUIVALENT)".to_string(),
+        ];
+        match codeentry::pick("WHAT THIS DEVICE MAY DO", &choices)? {
+            Some(1) => interactive_shell = true,
+            Some(_) => {}
+            None => return Err(cancelled()),
+        }
+    }
     let mut ceiling = if allow.is_empty() {
         if kind == "device" {
-            vec!["transfer".to_string(), "mount".to_string()]
+            let mut c = vec!["transfer".to_string(), "mount".to_string()];
+            if interactive_shell {
+                c.push("shell".to_string());
+            }
+            c
         } else {
             vec!["transfer".to_string()]
         }
