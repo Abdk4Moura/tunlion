@@ -39,7 +39,11 @@ if (fs.existsSync(CLI_TESTS_NM) && !Module.globalPaths.includes(CLI_TESTS_NM)) {
   process.env.NODE_PATH = (process.env.NODE_PATH ? process.env.NODE_PATH + path.delimiter : '') + CLI_TESTS_NM;
   Module._initPaths();
 }
-const { chromium } = require(path.join(CLI_TESTS_NM, 'playwright'));
+// #250: was require(path.join(CLI_TESTS_NM, 'playwright')), an absolute path
+// into cli/tests/node_modules that does not exist in a clean checkout.
+const { chromium } = require(require.resolve('playwright', {
+  paths: [path.join(__dirname, '..')],
+}));
 
 const ROOT = path.resolve(__dirname, '..', '..');           // repo root
 const FRONT = path.join(ROOT, 'frontend');

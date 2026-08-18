@@ -18,7 +18,12 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PW = '/root/wt-transport/experiments/ux/node_modules/playwright';
+// Resolve the declared devDependency rather than an absolute path into some
+// other worktree. Every one of these gates was dead on MODULE_NOT_FOUND because
+// the path it named had been reaped (#250).
+const PW = require.resolve('playwright', {
+  paths: [require('path').join(__dirname, '..')],
+});
 const { chromium } = require(PW);
 
 const ROOT = path.resolve(__dirname, '..', '..');
