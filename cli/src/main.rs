@@ -7652,6 +7652,27 @@ enum DirectIntent {
     Promote,
 }
 
+/// #246: a link is dead only when nothing is serving AND its WebRTC peer is
+/// not still making progress. `peer_live` is `Peer::is_live` (anything but
+/// Failed/Closed); `transport_dead` and `workers_all_dead` describe the direct
+/// transports. A WebRTC link that just finished `establish` is
+/// (peer_live=true, transport dead, workers empty) and therefore alive: it has
+/// no transport or workers YET, but its ICE agent is working. Named as a
+/// function so the decision is one expression, unit-testable, and stable
+/// across call sites.
+fn link_dead_for(peer_live: bool, transport_dead: bool, workers_all_dead: bool) -> bool {
+    !peer_live && transport_dead && workers_all_dead
+}
+
+/// #246: a link counts as live when any transport serves, any worker serves,
+/// or the WebRTC peer is still making progress. The peer clause is what lets a
+/// Normal re-dial yield to an establish that is still underway instead of
+/// arming a fresh direct attempt (whose fallback timer would then tear the
+/// establish down).
+fn link_has_live_for(peer_live: bool, primary_ok: bool, workers_ok: bool) -> bool {
+    peer_live || primary_ok || workers_ok
+}
+
 struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
     /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
@@ -8703,16 +8724,24 @@ impl Conn {
         Ok(self.is_active(&peer_id))
     }
 
-    /// A link is "live" if its primary transport or any worker is still alive.
-    /// Restored: the pending-only guard made it briefly dead, but promotion
-    /// intent needs it back. Every caller EXCEPT a deliberate promotion must
-    /// leave a live link alone, which is what warm-hold depends on.
+    /// A link is "live" if its primary transport or any worker is still alive,
+    /// or its WebRTC peer is still making progress (#246). Restored: the
+    /// pending-only guard made it briefly dead, but promotion intent needs it
+    /// back. Every caller EXCEPT a deliberate promotion must leave a live link
+    /// alone, which is what warm-hold depends on.
     fn has_live_transport(&self, pid: &str) -> bool {
         self.links.get(pid)
             .map(|l| {
+                // #246: a link mid-establish (peer present, ICE still working
+                // toward Connected) is making progress even before any
+                // transport/worker exists. Counting it as live is what lets a
+                // Normal re-dial yield to the in-flight establish instead of
+                // arming a fresh direct attempt whose 5s fallback timer then
+                // tears that establish down at the moment it is about to win.
+                let peer_live = l.peer.as_ref().map(|p| p.is_live()).unwrap_or(false);
                 let primary_ok = l.transport.as_ref().map(|t| !t.is_dead()).unwrap_or(false);
                 let workers_ok = l.workers.iter().any(|w| !w.is_dead());
-                primary_ok || workers_ok
+                link_has_live_for(peer_live, primary_ok, workers_ok)
             })
             .unwrap_or(false)
     }
@@ -9164,8 +9193,22 @@ impl Conn {
         }
         // A probe expects a relay link to be present (it's the one we'd upgrade
         // AWAY from); only the cold path bails when a link already exists.
+        // #246: a link without a transport and without workers is NOT
+        // necessarily dead. A WebRTC link that just finished `establish` has
+        // exactly that shape: peer present, ICE gathering, presence
+        // Connecting. Judging it dead here is what destroyed the in-flight
+        // ICE agent about a second into the relay fallback, on every 5s direct
+        // retry, forever. A link is dead only when BOTH nothing is serving AND
+        // its peer has reached a terminal state (Failed/Closed) or is absent.
         let link_dead = self.links.get(pid)
-            .map(|l| l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true) && l.workers.iter().all(|w| w.is_dead()))
+            .map(|l| {
+                let peer_live = l.peer.as_ref().map(|p| p.is_live()).unwrap_or(false);
+                link_dead_for(
+                    peer_live,
+                    l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true),
+                    l.workers.iter().all(|w| w.is_dead()),
+                )
+            })
             .unwrap_or(false);
         if link_dead {
             // The link is already dead, so destroying it loses nothing. Its
@@ -9200,6 +9243,17 @@ impl Conn {
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
         // promotion. Promotion is the one caller that intends to replace it.
+        // #246: `has_live_transport` now counts a mid-establish WebRTC peer as
+        // live, so a Normal re-dial YIELDS to an establish that is still
+        // making progress instead of arming a fresh direct attempt whose own
+        // 5s fallback timer would then re-enter `establish` at the same cursor
+        // and swap the still-establishing link. That is the livelock relocated
+        // rather than removed, which is why both gates are needed. Promote
+        // bypasses on purpose (it is the one caller that intends to displace a
+        // live link, and its teardown is the designed Option A), and Probe
+        // bypasses on purpose (it dials ALONGSIDE the serving relay link and
+        // never touches `links`, so it cannot disturb an establish it did not
+        // create).
         if intent == DirectIntent::Normal && self.has_live_transport(pid) {
             return; // already linked via a live transport
         }
@@ -19852,6 +19906,46 @@ mod tests {
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Contact));
         assert!(!suppressed.contains("peer-sid"));
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
+    }
+
+    #[test]
+    fn link_dead_and_live_predicates_encode_246_without_suppressing_disconnected_recovery() {
+        use super::{link_dead_for, link_has_live_for};
+        use crate::net::is_live_state;
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        // The livelock shape: a WebRTC link right after `establish`. NO
+        // transport, NO workers, but its ICE agent is alive and gathering. The
+        // old code read "no transport AND all (zero) workers dead" as DEAD and
+        // the next 5s direct retry dropped the in-flight establish. It must be
+        // alive.
+        //         (peer_live, no_transport, no_workers)
+        let establishing = (true, true, true);
+        assert!(!link_dead_for(establishing.0, establishing.1, establishing.2));
+        assert!(link_has_live_for(establishing.0, false, false));
+        // Disconnected is deliberately not peer-live. A polite peer does not
+        // restart ICE, so treating it as live would suppress its sole recovery:
+        // a re-dial. This intentionally lets a re-dial displace an impolite
+        // peer's restart too, restoring the bounded pre-#246 behavior.
+        assert!(!is_live_state(RTCPeerConnectionState::Disconnected));
+        let disconnected = (false, true, true);
+        assert!(link_dead_for(disconnected.0, disconnected.1, disconnected.2));
+        assert!(!link_has_live_for(disconnected.0, false, false));
+        // A link whose peer reached a terminal state with nothing serving IS
+        // dead: droppable before a fresh attempt (nothing is lost).
+        assert!(link_dead_for(false, true, true));
+        assert!(!link_has_live_for(false, false, false));
+        // A serving direct link (transport alive) is live regardless of peer.
+        assert!(!link_dead_for(false, false, true));
+        assert!(link_has_live_for(false, true, false));
+        // Any live worker keeps the link alive.
+        assert!(!link_dead_for(false, true, false));
+        assert!(link_has_live_for(false, false, true));
+        // Peer live always wins both predicates: even with everything else
+        // dead the peer's connection is still working or recovering.
+        for (td, wd) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(!link_dead_for(true, td, wd), "peer live must never read dead ({td},{wd})");
+            assert!(link_has_live_for(true, !td, !wd));
+        }
     }
 
     /// Fleet mount scope: `path_within` bounds a mount to the share root and

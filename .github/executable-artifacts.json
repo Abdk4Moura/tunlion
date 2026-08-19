@@ -157,6 +157,13 @@
       ]
     },
     {
+      "path": "cli/tests/livelock-nat-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/246",
+      "owner": "new-age-agent",
+      "expires": "2026-09-17"
+    },
+    {
       "path": "cli/tests/mount-gates.sh",
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/filament/issues/249",
