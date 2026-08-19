@@ -43,12 +43,6 @@
 #    Disconnected by on_pc_state's grace timer (6s or away+15s,
 #    Ev::GraceExpired), both generation-keyed. A regression of those timers
 #    would not be caught by this gate.
-#  - #252: at loss=3%, this fixture can hit the independent C3 watchdog race
-#    (observed 1/15 on 2026-08-18): ICE reaches Connected, the C3 watchdog sees
-#    PC Connecting and rebuilds, then the queued PC Connected event lands for
-#    the torn-down link. That has neither a fallback re-offer nor a link_dead
-#    killer signature, so delivery is context rather than a #246 verdict.
-
 set -uo pipefail
 
 LAB=/root/wt-hp2/lab
