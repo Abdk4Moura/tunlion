@@ -72,7 +72,7 @@ round() {
     code=$(grep -oiE "$word-[0-9]{3,5}" "$WORK/$tag-send.log" | head -1); [ -n "$code" ] && break; sleep 0.3
   done
   [ -z "$code" ] && { echo "SETUP: no pairing code for $tag"; kill $sp 2>/dev/null; return 2; }
-  env $recv_env timeout 45 "$BIN" recv "$code" -y --dir "$D" --server "$SERVER" >"$WORK/$tag-recv.log" 2>&1
+  env $recv_env timeout 45 "$BIN" receive "$code" -y --dir "$D" --server "$SERVER" >"$WORK/$tag-recv.log" 2>&1
   wait $sp 2>/dev/null
   return 0
 }
