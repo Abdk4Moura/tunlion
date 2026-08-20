@@ -6929,6 +6929,56 @@ fn cancelled() -> anyhow::Error {
 
 /// `add` was handed an invitation instead of a pairing code. One source for the
 /// sentence so the test and the error cannot drift apart.
+/// What the bare `filament` screen offers, given what this machine actually has.
+///
+/// Extracted so #194 can be pinned without driving a terminal: the bug was a
+/// menu that contradicted the header printed directly above it.
+fn first_screen_actions(owner: bool, joined: bool, device_count: usize) -> Vec<(&'static str, &'static str)> {
+    if owner {
+        vec![
+            ("Send something", "send"),
+            ("Receive something", "receive"),
+            ("Mount remote files", "mount"),
+            ("Connect a device with me now", "add"),
+            ("Invite a device or person", "add --for"),
+            ("Serve in the background", "up --install"),
+            ("See every device", "devices"),
+            ("View my identity", "id"),
+        ]
+    } else if joined {
+        vec![
+            ("Send something", "send"),
+            ("Receive something", "receive"),
+            ("Mount remote files", "mount"),
+            ("See every device", "devices"),
+            ("View my joined identity", "id"),
+        ]
+    } else if device_count == 0 {
+        vec![
+            ("Set up this first device", "init"),
+            ("Join with an invitation", "join"),
+            ("Receive a one-time transfer", "receive"),
+        ]
+    } else {
+        // #194: this branch is about having no IDENTITY, not about being the
+        // first device. A machine paired by code has peers in devices.json
+        // and no identity of its own, so the header counted "2 DEVICES"
+        // directly above an item reading "Set up this first device". The
+        // owner hit exactly that and called it strange, which it is.
+        //
+        // Say what is actually missing, and offer what already works: those
+        // peers are reachable right now, so hiding `send` and `devices`
+        // behind a setup step nobody needs is its own small lie.
+        vec![
+            ("Send something", "send"),
+            ("Receive something", "receive"),
+            ("See every device", "devices"),
+            ("Create an identity for this device", "init"),
+            ("Join with an invitation", "join"),
+        ]
+    }
+}
+
 fn invitation_not_a_code_msg() -> String {
     "that is an invitation, not a pairing code.\n  \
      Run `filament join` and paste it at the prompt; it is cleared from the terminal after reading.\n  \
@@ -11914,32 +11964,7 @@ async fn main() -> Result<()> {
         let header = format!("FILAMENT  /  {device_count} DEVICES  /  {availability}");
         let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
         let joined = !owner && local_device_cert().is_some();
-        let actions: Vec<(&str, &str)> = if owner {
-            vec![
-                ("Send something", "send"),
-                ("Receive something", "receive"),
-                ("Mount remote files", "mount"),
-                ("Connect a device with me now", "add"),
-                ("Invite a device or person", "add --for"),
-                ("Serve in the background", "up --install"),
-                ("See every device", "devices"),
-                ("View my identity", "id"),
-            ]
-        } else if joined {
-            vec![
-                ("Send something", "send"),
-                ("Receive something", "receive"),
-                ("Mount remote files", "mount"),
-                ("See every device", "devices"),
-                ("View my joined identity", "id"),
-            ]
-        } else {
-            vec![
-                ("Set up this first device", "init"),
-                ("Join with an invitation", "join"),
-                ("Receive a one-time transfer", "receive"),
-            ]
-        };
+        let actions = first_screen_actions(owner, joined, device_count);
         let labels = actions.iter().map(|(label, _)| (*label).to_string()).collect::<Vec<_>>();
         match codeentry::pick(&header, &labels)? {
             Some(index) => argv.extend(
@@ -21558,6 +21583,36 @@ mod tests {
     /// The remedy is asserted against `join`'s real interface: it takes the
     /// invitation interactively or via --invite-file, and NEVER from argv, so
     /// this must not tell anyone to pass it on the command line.
+    /// #194: the bare screen prints "FILAMENT / N DEVICES / ..." and then a
+    /// menu. Those two must not contradict each other. The owner saw
+    /// "2 DEVICES" above "Set up this first device" on a machine paired by
+    /// code, which has peers and no identity of its own.
+    #[test]
+    fn the_first_screen_menu_does_not_contradict_its_own_header() {
+        // Genuinely nothing here: the friendly first-run wording is true.
+        let fresh = first_screen_actions(false, false, 0);
+        assert!(fresh.iter().any(|(l, _)| l.contains("first device")));
+
+        // Peers but no identity. "first device" is false with a device count
+        // printed directly above it.
+        let paired = first_screen_actions(false, false, 2);
+        assert!(
+            !paired.iter().any(|(l, _)| l.contains("first device")),
+            "must not call it the first device when the header counts peers: {paired:?}"
+        );
+        // And what already works must be offered: those peers are reachable now.
+        for verb in ["send", "devices"] {
+            assert!(paired.iter().any(|(_, a)| *a == verb),
+                "a machine with peers must be offered `{verb}`: {paired:?}");
+        }
+        // Setting up an identity stays available, just not as a lie about order.
+        assert!(paired.iter().any(|(_, a)| *a == "init"));
+
+        // The owner and joined menus are unaffected by device count.
+        assert_eq!(first_screen_actions(true, false, 0), first_screen_actions(true, false, 5));
+        assert_eq!(first_screen_actions(false, true, 0), first_screen_actions(false, true, 5));
+    }
+
     #[test]
     fn an_invitation_pasted_into_add_is_named_and_the_remedy_exists() {
         let msg = invitation_not_a_code_msg();
