@@ -3617,7 +3617,8 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break Err(anyhow!(
-                "shell bootstrap timed out, is '{peer}' running `filament up` with shell access granted?"
+                "shell bootstrap timed out with no answer from '{peer}'. If it is running \
+                 `filament up`, the shell acceptor may be off there (`filament up --shell`)."
             ));
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
@@ -3628,6 +3629,20 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
                 // refuses the bootstrap on Inferred ("identity not proven").
                 Some("identity-nonce-challenge") => {
                     crate::respond_to_identity_challenge(&t, &v).await;
+                    continue;
+                }
+                // The acceptor SAYS why it refused, in an l2-close `err`. This
+                // arm used to fall through to `_ => continue`, so `--ssh` threw
+                // that sentence away, spun for the full 20s, and then guessed
+                // at a cause: "is '<peer>' running `filament up` with shell
+                // access granted?" The plain `filament shell` path surfaces the
+                // same message immediately. Same refusal, same wire, two very
+                // different errors, and the useless one was on the path a user
+                // reaches for when the first attempt fails.
+                Some("l2-close") => {
+                    if let Some(why) = v["err"].as_str() {
+                        break Err(anyhow!("shell refused by '{peer}': {why}"));
+                    }
                     continue;
                 }
                 Some("shell-bootstrap-ack") => {

@@ -18023,7 +18023,7 @@ async fn recv_cmd(
                     if !l2_enabled {
                         let sid = l2::wire_sid(&v).unwrap_or(0);
                         let _ = t
-                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell acceptor off on this device; run `filament up --shell` here to serve shells" }))
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `filament up --shell` on that device" }))
                             .await;
                         continue;
                     }
