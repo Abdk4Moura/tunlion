@@ -20,10 +20,15 @@
 
 pub use filament_cap::capability::*;
 
+/// Shell serving is OFF on the acceptor entirely. Not a capability problem, so a
+/// grant does not help and must never be suggested for it.
+pub const SHELL_OFF_REASON: &str =
+    "shell serving is off there; run `filament up --shell` on that device";
+
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a
 /// fresh invitation that includes the capability.
-pub const CEILING_REASON: &str = "not in auth key caps";
+pub const CEILING_REASON: &str = "this capability is outside the device's invitation ceiling";
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -59,7 +64,8 @@ pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
     // Check mtime and length for cache invalidation. Windows can retain the same
     // timestamp across rapid writes, while a revoke changes the JSON length.
     let metadata = std::fs::metadata(&p).ok();
-    let mtime = metadata.as_ref()
+    let mtime = metadata
+        .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos());
@@ -198,11 +204,16 @@ static PA_LD_NO_HEADER: OnceLock<ActionCounters> = OnceLock::new();
 
 #[allow(dead_code)]
 fn pa_get(map: &ActionCounters, action: &str) -> u64 {
-    map.lock().unwrap().get(action).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0)
+    map.lock()
+        .unwrap()
+        .get(action)
+        .map(|a| a.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 fn pa_inc(map: &ActionCounters, action: &str) {
-    map.lock().unwrap()
+    map.lock()
+        .unwrap()
         .entry(action.to_string())
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
@@ -212,20 +223,44 @@ fn pa_inc(map: &ActionCounters, action: &str) {
 pub fn cap_action_counts() -> Vec<ActionCounts> {
     let mut actions: HashMap<String, ActionCounts> = HashMap::new();
     let maps: [(&ActionCounters, fn(&mut ActionCounts, &str, u64)); 6] = [
-        (PA_LA_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())), |a, _action, val| a.la_authorized += val),
-        (PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())), |a, _action, val| a.la_denied += val),
-        (PA_LA_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())), |a, _action, val| a.la_no_header += val),
-        (PA_LD_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())), |a, _action, val| a.ld_authorized += val),
-        (PA_LD_DENIED.get_or_init(|| Mutex::new(HashMap::new())), |a, _action, val| a.ld_denied += val),
-        (PA_LD_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())), |a, _action, val| a.ld_no_header += val),
+        (
+            PA_LA_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.la_authorized += val,
+        ),
+        (
+            PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.la_denied += val,
+        ),
+        (
+            PA_LA_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.la_no_header += val,
+        ),
+        (
+            PA_LD_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.ld_authorized += val,
+        ),
+        (
+            PA_LD_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.ld_denied += val,
+        ),
+        (
+            PA_LD_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.ld_no_header += val,
+        ),
     ];
     for (map, setter) in maps {
         for (action, val) in map.lock().unwrap().iter() {
-            let entry = actions.entry(action.clone()).or_insert_with(|| ActionCounts {
-                action: action.clone(),
-                la_authorized: 0, la_denied: 0, la_no_header: 0,
-                ld_authorized: 0, ld_denied: 0, ld_no_header: 0,
-            });
+            let entry = actions
+                .entry(action.clone())
+                .or_insert_with(|| ActionCounts {
+                    action: action.clone(),
+                    la_authorized: 0,
+                    la_denied: 0,
+                    la_no_header: 0,
+                    ld_authorized: 0,
+                    ld_denied: 0,
+                    ld_no_header: 0,
+                });
             setter(entry, action, val.load(Ordering::Relaxed));
         }
     }
@@ -310,7 +345,14 @@ pub fn cap_authorize(
     match header {
         None => CapOutcome::Unprovisioned,
         Some(hdr) => match evaluate(
-            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(), auth_key_caps,
+            &store,
+            &hdr,
+            &device_pub,
+            &user_pub,
+            resource,
+            action,
+            now_secs(),
+            auth_key_caps,
         ) {
             Decision::Authorized => CapOutcome::Authorized,
             Decision::Denied(reason) => CapOutcome::Denied(reason),
@@ -352,7 +394,14 @@ pub fn cap_fleet_inputs(
     let user_pub = principal_user_pub.copied().unwrap_or([0u8; 32]);
     let explicit = matches!(
         evaluate_grants_only(
-            &store, &hdr, &device_pub, &user_pub, resource, action, now_secs(), auth_key_caps,
+            &store,
+            &hdr,
+            &device_pub,
+            &user_pub,
+            resource,
+            action,
+            now_secs(),
+            auth_key_caps,
         ),
         Decision::Authorized
     );
@@ -425,8 +474,13 @@ pub fn cap_gate_effective(
             // authoritative increment it), OUTSIDE flip_ready. A ceiling denial
             // does NOT change at the flip, so it doesn't belong in LA_/LD_.
             CEILING_DENIED.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_CEILING_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
-            return GateDecision::Deny { cap_reason: Some(CEILING_REASON.into()) };
+            pa_inc(
+                PA_CEILING_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
+            return GateDecision::Deny {
+                cap_reason: Some(CEILING_REASON.into()),
+            };
         }
     }
 
@@ -443,7 +497,9 @@ pub fn cap_gate_effective(
     //     to Authorized for a revoked device holding a standing grant.
     let legacy_allowed = legacy_allowed && !cert_revoked;
     if cert_revoked {
-        return GateDecision::Deny { cap_reason: Some("device revoked".into()) };
+        return GateDecision::Deny {
+            cap_reason: Some("device revoked".into()),
+        };
     }
 
     // === Same-owner fleet trust (Proven-gated scoped defaults) =============
@@ -489,7 +545,8 @@ pub fn cap_gate_effective(
             CapOutcome::Authorized
         } else {
             CapOutcome::Denied(
-                "fleet device: action needs an explicit grant (deliberate tier or out of scope)".into(),
+                "fleet device: action needs an explicit grant (deliberate tier or out of scope)"
+                    .into(),
             )
         }
     } else {
@@ -498,12 +555,8 @@ pub fn cap_gate_effective(
 
     // Compose restrictive gates under authoritative (order-independent:
     // both are purely restrictive — Authorized→Denied or pass-through).
-    let outcome = &cap_authorize_proven(
-        &base_outcome, binding, authoritative,
-    );
-    let outcome = &cap_authorize_expired(
-        outcome, cert_expires, authoritative,
-    );
+    let outcome = &cap_authorize_proven(&base_outcome, binding, authoritative);
+    let outcome = &cap_authorize_expired(outcome, cert_expires, authoritative);
 
     // Fleet force-allow: your own Proven device, within scope, gets the scoped
     // default in BOTH shadow and authoritative — the whole point is your fleet
@@ -523,27 +576,45 @@ pub fn cap_gate_effective(
     match (legacy_allowed, outcome) {
         (true, CapOutcome::Authorized) => {
             LA_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_LA_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())), action);
+            pa_inc(
+                PA_LA_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
         }
         (true, CapOutcome::Denied(_)) => {
             LA_DENIED.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
+            pa_inc(
+                PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
         }
         (true, CapOutcome::Unprovisioned) => {
             LA_NO_HEADER.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_LA_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())), action);
+            pa_inc(
+                PA_LA_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
         }
         (false, CapOutcome::Authorized) => {
             LD_AUTHORIZED.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_LD_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())), action);
+            pa_inc(
+                PA_LD_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
         }
         (false, CapOutcome::Denied(_)) => {
             LD_DENIED.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_LD_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
+            pa_inc(
+                PA_LD_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
         }
         (false, CapOutcome::Unprovisioned) => {
             LD_NO_HEADER.fetch_add(1, Ordering::Relaxed);
-            pa_inc(PA_LD_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())), action);
+            pa_inc(
+                PA_LD_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())),
+                action,
+            );
         }
     }
 
@@ -606,10 +677,14 @@ pub fn cap_gate_effective(
     } else if authoritative {
         let reason = match outcome {
             CapOutcome::Denied(r) => r.clone(),
-            CapOutcome::Unprovisioned => "resource unprovisioned (no capability header); run filament grant/init".to_string(),
+            CapOutcome::Unprovisioned => {
+                "resource unprovisioned (no capability header); run filament grant/init".to_string()
+            }
             CapOutcome::Authorized => String::new(),
         };
-        GateDecision::Deny { cap_reason: Some(reason) }
+        GateDecision::Deny {
+            cap_reason: Some(reason),
+        }
     } else {
         GateDecision::Deny { cap_reason: None }
     }
@@ -783,14 +858,28 @@ mod tests {
         op
     }
 
-    fn make_self_header(pk: &[u8; 32], resource: &str, nonce: &[u8; 32], owner: &Ed25519KeyPair) -> CapHeader {
+    fn make_self_header(
+        pk: &[u8; 32],
+        resource: &str,
+        nonce: &[u8; 32],
+        owner: &Ed25519KeyPair,
+    ) -> CapHeader {
         let mut h = CapHeader {
-            resource: resource.to_string(), epoch: 0, owner_pub: *pk,
-            nonce: *nonce, floors: vec![],
-            issued_at: now_secs(), prev_owner_pub: None, prev_header_hash: None, sig: [0u8; 64],
+            resource: resource.to_string(),
+            epoch: 0,
+            owner_pub: *pk,
+            nonce: *nonce,
+            floors: vec![],
+            issued_at: now_secs(),
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
         };
         h.sig = sign_cap_header(&h, owner);
-        CapHeader { resource: "self".to_string(), ..h }
+        CapHeader {
+            resource: "self".to_string(),
+            ..h
+        }
     }
 
     // Unique per-test dir (name suffix) so parallel cache tests never share a
@@ -807,7 +896,14 @@ mod tests {
     fn cap_authorize_no_header_is_unprovisioned() {
         let tmp = std::env::temp_dir().join(format!("fil-cap-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).ok();
-        let d = cap_authorize(&tmp, "self", "shell", Some(&[0xcc; 32]), Some(&[0xaa; 32]), None);
+        let d = cap_authorize(
+            &tmp,
+            "self",
+            "shell",
+            Some(&[0xcc; 32]),
+            Some(&[0xaa; 32]),
+            None,
+        );
         match d {
             CapOutcome::Unprovisioned => {}
             other => panic!("no-header must be Unprovisioned, got {other:?}"),
@@ -833,17 +929,45 @@ mod tests {
         let ak_caps = vec!["transfer".to_string()];
         // Same user_pub as header owner — normally shortcut to Authorized.
         // auth_key_caps ceiling gates first: transfer in caps → Authorized
-        let r1 = cap_authorize(&tmp, "self", "transfer", Some(&[0xCC; 32]), Some(&owner_pub), Some(&ak_caps));
-        assert_eq!(r1, CapOutcome::Authorized,
-            "transfer in auth_key_caps must authorize (ceiling passed)");
+        let r1 = cap_authorize(
+            &tmp,
+            "self",
+            "transfer",
+            Some(&[0xCC; 32]),
+            Some(&owner_pub),
+            Some(&ak_caps),
+        );
+        assert_eq!(
+            r1,
+            CapOutcome::Authorized,
+            "transfer in auth_key_caps must authorize (ceiling passed)"
+        );
         // Shell NOT in auth_key_caps → Denied
-        let r2 = cap_authorize(&tmp, "self", "shell", Some(&[0xCC; 32]), Some(&owner_pub), Some(&ak_caps));
-        assert!(matches!(r2, CapOutcome::Denied(_)),
-            "shell not in auth_key_caps must be denied (ceiling enforced)");
+        let r2 = cap_authorize(
+            &tmp,
+            "self",
+            "shell",
+            Some(&[0xCC; 32]),
+            Some(&owner_pub),
+            Some(&ak_caps),
+        );
+        assert!(
+            matches!(r2, CapOutcome::Denied(_)),
+            "shell not in auth_key_caps must be denied (ceiling enforced)"
+        );
         // Mount NOT in auth_key_caps → Denied
-        let r3 = cap_authorize(&tmp, "self", "mount", Some(&[0xCC; 32]), Some(&owner_pub), Some(&ak_caps));
-        assert!(matches!(r3, CapOutcome::Denied(_)),
-            "mount not in auth_key_caps must be denied (ceiling enforced)");
+        let r3 = cap_authorize(
+            &tmp,
+            "self",
+            "mount",
+            Some(&[0xCC; 32]),
+            Some(&owner_pub),
+            Some(&ak_caps),
+        );
+        assert!(
+            matches!(r3, CapOutcome::Denied(_)),
+            "mount not in auth_key_caps must be denied (ceiling enforced)"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -870,8 +994,10 @@ mod tests {
             false,
             false,
         );
-        assert!(matches!(decision, GateDecision::Allow),
-            "capability revocation alone must not remove live fleet certificate trust");
+        assert!(
+            matches!(decision, GateDecision::Allow),
+            "capability revocation alone must not remove live fleet certificate trust"
+        );
     }
 
     #[test]
@@ -894,8 +1020,10 @@ mod tests {
             false,
             true,
         );
-        assert!(matches!(decision, GateDecision::Deny { .. }),
-            "certificate revocation must remove fleet trust");
+        assert!(
+            matches!(decision, GateDecision::Deny { .. }),
+            "certificate revocation must remove fleet trust"
+        );
     }
 
     /// Per-action shadow counters must bucket each action independently so
@@ -919,12 +1047,54 @@ mod tests {
         let uk = [0xaa; 32];
         // Legacy-allowed, cap denies (Unprovisioned) → la_no_header
         for action in ["shell", "mount"] {
-            cap_gate_effective(true, &CapOutcome::Unprovisioned, action, "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+            cap_gate_effective(
+                true,
+                &CapOutcome::Unprovisioned,
+                action,
+                "self",
+                None,
+                Some(&uk),
+                BindingStrength::Proven,
+                Some(u64::MAX),
+                None,
+                None,
+                false,
+                false,
+                false,
+            );
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            true,
+            &CapOutcome::Denied("test".into()),
+            "transfer",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         // Legacy-denied, cap authorizes → ld_authorized (widening)
-        cap_gate_effective(false, &CapOutcome::Authorized, "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            false,
+            &CapOutcome::Authorized,
+            "mount",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
 
         let ac = cap_action_counts();
 
@@ -939,8 +1109,11 @@ mod tests {
         let total_pa_wd: u64 = ac.iter().map(|a| a.ld_denied).sum();
         let total_pa_wn: u64 = ac.iter().map(|a| a.ld_no_header).sum();
 
-        assert!(total_pa_la <= global.la_authorized,
-            "per-action la_authorized sum ({total_pa_la}) <= global ({})", global.la_authorized);
+        assert!(
+            total_pa_la <= global.la_authorized,
+            "per-action la_authorized sum ({total_pa_la}) <= global ({})",
+            global.la_authorized
+        );
         assert!(total_pa_ld <= global.la_denied);
         assert!(total_pa_ln <= global.la_no_header);
         assert!(total_pa_wa <= global.ld_authorized);
@@ -951,9 +1124,13 @@ mod tests {
         // actions we touched.
         let find = |action: &str, expected: bool| {
             for a in &ac {
-                if a.action == action { return true; }
+                if a.action == action {
+                    return true;
+                }
             }
-            if expected { panic!("action '{action}' must appear in per-action counters"); }
+            if expected {
+                panic!("action '{action}' must appear in per-action counters");
+            }
             false
         };
         assert!(find("shell", true));
@@ -988,7 +1165,21 @@ mod tests {
 
         // (legacy_allowed=true, Authorized) -> LA_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            "shell",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
         assert_eq!(after[1] - before[1], 0);
@@ -999,7 +1190,21 @@ mod tests {
 
         // (legacy_allowed=true, Denied) -> LA_DENIED++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            true,
+            &CapOutcome::Denied("test".into()),
+            "mount",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 1, "LA_DENIED must increment");
@@ -1010,7 +1215,21 @@ mod tests {
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            true,
+            &CapOutcome::Unprovisioned,
+            "transfer",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -1021,7 +1240,21 @@ mod tests {
 
         // (legacy_allowed=false, Authorized) -> LD_AUTHORIZED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            false,
+            &CapOutcome::Authorized,
+            "shell",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -1032,7 +1265,21 @@ mod tests {
 
         // (legacy_allowed=false, Denied) -> LD_DENIED++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Denied("test".into()), "mount", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            false,
+            &CapOutcome::Denied("test".into()),
+            "mount",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -1043,7 +1290,21 @@ mod tests {
 
         // (legacy_allowed=false, Unprovisioned) -> LD_NO_HEADER++
         let before = snap();
-        cap_gate_effective(false, &CapOutcome::Unprovisioned, "transfer", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            false,
+            &CapOutcome::Unprovisioned,
+            "transfer",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
         assert_eq!(after[1] - before[1], 0);
@@ -1054,9 +1315,27 @@ mod tests {
 
         // Same-bucket repeat proves no cross-contamination on a second call.
         let before = snap();
-        cap_gate_effective(true, &CapOutcome::Authorized, "shell", "self", None, Some(&uk), BindingStrength::Proven, Some(u64::MAX), None, None, false, false, false);
+        cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            "shell",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
         let after = snap();
-        assert_eq!(after[0] - before[0], 1, "second call same bucket must increment");
+        assert_eq!(
+            after[0] - before[0],
+            1,
+            "second call same bucket must increment"
+        );
         assert_eq!(after[1] - before[1], 0);
     }
 
@@ -1103,14 +1382,26 @@ mod tests {
         apply_cap_op(&mut store, &store_hdr, &grant, now_secs()).unwrap();
         let tmp = std::env::temp_dir().join(format!("fil-recon-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        std::fs::write(
+            &tmp.join("caps.json"),
+            serde_json::to_string(&serde_json::json!(store)).unwrap(),
+        )
+        .unwrap();
 
         // The signed grant must reach the production authorization boundary.
         let authorized = cap_authorize(
-            &tmp, "self", "shell", Some(&[0xcc; 32]), Some(&bob_user_pub), None,
+            &tmp,
+            "self",
+            "shell",
+            Some(&[0xcc; 32]),
+            Some(&bob_user_pub),
+            None,
         );
-        assert_eq!(authorized, CapOutcome::Authorized,
-            "shell grant must authorize the device before revoke");
+        assert_eq!(
+            authorized,
+            CapOutcome::Authorized,
+            "shell grant must authorize the device before revoke"
+        );
 
         // Write mock devices.json with cert for device "bob"
         // Use a distinct (non-owner) user_pub so the owner-always rule doesn't trigger
@@ -1130,27 +1421,48 @@ mod tests {
             "userKey": hex::encode(bob_user_pub),
         })];
 
-        std::fs::write(&tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
+        std::fs::write(
+            &tmp.join("devices.json"),
+            serde_json::to_string(&serde_json::json!(devices)).unwrap(),
+        )
+        .unwrap();
 
         // Before revoke: device should NOT be in revoked list (has shell)
         let before = devices_with_shell_revoked(&tmp);
-        assert!(before.is_empty(), "before revoke, device must not be in revoked list");
+        assert!(
+            before.is_empty(),
+            "before revoke, device must not be in revoked list"
+        );
 
         // Apply revoke to cap store
         let v2 = hlc_next(v1, now_ms());
         let revoke = make_revoke(&owner, target, "self", v2, 86400);
         apply_cap_op(&mut store, &store_hdr, &revoke, now_secs()).unwrap();
-        std::fs::write(&tmp.join("caps.json"), serde_json::to_string(&serde_json::json!(store)).unwrap()).unwrap();
+        std::fs::write(
+            &tmp.join("caps.json"),
+            serde_json::to_string(&serde_json::json!(store)).unwrap(),
+        )
+        .unwrap();
         let denied = cap_authorize(
-            &tmp, "self", "shell", Some(&[0xcc; 32]), Some(&bob_user_pub), None,
+            &tmp,
+            "self",
+            "shell",
+            Some(&[0xcc; 32]),
+            Some(&bob_user_pub),
+            None,
         );
-        assert!(matches!(denied, CapOutcome::Denied(_)),
-            "shell revoke must deny the device after revoke");
+        assert!(
+            matches!(denied, CapOutcome::Denied(_)),
+            "shell revoke must deny the device after revoke"
+        );
 
         // After revoke: device MUST be in revoked list
         let after = devices_with_shell_revoked(&tmp);
-        assert_eq!(after, vec!["bob".to_string()],
-            "device must appear in revoked list after shell revoke (authorized_keys block still exists — reconciler needed)");
+        assert_eq!(
+            after,
+            vec!["bob".to_string()],
+            "device must appear in revoked list after shell revoke (authorized_keys block still exists — reconciler needed)"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1193,7 +1505,10 @@ mod tests {
             sig: [0u8; 64],
         };
         hdr.sig = sign_cap_header(&hdr, &owner);
-        let store_hdr = CapHeader { resource: "self".to_string(), ..hdr.clone() };
+        let store_hdr = CapHeader {
+            resource: "self".to_string(),
+            ..hdr.clone()
+        };
 
         let v1 = hlc_next(0, now_ms());
         let grant = make_grant(&owner, target, "self", &["shell"], v1, 86400);
@@ -1227,7 +1542,11 @@ mod tests {
             "deviceCert": cert_json,
             "userKey": hex::encode(bob_user_pub),
         })];
-        std::fs::write(&tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
+        std::fs::write(
+            &tmp.join("devices.json"),
+            serde_json::to_string(&serde_json::json!(devices)).unwrap(),
+        )
+        .unwrap();
 
         // 2. Mock authorized_keys with managed block for "bob"
         let mock_ak = format!(
@@ -1241,8 +1560,10 @@ mod tests {
 
         // 4. Reconciler pipeline: devices_with_shell_revoked → strip_block → block gone
         let revoked = devices_with_shell_revoked(&tmp);
-        assert!(revoked.contains(&"bob".to_string()),
-            "bob must appear in revoked list after shell revoke");
+        assert!(
+            revoked.contains(&"bob".to_string()),
+            "bob must appear in revoked list after shell revoke"
+        );
 
         // Simulate what the caller (Cmd::Grant / daemon-start) does:
         // for each revoked device, strip its block from the mock authorized_keys
@@ -1252,8 +1573,10 @@ mod tests {
         }
 
         // Verify the block is actually removed
-        assert!(!crate::sshkeys::has_block(&cleaned, "bob"),
-            "e2e: after reconcile, NO filament-managed authorized_keys block must remain for bob");
+        assert!(
+            !crate::sshkeys::has_block(&cleaned, "bob"),
+            "e2e: after reconcile, NO filament-managed authorized_keys block must remain for bob"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1269,13 +1592,17 @@ mod tests {
 
         // Under authoritative, the block IS removed.
         let out_auth = reconcile_shell_keys(&revoked, mock_ak, true);
-        assert!(!crate::sshkeys::has_block(&out_auth, "bob"),
-            "authoritative: block must be removed");
+        assert!(
+            !crate::sshkeys::has_block(&out_auth, "bob"),
+            "authoritative: block must be removed"
+        );
 
         // Under shadow, the block is NOT removed (report-only).
         let out_shadow = reconcile_shell_keys(&revoked, mock_ak, false);
-        assert!(crate::sshkeys::has_block(&out_shadow, "bob"),
-            "shadow: block must NOT be removed — report-only");
+        assert!(
+            crate::sshkeys::has_block(&out_shadow, "bob"),
+            "shadow: block must NOT be removed — report-only"
+        );
     }
 
     /// BLOCKER-1 regression: the shell-key reconciler must track the explicit
@@ -1296,11 +1623,21 @@ mod tests {
         let target = CapTarget::Device(device_pub);
 
         let mut hdr = CapHeader {
-            resource: resource.clone(), epoch: 0, owner_pub: pk, nonce, floors: vec![],
-            issued_at: now_secs(), prev_owner_pub: None, prev_header_hash: None, sig: [0u8; 64],
+            resource: resource.clone(),
+            epoch: 0,
+            owner_pub: pk,
+            nonce,
+            floors: vec![],
+            issued_at: now_secs(),
+            prev_owner_pub: None,
+            prev_header_hash: None,
+            sig: [0u8; 64],
         };
         hdr.sig = sign_cap_header(&hdr, &owner);
-        let store_hdr = CapHeader { resource: "self".to_string(), ..hdr.clone() };
+        let store_hdr = CapHeader {
+            resource: "self".to_string(),
+            ..hdr.clone()
+        };
 
         // SAME-OWNER fleet device: its cert userPub IS the owner's pubkey.
         let cert_json = serde_json::json!({
@@ -1321,7 +1658,11 @@ mod tests {
 
         let tmp = std::env::temp_dir().join(format!("fil-fleet-recon-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("devices.json"), serde_json::to_string(&serde_json::json!(devices)).unwrap()).unwrap();
+        std::fs::write(
+            tmp.join("devices.json"),
+            serde_json::to_string(&serde_json::json!(devices)).unwrap(),
+        )
+        .unwrap();
 
         let mut hdr_json = hdr.to_json();
         hdr_json["resource"] = serde_json::json!("self");
@@ -1332,8 +1673,10 @@ mod tests {
         save_cap_store(&tmp, &store_nogrant).unwrap();
         invalidate_cap_cache();
         let revoked = devices_with_shell_revoked(&tmp);
-        assert!(revoked.contains(&"my-laptop".to_string()),
-            "same-owner fleet device with NO shell grant MUST be in the revoked set (owner shortcut must NOT exempt it)");
+        assert!(
+            revoked.contains(&"my-laptop".to_string()),
+            "same-owner fleet device with NO shell grant MUST be in the revoked set (owner shortcut must NOT exempt it)"
+        );
 
         // (b) WITH an explicit shell grant → the same device MUST NOT be revoked.
         let v1 = hlc_next(0, now_ms());
@@ -1343,8 +1686,10 @@ mod tests {
         save_cap_store(&tmp, &store_grant).unwrap();
         invalidate_cap_cache();
         let revoked2 = devices_with_shell_revoked(&tmp);
-        assert!(!revoked2.contains(&"my-laptop".to_string()),
-            "same-owner fleet device WITH an explicit shell grant must NOT be revoked");
+        assert!(
+            !revoked2.contains(&"my-laptop".to_string()),
+            "same-owner fleet device WITH an explicit shell grant must NOT be revoked"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1370,11 +1715,18 @@ mod tests {
         assert_eq!(load_cap_store(&dir).len(), 1);
 
         // Mutate and save: invalidate cache
-        let updated = vec![serde_json::json!({"perm":"shell"}), serde_json::json!({"perm":"deploy"})];
+        let updated = vec![
+            serde_json::json!({"perm":"shell"}),
+            serde_json::json!({"perm":"deploy"}),
+        ];
         save_cap_store(&dir, &updated).unwrap();
 
         let loaded = load_cap_store(&dir);
-        assert_eq!(loaded.len(), 2, "cache must be invalidated after save, reflecting new grant");
+        assert_eq!(
+            loaded.len(),
+            2,
+            "cache must be invalidated after save, reflecting new grant"
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -1394,11 +1746,24 @@ mod tests {
         // same-owner (peer user_pub == own_user_pub) + Proven + in-scope + NO grant
         // → ALLOW, even though legacy denied and the passed outcome is Denied.
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("no grant".into()), "transfer", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
+            false,
+            &CapOutcome::Denied("no grant".into()),
+            "transfer",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ false,
         );
-        assert!(d.allowed(), "same-owner Proven in-scope must ALLOW without a grant");
+        assert!(
+            d.allowed(),
+            "same-owner Proven in-scope must ALLOW without a grant"
+        );
     }
 
     #[test]
@@ -1408,11 +1773,24 @@ mod tests {
         // same-owner + Proven + DELIBERATE tier (scoped_in_bounds=false) + no grant
         // → DENY (the deliberate tier is never auto-trusted).
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "shell", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-             Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
+            false,
+            &CapOutcome::Denied("x".into()),
+            "shell",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ false,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ false,
         );
-        assert!(!d.allowed(), "same-owner Proven deliberate action without grant must DENY");
+        assert!(
+            !d.allowed(),
+            "same-owner Proven deliberate action without grant must DENY"
+        );
     }
 
     #[test]
@@ -1421,11 +1799,24 @@ mod tests {
         let me = [0x33u8; 32];
         // same-owner + INFERRED (not Proven) + in-scope → NOTHING (the Proven gate).
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "transfer", "self",
-            None, Some(&me), BindingStrength::Inferred, Some(u64::MAX), None,
-             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
+            false,
+            &CapOutcome::Denied("x".into()),
+            "transfer",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Inferred,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ false,
         );
-        assert!(!d.allowed(), "same-owner INFERRED must get nothing, even in-scope");
+        assert!(
+            !d.allowed(),
+            "same-owner INFERRED must get nothing, even in-scope"
+        );
     }
 
     #[test]
@@ -1439,11 +1830,24 @@ mod tests {
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x55u8; 32];
         let d = cap_gate_effective(
-            true, &CapOutcome::Authorized, "shell", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ true, /*cert_revoked*/ true,
+            true,
+            &CapOutcome::Authorized,
+            "shell",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ true,
+            /*cert_revoked*/ true,
         );
-        assert!(!d.allowed(), "a revoked device must be denied even with an explicit grant");
+        assert!(
+            !d.allowed(),
+            "a revoked device must be denied even with an explicit grant"
+        );
         assert_eq!(
             d.deny_reason("legacy"),
             "device revoked",
@@ -1459,11 +1863,24 @@ mod tests {
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x66u8; 32];
         let d = cap_gate_effective(
-            true, &CapOutcome::Authorized, "transfer", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ true,
+            true,
+            &CapOutcome::Authorized,
+            "transfer",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ true,
         );
-        assert!(!d.allowed(), "a revoked device must be denied even when fleet auto-trust would apply");
+        assert!(
+            !d.allowed(),
+            "a revoked device must be denied even when fleet auto-trust would apply"
+        );
     }
 
     #[test]
@@ -1477,16 +1894,29 @@ mod tests {
         unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", "0") };
         let me = [0x77u8; 32];
         let d = cap_gate_effective(
-            true, &CapOutcome::Authorized, "transfer", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ true, /*cert_revoked*/ true,
+            true,
+            &CapOutcome::Authorized,
+            "transfer",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ true,
+            /*cert_revoked*/ true,
         );
         if prior.is_empty() {
             unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") };
         } else {
             unsafe { std::env::set_var("FILAMENT_CAP_AUTHORITATIVE", &prior) };
         }
-        assert!(!d.allowed(), "a revoked device must be denied in default mode even when legacy allows");
+        assert!(
+            !d.allowed(),
+            "a revoked device must be denied in default mode even when legacy allows"
+        );
     }
 
     #[test]
@@ -1497,9 +1927,19 @@ mod tests {
         // (scoped_in_bounds=false: e.g. transfer to a non-inbox path, reach a
         // non-exposed port, a write/broader mount) + no grant → DENY.
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "mount", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-             Some(&me), /*scoped_in_bounds*/ false, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
+            false,
+            &CapOutcome::Denied("x".into()),
+            "mount",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ false,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ false,
         );
         assert!(!d.allowed(), "same-owner Proven out-of-scope must DENY");
     }
@@ -1512,11 +1952,24 @@ mod tests {
         // different owner (peer cert chains to a DIFFERENT user key) + Proven +
         // in-scope → DENY (deny-by-default; not my fleet).
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "transfer", "self",
-            None, Some(&other), BindingStrength::Proven, Some(u64::MAX), None,
-             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
+            false,
+            &CapOutcome::Denied("x".into()),
+            "transfer",
+            "self",
+            None,
+            Some(&other),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ false,
         );
-        assert!(!d.allowed(), "different-owner peer must be denied by default");
+        assert!(
+            !d.allowed(),
+            "different-owner peer must be denied by default"
+        );
     }
 
     #[test]
@@ -1526,11 +1979,24 @@ mod tests {
         // same-owner + Proven + in-scope but EXPIRED cert → DENY: fleet force-allow
         // still respects cert expiry (renewal is the only revocation bound).
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "transfer", "self",
-            None, Some(&me), BindingStrength::Proven, Some(0), None,
-             Some(&me), /*scoped_in_bounds*/ true, /*has_explicit_grant*/ false, /*cert_revoked*/ false,
+            false,
+            &CapOutcome::Denied("x".into()),
+            "transfer",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(0),
+            None,
+            Some(&me),
+            /*scoped_in_bounds*/ true,
+            /*has_explicit_grant*/ false,
+            /*cert_revoked*/ false,
         );
-        assert!(!d.allowed(), "expired cert must deny fleet auto-trust even in-scope");
+        assert!(
+            !d.allowed(),
+            "expired cert must deny fleet auto-trust even in-scope"
+        );
     }
 
     #[test]
@@ -1538,11 +2004,23 @@ mod tests {
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let me = [0x88u8; 32];
         let d = cap_gate_effective(
-            false, &CapOutcome::Denied("x".into()), "transfer", "self",
-            None, Some(&me), BindingStrength::Proven, Some(u64::MAX), None,
-            Some(&me), true, false, true,
+            false,
+            &CapOutcome::Denied("x".into()),
+            "transfer",
+            "self",
+            None,
+            Some(&me),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            Some(&me),
+            true,
+            false,
+            true,
         );
-        assert!(!d.allowed(), "locally revoked cert must deny fleet auto-trust");
+        assert!(
+            !d.allowed(),
+            "locally revoked cert must deny fleet auto-trust"
+        );
     }
-
 }
