@@ -6668,6 +6668,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         roster: HashMap::new(),
         suppressed_digest_adoptions: HashSet::new(),
         active: None,
+        active_binding: None,
         next_gen: 0,
         rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
         chunk_size: net::MAX_DC_PAYLOAD,
@@ -8320,6 +8321,19 @@ fn match_adoption_source(suppressed: &mut HashSet<String>, peer_id: &str, source
     }
 }
 
+fn active_binding_matches(
+    binding: &(String, Option<String>),
+    peer_id: &str,
+    peer_uid: Option<&str>,
+) -> bool {
+    binding.0 == peer_id
+        || binding
+            .1
+            .as_deref()
+            .zip(peer_uid)
+            .is_some_and(|(bound, candidate)| bound == candidate)
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -8334,6 +8348,9 @@ struct Conn {
     /// clears these; digest reconciliation skips them.
     suppressed_digest_adoptions: HashSet<String>,
     active: Option<String>,        // the transfer-target sid (send side)
+    /// A code-claimed receive is bound to the peer that completed PAKE. The sid
+    /// may change on signaling reconnect, so retain its install uid as well.
+    active_binding: Option<(String, Option<String>)>,
     next_gen: u32,
     /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
     rejoin: RejoinState,
@@ -8566,6 +8583,7 @@ impl Conn {
             roster: HashMap::new(),
             suppressed_digest_adoptions: HashSet::new(),
             active: None,
+            active_binding: None,
             next_gen: 0,
             rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
             chunk_size: net::MAX_DC_PAYLOAD,
@@ -8696,6 +8714,32 @@ impl Conn {
         match_adoption_source(&mut self.suppressed_digest_adoptions, peer_id, source)
     }
 
+    fn bind_active(&mut self, peer_id: &str) {
+        let uid = self
+            .links
+            .get(peer_id)
+            .and_then(|link| link.uid.clone())
+            .or_else(|| {
+                self.roster
+                    .get(peer_id)
+                    .and_then(|peer| peer["uid"].as_str().map(String::from))
+            });
+        self.active_binding = Some((peer_id.to_string(), uid));
+        self.active = Some(peer_id.to_string());
+        self.rejoin.waiting_rejoin = None;
+    }
+
+    fn is_bound_active_peer(&self, peer_id: &str) -> bool {
+        let uid = self
+            .links
+            .get(peer_id)
+            .and_then(|link| link.uid.as_deref())
+            .or_else(|| self.roster.get(peer_id).and_then(|peer| peer["uid"].as_str()));
+        self.active_binding
+            .as_ref()
+            .is_some_and(|binding| active_binding_matches(binding, peer_id, uid))
+    }
+
     /// Track a roster entry and (re)connect to it. `want_active` marks it as
     /// the intended transfer target if it passes the target filters and no
     /// target exists yet. Returns true if this peer is (now) the active one.
@@ -8773,7 +8817,18 @@ impl Conn {
             .active
             .as_ref()
             .is_some_and(|a| self.deferred_left.contains_key(a));
-        if want_active && (self.active.is_none() || active_deferred) && self.targetable(&name, peer_uid.as_deref()) {
+        let binding_allows = self
+            .active_binding
+            .as_ref()
+            .is_none_or(|binding| active_binding_matches(binding, &peer_id, peer_uid.as_deref()));
+        if want_active && !binding_allows {
+            ui::debug("filament: ADOPT refused: peer is not the authenticated code sender");
+        }
+        if want_active
+            && binding_allows
+            && (self.active.is_none() || active_deferred)
+            && self.targetable(&name, peer_uid.as_deref())
+        {
             // Claiming the slot from a deferred link: discharge that link now
             // (it left the room and is being replaced) so reap doesn't later
             // re-inject a stale peer-left against the slot the new peer holds.
@@ -8785,6 +8840,9 @@ impl Conn {
                 }
             }
             self.active = Some(peer_id.clone());
+            if let Some(binding) = self.active_binding.as_mut() {
+                binding.0 = peer_id.clone();
+            }
             self.rejoin.waiting_rejoin = None;
         }
         Ok(self.is_active(&peer_id))
@@ -15444,9 +15502,9 @@ async fn recv_cmd(
         Arc::new(Mutex::new(HashMap::new()));
     // Each candidate peer's own bounded budget (armed when its channel comes up).
     let mut recv_deadlines: HashMap<String, Instant> = HashMap::new();
-    // The peer that WON authentication (its ceremony confirmed). Once set, only
-    // this peer may offer files. `None` until someone authenticates.
-    let mut recv_pake_peer: Option<String> = None;
+    // Once a peer wins authentication, Conn binds the receive to its sid/install
+    // uid. Only that peer (or its same-uid signaling rejoin) may become active or
+    // offer files.
     // A file-offer can race ahead of auth: the sender offers as soon as IT has our
     // confirm, which can land a tick BEFORE we finish verifying ITS confirm (the
     // two confirms cross on the wire, and the shared-room mesh widens that gap). We
@@ -17142,7 +17200,6 @@ async fn recv_cmd(
                     }
                     if let Some(sec) = secret_opt {
                         // This peer authenticated. Record it as THE sender
-                        recv_pake_peer = Some(from.clone());
                         recv_pake_done = true;
                         recv_cers.clear();
                         recv_deadlines.clear();
@@ -17150,9 +17207,7 @@ async fn recv_cmd(
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
                         let promo = conn.start_direct_promote(&from, &from, &sec).await;
-                        if conn.active.is_none() {
-                            conn.active = Some(from.clone());
-                        }
+                        conn.bind_active(&from);
                         // A retained link is unannounced here too, and this loop's
                         // ChannelReady arm sends `caps` and the signed L3 announce,
                         // which a peer on a retained link would otherwise never get.
@@ -17456,26 +17511,11 @@ async fn recv_cmd(
                 // budget plus the overall backstop. The progression block (top of
                 // loop) drives every candidate independently; file-offers are not
                 // accepted until ONE peer's ceremony confirms (`recv_pake_done`),
-                // and then only from that authenticated peer. A direct link is
-                // already authenticated (its pair-secret MAC bound the QUIC key,
-                // `trusted`), so it skips the PAKE.
+                // and then only from that authenticated peer. A stored pairing
+                // secret authenticates that known device, but does not prove it
+                // minted this one-time code, so every candidate still runs PAKE.
                 if recv_code_path && !recv_pake_done {
-                    let (is_direct, is_trusted) = conn
-                        .link(&pid)
-                        .map(|l| (l.direct, l.trusted))
-                        .unwrap_or((false, false));
-                    if is_direct && is_trusted {
-                        // A secret-bound direct link is the sender (known device).
-                        recv_pake_peer = Some(pid.clone());
-                        recv_pake_done = true; // pre-authenticated transport
-                        recv_cers.clear();
-                        recv_deadlines.clear();
-                        let buffered = recv_pending_offers.remove(&pid);
-                        recv_pending_offers.clear();
-                        if let Some(offer) = buffered {
-                            let _ = tx.send(Ev::Control(pid.clone(), offer));
-                        }
-                    } else if recv_cers.contains_key(&pid) {
+                    if recv_cers.contains_key(&pid) {
                         // Ceremony already minted (its PAKE traffic arrived first);
                         // just make sure its budgets are armed.
                         recv_deadlines
@@ -18743,7 +18783,7 @@ async fn recv_cmd(
                     // If no peer has authenticated yet, the overall watchdog still
                     // fails loudly should the real sender never confirm.
                     if recv_code_path
-                        && (!recv_pake_done || recv_pake_peer.as_deref() != Some(pid.as_str()))
+                        && (!recv_pake_done || !conn.is_bound_active_peer(&pid))
                     {
                         // A pre-auth offer from a peer we are STILL authenticating
                         // (it has a live ceremony) is buffered, not lost: the offer
@@ -19966,6 +20006,27 @@ mod tests {
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Contact));
         assert!(!suppressed.contains("peer-sid"));
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
+    }
+
+    #[test]
+    fn code_receive_binding_rejects_unrelated_paired_peer_but_allows_rejoin() {
+        let binding = ("sender-old-sid".to_string(), Some("sender-install".to_string()));
+
+        assert!(active_binding_matches(
+            &binding,
+            "sender-old-sid",
+            Some("sender-install")
+        ));
+        assert!(active_binding_matches(
+            &binding,
+            "sender-new-sid",
+            Some("sender-install")
+        ));
+        assert!(!active_binding_matches(
+            &binding,
+            "unrelated-paired-sid",
+            Some("unrelated-install")
+        ));
     }
 
     #[test]
