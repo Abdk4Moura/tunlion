@@ -17880,7 +17880,7 @@ async fn recv_cmd(
                         let _ = t
                             .send_control(&json!({
                                 "type": "shell-bootstrap-deny",
-                                "reason": "shell serving is off there; run `filament up --shell` on that device",
+                                "reason": crate::capability::SHELL_OFF_REASON,
                             }))
                             .await;
                     }
@@ -18099,7 +18099,7 @@ async fn recv_cmd(
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
                         enqueue_if_requestable(who, "shell");
-                        // Carry the specific cap reason (e.g. "not in auth key caps",
+                        // Carry the specific cap reason (e.g. CEILING_REASON,
                         // "device revoked") to the peer; the generic string was
                         // produced and then thrown away before it crossed the wire,
                         // so the initiator read an empty success instead of the
