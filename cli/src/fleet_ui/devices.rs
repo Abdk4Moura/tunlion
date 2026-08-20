@@ -17,7 +17,6 @@ pub struct DeviceEntry {
     pub countdown: String,       // e.g. "expires in 4m" or "expired 2026-05-01"
                                  // Not "renews in ...": nothing renews (#236).
     pub last_seen: Option<String>, // e.g. "2h ago"
-    pub needs_promote: bool,
 }
 
 /// Device tier (fleet / external / needs-review / mesh-roster).
@@ -154,9 +153,6 @@ fn render_device_row(d: &DeviceEntry) -> String {
     if let Some(ref seen) = d.last_seen {
         line.push_str(&format!("  {}", ui::paint(Tone::Dim, &format!("(last seen {seen})"))));
     }
-    if d.needs_promote {
-        line.push_str(&format!("  {}", ui::paint(Tone::Warn, "promote to continue")));
-    }
     line
 }
 
@@ -251,7 +247,6 @@ mod tests {
                 caps_summary: "OWNER-EQUIVALENT shell reach:8080 inbox".into(),
                 countdown: "expires in 9m".into(),
                 last_seen: None,
-                needs_promote: false,
             },
             DeviceEntry {
                 name: "carol".into(),
@@ -260,7 +255,6 @@ mod tests {
                 caps_summary: "send→you".into(),
                 countdown: "expires in 4m".into(),
                 last_seen: None,
-                needs_promote: false,
             },
         ];
         let s = render_devices(&devices, 0, None);
@@ -277,16 +271,22 @@ mod tests {
                 name: "old-laptop".into(),
                 tier: DeviceTier::NeedsReview,
                 online: Some(false),
-                caps_summary: "(full legacy trust)".into(),
-                countdown: "promote to continue".into(),
+                caps_summary: "uncertified \u{b7} trusted in full".into(),
+                countdown: "no certificate".into(),
                 last_seen: None,
-                needs_promote: true,
             },
         ];
         let s = render_devices(&devices, 0, None);
         assert!(s.contains("NEEDS REVIEW"), "must show review section");
         assert!(s.contains("old-laptop"), "must show review device");
-        assert!(s.contains("promote to continue"), "must show promote nudge");
+        // #240: this used to assert the row said "promote to continue" and
+        // printed `filament devices promote <name>`. The verb does not exist,
+        // clap rejects it, and the owner hit exactly that on his own machines.
+        // The test pinned the defect, so it is inverted: the row must state the
+        // condition and prescribe no action it cannot deliver.
+        assert!(!s.contains("promote"), "must not prescribe a verb that does not exist: {s}");
+        assert!(!s.contains("legacy trust"), "must not leak internal jargon: {s}");
+        assert!(s.contains("re-pair to scope it"), "must say what the user can actually do");
     }
 
     #[test]

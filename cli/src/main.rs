@@ -4474,7 +4474,6 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
             // trusted in full rather than scoped. The tier's own design is #191
             // and #195 and is not settled here; this only stops the screen
             // asserting a blocked state and an impossible remedy.
-            let needs_promote = false;
             let caps_summary = if tier == fleet_ui::devices::DeviceTier::NeedsReview {
                 "uncertified · trusted in full".to_string()
             } else {
@@ -4495,11 +4494,9 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                 caps_summary,
                 countdown: match delegated_device_state(&name, cert.as_ref(), now, &records) {
                     Some((text, tone)) => ui::paint(tone, &text),
-                    None if needs_promote => String::new(),
                     None => device_countdown(tier, cert.as_ref()),
                 },
                 last_seen,
-                needs_promote,
             }
         })
         .collect::<Vec<_>>()
@@ -4532,7 +4529,6 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                         caps_summary: "known via owner".to_string(),
                         countdown: String::new(),
                         last_seen: None,
-                        needs_promote: false,
                     })
                 }).collect::<Vec<_>>()
             })
@@ -6931,6 +6927,16 @@ fn cancelled() -> anyhow::Error {
     anyhow!("cancelled")
 }
 
+/// `add` was handed an invitation instead of a pairing code. One source for the
+/// sentence so the test and the error cannot drift apart.
+fn invitation_not_a_code_msg() -> String {
+    "that is an invitation, not a pairing code.\n  \
+     Run `filament join` and paste it at the prompt; it is cleared from the terminal after reading.\n  \
+     If you saved it to a file: `filament join --invite-file <path>`.\n  \
+     Invitation material is deliberately never read from the command line, where it would land in `ps` output and shell history."
+        .to_string()
+}
+
 async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
@@ -7037,6 +7043,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     let mut my_nameplate;
     match &code {
         Some(c) => {
+            // An INVITATION is not a pairing code, and pasting one here is the
+            // obvious mistake: `add --for` prints the token on screen beside a
+            // QR, so the natural next move is to paste it into the verb that
+            // just produced it. Without this the token is sent as a nameplate,
+            // the server rejects it, and the user is told "codes burn after one
+            // use" about a token that was never claimed, with a remedy
+            // (`re-run filament add`) that mints a code and cannot help.
+            if c.starts_with("filament-invite:") {
+                bail!("{}", invitation_not_a_code_msg());
+            }
             // Claimer: normalize the typed code, split, send ONLY the nameplate.
             let normalized = crate::pake::norm_code(c);
             let (np, pw) = crate::pake::split_code(&normalized);
@@ -21531,6 +21547,28 @@ mod tests {
             "printed hints name verbs that do not exist (see docs/ui/OUTPUT.md):\n{}",
             bad.join("\n")
         );
+    }
+
+    /// An invitation pasted into `add` must be named for what it is, and the
+    /// remedy must be a command that exists. The old path sent the token as a
+    /// nameplate and the server answered "codes burn after one use" about a
+    /// token that was never claimed, prescribing `re-run filament add`, which
+    /// mints a code and cannot help. The owner hit exactly this.
+    ///
+    /// The remedy is asserted against `join`'s real interface: it takes the
+    /// invitation interactively or via --invite-file, and NEVER from argv, so
+    /// this must not tell anyone to pass it on the command line.
+    #[test]
+    fn an_invitation_pasted_into_add_is_named_and_the_remedy_exists() {
+        let msg = invitation_not_a_code_msg();
+        assert!(msg.contains("not a pairing code"), "must say what it is not: {msg}");
+        assert!(msg.contains("filament join"), "must name the verb that consumes it: {msg}");
+        assert!(msg.contains("--invite-file"), "must offer the file route: {msg}");
+        assert!(!msg.contains("burn"), "must not blame a burned code: {msg}");
+        assert!(!msg.contains("re-run `filament add`"), "must not prescribe minting a code: {msg}");
+        // `filament join` accepts no positional argument, by design.
+        assert!(!msg.contains("filament join filament-invite:"),
+            "must not tell anyone to put invitation material in argv: {msg}");
     }
 
     #[test]
