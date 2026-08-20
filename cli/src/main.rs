@@ -17867,6 +17867,25 @@ async fn recv_cmd(
                     });
                     complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
                 }
+                // Shell serving is OFF here. Without this arm the message falls
+                // through the match and the acceptor says NOTHING, so the caller
+                // can only time out: `filament shell X --ssh` burned its full
+                // bootstrap deadline and then guessed, while plain
+                // `filament shell X` printed the reason immediately. The refusal
+                // exists; only this path failed to send it. Measured across three
+                // machines, not inferred.
+                #[cfg(unix)]
+                Some("shell-bootstrap") if !l2_enabled => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": "shell serving is off there; run `filament up --shell` on that device",
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
                     // #30 GAP 2 (shell): honor the pending_proven hold. If a

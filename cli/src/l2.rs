@@ -2744,6 +2744,15 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         "the peer's certificate was revoked; restore it with {}",
                         crate::ui::paint(crate::ui::Tone::Brand, "filament devices restore <this-device>")
                     )
+                } else if reason == crate::capability::CEILING_REASON {
+                    // A grant cannot widen an enrolment ceiling, and `filament
+                    // grant` says so when you run it. Prescribing it here sent
+                    // the owner to a command that refuses, and the refusal named
+                    // the real fix. Name it here instead, one step earlier.
+                    format!(
+                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, "filament add --for <this-device> --allow shell")
+                    )
                 } else {
                     format!(
                         "grant shell on the peer: {}",
@@ -3659,9 +3668,15 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool, ssh_port: u16) -
                 }
                 Some("shell-bootstrap-deny") => {
                     let why = v["reason"].as_str().unwrap_or("shell capability not granted");
-                    break Err(anyhow!(
-                        "shell refused by '{peer}': {why}. Run `filament grant <this-device> shell` on '{peer}'."
-                    ));
+                    // Same trap as the non-ssh path: a grant cannot widen an
+                    // enrolment ceiling, so do not prescribe one when the
+                    // ceiling is the reason.
+                    let fix = if why == crate::capability::CEILING_REASON {
+                        format!("shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `filament add --for <this-device> --allow shell` on '{peer}'.")
+                    } else {
+                        format!("Run `filament grant <this-device> shell` on '{peer}'.")
+                    };
+                    break Err(anyhow!("shell refused by '{peer}': {why}. {fix}"));
                 }
                 _ => continue,
             },

@@ -20,6 +20,11 @@
 
 pub use filament_cap::capability::*;
 
+/// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
+/// ceiling, so any hint built on this reason must not prescribe one: the fix is a
+/// fresh invitation that includes the capability.
+pub const CEILING_REASON: &str = "not in auth key caps";
+
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -421,7 +426,7 @@ pub fn cap_gate_effective(
             // does NOT change at the flip, so it doesn't belong in LA_/LD_.
             CEILING_DENIED.fetch_add(1, Ordering::Relaxed);
             pa_inc(PA_CEILING_DENIED.get_or_init(|| Mutex::new(HashMap::new())), action);
-            return GateDecision::Deny { cap_reason: Some("not in auth key caps".into()) };
+            return GateDecision::Deny { cap_reason: Some(CEILING_REASON.into()) };
         }
     }
 
