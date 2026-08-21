@@ -457,6 +457,12 @@ impl Progress {
     }
 
     /// Final summary line; rings the bell (opt-in via tty) for long transfers.
+    ///
+    /// Times from construction to NOW, so it is only honest where "the last byte
+    /// was handled" and "the transfer finished" are the same instant. That holds
+    /// on the RECEIVE path (the bytes are in hand). It does NOT hold on the send
+    /// path, where the sender stops writing long before the wire drains: see
+    /// `transfer_summary` and #262.
     pub fn done(&self, bytes: u64) {
         let secs = self.started.elapsed().as_secs_f64().max(0.001);
         let rate = bytes as f64 / secs;
@@ -469,6 +475,33 @@ impl Progress {
         if caps().tty && secs > 30.0 {
             eprint!("\x07");
         }
+    }
+}
+
+/// The final one-line summary for a SENT transfer, timed by the caller.
+///
+/// Split out from `Progress::done` because on the send path the moment we stop
+/// writing is not the moment the transfer finished. `flush()` on the direct-QUIC
+/// transport returns once the bytes are accepted into quinn's send buffer, and
+/// those buffers are deliberately large (`direct.rs`), so a 10MB file is queued
+/// in about 20ms while the wire is still draining. Timing against that printed
+/// `484.1 MB/s` for a transfer measured at `2.53 MB/s`, a 191x overstatement, on
+/// a link whose RTT is 142ms (#262). WebRTC hid the bug because SCTP applies real
+/// backpressure, so writing cannot run ahead of the wire.
+///
+/// The caller therefore supplies an interval that ends when delivery was
+/// CONFIRMED (the whole-file-verified `delivery-ack`), not when writing stopped.
+pub fn transfer_summary(label: &str, bytes: u64, secs: f64) {
+    let secs = secs.max(0.001);
+    let rate = bytes as f64 / secs;
+    say(&format!(
+        "  {} {}  {}",
+        paint(Tone::Ok, glyph_ok()),
+        label,
+        paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
+    ));
+    if caps().tty && secs > 30.0 {
+        eprint!("\x07");
     }
 }
 

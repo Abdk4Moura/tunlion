@@ -13456,6 +13456,14 @@ struct Outgoing {
     /// to verify-and-ack, so it is `done` on send, the legacy size-only path.)
     acked: bool,
     done: bool,
+    /// #262: when this file's bytes STARTED streaming, and how many of them went
+    /// out in this attempt (`size - offset`, so a resume counts only its own
+    /// share). The completion throughput is computed from here to the moment the
+    /// `delivery-ack` lands, because that is the only instant at which the bytes
+    /// are known to be on the far side. Timing to the end of `flush()` instead
+    /// measured how fast we filled a socket buffer.
+    stream_started: Option<Instant>,
+    stream_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13603,7 +13611,7 @@ async fn send_cmd(
             let head = head_hash(&spool);
             let full = full_hash(&spool);
             let offered = name.clone().filter(|_| single).unwrap_or_else(|| "stdin.bin".into());
-            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false });
+            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
         } else {
             let path = PathBuf::from(p);
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
@@ -13623,7 +13631,7 @@ async fn send_cmd(
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
                 let full = full_hash(&spool);
-                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false });
+                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
             } else {
                 // A single regular file with --name uses the override; otherwise
                 // the basename. With multiple files --name was already warned off.
@@ -13632,7 +13640,7 @@ async fn send_cmd(
                 });
                 let head = head_hash(&path);
                 let full = full_hash(&path);
-                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, done: false });
+                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
             }
         }
     }
@@ -14520,6 +14528,13 @@ async fn send_cmd(
                         if !o.acked {
                             o.acked = true;
                             o.done = true;
+                            // #262: THIS is the instant the bytes are known to be
+                            // on the far side, so this is the interval the
+                            // throughput line is entitled to divide by. Printing
+                            // it at `flush()` measured the send buffer filling.
+                            if let Some(t0) = o.stream_started {
+                                ui::transfer_summary(&o.name, o.stream_bytes, t0.elapsed().as_secs_f64());
+                            }
                             ui::say(&ui::paint(ui::Tone::Dim, &format!("    {} delivered + verified (whole-file sha256 matched)", o.name)));
                         }
                     }
@@ -14789,6 +14804,15 @@ async fn stream_one(
     // which is the actual multi-stream win. The receiver reassembles by absolute
     // offset (positional writes), so range order does not matter.
     let bar = std::sync::Arc::new(tokio::sync::Mutex::new(ui::Progress::new(&name, size)));
+    // #262: stamp the real start of the byte stream, so the completion rate can
+    // be measured against the `delivery-ack` rather than against `flush()`.
+    {
+        let mut out = outgoing.lock().await;
+        if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+            o.stream_started = Some(Instant::now());
+            o.stream_bytes = size.saturating_sub(offset);
+        }
+    }
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(offset));
     let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let remaining = size.saturating_sub(offset);
@@ -14906,7 +14930,6 @@ async fn stream_one(
     for t in &transports {
         t.flush().await?;
     }
-    bar.lock().await.done(size.saturating_sub(offset));
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
         // P4: the bytes + file-end left this side, but the transfer is NOT
@@ -14921,6 +14944,12 @@ async fn stream_one(
         if o.full.is_none() {
             o.acked = true;
             o.done = true;
+            // #262: no digest means no `delivery-ack` is coming, so this is the
+            // last instant we will ever have. The rate is honest about what it
+            // can know here (bytes handed to the transport) and is the only case
+            // that still ends its interval at `flush()`.
+            let secs = o.stream_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            ui::transfer_summary(&o.name, o.stream_bytes, secs);
         }
     }
     Ok(())
