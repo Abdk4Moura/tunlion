@@ -1,0 +1,111 @@
+# Revocation gates: a revoked certificate must end access that is ALREADY OPEN.
+#
+# These three scripts were written with the #235 fix (7548f8b, "a revoked peer
+# loses a live shell and a live forward") and then never ran anywhere. #249
+# measured the general case: no workflow invoked any `cli/tests/*-gates.sh`. So
+# the repo's highest-severity guarantee, that revoke actually revokes, was
+# defended entirely by tests nothing executed. This workflow is that omission
+# closed for the revocation family.
+#
+# Each script carries its own controls, which is why they are worth running:
+#   A   the session streams BEFORE the revoke      (positive control)
+#   A2  a healthy session survives its own recheck (no-revoke control)
+#   B/C the revoked session stops, and the denial REACHES the client
+# A2 is the one that matters most. Without it a gate passes by closing
+# everything always, which would "prove" revocation while breaking the product.
+#
+# Linux only, deliberately. The mount arm needs FUSE, and the point here is to
+# run the guarantee somewhere real rather than to matrix it.
+
+name: Revoke Gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'cli/src/**'
+      - 'cli/tests/*revoke-gates.sh'
+      - 'cli/tests/lib/fixture.sh'
+      - 'backend/**'
+      - '.github/workflows/revoke-gates.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: revoke-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  revoke-gates:
+    name: revoke gates (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+
+      # The mount arm mounts a real FUSE filesystem and unmounts it in its trap.
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build filament
+        working-directory: cli
+        run: cargo build --release
+
+      # Every script is named explicitly and its gate count asserted. An exit
+      # code alone is not enough: `bad` only increments a counter, so a script
+      # that dies before reaching its gates, or one whose gates are skipped by a
+      # branch, can still leave FAIL at 0. A monitor once called a CI run
+      # finished on 3 of 13 checks for exactly this reason. Counting the PASS
+      # lines is what makes "green" mean "the gates ran AND passed".
+      - name: Run revocation gates
+        working-directory: cli/tests
+        env:
+          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/filament
+        run: |
+          set -uo pipefail
+          declare -A EXPECT=( [pty-revoke-gates]=3 [mount-revoke-gates]=4 [l2-revoke-gates]=3 )
+          rc=0
+          for g in pty-revoke-gates mount-revoke-gates l2-revoke-gates; do
+            echo "::group::$g"
+            [ -x "./$g.sh" ] || { echo "MISSING or not executable: $g.sh"; rc=1; echo "::endgroup::"; continue; }
+            out="$(./$g.sh 2>&1)"; code=$?
+            echo "$out"
+            echo "::endgroup::"
+            got=$(printf '%s\n' "$out" | grep -c '^PASS:')
+            want=${EXPECT[$g]}
+            if [ "$code" -ne 0 ]; then
+              echo "::error::$g exited $code"; rc=1
+            elif [ "$got" -ne "$want" ]; then
+              echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1
+            else
+              echo "$g: $got/$want gates passed"
+            fi
+          done
+          exit $rc
