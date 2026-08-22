@@ -13772,6 +13772,7 @@ struct Outgoing {
     /// a send. (Exception: an un-hashable file with no `full` digest has nothing
     /// to verify-and-ack, so it is `done` on send, the legacy size-only path.)
     acked: bool,
+    declined: bool,
     done: bool,
     /// #262: when this file's bytes STARTED streaming, and how many of them went
     /// out in this attempt (`size - offset`, so a resume counts only its own
@@ -13781,6 +13782,20 @@ struct Outgoing {
     /// measured how fast we filled a socket buffer.
     stream_started: Option<Instant>,
     stream_bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    Complete { completed: usize },
+    Declined { completed: usize, declined: usize },
+}
+
+fn send_outcome(completed: usize, declined: usize) -> SendOutcome {
+    if declined == 0 {
+        SendOutcome::Complete { completed }
+    } else {
+        SendOutcome::Declined { completed, declined }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13928,7 +13943,7 @@ async fn send_cmd(
             let head = head_hash(&spool);
             let full = full_hash(&spool);
             let offered = name.clone().filter(|_| single).unwrap_or_else(|| "stdin.bin".into());
-            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
+            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, declined: false, done: false, stream_started: None, stream_bytes: 0 });
         } else {
             let path = PathBuf::from(p);
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
@@ -13948,7 +13963,7 @@ async fn send_cmd(
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
                 let full = full_hash(&spool);
-                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
+                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, declined: false, done: false, stream_started: None, stream_bytes: 0 });
             } else {
                 // A single regular file with --name uses the override; otherwise
                 // the basename. With multiple files --name was already warned off.
@@ -13957,7 +13972,7 @@ async fn send_cmd(
                 });
                 let head = head_hash(&path);
                 let full = full_hash(&path);
-                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
+                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, declined: false, done: false, stream_started: None, stream_bytes: 0 });
             }
         }
     }
@@ -14829,6 +14844,7 @@ async fn send_cmd(
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
                         ui::say(&format!("declined: {}", o.name));
+                        o.declined = true;
                         o.done = true;
                     }
                 }
@@ -15077,10 +15093,25 @@ async fn send_cmd(
                 for o in out.iter().filter(|o| o.temp) {
                     let _ = std::fs::remove_file(&o.path);
                 }
-                ui::say("done.");
+                let completed = out.iter().filter(|o| o.done && !o.declined).count();
+                let declined = out.iter().filter(|o| o.declined).count();
+                match send_outcome(completed, declined) {
+                    SendOutcome::Complete { .. } => ui::say("done."),
+                    SendOutcome::Declined { completed: 0, declined } => {
+                        ui::say(&format!("no files delivered ({declined} declined)."));
+                    }
+                    SendOutcome::Declined { completed, declined } => {
+                        ui::say(&format!("partial: {completed} delivered, {declined} declined."));
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let _ = sio.disconnect().await;
-                return Ok(());
+                match send_outcome(completed, declined) {
+                    SendOutcome::Complete { .. } => return Ok(()),
+                    SendOutcome::Declined { completed, declined } => bail!(
+                        "send incomplete: {completed} delivered, {declined} declined"
+                    ),
+                }
             }
         }
     }
@@ -20391,6 +20422,28 @@ mod tests {
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Contact));
         assert!(!suppressed.contains("peer-sid"));
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
+    }
+
+    #[test]
+    fn send_outcome_refuses_success_for_any_declined_file() {
+        assert_eq!(
+            send_outcome(1, 0),
+            SendOutcome::Complete { completed: 1 }
+        );
+        assert_eq!(
+            send_outcome(0, 1),
+            SendOutcome::Declined {
+                completed: 0,
+                declined: 1,
+            }
+        );
+        assert_eq!(
+            send_outcome(1, 1),
+            SendOutcome::Declined {
+                completed: 1,
+                declined: 1,
+            }
+        );
     }
 
     #[test]
