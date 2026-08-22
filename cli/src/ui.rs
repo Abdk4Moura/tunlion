@@ -326,6 +326,28 @@ pub fn problem(headline: &str, detail: &str, steps: &[String]) {
     }
 }
 
+/// A structured CAUTION block: `problem`'s shape at warning tone, for an action
+/// that SUCCEEDED but did not accomplish what the operator was reaching for.
+///
+/// Separate from `problem` because a red `✗` after a command that worked reads
+/// as failure and teaches people to distrust the output. The case this exists
+/// for is #244: `revoke <device> shell` genuinely revokes the grant, and the
+/// device keeps its shell anyway because `up --shell` never consults a grant.
+/// Reporting only the success is how an operator runs the security verb and
+/// loses nothing without being told.
+pub fn caution(headline: &str, detail: Option<&str>, steps: &[String]) {
+    critical(&format!("{} {}", paint(Tone::Warn, glyph_warn()), paint(Tone::Bold, headline)));
+    if let Some(d) = detail.filter(|d| !d.is_empty()) {
+        critical(&format!("  {d}"));
+    }
+    if !steps.is_empty() {
+        critical(&format!("  {}", paint(Tone::Dim, "to actually remove it:")));
+        for s in steps {
+            critical(&format!("    {} {s}", paint(Tone::Brand, "•")));
+        }
+    }
+}
+
 /// DEBUG level (`-v`): resilience internals, stall detected, resuming, in-place
 /// repair, signaling reconnecting/reconnected, warm cutover, upgrade-probe
 /// attempts. No-op at the default level.

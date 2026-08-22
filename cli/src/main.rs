@@ -3174,6 +3174,34 @@ impl ShellPolicy {
             ShellPolicy::Only(set) => set.contains(name),
         }
     }
+    /// #244: the posture this daemon is actually serving, for `cap-status`.
+    ///
+    /// Reported by the RUNNING daemon rather than derived from settings by the
+    /// asking process. `up --shell` sets the policy from a launch flag that
+    /// never touches the settings file, so a settings-derived answer would be
+    /// true about the config and wrong about the daemon, which is precisely the
+    /// gap that lets `revoke <device> shell` report success while the policy
+    /// keeps handing out the shell.
+    fn label(&self) -> &'static str {
+        match self {
+            ShellPolicy::Granted => "granted",
+            ShellPolicy::All => "all",
+            ShellPolicy::Only(_) => "only",
+        }
+    }
+    /// The petnames this policy auto-shells regardless of any per-device grant.
+    /// Empty for `Granted`; `Only`'s set; `All` answers for every peer, so the
+    /// caller must read `label() == "all"` rather than look for a name here.
+    fn auto_names(&self) -> Vec<String> {
+        match self {
+            ShellPolicy::Only(set) => {
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort();
+                v
+            }
+            _ => Vec::new(),
+        }
+    }
     /// Active policy implies the L2 tunnel acceptor is on (you can't ssh without it).
     fn enables_l2(&self) -> bool {
         !matches!(self, ShellPolicy::Granted)
@@ -12912,6 +12940,41 @@ async fn main() -> Result<()> {
             if let Some(warning) = fleet_certificate_warning(&device) {
                 eprintln!("{warning}");
             }
+            // #244: revoking the `shell` CAP does nothing while `up --shell` is
+            // serving, because that policy auto-allows without consulting a
+            // per-device capability at all. The operator ran the security verb,
+            // saw success, and lost nothing. Say so, and name what does work.
+            //
+            // Asked of the RUNNING daemon, not derived from settings: `--shell`
+            // is a launch flag that never lands in the settings file, so a local
+            // guess would be confidently wrong in exactly the case that matters.
+            // When no daemon answers we say NOTHING rather than guess: silence
+            // here means "not known", and inventing a reassurance would repeat
+            // the defect one layer up.
+            if capability == "shell" {
+                if let Some(st) = crate::ctl::try_cap_status().await {
+                    let policy = st["shell_policy"].as_str().unwrap_or("");
+                    let auto = st["shell_auto"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|n| n == device))
+                        .unwrap_or(false);
+                    if policy == "all" || (policy == "only" && auto) {
+                        let how = if policy == "all" {
+                            "`up --shell` is serving, which auto-allows every paired device".to_string()
+                        } else {
+                            format!("`up --shell-only` is serving and lists {device}")
+                        };
+                        ui::caution(
+                            &format!("{device} still has shell access"),
+                            Some(&format!("the grant is revoked, but {how}, so this revoke changed nothing for it.")),
+                            &[
+                                format!("restart the daemon without it, or scope it: filament up --shell-only <others>"),
+                                format!("or remove the device entirely: filament devices forget {device}"),
+                            ],
+                        );
+                    }
+                }
+            }
             Ok(())
         }
         Cmd::Mount { peer, remote, local, read_write, options, foreground, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile, off } => {
@@ -16236,6 +16299,11 @@ async fn recv_cmd(
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
                                 "summary": counts.summary(),
+                                // #244: the LIVE shell posture. `revoke <dev> shell`
+                                // reads this so it can say when the shell it just
+                                // revoked is still being handed out by the policy.
+                                "shell_policy": shell_policy.label(),
+                                "shell_auto": shell_policy.auto_names(),
                             })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
                             handle_list_warm(&conn, req).await;

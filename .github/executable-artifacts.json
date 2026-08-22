@@ -118,10 +118,14 @@
     },
     {
       "path": "cli/tests/l2-revoke-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "new-deep-wisdom",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/l2-revoke-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/lib/fixture.sh",
@@ -131,7 +135,8 @@
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/pty-revoke-gates.sh",
-        "cli/tests/roster-gates.sh"
+        "cli/tests/roster-gates.sh",
+        "cli/tests/shell-posture-gates.sh"
       ]
     },
     {
@@ -172,10 +177,14 @@
     },
     {
       "path": "cli/tests/mount-revoke-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "new-deep-wisdom",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/mount-revoke-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/nat-cone-gate.sh",
@@ -203,10 +212,14 @@
     },
     {
       "path": "cli/tests/pty-revoke-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "new-deep-wisdom",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/pty-revoke-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/reliability_test.sh",
@@ -227,6 +240,17 @@
       "issue": "https://github.com/Abdk4Moura/filament/issues/249",
       "owner": "chief-ux",
       "expires": "2026-09-17"
+    },
+    {
+      "path": "cli/tests/shell-posture-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/shell-posture-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/ssh-gates.sh",

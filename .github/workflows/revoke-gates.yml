@@ -26,6 +26,7 @@ on:
     paths:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
+      - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -85,17 +86,29 @@ jobs:
       # finished on 3 of 13 checks for exactly this reason. Counting the PASS
       # lines is what makes "green" mean "the gates ran AND passed".
       - name: Run revocation gates
-        working-directory: cli/tests
         env:
           FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/filament
         run: |
           set -uo pipefail
-          declare -A EXPECT=( [pty-revoke-gates]=3 [mount-revoke-gates]=4 [l2-revoke-gates]=3 )
+          # Full paths, not bare names under a working-directory. The registry
+          # checker (#249) decides "is this artifact wired into CI" by looking for
+          # the artifact PATH in a workflow file, so a loop over `$g.sh` runs the
+          # gates while leaving them indistinguishable from unwired ones. Wiring
+          # that a machine cannot see is the thing #249 exists to catch.
+          declare -A EXPECT=(
+            [cli/tests/pty-revoke-gates.sh]=3
+            [cli/tests/mount-revoke-gates.sh]=4
+            [cli/tests/l2-revoke-gates.sh]=3
+            [cli/tests/shell-posture-gates.sh]=3
+          )
           rc=0
-          for g in pty-revoke-gates mount-revoke-gates l2-revoke-gates; do
+          for g in cli/tests/pty-revoke-gates.sh \
+                   cli/tests/mount-revoke-gates.sh \
+                   cli/tests/l2-revoke-gates.sh \
+                   cli/tests/shell-posture-gates.sh; do
             echo "::group::$g"
-            [ -x "./$g.sh" ] || { echo "MISSING or not executable: $g.sh"; rc=1; echo "::endgroup::"; continue; }
-            out="$(./$g.sh 2>&1)"; code=$?
+            [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
+            out="$(bash "$g" 2>&1)"; code=$?
             echo "$out"
             echo "::endgroup::"
             got=$(printf '%s\n' "$out" | grep -c '^PASS:')
