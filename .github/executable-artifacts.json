@@ -23,6 +23,17 @@
       "expires": "2026-09-17"
     },
     {
+      "path": "cli/tests/forward-refusal-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/forward-refusal-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/gates.sh",
       "disposition": "required",
       "entrypoint": "bash cli/tests/gates.sh",
@@ -132,6 +143,7 @@
       "disposition": "support",
       "invoked_by": [
         "cli/tests/devices-write-race-gates.sh",
+        "cli/tests/forward-refusal-gates.sh",
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/pty-revoke-gates.sh",

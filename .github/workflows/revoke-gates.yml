@@ -14,6 +14,12 @@
 # A2 is the one that matters most. Without it a gate passes by closing
 # everything always, which would "prove" revocation while breaking the product.
 #
+# Also carries forward-refusal-gates (#232/#268): the same question, asked of a
+# peer that refuses an l2-open rather than one that revokes. It lives here
+# because it is the same fixture family and the same property, what filament
+# tells you when the far side says no. There was no gate for it at all, which is
+# why #268 had to be found by hand across two machines.
+#
 # Linux only, deliberately. The mount arm needs FUSE, and the point here is to
 # run the guarantee somewhere real rather than to matrix it.
 
@@ -27,6 +33,7 @@ on:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
+      - 'cli/tests/forward-refusal-gates.sh'
       - 'cli/tests/lib/fixture.sh'
       - 'backend/**'
       - '.github/workflows/revoke-gates.yml'
@@ -100,12 +107,14 @@ jobs:
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3
             [cli/tests/shell-posture-gates.sh]=3
+            [cli/tests/forward-refusal-gates.sh]=5
           )
           rc=0
           for g in cli/tests/pty-revoke-gates.sh \
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \
-                   cli/tests/shell-posture-gates.sh; do
+                   cli/tests/shell-posture-gates.sh \
+                   cli/tests/forward-refusal-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             out="$(bash "$g" 2>&1)"; code=$?

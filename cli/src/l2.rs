@@ -3110,6 +3110,10 @@ struct ForwardActivity {
     active: std::sync::Arc<std::sync::atomic::AtomicU64>,
     total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     first: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #232/#268: report a peer refusal ONCE. A browser retrying a dead port
+    /// would otherwise repeat the same line per connection, and a reason
+    /// printed twenty times reads as a storm rather than an explanation.
+    refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     peer: String,
     rport: u16,
 }
@@ -3120,6 +3124,7 @@ impl ForwardActivity {
             active: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer: peer.to_string(),
             rport,
         }
@@ -3134,6 +3139,37 @@ impl ForwardActivity {
             self.total.load(Relaxed)
         ));
     }
+    /// A handle sharing the same counters, for the per-connection tasks.
+    fn handle(&self) -> ForwardActivity {
+        ForwardActivity {
+            active: self.active.clone(),
+            total: self.total.clone(),
+            first: self.first.clone(),
+            refused: self.refused.clone(),
+            peer: self.peer.clone(),
+            rport: self.rport,
+        }
+    }
+
+    /// #232/#268: the peer said no, and said why. Surface it.
+    ///
+    /// Before this, `forward` printed an accept-time line and then nothing: a
+    /// refusal reached `Mux::on_close`, which recorded the reason in `close_err`
+    /// exactly so a caller could read it, and forward was the one caller that
+    /// never did. pty already reads it via `take_close_err`. So this is wiring a
+    /// channel that existed, not building one, which is the correction the
+    /// reviewer made to my first description of this work.
+    fn refused_once(&self, reason: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.refused.swap(true, Relaxed) {
+            return;
+        }
+        crate::ui::critical(&format!(
+            "filament: {}:{} refused the connection: {reason}",
+            self.peer, self.rport
+        ));
+    }
+
     /// Register a newly accepted connection; the returned guard decrements on drop.
     fn begin(&self) -> ConnGuard {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3359,6 +3395,9 @@ pub async fn forward_cmd(
         }
         let rx = cold_rx.clone().unwrap();
         let guard = activity.begin();
+        // #232/#268: a handle sharing the same counters, so the spawned task can
+        // report a refusal against this forward's once-only flag.
+        let act = activity.handle();
         let peer_c = peer.to_string();
         // Serve this connection, retrying across a reconnect: a link that died in
         // the poll window is skipped (is_alive) and open_stream failures re-wait
@@ -3367,7 +3406,7 @@ pub async fn forward_cmd(
         // kill the whole forward (the beta.28/29 regression class).
         tokio::spawn(async move {
             let _guard = guard; // decrements + refreshes the activity line on close
-            serve_cold_connection(rx, sock, rport, peer_c).await;
+            serve_cold_connection(rx, sock, rport, peer_c, Some(act)).await;
         });
     }
 }
@@ -3585,7 +3624,7 @@ async fn handle_socks(
                 }
             };
             socks_reply(&mut sock, 0x00).await?;
-            serve_cold_connection(rx, sock, dport, peer).await;
+            serve_cold_connection(rx, sock, dport, peer, None).await;
             Ok(())
         }
         None => {
@@ -3684,7 +3723,7 @@ async fn handle_http(
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await;
-                serve_cold_connection(rx, sock, dport, peer).await;
+                serve_cold_connection(rx, sock, dport, peer, None).await;
                 Ok(())
             }
             None => {
@@ -3749,6 +3788,10 @@ async fn serve_cold_connection(
     sock: TcpStream,
     rport: u16,
     peer: String,
+    // #232/#268: Some for `forward`, whose user is watching a terminal and needs
+    // to know the peer refused. None for the proxy paths, which serve many
+    // callers and have no single console to narrate to.
+    activity: Option<ForwardActivity>,
 ) {
     let mut tries = 0u32;
     loop {
@@ -3767,7 +3810,14 @@ async fn serve_cold_connection(
         };
         match open_stream(&mux, rport).await {
             Ok((sid, rx_pipe)) => {
-                serve_stream(mux, sid, sock, rx_pipe, true, None, None).await;
+                serve_stream(mux.clone(), sid, sock, rx_pipe, true, None, None).await;
+                // The acceptor's `l2-close{err}` landed in `close_err` before the
+                // pipe was dropped (on_close orders it that way deliberately), so
+                // by the time serve_stream returns the reason is already there if
+                // there is one. A clean end leaves None and prints nothing.
+                if let (Some(a), Some(reason)) = (&activity, mux.take_close_err(sid).await) {
+                    a.refused_once(&reason);
+                }
                 return;
             }
             Err(_) => {
