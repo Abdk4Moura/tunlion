@@ -200,6 +200,9 @@ pub fn glyph_extern() -> &'static str {
 pub fn glyph_review() -> &'static str {
     if caps().unicode { "◐" } else { "[review]" }
 }
+pub fn glyph_mesh() -> &'static str {
+    if caps().unicode { "◇" } else { "[mesh]" }
+}
 pub fn glyph_warn() -> &'static str {
     if caps().unicode { "⚠" } else { "!" }
 }
@@ -317,6 +320,28 @@ pub fn problem(headline: &str, detail: &str, steps: &[String]) {
     }
     if !steps.is_empty() {
         critical(&format!("  {}", paint(Tone::Dim, "try one of:")));
+        for s in steps {
+            critical(&format!("    {} {s}", paint(Tone::Brand, "•")));
+        }
+    }
+}
+
+/// A structured CAUTION block: `problem`'s shape at warning tone, for an action
+/// that SUCCEEDED but did not accomplish what the operator was reaching for.
+///
+/// Separate from `problem` because a red `✗` after a command that worked reads
+/// as failure and teaches people to distrust the output. The case this exists
+/// for is #244: `revoke <device> shell` genuinely revokes the grant, and the
+/// device keeps its shell anyway because `up --shell` never consults a grant.
+/// Reporting only the success is how an operator runs the security verb and
+/// loses nothing without being told.
+pub fn caution(headline: &str, detail: Option<&str>, steps: &[String]) {
+    critical(&format!("{} {}", paint(Tone::Warn, glyph_warn()), paint(Tone::Bold, headline)));
+    if let Some(d) = detail.filter(|d| !d.is_empty()) {
+        critical(&format!("  {d}"));
+    }
+    if !steps.is_empty() {
+        critical(&format!("  {}", paint(Tone::Dim, "to actually remove it:")));
         for s in steps {
             critical(&format!("    {} {s}", paint(Tone::Brand, "•")));
         }
@@ -454,6 +479,12 @@ impl Progress {
     }
 
     /// Final summary line; rings the bell (opt-in via tty) for long transfers.
+    ///
+    /// Times from construction to NOW, so it is only honest where "the last byte
+    /// was handled" and "the transfer finished" are the same instant. That holds
+    /// on the RECEIVE path (the bytes are in hand). It does NOT hold on the send
+    /// path, where the sender stops writing long before the wire drains: see
+    /// `transfer_summary` and #262.
     pub fn done(&self, bytes: u64) {
         let secs = self.started.elapsed().as_secs_f64().max(0.001);
         let rate = bytes as f64 / secs;
@@ -466,6 +497,33 @@ impl Progress {
         if caps().tty && secs > 30.0 {
             eprint!("\x07");
         }
+    }
+}
+
+/// The final one-line summary for a SENT transfer, timed by the caller.
+///
+/// Split out from `Progress::done` because on the send path the moment we stop
+/// writing is not the moment the transfer finished. `flush()` on the direct-QUIC
+/// transport returns once the bytes are accepted into quinn's send buffer, and
+/// those buffers are deliberately large (`direct.rs`), so a 10MB file is queued
+/// in about 20ms while the wire is still draining. Timing against that printed
+/// `484.1 MB/s` for a transfer measured at `2.53 MB/s`, a 191x overstatement, on
+/// a link whose RTT is 142ms (#262). WebRTC hid the bug because SCTP applies real
+/// backpressure, so writing cannot run ahead of the wire.
+///
+/// The caller therefore supplies an interval that ends when delivery was
+/// CONFIRMED (the whole-file-verified `delivery-ack`), not when writing stopped.
+pub fn transfer_summary(label: &str, bytes: u64, secs: f64) {
+    let secs = secs.max(0.001);
+    let rate = bytes as f64 / secs;
+    say(&format!(
+        "  {} {}  {}",
+        paint(Tone::Ok, glyph_ok()),
+        label,
+        paint(Tone::Dim, &format!("{} · {}/s", crate::human(bytes), crate::human(rate as u64))),
+    ));
+    if caps().tty && secs > 30.0 {
+        eprint!("\x07");
     }
 }
 
@@ -597,21 +655,29 @@ pub fn qr_rows(url: &str) -> Option<usize> {
     Some((code.width() as usize + 4) / 2)
 }
 
+/// Does the QR fit in the terminal below `rows_used` rows of surrounding text?
+pub fn qr_fits(url: &str, rows_used: usize) -> bool {
+    match qr_rows(url) {
+        Some(rows) => {
+            let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(usize::MAX);
+            rows_used + rows <= term_h
+        }
+        None => false,
+    }
+}
+
 /// Render a QR if it fits the terminal height, else the payload plus the
 /// numbers. A QR whose top is cut off looks broken and cannot resolve; better
 /// to say so plainly (#190). `rows_used` is how many rows the surrounding text
 /// has already printed above the QR (review header etc).
 pub fn qr_or_text(url: &str, rows_used: usize) -> String {
-    let rows = match qr_rows(url) {
-        Some(r) => r,
-        None => return url.to_string(),
-    };
-    let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(usize::MAX);
-    if rows_used + rows <= term_h {
+    if qr_fits(url, rows_used) {
         qr(url)
     } else {
         format!(
-            "  (the QR needs {rows} rows and this window has {term_h}; the top would be cut off)\n  {url}",
+            "  (the QR needs {} rows and this window has {}; the top would be cut off)\n  {url}",
+            qr_rows(url).unwrap_or(0),
+            crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0),
         )
     }
 }

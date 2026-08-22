@@ -60,25 +60,31 @@ BIG="$WORK/big.bin";     head -c 5000000 /dev/urandom >"$BIG";  H_BIG=$(hashof "
 # for the known-device direct path. WebRTC (flag OFF) for the pairing itself.
 DA="$WORK/devA"; DB="$WORK/devB"; DDROP="$WORK/drop"; mkdir -p "$DA" "$DB" "$DDROP"
 pair() {
-  # The sender chooses a valid 2-word phrase (the SPAKE2 password); the numeric
-  # nameplate is ALWAYS machine-minted, so the receiver must claim the FULL
-  # minted code (grepped from the sender's log), not the spoken word. A single
-  # token like the old `pair-$$-$RANDOM` is now refused by the >=2-word floor.
-  local WORD="gigantic-element"
-  FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$WORD" --remember boxB --server "$SERVER" >"$WORK/pair-a.log" 2>&1 &
-  local SP=$!
-  local CODE=""
-  for _ in $(seq 1 40); do
-    CODE=$(grep -oiE "$WORD-[0-9]{3,5}" "$WORK/pair-a.log" | head -1)
-    [ -n "$CODE" ] && break; sleep 0.3
-  done
-  FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$CODE" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/pair-b.log" 2>&1
-  wait $SP 2>/dev/null
+  # `filament add` without --for is INTERACTIVE and refuses automation outright:
+  #   "add is interactive (it needs consent on both ends). For automation,
+  #    create a bounded invitation instead: filament add --for device"
+  # and `send/receive --remember` silently stores nothing (#256), which is why
+  # this gate's original setup produced two unpaired stores while reporting a
+  # successful transfer. The invitation flow is the supported non-interactive
+  # ceremony; the owner's daemon must be UP or `join` only times out.
+  # `add --for` needs an owner identity ("no identity. Run `filament init` first").
+  env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes \
+      >"$WORK/pair-a-init.log" 2>&1 || { echo "init failed"; cat "$WORK/pair-a-init.log"; return 1; }
+  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$DDROP" \
+      >"$WORK/pair-a-daemon.log" 2>&1 &
+  PAIR_DAEMON=$!
+  sleep 3
+  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for boxB \
+      --out "$WORK/inv.txt" --yes >"$WORK/pair-a.log" 2>&1
+  env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" join --invite-file "$WORK/inv.txt" \
+      --name boxB --no-interactive >"$WORK/pair-b.log" 2>&1
+  kill "$PAIR_DAEMON" 2>/dev/null; sleep 2
 }
-say "setup: pairing A<->B (--remember over a code)"
+say "setup: pairing A<->B (bounded invitation + join)"
 pair
-if [ -s "$DA/devices.json" ] && [ -s "$DB/devices.json" ]; then
-  ok "paired (A knows boxB, B knows boxA)"
+if FILAMENT_CONFIG_DIR="$DA" "$BIN" devices 2>/dev/null | grep -q 'boxB' \
+   && [ -s "$DB/devices.json" ]; then
+  ok "paired (A knows boxB by name)"
 else
   bad "pairing setup"; tail -n 5 "$WORK/pair-a.log" "$WORK/pair-b.log"
   echo "RESULT: $PASS passed, $FAIL failed"; exit 1

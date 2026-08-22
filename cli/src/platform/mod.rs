@@ -289,6 +289,94 @@ impl filament_id::KeyStore for PlatformKeyStore {
     }
 }
 
+// --------------------------------------------------------- DevicesFileLock --
+
+/// An exclusive advisory lock on the `devices.json.lock` sidecar, held for the
+/// lifetime of the guard. Coordinates the read-modify-write of `devices.json`
+/// across processes (#238): the store itself is written by atomic replace
+/// (temp + rename), so a lock on the store inode would be replaced out from
+/// under a holder. The sidecar is never replaced.
+///
+/// Unix: flock(LOCK_EX). Windows: LockFileEx. Other platforms: the file is
+/// opened but not locked (filament targets unix + windows).
+pub struct DevicesFileLock {
+    _file: std::fs::File,
+}
+
+impl DevicesFileLock {
+    /// Acquire the lock, blocking until it is available.
+    pub fn acquire() -> anyhow::Result<Self> {
+        let path = Paths::config_dir().join("devices.json.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(anyhow::anyhow!(
+                    "flock devices.json.lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::LockFileEx;
+            let handle = file.as_raw_handle() as HANDLE;
+            // Lock the first u32::MAX bytes at offset 0 (a zeroed OVERLAPPED).
+            // Blocking (no LOCKFILE_FAIL_IMMEDIATELY).
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            let ok = unsafe {
+                LockFileEx(
+                    handle,
+                    windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    overlapped.as_mut_ptr(),
+                )
+            };
+            if ok == 0 {
+                return Err(anyhow::anyhow!(
+                    "LockFileEx devices.json.lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(DevicesFileLock { _file: file })
+    }
+}
+
+impl Drop for DevicesFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self._file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+            let handle = self._file.as_raw_handle() as HANDLE;
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, overlapped.as_mut_ptr()) };
+        }
+    }
+}
+
 // --------------------------------------------------------- ServiceHost --
 
 /// The detected service manager on this platform.
@@ -757,6 +845,121 @@ pub fn add_firewall_rule(exe: &Path) {
             "program=", &exe.display().to_string(),
             "enable=yes"])
         .output();
+}
+
+/// Spawn `exe` with `args` detached from this process's terminal, its stdout
+/// and stderr appended to `log`. One portable operation with two arms, written
+/// together: the unix arm detaches with `setsid`, the Windows arm with
+/// `CREATE_NO_WINDOW | DETACHED_PROCESS`; both redirect the child's console to
+/// the same log file. The caller polls the pidfile itself for "is it up yet"
+/// (`daemon_alive` is portable since #204).
+///
+/// The two arms MUST ship together. #215 was a half-written detach: the
+/// Windows arm computed the log path and then discarded it, so `logs`,
+/// `up`-follows and `--detach` all dead-ended on a file that never appeared.
+pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::process::Child> {
+    if let Some(parent) = log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(log_file.try_clone()?));
+    cmd.stderr(std::process::Stdio::from(log_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("detached spawn is not supported on this platform");
+    }
+    Ok(cmd.spawn()?)
+}
+
+// --------------------------------------------------- process identity --
+
+/// The absolute path of the executable backing a live process, or `None` when
+/// the pid does not name a process we can inspect (a dead or recycled pid).
+/// This is the identity check behind `daemon_alive`: a command-line substring
+/// can be defeated by renaming the binary, the executable path cannot.
+///
+/// Linux reads the `/proc/<pid>/exe` symlink, macOS asks libproc for the pid's
+/// image path, and Windows asks the kernel for the full image name (there is no
+/// /proc on either). The arms must ship together; a missing variant makes
+/// `daemon_alive` constant-false on that platform, which is the #204 bug this
+/// predicate exists to close for good.
+#[cfg(target_os = "linux")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    // proc_pidpath may include the NUL terminator in its return count.
+    let mut end = (n as usize).min(buf.len());
+    if end > 0 && buf[end - 1] == 0 {
+        end -= 1;
+    }
+    String::from_utf8(buf[..end].to_vec()).ok().map(PathBuf::from)
+}
+
+#[cfg(target_os = "windows")]
+pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
+    unsafe {
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+            fn QueryFullProcessImageNameW(h: isize, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 // ------------------------------------------------------- InstallSource --

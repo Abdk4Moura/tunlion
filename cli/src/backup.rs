@@ -74,7 +74,7 @@ pub async fn backup_cmd(
         if relay {
             proxy.push_str(" --relay");
         }
-        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        proxy.push_str(&format!(" forward {peer_name}:{} --stdio", info.rport));
         ssh_cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
         dest_token = format!("{}@{}", info.login, info.host);
     }
@@ -133,7 +133,7 @@ pub async fn backup_cmd(
                     let exe = exe.to_string_lossy();
                     let mut proxy = format!("{exe} --server {server}");
                     if relay { proxy.push_str(" --relay"); }
-                    proxy.push_str(&format!(" netcat {peer_name} {}", retry.rport));
+                    proxy.push_str(&format!(" forward {peer_name}:{} --stdio", retry.rport));
                     ssh_cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
                     dest_token = format!("{}@{}", retry.login, retry.host);
                 }

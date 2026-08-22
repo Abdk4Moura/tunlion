@@ -42,6 +42,7 @@ use webrtc::data::data_channel::DataChannel as RawDataChannel;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -1355,6 +1356,11 @@ impl Peer {
 
         // C3: establishment watchdog. ICE only times out once descriptions are
         // exchanged; a lost offer would otherwise mean 'connecting' forever.
+        // If ICE is already connected, defer exactly once for the PC/DTLS/SCTP
+        // handoff: 31 transfer-link samples in the remapping-NAT lab at 100ms
+        // delay and 3% loss measured 403-1611ms, so 2s leaves 389ms headroom.
+        // Recheck after that one grace; a watchdog must still fire for a PC
+        // whose data-channel handshake never completes.
         {
             let pc = pc.clone();
             let tx = tx.clone();
@@ -1362,6 +1368,11 @@ impl Peer {
             let closed = closed.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_SECS)).await;
+                if !closed.load(std::sync::atomic::Ordering::Relaxed)
+                    && c3_needs_handoff_grace(pc.connection_state(), pc.ice_connection_state())
+                {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
                 if !closed.load(std::sync::atomic::Ordering::Relaxed)
                     && pc.connection_state() != RTCPeerConnectionState::Connected
                 {
@@ -1392,6 +1403,23 @@ impl Peer {
 
     pub fn is_connected(&self) -> bool {
         self.pc.connection_state() == RTCPeerConnectionState::Connected
+    }
+
+    /// #246: a peer connection is "live" while it is establishing or serving.
+    /// `is_connected` is the serving-state test (the data path is up); this is
+    /// the narrower PROGRESS test. New/Connecting/Connected have a concrete
+    /// operation in flight, so a re-dial must not displace them.
+    ///
+    /// Disconnected is deliberately NOT live. Only an impolite, non-away peer
+    /// restarts ICE in `on_pc_state`; a polite peer otherwise has no recovery
+    /// in flight. Calling both states live suppressed that polite peer's sole
+    /// recovery, the re-dial, until its grace expired. This also means a re-dial
+    /// may displace an impolite peer's ICE restart, restoring pre-#246 behavior
+    /// for that bounded state rather than silently changing recovery semantics.
+    /// New/Connecting remain bounded by the C3 establishment watchdog
+    /// (`WATCHDOG_SECS`, 15s, sent Ev::Stuck when the pc is not Connected).
+    pub fn is_live(&self) -> bool {
+        is_live_state(self.pc.connection_state())
     }
 
     /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
@@ -1602,6 +1630,25 @@ impl Peer {
                 || pair.remote.typ == RTCIceCandidateType::Relay,
         })
     }
+}
+
+fn c3_needs_handoff_grace(
+    pc_state: RTCPeerConnectionState,
+    ice_state: RTCIceConnectionState,
+) -> bool {
+    pc_state != RTCPeerConnectionState::Connected
+        && matches!(ice_state, RTCIceConnectionState::Connected | RTCIceConnectionState::Completed)
+}
+
+/// The state-only portion of `Peer::is_live`, exposed so #246's executable
+/// invariant can pin the disconnected recovery boundary without a live PC.
+pub(crate) fn is_live_state(state: RTCPeerConnectionState) -> bool {
+    matches!(
+        state,
+        RTCPeerConnectionState::New
+            | RTCPeerConnectionState::Connecting
+            | RTCPeerConnectionState::Connected
+    )
 }
 
 /// The concrete endpoints of a selected ICE candidate pair, for path display.
@@ -1927,6 +1974,26 @@ async fn wire_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c3_defers_once_for_ice_to_pc_handoff_only() {
+        assert!(c3_needs_handoff_grace(
+            RTCPeerConnectionState::Connecting,
+            RTCIceConnectionState::Connected,
+        ));
+        assert!(c3_needs_handoff_grace(
+            RTCPeerConnectionState::Connecting,
+            RTCIceConnectionState::Completed,
+        ));
+        assert!(!c3_needs_handoff_grace(
+            RTCPeerConnectionState::Connected,
+            RTCIceConnectionState::Connected,
+        ));
+        assert!(!c3_needs_handoff_grace(
+            RTCPeerConnectionState::Connecting,
+            RTCIceConnectionState::Checking,
+        ));
+    }
 
     #[test]
     fn polite_role_prefers_uid_then_sid() {

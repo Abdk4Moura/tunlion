@@ -926,16 +926,11 @@ pub(crate) fn burn_auth_key_at(enroll_pub: &[u8; 32], reuse: &Reuse, now_secs: u
     entry.burn_count += 1;
     entry.window_count += 1;
 
-    // Burn-disarm: drop a consumed key from the armed set so the daemon
-    // leaves the enrollment channel immediately, not at TTL expiry.
-    let exhausted = match reuse {
-        Reuse::Once => true,
-        Reuse::N(max) => entry.burn_count >= *max,
-        Reuse::Reusable => false,
-    };
-    if exhausted {
-        disarm(&hex::encode(enroll_pub));
-    }
+    // Burn: a consumed key is left in the armed file until its expiry, when the
+    // file-backed store's is_armed() prunes it. Enrollment still requires the
+    // signed invitation, so a burned key lingering in the set is harmless and a
+    // per-key immediate disarm (which needs this crate to know the store path,
+    // which it must not) is a refinement the CLI may add later.
     Ok(())
 }
 
@@ -1043,46 +1038,15 @@ pub fn consume_latest_nonce(peer_id: &str) -> Result<[u8; 32]> {
 
 // ---------------------------------------------------------------------------
 // Arm-gate: armed set for enrollment room membership
+//
+// REMOVED from here. The armed set was an in-memory OnceLock, which meant the
+// only way a mint could tell the daemon "an invitation is outstanding" was
+// inter-process communication, and IPC is the one thing with no portable form
+// (#205 Windows had no socket, #211 the socket was a bind race, and a daemon
+// restart silently disarmed every outstanding invitation). It is now a
+// file-backed store in the CLI (cli/src/armed.rs): the mint writes armed.json
+// directly, the daemon's per-tick arm-gate reads it. This crate stays pure.
 // ---------------------------------------------------------------------------
-
-struct ArmedEntry {
-    expiry: u64, // absolute unix seconds
-    key_id: String,
-}
-
-struct ArmedSet {
-    entries: Vec<ArmedEntry>,
-}
-
-static ARMED: OnceLock<Mutex<ArmedSet>> = OnceLock::new();
-
-fn armed_set() -> &'static Mutex<ArmedSet> {
-    ARMED.get_or_init(|| Mutex::new(ArmedSet { entries: Vec::new() }))
-}
-
-/// Arm the daemon: add a key to the armed set. Called from Mint via ctl socket.
-pub fn arm(key_id: String, expires_at: u64) {
-    let mut set = armed_set().lock().unwrap();
-    set.entries.retain(|e| e.key_id != key_id); // dedup
-    set.entries.push(ArmedEntry { expiry: expires_at, key_id });
-}
-
-/// Disarm: remove a key from the armed set (called when it burns).
-/// Lock order: burn_auth_key holds burn_state lock, then calls disarm.
-/// Never acquire armed_set before burn_state.
-pub fn disarm(key_id: &str) {
-    let mut set = armed_set().lock().unwrap();
-    set.entries.retain(|e| e.key_id != key_id);
-}
-
-/// Check if the daemon should be in the enroll room (any unexpired armed key).
-/// Prunes expired entries.
-pub fn is_armed() -> bool {
-    let now = now_secs();
-    let mut set = armed_set().lock().unwrap();
-    set.entries.retain(|e| e.expiry > now);
-    !set.entries.is_empty()
-}
 
 // ---------------------------------------------------------------------------
 // Utility

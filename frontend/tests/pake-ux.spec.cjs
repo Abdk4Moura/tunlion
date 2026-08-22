@@ -39,14 +39,26 @@ if (fs.existsSync(CLI_TESTS_NM) && !Module.globalPaths.includes(CLI_TESTS_NM)) {
   process.env.NODE_PATH = (process.env.NODE_PATH ? process.env.NODE_PATH + path.delimiter : '') + CLI_TESTS_NM;
   Module._initPaths();
 }
-const { chromium } = require(path.join(CLI_TESTS_NM, 'playwright'));
+// #250: was require(path.join(CLI_TESTS_NM, 'playwright')), an absolute path
+// into cli/tests/node_modules that does not exist in a clean checkout.
+const { chromium } = require(require.resolve('playwright', {
+  paths: [path.join(__dirname, '..')],
+}));
 
 const ROOT = path.resolve(__dirname, '..', '..');           // repo root
 const FRONT = path.join(ROOT, 'frontend');
 const BACKEND = path.join(ROOT, 'backend');
 const DIST = path.join(FRONT, 'dist');
+// #250: this defaulted to /root/.claude/jobs/330c2366/tmp/venv/bin/python, a
+// job-scoped venv from a job that finished long ago. Third instrument in this
+// directory pinned to a path outside the repo, and like the others it made the
+// gate unrunnable rather than failing loudly. Prefer the override, then any
+// venv at the repo root, then whatever python3 is on PATH; the backend needs
+// flask, flask-socketio and flask-cors, and the gate says so if they are absent.
 const VENV_PY = process.env.FILAMENT_TEST_VENV
-  || '/root/.claude/jobs/330c2366/tmp/venv/bin/python';
+  || (fs.existsSync(path.join(ROOT, '.venv', 'bin', 'python'))
+        ? path.join(ROOT, '.venv', 'bin', 'python')
+        : 'python3');
 const BACK_PORT = 8231;
 const HARNESS_PORT = 8232;
 const BACK_URL = `http://127.0.0.1:${BACK_PORT}`;
@@ -95,7 +107,12 @@ function buildHarness() {
   const out = path.join(__dirname, '.pakekeep-bundle.js');
   const r = spawnSync(path.join(FRONT, 'node_modules', '.bin', 'esbuild'),
     [path.join(__dirname, 'pakekeep-harness.jsx'), '--bundle', '--format=iife',
-      `--outfile=${out}`, '--loader:.js=jsx', '--jsx=automatic', '--define:process.env.NODE_ENV="production"'],
+      `--outfile=${out}`, '--loader:.js=jsx', '--jsx=automatic', '--define:process.env.NODE_ENV="production"',
+      // #250: `import x from '*.wasm?url'` is Vite syntax esbuild has no
+      // loader for, and iife has no `import.meta`, so the bundle failed and
+      // then the component threw reading import.meta.env. Same-origin is
+      // what a harness wants: an empty base keeps requests local.
+      '--loader:.wasm=file', '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;

@@ -21,7 +21,12 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PW = '/root/wt-transport/experiments/ux/node_modules/playwright';
+// Resolve the declared devDependency rather than an absolute path into some
+// other worktree. Every one of these gates was dead on MODULE_NOT_FOUND because
+// the path it named had been reaped (#250).
+const PW = require.resolve('playwright', {
+  paths: [require('path').join(__dirname, '..')],
+});
 const { chromium } = require(PW);
 
 const ROOT = path.resolve(__dirname, '..', '..');
@@ -37,7 +42,12 @@ function buildHarness() {
   const out = path.join(__dirname, '.p1-relay-bundle.js');
   const r = spawnSync(path.join(FRONT, 'node_modules', '.bin', 'esbuild'),
     [path.join(__dirname, 'p1-relay-rebuild-harness.jsx'), '--bundle', '--format=iife',
-      `--outfile=${out}`, '--loader:.js=jsx', '--jsx=automatic', '--define:process.env.NODE_ENV="production"'],
+      `--outfile=${out}`, '--loader:.js=jsx', '--jsx=automatic', '--define:process.env.NODE_ENV="production"',
+      // #250: `import x from '*.wasm?url'` is Vite syntax esbuild has no
+      // loader for, and iife has no `import.meta`, so the bundle failed and
+      // then the component threw reading import.meta.env. Same-origin is
+      // what a harness wants: an empty base keeps requests local.
+      '--loader:.wasm=file', '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;

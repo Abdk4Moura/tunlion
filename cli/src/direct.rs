@@ -40,6 +40,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -460,6 +461,23 @@ struct PubIpEntry {
 
 static PUBIP_CACHE: std::sync::OnceLock<Mutex<Option<PubIpEntry>>> = std::sync::OnceLock::new();
 
+/// Our public IP as OBSERVED by an authenticated peer (#237): the peer saw us
+/// connect from this address, so it is the only source NOT chosen by the party
+/// under suspicion (the signaling server). It SUPERSEDES the `/api/whoami`
+/// assertion (the `PUBIP_CACHE` above, including the `warm_public_ip` pre-warm
+/// at daemon start): once a peer has seen us, the server's guess is ignored.
+/// Empty until a peer has actually connected to us.
+static PEER_OBSERVED_IP: std::sync::OnceLock<Mutex<Option<IpAddr>>> = std::sync::OnceLock::new();
+
+/// The address an authenticated peer observed us connecting from, if any.
+pub async fn observed_public_ip() -> Option<IpAddr> {
+    *PEER_OBSERVED_IP.get_or_init(|| Mutex::new(None)).lock().await
+}
+
+async fn record_observed_ip(ip: IpAddr) {
+    *PEER_OBSERVED_IP.get_or_init(|| Mutex::new(None)).lock().await = Some(ip);
+}
+
 /// Pure freshness test, split out so the TTL/server-match logic is unit-testable
 /// without a clock or the network. A cached IP is reusable only for the SAME
 /// server and only while younger than the TTL.
@@ -526,6 +544,17 @@ fn suppress_public() -> bool {
     std::env::var("FILAMENT_DIRECT_NO_PUBLIC").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Test-only: advertise ONLY the server-asserted (`whoami`) public candidate.
+/// Uses the SAME single adopted-value computation as the normal path and returns
+/// `(vec![the adopted address], Some(it))` when one was adopted. The gate C
+/// fixture uses it to make the direct race DIAL a real, unanswerable address
+/// (TEST-NET) and fail for real, so the fallback attribution names a candidate
+/// that was actually dialed on the wire - not a simulated stand-in. NOT a
+/// product knob, only the whoami-candidate gate sets it.
+fn only_public() -> bool {
+    std::env::var("FILAMENT_DIRECT_ONLY_PUBLIC").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Test-only: pin candidates to loopback (`127.0.0.1`). A multi-homed host (a
 /// cloud box with eth0/private/docker/tailscale/bridge IPs) advertises many
 /// local candidates; the simultaneous-open race can then pick a pair that can't
@@ -545,28 +574,84 @@ fn loopback_only() -> bool {
     false
 }
 
-/// Gather all advertisable candidates for our bound endpoint port.
+/// True exactly when the dial-ahead for candidate `cand` is a dial OF the
+/// peer's claimed server-asserted address. The peer's claim comes off the
+/// wire untrusted, so this is the ONLY thing that may let the fallback name
+/// it: the name and the dialed address must be the SAME socket. A claim that
+/// does not parse, or a candidate that does not parse, or two addresses that
+/// merely look alike, all yield false - the attribution may only state a fact
+/// it established by dialing.
+fn dials_claimed(claimed: Option<SocketAddr>, cand: &str) -> bool {
+    match (claimed, cand.parse::<SocketAddr>()) {
+        (Some(c), Ok(a)) => c == a,
+        _ => false,
+    }
+}
+
+/// Gather all advertisable candidates for our bound endpoint port, and return
+/// (cands, adopted_server_public) where the second element is exactly the
+/// server-asserted (`whoami`) candidate that was ADOPTED into the set - computed
+/// in the SAME place the push decision is made, so there is no second copy of
+/// the rule to desynchronize. `Some(s)` means `s` was appended on the server's
+/// say-so alone (no peer had observed us, whoami not suppressed, and the answer
+/// was not a local address); `None` means no server-chosen address was adopted.
+/// The relay fallback carries that value to name it at the decision, so the
+/// attribution can never name an address the candidate set did not contain.
 /// `peer` is optional — when provided, per-peer avoid/prefer overrides are read.
-pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
+pub async fn gather_candidates(server: &str, port: u16) -> (Vec<String>, Option<String>) {
     let peer: Option<&str> = None; // per-peer filter not yet wired from callers
     if loopback_only() {
         let lo: IpAddr = "127.0.0.1".parse().unwrap();
-        return vec![cand_str(lo, port)];
+        return (vec![cand_str(lo, port)], None);
     }
-    let ips = filter_local_ips(local_ips(), peer);
+    let all_local = local_ips();
+    let ips = filter_local_ips(all_local.clone(), peer);
     let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
-    if cands.is_empty() && !local_ips().is_empty() {
+    if cands.is_empty() && !all_local.is_empty() {
         crate::ui::debug("iface filter removed ALL host candidates; connectivity may fail");
     }
+    let mut adopted_server_public: Option<String> = None;
     if !suppress_public() {
-        if let Some(pip) = public_ip(server).await {
+        // #237: the peer-observed address (an authenticated peer saw us connect
+        // from it) SUPERSEDES the server's whoami assertion, including the
+        // warm pre-warm cache. whoami is only a bootstrap hint for FIRST
+        // contact, before any peer has observed us; a wrong answer there costs
+        // one slow connection instead of a standing downgrade.
+        let observed = observed_public_ip().await;
+        let pip = match observed {
+            Some(ip) => Some(ip),
+            None => public_ip(server).await,
+        };
+        if let Some(pip) = pip {
             let s = cand_str(pip, port);
             if !cands.contains(&s) {
+                if observed.is_none() && !all_local.contains(&pip) {
+                    // Gate C (#237): the SAME edge that makes this candidate
+                    // server-asserted (adopted on the server's say-so, before
+                    // any peer observed us, not local) is the one the fallback
+                    // uses to NAME it. Carried value first, forecast second -
+                    // one computation, one condition.
+                    adopted_server_public = Some(s.clone());
+                    // Diagnostic detail, demoted to -v. The HEADLINE is the
+                    // fallback attribution in `expired_direct` (the moment of
+                    // the symptom), not this forecast.
+                    crate::ui::debug(&format!(
+                        "public candidate {s} is server-asserted (bootstrap hint) and unverified; the relay fallback will name it if it never answers"
+                    ));
+                }
                 cands.push(s);
             }
         }
     }
-    cands
+    // Test-only (gate C positive): strip everything but the adopted server-
+    // asserted candidate so the race DIALS it for real and fails for real.
+    if only_public() {
+        return match adopted_server_public.as_ref() {
+            Some(s) => (vec![s.clone()], adopted_server_public),
+            None => (Vec::new(), None),
+        };
+    }
+    (cands, adopted_server_public)
 }
 
 // =============================================================== TLS configs ==
@@ -1606,13 +1691,29 @@ pub async fn race_connect(
     peer_uid: String,
     my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    exchange: bool,
+    peer_claimed: Option<SocketAddr>,
+    server_public_dialed: Arc<AtomicBool>,
 ) -> Option<Arc<dyn Transport>> {
-    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic").await
+    race_connect_labeled(endpoint, peer_cands, secret, peer_id, my_uid, peer_uid, my_id, tx, "direct-quic", exchange, peer_claimed, server_public_dialed).await
 }
 
 /// Same race, but with the route label parameterized so rung-2 (hole-punch) can
 /// reuse this verbatim and emit `route: holepunched`. rung-1 calls the wrapper
 /// above with `direct-quic`; nothing else about the race changes.
+///
+/// `exchange` is the negotiated observed-address exchange agreement: true only
+/// when BOTH ends' transport-offers said `proto >= 2`. When either side is an
+/// older build the frame is skipped on BOTH sides (byte-identical stream, no
+/// hang, no misalignment), it is never read without the peer having agreed to
+/// write it.
+///
+/// `peer_claimed` is the peer's wire-carried `server_public` claim, parsed. It
+/// is UNTRUSTED: it only becomes a fact when the dial loop below actually
+/// dials that address. `server_public_dialed` is set true exactly then and
+/// nowhere else, so the relay fallback can say "dialed and never answered"
+/// only about an address it dialed - never about a label that merely appeared
+/// on the wire.
 pub async fn race_connect_labeled(
     endpoint: Endpoint,
     peer_cands: Vec<String>,
@@ -1623,6 +1724,9 @@ pub async fn race_connect_labeled(
     my_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     route: &str,
+    exchange: bool,
+    peer_claimed: Option<SocketAddr>,
+    server_public_dialed: Arc<AtomicBool>,
 ) -> Option<Arc<dyn Transport>> {
     let answerer = match answerer_for(&my_uid, &peer_uid, &my_id, &peer_id) {
         Ok(value) => value,
@@ -1633,7 +1737,9 @@ pub async fn race_connect_labeled(
     };
     // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
     // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2, a
-    // hole-punch race carries a distinct label.
+    // hole-punch race carries a distinct label. It returns BEFORE any dial, so
+    // `server_public_dialed` stays false and the fallback attribution stays
+    // silent - the gate's negative control for "we never got to the candidate".
     if route == "direct-quic" && test_block() {
         // Fallback gate: pretend the direct path is unreachable. Drop the
         // endpoint and let the budget expire so WebRTC takes over.
@@ -1650,9 +1756,87 @@ pub async fn race_connect_labeled(
         conn: quinn::Connection,
         tkey: [u8; 32],
         is_dialer: bool,
+        exchange: bool,
     ) -> Result<(quinn::Connection, SendStream, RecvStream, bool)> {
-        let (s, r) = authenticate(&conn, &tkey, is_dialer).await?;
+        let (mut s, mut r) = authenticate(&conn, &tkey, is_dialer).await?;
+        // #237: after auth, exchange the peer-observed address. The acceptor
+        // tells the dialer the source address it saw the dialer connect from;
+        // the dialer records it and supersedes the server's whoami assertion.
+        // Only when BOTH ends agreed (proto >= 2 in their transport-offers),
+        // so a mixed old/new fleet skips the frame on both sides instead of
+        // hanging or misaligning the stream.
+        exchange_observed_address(&conn, is_dialer, &mut s, &mut r, exchange).await?;
         Ok((conn, s, r, is_dialer))
+    }
+
+    /// Post-auth observed-address exchange (see `auth_conn`). The acceptor
+    /// writes the dialer's source address (as the acceptor sees it); the dialer
+    /// reads it and records it as its peer-observed public address. Framed as a
+    /// 2-byte BE length + ASCII IP, read exactly by the dialer before the stream
+    /// is handed to `DirectTransport`, so the transport's own framing stays
+    /// aligned. Auth failures already dropped the connection, so both sides are
+    /// authenticated here; a malformed frame just means no observation recorded.
+    /// When `exchange` is false (either side predates #237's exchange) the frame
+    /// is skipped on BOTH sides - the stream is byte-identical to the old
+    /// protocol, so an old peer links fine and a clear refusal is surfaced by
+    /// the caller (on_transport_offer) instead.
+    async fn exchange_observed_address(
+        conn: &quinn::Connection,
+        is_dialer: bool,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        exchange: bool,
+    ) -> Result<()> {
+        if !exchange {
+            return Ok(());
+        }
+        if is_dialer {
+            // Defensive: a peer that AGREED to the exchange but never sends the
+            // frame must not hang the direct link (a hang and a refusal are
+            // indistinguishable to the operator). Time out, skip the exchange,
+            // and keep the authenticated connection - the stream is clean on
+            // our side, and a conforming peer wrote the frame immediately after
+            // auth, so this only ever fires on an inconsistent build.
+            let timeout_read = async {
+                let mut lenb = [0u8; 2];
+                recv.read_exact(&mut lenb).await.context("read observed-address length")?;
+                let len = u16::from_be_bytes(lenb) as usize;
+                if len > 64 {
+                    anyhow::bail!("observed-address frame too long ({len})");
+                }
+                let mut buf = vec![0u8; len];
+                recv.read_exact(&mut buf).await.context("read observed-address")?;
+                Ok::<Vec<u8>, anyhow::Error>(buf)
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(3), timeout_read).await {
+                Ok(Ok(buf)) => {
+                    if let Ok(s) = std::str::from_utf8(&buf) {
+                        if let Ok(ip) = s.trim().parse::<IpAddr>() {
+                            record_observed_ip(ip).await;
+                            crate::ui::trace(&format!("filament: peer observed us from {ip}; supersedes whoami"));
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    // A malformed frame is not an observation; the connection
+                    // still works. Surface it so the operator can see it.
+                    crate::ui::debug(&format!("filament: observed-address exchange failed ({e}); skipping"));
+                }
+                Err(_) => {
+                    crate::ui::say("filament: peer agreed to the observed-address exchange but never sent the frame; skipping (inconsistent older build)");
+                }
+            }
+        } else {
+            let ip = conn.remote_address().ip();
+            let b = ip.to_string();
+            let bytes = b.as_bytes();
+            if bytes.len() > u16::MAX as usize {
+                anyhow::bail!("observed-address too long");
+            }
+            send.write_all(&(bytes.len() as u16).to_be_bytes()).await.context("write observed-address length")?;
+            send.write_all(bytes).await.context("write observed-address")?;
+        }
+        Ok(())
     }
 
     let mut futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(quinn::Connection, SendStream, RecvStream, bool)>> + Send>>> = Vec::new();
@@ -1666,13 +1850,22 @@ pub async fn race_connect_labeled(
         futs.push(Box::pin(async move {
             let incoming = ep.accept().await.ok_or_else(|| anyhow!("endpoint closed"))?;
             let conn = incoming.await.context("accept handshake")?;
-            auth_conn(conn, tkey, false).await
+            auth_conn(conn, tkey, false, exchange).await
         }));
     }
 
     // Dialer side: one future per candidate, auth as dialer.
     for cand in peer_cands {
         let Ok(addr) = cand.parse::<SocketAddr>() else { continue };
+        // #237: the fallback attribution ("X never answered") is only honest
+        // when the PEER CLAIMED server-asserted address, and only THAT address,
+        // was actually dialed. Mark the flag at the candidate that equals the
+        // claim (after a successful parse), so a claim that was never in the
+        // dial set - or that does not even parse - can never be named by the
+        // fallback. The fact and the sentence are tied to the same address.
+        if dials_claimed(peer_claimed, &cand) {
+            server_public_dialed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let ep = endpoint.clone();
         let tkey = tkey;
         futs.push(Box::pin(async move {
@@ -1680,7 +1873,7 @@ pub async fn race_connect_labeled(
                 .connect(addr, "filament-direct")
                 .context("connect")?;
             let conn = connecting.await.context("dial handshake")?;
-            auth_conn(conn, tkey, true).await
+            auth_conn(conn, tkey, true, exchange).await
         }));
     }
 
@@ -1834,5 +2027,61 @@ mod tests {
         assert!(!preferred_connection(true, true));
         assert!(!preferred_connection(false, false));
         assert!(preferred_connection(false, true));
+    }
+
+    /// #237 regression: once a peer has observed our address, `gather_candidates`
+    /// advertises THAT and does not consult the `/api/whoami` cache (which
+    /// `warm_public_ip` pre-warms at daemon start with a server assertion). The
+    /// server is unreachable here, so if whoami WERE consulted it would return
+    /// None and no public candidate would exist; the observed address being
+    /// present proves whoami was bypassed. The carried `adopted_server_public`
+    /// must be None (a peer-observed address is NOT server-asserted), so the
+    /// relay fallback would not name anything for a connection adopted this way.
+    /// #237: the fallback may name a peer's claimed server-asserted address only
+    /// when that EXACT address was dialed. `dials_claimed` is the two-value
+    /// comparison at the dial site: parse-normalized equality (so a merely
+    /// cosmetic difference in the label cannot defeat the claim), and false for
+    /// everything that does not prove a dial of the claim - a claim that does
+    /// not parse surfaces as `None` and can never match, a candidate that does
+    /// not parse is skipped by the dial loop, and an address that merely looks
+    /// close is not the dialed one.
+    #[test]
+    fn claimed_means_dialed_exactly() {
+        let claimed = Some("8.8.8.8:53".parse::<SocketAddr>().unwrap());
+        assert!(dials_claimed(claimed, "8.8.8.8:53"));
+        assert!(dials_claimed(claimed, "8.8.8.8:0053"), "cosmetic port formatting must match");
+        assert!(!dials_claimed(claimed, "8.8.8.9:53"), "a look-alike address is not the dialed one");
+        assert!(!dials_claimed(None, "8.8.8.8:53"), "an absent/unparseable claim is never a dialed claim");
+        assert!(
+            !dials_claimed(claimed, "8.8.8.8:notaport"),
+            "an unparseable candidate is skipped by the dial loop, never a dial of the claim"
+        );
+    }
+    /// #237 regression: once a peer has observed our address, `gather_candidates`
+    /// advertises THAT and does not consult the `/api/whoami` cache (which
+    /// `warm_public_ip` pre-warms at daemon start with a server assertion). The
+    /// server is unreachable here, so if whoami WERE consulted it would return
+    /// None and no public candidate would exist; the observed address being
+    /// present proves whoami was bypassed. The carried `adopted_server_public`
+    /// must be None (a peer-observed address is NOT server-asserted), so the
+    /// relay fallback would not name anything for a connection adopted this way.
+    #[test]
+    fn peer_observed_address_supersedes_whoami() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            record_observed_ip("192.0.2.55".parse().unwrap()).await;
+            let (cands, adopted) = gather_candidates("http://127.0.0.1:1", 4242).await;
+            assert!(
+                cands.iter().any(|c| c.starts_with("192.0.2.55:4242")),
+                "the peer-observed address must be advertised and whoami bypassed, got: {cands:?}"
+            );
+            assert!(
+                adopted.is_none(),
+                "a peer-observed address must not be reported as server-asserted, got: {adopted:?}"
+            );
+        });
     }
 }

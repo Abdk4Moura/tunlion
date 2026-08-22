@@ -1,10 +1,442 @@
 # Mesh networking: why filament stays pairwise
 
-> Status: decided (2026-07-16). This note records a design question that was
-> taken seriously, explored exhaustively, and deliberately answered "no." It
-> exists so the next person (or agent) who proposes a mesh control plane can see
-> the reasoning already done, rather than re-run it. The near-term build list at
-> the bottom is the actionable part.
+> Status: **partly superseded (2026-08-15).** The 2026-07-16 analysis below
+> answered "should filament grow an open mesh control plane" and answered no.
+> That answer stands for what it was asked about. It was then read as "filament
+> is not a mesh", which is no longer the decision. Read the reconciliation
+> first; the original note is kept unedited underneath because its reasoning
+> about federation and transitive trust is still the reasoning we hold.
+
+## Reconciliation, 2026-08-15
+
+**filament is a mesh.** Specifically: every user has their own personal, private
+mesh. Two meshes can be connected, by a user sharing one device into another
+mesh. Two meshes can be merged. That is the model, and the line below saying
+"filament will not build a mesh" is stale.
+
+**There is no open join.** Membership in a mesh requires a signature descending
+from that mesh's owner, so nothing can insert itself. No admission policy to
+subvert, no coordinator to compromise into membership. The mesh is bounded by
+whose key signed you in, which is the same property that makes the rest of the
+authorization model work.
+
+That is the true claim and it is deliberately weaker than the one that stood
+here until 2026-08-15, which said "Sybil resistance is what the bounded shape
+buys." Adversarial review took that apart three ways and it was right each time.
+It is **vacuous today**, because Sybil resistance only means something relative
+to something that counts identities, and nothing in the mesh counts: no vote, no
+quorum, no majority. It **breaks exactly where counting arrives**, because once
+k-of-n primaries exist, a single compromised primary can add devices and promote
+them, each descending from an owner-delegated signer and each a distinct
+identity, so k-of-n resists a compromised primary no better than 1-of-n. And it
+**does not survive a merge**, because any owner may legitimately sign unlimited
+devices into their own mesh, so merging with them imports that unbounded minting
+capability. Owner-signature resistance is a per-mesh property; merge is a
+cross-mesh operation.
+
+No-open-join holds, is worth having, and does not imply the rest. Do not restore
+the stronger sentence without a mechanism that counts and a reason it is safe.
+
+### Decided 2026-08-15: enrolment and primacy are two rights, not one
+
+**Changing the set of primaries always needs the root. Changing the set of
+devices never does.**
+
+- **Enrolment delegation.** May add ordinary devices within a ceiling.
+  Short-lived, root-signed, held by as many devices as the owner likes. Cannot
+  touch the primary set.
+- **The primary right.** May change who is a primary. Root only, which in
+  practice means the recovery phrase. A primary may neither promote nor demote.
+- **Two primaries** by default. Not for convenience, which enrolment
+  delegations now cover, but so that losing one device does not drop the owner
+  into recovery-phrase-only operation.
+
+This started as a conflict and turned out not to be one. `design-pairing-ux.md`
+rule 3 says primary is a security role and warns against making every device one
+"so joining is easier". The owner's requirement is that adding a device works
+from whatever machine is in his hand. Those only collide while "may add a
+device" and "may change who may add devices" are the same right. Split them and
+both hold in full: enrolment works everywhere, and the containment rule 3 is
+protecting is untouched.
+
+Why each half is closed rather than merely chosen:
+
+**A primary may not promote.** Otherwise a stolen primary promotes a device the
+root has never seen, and demoting the stolen primary leaves the promoted one
+signing, which promotes another. Demotion stops being a bounded operation, and
+the recovery phrase does not recover the mesh.
+
+**A primary may not demote.** Otherwise a stolen primary demotes every other
+primary and becomes the sole remaining signer, and the root's removal then has
+to be delivered through a mesh where the attacker is the only authority left.
+
+**Two, not more.** Removal must reach every primary; renewal needs only one to
+have missed it. An expired device shops for the primary that has not heard about
+its removal, and the attacker chooses which one to ask, so the defender needs
+unanimity while the attacker needs a single stale observer. Each additional
+primary is another sampling point. Under "possibly every device is a primary"
+this is trivially exploitable, which is the second independent argument against
+the drift rule 3 warns about.
+
+**k-of-n is not being built.** It is the right long-term answer to coercion, it
+costs k devices awake for every membership change, and per the Sybil section
+above it buys no resistance against a compromised primary. It is a coercion
+mitigation wearing a Sybil costume. Later, deliberately, or not at all.
+
+Availability cost, which is the question that prompted this: promote and demote
+need the recovery phrase, both are rare, and both already have their ceremony
+designed. With every primary offline the owner can still **add devices**, since
+that is an enrolment delegation and not a primary right. So the cost falls
+entirely on rare operations and the common path is untouched.
+
+### What the original note got right and still holds
+
+- **No hub federation.** Unchanged.
+- **No transitive trust.** A device does not gain reach to a peer because two
+  hubs were paired. Connecting two meshes is an explicit act by an owner
+  sharing a specific device, not an emergent consequence of adjacency.
+- **No coordinator.** The meeting point still authorizes nobody and routes
+  nothing.
+- **The reachability layer is the private graph**, not an open substrate. That
+  is more true now, not less.
+
+### The premise that broke
+
+The note's sharpest argument against a control plane was this:
+
+> **The gossip has nothing to carry.** With authorization strictly device-level,
+> rosters and capabilities are per-pair [...] So the control plane has no job.
+
+That was sound when it was written. It is not sound now. Bounded invitations
+introduced a delegated principal whose authority comes from an owner-signed
+ceiling rather than from a pairing, so **membership now exists as an object**:
+the set of devices under an owner key, with their ceilings. That is exactly the
+payload the note said did not exist.
+
+Observed today on `b9808062`: alpha enrolled bravo, foxtrot and india. Each of
+the three lists only alpha, and each files alpha under `EXTERNAL / other people,
+deny-by-default`. So a spoke does not currently know it is in a mesh at all. The
+membership object exists only in the issuer's local index. That is the gap, and
+it is a real one now that meshes are meant to connect and merge.
+
+### Rendezvous: prefer your own public peers, fall back to a hosted one
+
+Decided in principle 2026-08-16, mechanism open. This is items 1 and 2 of the
+signaling trajectory at the bottom of this note, promoted from "eventual" to
+"the default behaviour", plus one rule that was not there before.
+
+**The rule that is not optional.** If a mesh contains a peer that is publicly
+reachable, that peer is the rendezvous for the mesh. The hosted server is a hard
+fallback, not the normal path. A user may change which hosted server is their
+fallback, and `--server` / `FILAMENT_SERVER` already allows this.
+
+**Considered and dropped.** Volunteering a public peer as a rendezvous for
+strangers was part of the original proposal. It does not survive #237 and is not
+being built; the reasoning is below, because it is the kind of idea that returns.
+
+Preference order: public peers in your own mesh, then any rendezvous explicitly
+configured, then the hosted fallback. Volunteering to strangers was considered
+and dropped; see below.
+
+#### Why this is worth doing beyond ideology
+
+The hosted server's only powers are denial of service and metadata observation
+(see the trajectory below). Denial of service is already handled by fallback.
+**Metadata observation is the one that does not have an answer today**, and it is
+the whole of it: a hosted rendezvous sees who wants to connect to whom, across
+every mesh at once. Moving rendezvous onto a peer the user already owns removes
+that observation for that user entirely, rather than moving it somewhere more
+trustworthy. That is a categorical improvement, not an incremental one.
+
+#### Four things that have to be solved, and one that looks solved and is not
+
+**1. Both ends must choose the same rendezvous.** This is the one that breaks
+implementations. Signaling only works if both peers meet at the same place, so
+this cannot be a per-device preference: if A prefers A's public peer and B
+prefers B's, they never meet. It has to be a per-**mesh** ordered set, carried in
+the roster, so every member computes the same answer. Cross-mesh, the connection
+itself has to name one, because two meshes have two sets.
+
+**2. A new device has no roster.** It holds an invitation and nothing else, so
+the invitation is the bootstrap and must carry the rendezvous hint. That is a
+natural home for it and it means the invitation format has to change before any
+of this ships.
+
+**3. "Public" is a claim, and it is not binary.** A peer reachable from one
+network is not reachable from another, and a peer that advertises public and is
+not breaks rendezvous for the whole mesh. It needs verification rather than
+self-declaration, and the verification result is per-observer.
+
+**4. Availability.** A public peer that goes down must fail over fast enough that
+nobody notices, which is the same never-flaky discipline as the transport work,
+applied to a new dependency.
+
+**The one that looked solved, and does not.** Volunteering appeared to need no
+trust decision, on the reasoning that a rendezvous can neither read nor forge, so
+a hostile one could only deny service or observe metadata. That is wrong, and
+`#237` is why: the rendezvous is not a courier in this protocol, it is an
+**oracle**. `direct.rs` asks it for our own public address over `/api/whoami` and
+advertises the answer as a candidate unchecked, so a wrong answer kills the
+direct path and lands the pair on relay. If the same party relays, it has
+converted a signalling position into a data-path position: a rendezvous learns
+"A wanted B at time T" once, a relay observes volume and timing continuously.
+
+That changes the character of the third leg completely. Today, occupying that
+position requires being the hosted server, which is one known party. Volunteering
+makes it self-service, so **anyone who wants to sit on strangers' paths can opt
+in by running a peer and offering it.** That inverts the trust story rather than
+decentralising it.
+
+**So the third leg is dropped.** Own public peers need no discovery, because you
+already know them. Explicitly configured needs none, because the user chose it.
+Only strangers need a directory, and strangers are also the only case with the
+trust problem above, so cutting one optional feature removes both. Passing a
+volunteer's address out of band is not a neutral deferral either: it is
+trust-on-first-use with no authentication and no revocation path, on a party with
+path-selection power.
+
+If it is ever revisited, the peer-reflexive fix in #237 is a precondition and not
+a follow-up.
+
+**#237 is independent of all of this and should be fixed regardless**, because
+the hosted rendezvous has the same power today and the hosted relay is run by the
+same party.
+
+#### Relay gets the same treatment, separately
+
+Rendezvous and relay are different services and item 4 below already forbids
+assuming one implies the other. A public peer may serve either, both, or
+neither, and the preference order is computed per service. Tailscale parity needs
+both decentralised, since a DERP-equivalent that is always the hosted relay is
+the same dependency wearing a different hat.
+
+#### Honest parity scorecard
+
+Written carefully, because this is the paragraph most likely to end up in launch
+copy and two earlier drafts of it overclaimed.
+
+**What is true.** This removes a rendezvous dependency that Tailscale requires.
+A filament rendezvous holds no policy and no node registry.
+
+**What that is not.** It is not "matching Tailscale on coordination
+decentralisation". A Tailscale coordination server does rendezvous *and*
+distributes the node registry and keys. This decentralises rendezvous only.
+filament does not decentralise membership distribution because filament does not
+do membership distribution at all: on `b9808062` each spoke lists only the
+issuer. The scope is smaller, not the achievement larger.
+
+**And it is not "ahead of Tailscale on trust model", in the present tense.** Their
+coordination server holds a registry because something has to hold membership.
+When filament solves membership it will hold something too. The current candidate,
+an encrypted blob at a meeting point, genuinely is better, and it does not exist.
+
+**On "a Tailscale replacement for a personal mesh".** Defensible as an
+architectural statement, and dangerous as product copy, because a Tailscale user's
+baseline expectation is that removing a device removes its access, and today
+filament has no renewal, no membership distribution, and a revocation that does
+not tear down an established session (#235, live in 0.8.5). That sentence would
+be true about the architecture and read as a claim about the product, which is
+the shape `docs/ui/OUTPUT.md` now names.
+
+**What to keep saying:** filament declines subnet routers and exit nodes. Anyone
+who needs to reach a printer that will never run filament needs a different tool.
+That half is accurate and does real work by naming what is excluded.
+
+### Decided 2026-08-16: subnet routers and exit nodes are IN scope
+
+This **reverses** the founding scope decision at the bottom of this note, which
+declined both. Recording the argument rather than letting the old line quietly
+disappear, because a guardrail that goes missing instead of being overturned is
+how #198 shipped and how `design-pairing-ux.md` rule 3 nearly went.
+
+**What the old decision got right, and why it no longer decides this.** The
+argument was: anything needing multi-hop segmented routing is out of scope,
+because "if two nodes already share a tailnet, that mesh has already connected
+them and filament adds nothing between them". That reasoning is about filament
+stacking *onto* another mesh to gain reach. Subnet routing is the opposite case:
+filament *being* the mesh, for devices that will never run it. A printer, a
+camera, a NAS appliance, a landlord's thermostat. The old argument does not
+address that case, it addresses a different one.
+
+**And the mechanism now exists.** `l3.rs` already runs a TUN with a route table
+that maps a destination to a peer transport and cryptokey-routes packets to it.
+It is keyed on a single `IpAddr`, so today it does host routes only. Subnet
+routing is that table keyed on a prefix with longest-match, not a new subsystem.
+`expose` and `forward` already do this one port at a time at L4; this is the same
+idea at L3.
+
+**Order: after revocation, not before.** Subnet routing multiplies the
+consequence of every revocation defect currently open. A revoked device that
+keeps an established session (#235) today keeps a mount; with a subnet route it
+keeps a path into a LAN. Widening reach before revocation binds is the wrong
+sequence, so this lands after #235, renewal, and membership distribution.
+
+#### The constraint that must not be relaxed
+
+**Destinations behind a subnet router have no filament identity, so the
+capability system cannot govern them.** A printer at `192.168.1.50` has no key,
+no certificate and no ceiling. Access to it can only be governed by prefix policy
+on the router.
+
+That means a **second authorization model**, living beside the first. Given that
+#226 and #228 were both literally "two places compute authority and disagree",
+this has to be structurally separated rather than carefully coordinated:
+
+- Prefix policy on the router is the **sole** authority for identity-less
+  destinations.
+- It must be impossible to express a capability grant that resolves to a bare IP.
+- A device's ceiling governs what it may ask *the router* to do, and never what
+  lies behind it.
+
+If those three cannot be enforced by construction, this should not ship.
+
+#### Route acceptance is local, explicit, and never automatic
+
+An advertisement is an **offer**. Acceptance is local configuration. This keeps
+the invariant that the roster is never an authorization input, since the roster
+may carry the offer while only local state decides, and it forecloses route
+hijack by a peer advertising a prefix it should not serve.
+
+`0.0.0.0/0`, which is what an exit node is, requires a separate and louder
+decision than a `/24`. Same mechanism, different consent.
+
+#### Exit nodes: yes, and the cross-mesh case is already solved
+
+Technically an exit node is a subnet router advertising a default route, so it is
+nearly free once the prefix work exists. The risk is not free: the operator
+observes all traffic that is not otherwise encrypted.
+
+An earlier draft said a cross-mesh exit node is **forbidden**. That was wrong,
+and wrong twice. It is paternalistic, since people knowingly route traffic
+through operators they have chosen every time they use a VPN. And it is
+unnecessary, because the mechanism for the legitimate case already exists.
+
+**If Bob wants to give Alice egress, Bob shares that device into Alice's mesh.**
+Sharing a device is already a primitive, it already carries per-mesh ceilings
+keyed `(issuing root, device, ceiling)`, and the act of sharing is the explicit
+two-sided consent that a cross-boundary route otherwise lacks. From Alice's side
+it is then an ordinary intra-mesh exit node, governed by the rules above. No new
+concept, and the consent is a deliberate act rather than a checkbox.
+
+So the rule is not a prohibition, it is a placement:
+
+> **L3 crosses no mesh boundary. What crosses a boundary is either a shared
+> device, which becomes intra-mesh, or an L4 service, which is
+> capability-governed.**
+
+That line is principled rather than arbitrary. An L3 destination behind a router
+has no identity, so it can only be governed by prefix policy. An L4 service sits
+on an identified peer, so the capability system governs it and revocation works
+through the path that already exists. **Crossing a trust boundary should use the
+model that has identity in it.**
+
+**And for narrower cases there is already a tool.** `filament forward
+<peer>:<port> --socks` runs a SOCKS5 proxy through a peer. That is
+per-application rather than device-wide, does not capture DNS by default, is a
+service on an identified device so the capability system covers it, and is
+revocable through the normal path. Anyone who wants "route this one tool through
+my friend's connection" should get that, not a default route.
+
+The ergonomic cost is real and worth stating: cross-mesh egress is per-application
+unless the device is shared. That is the intended shape, since device-wide egress
+through someone else's machine should require them to have handed you the machine.
+
+#### What this reopens, stated honestly
+
+The old note declined hub federation partly on the grounds that federation's
+value "genuinely reappears in one place: segmented / enterprise networks [...]
+That is precisely the subnet-router / exit-node space filament chose not to
+enter." Entering that space removes that justification.
+
+Federation is still declined, on the surviving argument rather than that one:
+accepting a route is a local decision by a device about a peer it already
+authorized, which is delegated reachability. It is not transitive trust, because
+no device gains authority over a new principal, and nothing is authorized on
+anyone's behalf.
+
+### A ceiling belongs to a (mesh, device) pair, never to a device
+
+Stated separately because an implementer reading "membership is a set of
+devices with their ceilings" will key on the device public key, and that is a
+defect rather than a shortcut.
+
+Alice shares device D into Bob's mesh, so D appears in both rosters. Alice's
+ceiling on D and Bob's ceiling on D constrain different things: what D may do
+*in Alice's mesh* and what D may do *in Bob's*. Key a roster on the device and
+any merge rule that takes the narrower of two ceilings will apply Bob's across
+the boundary. Concretely, Alice shares her NAS into Bob's mesh so he can drop
+files, Bob narrows its ceiling inside his own mesh as he is entitled to do, and
+**Alice can no longer mount her own NAS**. An outsider turned off a capability
+inside her mesh without compromising anything.
+
+So a roster is a set of `(issuing root, device, ceiling)` triples, and there is
+no cross-mesh comparison of ceilings at all.
+
+The general lesson is worth keeping in front of whoever builds this: that
+failure is #226 and #228 in their purest form, two places computing authority
+for what looks like the same subject while using different keys for identity.
+
+It also refutes a rule of thumb that sounds safe. "When two statements disagree,
+take the lesser authority" is wrong when the capability being removed is itself
+a recovery path. Availability is a security property when the unavailable thing
+is what you recover with.
+
+### The open question: O(1) without gossip
+
+Requirement: per-machine cost stays O(1) as a mesh grows. Note what that rules
+out.
+
+**Gossip is what breaks O(1), not what delivers it.** A gossiped roster means
+every node holds every member (O(N) state) and pays for every membership change
+(O(N) churn). It is the wrong tool for the stated requirement, which is a
+stronger reason to decline it than the one in the original note.
+
+O(1) per machine comes from resolving on demand instead of replicating. A device
+holds its own certificate plus a cache, and asks when it needs to reach someone.
+
+That leaves a three-way tension, and it is genuinely unresolved:
+
+1. O(1) state per machine, so no replicated roster.
+2. No gossip, so no peer-to-peer propagation.
+3. The meeting point holds no roster, per the constraint at the bottom of this
+   note, so it cannot answer membership queries either.
+
+All three cannot hold with a naive design. Options worth thinking through, none
+chosen:
+
+- **Owner's primary as the authority.** Membership queries go to the owner's
+  primary device. O(1) for every other device; O(N) at one machine the user
+  already controls. Fails when the primary is offline.
+- **Signed roster blob at the meeting point.** The owner authors a roster,
+  signs it, and the meeting point stores it as bytes it can neither read nor
+  forge. This arguably does not violate constraint 3: the server is not a source
+  of truth, it is carrying an object whose authority lives entirely under the
+  owner's key. Encrypting it to the members closes the metadata leak the note
+  worries about. Devices fetch on demand and cache, so steady state stays O(1).
+- **Connecting two meshes is an edge, not a merge of rosters.** A device shared
+  into another mesh is a cross-signed grant. The other mesh's members resolve it
+  the same way, against a scoped subset the owner chose to expose. Merging two
+  meshes is the harder case and needs its own treatment.
+
+The second option is the one that appears to thread all three constraints, and
+it is the one to attack first when this is picked up. It is written here as a
+candidate, not a decision.
+
+### Consequence for the near-term build list
+
+Nothing in the "Build" list below is invalidated. The "Do not build" list keeps
+hub federation, transitive trust, third-party store-and-forward, the centralized
+coordinator and the full decentralized overlay. What moves out of "do not build"
+is membership itself, which is now a first-class object and needs a home.
+
+`/root/filament-l3-plan.md` step 3 is titled "roster gossip via C30". Given the
+above, the title is wrong for the requirement even if the step is right: what is
+needed is roster *resolution*, and gossip is the implementation that O(1) rules
+out.
+
+---
+
+*Everything below is the original 2026-07-16 note, unedited.*
 
 ## Summary / decision
 

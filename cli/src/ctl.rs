@@ -40,16 +40,16 @@ pub fn reuse_disabled() -> bool {
 }
 
 #[cfg(unix)]
-    pub use imp::{
-        daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-        try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-        try_arm, try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
-        try_reload_expose, try_resize, try_unmount, Req, ReqKind,
-    };
+pub use imp::{
+    daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
+    try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
+    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+    try_reload_expose, try_resize, try_unmount, Req, ReqKind,
+};
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_arm, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
+    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
     Req,
 };
 
@@ -261,20 +261,12 @@ mod imp {
 
     /// Arm the local daemon for enrollment: tell it an auth key is outstanding.
     /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
-    pub async fn try_arm(key_id: String, expiry: u64) -> Option<Value> {
-        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
-        let req = json!({ "op": "arm", "key_id": key_id, "expiry": expiry });
-        let mut line = serde_json::to_vec(&req).ok()?;
-        line.push(b'\n');
-        s.write_all(&line).await.ok()?;
-        s.flush().await.ok()?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(4), read_line(&mut s, 4096))
-            .await
-            .ok()?
-            .ok()?;
-        let v: Value = serde_json::from_str(&reply).ok()?;
-        (v["ok"].as_bool() == Some(true)).then_some(v)
-    }
+    ///
+    /// REMOVED (#205/#211): arming no longer goes through IPC at all. The mint
+    /// writes armed.json directly and the daemon's per-tick arm-gate reads it,
+    /// so this function (and the Arm ReqKind, and the ArmOutcome enum) are gone.
+    /// The #211 ready-banner work (serve_at's ready oneshot) stays: that is
+    /// about the banner meaning "serving", not about arming.
 
     /// Ask the running daemon to re-read `expose.json` and reconcile its overlay
     /// listeners (used by `filament expose`/`unexpose`). Returns the daemon reply
@@ -537,10 +529,6 @@ mod imp {
         ApproveRequest { id: u64, allow: String, expires: u64 },
         /// Deny a pending request by id.
         DenyRequest { id: u64 },
-        /// Arm the daemon for enrollment: a minted auth key is outstanding.
-        /// The daemon joins the enrollment room for the key's TTL.
-        /// key_id = enroll_pub hex for dedup, expiry = absolute unix seconds.
-        Arm { key_id: String, expiry: u64 },
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -589,11 +577,15 @@ mod imp {
     /// daemon event loop). Removes a stale socket file first; `daemon_alive()`
     /// already guards against two live daemons. Sets mode 0600.
     pub async fn serve(tx: mpsc::UnboundedSender<Req>) -> Result<()> {
-        serve_at(control_sock_path(), tx).await
+        serve_at(control_sock_path(), tx, None).await
     }
 
     /// `serve` against an explicit socket path (tests pass a hermetic path).
-    pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>) -> Result<()> {
+    /// `ready`, when given, fires the moment the listener has BOUND: the socket
+    /// is accepting from that instant. #211: callers who print "the daemon is
+    /// up" must not print it until this fires, or a sibling process races the
+    /// bind.
+    pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -602,6 +594,9 @@ mod imp {
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Some(ready) = ready {
+            let _ = ready.send(());
         }
         crate::ui::trace(&format!("filament: control socket at {}", path.display()));
         loop {
@@ -661,11 +656,6 @@ mod imp {
                         let Some(key) = v["key"].as_str().filter(|s| !s.is_empty() && s.len() <= 64).map(str::to_string) else { return };
                         ReqKind::Reconfigure { key }
                     }
-                    Some("arm") => {
-                        let Some(key_id) = v["key_id"].as_str().filter(|s| !s.is_empty() && s.len() <= 128).map(str::to_string) else { return };
-                        let Some(expiry) = v["expiry"].as_u64() else { return };
-                        ReqKind::Arm { key_id, expiry }
-                    }
                     Some("reload-expose") => ReqKind::ReloadExpose,
                     Some("reload") => ReqKind::Reload,
                     Some("mount") => {
@@ -721,7 +711,7 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = PathBuf::from(&dir).join("control.sock");
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
-            let server = tokio::spawn(serve_at(path.clone(), tx));
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
 
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let p = path.clone();
@@ -759,7 +749,7 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = PathBuf::from(&dir).join("control.sock");
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
-            let server = tokio::spawn(serve_at(path.clone(), tx));
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let p = path.clone();
@@ -790,7 +780,7 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = PathBuf::from(&dir).join("control.sock");
             let (tx, mut rx) = mpsc::unbounded_channel::<Req>();
-            let server = tokio::spawn(serve_at(path.clone(), tx));
+            let server = tokio::spawn(serve_at(path.clone(), tx, None));
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let p = path.clone();
             let client = tokio::spawn(async move { try_open_at(&p, "nope", 22).await });
@@ -854,13 +844,6 @@ mod stub {
     /// No control socket here, so there is no daemon consent queue to deny
     /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_deny_request(_id: u64) -> Option<Value> {
-        None
-    }
-
-    /// No control socket here, so there is no local daemon to arm for an
-    /// enrollment room. Callers treat `None` as "no local daemon" and degrade
-    /// gracefully. Present so the unconditional call site compiles on non-unix.
-    pub async fn try_arm(_key_id: String, _expiry: u64) -> Option<Value> {
         None
     }
 }

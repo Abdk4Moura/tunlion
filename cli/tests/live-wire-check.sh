@@ -94,7 +94,7 @@ FA="$WORK/g6-a.bin"; FB="$WORK/g6-b.bin"
 head -c $((4*1024*1024)) /dev/urandom > "$FA"
 head -c $((1024*1024))   /dev/urandom > "$FB"
 RM6="lw6room$$"
-timeout 240 "$BIN" recv -y --dir "$D" --room "$RM6" --server "$SERVER" >"$WORK/g6-recv.log" 2>&1 &
+timeout 240 "$BIN" receive -y --dir "$D" --room "$RM6" --server "$SERVER" >"$WORK/g6-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 2
 G6=0
 ( cd "$HERE" && timeout 200 node browser-sender.js "$SERVER/rooms/$RM6" "$FA" "$FB" >"$WORK/g6-pw.log" 2>&1 ) || G6=1

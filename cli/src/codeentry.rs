@@ -97,7 +97,7 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
     if trimmed.is_empty() {
         let steer = match mode {
             Mode::Claim => "type the code they read you, e.g. brave-otter-3141".to_string(),
-            Mode::Create => "type two words, easier to say and harder to guess".to_string(),
+            Mode::Create => "type two words, or press Enter for a generated pair".to_string(),
         };
         return Judgment { level: Level::Empty, steer, preview: None };
     }
@@ -294,7 +294,12 @@ pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
             continue;
         }
         match k.code {
+            // #203: in raw mode the kernel does not synthesise SIGINT, and
+            // crossterm may deliver the lone 0x03 byte WITHOUT the CONTROL
+            // modifier. Match the raw control byte as well as the composed
+            // Ctrl-C, so the keypress dismisses the picker on every platform.
             KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
+            KeyCode::Char('\u{3}') => return Ok(None),
             KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
             KeyCode::Enter => return Ok(Some(sel)),
@@ -329,6 +334,10 @@ pub fn run(prompt: &str, mode: Mode, prefill: &str, auto_nameplate: &str) -> std
         }
         match code {
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(Outcome::Cancelled);
+            }
+            KeyCode::Char('\u{3}') => {
+                // #203: the lone 0x03 byte in raw mode.
                 return Ok(Outcome::Cancelled);
             }
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {

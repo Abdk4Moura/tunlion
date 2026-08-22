@@ -40,6 +40,26 @@ from collections import deque
 MAXATT = 3   # establishment-watchdog / grace retries (net.rs MAX_ATTEMPTS)
 MAXREP = 2   # stall-ladder repairs before relay escalation (<= STALL_MAX_REPAIRS)
 
+# Premises the safety invariants are written against. Each must be satisfied by
+# at least one reachable state, or the invariant guarding it passed without
+# being tested. See Model.invariant_violations for why this is checked at all.
+#
+# Per tier, because what SHOULD be exercised differs by tier and a blanket set
+# produces a false alarm that teaches people to ignore the check. GoodNet has a
+# zero fault budget, so nothing retries, so the attempt and repair counters stay
+# at zero and the budget invariant is vacuous there BY CONSTRUCTION. That is
+# correct and expected. It would be a real finding under Degraded, where faults
+# are what drive the counters, so that is where it is required.
+#
+# Found by the check itself on its first run, which is the argument for having
+# it: the initial blanket set flagged budget.nonzero under GoodNet, and the
+# right response was not to widen the model but to state per tier which premises
+# that tier is supposed to reach.
+EXPECTED_ANTECEDENTS = {
+    'GoodNet':  {'I2.offerer-ready', 'I2.answerer-ready'},
+    'Degraded': {'I2.offerer-ready', 'I2.answerer-ready', 'budget.nonzero'},
+}
+
 # A pair (i<j): i = offerer (impolite), j = answerer (polite).
 # Endpoint states:
 #   offerer  o in {IDLE, OFFER, READY, RECON, FAIL}
@@ -207,11 +227,44 @@ class Model:
         return succ
 
     # ---- invariants (safety) checked on EVERY reachable state
-    def invariant_violations(self, st):
+    #
+    # Each invariant here is an implication: "if the antecedent holds, the
+    # consequent must". An implication is satisfied for free when its antecedent
+    # never occurs, so a clean run proves nothing about a property whose premise
+    # the state space never reached. Standard model-checking hazard, and the
+    # standard companion is vacuity detection, so `antecedents_seen` records
+    # which premises were actually exercised and `check()` fails on any that
+    # were not.
+    #
+    # Concretely: I2 says a READY endpoint must not face an IDLE or FAIL peer.
+    # If no reachable state ever puts an endpoint in READY, I2 passes and has
+    # tested nothing. Without this counter, narrowing the state space (a smaller
+    # fault budget, a changed step rule) can silently turn a real property into
+    # a vacuous one and the board stays green.
+    #
+    # This is the same discipline as red-before-green on the gate board, one
+    # level up: that proves a TEST can fail, this proves a PROPERTY can.
+    # Related, in prose rather than code: docs/ui/OUTPUT.md, "A true sentence
+    # can still be the bug", and #224, where a test asserted
+    # is_filament_process(own_pid) with a binary named filament-<hash>, so the
+    # input could not fail.
+    def invariant_violations(self, st, antecedents_seen=None):
         pairs, fb = st
         v = []
+
+        def saw(name):
+            if antecedents_seen is not None:
+                antecedents_seen.add(name)
+
         for idx, ps in enumerate(pairs):
             o, a = ps[0], ps[1]
+            # Record that each premise was reachable at all.
+            if o == 'READY':
+                saw('I2.offerer-ready')
+            if a == 'READY':
+                saw('I2.answerer-ready')
+            if ps[4] or ps[5] or ps[6]:
+                saw('budget.nonzero')
             # I2: no stuck half-open -- one endpoint believes CONNECTED while the
             # other has given up (FAIL) or never started (IDLE) with no recovery.
             if o == 'READY' and a in ('IDLE', 'FAIL'):
@@ -271,10 +324,18 @@ def check(n_peers, fault_budget, tier):
 
     # SAFETY: invariants hold everywhere
     inv = []
+    antecedents_seen = set()
     for s in states:
-        for msg in m.invariant_violations(s):
+        for msg in m.invariant_violations(s, antecedents_seen):
             inv.append((s, msg))
     report['invariant_violations'] = inv
+
+    # VACUITY: an invariant whose premise no reachable state satisfies passed
+    # without being tested. Report it as a failure, because "green" and "never
+    # exercised" are indistinguishable from the outside and only one of them is
+    # evidence.
+    expected = EXPECTED_ANTECEDENTS.get(tier, set())
+    report['vacuous_invariants'] = sorted(expected - antecedents_seen)
 
     # NO DEADLOCK: every non-terminal state has at least one successor (a timer
     # always rescues a wait). A non-terminal sink == stuck.
@@ -323,7 +384,8 @@ def trace_to(edges, start, pred, limit=40):
 
 def banner(r):
     ok = (not r['invariant_violations'] and not r['deadlocks']
-          and not r['cannot_reach_any_terminal'])
+          and not r['cannot_reach_any_terminal']
+          and not r['vacuous_invariants'])
     extra_ok = True
     notes = []
     if r['tier'] == 'GoodNet':
@@ -339,6 +401,8 @@ def banner(r):
     print(f"=== {r['tier']:10s} N={r['n_peers']} faults<= {r['fault_budget']}"
           f"  | states={r['states']:>7d} depth<= {r['max_depth']:>2d}  ->  {verdict}")
     print(f"      invariant violations : {len(r['invariant_violations'])}")
+    if r['vacuous_invariants']:
+        print(f"      VACUOUS (passed untested): {', '.join(r['vacuous_invariants'])}")
     print(f"      deadlocks (stuck)    : {len(r['deadlocks'])}")
     print(f"      states that can't reach ANY terminal : {len(r['cannot_reach_any_terminal'])}")
     if r['tier'] == 'GoodNet':

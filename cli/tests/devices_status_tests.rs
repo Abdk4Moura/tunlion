@@ -60,15 +60,31 @@ fn devices_shows_table_headers() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
+    // #240: this test used to require "promote to continue" and the hint
+    // "filament devices promote test-device". Both were removed because the
+    // verb does not exist (#191), nothing was actually blocked (a transfer to
+    // such a device works immediately, verified between two machines), and the
+    // tier heading blamed "paired before scoped trust" for pairings made
+    // minutes earlier on the current build.
+    //
+    // The test was pinning the defect, so it failed when the defect was fixed.
+    // It now pins the property that matters and that a future rewrite must not
+    // lose: the row states the condition and prescribes no action.
     assert!(
-        stdout.contains("NEEDS REVIEW") && stdout.contains("promote to continue"),
+        stdout.contains("NEEDS REVIEW"),
         "Expected the needs-review listing, got: {}",
         stdout
     );
 
     assert!(
-        stdout.contains("filament devices promote test-device"),
-        "Expected the promote command hint, got: {}",
+        !stdout.contains("promote to continue"),
+        "Must not claim something is blocked: nothing is. Got: {}",
+        stdout
+    );
+
+    assert!(
+        !stdout.contains("devices promote"),
+        "Must not prescribe `devices promote`, which is not a verb (#191). Got: {}",
         stdout
     );
 

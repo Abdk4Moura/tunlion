@@ -266,7 +266,7 @@ pub async fn mount_cmd(
             if let Some(g) = mp_guard.as_mut() { g.disarm(); }
             crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
             crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
-            crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+            crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
             return Ok(());
         }
         // Daemon not available or mount failed, fall through to direct spawn.
@@ -300,7 +300,7 @@ pub async fn mount_cmd(
             crate::ui::say(&format!(
                 "  note: `filament mount` currently rides sshfs and needs an sshd on '{peer}'. \
                  A no-sshd mesh-native mount is in progress; for now run an sshd there, set \
-                 FILAMENT_SSH_PORT, or use `filament pty {peer}` for a shell."
+                 FILAMENT_SSH_PORT, or use `filament shell {peer}` for a shell."
             ));
             return Err(e);
         }
@@ -333,7 +333,7 @@ pub async fn mount_cmd(
         if relay {
             proxy.push_str(" --relay");
         }
-        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        proxy.push_str(&format!(" forward {peer_name}:{} --stdio", info.rport));
         cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
         let dest_token = format!("{}@{}", info.login, info.host);
         cmd.arg(format!("{dest_token}:{remote_path}"));
@@ -358,7 +358,7 @@ pub async fn mount_cmd(
             Ok(s) if s.success() => {
                 if let Some(g) = mp_guard.as_mut() { g.disarm(); }
                 crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path}"));
-                crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+                crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
                 Ok(())
             }
             Ok(s) => {
@@ -407,7 +407,7 @@ pub async fn mount_cmd(
         if let Some(g) = mp_guard.as_mut() { g.disarm(); }
         crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (id: {mount_id})"));
         crate::ui::say(&format!("  check with: filament mount --check {mount_id}"));
-        crate::ui::say(&format!("  unmount with: filament unmount {local_path}"));
+        crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
 
         // Spawn monitor thread (not tokio, because we use std::process::Command).
         let monitor_local = local_path.clone();
@@ -447,7 +447,7 @@ fn monitor_mount(local: String, peer: String, remote: String, _server: String, _
                         "mount {local} is {status}, run `filament mount --check {local}` for details"
                     ));
                     crate::ui::say(&format!(
-                        "  to recover: filament unmount {local} && filament mount {peer} {remote} {local}"
+                        "  to recover: filament mount --off {local} && filament mount {peer} {remote} {local}"
                     ));
                     let _ = remove_mount(&local);
                     return;
@@ -496,7 +496,7 @@ pub fn list_cmd() -> Result<()> {
 
     if is_tty {
         println!("\n{healthy} healthy, {unhealthy} unhealthy, {} total", mounts.len());
-        println!("unmount with: filament unmount <id>");
+        println!("unmount with: filament mount --off <path>");
     }
 
     Ok(())
@@ -1016,7 +1016,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                         println!("  Mount: {}:{} -> {}", entry.peer, entry.remote, entry.local);
                         println!("  \x1b[2mCommands:\x1b[0m");
                         println!("    filament mount --check {}", entry.local);
-                        println!("    filament unmount {}", entry.local);
+                        println!("    filament mount --off {}", entry.local);
                     }
                     return Ok(());
                 }

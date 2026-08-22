@@ -18,6 +18,11 @@ class RegistryValidationTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / "gate.sh").write_text("#!/bin/sh\n./consumer.sh\n")
         (self.root / "consumer.sh").write_text("#!/bin/sh\n")
+        # A `required` artifact must be referenced by some workflow (#249),
+        # so the fixture tree needs CI that actually runs the gate it declares.
+        wf = self.root / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        (wf / "ci.yml").write_text("jobs:\n  t:\n    steps:\n      - run: sh gate.sh\n")
         self.today = dt.date(2026, 8, 4)
 
     def tearDown(self):
@@ -34,6 +39,59 @@ class RegistryValidationTests(unittest.TestCase):
             for path in sorted(registry_module.RETIRED_TOMBSTONES)
         ]
         return {"version": 1, "artifacts": artifacts + retired, "verdict_debt": []}
+
+    def test_required_artifact_no_workflow_references_is_rejected(self):
+        """The check that would have caught #247 and #249 must be able to fail.
+
+        A `required` entry whose entrypoint is spelled perfectly but which no
+        workflow invokes is the exact shape that let cli/tests/gates.sh sit
+        marked required for months while nothing ran it.
+        """
+        (self.root / ".github" / "workflows" / "ci.yml").write_text(
+            "jobs:\n  t:\n    steps:\n      - run: echo nothing\n"
+        )
+        registry = self.registry(
+            [
+                {
+                    "path": "gate.sh",
+                    "disposition": "required",
+                    "entrypoint": "sh gate.sh",
+                    "matrix": [{"platform": "linux", "topology": "unit"}],
+                }
+            ]
+        )
+        errors = registry_module.validate(
+            registry, self.root, {"gate.sh"}, self.today
+        )
+        self.assertTrue(
+            any("no workflow references it" in e for e in errors),
+            f"expected the unwired-required error, got: {errors}",
+        )
+
+    def test_ratchet_entry_that_became_wired_is_rejected(self):
+        """The ratchet may only shrink, so a line that is no longer true errors."""
+        path = sorted(registry_module.UNWIRED_REQUIRED)[0]
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/bin/sh\n")
+        (self.root / ".github" / "workflows" / "ci.yml").write_text(
+            f"jobs:\n  t:\n    steps:\n      - run: sh {path}\n"
+        )
+        registry = self.registry(
+            [
+                {
+                    "path": path,
+                    "disposition": "required",
+                    "entrypoint": f"sh {path}",
+                    "matrix": [{"platform": "linux", "topology": "unit"}],
+                }
+            ]
+        )
+        errors = registry_module.validate(registry, self.root, {path}, self.today)
+        self.assertTrue(
+            any("the ratchet may only shrink" in e for e in errors),
+            f"expected the stale-ratchet error, got: {errors}",
+        )
 
     def test_valid_required_and_support(self):
         registry = self.registry(

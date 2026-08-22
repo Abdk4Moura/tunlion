@@ -24,6 +24,28 @@ TOPOLOGIES = {
     "unit",
 }
 ISSUE_RE = re.compile(r"https://github\.com/Abdk4Moura/filament/issues/[1-9][0-9]*$")
+# A `required` artifact whose path appears in no workflow is not required by
+# anything: the entrypoint check below proves only that the command is spelled
+# correctly, never that CI invokes it (#249). These 14 predate that check. The
+# set may only SHRINK - wire one into CI, or re-disposition it honestly, and
+# delete its line. Adding a line is not a fix.
+UNWIRED_REQUIRED = {
+    "cli/tests/gates.sh",
+    "cli/tests/l1a/gate1_mutual_key.sh",
+    "cli/tests/l1a/gate3_wrongpw_burn.sh",
+    "cli/tests/l1a/gate6_downgrade.sh",
+    "cli/tests/l1a/gate7_noregression.sh",
+    "cli/tests/l1a/gate9_transfer_pake.sh",
+    "cli/tests/l1a/gate9b_shared_room.sh",
+    "cli/tests/l2-gates.sh",
+    "cli/tests/live-pairing-gate.sh",
+    "cli/tests/live-wire-check.sh",
+    "cli/tests/natprobe-test.sh",
+    "cli/tests/ssh-gates.sh",
+    "cli/tests/transport-gates.sh",
+    "deploy/monitor/test-memory-pressure-monitor.py",
+}
+
 RETIRED_TOMBSTONES = {
     "cli/tests/holepunch-gates.sh",
     "cli/tests/nat-cone-gate.sh",
@@ -260,6 +282,27 @@ def validate(
         errors.append(f"{path}: executable artifact is unregistered")
     for path in sorted(active - discovered):
         errors.append(f"{path}: active registry entry is not executable or has no shebang")
+
+    workflows = ""
+    wf_dir = root / ".github" / "workflows"
+    if wf_dir.is_dir():
+        for wf in sorted(wf_dir.glob("*.y*ml")):
+            workflows += wf.read_text(encoding="utf-8", errors="replace")
+    required = {
+        path for path, entry in entries.items() if entry.get("disposition") == "required"
+    }
+    unwired = {path for path in required if path not in workflows}
+    for path in sorted(unwired - UNWIRED_REQUIRED):
+        errors.append(
+            f"{path}: disposition is 'required' but no workflow references it, "
+            "so nothing requires it. Wire it into CI, or use a disposition that "
+            "states the truth (see #249)."
+        )
+    for path in sorted((UNWIRED_REQUIRED & required) - unwired):
+        errors.append(
+            f"{path}: listed in UNWIRED_REQUIRED but it is now wired or no longer "
+            "required. Delete its line; the ratchet may only shrink."
+        )
 
     retired = {
         path for path, entry in entries.items() if entry.get("disposition") == "retired"

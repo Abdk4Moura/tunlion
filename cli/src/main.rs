@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod codeentry;
+mod armed;
 mod ctl;
 mod diag;
 mod direct;
@@ -50,6 +51,7 @@ mod platform;
 pub(crate) use filament_pair as pake;
 mod pake_ceremony;
 mod ping;
+mod roster;
 mod sdnotify;
 mod protocol;
 mod resilience;
@@ -347,16 +349,48 @@ impl UiCapability {
     pub fn confirm(&self, action: &str) -> Result<()> {
         if self.yes { return Ok(()); }
         if self.interactive {
-            use std::io::Write;
-            eprint!("{action} [y/N] ");
-            let _ = std::io::stderr().flush();
-            let mut line = String::new();
-            std::io::stdin().read_line(&mut line).ok();
-            if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                anyhow::bail!("cancelled");
+            // #208: a confirmation should cost ONE keypress, not a key and an
+            // Enter. On a TTY read a single key with crossterm (raw mode); bare
+            // Enter takes the capitalised default (N). Scripts/pipes keep the
+            // line-reading path below, so `echo y | filament ...` is unchanged.
+            if std::io::stdin().is_terminal() {
+                use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
+                use std::io::Write as _;
+                eprint!("{action} [y/N] ");
+                let _ = std::io::stderr().flush();
+                // #208: read ONE key with crossterm in raw mode; bare Enter takes
+                // the capitalised default (N). The guard restores the terminal on
+                // every path, including a panic.
+                let _guard = crate::codeentry::RawGuard::enable().ok();
+                let answer = match read() {
+                    Ok(Event::Key(KeyEvent { code: KeyCode::Char('y'), modifiers: KeyModifiers::NONE, .. }))
+                    | Ok(Event::Key(KeyEvent { code: KeyCode::Char('Y'), modifiers: KeyModifiers::NONE, .. })) => true,
+                    Ok(Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. })) => false,
+                    _ => false,
+                };
+                drop(_guard);
+                if !answer {
+                    anyhow::bail!("cancelled");
+                }
+            } else {
+                use std::io::Write;
+                eprint!("{action} [y/N] ");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).ok();
+                if !matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    anyhow::bail!("cancelled");
+                }
             }
         } else {
-            anyhow::bail!("refusing {action} without --yes (non-interactive)");
+            // "to" belongs here, not in the callers. `action` is also the
+            // interactive prompt ("shut down the daemon [y/N]"), where an
+            // infinitive would read wrong, so one string is being asked to fit
+            // two grammars and only this side needs the particle. Without it
+            // every caller is ungrammatical in exactly one of the two modes:
+            // "refusing shut down the daemon", "refusing include deliberate
+            // remote authority in this invitation ceiling".
+            anyhow::bail!("refusing to {action} without --yes (non-interactive)");
         }
         Ok(())
     }
@@ -463,11 +497,13 @@ COMMANDS
     reach <device>         check if a device is reachable (direct/relay + rtt)
     forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
-    mount <device>:<dir>   mount a remote folder over the mesh
+    mount <device> <dir> [local]  mount a remote folder over the mesh
   Serve
-    up                     serve: receive, mount, shell (run attached)
+    up                     serve: receive, mount (run attached; shell with --shell)
     up --install           the same, always-on (autostart at logon)
+    up --detach            the same, detached in the background (no service manager)
     down                   stop the daemon
+    logs                   follow the daemon's log (-f follows, ctrl-c detaches)
     reset                  wipe this machine's state (destructive)
   Devices
     devices                list your known devices
@@ -711,6 +747,12 @@ enum Cmd {
         /// Install + start a systemd user service instead of running attached
         #[arg(long)]
         install: bool,
+        /// Run the daemon detached from this terminal (background). For
+        /// machines without a service manager, this is the middle between
+        /// attached-now and service-forever; the daemon survives closing the
+        /// terminal. Its output goes to {config}/daemon.log.
+        #[arg(long)]
+        detach: bool,
         /// With --install: install a SYSTEM service (root, one-time sudo) that gets
         /// CAP_NET_ADMIN from systemd via AmbientCapabilities. The overlay's kernel
         /// TUN then needs NO setcap on the binary, so `filament update` never prompts
@@ -720,14 +762,14 @@ enum Cmd {
         /// Force the ZERO-PRIVILEGE userspace overlay (an in-process smoltcp netstack
         /// instead of a kernel TUN): no CAP_NET_ADMIN, no /dev/net/tun, works in a
         /// container. Note: host firewall rules do not apply and native tools reach
-        /// <peer>.mesh only via `filament proxy`/`dial`. Default is auto (kernel TUN
+        /// <peer>.mesh only via `filament forward <peer>:<port> --socks`. Default is auto (kernel TUN
         /// when available, userspace otherwise).
         #[arg(long)]
         userspace: bool,
         /// Drop directory (default: `filament config dir`, else ~/Filament)
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept seamless `filament ssh` from ANY paired (proof-verified) device,
+        /// Accept seamless `filament shell --ssh` from ANY paired (proof-verified) device,
         /// no per-device `grant` needed. Enables the tunnel acceptor too, so you
         /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
         /// required). Prints a security banner.
@@ -770,6 +812,16 @@ enum Cmd {
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
     Down,
+    /// Follow the daemon's diagnostic timeline (diag.jsonl).
+    Logs {
+        /// Follow the log as new lines arrive (like docker logs -f).
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// Show only the last N lines before following/stopping (default 20;
+        /// 0 = live only, never replay history).
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
     ///
     /// No args prints all settings with their value, scope, and where each came
     /// from (env > peer > config > default). Strictly imperative: `set` only
@@ -778,8 +830,8 @@ enum Cmd {
         filament set                          show every setting + where it came from\n  \
         filament set auto-extract on          change one setting (partial, never resets others)\n  \
         filament set shell on --peer laptop   per-device override\n  \
-        filament get drop-dir --show-origin   read one value (bare value on stdout)\n  \
-        filament unset relay                  revert one setting to its default\n\n\
+        filament set drop-dir                 read one value (bare value on stdout)\n  \
+        filament set relay --reset            revert settings to their defaults\n\n\
         Keys: name, server, drop-dir, relay, auto-extract, shell, shell-user")]
     Set {
         /// Setting name (run `filament set` to list them all)
@@ -867,6 +919,11 @@ enum Cmd {
         /// Override the local listen port.
         #[arg(long)]
         lport: Option<u16>,
+        /// Pipe instead of listen: attach stdin/stdout to the peer's port (the
+        /// `netcat` shape, used as an ssh ProxyCommand). This is the transport
+        /// an external process expects on its own stdio.
+        #[arg(long)]
+        stdio: bool,
         /// Run a local SOCKS5 proxy for mesh access from any app.
         #[arg(long)]
         socks: bool,
@@ -879,6 +936,14 @@ enum Cmd {
         /// HTTP CONNECT proxy port (0 = disabled)
         #[arg(long, default_value_t = 0)]
         http_port: u16,
+    },
+    /// (hidden for one release) The netcat shape moved into `forward --stdio`.
+    #[command(hide = true)]
+    Netcat {
+        /// Known device (petname) whose port to reach
+        peer: String,
+        /// Remote port on the peer's localhost
+        rport: u16,
     },
     /// Publish a local port on this device's mesh address (peers reach it at
     /// <this-device>.mesh:<port>), like a Tailscale-served port.
@@ -935,7 +1000,7 @@ enum Cmd {
         json: bool,
     },
     /// Grant a known device a capability (deny-by-default). `shell` permits
-    /// seamless `filament ssh` into THIS machine, a separate consent from
+    /// seamless `filament shell --ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
     Grant {
         /// Known device (petname), or omit with --tag
@@ -1001,7 +1066,7 @@ enum Cmd {
     },
     /// Sync files to/from a peer via rsync over the mesh.
     ///
-    /// Requires rsync on both ends. Uses `filament ssh` as the remote shell,
+    /// Requires rsync on both ends. Uses `filament shell --ssh` as the remote shell,
     /// so the same transport and bootstrap logic applies.
     #[command(hide = true)]
     Backup {
@@ -1026,7 +1091,15 @@ enum Cmd {
     },
     /// Open a shell on a device.
     ///
-    /// Default: Filament's native PTY. The peer must explicitly authorize shell.
+    // #234: this said "The peer must explicitly authorize shell", which reads as
+    // per-device and is why `up --shell` surprised people: one flag on the
+    // acceptor admits every paired device, present and future. The behaviour is
+    // deliberate (see ShellPolicy::All); the sentence describing it was not.
+    // Rationale lives here, in a comment. The doc line below is what a user
+    // reads, so it states the two ways in and nothing else.
+    /// Default: Filament's native PTY. The peer must authorize shell, either
+    /// per-device with `grant <device> shell`, or for every paired device at
+    /// once by serving `up --shell` (use `up --shell-only a,b` to scope it).
     /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
     /// (reuses your keys, known_hosts, and ~/.ssh/config).
     Shell {
@@ -1486,6 +1559,28 @@ fn devices_path() -> PathBuf {
     crate::platform::Paths::config_path("devices.json")
 }
 
+/// Lock, read, mutate, and atomically write devices.json. The read-modify-write
+/// is atomic across processes via the `devices.json.lock` sidecar (#238), so the
+/// daemon's liveness sweep and a concurrent `grant`/`revoke`/`add`/`join` cannot
+/// lose each other's update (a lost update is a revoke that reports success and
+/// does not persist). The closure runs on the freshly-read array; if it returns
+/// Err the file is NOT written (a bail must not clobber a valid store), and if
+/// the store cannot be read or parsed the write is skipped too.
+fn with_devices_mut<T>(f: impl FnOnce(&mut Vec<Value>) -> Result<T>) -> Result<T> {
+    let _lock = crate::platform::DevicesFileLock::acquire()?;
+    let p = devices_path();
+    let mut arr: Vec<Value> = match std::fs::read_to_string(&p) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse devices.json: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(anyhow::anyhow!("read devices.json: {e}")),
+    };
+    let out = f(&mut arr)?;
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
+        .context("atomic write devices.json")?;
+    Ok(out)
+}
+
 /// Pure merge step (no I/O): upsert the (secret, cert, caps, scope) fields for `name`
 /// into `arr` as ONE record, returning the final stored name (auto-suffixed on a
 /// new-name collision). This is the atomicity-relevant step: secret and cert land in
@@ -1600,15 +1695,10 @@ pub(crate) fn devices_upsert_atomic(
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir).context("create config dir")?;
     }
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    let final_name = upsert_peer_record(&mut arr, name, secret, cert, caps, scope, user_key_hex, delegated);
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).context("serialize devices")?)
-        .context("atomic write devices.json")?;
-    Ok(final_name)
+    with_devices_mut(|arr| {
+        let final_name = upsert_peer_record(arr, name, secret, cert, caps, scope, user_key_hex, delegated);
+        Ok(final_name)
+    })
 }
 
 pub(crate) fn devices_load() -> Vec<(String, String)> {
@@ -1679,6 +1769,14 @@ fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
 }
 
 /// Read the device cert (if any) for a named device.
+/// The certificate STORED for `name`, valid or not.
+///
+/// #266: this deliberately does NOT check expiry, and most of its callers want
+/// exactly that, because they are asking "is there a record" or are about to run
+/// their own `verify`. The name does not say so, which is the trap: a gate
+/// written as `device_cert_for(..).is_none()` closes when the first certificate
+/// is stored and never reopens when that certificate dies. Use
+/// [`device_cert_valid_for`] for any decision that should reopen on expiry.
 fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
     let p = devices_path();
     let raw = std::fs::read_to_string(&p).ok()?;
@@ -1689,6 +1787,17 @@ fn device_cert_for(name: &str) -> Option<identity::DeviceCert> {
         }
     }
     None
+}
+
+/// The certificate stored for `name` IF it is still valid right now.
+///
+/// #266: the expiry-aware half of [`device_cert_for`]. A gate meaning "do we
+/// already have a usable identity for this device" must ask this one, or an
+/// expired certificate wedges the record: unusable everywhere that verifies,
+/// still present to anything that only checks existence, with `devices forget`
+/// as the sole exit.
+fn device_cert_valid_for(name: &str) -> Option<identity::DeviceCert> {
+    device_cert_for(name).filter(|c| c.verify(identity::now_secs()).is_ok())
 }
 
 /// The three clocks that can end a delegated device's recognition. The binding
@@ -1852,29 +1961,119 @@ fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
     }
 }
 
+/// Reject a peer name that is not in the device store, and say what IS.
+///
+/// #241: `reach DGMFA` on a name that had never been paired reported
+/// "unreachable, gave up at the establishing phase (~0ms) — DGMFA may be
+/// offline, or not running `filament up`". It described a lookup miss as a
+/// reachability outcome and sent the user to go and check a machine that was
+/// not in their store. The `~0ms` was the tell: it gave up instantly because
+/// there was nothing to look up.
+///
+/// The realistic case is a stale name, not a typo. A device that existed before
+/// a `filament reset` and came back under a different name is exactly what
+/// someone reaches for.
+///
+/// This is #221 in another verb. That one was fixed for `send --to` and left
+/// everywhere else, so the resolution lives here now and the verbs share it.
+///
+/// Listing the known names is the part that makes it a fix rather than a better
+/// error: the next question is always "then what is it called".
+pub(crate) fn require_known_device(name: &str) -> Result<()> {
+    let mut known: Vec<String> = devices_load().into_iter().map(|(n, _)| n).collect();
+    // Mesh siblings learned from the owner-signed roster are known NAMES (they
+    // resolve, and `devices` shows them), but they carry no reconnect secret, so
+    // they are recognised, not reachable: a connection to them is not in v1.
+    for n in crate::roster::roster_device_names() {
+        if !known.iter().any(|k| k == &n) {
+            known.push(n);
+        }
+    }
+    if known.iter().any(|n| n == name) {
+        return Ok(());
+    }
+    if known.is_empty() {
+        bail!("no device named '{name}'. You have not paired any devices yet: `filament add` to pair one");
+    }
+    bail!(
+        "no device named '{name}'. Known devices: {}\n  filament devices   to see them\n  filament add       to pair a new one",
+        known.join(", ")
+    )
+}
+
 /// #157 call-site derivation for the gate's `cert_revoked` input. A peer with
 /// NO resolved device identity is UNIDENTIFIED, not revoked: revocation is a
 /// decision about a KNOWN device, and an unidentified peer is one the gate
 /// must judge by binding strength, trust floor and grants. An unknown DEVICE
 /// (a device_pub with no record) is likewise not revoked; it is a fresh peer
 /// the normal gate decides by consent and grants.
-fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
+pub(crate) fn cert_revoked_for(idev: Option<&[u8; 32]>) -> bool {
     idev.map(device_cert_revoked).unwrap_or(false)
+}
+
+/// The revocation re-check interval, overridable for tests. Clamped so a
+/// misconfiguration cannot make the re-check effectively never run, or spin on a
+/// read-heavy stream by re-reading the device store every operation.
+pub(crate) fn revoke_recheck_interval() -> std::time::Duration {
+    let ms = std::env::var("FILAMENT_REVOKE_RECHECK_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0) // 0 and garbage mean "default", never "never re-check"
+        .unwrap_or(5_000);
+    std::time::Duration::from_millis(ms.clamp(250, 300_000))
+}
+
+/// Re-checks a live session's authorization on a bounded interval, so a revoked
+/// peer loses a long-lived stream (mount, pty, l2) without re-reading the device
+/// store per operation. The interval-and-verdict decision lives here, once,
+/// instead of being re-derived in each serve loop where it can drift (the shape
+/// of #226 and #228).
+///
+/// The caller MUST deliver the denial in a form its client can act on, then
+/// close. Returning silently is not enough: a client that just stops receiving
+/// parks where no signal lands (see #235's FUSE D-state).
+pub(crate) struct RevokeRecheck {
+    last: std::time::Instant,
+    interval: std::time::Duration,
+}
+
+impl RevokeRecheck {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            interval: revoke_recheck_interval(),
+        }
+    }
+
+    /// The re-check interval. Timer-driven loops (pty, l2) build a ticker at this
+    /// cadence and re-ask the verdict directly; the request-shaped mount uses
+    /// [`Self::revoked`] instead.
+    pub(crate) fn interval(&self) -> std::time::Duration {
+        self.interval
+    }
+
+    /// True when the interval has elapsed AND the peer is now revoked. The
+    /// caller re-checks at its natural cadence (per request for mount); the
+    /// interval bound inside keeps that cadence cheap.
+    pub(crate) fn revoked(&mut self, idev: Option<&[u8; 32]>) -> bool {
+        if self.last.elapsed() < self.interval {
+            return false;
+        }
+        self.last = std::time::Instant::now();
+        cert_revoked_for(idev)
+    }
 }
 
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
 fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).unwrap_or_default();
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
-        bail!("device '{name}' is not in the device store");
-    };
-    device["certRevoked"] = json!(revoked);
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
-        .context("atomic write devices.json")?;
-    Ok(())
+    with_devices_mut(|arr| {
+        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+            bail!("device '{name}' is not in the device store");
+        };
+        device["certRevoked"] = json!(revoked);
+        Ok(())
+    })
 }
 
 /// Terminal principal states written to `principalState` on a device record.
@@ -1910,29 +2109,26 @@ fn enrollment_refusal(prior: &Value) -> Option<String> {
 /// on every reconnect, and a cert renewal must not clear it (the writer has no
 /// clearing line). `principalState`/`revokedAt` are display only.
 fn set_device_revoked(name: &str, revoked: bool) -> Result<()> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).unwrap_or_default();
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
-        bail!("device '{name}' is not in the device store");
-    };
-    device["certRevoked"] = json!(revoked);
-    if revoked {
-        device["revokedAt"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
-        device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
-    } else {
-        if let Some(map) = device.as_object_mut() {
-            map.remove("revokedAt");
+    with_devices_mut(|arr| {
+        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else {
+            bail!("device '{name}' is not in the device store");
+        };
+        device["certRevoked"] = json!(revoked);
+        if revoked {
+            device["revokedAt"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+            device["principalState"] = json!(PRINCIPAL_STATE_REVOKED);
+        } else {
+            if let Some(map) = device.as_object_mut() {
+                map.remove("revokedAt");
+            }
+            // Restore returns the device to its pre-revoke state: if it was lapsed
+            // the sweeper's marker stays, otherwise clear the terminal state.
+            if device["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
+                device["principalState"] = Value::Null;
+            }
         }
-        // Restore returns the device to its pre-revoke state: if it was lapsed
-        // the sweeper's marker stays, otherwise clear the terminal state.
-        if device["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED) {
-            device["principalState"] = Value::Null;
-        }
-    }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)
-        .context("atomic write devices.json")?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Mark delegated records whose effective deadline has passed as lapsed.
@@ -1968,14 +2164,7 @@ fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 /// Sweep the device store for lapsed delegated records. Called periodically by
 /// the daemon. Returns how many records newly lapsed.
 fn devices_sweep_lapsed(now: u64) -> usize {
-    let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return 0 };
-    let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return 0 };
-    let changed = sweep_lapsed(&mut arr, now);
-    if changed > 0 {
-        let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
-    }
-    changed
+    with_devices_mut(|arr| Ok(sweep_lapsed(arr, now))).unwrap_or(0)
 }
 
 fn load_owner_key() -> Option<crate::identity::UserKey> {
@@ -2268,6 +2457,61 @@ fn handle_identity_expose(
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
         pid
     ));
+    // #243: a vouch writes {name, secret} and nothing else, so the record carries
+    // no certificate for revocation to key on: `revoke --certificate` bails with
+    // "no stored fleet certificate", the peer re-derives as legacy trust on every
+    // reconnect, and it renders as "trusted in full". The verified certificate is
+    // right here, and until now only ever reached the pid-keyed sidecar that
+    // `resolve_peer_identity` (petname-keyed) never reads.
+    //
+    // THE MODEL IS TRUST-ON-FIRST-USE, and it should be called that. `vouch` is
+    // the CROSS-OWNER mechanism, so the peer's certificate cannot chain to our
+    // root and `verify_chain` is not available; `cert.verify` only checks a cert
+    // against its own embedded user_pub, which cannot say whose mesh this is. So
+    // the first identity to answer for this petname is the one that gets pinned.
+    // That is a defensible model, but it is a decision, not a fact, and the line
+    // we print says so.
+    //
+    // What it is NOT: privilege escalation. A peer reaching here already holds
+    // the pairing secret, so it already IS this petname to this device. The bound
+    // is petname squatting and durable misidentification: the legitimate device
+    // can never be certified under that name afterwards.
+    //
+    // Scoped to the VOUCH SHAPE, a known petname holding a secret with no cert.
+    // Certifying every expose would undo the stated design of
+    // `store_provisional_identity`, that a failed overlay session leaves no
+    // durable anchor.
+    let petname = conn.link(pid).map(|l| l.name.clone()).unwrap_or_default();
+    if !petname.is_empty()
+        // #266: VALID, not merely present. With a plain existence check an expired
+        // vouch certificate held this gate shut forever while failing `verify`
+        // everywhere else, so the device could never be re-certified.
+        //
+        // This relaxation is what makes the guard inside `update_peer_identity`
+        // load-bearing rather than decorative: a second durable write becomes
+        // reachable, and that guard refuses one carrying a different user key.
+        && device_cert_valid_for(&petname).is_none()
+        && devices_load().iter().any(|(n, _)| n == &petname)
+    {
+        match update_peer_identity(&petname, &cert, VOUCH_CERT_SCOPE) {
+            Ok(()) => ui::say(&format!(
+                "  {} first identity for '{}' pinned; `filament revoke {} --certificate` can now reach it",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                petname,
+                petname
+            )),
+            // The in-memory Proven binding still holds for this link, but the
+            // durable record stays un-revocable, which is the whole defect. Name
+            // it rather than let the vouch look complete.
+            Err(e) => ui::caution(
+                &format!("'{petname}' is paired but not certified"),
+                Some(&format!(
+                    "its certificate was not stored ({e}), so revoke has nothing to key on."
+                )),
+                &[format!("remove it instead: filament devices forget {petname}")],
+            ),
+        }
+    }
     // Erase held nonce (single-use)
     identity_nonces.remove(pid);
     true
@@ -2335,9 +2579,55 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
     identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+/// #243: the intro scope a vouch stores. A vouch introduces a DEVICE, not a
+/// user, so `Device` (0x01) is the correct anchor. The value is NOT cosmetic:
+/// `apply_peer_identity` gates its device-pinning branch on
+/// `existing_scope == 0x01`, so storing `User` here would silently disarm that
+/// check for every LATER write to the same petname on the path where the guard
+/// does run (l3-announce). Named as a constant so the choice is one line, is
+/// testable, and cannot drift.
+pub(crate) const VOUCH_CERT_SCOPE: u8 = 0x01; // identity::IntroScope::Device
+
 fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
-    // Delegate to atomic upsert: cert only, preserve secret & caps
-    devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None, None)?;
+    // #243: refuse a re-anchor HERE, in the writer, rather than trusting each
+    // caller to have checked first.
+    //
+    // `devices_upsert_atomic` -> `upsert_peer_record` overwrites `userKey` and
+    // `deviceCert` unconditionally, with no comparison and no bail. The takeover
+    // guard people assume protects this (`identity::apply_peer_identity`) had
+    // exactly one production caller, the l3-announce path, and was never on this
+    // one. I asserted otherwise in the first draft of this fix without tracing
+    // the call, which is the same defect this issue is about.
+    //
+    // Today this is INERT for the vouch flow: the only caller gates on
+    // `device_cert_for(..).is_none()`, so a second write never arrives. It is
+    // here anyway because that gate is a policy in a caller while this is an
+    // invariant in the store, and only one of those survives an edit. The edit
+    // is already foreseeable: #266 (device_cert_for ignores expiry, so an
+    // expired cert permanently blocks re-certification) will be fixed by
+    // relaxing that gate to `is_none() || expired`, and at that moment a second
+    // durable write becomes reachable and this is what refuses it.
+    //
+    // Do not delete this because it never fires. That is the point of it.
+    // Guard and write in ONE with_devices_mut, not two.
+    //
+    // The first version called the guard in its own with_devices_mut and then
+    // `devices_upsert_atomic` in a second. On Windows that failed outright with
+    // "atomic write devices.json": the first cycle's handle was still open when
+    // the second tried to rename over the file, and Windows will not replace an
+    // open file. Linux tolerated it silently, so only the Windows CI job found
+    // it. Two lock-and-write cycles where the operation is one.
+    //
+    // It was also a TOCTOU window: between the guard reading the record and the
+    // upsert writing it, another writer could have changed the very thing the
+    // guard just approved. Folding them removes the window as well as the
+    // Windows failure, which is the better reason of the two.
+    with_devices_mut(|arr| {
+        identity::apply_peer_identity(arr, name, peer_cert, scope)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        upsert_peer_record(arr, name, None, Some(peer_cert), None, Some(scope), None, None);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2370,26 +2660,23 @@ fn clear_provisional_identity(name: &str) {
 /// Called on each connect so `filament addr <device>` can show recency and addresses.
 fn devices_touch(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>) {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    devices_touch_at(name, v6, v4, now);
+    let _ = devices_touch_at(name, v6, v4, now);
 }
 
 /// Clock-injectable form of `devices_touch` so the liveness tests can advance
 /// time without sleeping. The production call site passes the real wall clock.
-fn devices_touch_at(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>, now: u64) {
-    let p = devices_path();
-    let Ok(raw) = std::fs::read_to_string(&p) else { return };
-    let Ok(val) = serde_json::from_str::<Value>(&raw) else { return };
-    let Some(arr) = val.as_array() else { return };
-    let mut arr = arr.clone();
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(name) {
-            d["lastSeen"] = json!(now);
-            if let Some(v6) = v6 { d["overlayV6"] = json!(v6.to_string()); }
-            if let Some(v4) = v4 { d["overlayV4"] = json!(v4.to_string()); }
-            break;
+fn devices_touch_at(name: &str, v6: Option<std::net::Ipv6Addr>, v4: Option<std::net::Ipv4Addr>, now: u64) -> Result<()> {
+    with_devices_mut(|arr| {
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some(name) {
+                d["lastSeen"] = json!(now);
+                if let Some(v6) = v6 { d["overlayV6"] = json!(v6.to_string()); }
+                if let Some(v4) = v4 { d["overlayV4"] = json!(v4.to_string()); }
+                break;
+            }
         }
-    }
-    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
+        Ok(())
+    })
 }
 
 /// Read the `lastSeen` timestamp and overlay addresses for a known device.
@@ -2408,7 +2695,7 @@ fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<String>)> {
 /// uses this to switch L2/shell ON even for a plain `filament up`: otherwise
 /// `filament grant <dev> shell` writes a grant the running daemon never consults
 /// (l2_enabled was set only by --shell/--shell-only at startup), so the grant
-/// silently did nothing and `filament ssh` timed out. With this, a grant alone is
+/// silently did nothing and `filament shell --ssh` timed out. With this, a grant alone is
 /// enough; the per-device cap gate (auto_allows || device_allows) still denies
 /// every non-granted device, so this does NOT broaden access, it only honors the
 /// grants that already exist.
@@ -2500,6 +2787,36 @@ fn device_caps(name: &str) -> Option<Vec<String>> {
     device_caps_at(&devices_path(), name)
 }
 
+/// The persisted capability ceiling of a device record, when that record is a
+/// delegated (joined) device. None for an owner device or a plain pair, which
+/// are not ceiling-restricted.
+fn principal_ceiling_for(name: &str) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr = serde_json::from_str::<Value>(&raw).ok()?;
+    let record = arr.as_array()?.iter().find(|d| d["name"].as_str() == Some(name))?;
+    if record["principalKind"].as_str() != Some("delegated") {
+        return None;
+    }
+    Some(
+        record["principalCeiling"]
+            .as_array()
+            .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+    )
+}
+
+/// The capabilities enforcement actually honours for this device: the enrollment
+/// ceiling for a delegated device (grant writes never widen it), or the grant
+/// store for a non-delegated device. The devices display renders from this, and
+/// `grant`/`revoke` consult the same `principal_ceiling_for` source, so none of
+/// the three surfaces hand-writes the delegated/ceiling verdict and drifts.
+fn effective_device_caps(name: &str) -> Vec<String> {
+    match principal_ceiling_for(name) {
+        Some(ceiling) => ceiling,
+        None => device_caps(name).unwrap_or_else(|| vec!["transfer".to_string()]),
+    }
+}
+
 /// Path-explicit core of `device_caps` (testable without touching the global
 /// config-dir env var).
 #[allow(dead_code)]
@@ -2554,73 +2871,104 @@ fn device_allows(name: &str, capability: &str) -> bool {
 /// back-compat baseline `["transfer"]` first, so granting `shell` never silently
 /// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
 /// Returns Err if the device is unknown (you can't grant a stranger a shell).
+/// Has the owner explicitly revoked this capability from this device?
+///
+/// #244: `revoke <device> shell` wrote caps, and the blanket `up --shell`
+/// policy never read caps: `ShellPolicy::All => true`, name and caps ignored.
+/// So the command printed "revoked 'shell' from 'X'" and the shell kept
+/// working. Worse for a vouched record, which has no certificate, so
+/// `revoke --certificate` bailed too and NEITHER verb could reach it. The
+/// operator ran the security verb, got a success line, and lost nothing.
+///
+/// A grant is a capability. A revoke is a DECISION, and a decision has to
+/// outrank a policy default or it is not a decision. This is the durable record
+/// of that decision, and the blanket policy is now subordinate to it.
+fn device_capability_denied(name: &str, capability: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else { return false };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else { return false };
+    arr.iter()
+        .find(|d| d["name"].as_str() == Some(name))
+        .and_then(|d| d["deniedCaps"].as_array())
+        .is_some_and(|list| list.iter().any(|c| c.as_str() == Some(capability)))
+}
+
 fn device_set_cap(name: &str, capability: &str, grant: bool, expires: Option<u64>) -> Result<()> {
     let capability = crate::capability::canonical_capability(capability)?;
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p)
-        .map_err(|_| anyhow::anyhow!("no known device named '{name}', pair first"))?;
-    let mut arr: Vec<Value> = serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
     let mut found = false;
-    for d in arr.iter_mut() {
-        if d["name"].as_str() != Some(name) {
-            continue;
-        }
-        found = true;
-        // Current caps: v1 (absent) reads as the transfer baseline.
-        let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
-            Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
-            None => vec!["transfer".to_string()],
-        };
-        caps.retain(|c| c != &capability);
-        if grant {
-            caps.push(capability.to_string());
-        }
-        if let Some(obj) = d.as_object_mut() {
-            obj.insert("v".into(), json!(2));
-            obj.insert("caps".into(), json!(caps));
-            let mut cap_expires = obj.get("capExpires").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    with_devices_mut(|arr| {
+        for d in arr.iter_mut() {
+            if d["name"].as_str() != Some(name) {
+                continue;
+            }
+            found = true;
+            // #244: a revoke is a decision, not just the absence of a grant, so
+            // record it durably where the blanket shell policy can see it.
+            // Without this, `revoke <dev> shell` under `up --shell` printed
+            // success and changed nothing, because auto_allows reads no caps.
+            {
+                let mut denied: Vec<String> = d
+                    .get("deniedCaps")
+                    .and_then(|c| c.as_array())
+                    .map(|l| l.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                denied.retain(|c| c != &capability);
+                if !grant {
+                    denied.push(capability.clone());
+                }
+                denied.sort();
+                denied.dedup();
+                d["deniedCaps"] = json!(denied);
+            }
+            // Current caps: v1 (absent) reads as the transfer baseline.
+            let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
+                Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
+                None => vec!["transfer".to_string()],
+            };
+            caps.retain(|c| c != &capability);
             if grant {
-                if let Some(expiry) = expires {
-                    cap_expires.insert(capability.to_string(), json!(expiry));
+                caps.push(capability.to_string());
+            }
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("v".into(), json!(2));
+                obj.insert("caps".into(), json!(caps));
+                let mut cap_expires = obj.get("capExpires").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                if grant {
+                    if let Some(expiry) = expires {
+                        cap_expires.insert(capability.to_string(), json!(expiry));
+                    } else {
+                        cap_expires.remove(&capability);
+                    }
                 } else {
                     cap_expires.remove(&capability);
                 }
-            } else {
-                cap_expires.remove(&capability);
+                obj.insert("capExpires".into(), json!(cap_expires));
+                let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                if grant && expires.is_some() {
+                    sources.insert(capability.to_string(), json!("legacy"));
+                } else {
+                    sources.remove(&capability);
+                }
+                obj.insert("capSources".into(), json!(sources));
             }
-            obj.insert("capExpires".into(), json!(cap_expires));
-            let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-            if grant && expires.is_some() {
-                sources.insert(capability.to_string(), json!("legacy"));
-            } else {
-                sources.remove(&capability);
-            }
-            obj.insert("capSources".into(), json!(sources));
         }
-    }
-    if !found {
-        return Err(anyhow::anyhow!(
-            "no known device named '{name}', run `filament devices` to see who you've paired"
-        ));
-    }
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
-    Ok(())
+        if !found {
+            return Err(anyhow::anyhow!(
+                "no known device named '{name}', run `filament devices` to see who you've paired"
+            ));
+        }
+        Ok(())
+    })
 }
 
 fn mark_bounded_cap_source(name: &str, capability: &str, source: &str) -> Result<()> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p)?;
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
-    let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else { bail!("unknown device '{name}'") };
-    let obj = device.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid device record"))?;
-    let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-    sources.insert(capability.to_string(), json!(source));
-    obj.insert("capSources".into(), json!(sources));
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
-    Ok(())
+    with_devices_mut(|arr| {
+        let Some(device) = arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) else { bail!("unknown device '{name}'") };
+        let obj = device.as_object_mut().ok_or_else(|| anyhow::anyhow!("invalid device record"))?;
+        let mut sources = obj.get("capSources").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        sources.insert(capability.to_string(), json!(source));
+        obj.insert("capSources".into(), json!(sources));
+        Ok(())
+    })
 }
 
 /// Add the authoritative owner-signed bounded grant when the peer is certified.
@@ -2667,14 +3015,10 @@ fn devices_remove(name: &str) -> Result<()> {
     // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
     // addedAt). The old tuple round-trip rewrote every survivor as bare
     // {name, secret}, silently wiping their `shell` grants on any forget.
-    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    arr.retain(|d| d["name"].as_str() != Some(name));
-    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
-    Ok(())
+    with_devices_mut(|arr| {
+        arr.retain(|d| d["name"].as_str() != Some(name));
+        Ok(())
+    })
 }
 
 pub(crate) fn channel_of(secret: &str) -> String {
@@ -2843,10 +3187,47 @@ fn up_log() -> PathBuf {
     devices_path().with_file_name("up.log")
 }
 
+/// Record the daemon's identity beside its pid. A pid alone can be recycled and
+/// a name substring can lie, so the pidfile carries the executable path the
+/// daemon started from; `daemon_alive` confirms it against the live process.
+fn write_pidfile() -> Result<()> {
+    let pid = std::process::id();
+    let exe = std::env::current_exe()?;
+    std::fs::write(pidfile(), format!("{pid}\n{}\n", exe.display()))?;
+    Ok(())
+}
+
 fn daemon_alive() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
-    let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
-    cmd.contains("filament").then_some(pid)
+    let raw = std::fs::read_to_string(pidfile()).ok()?;
+    let mut lines = raw.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    // The executable the daemon recorded when it wrote the pidfile. A pidfile
+    // from before this fix records only the pid; the daemon and this CLI are
+    // the same installed binary, so fall back to our own executable.
+    let recorded = lines.next().map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from);
+    let expected = recorded.or_else(|| std::env::current_exe().ok())?;
+    // Identify the process by its executable path, never by matching a name.
+    // process_exe_path returns None for a dead or recycled pid, which is
+    // exactly the case the pidfile alone cannot detect.
+    let live = platform::process_exe_path(pid)?;
+    same_executable(&live, &expected).then_some(pid)
+}
+
+/// Compare two executable paths the way daemon identity needs: symlinks
+/// resolved, and the " (deleted)" suffix Linux appends to `/proc/<pid>/exe`
+/// after an in-place binary upgrade ignored. Without the latter, upgrading the
+/// binary under a running daemon reads as "not running" and starts a second
+/// daemon, the very bug this check exists to prevent.
+fn same_executable(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy();
+        match s.strip_suffix(" (deleted)") {
+            Some(t) => PathBuf::from(t),
+            None => p.to_path_buf(),
+        }
+    };
+    let (a, b) = (norm(a), norm(b));
+    a.canonicalize().unwrap_or(a) == b.canonicalize().unwrap_or(b)
 }
 
 /// The argv for a web-shell PTY.
@@ -2899,7 +3280,7 @@ fn spawn_session_pumps(
 }
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
-/// may `filament ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
+/// may `filament shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
 /// always enforced separately, this is purely the capability side.
 #[derive(Clone, Debug)]
 enum ShellPolicy {
@@ -2919,6 +3300,34 @@ impl ShellPolicy {
             ShellPolicy::Granted => false,
             ShellPolicy::All => true,
             ShellPolicy::Only(set) => set.contains(name),
+        }
+    }
+    /// #244: the posture this daemon is actually serving, for `cap-status`.
+    ///
+    /// Reported by the RUNNING daemon rather than derived from settings by the
+    /// asking process. `up --shell` sets the policy from a launch flag that
+    /// never touches the settings file, so a settings-derived answer would be
+    /// true about the config and wrong about the daemon, which is precisely the
+    /// gap that lets `revoke <device> shell` report success while the policy
+    /// keeps handing out the shell.
+    fn label(&self) -> &'static str {
+        match self {
+            ShellPolicy::Granted => "granted",
+            ShellPolicy::All => "all",
+            ShellPolicy::Only(_) => "only",
+        }
+    }
+    /// The petnames this policy auto-shells regardless of any per-device grant.
+    /// Empty for `Granted`; `Only`'s set; `All` answers for every peer, so the
+    /// caller must read `label() == "all"` rather than look for a name here.
+    fn auto_names(&self) -> Vec<String> {
+        match self {
+            ShellPolicy::Only(set) => {
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort();
+                v
+            }
+            _ => Vec::new(),
         }
     }
     /// Active policy implies the L2 tunnel acceptor is on (you can't ssh without it).
@@ -3130,6 +3539,7 @@ async fn up_cmd(
     server: &str,
     install: bool,
     system: bool,
+    detach: bool,
     dir: Option<PathBuf>,
     relay: bool,
     shell: bool,
@@ -3228,42 +3638,31 @@ async fn up_cmd(
             // #182: HKCU Run only fires at logon. The user asked for the
             // inbox NOW (the other platforms' service managers do `enable
             // --now` / bootstrap). Start the receiver now, detached, and
-            // confirm it is live before printing.
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                const DETACHED_PROCESS: u32 = 0x00000008;
-                let mut child = std::process::Command::new(&exe)
-                    .arg("up")
-                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-                let started = match child {
-                    Ok(_) => {
-                        // Give the receiver a moment to write its pidfile.
-                        let mut live = false;
-                        for _ in 0..40 {
-                            if daemon_alive().is_some() {
-                                live = true;
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(250));
+            // confirm it is live before printing. The detach is the SAME
+            // portable operation as `up --detach` (platform::spawn_detached),
+            // so the receiver's console lands in daemon.log.
+            let log_path = crate::platform::Paths::config_path("daemon.log");
+            let started = match crate::platform::spawn_detached(&exe, &["up"], &log_path) {
+                Ok(_) => {
+                    // Give the receiver a moment to write its pidfile.
+                    let mut live = false;
+                    for _ in 0..40 {
+                        if daemon_alive().is_some() {
+                            live = true;
+                            break;
                         }
-                        live
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                     }
-                    Err(_) => false,
-                };
-                if started {
-                    ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                } else {
-                    ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
-                        ui::paint(ui::Tone::Warn, "!")));
+                    live
                 }
+                Err(_) => false,
+            };
+            if started {
+                ui::say(&format!("  {} receiving now, and at every logon", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            } else {
+                ui::say(&format!("  {} autostart installed; starting the receiver now failed, run `filament up`",
+                    ui::paint(ui::Tone::Warn, "!")));
             }
-            #[cfg(not(target_os = "windows"))]
-            ui::say(&format!("  {} installed as a user-level autostart", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
         } else {
             match host.install_system(&exe, &up_args) {
                 Ok(platform::InstallResult::System) => {
@@ -3284,18 +3683,27 @@ async fn up_cmd(
     }
     if let Some(pid) = daemon_alive() {
         dlog!("[up] already-up: pidfile={:?} pid={pid} cmdline={:?}", pidfile(), std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default());
-        bail!("already up (pid {pid}), `filament status` / `filament down`");
+        // #192: `up` twice should not dead-end. The daemon is already serving;
+        // follow its log. Ctrl-c detaches and leaves it running.
+        ui::say(&format!("  daemon already running (pid {pid}); following its log (ctrl-c to detach)"));
+        return logs_cmd(true, 20).await;
+    }
+    if detach {
+        // --detach: spawn the daemon in the background, redirect its console to
+        // {config}/daemon.log, return to the shell. The child writes the pidfile
+        // and serves detached (survives closing this terminal).
+        return detach_up(server, dir).await;
     }
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(pidfile(), std::process::id().to_string())?;
+    write_pidfile()?;
     let granted_names = shell_grant_names();
     match &shell_policy {
         // M-2: --shell intentionally grants ALL proof-verified paired devices
         // (current AND any introduced later via pair-intro). This is a broad,
         // deliberate over-grant; --shell-only is the scoped, safer alternative.
         ShellPolicy::All => ui::say(&format!(
-            "  {} seamless shell ON, ANY paired device (now or paired later) can `filament ssh` into this machine",
+            "  {} seamless shell ON, ANY paired device (now or paired later) can `filament shell --ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
         )),
         ShellPolicy::Only(set) => {
@@ -3303,12 +3711,12 @@ async fn up_cmd(
             names.sort();
             let list = names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
             ui::say(&format!(
-                "  {} seamless shell ON for: {list}, they can `filament ssh` into this machine",
+                "  {} seamless shell ON for: {list}, they can `filament shell --ssh` into this machine",
                 ui::paint(ui::Tone::Warn, "!"),
             ));
         }
         ShellPolicy::Granted if !granted_names.is_empty() => ui::say(&format!(
-            "  {} seamless shell ON for: {}, they can `filament ssh` into this machine",
+            "  {} seamless shell ON for: {}, they can `filament shell --ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
             granted_names.join(", "),
         )),
@@ -3353,7 +3761,7 @@ async fn up_cmd(
         // actually have a block (avoid noise for devices without one).
         for device in &revoked {
             if sshkeys::has_block(&ak_content, device) && !authoritative {
-                eprintln!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                ui::critical(&format!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"));
             }
         }
         let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
@@ -3539,11 +3947,23 @@ async fn init_experience(
     if let Some(existing) = identity::UserKey::load(&store)? {
         bail!("this device already has identity {}; see `filament id`", existing.fingerprint());
     }
-    if !caps.interactive && recovery_file.is_none() && recovery_fd.is_none() {
-        bail!("non-interactive init requires --recovery-file <new-path> or --recovery-fd <fd>");
-    }
-    if !caps.interactive && !caps.yes {
-        bail!("non-interactive init requires --yes after naming a recovery destination");
+    // Non-interactive init names EVERYTHING it needs in one message, so a
+    // script learns the full contract in one round trip instead of two
+    // (--recovery-file, then --yes, then --name).
+    if !caps.interactive {
+        let mut missing: Vec<&str> = Vec::new();
+        if recovery_file.is_none() && recovery_fd.is_none() {
+            missing.push("--recovery-file <path> (or --recovery-fd <fd>)");
+        }
+        if !caps.yes {
+            missing.push("--yes");
+        }
+        if name.is_none() {
+            missing.push("--name <device>");
+        }
+        if !missing.is_empty() {
+            bail!("non-interactive init needs: {}", missing.join(", "));
+        }
     }
 
     let device_name = match name {
@@ -3584,7 +4004,7 @@ async fn init_experience(
         false
     };
     if start_background {
-        up_cmd(server, true, false, Some(inbox.clone()), relay, false, None, None, None, false, false, false)
+        up_cmd(server, true, false, false, Some(inbox.clone()), relay, false, None, None, None, false, false, false)
             .await
             .context("install always-on receive service")?;
     }
@@ -3686,7 +4106,7 @@ fn tour_cmd() -> Result<()> {
         act("filament shell <device>", "open an authorized terminal");
     }
     act("filament receive", "receive once");
-    act("filament up", "serve: receive, mount, shell");
+    act("filament up", "serve: receive, mount (shell with --shell)");
     act("filament up --install", "the same, always-on");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  more:  filament --help  /  filament devices  /  filament id"));
     Ok(())
@@ -4024,25 +4444,50 @@ fn format_approval_expiry(expires: u64) -> String {
         .unwrap_or_else(|| expires.to_string())
 }
 
-fn device_countdown(tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
+/// How long this device's certificate has left, in the words of what actually
+/// happens to it.
+///
+/// #236: Fleet used to get "renews in 87d", and an already-expired Fleet cert
+/// got "renews until <a date in the past>" while External got "expired" for the
+/// same condition. Nothing renews. `DeviceCert::certify` is reached only from
+/// init, recover, enrollment/join and pairing cert storage: no timer, no
+/// opportunistic-on-connect path, no verb. The wording came from
+/// docs/design-pairing-ux.md rule 2, "auto-renewed by a primary while the device
+/// is in good standing", which was designed and never built, so the string was
+/// describing a security model the product does not have. Meanwhile the gate
+/// fails the cert at exactly the moment the screen said it would renew.
+///
+/// The tier no longer changes the sentence, because the tier does not change
+/// the fact. If renewal is ever built, this is where the distinction earns its
+/// way back, and not before.
+fn device_countdown(_tier: fleet_ui::devices::DeviceTier, cert: Option<&identity::DeviceCert>) -> String {
     let Some(cert) = cert else {
-        return "promote to continue".to_string();
+        // #240: was "promote to continue", the SECOND source of that string
+        // after the row flag. No certificate means there is no expiry to count
+        // down to, and nothing is blocked, so the column says what is true and
+        // the tier heading carries the explanation.
+        return "no certificate".to_string();
     };
     let now = identity::now_secs();
     if cert.expires <= now {
         let date = chrono::DateTime::from_timestamp(cert.expires as i64, 0)
             .map(|at| at.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "expired".to_string());
-        return match tier {
-            fleet_ui::devices::DeviceTier::Fleet => format!("renews until {date}"),
-            _ => format!("expired {date}"),
-        };
+        return format!("expired {date}");
     }
-    let minutes = (cert.expires - now).saturating_add(59) / 60;
-    match tier {
-        fleet_ui::devices::DeviceTier::Fleet => format!("renews in {minutes}m"),
-        _ => format!("expires in {minutes}m"),
-    }
+    // Round UP to the nearest whole unit, so a cert issued for 90 days reads
+    // "90d", not "129600m" or a seconds figure a few seconds short of the day.
+    let secs = cert.expires - now;
+    let text = if secs >= 86400 {
+        format!("{}d", (secs + 86399) / 86400)
+    } else if secs >= 3600 {
+        format!("{}h", (secs + 3599) / 3600)
+    } else if secs >= 60 {
+        format!("{}m", (secs + 59) / 60)
+    } else {
+        format!("{secs}s")
+    };
+    format!("expires in {text}")
 }
 
 fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
@@ -4130,6 +4575,14 @@ fn delegated_device_state(name: &str, cert: Option<&identity::DeviceCert>, now: 
 fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
     let owner = load_owner_key().map(|key| key.public_key_bytes());
+    // The key that identifies "same mesh as me": my own owner key if I have one,
+    // else the issuer key held in my own device certificate (the owner I joined
+    // under). A device whose cert chains to THIS key is fleet, not external; so
+    // a spoke stops filing its owner under "other people".
+    let same_owner = owner
+        .as_ref()
+        .copied()
+        .or_else(|| local_device_cert().map(|c| c.user_pub));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -4145,10 +4598,10 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
             let cert = device_cert_for(&name);
             let tier = match cert.as_ref() {
                 None => fleet_ui::devices::DeviceTier::NeedsReview,
-                Some(cert) if owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
+                Some(cert) if same_owner.as_ref() == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
                 Some(_) => fleet_ui::devices::DeviceTier::External,
             };
-            let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+            let caps = effective_device_caps(&name);
             let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
             let address = stored_v6.or(stored_v4);
             let last_seen = (last_seen > 0).then(|| {
@@ -4163,9 +4616,22 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
                     format!("{}d ago", ago / 86400)
                 }
             });
-            let needs_promote = tier == fleet_ui::devices::DeviceTier::NeedsReview;
-            let caps_summary = if needs_promote {
-                "(full legacy trust)".to_string()
+            // #240: this tier is reached whenever a device has no stored
+            // certificate, which every code-flow pairing does. The row used to
+            // say "promote to continue" and print `filament devices promote
+            // <name>` underneath. Three things wrong at once: the verb does not
+            // exist (#191), nothing is blocked (a transfer to such a device
+            // works immediately, verified between two machines), and the tier
+            // heading blamed "paired before scoped trust" for a pairing made
+            // minutes earlier on the current build.
+            //
+            // So the row now states the condition and prescribes nothing. What
+            // is TRUE is that the peer's identity was never certified, so it is
+            // trusted in full rather than scoped. The tier's own design is #191
+            // and #195 and is not settled here; this only stops the screen
+            // asserting a blocked state and an impossible remedy.
+            let caps_summary = if tier == fleet_ui::devices::DeviceTier::NeedsReview {
+                "uncertified · trusted in full".to_string()
             } else {
                 device_caps_summary(&caps, tier)
             };
@@ -4176,17 +4642,53 @@ fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
             fleet_ui::devices::DeviceEntry {
                 name: name.clone(),
                 tier,
-                online: warm_names.contains(&name),
+                // #217: online is authoritative only when the warm-link reply is
+                // present. On a platform with no control channel (or no daemon)
+                // `warm` is None and the row omits the status instead of
+                // rendering "offline" for every device always.
+                online: warm.map(|_| warm_names.contains(&name)),
                 caps_summary,
                 countdown: match delegated_device_state(&name, cert.as_ref(), now, &records) {
                     Some((text, tone)) => ui::paint(tone, &text),
-                    None if needs_promote => String::new(),
                     None => device_countdown(tier, cert.as_ref()),
                 },
                 last_seen,
-                needs_promote,
             }
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .chain(crate::roster::stored_roster()
+            .and_then(|r| r["devices"].as_array().cloned())
+            .map(|arr| {
+                let self_pub = crate::overlay::overlay_pubkey_bytes().ok();
+                arr.into_iter().filter_map(move |d| {
+                    let name = d["petname"].as_str()?.to_string();
+                    // Skip a sibling that is ALREADY in the local store (it has a
+                    // secret and a real channel; the roster adds nothing).
+                    if devices_load().iter().any(|(n, _)| n == &name) {
+                        return None;
+                    }
+                    // Skip MYSELF: the roster lists the owner's devices, and on a
+                    // spoke that includes this device's own key, which must never
+                    // render as its own sibling.
+                    if let (Some(self_pub), Some(hex_pub)) = (self_pub.as_ref(), d["device_pub"].as_str()) {
+                        if let Ok(decoded) = hex::decode(hex_pub) {
+                            if decoded.as_slice() == self_pub {
+                                return None;
+                            }
+                        }
+                    }
+                    Some(fleet_ui::devices::DeviceEntry {
+                        name,
+                        tier: fleet_ui::devices::DeviceTier::MeshRoster,
+                        online: None, // unknown liveness (#217), never idle/offline
+                        caps_summary: "known via owner".to_string(),
+                        countdown: String::new(),
+                        last_seen: None,
+                    })
+                }).collect::<Vec<_>>()
+            })
+            .unwrap_or_default())
         .collect()
 }
 
@@ -4408,11 +4910,11 @@ async fn ephemeral_cmd(server: &str, action: EphemeralAction, relay: bool) -> Re
             write_owner_only_file(&out, json.as_str())?;
             eprintln!("{} auth key bundle written to {}",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()), out.display());
-            // Arm the local daemon so it joins the enrollment room
-            if ctl::try_arm(hex::encode(ak.enroll_pub), ak.expires).await.is_some() {
-                ui::debug("local daemon armed for enrollment");
-            } else {
-                ui::say(&format!("  {} no local daemon / enrollment room not armed (start 'filament up' first)",
+            // Arm: a file write (armed.json), not IPC. The daemon's arm-gate
+            // picks it up on the next tick.
+            crate::armed::arm(hex::encode(ak.enroll_pub), ak.expires);
+            if daemon_alive().is_none() {
+                ui::say(&format!("  {} no local daemon running yet (start 'filament up' before this key is claimed)",
                     ui::paint(ui::Tone::Dim, "·")));
             }
             Ok(())
@@ -4561,22 +5063,21 @@ fn persist_join_ack_v2(v: &Value, inv: &crate::ephemeral::InvitationV2) -> Resul
 /// Mark a device record lapsed immediately (advisory depart, or manual). The
 /// record is KEPT (option b): evidence survives. Returns the device name.
 fn mark_lapsed_now(device_pub: &[u8; 32]) -> Option<String> {
-    let p = devices_path();
-    let raw = std::fs::read_to_string(&p).ok()?;
-    let mut arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
     let key = hex::encode(device_pub);
-    let name = arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
-        .and_then(|d| d["name"].as_str().map(str::to_string))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    for d in arr.iter_mut() {
-        if d["name"].as_str() == Some(&name) {
-            d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
-            d["lapsedAt"] = json!(now);
-            break;
+    with_devices_mut(|arr| {
+        let name = arr.iter().find(|d| d["deviceCert"]["devicePub"].as_str() == Some(&key))
+            .and_then(|d| d["name"].as_str().map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("device not in the store"))?;
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some(&name) {
+                d["principalState"] = json!(PRINCIPAL_STATE_LAPSED);
+                d["lapsedAt"] = json!(now);
+                break;
+            }
         }
-    }
-    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
-    Some(name)
+        Ok(name)
+    }).ok()
 }
 
 /// The joined device's owner record: the stored device whose cert chains to our
@@ -4727,34 +5228,61 @@ async fn add_for_cmd(
 ) -> Result<()> {
     use base64::Engine;
     // `--for` with no value (Some("")) means "ask me on a terminal"; the
-    // one-shot path requires an explicit device|person value.
+    // one-shot path requires an explicit device|person value. The interactive
+    // prompt lives in the match below (the None arm), exactly once - a
+    // cancelled (Ctrl-C) picker must NOT re-prompt (#203).
     let mut for_ = for_.filter(|v| !v.is_empty());
-    if for_.is_none() && caps.interactive {
-        let choices = vec!["A device I control".to_string(), "Another person".to_string()];
-        for_ = codeentry::pick("WHO IS JOINING", &choices)?
-            .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() });
-    }
     // #187: `--for` reads like a name. A bare word that is not the literal
     // device/person is a DEVICE NAME: select device-kind and pre-fill the
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
     let (kind, _invitee_name) = match for_.as_deref() {
         None => {
-            let k = if caps.interactive {
+            if caps.interactive {
+                // A cancelled picker (Ctrl-C / Esc) is a cancellation, not a
+                // missing argument (#203): exit cleanly instead of reporting
+                // the non-interactive requirement.
                 let choices = vec!["A device I control".to_string(), "Another person".to_string()];
-                codeentry::pick("WHO IS JOINING", &choices)?
-                    .map(|index| if index == 0 { "device".to_string() } else { "person".to_string() })
+                match codeentry::pick("WHO IS JOINING", &choices)? {
+                    Some(index) => ((if index == 0 { "device".to_string() } else { "person".to_string() }), None),
+                    None => return Err(cancelled()),
+                }
             } else {
-                None
-            };
-            (k.ok_or_else(|| anyhow!("non-interactive add --for requires device|person or a device name"))?, None)
+                bail!("non-interactive add --for requires device|person or a device name");
+            }
         }
         Some("device") | Some("person") => (for_.unwrap(), None),
         Some(name) => ("device".to_string(), Some(name.to_string())),
     };
+    // The ergonomic gap behind "I want to shell into my own devices": shell has
+    // to be in the invitation ceiling, because a grant cannot widen one later
+    // (#226, which now refuses honestly instead of pretending). So the only way
+    // to get it was `--allow shell`, a flag you had to already know about, on a
+    // path the interactive flow never mentioned. Ask instead.
+    //
+    // Offered only for a device you control, only when the user did not pass
+    // --allow, and only interactively. A person gets transfer and is not asked,
+    // because owner-equivalent access to a stranger should stay a deliberate
+    // flag rather than a menu item one keypress away.
+    let mut interactive_shell = false;
+    if allow.is_empty() && kind == "device" && caps.interactive {
+        let choices = vec![
+            "Send files, and mount my folders".to_string(),
+            "...and open a terminal here  (OWNER-EQUIVALENT)".to_string(),
+        ];
+        match codeentry::pick("WHAT THIS DEVICE MAY DO", &choices)? {
+            Some(1) => interactive_shell = true,
+            Some(_) => {}
+            None => return Err(cancelled()),
+        }
+    }
     let mut ceiling = if allow.is_empty() {
         if kind == "device" {
-            vec!["transfer".to_string(), "mount".to_string()]
+            let mut c = vec!["transfer".to_string(), "mount".to_string()];
+            if interactive_shell {
+                c.push("shell".to_string());
+            }
+            c
         } else {
             vec!["transfer".to_string()]
         }
@@ -4798,10 +5326,30 @@ async fn add_for_cmd(
         "filament-invite:v2:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
-    // #176: minting a bounded invitation is a local act (signing + printing);
-    // the always-on receiver is only needed when someone CLAIMS it. Arm the
-    // enrollment room best-effort; never block minting on the daemon.
-    let armed = crate::ctl::try_arm(hex::encode(inv.enroll_pub), inv.expires).await.is_some();
+    // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in
+    // armed.json directly; the daemon's per-tick arm-gate reads it. No socket,
+    // no bind race, no platform branch, no control channel. The only thing the
+    // mint cannot guarantee is that a RECEIVER is actually running to pick the
+    // key up - check that, and offer to start one.
+    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
+    // #207: a minted code that nothing can claim is not an invitation, it is a
+    // lie with a QR on it. The receiver is what claims; if none is running,
+    // say so before printing and offer to start one.
+    if caps.interactive && daemon_alive().is_none() {
+        use std::io::Write as _;
+        eprint!("  the always-on receiver is not running.\n  Start it now so this invitation can be claimed? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans).ok();
+        if matches!(ans.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            let exe = std::env::current_exe()?;
+            let _ = std::process::Command::new(&exe)
+                .arg("up")
+                .arg("--install")
+                .spawn();
+            ui::say(&format!("  {} receiver starting ({})", ui::paint(ui::Tone::Ok, ui::glyph_ok()), exe.display()));
+        }
+    }
 
     if let Some(path) = out.as_deref() {
         write_owner_only_file(path, token.as_str())?;
@@ -4818,9 +5366,20 @@ async fn add_for_cmd(
         eprintln!("  expires  {ttl_text}");
         eprintln!();
         eprintln!("  Whoever captures this can join until it is used or expires.");
-        eprintln!("{}", ui::qr_or_text(token.as_str(), 8));
+        // The token is printed ONCE, on its own line. qr_or_text's fallback
+        // embeds the text, which would double it here; so render the QR only
+        // when it fits and let the note stand alone otherwise (the other QR
+        // callers rely on the fallback embedding the text, so the helper is
+        // not changed - this call site prints the token separately).
+        if ui::qr_fits(token.as_str(), 8) {
+            eprintln!("{}", ui::qr(token.as_str()));
+        } else {
+            eprintln!("  (the QR needs {} rows and this window has {}; the top would be cut off - the code is below)",
+                ui::qr_rows(token.as_str()).unwrap_or(0),
+                crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0));
+        }
         eprintln!("{}", token.as_str());
-        eprintln!("  keep this window open until the other device claims it");
+        eprintln!("  keep this window open so the QR stays on screen; the other device scans it");
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
         let _ = execute!(err, terminal::LeaveAlternateScreen);
         result?;
@@ -4838,10 +5397,13 @@ async fn add_for_cmd(
         ui::say(&format!("  {} invitation written to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), path.display()));
         ui::say(&ui::paint(ui::Tone::Warn, "  Anyone who reads that file can join until it is used or expires."));
     }
-    if !armed {
+    // Non-interactive (--out or a pipe): no offer was printed above. Warn that a
+    // receiver must be running to claim, which is the one thing the file write
+    // cannot guarantee.
+    if !caps.interactive && daemon_alive().is_none() {
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running, so this invitation cannot be claimed yet.\n  start `filament up --install`, then the other device can join.",
+            "  note: the always-on receiver is not running; start `filament up --install` before anyone claims this invitation.",
         ));
     }
     Ok(())
@@ -5140,7 +5702,15 @@ async fn enroll_cmd(
                     return Ok(());
                 }
                 Some("identity-auth-key-enroll-error") => {
-                    bail!("enrollment rejected: {}", v["reason"].as_str().unwrap_or("unknown reason"));
+                    // #222: name the reason the way the expired path does. The
+                    // server sends a specific fact (already used / use limit
+                    // reached / rate-limited) instead of a generic denial.
+                    let reason = v["reason"].as_str().unwrap_or("unknown");
+                    bail!(match reason {
+                        "already used" => "this invitation has already been used".to_string(),
+                        "use limit reached" => "this invitation has reached its use limit".to_string(),
+                        _ => format!("enrollment denied: {reason}"),
+                    });
                 }
                 _ => {}
             },
@@ -5759,7 +6329,21 @@ async fn handle_auth_key_enroll_response(
             // Burn ON SUCCESS only (never-reset counter)
             if let Err(e) = crate::ephemeral::burn_auth_key(&enroll_pub, &ak.reuse) {
                 ui::debug(&format!("enroll response burn failed: {e}"));
-                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": "enrollment denied"})).await;
+                // #222: the burn state knows WHY it refused (already used,
+                // use limit reached, rate-limited). Send that specific fact,
+                // not the generic "enrollment denied", so the joiner can say
+                // it the way the expired path does.
+                let msg = e.to_string();
+                let reason = if msg.contains("already used") {
+                    "already used"
+                } else if msg.contains("exhausted") {
+                    "use limit reached"
+                } else if msg.contains("rate-limited") {
+                    "rate-limited"
+                } else {
+                    "enrollment denied"
+                };
+                let _ = t.send_control(&json!({"type": "identity-auth-key-enroll-error", "reason": reason})).await;
                 return;
             }
             // #155: the enrollment side READS the signed `ephemeral` flag. An
@@ -5855,7 +6439,15 @@ async fn handle_auth_key_enroll_response(
 fn down_cmd() -> Result<()> {
     match daemon_alive() {
         Some(pid) => {
-            std::process::Command::new("kill").arg(pid.to_string()).status()?;
+            // #191: a managed service restarts a killed process. systemd's
+            // Restart=always reacts to an UNEXPECTED exit; a manual
+            // `systemctl stop` is authoritative and is not restarted. So stop
+            // through the manager first, and only fall back to a bare kill
+            // when no manager owns the daemon (a foreground `up`, or a
+            // non-service-managed box).
+            if !stop_managed_service(pid) {
+                std::process::Command::new("kill").arg(pid.to_string()).status()?;
+            }
             let _ = std::fs::remove_file(pidfile());
             ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
             Ok(())
@@ -5864,6 +6456,267 @@ fn down_cmd() -> Result<()> {
             ui::say("  not running");
             Ok(())
         }
+    }
+}
+
+/// Follow or tail the daemon's diagnostic timeline (diag.jsonl). The daemon
+/// writes structured JSONL connect spans here; `logs` renders them readably and
+/// refuses to flood: a bounded backlog (default 20 lines, --tail 0 = live
+/// only), then follows live with -f.
+async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
+    // The daemon's human console output goes to daemon.log when detached, and
+    // the diagnostic timeline is diag.jsonl. Follow whichever exists; prefer
+    // the console log when present (it is what a user means by "logs").
+    let console = crate::platform::Paths::config_path("daemon.log");
+
+    // A daemon under a service manager writes to the journal, not to a file we
+    // own, so there is nothing here to read and there never will be. That is
+    // the DEFAULT path: first-run offers "Stay available in the background?"
+    // and installs a service, after which `filament logs` said "no log yet (the
+    // daemon writes it while it runs)" forever, on a daemon that was running
+    // and was writing plenty. The sentence blamed timing for a condition that
+    // does not change. Hand the user the journal instead.
+    if !console.exists() {
+        if let Some(pid) = daemon_alive() {
+            if let Some(mgr) = service_manager_for_pid(pid) {
+                let scope = match mgr {
+                    ServiceManager::SystemdSystem => "",
+                    ServiceManager::SystemdUser => "--user ",
+                };
+                let n = tail.max(1);
+                let follow_flag = if follow { "-f " } else { "" };
+                let cmd = format!("journalctl {scope}-u filament {follow_flag}-n {n} --no-pager");
+                ui::say(&format!(
+                    "  this daemon runs as a service (pid {pid}); its output goes to the journal"
+                ));
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
+                let status = std::process::Command::new("journalctl")
+                    .args(scope.split_whitespace())
+                    .args(["-u", "filament"])
+                    .args(if follow { vec!["-f"] } else { vec![] })
+                    .args(["-n", &n.to_string(), "--no-pager"])
+                    .status();
+                return match status {
+                    Ok(st) if st.success() => Ok(()),
+                    // Say which step failed. "no log yet" would be a third
+                    // wrong explanation for the same situation.
+                    _ => {
+                        ui::say("  could not read the journal here; run the command above directly");
+                        Ok(())
+                    }
+                };
+            }
+        }
+    }
+
+    let path = if console.exists() { console } else { crate::platform::Paths::config_path("diag.jsonl") };
+    let read_tail = |count: usize| -> Result<()> {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            // Say what is true now, not what will happen later: nothing has
+            // been written yet. Whether it WILL appear depends on the daemon
+            // actually running (and, on some platforms, having a place to
+            // write), which this process cannot establish.
+            ui::say("  no log yet (nothing written so far)");
+            return Ok(());
+        };
+        let lines: Vec<&str> = raw.lines().collect();
+        let start = lines.len().saturating_sub(count);
+        for line in &lines[start..] {
+            eprintln!("{line}");
+        }
+        Ok(())
+    };
+    if tail > 0 {
+        read_tail(tail)?;
+    }
+    if !follow {
+        return Ok(());
+    }
+    // Follow live: read new appended lines until ctrl-c. Ctrl-c must detach
+    // cleanly, never stop the daemon. The file may not exist yet (the daemon
+    // is still starting); poll for it instead of erroring.
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+    // #216: ONE interrupt registration, created before the loops and held for
+    // the whole follow.
+    //
+    // The old shape built `tokio::signal::ctrl_c()` fresh inside each select and
+    // awaited the idle sleep in the branch BODY, outside any select. A followed
+    // log is idle almost all of the time, so almost every press landed in a
+    // window where no ctrl_c future existed, and a signal delivered when nothing
+    // is listening is not replayed to whatever listens next. The user saw
+    // ^C^C^C^C do nothing while two banners promised ctrl-c detaches.
+    //
+    // `notify_one` (not `notify_waiters`) is the load-bearing choice: it stores a
+    // permit when there is no waiter, so a press during a sleep is remembered and
+    // consumed by the next `notified()`. `notify_waiters` would drop it and
+    // reintroduce the bug in a subtler form.
+    let interrupted = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let n = interrupted.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            n.notify_one();
+        });
+    }
+    macro_rules! detached {
+        () => {{
+            ui::say("\n  detached (the daemon keeps running)");
+            return Ok(());
+        }};
+    }
+    loop {
+        match tokio::fs::OpenOptions::new().read(true).open(&path).await {
+            Ok(f) => {
+                let mut file = f;
+                file.seek(std::io::SeekFrom::End(0)).await?;
+                let mut reader = tokio::io::BufReader::new(file);
+                let mut line = String::new();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = interrupted.notified() => detached!(),
+                        res = reader.read_line(&mut line) => {
+                            if res? == 0 {
+                                // The idle wait is a select ARM, not an awaited
+                                // body, so the interrupt stays live through it.
+                                tokio::select! {
+                                    biased;
+                                    _ = interrupted.notified() => detached!(),
+                                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                                }
+                                continue;
+                            }
+                            eprintln!("{}", line.trim_end());
+                            line.clear();
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // The same window while waiting for the file to appear: a daemon
+                // that is slow to start must not make ctrl-c inert either.
+                tokio::select! {
+                    biased;
+                    _ = interrupted.notified() => detached!(),
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                }
+                continue;
+            }
+        }
+    }
+}
+
+/// this terminal. The detached child writes the pidfile and serves; its console
+/// output goes to {config}/daemon.log so `filament logs` can follow it. The
+/// detach itself is one portable operation in `platform::spawn_detached`, whose
+/// two arms ship together (#215 was the half-written version: the Windows arm
+/// computed the log path and threw it away).
+async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let log_path = crate::platform::Paths::config_path("daemon.log");
+    let dir_arg: Option<String> = dir.as_deref().and_then(|d| d.to_str()).map(str::to_string);
+    let mut args: Vec<&str> = vec!["up", "--server", server];
+    if let Some(d) = dir_arg.as_deref() {
+        args.push("--dir");
+        args.push(d);
+    }
+    let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
+    // Let the child write its pidfile before we return; poll briefly.
+    let mut came_up = false;
+    for _ in 0..50 {
+        if daemon_alive().is_some() {
+            came_up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child;
+    if came_up {
+        ui::say(&format!(
+            "  {} daemon detached (pidfile at {}) - output: {}",
+            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+            pidfile().display(),
+            log_path.display()
+        ));
+    } else {
+        ui::say(&format!(
+            "  {} spawned the daemon but it did not come up within 5s - output: {}",
+            ui::paint(ui::Tone::Warn, "!"),
+            log_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Stop the daemon through its service manager, if one owns it. Returns true
+/// only when a manager stop actually succeeded. The system and per-user
+/// systemd units are tried first, then launchd on macOS; a box where the
+/// daemon is not a managed service (a foreground `up`, no systemd) falls back
+/// to a plain kill.
+/// Which systemd manager owns a daemon pid, if any. Two units can share the
+/// name `filament.service` (a system unit and a per-user unit under Linger),
+/// so the cgroup's SCOPE, not the unit name, decides which manager to ask:
+///   system unit:  /system.slice/filament.service
+///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/filament.service
+/// The unit name is matched as a cgroup segment (`/filament.service`), never as
+/// a substring, so a neighbouring unit (`my-filament.service`) cannot collide.
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceManager {
+    SystemdSystem,
+    SystemdUser,
+}
+
+fn service_manager_for_cgroup(cg: &str) -> Option<ServiceManager> {
+    // The unit name is matched as a cgroup segment (`/filament.service`), never
+    // as a substring, so a neighbouring unit (`my-filament.service`) cannot
+    // collide. The scope decides which manager.
+    if cg.contains("/system.slice/filament.service") {
+        return Some(ServiceManager::SystemdSystem);
+    }
+    if cg.contains("/app.slice/filament.service") && cg.contains("/user.slice/") {
+        return Some(ServiceManager::SystemdUser);
+    }
+    None
+}
+
+fn service_manager_for_pid(pid: u32) -> Option<ServiceManager> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .ok()
+            .and_then(|cg| service_manager_for_cgroup(&cg))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn stop_managed_service(pid: u32) -> bool {
+    // Only stop through the manager when THIS daemon is actually the managed
+    // unit's process, AND the right manager. `systemctl stop filament` stops
+    // the named unit even when down targets a DIFFERENT daemon (a detached
+    // foreground `up` on another config), which killed another machine's
+    // service during development. Two units share the name here, so the cgroup
+    // scope decides which manager.
+    match service_manager_for_pid(pid) {
+        Some(ServiceManager::SystemdSystem) => {
+            std::process::Command::new("systemctl")
+                .args(["stop", "filament"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        Some(ServiceManager::SystemdUser) => {
+            std::process::Command::new("systemctl")
+                .args(["--user", "stop", "filament"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        // Not a managed daemon (a detached foreground `up`, or no systemd):
+        // the caller falls back to a plain kill.
+        None => false,
     }
 }
 
@@ -6009,6 +6862,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         roster: HashMap::new(),
         suppressed_digest_adoptions: HashSet::new(),
         active: None,
+        active_binding: None,
         next_gen: 0,
         rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
         chunk_size: net::MAX_DC_PAYLOAD,
@@ -6030,6 +6884,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     direct_endpoint: None,
     warm_hold: WarmHold::default(),
     worker_port_tx: HashMap::new(),
+    roster_pushed: None,
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -6267,6 +7122,75 @@ fn cancelled() -> anyhow::Error {
     anyhow!("cancelled")
 }
 
+/// `add` was handed an invitation instead of a pairing code. One source for the
+/// sentence so the test and the error cannot drift apart.
+/// What the bare `filament` screen offers, given what this machine actually has.
+///
+/// Extracted so #194 can be pinned without driving a terminal: the bug was a
+/// menu that contradicted the header printed directly above it.
+fn first_screen_actions(owner: bool, joined: bool, device_count: usize) -> Vec<(&'static str, &'static str)> {
+    if owner {
+        vec![
+            ("Send something", "send"),
+            ("Receive something", "receive"),
+            ("Mount remote files", "mount"),
+            ("Connect a device with me now", "add"),
+            ("Invite a device or person", "add --for"),
+            ("Serve in the background", "up --install"),
+            ("See every device", "devices"),
+            ("View my identity", "id"),
+        ]
+    } else if joined {
+        vec![
+            ("Send something", "send"),
+            ("Receive something", "receive"),
+            ("Mount remote files", "mount"),
+            ("See every device", "devices"),
+            ("View my joined identity", "id"),
+        ]
+    } else if device_count == 0 {
+        vec![
+            ("Set up this first device", "init"),
+            // #209: there are TWO ways to be brought into an identity. `add`
+            // mints a pairing code claimed with `add <code>`; `add --for` mints
+            // a bounded invitation claimed with `join`. This menu offered only
+            // the second, so someone holding a pairing code, which is the path
+            // the OWNER side presents first as "Connect a device with me now",
+            // had no entry here and had to know to type it. #198's shape: two
+            // mint paths, and the claim surface grew only one of them.
+            ("Pair with a code I was given", "add"),
+            ("Join with an invitation", "join"),
+            ("Receive a one-time transfer", "receive"),
+        ]
+    } else {
+        // #194: this branch is about having no IDENTITY, not about being the
+        // first device. A machine paired by code has peers in devices.json
+        // and no identity of its own, so the header counted "2 DEVICES"
+        // directly above an item reading "Set up this first device". The
+        // owner hit exactly that and called it strange, which it is.
+        //
+        // Say what is actually missing, and offer what already works: those
+        // peers are reachable right now, so hiding `send` and `devices`
+        // behind a setup step nobody needs is its own small lie.
+        vec![
+            ("Send something", "send"),
+            ("Receive something", "receive"),
+            ("See every device", "devices"),
+            ("Create an identity for this device", "init"),
+            ("Pair with a code I was given", "add"), // #209, as above
+            ("Join with an invitation", "join"),
+        ]
+    }
+}
+
+fn invitation_not_a_code_msg() -> String {
+    "that is an invitation, not a pairing code.\n  \
+     Run `filament join` and paste it at the prompt; it is cleared from the terminal after reading.\n  \
+     If you saved it to a file: `filament join --invite-file <path>`.\n  \
+     Invitation material is deliberately never read from the command line, where it would land in `ps` output and shell history."
+        .to_string()
+}
+
 async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
@@ -6373,6 +7297,16 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     let mut my_nameplate;
     match &code {
         Some(c) => {
+            // An INVITATION is not a pairing code, and pasting one here is the
+            // obvious mistake: `add --for` prints the token on screen beside a
+            // QR, so the natural next move is to paste it into the verb that
+            // just produced it. Without this the token is sent as a nameplate,
+            // the server rejects it, and the user is told "codes burn after one
+            // use" about a token that was never claimed, with a remedy
+            // (`re-run filament add`) that mints a code and cannot help.
+            if c.starts_with("filament-invite:") {
+                bail!("{}", invitation_not_a_code_msg());
+            }
             // Claimer: normalize the typed code, split, send ONLY the nameplate.
             let normalized = crate::pake::norm_code(c);
             let (np, pw) = crate::pake::split_code(&normalized);
@@ -6988,6 +7922,27 @@ enum DirectIntent {
     Promote,
 }
 
+/// #246: a link is dead only when nothing is serving AND its WebRTC peer is
+/// not still making progress. `peer_live` is `Peer::is_live` (anything but
+/// Failed/Closed); `transport_dead` and `workers_all_dead` describe the direct
+/// transports. A WebRTC link that just finished `establish` is
+/// (peer_live=true, transport dead, workers empty) and therefore alive: it has
+/// no transport or workers YET, but its ICE agent is working. Named as a
+/// function so the decision is one expression, unit-testable, and stable
+/// across call sites.
+fn link_dead_for(peer_live: bool, transport_dead: bool, workers_all_dead: bool) -> bool {
+    !peer_live && transport_dead && workers_all_dead
+}
+
+/// #246: a link counts as live when any transport serves, any worker serves,
+/// or the WebRTC peer is still making progress. The peer clause is what lets a
+/// Normal re-dial yield to an establish that is still underway instead of
+/// arming a fresh direct attempt (whose fallback timer would then tear the
+/// establish down).
+fn link_has_live_for(peer_live: bool, primary_ok: bool, workers_ok: bool) -> bool {
+    peer_live || primary_ok || workers_ok
+}
+
 struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
     /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
@@ -7171,7 +8126,7 @@ struct RejoinState {
 }
 
 /// WARM-HOLD state: keeps connections alive to recently-used and explicitly
-/// configured peers so `filament ping`/`ssh` is instant.
+/// configured peers so `filament reach`/`ssh` is instant.
 ///
 /// Design:
 /// - EXPLICIT peers: from `filament set warm-peers dovm,popos` (always connected)
@@ -7569,6 +8524,19 @@ fn match_adoption_source(suppressed: &mut HashSet<String>, peer_id: &str, source
     }
 }
 
+fn active_binding_matches(
+    binding: &(String, Option<String>),
+    peer_id: &str,
+    peer_uid: Option<&str>,
+) -> bool {
+    binding.0 == peer_id
+        || binding
+            .1
+            .as_deref()
+            .zip(peer_uid)
+            .is_some_and(|(bound, candidate)| bound == candidate)
+}
+
 struct Conn {
     server: String,
     sio: rust_socketio::asynchronous::Client,
@@ -7583,6 +8551,9 @@ struct Conn {
     /// clears these; digest reconciliation skips them.
     suppressed_digest_adoptions: HashSet<String>,
     active: Option<String>,        // the transfer-target sid (send side)
+    /// A code-claimed receive is bound to the peer that completed PAKE. The sid
+    /// may change on signaling reconnect, so retain its install uid as well.
+    active_binding: Option<(String, Option<String>)>,
     next_gen: u32,
     /// Peer-absence / rejoin-grace state (the reconnect window + declared brb).
     rejoin: RejoinState,
@@ -7626,7 +8597,7 @@ struct Conn {
     /// was created (peer's re-dial after a mid-transfer death). Same class as Bug
     /// 1 (pre-PAKE offers): buffered here and replayed once `start_direct` creates
     /// the pending. pid → (candidates, srflx).
-    buffered_offers: HashMap<String, (Vec<String>, Option<String>)>,
+    buffered_offers: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)>,
     /// RESILIENCE bookkeeping (stall/relay/warm/upgrade); see ResilienceState.
     resil: ResilienceState,
     /// Is the rung-1 direct-QUIC path allowed for THIS session? Normally this is
@@ -7653,7 +8624,7 @@ struct Conn {
     /// when multi-streaming is disabled (`direct_streams() == 1`).
     direct_endpoint: Option<quinn::Endpoint>,
     /// WARM-HOLD: keeps connections alive to recently-used and explicitly
-    /// configured peers so `filament ping`/`ssh` is instant. Tracked per-peer
+    /// configured peers so `filament reach`/`ssh` is instant. Tracked per-peer
     /// with LRU eviction and exponential backoff on failures.
     warm_hold: WarmHold,
     /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
@@ -7661,6 +8632,10 @@ struct Conn {
     /// `worker-ports` control message handler delivers the acceptor's port list
     /// through it. Removed by the receiver on delivery (one-shot).
     worker_port_tx: HashMap<String, oneshot::Sender<Vec<u16>>>,
+    /// Owner-only roster push bookkeeping: the (epoch, valid_until) last pushed
+    /// and the live links it reached, so a re-push fires only on a membership
+    /// change (new epoch), a validity refresh (new valid_until), or a new link.
+    roster_pushed: Option<(u64, u64, HashSet<String>)>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -7758,6 +8733,18 @@ struct DirectPending {
     /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
     #[allow(dead_code)]
     my_srflx: Option<std::net::SocketAddr>,
+    /// #237: the server-asserted (whoami) public candidate the PEER advertised in
+    /// its transport-offer, when the peer adopted one (None when the peer had
+    /// already observed OUR address, suppressed whoami, or was answered a local
+    /// address). This is the candidate OUR race actually dialed, so it is the one
+    /// the relay-fallback attribution may honestly name as "never answered".
+    peer_server_public: Option<String>,
+    /// #237: set true at the dial site exactly when the race dialed THE PEER'S
+    /// CLAIMED server-asserted address (see `dials_claimed`), never for a dial
+    /// of any other candidate and never for a knob that skips the dials. The
+    /// attribution says "dialed and never answered" only when this is true, so
+    /// the sentence is bound to the address it names.
+    server_public_dialed: Arc<AtomicBool>,
     /// P5 (GAP-6): this is a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE a live relay link (not the cold establishment path). When the
     /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
@@ -7799,6 +8786,7 @@ impl Conn {
             roster: HashMap::new(),
             suppressed_digest_adoptions: HashSet::new(),
             active: None,
+            active_binding: None,
             next_gen: 0,
             rejoin: RejoinState { waiting_rejoin: None, rejoin_window: REJOIN_WINDOW, away: None },
             chunk_size: net::MAX_DC_PAYLOAD,
@@ -7820,6 +8808,7 @@ impl Conn {
             direct_endpoint: None,
             warm_hold: WarmHold::default(),
             worker_port_tx: HashMap::new(),
+            roster_pushed: None,
         }
     }
 
@@ -7840,6 +8829,52 @@ impl Conn {
     }
     fn transport_of(&self, pid: &str) -> Option<Arc<dyn Transport>> {
         self.links.get(pid).and_then(|l| l.transport.clone())
+    }
+
+    /// Owner-only: mint the current roster and push it to every live link whose
+    /// view is stale (membership changed = new epoch, validity refreshed = new
+    /// valid_until, or a newly-established link). A push that fails is dropped
+    /// silently here; the next tick re-tries because `roster_pushed` still holds
+    /// the old mark, so a lost push is not a fact we swallow.
+    async fn roster_maintenance(&mut self) {
+        let Some(owner) = load_owner_key() else { return };
+        let now = identity::now_secs();
+        let Ok((blob, _changed)) = crate::roster::mint_roster(&owner, now) else { return };
+        let epoch = blob["epoch"].as_u64().unwrap_or(0);
+        let until = blob["valid_until"].as_u64().unwrap_or(0);
+        let live: HashSet<String> = self
+            .links
+            .iter()
+            .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        let should_push = match &self.roster_pushed {
+            None => true,
+            Some((e, u, pids)) => *e != epoch || *u != until || *pids != live,
+        };
+        if !should_push {
+            return;
+        }
+        let mut msg = blob.clone();
+        msg["type"] = json!("roster");
+        let mut pushed_to: HashSet<String> = HashSet::new();
+        for pid in &live {
+            if let Some(t) = self.transport_of(pid) {
+                if t.send_control(&msg).await.is_ok() {
+                    pushed_to.insert(pid.clone());
+                }
+            }
+        }
+        if pushed_to.len() != live.len() {
+            // A failed push is a fact worth surfacing: a spoke that missed it
+            // stays stale until the next successful push. Re-tried next tick.
+            let missed = live.len() - pushed_to.len();
+            ui::say(&format!(
+                "  {} roster push did not reach {missed} device(s); will retry",
+                ui::paint(ui::Tone::Warn, ui::glyph_warn())
+            ));
+        }
+        self.roster_pushed = Some((epoch, until, pushed_to));
     }
 
     /// #28: is the link keyed by `pid` actively moving transfer bytes right now?
@@ -7880,6 +8915,32 @@ impl Conn {
 
     fn adoption_allowed(&mut self, peer_id: &str, source: AdoptSource) -> bool {
         match_adoption_source(&mut self.suppressed_digest_adoptions, peer_id, source)
+    }
+
+    fn bind_active(&mut self, peer_id: &str) {
+        let uid = self
+            .links
+            .get(peer_id)
+            .and_then(|link| link.uid.clone())
+            .or_else(|| {
+                self.roster
+                    .get(peer_id)
+                    .and_then(|peer| peer["uid"].as_str().map(String::from))
+            });
+        self.active_binding = Some((peer_id.to_string(), uid));
+        self.active = Some(peer_id.to_string());
+        self.rejoin.waiting_rejoin = None;
+    }
+
+    fn is_bound_active_peer(&self, peer_id: &str) -> bool {
+        let uid = self
+            .links
+            .get(peer_id)
+            .and_then(|link| link.uid.as_deref())
+            .or_else(|| self.roster.get(peer_id).and_then(|peer| peer["uid"].as_str()));
+        self.active_binding
+            .as_ref()
+            .is_some_and(|binding| active_binding_matches(binding, peer_id, uid))
     }
 
     /// Track a roster entry and (re)connect to it. `want_active` marks it as
@@ -7959,7 +9020,18 @@ impl Conn {
             .active
             .as_ref()
             .is_some_and(|a| self.deferred_left.contains_key(a));
-        if want_active && (self.active.is_none() || active_deferred) && self.targetable(&name, peer_uid.as_deref()) {
+        let binding_allows = self
+            .active_binding
+            .as_ref()
+            .is_none_or(|binding| active_binding_matches(binding, &peer_id, peer_uid.as_deref()));
+        if want_active && !binding_allows {
+            ui::debug("filament: ADOPT refused: peer is not the authenticated code sender");
+        }
+        if want_active
+            && binding_allows
+            && (self.active.is_none() || active_deferred)
+            && self.targetable(&name, peer_uid.as_deref())
+        {
             // Claiming the slot from a deferred link: discharge that link now
             // (it left the room and is being replaced) so reap doesn't later
             // re-inject a stale peer-left against the slot the new peer holds.
@@ -7971,21 +9043,32 @@ impl Conn {
                 }
             }
             self.active = Some(peer_id.clone());
+            if let Some(binding) = self.active_binding.as_mut() {
+                binding.0 = peer_id.clone();
+            }
             self.rejoin.waiting_rejoin = None;
         }
         Ok(self.is_active(&peer_id))
     }
 
-    /// A link is "live" if its primary transport or any worker is still alive.
-    /// Restored: the pending-only guard made it briefly dead, but promotion
-    /// intent needs it back. Every caller EXCEPT a deliberate promotion must
-    /// leave a live link alone, which is what warm-hold depends on.
+    /// A link is "live" if its primary transport or any worker is still alive,
+    /// or its WebRTC peer is still making progress (#246). Restored: the
+    /// pending-only guard made it briefly dead, but promotion intent needs it
+    /// back. Every caller EXCEPT a deliberate promotion must leave a live link
+    /// alone, which is what warm-hold depends on.
     fn has_live_transport(&self, pid: &str) -> bool {
         self.links.get(pid)
             .map(|l| {
+                // #246: a link mid-establish (peer present, ICE still working
+                // toward Connected) is making progress even before any
+                // transport/worker exists. Counting it as live is what lets a
+                // Normal re-dial yield to the in-flight establish instead of
+                // arming a fresh direct attempt whose 5s fallback timer then
+                // tears that establish down at the moment it is about to win.
+                let peer_live = l.peer.as_ref().map(|p| p.is_live()).unwrap_or(false);
                 let primary_ok = l.transport.as_ref().map(|t| !t.is_dead()).unwrap_or(false);
                 let workers_ok = l.workers.iter().any(|w| !w.is_dead());
-                primary_ok || workers_ok
+                link_has_live_for(peer_live, primary_ok, workers_ok)
             })
             .unwrap_or(false)
     }
@@ -8437,8 +9520,22 @@ impl Conn {
         }
         // A probe expects a relay link to be present (it's the one we'd upgrade
         // AWAY from); only the cold path bails when a link already exists.
+        // #246: a link without a transport and without workers is NOT
+        // necessarily dead. A WebRTC link that just finished `establish` has
+        // exactly that shape: peer present, ICE gathering, presence
+        // Connecting. Judging it dead here is what destroyed the in-flight
+        // ICE agent about a second into the relay fallback, on every 5s direct
+        // retry, forever. A link is dead only when BOTH nothing is serving AND
+        // its peer has reached a terminal state (Failed/Closed) or is absent.
         let link_dead = self.links.get(pid)
-            .map(|l| l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true) && l.workers.iter().all(|w| w.is_dead()))
+            .map(|l| {
+                let peer_live = l.peer.as_ref().map(|p| p.is_live()).unwrap_or(false);
+                link_dead_for(
+                    peer_live,
+                    l.transport.as_ref().map(|t| t.is_dead()).unwrap_or(true),
+                    l.workers.iter().all(|w| w.is_dead()),
+                )
+            })
             .unwrap_or(false);
         if link_dead {
             // The link is already dead, so destroying it loses nothing. Its
@@ -8473,6 +9570,17 @@ impl Conn {
         }
         // A live link is a REASON TO STOP for everyone except a deliberate
         // promotion. Promotion is the one caller that intends to replace it.
+        // #246: `has_live_transport` now counts a mid-establish WebRTC peer as
+        // live, so a Normal re-dial YIELDS to an establish that is still
+        // making progress instead of arming a fresh direct attempt whose own
+        // 5s fallback timer would then re-enter `establish` at the same cursor
+        // and swap the still-establishing link. That is the livelock relocated
+        // rather than removed, which is why both gates are needed. Promote
+        // bypasses on purpose (it is the one caller that intends to displace a
+        // live link, and its teardown is the designed Option A), and Probe
+        // bypasses on purpose (it dials ALONGSIDE the serving relay link and
+        // never touches `links`, so it cannot disturb an establish it did not
+        // create).
         if intent == DirectIntent::Normal && self.has_live_transport(pid) {
             return; // already linked via a live transport
         }
@@ -8518,7 +9626,13 @@ impl Conn {
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
 
-        let (cands, srflx) = if is_local {
+        // #237: gather_candidates is the ONE computation of both the candidate
+        // set and the server-asserted address adopted into it (Some exactly
+        // when a server-chosen address was pushed and no peer had observed us
+        // yet). The offer carries that value to the peer so the PEER's race can
+        // dial it and, if it never answers, name it at ITS fallback decision.
+        // No second copy of the rule exists to desynchronize.
+        let (cands, server_public, srflx) = if is_local {
             // For local peers, ensure we have a listener and return TCP candidate.
             if self.local_port.is_none() {
                 let (listener, port) = crate::local::listen_local().await.unwrap();
@@ -8526,7 +9640,7 @@ impl Conn {
                 self.local_port = Some(port);
             }
             let cands = vec![format!("{{\"type\":\"tcp-localhost\",\"port\":{}}}", self.local_port.unwrap())];
-            (cands, None)
+            (cands, None, None)
         } else {
             let srflx_fut = async {
                 if holepunch::holepunch_enabled() {
@@ -8535,7 +9649,9 @@ impl Conn {
                     None
                 }
             };
-            tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut)
+            let ((cands, server_public), srflx) =
+                tokio::join!(direct::gather_candidates(&self.server, port), srflx_fut);
+            (cands, server_public, srflx)
         };
 
         let (punch_sock, my_srflx) = match srflx {
@@ -8545,9 +9661,25 @@ impl Conn {
 
         // transport-offer rides the OPAQUE signaling relay (same channel as ICE
         // signals); the server cannot read or forge it without failing the MAC.
-        let mut offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
+        let mut offer = json!({ "type": "transport-offer", "v": 1, "proto": 2, "addrs": cands });
         if let Some(s) = my_srflx {
             offer["srflx"] = json!(s.to_string());
+        }
+        // #237: the candidate this offer adopts on the server's say-so alone.
+        // The peer dials it; if it never answers, the peer's fallback can name
+        // exactly this address instead of claiming a cause it never dialed.
+        if let Some(s) = server_public {
+            // Test-only (gate C-negative/mismatch): advertise a server_public
+            // label that is NOT the dialed candidate, modelling a peer (or
+            // adversarially-mislabeled offer) whose claimed address is not in
+            // its addrs. The peer that dials THIS offer's addrs must NOT name
+            // this label on fallback - it never dialed 8.8.8.8:53.
+            let tag = if std::env::var("FILAMENT_DIRECT_SERVER_PUBLIC_MISMATCH").map(|v| v == "1").unwrap_or(false) {
+                "8.8.8.8:53".to_string()
+            } else {
+                s
+            };
+            offer["server_public"] = json!(tag);
         }
         // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
         // too, its winning side then posts Ev::DirectUpgradeReady (verify-before-
@@ -8607,6 +9739,12 @@ impl Conn {
                 endpoint: ep,
                 punch_sock,
                 my_srflx,
+                // #237: the peer's server-asserted candidate arrives with its transport-offer
+                // (on_transport_offer fills it); at insert time no offer has
+                // arrived yet. The per-address dial gate starts false and flips
+                // only when the race dials exactly the claimed address.
+                peer_server_public: None,
+                server_public_dialed: Arc::new(AtomicBool::new(false)),
                 probe,
             },
         );
@@ -8618,9 +9756,9 @@ impl Conn {
         }
         // Bug 2: replay any transport-offers that were buffered while we had
         // no DirectPending (the sender re-dialed after a mid-transfer death).
-        if let Some((cands, srflx)) = self.buffered_offers.remove(pid) {
+        if let Some((cands, srflx, server_public, proto)) = self.buffered_offers.remove(pid) {
             ui::debug(&format!("replaying buffered transport-offer from {pid}"));
-            self.on_transport_offer(pid, cands, srflx);
+            self.on_transport_offer(pid, cands, srflx, server_public, proto);
         }
     }
 
@@ -8653,12 +9791,37 @@ impl Conn {
     /// and haven't started the race yet, consume the endpoint and spawn the
     /// simultaneous-open + auth race; the winner posts Ev::DirectReady (or, for an
     /// upgrade probe, Ev::DirectUpgradeReady, verify-before-upgrade).
-    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
+    /// `peer_server_public`/`peer_proto` come from the peer's transport-offer
+    /// (#237): the server-asserted candidate the peer adopted (which OUR race
+    /// will dial) and the protocol version that gates the observed-address
+    /// exchange.
+    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>, peer_server_public: Option<String>, peer_proto: u8) {
         let Some(p) = self.direct_pending.get_mut(pid) else { return };
         if p.racing {
             return;
         }
         let Some(ep) = p.endpoint.take() else { return };
+        // #237: record what the peer advertised on the server's say-so, BEFORE the
+        // race consumes the endpoint. The claim is WIRE DATA and untrusted:
+        // it only becomes a fact when the race dials that exact address (the
+        // dial site sets server_public_dialed, nothing else can).
+        let peer_name = p.secret.0.clone();
+        // An unparseable claim can never be dialed (there is no such address);
+        // passing None keeps it silent, which is the safe direction.
+        let peer_claimed = peer_server_public.as_deref().and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+        let server_public_dialed = p.server_public_dialed.clone();
+        p.peer_server_public = peer_server_public;
+        // #237 (mixed-fleet): a peer running an older build (no `proto` >= 2 in
+        // its offer) gets a clear sentence instead of a hang or a mismatch. The
+        // observed-address exchange is skipped on BOTH sides (the race below is
+        // told `exchange=false`, so the stream stays byte-identical to the old
+        // protocol and the direct link still forms). A refusal without a
+        // sentence is just a support mystery; this is the sentence.
+        if peer_proto < 2 {
+            crate::ui::say(&format!(
+                "peer {peer_name} is running an older build without the direct address exchange; link still works, address supersession skipped"
+            ));
+        }
         p.racing = true;
         let secret = p.secret.1.clone();
         // P5 (GAP-6): is THIS the upgrade-probe pending? Then the winner posts
@@ -8672,6 +9835,11 @@ impl Conn {
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
+        // #237: the observed-address exchange runs only when BOTH ends agreed
+        // (our build is proto 2, so the negotiator is the peer's advertised
+        // version). The peer computes the same boolean from OUR offer, so both
+        // sides skip or both sides run - never one of each.
+        let exchange = peer_proto >= 2;
         let peer_uid = self.roster.get(pid).and_then(|info| info["uid"].as_str()).map(str::to_owned);
         let Some(peer_uid) = peer_uid else {
             eprintln!("direct role election deferred for {pid}: no peer UID");
@@ -8711,7 +9879,7 @@ impl Conn {
             // derived inside the race from both endpoint identity tuples, so the
             // connector and offer-receiver cannot drift via caller literals.
             if let Some(t) =
-                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone()).await
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), my_uid.clone(), peer_uid.clone(), my_id.clone(), tx.clone(), exchange, peer_claimed, server_public_dialed.clone()).await
             {
                 let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
@@ -8733,6 +9901,12 @@ impl Conn {
                         peer_uid.clone(),
                         my_id.clone(),
                         tx.clone(),
+                        exchange,
+                        // The punched race dials ONLY the srflx, never the
+                        // claimed server-asserted address, so it cannot set the
+                        // flag that would let the fallback name that address.
+                        None,
+                        server_public_dialed.clone(),
                     )
                     .await
                     {
@@ -8970,11 +10144,31 @@ impl Conn {
                     .get(&pid)
                     .cloned()
                     .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
-                // DEBUG, resilience internal (direct→WebRTC fallback).
-                ui::debug(&format!(
-                    "filament: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
-                    p.secret.0
-                ));
+                // Gate C (#237): the fallback is now ATTRIBUTED - and only when the
+                // attribution is TRUE. The decision to use the relay names the
+                // peer's claimed server-asserted public candidate only when the
+                // race actually DIALED THAT EXACT ADDRESS (the dial site set
+                // server_public_dialed; nothing else can). The claim is wire
+                // data and untrusted: absent a dial of the named address,
+                // "never answered" would blame a sentence rather than a fact -
+                // whether the claim was never in the candidate set, never
+                // parsed, or the budget went to other dials. All of those stay
+                // silent at default verbosity: the infinite negative run stays
+                // quiet, and a fallback with an unrelated cause - or a lying
+                // label - never names a cause it has not established.
+                let attributed = p.peer_server_public.as_ref().filter(|_| p.server_public_dialed.load(Ordering::Relaxed));
+                match attributed {
+                    Some(sp) => crate::ui::say(&format!(
+                        "falling back to relay: the public address from the server ({sp}) never answered"
+                    )),
+                    None => {
+                        // DEBUG, resilience internal (direct→WebRTC fallback).
+                        ui::debug(&format!(
+                            "filament: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
+                            p.secret.0
+                        ))
+                    }
+                }
                 fell_back.push((pid, info, p.secret));
             }
         }
@@ -10188,10 +11382,8 @@ async fn handle_warm_req(
         // Reconfigure is handled inline in the daemon loop (it mutates loop state),
         // so it never reaches this dispatcher; answer defensively if it ever does.
         ctl::ReqKind::Reconfigure { .. } => req.reply(&json!({ "ok": true, "live": false })).await,
-        ctl::ReqKind::Arm { key_id, expiry } => {
-            crate::ephemeral::arm(key_id.clone(), *expiry);
-            req.reply(&json!({ "ok": true })).await;
-        }
+        // ReqKind::Arm is gone: the mint writes armed.json directly (no IPC),
+        // and the per-tick arm-gate reads it. See cli/src/armed.rs.
         // ReloadExpose is likewise handled inline in the daemon loop (it owns the
         // Exposer); answer defensively if it ever reaches here.
         ctl::ReqKind::ReloadExpose => req.reply(&json!({ "ok": true, "live": false, "count": 0 })).await,
@@ -10286,7 +11478,7 @@ async fn handle_mount(
         if relay {
             proxy.push_str(" --relay");
         }
-        proxy.push_str(&format!(" netcat {peer_name} {}", info.rport));
+        proxy.push_str(&format!(" forward {peer_name}:{} --stdio", info.rport));
         args.push("-o".into());
         args.push(format!("ProxyCommand={proxy}"));
         format!("{}@{}", info.login, info.host)
@@ -10423,7 +11615,7 @@ async fn handle_mount_health(req: ctl::Req, daemon_mounts: &DaemonMounts) {
 }
 
 /// Is something listening on this host's own loopback `port` - i.e. an sshd a
-/// `filament ssh` initiator could actually reach? A fast connect probe: a
+/// `filament shell --ssh` initiator could actually reach? A fast connect probe: a
 /// successful connect means a listener (we close it at once); refused/timeout
 /// means nothing is there. Reported in the shell-bootstrap ack so the initiator
 /// fails fast with a clear message instead of ssh hanging on a dead port.
@@ -10451,7 +11643,7 @@ async fn sshd_listening(port: u16) -> bool {
     false
 }
 
-/// Answer a `filament ping`: report the daemon's warm link to `peer` (route,
+/// Answer a `filament reach`: report the daemon's warm link to `peer` (route,
 /// remote address, RTT, verified name). Synchronous - every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
@@ -10620,7 +11812,7 @@ async fn handle_warm_open(
 }
 
 /// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
-/// client's stdio socket (the `filament pty` fast path). Records the session->sid
+/// client's stdio socket (the `filament shell` fast path). Records the session->sid
 /// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
 #[cfg(unix)]
 async fn handle_warm_pty(
@@ -10709,7 +11901,7 @@ type PendingBootstraps =
 
 /// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
 /// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
-/// big win for `filament ssh` (pty already rode the warm link; the bootstrap was
+/// big win for `filament shell --ssh` (pty already rode the warm link; the bootstrap was
 /// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
 /// socket; the ack/deny handler completes it. A miss falls the client back to the
 /// cold `shell_bootstrap`.
@@ -11033,35 +12225,24 @@ async fn main() -> Result<()> {
         let header = format!("FILAMENT  /  {device_count} DEVICES  /  {availability}");
         let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
         let joined = !owner && local_device_cert().is_some();
-        let actions: Vec<(&str, &str)> = if owner {
-            vec![
-                ("Send something", "send"),
-                ("Receive something", "receive"),
-                ("Mount remote files", "mount"),
-                ("Connect another device", "add"),
-                ("Serve in the background", "up --install"),
-                ("See every device", "devices"),
-                ("View my identity", "id"),
-            ]
-        } else if joined {
-            vec![
-                ("Send something", "send"),
-                ("Receive something", "receive"),
-                ("Mount remote files", "mount"),
-                ("See every device", "devices"),
-                ("View my joined identity", "id"),
-            ]
-        } else {
-            vec![
-                ("Set up this first device", "init"),
-                ("Join with an invitation", "join"),
-                ("Receive a one-time transfer", "receive"),
-            ]
-        };
+        let actions = first_screen_actions(owner, joined, device_count);
         let labels = actions.iter().map(|(label, _)| (*label).to_string()).collect::<Vec<_>>();
         match codeentry::pick(&header, &labels)? {
-            Some(index) => argv.push(actions[index].1.to_string()),
-            None => return tour_cmd(),
+            Some(index) => argv.extend(
+                actions[index]
+                    .1
+                    .split_whitespace()
+                    .map(str::to_string),
+            ),
+            // #209: Ctrl-C means stop. Answering it with the full
+            // status-and-help screen reads as "I picked the first item and got a
+            // help page", which is what the owner reported on Windows. Exit
+            // quietly, status 0, printing nothing.
+            //
+            // This arm was mostly unreachable until #203 made cancelling work,
+            // so fixing cancel is what turned a bad destination into a live one.
+            // Every other `None =>` on a picker deserves the same second look.
+            None => return Ok(()),
         }
     }
     let cli = Cli::parse_from(argv);
@@ -11179,7 +12360,7 @@ async fn main() -> Result<()> {
                 let Some((_, secret)) = entry else {
                     bail!("no device named '{name}', see `filament devices`");
                 };
-                let caps = device_caps(&name).unwrap_or_else(|| vec!["transfer".to_string()]);
+                let caps = effective_device_caps(&name);
                 let channel = channel_of(secret);
                 // Load lastSeen and overlay addresses from the device store.
                 let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
@@ -11330,7 +12511,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, system, userspace, dir, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback } => {
+        Cmd::Up { install, system, detach, userspace, dir, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback } => {
             // `--userspace` forces the netstack backend; L3::start reads this env, so
             // set it before the daemon brings L3 up (same process). Safe: single
             // threaded at this point (the daemon's tasks are not spawned yet).
@@ -11348,10 +12529,11 @@ async fn main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
-            up_cmd(&server, install, system, dir, relay, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback).await
+            up_cmd(&server, install, system, detach, dir, relay, shell, shell_only, shell_program, shell_user, i_know, install_system, no_proxy_fallback).await
         }
         Cmd::Status { json } => status_cmd(json || ui_caps.json),
         Cmd::Down => { ui_caps.confirm("shut down the daemon")?; down_cmd() },
+        Cmd::Logs { follow, tail } => logs_cmd(follow, tail).await,
         Cmd::Reset => reset_cmd(&ui_caps),
         Cmd::Add { code, name, word, for_, allow, expires, out } => {
             if for_.is_some() {
@@ -11378,7 +12560,7 @@ async fn main() -> Result<()> {
                                 json!({
                                     "name": n,
                                     "channel": channel_of(s),
-                                    "caps": device_caps(n).unwrap_or_else(|| vec!["transfer".to_string()]),
+                                    "caps": effective_device_caps(n),
                                     "lastSeen": last_seen,
                                     "address": addr,
                                     "mesh": mesh,
@@ -11389,9 +12571,25 @@ async fn main() -> Result<()> {
                     } else {
                         let warm = ctl::try_list_warm().await;
                         let pending = ctl::try_list_pending().await;
+                        let now = identity::now_secs();
+                        // Honest roster heading: show the epoch and when it was
+                        // received, never "current"; and distinguish an expired
+                        // roster (stale in both directions) from one never seen.
+                        let roster_heading = match crate::roster::roster_staleness(now) {
+                            crate::roster::RosterStaleness::Fresh { epoch, received_at } => {
+                                let ago = now.saturating_sub(received_at);
+                                let ago = if ago < 60 { "just now".to_string() } else if ago < 3600 { format!("{}m ago", ago / 60) } else { format!("{}h ago", ago / 3600) };
+                                Some(format!("MESH  /  your owner's other devices (epoch {epoch}, received {ago})"))
+                            }
+                            crate::roster::RosterStaleness::Expired => Some(
+                                "MESH  /  your owner's other devices (roster expired; reconnect to the owner to refresh)".to_string(),
+                            ),
+                            crate::roster::RosterStaleness::None => None,
+                        };
                         let rendered = fleet_ui::devices::render_devices(
                             &device_entries(warm.as_ref()),
                             pending_request_count(pending.as_ref()),
+                            roster_heading,
                         );
                         println!("{rendered}");
                     }
@@ -11428,24 +12626,20 @@ async fn main() -> Result<()> {
                 Some(DevicesAction::Rename { old, new }) => {
                     // Rename in place on the raw record so caps/v2 fields ride
                     // along (remove+store dropped the renamed device's caps).
-                    let p = devices_path();
-                    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
-                        .ok()
-                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default();
-                    if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
-                        bail!("no device named '{old}', see `filament devices`");
-                    }
-                    if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
-                        bail!("'{new}' already exists, forget it first or pick another name");
-                    }
-                    for d in arr.iter_mut() {
-                        if d["name"].as_str() == Some(old.as_str()) {
-                            d["name"] = json!(new);
+                    with_devices_mut(|arr| {
+                        if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
+                            bail!("no device named '{old}', see `filament devices`");
                         }
-                    }
-                    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr)?)?;
+                        if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
+                            bail!("'{new}' already exists, forget it first or pick another name");
+                        }
+                        for d in arr.iter_mut() {
+                            if d["name"].as_str() == Some(old.as_str()) {
+                                d["name"] = json!(new);
+                            }
+                        }
+                        Ok(())
+                    })?;
                     println!("renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)");
                 }
                 Some(DevicesAction::Vouch { a, b }) => {
@@ -11518,6 +12712,19 @@ async fn main() -> Result<()> {
                 }
                 None => bail!("shell needs a device in non-interactive mode: filament shell <device>"),
             };
+            require_known_device(&peer)?;
+            // #219: a device whose invitation ceiling excludes shell can never
+            // serve one, and the denial was surfacing as a silent hang (the
+            // acceptor's l2-close is only sent when the acceptor is ON). Say so
+            // before opening anything, matching the #206 mount pre-check.
+            if let Some(caps) = principal_ceiling_for(&peer) {
+                if !caps.iter().any(|c| c == "shell") {
+                    bail!(
+                        "shell denied by {peer}: this device's invitation ceiling ({}) does not include shell",
+                        caps.join(", ")
+                    );
+                }
+            }
             if opened_flow {
                 eprintln!();
                 eprintln!("  {}", ui::paint(ui::Tone::Brand, "REMOTE TERMINAL"));
@@ -11545,24 +12752,57 @@ async fn main() -> Result<()> {
                 Some(d) if d.contains(':') => bail!(
                     "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `filament forward {d}`"
                 ),
-                Some(d) => crate::ping::ping_cmd(&server, &d, 1, json, relay).await,
+                Some(d) => {
+                    require_known_device(&d)?;
+                    // A mesh sibling is a known NAME (via the owner's roster) but
+                    // carries no channel, so there is nothing to probe. Say so
+                    // honestly instead of reporting "may be offline" (#240/#241
+                    // shape) about a device this side has never contacted.
+                    let roster_only = crate::roster::roster_device_names().iter().any(|n| n == &d)
+                        && !devices_load().iter().any(|(n, _)| n == &d);
+                    if roster_only {
+                        // Human narration goes through ui::, not println!: this is
+                        // stderr for a person, and println! would put it on stdout
+                        // where a script parsing `reach` output would collect it.
+                        ui::say(&format!("{} {}", ui::paint(ui::Tone::Dim, "filament reach →"), ui::paint(ui::Tone::Brand, &d)));
+                        ui::say(&format!(
+                            "  {} {}",
+                            ui::paint(ui::Tone::Brand, ui::glyph_mesh()),
+                            ui::paint(ui::Tone::Dim, "in your mesh via the owner's roster; sibling connections are not in this release")
+                        ));
+                        return Ok(());
+                    }
+                    crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                }
                 None => bail!("reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."),
             }
         },
-        Cmd::Forward { target, lport, socks, port, bind, http_port } => {
-            if socks {
+        Cmd::Forward { target, lport, stdio, socks, port, bind, http_port } => {
+            let (peer, rport) = match target.split_once(':') {
+                Some((p, r)) => (
+                    p.to_string(),
+                    r.parse().map_err(|_| anyhow!("invalid port in '{target}'; expected <device>:<port>"))?,
+                ),
+                None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
+            };
+            if stdio {
+                // #202: the netcat shape - pipe stdio to the peer's port (the
+                // ssh ProxyCommand contract). `forward` owns the role; --stdio
+                // is the second plumbing.
+                require_known_device(&peer)?;
+                l2::netcat_cmd(&server, &peer, rport, relay).await
+            } else if socks {
                 l2::proxy_cmd(&server, &bind, port, http_port, relay).await
             } else {
-                let (peer, rport) = match target.split_once(':') {
-                    Some((p, r)) => (
-                        p.to_string(),
-                        r.parse().map_err(|_| anyhow!("invalid port in '{target}'; expected <device>:<port>"))?,
-                    ),
-                    None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
-                };
+                require_known_device(&peer)?;
                 let lport = lport.unwrap_or(rport);
                 l2::forward_cmd(&server, lport, &peer, rport, relay).await
             }
+        },
+        Cmd::Netcat { peer, rport } => {
+            // Hidden one-release alias for the netcat shape, now forward --stdio.
+            require_known_device(&peer)?;
+            l2::netcat_cmd(&server, &peer, rport, relay).await
         },
         Cmd::Expose { port, to, peer, list, off } => {
             if off {
@@ -11577,6 +12817,9 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Doctor { device, watch, repeat, json } => {
+            if let Some(d) = &device {
+                require_known_device(d)?;
+            }
             doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
@@ -11612,6 +12855,21 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             // Original device grant path (unchanged)
+            // A delegated device's authority comes from its enrollment ceiling,
+            // which enforcement reads from its fleet certificate; a grant targets
+            // a key the device never presents, so it cannot bind. Refuse rather
+            // than report a success enforcement will not honour.
+            if let Some(ceiling) = principal_ceiling_for(&device) {
+                if ceiling.iter().any(|c| c == &capability) {
+                    bail!(
+                        "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
+                    );
+                }
+                bail!(
+                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  filament add --for {device} --allow {capability} --yes",
+                    ceiling.join(", ")
+                );
+            }
             device_set_cap(&device, &capability, true, None)?;
             // If identity layer is active, also issue an owner-signed CapOp
             if let Ok(Some(user_key)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
@@ -11710,7 +12968,7 @@ async fn main() -> Result<()> {
                     // Emit per-device shadow logs for actual-block devices.
                     for device in &revoked {
                         if sshkeys::has_block(&ak_content, device) && !authoritative {
-                            eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                            ui::critical(&format!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"));
                         }
                     }
                     let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
@@ -11724,7 +12982,7 @@ async fn main() -> Result<()> {
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
-                    "OWNER-EQUIVALENT: they can act as you through `filament ssh` (their key is installed on first connect)."
+                    "OWNER-EQUIVALENT: they can act as you through `filament shell --ssh` (their key is installed on first connect)."
                 } else {
                     ""
                 }
@@ -11738,7 +12996,13 @@ async fn main() -> Result<()> {
                 }
                 ui_caps.confirm(&format!("revoke fleet certificate from {device}"))?;
                 let cert = device_cert_for(&device)
-                    .ok_or_else(|| anyhow!("device '{device}' has no stored fleet certificate"))?;
+                    .ok_or_else(|| anyhow!(
+                            // #244: this used to end here, so an operator revoking a
+                            // vouched device got an error and no route. A record with no
+                            // certificate is removed by forgetting it, and nothing else
+                            // said so.
+                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `filament devices`).\n  To remove its access: filament devices forget {device}"
+                        ))?;
                 let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
                 if cert.user_pub != owner.public_key_bytes() {
                     bail!("device '{device}' certificate is not chained to this user identity");
@@ -11750,6 +13014,20 @@ async fn main() -> Result<()> {
             let capability = capability
                 .ok_or_else(|| anyhow!("capability is required unless --certificate is set"))?;
             let capability = crate::capability::canonical_capability(&capability)?;
+            // A delegated device's authority comes from its enrollment ceiling, not
+            // a grant, so revoking a capability from it cannot bind. Name the thing
+            // that does work: revoking the certificate.
+            if let Some(ceiling) = principal_ceiling_for(&device) {
+                if ceiling.iter().any(|c| c == &capability) {
+                    bail!(
+                        "'{capability}' cannot be revoked from {device}: its access comes from the enrollment ceiling on its fleet certificate, not from a grant. Revoke the certificate:\n  filament revoke {device} --certificate"
+                    );
+                }
+                bail!(
+                    "'{capability}' is not granted to {device} (its invitation ceiling is {}); nothing to revoke",
+                    ceiling.join(", ")
+                );
+            }
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false, None)?;
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so
@@ -11845,6 +13123,41 @@ async fn main() -> Result<()> {
             if let Some(warning) = fleet_certificate_warning(&device) {
                 eprintln!("{warning}");
             }
+            // #244: revoking the `shell` CAP does nothing while `up --shell` is
+            // serving, because that policy auto-allows without consulting a
+            // per-device capability at all. The operator ran the security verb,
+            // saw success, and lost nothing. Say so, and name what does work.
+            //
+            // Asked of the RUNNING daemon, not derived from settings: `--shell`
+            // is a launch flag that never lands in the settings file, so a local
+            // guess would be confidently wrong in exactly the case that matters.
+            // When no daemon answers we say NOTHING rather than guess: silence
+            // here means "not known", and inventing a reassurance would repeat
+            // the defect one layer up.
+            if capability == "shell" {
+                if let Some(st) = crate::ctl::try_cap_status().await {
+                    let policy = st["shell_policy"].as_str().unwrap_or("");
+                    let auto = st["shell_auto"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).any(|n| n == device))
+                        .unwrap_or(false);
+                    if policy == "all" || (policy == "only" && auto) {
+                        let how = if policy == "all" {
+                            "`up --shell` is serving, which auto-allows every paired device".to_string()
+                        } else {
+                            format!("`up --shell-only` is serving and lists {device}")
+                        };
+                        ui::caution(
+                            &format!("{device} still has shell access"),
+                            Some(&format!("the grant is revoked, but {how}, so this revoke changed nothing for it.")),
+                            &[
+                                format!("restart the daemon without it, or scope it: filament up --shell-only <others>"),
+                                format!("or remove the device entirely: filament devices forget {device}"),
+                            ],
+                        );
+                    }
+                }
+            }
             Ok(())
         }
         Cmd::Mount { peer, remote, local, read_write, options, foreground, save_auto, list, check, save_profile, apply_profile, profiles, delete_profile, off } => {
@@ -11868,6 +13181,7 @@ async fn main() -> Result<()> {
                     bail!("--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount");
                 }
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
+                require_known_device(&plan.peer)?;
                 let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;
                 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
                 {
@@ -11886,6 +13200,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup { peer, source, dest, exclude, dry_run, delete, options } => {
+            require_known_device(&peer)?;
             backup::backup_cmd(&server, &peer, &source, &dest, exclude, dry_run, delete, options, relay).await
         }
     }
@@ -11950,6 +13265,19 @@ fn resolve_mount_plan(
         peer = Some(devices[selected].0.clone());
     }
     let peer = peer.unwrap();
+    // #206: a joined device knows its own ceiling (it printed it at join). If
+    // the ceiling excludes mount, say so BEFORE opening a stream, instead of
+    // letting the peer's denial come back as a ten-second transport timeout.
+    // The device's ceiling lives on its record; a peer with no delegated
+    // ceiling (an owner device or a plain pair) is not restricted here.
+    if let Some(caps) = principal_ceiling_for(&peer) {
+        if !caps.iter().any(|c| c == "mount") {
+            bail!(
+                "mount denied by {peer}: this device's invitation ceiling ({}) does not include mount",
+                caps.join(", ")
+            );
+        }
+    }
     let remote = match remote {
         Some(remote) => remote,
         None if caps.interactive => {
@@ -12053,7 +13381,7 @@ async fn mount_fuse_cmd(
         if plan.read_only { "read only" } else { "read and write" }
     ));
     ui::say(&format!(
-        "  {} mounted. unmount with `filament unmount {local}` or ctrl-c",
+        "  {} mounted. unmount with `filament mount --off {local}` or ctrl-c",
         ui::paint(ui::Tone::Ok, ui::glyph_ok())
     ));
 
@@ -12374,6 +13702,14 @@ struct Outgoing {
     /// to verify-and-ack, so it is `done` on send, the legacy size-only path.)
     acked: bool,
     done: bool,
+    /// #262: when this file's bytes STARTED streaming, and how many of them went
+    /// out in this attempt (`size - offset`, so a resume counts only its own
+    /// share). The completion throughput is computed from here to the moment the
+    /// `delivery-ack` lands, because that is the only instant at which the bytes
+    /// are known to be on the far side. Timing to the end of `flush()` instead
+    /// measured how fast we filled a socket buffer.
+    stream_started: Option<Instant>,
+    stream_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12390,6 +13726,25 @@ async fn send_cmd(
 ) -> Result<()> {
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
+
+    // #230: `filament send <file>` with no --to and no --code fell through to
+    // local-network discovery and printed a raw room id, while the bare
+    // `filament <file>` minted a speakable code. Same intent, two experiences,
+    // and the banner documented the code on the verb that lacked it.
+    //
+    // This defaulting must come AFTER opened_flow, and the first version of the
+    // fix did not: setting use_code above the gate made `!use_code` false, so
+    // the interactive picker could never open and a TTY user with paired
+    // devices lost "send to which device?" entirely. Caught in a flow sweep,
+    // not by any gate, because every gate tests a defect and none walks a
+    // session.
+    //
+    // So: ask when we can, and default to a code only when we are not going to
+    // ask. Non-interactive keeps the code instead of the room id, which was the
+    // actual complaint. Local discovery stays reachable with --room.
+    if !opened_flow && !use_code && to.is_none() && room.is_none() {
+        use_code = true;
+    }
     if paths.is_empty() {
         if !interactive_allowed() {
             bail!("nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin");
@@ -12422,6 +13777,18 @@ async fn send_cmd(
                 }
                 Err(e) => bail!("cannot send '{first}': {e}"),
             }
+        }
+    }
+    // #221: --to must name a device we actually know. Falling back to local
+    // discovery silently turned a targeted, identity-verified send into a
+    // discoverable one, and a mistyped name cost a minute of silence before the
+    // timeout. Reject up front, like mount does.
+    if let Some(target) = to.as_deref() {
+        let known = devices_load().iter().any(|(n, _)| n.eq_ignore_ascii_case(target));
+        if !known {
+            bail!(
+                "send --to '{target}': no known device by that name; run `filament devices` to see who you can reach"
+            );
         }
     }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
@@ -12490,7 +13857,7 @@ async fn send_cmd(
             let head = head_hash(&spool);
             let full = full_hash(&spool);
             let offered = name.clone().filter(|_| single).unwrap_or_else(|| "stdin.bin".into());
-            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false });
+            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
         } else {
             let path = PathBuf::from(p);
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
@@ -12510,7 +13877,7 @@ async fn send_cmd(
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
                 let full = full_hash(&spool);
-                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false });
+                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
             } else {
                 // A single regular file with --name uses the override; otherwise
                 // the basename. With multiple files --name was already warned off.
@@ -12519,7 +13886,7 @@ async fn send_cmd(
                 });
                 let head = head_hash(&path);
                 let full = full_hash(&path);
-                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, done: false });
+                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, done: false, stream_started: None, stream_bytes: 0 });
             }
         }
     }
@@ -12999,6 +14366,12 @@ async fn send_cmd(
                         .unwrap_or_default();
                     // rung-2: optional server-reflexive candidate for hole-punch.
                     let srflx = data["srflx"].as_str().map(String::from);
+                    // #237: the candidate the peer adopted on the server's say-so
+                    // alone (the one OUR race will dial and may have to name),
+                    // and the peer's protocol version (gates the observed-address
+                    // exchange; an offer without `proto` is an older build).
+                    let peer_server_public = data["server_public"].as_str().map(String::from);
+                    let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
                     // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
                     // probe from the other end. If we're serving this peer on relay
                     // and have no probe of our own yet, ARM one so the symmetric
@@ -13014,7 +14387,7 @@ async fn send_cmd(
                     // our DirectPending exists (our start_direct hasn't returned
                     // yet, or PeerLeft dropped the link before the repair).
                     if conn.direct_pending.contains_key(&from) {
-                        conn.on_transport_offer(&from, cands, srflx);
+                        conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                     } else {
                         let known = crate::devices_load()
                             .into_iter()
@@ -13023,9 +14396,9 @@ async fn send_cmd(
                             conn.start_direct(&from, &name, &secret).await;
                         }
                         if conn.direct_pending.contains_key(&from) {
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                         } else {
-                            conn.buffered_offers.insert(from.clone(), (cands, srflx));
+                            conn.buffered_offers.insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
                         }
                     }
                     continue;
@@ -13401,6 +14774,13 @@ async fn send_cmd(
                         if !o.acked {
                             o.acked = true;
                             o.done = true;
+                            // #262: THIS is the instant the bytes are known to be
+                            // on the far side, so this is the interval the
+                            // throughput line is entitled to divide by. Printing
+                            // it at `flush()` measured the send buffer filling.
+                            if let Some(t0) = o.stream_started {
+                                ui::transfer_summary(&o.name, o.stream_bytes, t0.elapsed().as_secs_f64());
+                            }
                             ui::say(&ui::paint(ui::Tone::Dim, &format!("    {} delivered + verified (whole-file sha256 matched)", o.name)));
                         }
                     }
@@ -13670,6 +15050,15 @@ async fn stream_one(
     // which is the actual multi-stream win. The receiver reassembles by absolute
     // offset (positional writes), so range order does not matter.
     let bar = std::sync::Arc::new(tokio::sync::Mutex::new(ui::Progress::new(&name, size)));
+    // #262: stamp the real start of the byte stream, so the completion rate can
+    // be measured against the `delivery-ack` rather than against `flush()`.
+    {
+        let mut out = outgoing.lock().await;
+        if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+            o.stream_started = Some(Instant::now());
+            o.stream_bytes = size.saturating_sub(offset);
+        }
+    }
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(offset));
     let injected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let remaining = size.saturating_sub(offset);
@@ -13787,7 +15176,6 @@ async fn stream_one(
     for t in &transports {
         t.flush().await?;
     }
-    bar.lock().await.done(size.saturating_sub(offset));
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
         // P4: the bytes + file-end left this side, but the transfer is NOT
@@ -13802,6 +15190,12 @@ async fn stream_one(
         if o.full.is_none() {
             o.acked = true;
             o.done = true;
+            // #262: no digest means no `delivery-ack` is coming, so this is the
+            // last instant we will ever have. The rate is honest about what it
+            // can know here (bytes handed to the transport) and is the only case
+            // that still ends its interval at `flush()`.
+            let secs = o.stream_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            ui::transfer_summary(&o.name, o.stream_bytes, secs);
         }
     }
     Ok(())
@@ -14383,9 +15777,9 @@ async fn recv_cmd(
         Arc::new(Mutex::new(HashMap::new()));
     // Each candidate peer's own bounded budget (armed when its channel comes up).
     let mut recv_deadlines: HashMap<String, Instant> = HashMap::new();
-    // The peer that WON authentication (its ceremony confirmed). Once set, only
-    // this peer may offer files. `None` until someone authenticates.
-    let mut recv_pake_peer: Option<String> = None;
+    // Once a peer wins authentication, Conn binds the receive to its sid/install
+    // uid. Only that peer (or its same-uid signaling rejoin) may become active or
+    // offer files.
     // A file-offer can race ahead of auth: the sender offers as soon as IT has our
     // confirm, which can land a tick BEFORE we finish verifying ITS confirm (the
     // two confirms cross on the wire, and the shared-room mesh widens that gap). We
@@ -14393,7 +15787,7 @@ async fn recv_cmd(
     // BUFFER the most recent pre-auth offer per candidate peer and REPLAY it the
     // instant that peer authenticates. Bounded by RECV_MAX_CANDIDATES (same keys).
     let mut recv_pending_offers: HashMap<String, Value> = HashMap::new();
-    let mut recv_pending_direct: HashMap<String, (Vec<String>, Option<String>)> = HashMap::new();
+    let mut recv_pending_direct: HashMap<String, (Vec<String>, Option<String>, Option<String>, u8)> = HashMap::new();
     // #161: first-offer hold start times per peer. On the typed-code path the
     // buffered offer is replayed at PAKE confirm, BEFORE DirectReady issues the
     // 0x02 identity challenge, so the first offer always arrives with identity
@@ -14423,6 +15817,29 @@ async fn recv_cmd(
     // concurrent candidate ceremonies; further candidates are ignored (the real
     // sender is, in practice, among the first to share the room with the claimer).
     const RECV_MAX_CANDIDATES: usize = 8;
+    // #211: the control socket must be ACCEPTING before "filament up" is printed.
+    // A sibling `mint` can race the bind and silently fail to arm otherwise.
+    // Create the control channel here (before the banner) and spawn the server
+    // with a readiness signal the banner awaits. `ctl_tx` is held for the loop's
+    // life so `ctl_rx` stays open (recv pends, never spins) even when we are not
+    // the daemon and `serve` was not spawned.
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
+    let mut ctl_ready: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    #[cfg(unix)]
+    {
+        if daemon && daemon_alive() == Some(std::process::id()) {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            ctl_ready = Some(ready_rx);
+            let ctl_tx = ctl_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ctl::serve_at(crate::ctl::control_sock_path(), ctl_tx, Some(ready_tx)).await {
+                    crate::ui::trace(&format!("filament: control socket disabled: {e}"));
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = &ctl_tx;
     match &code {
         Some(c) => {
             // Split the typed code into (nameplate, words); send ONLY the
@@ -14448,14 +15865,21 @@ async fn recv_cmd(
             let solo = format!("up-{}", fresh_secret());
             sess.room = Some(solo.clone());
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
-            if crate::ephemeral::is_armed() {
+            // #211: the banner means SERVING, not "process started". Wait
+            // (bounded) for the control socket to accept before announcing up;
+            // a sibling `mint` that arms right after this line must not race a
+            // socket that is not listening yet.
+            if let Some(ready) = ctl_ready.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
+            }
+            if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
             } else {
                 ui::debug("enrollment closed (no armed keys — mint or arm an auth-key to open)");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             let mut c = chans;
-            if crate::ephemeral::is_armed() {
+            if crate::armed::is_armed() {
                 if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
                     let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
                     if !c.contains(&ek) { c.push(ek); }
@@ -14536,7 +15960,7 @@ async fn recv_cmd(
         // L2/ssh acceptor, OR when this is the long-lived `up` daemon. Any acceptor
         // MUST answer the initiator's transport-offer (direct-QUIC over the
         // reachable host candidate, e.g. Tailscale) rather than build a colliding
-        // WebRTC peer (glare). For `up --shell` this kills the `filament ssh`
+        // WebRTC peer (glare). For `up --shell` this kills the `filament shell --ssh`
         // "stuck while connecting" failure; for a plain `up` it kills the up<->up
         // glare/supersede churn (two known daemons each racing to be the WebRTC
         // initiator). See `direct_ok_for`. One-shot send/recv/pair (daemon=false)
@@ -14667,7 +16091,7 @@ async fn recv_cmd(
                                 ));
                                 ui::say(&ui::paint(ui::Tone::Warn,
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access"));
-                                ui::say("    native tools reach <peer>.mesh via `filament proxy` / `filament dial` (no kernel route in userspace)");
+                                ui::say("    native tools reach <peer>.mesh via `filament forward <peer>:<port> --socks` (no kernel route in userspace)");
                                 // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
                                 // Opt-out via --no-proxy-fallback or `filament set auto-proxy off`.
                                 let auto_proxy = settings::get_bool("auto-proxy", None)
@@ -14821,28 +16245,15 @@ async fn recv_cmd(
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
-    // daemon's path). When a sibling `filament ssh`/`netcat`/`forward` asks to
+    // daemon's path). When a sibling `filament shell --ssh`/`netcat`/`forward` asks to
     // reach a peer we already hold a link to, we open a new L2 stream over that
-    // warm link instead of making the sibling establish a fresh one. `ctl_tx` is
-    // held for the loop's life so the channel stays open (recv pends, never spins)
-    // even when we are not the daemon and `serve` was not spawned.
-    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ctl::Req>();
-    // The control socket is a unix-domain socket, so warm-link reuse is unix-only.
-    #[cfg(unix)]
-    {
-        if daemon_alive() == Some(std::process::id()) {
-            let ctl_tx = ctl_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = ctl::serve(ctl_tx).await {
-                    crate::ui::trace(&format!("filament: control socket disabled: {e}"));
-                }
-            });
-        }
-    }
+    // warm link instead of making the sibling establish a fresh one. `ctl_tx`
+    // was created (and `serve` spawned, when we are the daemon) before the
+    // banner, so a mint racing the bind cannot happen; `ctl_rx` is consumed
+    // below.
+
     // Hold `ctl_tx` for the loop's life so `ctl_rx` stays open (recv pends, never
     // spins) even when `serve` was not spawned (non-unix, or not the daemon).
-    #[cfg(not(unix))]
-    let _ = &ctl_tx;
     // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
     // session id, OUTLIVE the link that opened them. A dropped data channel
     // DETACHES (does not kill) the shell; a reconnect with the same session id
@@ -14926,6 +16337,9 @@ async fn recv_cmd(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    // Owner-only roster push: mint + push the mesh roster on membership change,
+    // validity refresh, or a newly-established link.
+    let mut last_roster_push = Instant::now();
 
     // systemd Type=notify: announce readiness once the serving loop is about to
     // run, then ping the watchdog below. No-op when not run under systemd.
@@ -15068,6 +16482,11 @@ async fn recv_cmd(
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
                                 "summary": counts.summary(),
+                                // #244: the LIVE shell posture. `revoke <dev> shell`
+                                // reads this so it can say when the shell it just
+                                // revoked is still being handed out by the policy.
+                                "shell_policy": shell_policy.label(),
+                                "shell_auto": shell_policy.auto_names(),
                             })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
                             handle_list_warm(&conn, req).await;
@@ -15327,7 +16746,7 @@ async fn recv_cmd(
         // would otherwise never subscribe and no ephemeral device could enroll.
         if let Ok(Some(uk)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
             let ek = crate::ephemeral::enroll_channel(&uk.public_key_bytes());
-            let armed = crate::ephemeral::is_armed();
+            let armed = crate::armed::is_armed();
             let subscribed = sess.channels.contains(&ek);
             if armed && !subscribed {
                 sess.channels.push(ek.clone());
@@ -15390,6 +16809,14 @@ async fn recv_cmd(
             }
         }
 
+        // ROSTER (v1, owner-only): push the mesh roster over live links on a
+        // membership change, a validity refresh, or a newly-established link.
+        // Runs faster than the sweep so a new link gets the roster promptly.
+        if daemon && last_roster_push.elapsed() >= Duration::from_secs(5) {
+            last_roster_push = Instant::now();
+            conn.roster_maintenance().await;
+        }
+
         // Daemon-managed mount health check: periodically check all tracked
         // mounts and remove dead/stale entries. Runs every 30s, daemon-only.
         if daemon && last_mount_check.elapsed() >= Duration::from_secs(30) {
@@ -15421,7 +16848,7 @@ async fn recv_cmd(
 
         // WARM-HOLD: periodically check for warm peers that need connections.
         // This keeps recently-used and explicitly configured peers connected
-        // so `filament ping`/`ssh` is instant. Runs every 10s, daemon-only.
+        // so `filament reach`/`ssh` is instant. Runs every 10s, daemon-only.
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
             // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
@@ -15955,12 +17382,16 @@ async fn recv_cmd(
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
                     let srflx = data["srflx"].as_str().map(String::from);
+                    // #237: peer's server-asserted candidate + protocol version
+                    // (see the send-side handler; absent `proto` means older build).
+                    let peer_server_public = data["server_public"].as_str().map(String::from);
+                    let peer_proto = data["proto"].as_u64().unwrap_or(1).clamp(1, 255) as u8;
                     // If we're on the code path and this peer hasn't authenticated yet,
                     // buffer the transport-offer until PAKE completes. Otherwise
                     // on_transport_offer would find no DirectPending (no secret) and
                     // silently drop the offer, causing the QUIC race to fail.
                     if recv_code_path && !recv_pake_done {
-                        recv_pending_direct.insert(from.clone(), (cands, srflx));
+                        recv_pending_direct.insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
                         ui::debug(&format!("buffering pre-auth transport-offer from {from}"));
                         continue;
                     }
@@ -15973,7 +17404,7 @@ async fn recv_cmd(
                     // Bug 1's pre-PAKE buffer). Without this, on_transport_offer
                     // finds no pending and silently drops the offer.
                     if conn.direct_pending.contains_key(&from) {
-                        conn.on_transport_offer(&from, cands, srflx);
+                        conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                     } else {
                         // Also try to re-arm direct proactively: if we still
                         // know this peer's (name,secret), create the pending
@@ -15986,9 +17417,9 @@ async fn recv_cmd(
                         }
                         if conn.direct_pending.contains_key(&from) {
                             // Re-arm succeeded — process the offer now.
-                            conn.on_transport_offer(&from, cands, srflx);
+                            conn.on_transport_offer(&from, cands, srflx, peer_server_public, peer_proto);
                         } else {
-                            conn.buffered_offers.insert(from.clone(), (cands, srflx));
+                            conn.buffered_offers.insert(from.clone(), (cands, srflx, peer_server_public, peer_proto));
                             ui::debug(&format!("buffering re-dial transport-offer from {from} (no pending yet)"));
                         }
                     }
@@ -16049,7 +17480,6 @@ async fn recv_cmd(
                     }
                     if let Some(sec) = secret_opt {
                         // This peer authenticated. Record it as THE sender
-                        recv_pake_peer = Some(from.clone());
                         recv_pake_done = true;
                         recv_cers.clear();
                         recv_deadlines.clear();
@@ -16057,9 +17487,7 @@ async fn recv_cmd(
                         // Option A: start the direct-QUIC race. start_direct owns
                         // replacement after all fallible setup and pending registration.
                         let promo = conn.start_direct_promote(&from, &from, &sec).await;
-                        if conn.active.is_none() {
-                            conn.active = Some(from.clone());
-                        }
+                        conn.bind_active(&from);
                         // A retained link is unannounced here too, and this loop's
                         // ChannelReady arm sends `caps` and the signed L3 announce,
                         // which a peer on a retained link would otherwise never get.
@@ -16093,8 +17521,8 @@ async fn recv_cmd(
                         }
                         // Replay any buffered transport-offer that arrived before PAKE
                         // (now that start_direct created a DirectPending with the secret)
-                        if let Some((cands, srflx)) = recv_pending_direct.remove(&from) {
-                            conn.on_transport_offer(&from, cands, srflx);
+                        if let Some((cands, srflx, server_public, proto)) = recv_pending_direct.remove(&from) {
+                            conn.on_transport_offer(&from, cands, srflx, server_public, proto);
                         }
                         recv_pending_direct.clear();
                         // Replay any buffered file offers from this peer
@@ -16363,26 +17791,11 @@ async fn recv_cmd(
                 // budget plus the overall backstop. The progression block (top of
                 // loop) drives every candidate independently; file-offers are not
                 // accepted until ONE peer's ceremony confirms (`recv_pake_done`),
-                // and then only from that authenticated peer. A direct link is
-                // already authenticated (its pair-secret MAC bound the QUIC key,
-                // `trusted`), so it skips the PAKE.
+                // and then only from that authenticated peer. A stored pairing
+                // secret authenticates that known device, but does not prove it
+                // minted this one-time code, so every candidate still runs PAKE.
                 if recv_code_path && !recv_pake_done {
-                    let (is_direct, is_trusted) = conn
-                        .link(&pid)
-                        .map(|l| (l.direct, l.trusted))
-                        .unwrap_or((false, false));
-                    if is_direct && is_trusted {
-                        // A secret-bound direct link is the sender (known device).
-                        recv_pake_peer = Some(pid.clone());
-                        recv_pake_done = true; // pre-authenticated transport
-                        recv_cers.clear();
-                        recv_deadlines.clear();
-                        let buffered = recv_pending_offers.remove(&pid);
-                        recv_pending_offers.clear();
-                        if let Some(offer) = buffered {
-                            let _ = tx.send(Ev::Control(pid.clone(), offer));
-                        }
-                    } else if recv_cers.contains_key(&pid) {
+                    if recv_cers.contains_key(&pid) {
                         // Ceremony already minted (its PAKE traffic arrived first);
                         // just make sure its budgets are armed.
                         recv_deadlines
@@ -16485,23 +17898,17 @@ async fn recv_cmd(
                                                 }
                                                 // Check takeover guard and scope-aware anchor before promoting
                                                 {
-                                                    let p = devices_path();
-                                                    if let Ok(raw) = std::fs::read_to_string(&p) {
-                                                        if let Ok(mut arr) = serde_json::from_str::<Vec<Value>>(&raw) {
-                                                            // For promote, use Device-scope as fixed convention for pair
-                                                            let scope = crate::identity::IntroScope::Device.to_byte();
-                                                            match identity::apply_peer_identity(&mut arr, &who, &prov_cert, scope) {
-                                                                Ok(_) => {
-                                                                    // Write durable anchor only after overlay assertion passes
-                                                                    let _ = crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&arr).unwrap_or_default());
-                                                                    clear_provisional_identity(&who);
-                                                                }
-                                                                Err(e) => {
-                                                                    ui::say(&ui::paint(ui::Tone::Warn, &format!("  takeover guard at overlay establishment: {}", e)));
-                                                                    clear_provisional_identity(&who);
-                                                                    continue;
-                                                                }
-                                                            }
+                                                    // For promote, use Device-scope as fixed convention for pair
+                                                    let scope = crate::identity::IntroScope::Device.to_byte();
+                                                    match with_devices_mut(|arr| identity::apply_peer_identity(arr, &who, &prov_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))) {
+                                                        Ok(_) => {
+                                                            // Write durable anchor only after overlay assertion passes
+                                                            clear_provisional_identity(&who);
+                                                        }
+                                                        Err(e) => {
+                                                            ui::say(&ui::paint(ui::Tone::Warn, &format!("  takeover guard at overlay establishment: {}", e)));
+                                                            clear_provisional_identity(&who);
+                                                            continue;
                                                         }
                                                     }
                                                 }
@@ -16593,6 +18000,24 @@ async fn recv_cmd(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                // Owner-signed mesh roster push (v1, display-only). Verify
+                // against the owner key held in OUR device certificate (the
+                // issuer), accept only a newer (epoch, valid_until), store for
+                // `devices` to render. The roster NEVER feeds an authorization
+                // decision, so a failed receipt (bad sig / wrong owner / replay /
+                // expired) is a silent no-op, logged at debug only.
+                Some("roster") => {
+                    if let Some(cert) = local_device_cert() {
+                        match crate::roster::verify_and_store_roster(&v, &cert.user_pub, identity::now_secs()) {
+                            Ok(true) => ui::debug(&format!(
+                                "roster: accepted epoch {} from owner",
+                                v["epoch"].as_u64().unwrap_or(0)
+                            )),
+                            Ok(false) => {}
+                            Err(e) => ui::debug(&format!("roster: rejected: {e}")),
                         }
                     }
                 }
@@ -16707,7 +18132,11 @@ async fn recv_cmd(
                             .clone();
                         match mux.accept_control(&v, trusted, allow_nonloopback).await {
                             l2::OpenVerdict::Accept { sid, host, port, rx } => {
-                                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
+                                // The peer's device key, resolved again for the live
+                                // stream's revocation re-check (the gate above resolved
+                                // the same value for the open decision).
+                                let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx, spawn_idev));
                             }
                             l2::OpenVerdict::Deny { sid, err } => {
                                 // Log refused dials at INFO (visible by default,
@@ -16758,6 +18187,59 @@ async fn recv_cmd(
                     });
                     complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
                 }
+                // #268: an `l2-open` arriving while L2 is OFF used to fall
+                // through and be IGNORED. The initiator has already committed a
+                // client to that stream, so it waits for an answer that is never
+                // coming: measured cross-machine, curl hung for its full 25s
+                // timeout while filament printed nothing at either end.
+                //
+                // `shell-bootstrap` directly below already refuses explicitly in
+                // this exact state. The tunnel open, which is the more common
+                // path (`forward`, `netcat`, ssh), did not, so the two disagreed
+                // about whether "off" is something you say or something you
+                // silently do.
+                //
+                // `on_close` turns this into OpenOutcome::Refused with the reason
+                // (#206), so the client gets a clean, immediate, explained close
+                // instead of a hang.
+                Some("l2-open") if !l2_enabled => {
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "l2-close",
+                                "sid": sid,
+                                "err": crate::capability::TUNNEL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
+                // NOTE: keep this arm ABOVE the `#[cfg(unix)]` comment block
+                // below. That attribute belongs to `shell-bootstrap`, and an
+                // outer attribute binds to the NEXT arm regardless of any
+                // comments in between: inserting here originally compiled this
+                // refusal out on Windows AND silently made the shell-bootstrap
+                // deny unconditional there. Found in review, not by the compiler,
+                // because both outcomes still build.
+                // Shell serving is OFF here. Without this arm the message falls
+                // through the match and the acceptor says NOTHING, so the caller
+                // can only time out: `filament shell X --ssh` burned its full
+                // bootstrap deadline and then guessed, while plain
+                // `filament shell X` printed the reason immediately. The refusal
+                // exists; only this path failed to send it. Measured across three
+                // machines, not inferred.
+                #[cfg(unix)]
+                Some("shell-bootstrap") if !l2_enabled => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": crate::capability::SHELL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
                 Some("shell-bootstrap") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
                     // #30 GAP 2 (shell): honor the pending_proven hold. If a
@@ -16799,7 +18281,8 @@ async fn recv_cmd(
                     let legacy_ok = trusted
                         && dev
                             .as_deref()
-                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .map(|n| !device_capability_denied(n, "shell")
+                                 && (shell_policy.auto_allows(n) || device_allows(n, "shell")))
                             .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
@@ -16873,7 +18356,7 @@ async fn recv_cmd(
                             let hostkeys = sshkeys::host_pubkeys();
                             let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
                             // Tell the initiator whether an sshd is actually
-                            // listening on the port `filament ssh` will dial here,
+                            // listening on the port `filament shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
                             // spawning ssh into a refused/black-holed connection.
                             let ssh_port = v["ssh_port"].as_u64().and_then(|n| u16::try_from(n).ok()).unwrap_or(22);
@@ -16904,8 +18387,19 @@ async fn recv_cmd(
                 // bridge it to a sid stream. Same deny-by-default gate as
                 // shell-bootstrap, a PTY is a superset of ssh-key access, so it
                 // reuses the `shell` cap / --shell policy and requires `trusted`.
-                Some("pty-open") if l2_enabled => {
+                Some("pty-open") => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
+                    // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
+                    // no FILAMENT_L2). The peer is visibly up but cannot serve a
+                    // shell, and dropping the open silently made `shell` hang with
+                    // no output. Say so, so the initiator errors instead of waiting.
+                    if !l2_enabled {
+                        let sid = l2::wire_sid(&v).unwrap_or(0);
+                        let _ = t
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `filament up --shell` on that device" }))
+                            .await;
+                        continue;
+                    }
                     // wire_sid rejects a missing OR out-of-range sid instead of
                     // defaulting to 0 / wrapping into a forged is_l2_sid value.
                     let Some(sid) = l2::wire_sid(&v) else { continue };
@@ -16917,7 +18411,8 @@ async fn recv_cmd(
                     let legacy_ok = trusted
                         && dev
                             .as_deref()
-                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .map(|n| !device_capability_denied(n, "shell")
+                                 && (shell_policy.auto_allows(n) || device_allows(n, "shell")))
                             .unwrap_or(false);
                     // Capability layer evaluated unconditionally (shadow samples the
                     // legacy-allowed population); legacy stands in shadow, cap gates
@@ -16958,8 +18453,14 @@ async fn recv_cmd(
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!("l2: pty refused: {who}: {}", granted.deny_reason("no shell cap / untrusted")));
                         enqueue_if_requestable(who, "shell");
+                        // Carry the specific cap reason (e.g. CEILING_REASON,
+                        // "device revoked") to the peer; the generic string was
+                        // produced and then thrown away before it crossed the wire,
+                        // so the initiator read an empty success instead of the
+                        // refusal. The fallback stays coarse on purpose.
+                        let reason = granted.deny_reason("shell capability not granted");
                         let _ = t
-                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
                             .await;
                         continue;
                     }
@@ -17069,6 +18570,10 @@ async fn recv_cmd(
                     } else {
                         host.exec_cmd_args(&pty_cmd)
                     };
+                    // The peer's device key, resolved again for the live session's
+                    // revocation re-check (the gate above resolved the same value for
+                    // the open decision; this is that same value).
+                    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
                     match l2::spawn_pty_session(
                         pty_sessions.clone(),
                         session_id.clone(),
@@ -17079,6 +18584,7 @@ async fn recv_cmd(
                         &term,
                         argv,
                         pty_guard,
+                        spawn_idev,
                     )
                     .await
                     {
@@ -17208,7 +18714,10 @@ async fn recv_cmd(
                     let transport = t.clone();
                     let spawn_sid = sid;
                     let proto_version = caps.protocol_version;
-                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version, read_only);
+                    // #235: hand the peer's device key down so the live session can re-ask
+                    // the gate. Resolved above for the open decision; the same value.
+                    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                    mount_proto::spawn_mount_server(root_path, transport, spawn_sid, rx, proto_version, read_only, spawn_idev);
                 }
                 Some("pty-resize") if l2_enabled => {
                     let Some(sid) = l2::wire_sid(&v) else { continue };
@@ -17588,7 +19097,7 @@ async fn recv_cmd(
                     // If no peer has authenticated yet, the overall watchdog still
                     // fails loudly should the real sender never confirm.
                     if recv_code_path
-                        && (!recv_pake_done || recv_pake_peer.as_deref() != Some(pid.as_str()))
+                        && (!recv_pake_done || !conn.is_bound_active_peer(&pid))
                     {
                         // A pre-auth offer from a peer we are STILL authenticating
                         // (it has a live ceremony) is buffered, not lost: the offer
@@ -17829,7 +19338,10 @@ async fn recv_cmd(
                         continue;
                     }
                     if !ok {
-                        if !daemon && std::io::stdin().is_terminal() {
+                        if !daemon
+                            && std::io::stdin().is_terminal()
+                            && xfer_deny_reason.is_none()
+                        {
                             pending.push_back((pid.clone(), v.clone()));
                             question_open.store(true, std::sync::atomic::Ordering::Relaxed);
                             if pending.len() == 1 {
@@ -17843,9 +19355,20 @@ async fn recv_cmd(
                             }
                             continue; // decision arrives later via StdinLine
                         }
+                        // #213: surface the REAL gate reason. In shadow mode a
+                        // consent denial returns cap_reason None, so xfer_deny_reason
+                        // is Some exactly when the gate refused for a real reason
+                        // (revocation, ceiling, authoritative) - surface it. The tty
+                        // hint is ONLY for the None case: an unanswered consent
+                        // prompt on a non-tty, where passing -y genuinely changes the
+                        // outcome. Telling a user to pass a flag they already passed,
+                        // for a decision no flag can change, is how a green security
+                        // property turns unmeasurable.
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({})",
-                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") } else { "no tty, use -y to auto-accept" }
+                            if daemon { xfer_deny_reason.as_deref().unwrap_or("unverified peer") }
+                            else if let Some(reason) = xfer_deny_reason.as_deref() { reason }
+                            else { "no tty, use -y to auto-accept" }
                         )));
                         t.send_control(&protocol::decline_msg(&id)).await?;
                         continue;
@@ -18338,7 +19861,18 @@ async fn recv_cmd(
             }
             Ev::Interrupted => {
                 flush_inflight(&mut by_sid).await;
-                ui::say(&format!("  {} interrupted, partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                // One string served two situations. "partials kept; run the
+                // same command to resume" is exactly right for an interrupted
+                // transfer and meaningless for a daemon, which has no partials
+                // to keep: Ctrl-C out of `filament up` printed a transfer's
+                // recovery advice. Observed on two machines. The daemon's own
+                // banner already says "Ctrl-C or `filament down` to stop", so
+                // say the thing that banner promised.
+                if daemon {
+                    ui::say(&format!("  {} stopped serving; `filament up` starts again", ui::paint(ui::Tone::Dim, "·")));
+                } else {
+                    ui::say(&format!("  {} interrupted, partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                }
                 if let Some(g) = &tty_guard {
                     g.restore(); // process::exit skips Drop
                 }
@@ -18788,6 +20322,67 @@ mod tests {
         assert!(match_adoption_source(&mut suppressed, "peer-sid", AdoptSource::Digest));
     }
 
+    #[test]
+    fn code_receive_binding_rejects_unrelated_paired_peer_but_allows_rejoin() {
+        let binding = ("sender-old-sid".to_string(), Some("sender-install".to_string()));
+
+        assert!(active_binding_matches(
+            &binding,
+            "sender-old-sid",
+            Some("sender-install")
+        ));
+        assert!(active_binding_matches(
+            &binding,
+            "sender-new-sid",
+            Some("sender-install")
+        ));
+        assert!(!active_binding_matches(
+            &binding,
+            "unrelated-paired-sid",
+            Some("unrelated-install")
+        ));
+    }
+
+    #[test]
+    fn link_dead_and_live_predicates_encode_246_without_suppressing_disconnected_recovery() {
+        use super::{link_dead_for, link_has_live_for};
+        use crate::net::is_live_state;
+        use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+        // The livelock shape: a WebRTC link right after `establish`. NO
+        // transport, NO workers, but its ICE agent is alive and gathering. The
+        // old code read "no transport AND all (zero) workers dead" as DEAD and
+        // the next 5s direct retry dropped the in-flight establish. It must be
+        // alive.
+        //         (peer_live, no_transport, no_workers)
+        let establishing = (true, true, true);
+        assert!(!link_dead_for(establishing.0, establishing.1, establishing.2));
+        assert!(link_has_live_for(establishing.0, false, false));
+        // Disconnected is deliberately not peer-live. A polite peer does not
+        // restart ICE, so treating it as live would suppress its sole recovery:
+        // a re-dial. This intentionally lets a re-dial displace an impolite
+        // peer's restart too, restoring the bounded pre-#246 behavior.
+        assert!(!is_live_state(RTCPeerConnectionState::Disconnected));
+        let disconnected = (false, true, true);
+        assert!(link_dead_for(disconnected.0, disconnected.1, disconnected.2));
+        assert!(!link_has_live_for(disconnected.0, false, false));
+        // A link whose peer reached a terminal state with nothing serving IS
+        // dead: droppable before a fresh attempt (nothing is lost).
+        assert!(link_dead_for(false, true, true));
+        assert!(!link_has_live_for(false, false, false));
+        // A serving direct link (transport alive) is live regardless of peer.
+        assert!(!link_dead_for(false, false, true));
+        assert!(link_has_live_for(false, true, false));
+        // Any live worker keeps the link alive.
+        assert!(!link_dead_for(false, true, false));
+        assert!(link_has_live_for(false, false, true));
+        // Peer live always wins both predicates: even with everything else
+        // dead the peer's connection is still working or recovering.
+        for (td, wd) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(!link_dead_for(true, td, wd), "peer live must never read dead ({td},{wd})");
+            assert!(link_has_live_for(true, !td, !wd));
+        }
+    }
+
     /// Fleet mount scope: `path_within` bounds a mount to the share root and
     /// resists `..` escapes. This is the SECURITY check that keeps an
     /// auto-trusted mount inside the share root (never home/`/`).
@@ -19230,6 +20825,325 @@ mod tests {
         unsafe { std::env::set_var("FILAMENT_DIRECT", "0") };
         assert!(!direct_ok_for(false, false), "FILAMENT_DIRECT=0 disables direct");
         unsafe { std::env::remove_var("FILAMENT_DIRECT") };
+    }
+
+    // ---- #243: what a vouch may durably write, and what it may not ----------
+    //
+    // These target `update_peer_identity`, the store-side writer, rather than
+    // `handle_identity_expose`, the caller. Same-host ICE blocks a live vouch on
+    // a release build, but that never blocked testing this: it is a plain
+    // function over devices.json. Treating one blocked path as if it blocked the
+    // whole question is how #243 stayed "reasoned from code" longer than it had
+    // to.
+
+    fn td(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fil-243-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        dir
+    }
+
+    fn cert_for(user: u8, device: u8, expires: u64) -> identity::DeviceCert {
+        identity::DeviceCert::from_json(&serde_json::json!({
+            "devicePub": hex::encode([device; 32]),
+            "userPub": hex::encode([user; 32]),
+            "expires": expires,
+            "issued": 1u64,
+            "sig": hex::encode([0u8; 64]),
+        })).unwrap()
+    }
+
+    fn stored_user_key(dir: &std::path::Path, name: &str) -> Option<String> {
+        let raw = std::fs::read_to_string(dir.join("devices.json")).ok()?;
+        let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+        arr.into_iter()
+            .find(|d| d["name"].as_str() == Some(name))
+            .and_then(|d| d["userKey"].as_str().map(|s| s.to_string()))
+    }
+
+    /// A record already anchored to one user key must not be re-anchored to a
+    /// different one by a later write. `upsert_peer_record` overwrites `userKey`
+    /// unconditionally, so before the guard moved into `update_peer_identity`
+    /// this test failed: the foreign key landed.
+    #[test]
+    fn vouch_write_refuses_a_foreign_user_key() {
+        let _guard = lock_test_config();
+        let dir = td("foreign");
+        let mine = cert_for(0x11, 0xa1, 9_999_999_999);
+        update_peer_identity("boxy", &mine, identity::IntroScope::Device.to_byte()).unwrap();
+        assert_eq!(stored_user_key(&dir, "boxy"), Some(hex::encode([0x11u8; 32])));
+
+        let theirs = cert_for(0x22, 0xb2, 9_999_999_999);
+        let res = update_peer_identity("boxy", &theirs, identity::IntroScope::Device.to_byte());
+        assert!(res.is_err(), "a cert under a different user key must be refused");
+        assert_eq!(
+            stored_user_key(&dir, "boxy"),
+            Some(hex::encode([0x11u8; 32])),
+            "the original anchor must survive a refused write"
+        );
+    }
+
+    /// First-writer-wins is the whole trust model here (TOFU), so pin it: the
+    /// second certificate does not replace the first.
+    #[test]
+    fn vouch_write_is_first_writer_wins() {
+        let _guard = lock_test_config();
+        let dir = td("tofu");
+        let first = cert_for(0x33, 0xc3, 9_999_999_999);
+        update_peer_identity("pinned", &first, identity::IntroScope::Device.to_byte()).unwrap();
+
+        let second = cert_for(0x44, 0xd4, 9_999_999_999);
+        assert!(update_peer_identity("pinned", &second, identity::IntroScope::Device.to_byte()).is_err());
+        assert_eq!(stored_user_key(&dir, "pinned"), Some(hex::encode([0x33u8; 32])));
+    }
+
+    /// The scope a vouch stores is Device, not User, and the difference is not
+    /// cosmetic: `apply_peer_identity` gates its device-pinning branch on
+    /// `existing_scope == 0x01`, so storing User silently disarms that check for
+    /// every later write to this petname on the path where the guard does run.
+    #[test]
+    fn vouch_scope_is_device_so_device_pinning_stays_armed() {
+        let _guard = lock_test_config();
+        let _dir = td("scope");
+        assert_eq!(
+            VOUCH_CERT_SCOPE,
+            identity::IntroScope::Device.to_byte(),
+            "a vouch introduces a DEVICE; User scope would disarm device-pinning"
+        );
+
+        let laptop = cert_for(0x55, 0xe5, 9_999_999_999);
+        update_peer_identity("sib", &laptop, VOUCH_CERT_SCOPE).unwrap();
+
+        // Same user, different device, through the path where the guard runs.
+        let phone = cert_for(0x55, 0xf6, 9_999_999_999);
+        let res = with_devices_mut(|arr| {
+            identity::apply_peer_identity(arr, "sib", &phone, VOUCH_CERT_SCOPE)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        });
+        assert!(res.is_err(), "a different device under the same user is a new trust decision");
+    }
+
+    /// #266, now fixed, and this test is why the fix was safe to make.
+    ///
+    /// It previously pinned the OLD behaviour, that an expired certificate held
+    /// the vouch gate shut forever. It was written that way on review advice so
+    /// whoever relaxed the gate would have to break it and look at the guard
+    /// first. That is exactly what happened.
+    ///
+    /// Deliberately PURE: it drives `apply_peer_identity` over an in-memory
+    /// `Vec<Value>` and never touches the filesystem or the environment.
+    ///
+    /// Two earlier versions went through `update_peer_identity`, which resolves
+    /// devices.json from `FILAMENT_CONFIG_DIR`, and both failed only on Windows
+    /// CI. The diagnostic showed why: the variable read back as NotPresent
+    /// mid-test, so the call operated on the REAL user config dir. Once via a
+    /// read, then via a write that consequently found no record to refuse and
+    /// returned Ok, which looked exactly like the guard failing. `set_var` is
+    /// not thread-safe, which is why Rust 2024 marks it unsafe, and
+    /// `lock_test_config` only serialises the tests that touch the variable, not
+    /// the ~420 others running concurrently in the same process.
+    ///
+    /// The invariant under test has nothing to do with files, so testing it
+    /// through one was the mistake. This is the technique the filament-id crate
+    /// already uses on its side of the guard.
+    #[test]
+    fn an_expired_certificate_reopens_the_vouch_gate_but_not_to_a_stranger() {
+        let dead = cert_for(0x66, 0xa7, 1); // expired in 1970
+        assert!(dead.verify(identity::now_secs()).is_err(), "precondition: expired");
+
+        // #266's property, over the certificate itself: an expired cert is
+        // STORED but not USABLE. That combination is what wedged the gate, since
+        // the old check asked only about presence. `device_cert_valid_for`
+        // filters on exactly this predicate.
+        let mut arr: Vec<Value> = vec![];
+        identity::apply_peer_identity(&mut arr, "lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
+        let stored = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).expect("a cert is stored");
+        assert!(
+            stored.verify(identity::now_secs()).is_err(),
+            "the stored certificate is expired, so it must not count as a usable identity"
+        );
+
+        // The reopened path is not a way in for a different user key. This is
+        // the guard that makes the #266 relaxation safe, and it only became
+        // reachable because that relaxation lets a second write happen at all.
+        let stranger = cert_for(0x77, 0xb8, 9_999_999_999);
+        assert!(
+            identity::apply_peer_identity(&mut arr, "lapsed", &stranger, VOUCH_CERT_SCOPE).is_err(),
+            "re-certification must not re-anchor the record to a different user"
+        );
+        assert_eq!(
+            arr[0]["userKey"].as_str(),
+            Some(hex::encode([0x66u8; 32]).as_str()),
+            "the original anchor survives the refused write"
+        );
+
+        // And the legitimate device, renewing under the SAME user and device
+        // key, is admitted, so the guard is not simply refusing everything.
+        //
+        // Asserted on `expires`, not on `verify()`. `verify` checks expiry FIRST
+        // and the signature second, and these fixtures carry a zero signature,
+        // so a renewed cert clears the expiry check and then fails on the
+        // signature. `verify().is_err()` above is still exact, because an
+        // expires-in-1970 cert bails on expiry before the signature is reached,
+        // but the inverse cannot be asserted with an unsigned fixture. Claiming
+        // it would be a check that passes for a reason other than the one named,
+        // which is the defect this whole branch is about.
+        let renewed = cert_for(0x66, 0xa7, 9_999_999_999);
+        identity::apply_peer_identity(&mut arr, "lapsed", &renewed, VOUCH_CERT_SCOPE)
+            .expect("a renewal under the same user and device key is admitted");
+        let now_stored = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
+        assert!(
+            now_stored.expires > identity::now_secs(),
+            "the renewal replaced the expired certificate in the record"
+        );
+    }
+
+    #[test]
+    fn require_known_device_names_the_known_devices() {
+        // #221 in the peer-taking verbs: a stale name must read as a lookup
+        // miss that lists what IS known, not as "may be offline / unreachable".
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-known-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let sec = "b".repeat(64);
+        let p = dir.join("devices.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "popos", "secret": sec},
+                {"name": "pixel", "secret": "c".repeat(64)},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(require_known_device("popos").is_ok());
+        let err = require_known_device("zzz-not-a-device").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no device named 'zzz-not-a-device'"), "got: {msg}");
+        assert!(msg.contains("popos"), "known names missing: {msg}");
+        assert!(msg.contains("pixel"), "known names missing: {msg}");
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roster_is_newer_lexicographic() {
+        use crate::roster::roster_is_newer;
+        // Fresh accept (nothing seen).
+        assert!(roster_is_newer(1, 100, None, None));
+        // Strictly newer epoch.
+        assert!(roster_is_newer(2, 100, Some(1), Some(100)));
+        // Same epoch, later valid_until = a validity refresh, deliverable.
+        assert!(roster_is_newer(1, 200, Some(1), Some(100)));
+        // Replay (same epoch, same valid_until) rejected.
+        assert!(!roster_is_newer(1, 100, Some(1), Some(100)));
+        // Older epoch rejected even with a later valid_until.
+        assert!(!roster_is_newer(1, 999, Some(2), Some(100)));
+        // Same epoch, OLDER valid_until rejected.
+        assert!(!roster_is_newer(1, 50, Some(1), Some(100)));
+    }
+
+    #[test]
+    fn roster_wrong_key_rejected_and_epoch_monotone() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-roster-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+
+        let owner = Ed25519KeyPair::from_seed_unchecked(&[1u8; 32]).unwrap();
+        let attacker = Ed25519KeyPair::from_seed_unchecked(&[2u8; 32]).unwrap();
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let now = identity::now_secs();
+        let mk = |epoch: u64, until: u64| identity::MeshRoster {
+            owner_pub,
+            epoch,
+            valid_until: until,
+            devices: vec![identity::RosterDevice {
+                device_pub: [9u8; 32],
+                petname: "d1".to_string(),
+            }],
+        };
+        let signed = |r: &identity::MeshRoster, key: &Ed25519KeyPair| {
+            let sig = r.sign(key).unwrap();
+            let mut b = r.to_json();
+            b["sig"] = serde_json::json!(hex::encode(sig));
+            b
+        };
+
+        // Wrong owner field (signed by owner, claims attacker's key) -> reject.
+        let wrong_owner = identity::MeshRoster {
+            owner_pub: attacker.public_key().as_ref().try_into().unwrap(),
+            epoch: 1,
+            valid_until: now + 1000,
+            devices: vec![],
+        };
+        let b = signed(&wrong_owner, &owner);
+        assert!(crate::roster::verify_and_store_roster(&b, &owner_pub, now).is_err());
+
+        // Wrong signer (owner field correct, sig by attacker) -> reject.
+        let b = signed(&mk(1, now + 1000), &attacker);
+        assert!(crate::roster::verify_and_store_roster(&b, &owner_pub, now).is_err());
+
+        // Valid roster -> accepted and stored.
+        assert!(crate::roster::verify_and_store_roster(&signed(&mk(1, now + 1000), &owner), &owner_pub, now).unwrap());
+
+        // Older epoch (0 < 1) does not overwrite, even with a later valid_until.
+        assert!(!crate::roster::verify_and_store_roster(&signed(&mk(0, now + 9999), &owner), &owner_pub, now).unwrap());
+        // Replay (same epoch, same valid_until) rejected.
+        assert!(!crate::roster::verify_and_store_roster(&signed(&mk(1, now + 1000), &owner), &owner_pub, now).unwrap());
+        // Same epoch + later valid_until = refresh -> accepted.
+        assert!(crate::roster::verify_and_store_roster(&signed(&mk(1, now + 3000), &owner), &owner_pub, now).unwrap());
+        // Newer epoch -> accepted.
+        assert!(crate::roster::verify_and_store_roster(&signed(&mk(2, now + 1000), &owner), &owner_pub, now).unwrap());
+        // Expired (valid_until in the past) -> rejected, never stored.
+        assert!(!crate::roster::verify_and_store_roster(&signed(&mk(3, now.saturating_sub(1)), &owner), &owner_pub, now).unwrap());
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roster_snapshot_filters_revoked_devices() {
+        // A revoked device is no longer a mesh member: the owner's snapshot must
+        // not re-issue it to every spoke, even though its record still holds a
+        // cert chaining to the owner key (revocation is a tombstone on the same
+        // record). The acceptor refuses it independently; `devices` must not lie.
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let _guard = lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-roster-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let owner = Ed25519KeyPair::from_seed_unchecked(&[1u8; 32]).unwrap();
+        let owner_pub: [u8; 32] = owner.public_key().as_ref().try_into().unwrap();
+        let now = identity::now_secs();
+        let cert = |pubbyte: u8| serde_json::json!({
+            "devicePub": hex::encode([pubbyte; 32]),
+            "userPub": hex::encode(owner_pub),
+            "expires": now + 1000,
+            "issued": now,
+            "sig": hex::encode([0u8; 64]),
+        });
+        let p = std::path::PathBuf::from(&dir).join("devices.json");
+        std::fs::write(
+            &p,
+            serde_json::to_string(&serde_json::json!([
+                {"name": "ok", "secret": "b".repeat(64), "deviceCert": cert(0x11)},
+                {"name": "revoked", "secret": "c".repeat(64), "deviceCert": cert(0x22), "certRevoked": true},
+            ])).unwrap(),
+        ).unwrap();
+
+        let names: Vec<String> = crate::roster::owner_snapshot(&owner_pub)
+            .into_iter().map(|d| d.petname).collect();
+        assert!(names.contains(&"ok".to_string()), "non-revoked device must be listed: {names:?}");
+        assert!(!names.contains(&"revoked".to_string()), "revoked device must be filtered: {names:?}");
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -19716,6 +21630,65 @@ mod tests {
     }
 
     #[test]
+    fn the_countdown_does_not_promise_a_renewal() {
+        // #236: `device_countdown` told Fleet devices "renews in 87d" when
+        // nothing renews, and told an ALREADY EXPIRED cert "renews until
+        // <date>" with a date in the past, in a branch guarded by
+        // `cert.expires <= now`. The External arm of the same match said
+        // "expired", correctly, so one function described the same fact two
+        // ways depending on the tier.
+        //
+        // There is no renewal. `DeviceCert::certify` is reached only from init,
+        // recover, enrollment/join and pairing cert storage: no timer, no
+        // opportunistic-on-connect path, no verb. The copy was written to
+        // docs/design-pairing-ux.md rule 2, which was never built, so the string
+        // was the last surviving trace of a security model the product does not
+        // have, reassuring users about the mechanism that model promised would
+        // protect them.
+        use fleet_ui::devices::DeviceTier;
+        let mk = |expires: u64| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([0x42u8; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": expires,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            })).unwrap()
+        };
+        let now = identity::now_secs();
+        let live = mk(now + 87 * 86400);
+        let dead = mk(now.saturating_sub(86400));
+
+        for tier in [DeviceTier::Fleet, DeviceTier::External] {
+            for cert in [&live, &dead] {
+                let s = device_countdown(tier, Some(cert));
+                assert!(
+                    !s.contains("renew"),
+                    "the countdown must not promise a renewal that nothing performs, got {s:?}"
+                );
+            }
+        }
+        // And the expired case must read as expired rather than as a future
+        // promise about a date that has gone.
+        let s = device_countdown(DeviceTier::Fleet, Some(&dead));
+        assert!(s.starts_with("expired"), "an expired cert must read as expired, got {s:?}");
+    }
+
+    #[test]
+    fn the_refusal_reads_as_a_sentence() {
+        // Shipped in 0.8.5 as "refusing shut down the daemon without --yes" and
+        // "refusing include deliberate remote authority in this invitation
+        // ceiling without --yes". One `action` string feeds both the imperative
+        // prompt and this infinitive refusal, so the particle has to live here.
+        let caps = UiCapability { interactive: false, json: false, yes: false, color: false };
+        let msg = caps.confirm("shut down the daemon").unwrap_err().to_string();
+        assert!(
+            msg.starts_with("refusing to "),
+            "the refusal must read as a sentence, got: {msg}"
+        );
+    }
+
+    #[test]
     fn known_peer_liveness_allows_reconnect() {
         let mut saw: HashSet<String> = HashSet::new();
         let n = "peer";
@@ -19855,14 +21828,14 @@ mod tests {
 
         // t0: the link comes up. The connect handler observes it once.
         let t0 = 1_000_000u64;
-        devices_touch_at("quietbox", None, None, t0);
+        devices_touch_at("quietbox", None, None, t0).unwrap();
         let (last_seen, _, _) = devices_info("quietbox").unwrap();
         assert_eq!(last_seen, t0);
 
         // Hold the link open with ZERO traffic for 15s, longer than the 10s
         // budget. The periodic observation (link still up) refreshes lastSeen.
         let t1 = t0 + 15;
-        devices_touch_at("quietbox", None, None, t1);
+        devices_touch_at("quietbox", None, None, t1).unwrap();
         let (last_seen, _, _) = devices_info("quietbox").unwrap();
         assert_eq!(last_seen, t1, "the periodic observation advanced lastSeen with no traffic at all");
         let (deadline, clock) = effective_principal_deadline(far, Some(far), Some(last_seen), Some(budget));
@@ -20094,6 +22067,424 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    #[test]
+    fn a_device_with_no_identity_is_offered_both_ways_in() {
+        // #209: there are TWO ways to be brought into an identity, a pairing code
+        // claimed with `add <code>` and a bounded invitation claimed with `join`,
+        // and the launcher offered only the second. Someone holding a pairing
+        // code, which is the path the OWNER side presents first, had no entry on
+        // the device doing the claiming.
+        //
+        // Added because review found the fix undefended: the existing menu test
+        // asserts send/devices/init and says nothing about this entry, so
+        // deleting it left the suite green. That is the same shape as #227, which
+        // this same PR exists to correct, so leaving it untested would have been
+        // the defect reappearing inside its own fix.
+        for (owner, joined, count) in [(false, false, 0usize), (false, false, 2usize)] {
+            let actions = first_screen_actions(owner, joined, count);
+            let verbs: Vec<&str> = actions.iter().map(|(_, verb)| *verb).collect();
+            assert!(
+                verbs.contains(&"add"),
+                "a device with no identity must be offered the pairing-code claim (device_count={count}): {verbs:?}"
+            );
+            assert!(
+                verbs.contains(&"join"),
+                "and the invitation claim as well (device_count={count}): {verbs:?}"
+            );
+        }
+        // An owner already has an identity; neither claim belongs on that menu.
+        let owner_verbs: Vec<&str> = first_screen_actions(true, false, 1)
+            .iter()
+            .map(|(_, v)| *v)
+            .collect();
+        assert!(
+            !owner_verbs.contains(&"join"),
+            "an owner is not claiming an invitation: {owner_verbs:?}"
+        );
+    }
+
+    #[test]
+    fn printed_hints_carry_every_required_flag() {
+        // #227: `filament requests` printed `[ filament requests approve 1 ]`.
+        // Both `--allow` and `--for` are REQUIRED, so typing the hint exactly as
+        // shown fails with a usage error. The hint was corrected, but the test
+        // defending it asserted only `contains("requests approve 2")`, which is
+        // true of the broken hint too. A check that cannot distinguish the bug
+        // from the fix is not defending anything.
+        //
+        // Sibling of `printed_hints_name_verbs_that_exist`: that one asks whether
+        // the VERB exists, this one asks whether the command as printed would
+        // actually run. Required flags come from clap, so adding one to a
+        // subcommand fails this test until every hint that names it is updated.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+
+        // (path, required long flags) for every subcommand, one level deep.
+        let mut required: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for sc in cmd.get_subcommands() {
+            let collect = |c: &clap::Command| -> Vec<String> {
+                c.get_arguments()
+                    .filter(|a| a.is_required_set())
+                    .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+                    .collect()
+            };
+            let top = collect(sc);
+            if !top.is_empty() {
+                required.push((vec![sc.get_name().to_string()], top));
+            }
+            for ss in sc.get_subcommands() {
+                let inner = collect(ss);
+                if !inner.is_empty() {
+                    required.push((
+                        vec![sc.get_name().to_string(), ss.get_name().to_string()],
+                        inner,
+                    ));
+                }
+            }
+        }
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mut bad = Vec::new();
+        for rel in ["src/main.rs", "src/mount.rs", "src/l2.rs", "src/ui.rs",
+                    "src/fleet_ui/devices.rs", "src/fleet_ui/requests.rs", "src/fleet_ui/mint.rs"] {
+            let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else { continue };
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue; // prose and history, not instructions
+                }
+                for (path, flags) in &required {
+                    let needle = format!("filament {}", path.join(" "));
+                    let Some(i) = line.find(&needle) else { continue };
+                    // The hint is the rest of this literal. Anything the caller
+                    // interpolates is still inside it, so a flag supplied via
+                    // `{}` counts as present.
+                    let rest = &line[i..];
+                    let missing: Vec<&String> =
+                        flags.iter().filter(|f| !rest.contains(f.as_str())).collect();
+                    if !missing.is_empty() {
+                        bad.push(format!(
+                            "{rel}:{}: hint `filament {}` omits required {:?}",
+                            n + 1,
+                            path.join(" "),
+                            missing
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "printed hints that would fail if typed:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn printed_hints_name_verbs_that_exist() {
+        // #229, and the reason this test exists rather than a fifth point fix:
+        // `filament unmount` was printed after every successful mount and has
+        // never been a verb. It was corrected in three places and survived in
+        // FIVE more, including the one users actually hit, and the miss was
+        // found by reading a real mount on a real machine rather than by any
+        // test. Change one copy of a sentence, leave the others, and the wrong
+        // one is the one someone reads next.
+        //
+        // `internal_subcommand_invocations_name_real_verbs` covers what filament
+        // types AT ITSELF. This covers what filament tells the USER to type,
+        // which is the larger surface and the one with a person on the end of it.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let mut valid: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .flat_map(|sc| {
+                let mut v = vec![sc.get_name().to_string()];
+                v.extend(sc.get_all_aliases().map(str::to_string));
+                v
+            })
+            .collect();
+        // `filament <file>` is the bare-send form, and `filament --help` etc.
+        valid.insert("--help".into());
+        // "filament" is also an ordinary noun in our own prose: "the filament
+        // daemon", "local filament state", "no active filament mounts". These
+        // are the words that legitimately follow it there. A NEW one trips this
+        // test once and gets added deliberately, which is the point: the cost of
+        // adding a word is a moment's thought about whether it is prose or an
+        // instruction.
+        for prose in ["daemon", "state", "mounts", "was", "from", "video", "identity"] {
+            valid.insert(prose.into());
+        }
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mut bad = Vec::new();
+        for rel in ["src/main.rs", "src/mount.rs", "src/l2.rs", "src/ui.rs",
+                    "src/fleet_ui/devices.rs", "src/fleet_ui/requests.rs", "src/fleet_ui/mint.rs"] {
+            let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else { continue };
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // Comments explain history ("replaces `filament unmount`") and
+                // are not instructions to anyone.
+                if t.starts_with("//") {
+                    continue;
+                }
+                for (i, _) in line.match_indices("filament ") {
+                    let rest = &line[i + "filament ".len()..];
+                    let word: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                        .collect();
+                    // Not a verb position: a path, an interpolation, a flag we
+                    // do not model, or the bare-send form.
+                    if word.len() < 3 || word.starts_with('-') {
+                        continue;
+                    }
+                    if !valid.contains(&word) {
+                        bad.push(format!("  {rel}:{}: prints `filament {word}`, which clap does not accept\n    {}", n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "printed hints name verbs that do not exist (see docs/ui/OUTPUT.md):\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// An invitation pasted into `add` must be named for what it is, and the
+    /// remedy must be a command that exists. The old path sent the token as a
+    /// nameplate and the server answered "codes burn after one use" about a
+    /// token that was never claimed, prescribing `re-run filament add`, which
+    /// mints a code and cannot help. The owner hit exactly this.
+    ///
+    /// The remedy is asserted against `join`'s real interface: it takes the
+    /// invitation interactively or via --invite-file, and NEVER from argv, so
+    /// this must not tell anyone to pass it on the command line.
+    /// #194: the bare screen prints "FILAMENT / N DEVICES / ..." and then a
+    /// menu. Those two must not contradict each other. The owner saw
+    /// "2 DEVICES" above "Set up this first device" on a machine paired by
+    /// code, which has peers and no identity of its own.
+    #[test]
+    fn the_first_screen_menu_does_not_contradict_its_own_header() {
+        // Genuinely nothing here: the friendly first-run wording is true.
+        let fresh = first_screen_actions(false, false, 0);
+        assert!(fresh.iter().any(|(l, _)| l.contains("first device")));
+
+        // Peers but no identity. "first device" is false with a device count
+        // printed directly above it.
+        let paired = first_screen_actions(false, false, 2);
+        assert!(
+            !paired.iter().any(|(l, _)| l.contains("first device")),
+            "must not call it the first device when the header counts peers: {paired:?}"
+        );
+        // And what already works must be offered: those peers are reachable now.
+        for verb in ["send", "devices"] {
+            assert!(paired.iter().any(|(_, a)| *a == verb),
+                "a machine with peers must be offered `{verb}`: {paired:?}");
+        }
+        // Setting up an identity stays available, just not as a lie about order.
+        assert!(paired.iter().any(|(_, a)| *a == "init"));
+
+        // The owner and joined menus are unaffected by device count.
+        assert_eq!(first_screen_actions(true, false, 0), first_screen_actions(true, false, 5));
+        assert_eq!(first_screen_actions(false, true, 0), first_screen_actions(false, true, 5));
+    }
+
+    #[test]
+    fn an_invitation_pasted_into_add_is_named_and_the_remedy_exists() {
+        let msg = invitation_not_a_code_msg();
+        assert!(msg.contains("not a pairing code"), "must say what it is not: {msg}");
+        assert!(msg.contains("filament join"), "must name the verb that consumes it: {msg}");
+        assert!(msg.contains("--invite-file"), "must offer the file route: {msg}");
+        assert!(!msg.contains("burn"), "must not blame a burned code: {msg}");
+        assert!(!msg.contains("re-run `filament add`"), "must not prescribe minting a code: {msg}");
+        // `filament join` accepts no positional argument, by design.
+        assert!(!msg.contains("filament join filament-invite:"),
+            "must not tell anyone to put invitation material in argv: {msg}");
+    }
+
+    #[test]
+    fn descriptions_of_a_verb_do_not_contradict_each_other() {
+        // Three fixes in a row landed in one of several copies of the same
+        // sentence and left the others. #202: `netcat` survived in six internal
+        // call sites. #220: the banner taught `mount <device>:<dir>`, a form
+        // mount rejects. #219: the banner was corrected to say `up` serves shell
+        // only with --shell, and tour_cmd went on promising "serve: receive,
+        // mount, shell" underneath it.
+        //
+        // The invariant is narrow enough to decide mechanically. Naming verb V
+        // inside the description of verb S is a promise that S provides V. If
+        // any surface qualifies that promise with the flag that buys it
+        // (`--shell`), no other surface may make it bare: one of the two is
+        // telling the user they get V for free when they do not.
+        //
+        // A surface is allowed to say LESS. The tour calls `send` "send
+        // something" where the banner mentions --to, and a summary is not a
+        // contradiction. Only bare-versus-flagged about the SAME verb is a lie,
+        // and that is the only thing asserted here.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let verbs: Vec<String> = cmd
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+
+        /// A bare occurrence: the verb as a whole word, so `--shell` (preceded
+        /// by a dash) and `shell-only` do not count as promising `shell`.
+        fn mentions_bare(desc: &str, verb: &str) -> bool {
+            let edge = |c: Option<char>| match c {
+                Some(c) => !(c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                None => true,
+            };
+            desc.match_indices(verb).any(|(i, _)| {
+                edge(desc[..i].chars().next_back()) && edge(desc[i + verb.len()..].chars().next())
+            })
+        }
+
+        // (surface name, subject verb, description)
+        let mut described: Vec<(&str, String, String)> = Vec::new();
+
+        // The help banner's COMMANDS section: a command column, two or more
+        // spaces, then the description.
+        let section = EXAMPLES.split("\nEXAMPLES").next().unwrap_or(EXAMPLES);
+        for line in section.lines() {
+            let t = line.trim();
+            let Some(gap) = t.find("  ") else { continue };
+            let (lhs, rhs) = t.split_at(gap);
+            let desc = rhs.trim();
+            let subject = lhs.split_whitespace().next().unwrap_or("");
+            if desc.is_empty() || !verbs.iter().any(|v| v == subject) {
+                continue;
+            }
+            described.push(("help banner", subject.to_string(), desc.to_string()));
+        }
+
+        // tour_cmd's `act("filament <verb> ...", "<desc>")` lines, read from the
+        // source: the tour is printed, not returned, so there is nothing to call.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let src = std::fs::read_to_string(format!("{manifest}/src/main.rs")).expect("read main.rs");
+        let tour = src
+            .split("fn tour_cmd")
+            .nth(1)
+            .expect("tour_cmd must exist for this test to mean anything");
+        for line in tour.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("act(\"filament ") else { continue };
+            let Some((lhs, rest)) = rest.split_once("\", \"") else { continue };
+            let Some((desc, _)) = rest.split_once('"') else { continue };
+            let subject = lhs.split_whitespace().next().unwrap_or("");
+            if !verbs.iter().any(|v| v == subject) {
+                continue;
+            }
+            described.push(("tour", subject.to_string(), desc.to_string()));
+        }
+
+        assert!(
+            described.iter().any(|(s, _, _)| *s == "tour"),
+            "no tour descriptions were parsed; the scan has drifted from the source and this test now proves nothing"
+        );
+
+        // For each subject, which verbs does some surface say cost a flag?
+        let mut flagged: std::collections::BTreeSet<(String, String)> = Default::default();
+        for (_, subject, desc) in &described {
+            for v in &verbs {
+                if v != subject && desc.contains(&format!("--{v}")) {
+                    flagged.insert((subject.clone(), v.clone()));
+                }
+            }
+        }
+
+        let mut bad = Vec::new();
+        for (surface, subject, desc) in &described {
+            for v in &verbs {
+                if v == subject || !flagged.contains(&(subject.clone(), v.clone())) {
+                    continue;
+                }
+                if mentions_bare(desc, v) && !desc.contains(&format!("--{v}")) {
+                    bad.push(format!(
+                        "  {surface}: '{subject}' is described as \"{desc}\", which promises '{v}' \
+                         with no flag, while another surface says '{v}' needs --{v}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "surfaces disagree about what a command provides:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn down_picks_the_right_systemd_manager_for_the_daemon_cgroup() {
+        // Two units can share the name filament.service (system + user under
+        // Linger). down must ask the manager whose cgroup actually owns the
+        // daemon, or it stops someone else's unit.
+        let system = "0::/system.slice/filament.service";
+        assert_eq!(service_manager_for_cgroup(system), Some(ServiceManager::SystemdSystem));
+        let user = "0::/user.slice/user-0.slice/user@0.service/app.slice/filament.service";
+        assert_eq!(service_manager_for_cgroup(user), Some(ServiceManager::SystemdUser));
+        // A neighbouring unit name must not collide (the name is matched as a
+        // cgroup segment, not a substring).
+        let neighbour = "0::/system.slice/my-filament.service";
+        assert_eq!(service_manager_for_cgroup(neighbour), None);
+        // A detached foreground daemon is not a managed service at all.
+        let detached = "0::/user.slice/user-0.slice/session-3.scope";
+        assert_eq!(service_manager_for_cgroup(detached), None);
+    }
+
+    #[test]
+    fn internal_subcommand_invocations_name_real_verbs() {
+        // #202 inward audit: the banner-vs-clap test asks what a PERSON can
+        // type. Nothing asked what filament types AT ITSELF, which is how a
+        // dead verb (netcat) survived in six internal ProxyCommand call sites
+        // and one printed hint. Scan the source for format!-built subcommand
+        // invocations (a quoted verb, a space, then an interpolation brace) and
+        // assert each names a verb clap accepts.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let valid: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .flat_map(|sc| {
+                let mut v = vec![sc.get_name().to_string()];
+                v.extend(sc.get_all_aliases().map(str::to_string));
+                v
+            })
+            .collect();
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let sources = ["src/main.rs", "src/mount.rs", "src/backup.rs", "src/l2.rs"];
+        let mut checked = 0usize;
+        for f in sources {
+            let Ok(text) = std::fs::read_to_string(format!("{manifest}/{f}")) else { continue };
+            for line in text.lines() {
+                let bytes = line.as_bytes();
+                let mut i = 0usize;
+                while i + 1 < bytes.len() {
+                    if bytes[i] == b'"' && bytes[i + 1] == b' ' {
+                        let mut j = i + 2;
+                        while j < bytes.len() && bytes[j].is_ascii_lowercase() {
+                            j += 1;
+                        }
+                        if j > i + 2
+                            && j < bytes.len()
+                            && bytes[j] == b' '
+                            && j + 1 < bytes.len()
+                            && bytes[j + 1] == b'{'
+                        {
+                            let verb = &line[i + 2..j];
+                            assert!(
+                                valid.contains(verb),
+                                "internal subcommand invocation names '{verb}', which clap does not accept ({f}: {line})"
+                            );
+                            checked += 1;
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 6, "expected the internal subcommand invocations to be found, got {checked}");
     }
 
     #[test]
