@@ -1091,7 +1091,15 @@ enum Cmd {
     },
     /// Open a shell on a device.
     ///
-    /// Default: Filament's native PTY. The peer must explicitly authorize shell.
+    // #234: this said "The peer must explicitly authorize shell", which reads as
+    // per-device and is why `up --shell` surprised people: one flag on the
+    // acceptor admits every paired device, present and future. The behaviour is
+    // deliberate (see ShellPolicy::All); the sentence describing it was not.
+    // Rationale lives here, in a comment. The doc line below is what a user
+    // reads, so it states the two ways in and nothing else.
+    /// Default: Filament's native PTY. The peer must authorize shell, either
+    /// per-device with `grant <device> shell`, or for every paired device at
+    /// once by serving `up --shell` (use `up --shell-only a,b` to scope it).
     /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
     /// (reuses your keys, known_hosts, and ~/.ssh/config).
     Shell {
@@ -2430,6 +2438,54 @@ fn handle_identity_expose(
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
         pid
     ));
+    // #243: a vouch writes {name, secret} and nothing else, so the record carries
+    // no certificate for revocation to key on: `revoke --certificate` bails with
+    // "no stored fleet certificate", the peer re-derives as legacy trust on every
+    // reconnect, and it renders as "trusted in full". The verified certificate is
+    // right here, and until now only ever reached the pid-keyed sidecar that
+    // `resolve_peer_identity` (petname-keyed) never reads.
+    //
+    // THE MODEL IS TRUST-ON-FIRST-USE, and it should be called that. `vouch` is
+    // the CROSS-OWNER mechanism, so the peer's certificate cannot chain to our
+    // root and `verify_chain` is not available; `cert.verify` only checks a cert
+    // against its own embedded user_pub, which cannot say whose mesh this is. So
+    // the first identity to answer for this petname is the one that gets pinned.
+    // That is a defensible model, but it is a decision, not a fact, and the line
+    // we print says so.
+    //
+    // What it is NOT: privilege escalation. A peer reaching here already holds
+    // the pairing secret, so it already IS this petname to this device. The bound
+    // is petname squatting and durable misidentification: the legitimate device
+    // can never be certified under that name afterwards.
+    //
+    // Scoped to the VOUCH SHAPE, a known petname holding a secret with no cert.
+    // Certifying every expose would undo the stated design of
+    // `store_provisional_identity`, that a failed overlay session leaves no
+    // durable anchor.
+    let petname = conn.link(pid).map(|l| l.name.clone()).unwrap_or_default();
+    if !petname.is_empty()
+        && device_cert_for(&petname).is_none()
+        && devices_load().iter().any(|(n, _)| n == &petname)
+    {
+        match update_peer_identity(&petname, &cert, VOUCH_CERT_SCOPE) {
+            Ok(()) => ui::say(&format!(
+                "  {} first identity for '{}' pinned; `filament revoke {} --certificate` can now reach it",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                petname,
+                petname
+            )),
+            // The in-memory Proven binding still holds for this link, but the
+            // durable record stays un-revocable, which is the whole defect. Name
+            // it rather than let the vouch look complete.
+            Err(e) => ui::caution(
+                &format!("'{petname}' is paired but not certified"),
+                Some(&format!(
+                    "its certificate was not stored ({e}), so revoke has nothing to key on."
+                )),
+                &[format!("remove it instead: filament devices forget {petname}")],
+            ),
+        }
+    }
     // Erase held nonce (single-use)
     identity_nonces.remove(pid);
     true
@@ -2497,8 +2553,39 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
     identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+/// #243: the intro scope a vouch stores. A vouch introduces a DEVICE, not a
+/// user, so `Device` (0x01) is the correct anchor. The value is NOT cosmetic:
+/// `apply_peer_identity` gates its device-pinning branch on
+/// `existing_scope == 0x01`, so storing `User` here would silently disarm that
+/// check for every LATER write to the same petname on the path where the guard
+/// does run (l3-announce). Named as a constant so the choice is one line, is
+/// testable, and cannot drift.
+pub(crate) const VOUCH_CERT_SCOPE: u8 = 0x01; // identity::IntroScope::Device
+
 fn update_peer_identity(name: &str, peer_cert: &identity::DeviceCert, scope: u8) -> Result<()> {
-    // Delegate to atomic upsert: cert only, preserve secret & caps
+    // #243: refuse a re-anchor HERE, in the writer, rather than trusting each
+    // caller to have checked first.
+    //
+    // `devices_upsert_atomic` -> `upsert_peer_record` overwrites `userKey` and
+    // `deviceCert` unconditionally, with no comparison and no bail. The takeover
+    // guard people assume protects this (`identity::apply_peer_identity`) had
+    // exactly one production caller, the l3-announce path, and was never on this
+    // one. I asserted otherwise in the first draft of this fix without tracing
+    // the call, which is the same defect this issue is about.
+    //
+    // Today this is INERT for the vouch flow: the only caller gates on
+    // `device_cert_for(..).is_none()`, so a second write never arrives. It is
+    // here anyway because that gate is a policy in a caller while this is an
+    // invariant in the store, and only one of those survives an edit. The edit
+    // is already foreseeable: #266 (device_cert_for ignores expiry, so an
+    // expired cert permanently blocks re-certification) will be fixed by
+    // relaxing that gate to `is_none() || expired`, and at that moment a second
+    // durable write becomes reachable and this is what refuses it.
+    //
+    // Do not delete this because it never fires. That is the point of it.
+    with_devices_mut(|arr| {
+        identity::apply_peer_identity(arr, name, peer_cert, scope).map_err(|e| anyhow::anyhow!("{}", e))
+    })?;
     devices_upsert_atomic(name, None, Some(peer_cert), None, Some(scope), None, None)?;
     Ok(())
 }
@@ -3633,7 +3720,7 @@ async fn up_cmd(
         // actually have a block (avoid noise for devices without one).
         for device in &revoked {
             if sshkeys::has_block(&ak_content, device) && !authoritative {
-                eprintln!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                ui::critical(&format!("CAP-SHADOW RECONCILE (startup): WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"));
             }
         }
         let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
@@ -6408,6 +6495,34 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     // cleanly, never stop the daemon. The file may not exist yet (the daemon
     // is still starting); poll for it instead of erroring.
     use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+    // #216: ONE interrupt registration, created before the loops and held for
+    // the whole follow.
+    //
+    // The old shape built `tokio::signal::ctrl_c()` fresh inside each select and
+    // awaited the idle sleep in the branch BODY, outside any select. A followed
+    // log is idle almost all of the time, so almost every press landed in a
+    // window where no ctrl_c future existed, and a signal delivered when nothing
+    // is listening is not replayed to whatever listens next. The user saw
+    // ^C^C^C^C do nothing while two banners promised ctrl-c detaches.
+    //
+    // `notify_one` (not `notify_waiters`) is the load-bearing choice: it stores a
+    // permit when there is no waiter, so a press during a sleep is remembered and
+    // consumed by the next `notified()`. `notify_waiters` would drop it and
+    // reintroduce the bug in a subtler form.
+    let interrupted = std::sync::Arc::new(tokio::sync::Notify::new());
+    {
+        let n = interrupted.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            n.notify_one();
+        });
+    }
+    macro_rules! detached {
+        () => {{
+            ui::say("\n  detached (the daemon keeps running)");
+            return Ok(());
+        }};
+    }
     loop {
         match tokio::fs::OpenOptions::new().read(true).open(&path).await {
             Ok(f) => {
@@ -6417,23 +6532,33 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 let mut line = String::new();
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = interrupted.notified() => detached!(),
                         res = reader.read_line(&mut line) => {
                             if res? == 0 {
-                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                // The idle wait is a select ARM, not an awaited
+                                // body, so the interrupt stays live through it.
+                                tokio::select! {
+                                    biased;
+                                    _ = interrupted.notified() => detached!(),
+                                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                                }
                                 continue;
                             }
                             eprintln!("{}", line.trim_end());
                             line.clear();
                         }
-                        _ = tokio::signal::ctrl_c() => {
-                            ui::say("\n  detached (the daemon keeps running)");
-                            return Ok(());
-                        }
                     }
                 }
             }
             Err(_) => {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                // The same window while waiting for the file to appear: a daemon
+                // that is slow to start must not make ctrl-c inert either.
+                tokio::select! {
+                    biased;
+                    _ = interrupted.notified() => detached!(),
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                }
                 continue;
             }
         }
@@ -6985,6 +7110,14 @@ fn first_screen_actions(owner: bool, joined: bool, device_count: usize) -> Vec<(
     } else if device_count == 0 {
         vec![
             ("Set up this first device", "init"),
+            // #209: there are TWO ways to be brought into an identity. `add`
+            // mints a pairing code claimed with `add <code>`; `add --for` mints
+            // a bounded invitation claimed with `join`. This menu offered only
+            // the second, so someone holding a pairing code, which is the path
+            // the OWNER side presents first as "Connect a device with me now",
+            // had no entry here and had to know to type it. #198's shape: two
+            // mint paths, and the claim surface grew only one of them.
+            ("Pair with a code I was given", "add"),
             ("Join with an invitation", "join"),
             ("Receive a one-time transfer", "receive"),
         ]
@@ -7003,6 +7136,7 @@ fn first_screen_actions(owner: bool, joined: bool, device_count: usize) -> Vec<(
             ("Receive something", "receive"),
             ("See every device", "devices"),
             ("Create an identity for this device", "init"),
+            ("Pair with a code I was given", "add"), // #209, as above
             ("Join with an invitation", "join"),
         ]
     }
@@ -12059,7 +12193,15 @@ async fn main() -> Result<()> {
                     .split_whitespace()
                     .map(str::to_string),
             ),
-            None => return tour_cmd(),
+            // #209: Ctrl-C means stop. Answering it with the full
+            // status-and-help screen reads as "I picked the first item and got a
+            // help page", which is what the owner reported on Windows. Exit
+            // quietly, status 0, printing nothing.
+            //
+            // This arm was mostly unreachable until #203 made cancelling work,
+            // so fixing cancel is what turned a bad destination into a live one.
+            // Every other `None =>` on a picker deserves the same second look.
+            None => return Ok(()),
         }
     }
     let cli = Cli::parse_from(argv);
@@ -12785,7 +12927,7 @@ async fn main() -> Result<()> {
                     // Emit per-device shadow logs for actual-block devices.
                     for device in &revoked {
                         if sshkeys::has_block(&ak_content, device) && !authoritative {
-                            eprintln!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow");
+                            ui::critical(&format!("CAP-SHADOW RECONCILE: WOULD remove shell key for '{device}' (cap store denies shell); NOT removing in shadow"));
                         }
                     }
                     let new_ak = crate::capability::reconcile_shell_keys(&revoked, &ak_content, authoritative);
@@ -18004,6 +18146,40 @@ async fn recv_cmd(
                     });
                     complete_warm_bootstrap(&mut pending_bootstrap, &pid, &reply).await;
                 }
+                // #268: an `l2-open` arriving while L2 is OFF used to fall
+                // through and be IGNORED. The initiator has already committed a
+                // client to that stream, so it waits for an answer that is never
+                // coming: measured cross-machine, curl hung for its full 25s
+                // timeout while filament printed nothing at either end.
+                //
+                // `shell-bootstrap` directly below already refuses explicitly in
+                // this exact state. The tunnel open, which is the more common
+                // path (`forward`, `netcat`, ssh), did not, so the two disagreed
+                // about whether "off" is something you say or something you
+                // silently do.
+                //
+                // `on_close` turns this into OpenOutcome::Refused with the reason
+                // (#206), so the client gets a clean, immediate, explained close
+                // instead of a hang.
+                Some("l2-open") if !l2_enabled => {
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "l2-close",
+                                "sid": sid,
+                                "err": crate::capability::TUNNEL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
+                // NOTE: keep this arm ABOVE the `#[cfg(unix)]` comment block
+                // below. That attribute belongs to `shell-bootstrap`, and an
+                // outer attribute binds to the NEXT arm regardless of any
+                // comments in between: inserting here originally compiled this
+                // refusal out on Windows AND silently made the shell-bootstrap
+                // deny unconditional there. Found in review, not by the compiler,
+                // because both outcomes still build.
                 // Shell serving is OFF here. Without this arm the message falls
                 // through the match and the acceptor says NOTHING, so the caller
                 // can only time out: `filament shell X --ssh` burned its full
@@ -20610,6 +20786,124 @@ mod tests {
         unsafe { std::env::remove_var("FILAMENT_DIRECT") };
     }
 
+    // ---- #243: what a vouch may durably write, and what it may not ----------
+    //
+    // These target `update_peer_identity`, the store-side writer, rather than
+    // `handle_identity_expose`, the caller. Same-host ICE blocks a live vouch on
+    // a release build, but that never blocked testing this: it is a plain
+    // function over devices.json. Treating one blocked path as if it blocked the
+    // whole question is how #243 stayed "reasoned from code" longer than it had
+    // to.
+
+    fn td(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fil-243-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        dir
+    }
+
+    fn cert_for(user: u8, device: u8, expires: u64) -> identity::DeviceCert {
+        identity::DeviceCert::from_json(&serde_json::json!({
+            "devicePub": hex::encode([device; 32]),
+            "userPub": hex::encode([user; 32]),
+            "expires": expires,
+            "issued": 1u64,
+            "sig": hex::encode([0u8; 64]),
+        })).unwrap()
+    }
+
+    fn stored_user_key(dir: &std::path::Path, name: &str) -> Option<String> {
+        let raw = std::fs::read_to_string(dir.join("devices.json")).ok()?;
+        let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+        arr.into_iter()
+            .find(|d| d["name"].as_str() == Some(name))
+            .and_then(|d| d["userKey"].as_str().map(|s| s.to_string()))
+    }
+
+    /// A record already anchored to one user key must not be re-anchored to a
+    /// different one by a later write. `upsert_peer_record` overwrites `userKey`
+    /// unconditionally, so before the guard moved into `update_peer_identity`
+    /// this test failed: the foreign key landed.
+    #[test]
+    fn vouch_write_refuses_a_foreign_user_key() {
+        let _guard = lock_test_config();
+        let dir = td("foreign");
+        let mine = cert_for(0x11, 0xa1, 9_999_999_999);
+        update_peer_identity("boxy", &mine, identity::IntroScope::Device.to_byte()).unwrap();
+        assert_eq!(stored_user_key(&dir, "boxy"), Some(hex::encode([0x11u8; 32])));
+
+        let theirs = cert_for(0x22, 0xb2, 9_999_999_999);
+        let res = update_peer_identity("boxy", &theirs, identity::IntroScope::Device.to_byte());
+        assert!(res.is_err(), "a cert under a different user key must be refused");
+        assert_eq!(
+            stored_user_key(&dir, "boxy"),
+            Some(hex::encode([0x11u8; 32])),
+            "the original anchor must survive a refused write"
+        );
+    }
+
+    /// First-writer-wins is the whole trust model here (TOFU), so pin it: the
+    /// second certificate does not replace the first.
+    #[test]
+    fn vouch_write_is_first_writer_wins() {
+        let _guard = lock_test_config();
+        let dir = td("tofu");
+        let first = cert_for(0x33, 0xc3, 9_999_999_999);
+        update_peer_identity("pinned", &first, identity::IntroScope::Device.to_byte()).unwrap();
+
+        let second = cert_for(0x44, 0xd4, 9_999_999_999);
+        assert!(update_peer_identity("pinned", &second, identity::IntroScope::Device.to_byte()).is_err());
+        assert_eq!(stored_user_key(&dir, "pinned"), Some(hex::encode([0x33u8; 32])));
+    }
+
+    /// The scope a vouch stores is Device, not User, and the difference is not
+    /// cosmetic: `apply_peer_identity` gates its device-pinning branch on
+    /// `existing_scope == 0x01`, so storing User silently disarms that check for
+    /// every later write to this petname on the path where the guard does run.
+    #[test]
+    fn vouch_scope_is_device_so_device_pinning_stays_armed() {
+        let _guard = lock_test_config();
+        let _dir = td("scope");
+        assert_eq!(
+            VOUCH_CERT_SCOPE,
+            identity::IntroScope::Device.to_byte(),
+            "a vouch introduces a DEVICE; User scope would disarm device-pinning"
+        );
+
+        let laptop = cert_for(0x55, 0xe5, 9_999_999_999);
+        update_peer_identity("sib", &laptop, VOUCH_CERT_SCOPE).unwrap();
+
+        // Same user, different device, through the path where the guard runs.
+        let phone = cert_for(0x55, 0xf6, 9_999_999_999);
+        let res = with_devices_mut(|arr| {
+            identity::apply_peer_identity(arr, "sib", &phone, VOUCH_CERT_SCOPE)
+                .map_err(|e| anyhow::anyhow!("{}", e))
+        });
+        assert!(res.is_err(), "a different device under the same user is a new trust decision");
+    }
+
+    /// #266: `device_cert_for` ignores expiry, so once a certificate is stored
+    /// the vouch gate never reopens, even after that certificate dies. Pinned
+    /// deliberately rather than left accidental: when someone relaxes the gate to
+    /// `is_none() || expired` to fix #266, this test fails and makes them look at
+    /// the guard, which is the reason the guard is in the path at all.
+    #[test]
+    fn expired_certificate_still_closes_the_vouch_gate() {
+        let _guard = lock_test_config();
+        let _dir = td("expired");
+        let dead = cert_for(0x66, 0xa7, 1); // expired in 1970
+        update_peer_identity("lapsed", &dead, VOUCH_CERT_SCOPE).unwrap();
+
+        assert!(dead.verify(identity::now_secs()).is_err(), "precondition: the cert is expired");
+        assert!(
+            device_cert_for("lapsed").is_some(),
+            "device_cert_for ignores expiry (#266), so the gate stays shut; \
+             if this now fails, #266 was fixed and the store-side guard is the \
+             only thing left protecting this path"
+        );
+    }
+
     #[test]
     fn require_known_device_names_the_known_devices() {
         // #221 in the peer-taking verbs: a stale name must read as a lookup
@@ -21678,6 +21972,115 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    #[test]
+    fn a_device_with_no_identity_is_offered_both_ways_in() {
+        // #209: there are TWO ways to be brought into an identity, a pairing code
+        // claimed with `add <code>` and a bounded invitation claimed with `join`,
+        // and the launcher offered only the second. Someone holding a pairing
+        // code, which is the path the OWNER side presents first, had no entry on
+        // the device doing the claiming.
+        //
+        // Added because review found the fix undefended: the existing menu test
+        // asserts send/devices/init and says nothing about this entry, so
+        // deleting it left the suite green. That is the same shape as #227, which
+        // this same PR exists to correct, so leaving it untested would have been
+        // the defect reappearing inside its own fix.
+        for (owner, joined, count) in [(false, false, 0usize), (false, false, 2usize)] {
+            let actions = first_screen_actions(owner, joined, count);
+            let verbs: Vec<&str> = actions.iter().map(|(_, verb)| *verb).collect();
+            assert!(
+                verbs.contains(&"add"),
+                "a device with no identity must be offered the pairing-code claim (device_count={count}): {verbs:?}"
+            );
+            assert!(
+                verbs.contains(&"join"),
+                "and the invitation claim as well (device_count={count}): {verbs:?}"
+            );
+        }
+        // An owner already has an identity; neither claim belongs on that menu.
+        let owner_verbs: Vec<&str> = first_screen_actions(true, false, 1)
+            .iter()
+            .map(|(_, v)| *v)
+            .collect();
+        assert!(
+            !owner_verbs.contains(&"join"),
+            "an owner is not claiming an invitation: {owner_verbs:?}"
+        );
+    }
+
+    #[test]
+    fn printed_hints_carry_every_required_flag() {
+        // #227: `filament requests` printed `[ filament requests approve 1 ]`.
+        // Both `--allow` and `--for` are REQUIRED, so typing the hint exactly as
+        // shown fails with a usage error. The hint was corrected, but the test
+        // defending it asserted only `contains("requests approve 2")`, which is
+        // true of the broken hint too. A check that cannot distinguish the bug
+        // from the fix is not defending anything.
+        //
+        // Sibling of `printed_hints_name_verbs_that_exist`: that one asks whether
+        // the VERB exists, this one asks whether the command as printed would
+        // actually run. Required flags come from clap, so adding one to a
+        // subcommand fails this test until every hint that names it is updated.
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+
+        // (path, required long flags) for every subcommand, one level deep.
+        let mut required: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for sc in cmd.get_subcommands() {
+            let collect = |c: &clap::Command| -> Vec<String> {
+                c.get_arguments()
+                    .filter(|a| a.is_required_set())
+                    .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+                    .collect()
+            };
+            let top = collect(sc);
+            if !top.is_empty() {
+                required.push((vec![sc.get_name().to_string()], top));
+            }
+            for ss in sc.get_subcommands() {
+                let inner = collect(ss);
+                if !inner.is_empty() {
+                    required.push((
+                        vec![sc.get_name().to_string(), ss.get_name().to_string()],
+                        inner,
+                    ));
+                }
+            }
+        }
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mut bad = Vec::new();
+        for rel in ["src/main.rs", "src/mount.rs", "src/l2.rs", "src/ui.rs",
+                    "src/fleet_ui/devices.rs", "src/fleet_ui/requests.rs", "src/fleet_ui/mint.rs"] {
+            let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else { continue };
+            for (n, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue; // prose and history, not instructions
+                }
+                for (path, flags) in &required {
+                    let needle = format!("filament {}", path.join(" "));
+                    let Some(i) = line.find(&needle) else { continue };
+                    // The hint is the rest of this literal. Anything the caller
+                    // interpolates is still inside it, so a flag supplied via
+                    // `{}` counts as present.
+                    let rest = &line[i..];
+                    let missing: Vec<&String> =
+                        flags.iter().filter(|f| !rest.contains(f.as_str())).collect();
+                    if !missing.is_empty() {
+                        bad.push(format!(
+                            "{rel}:{}: hint `filament {}` omits required {:?}",
+                            n + 1,
+                            path.join(" "),
+                            missing
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "printed hints that would fail if typed:\n{}", bad.join("\n"));
     }
 
     #[test]

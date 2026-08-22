@@ -3140,8 +3140,22 @@ impl ForwardActivity {
         self.total.fetch_add(1, Relaxed);
         self.active.fetch_add(1, Relaxed);
         if !self.first.swap(true, Relaxed) {
+            // #232: this used to read "first connection forwarded to X:Y", and it
+            // fires on `listener.accept()`, before any l2-open has been sent. On
+            // the cold path the peer has not been asked yet; on either path
+            // `open_stream` returns as soon as the l2-open frame is WRITTEN, so
+            // even that is not proof the peer accepted. The reporter saw
+            // "the link is live" printed while curl got an empty reply.
+            //
+            // Accepting a local connection is true and narrower than the peer
+            // forwarding it, so the line now claims only what is known here.
+            // Proof of delivery is the first inbound frame, which lives behind
+            // `verify_first_frame` on the warm path and behind `serve_stream`'s
+            // shared plumbing on the cold one; reporting from there needs an
+            // outcome channel that several other callers must NOT inherit, so it
+            // is a follow-up rather than a claim made loosely here.
             crate::ui::say(&format!(
-                "filament: first connection forwarded to {}:{}",
+                "filament: first connection accepted, opening to {}:{}",
                 self.peer, self.rport
             ));
         }
@@ -3759,8 +3773,12 @@ async fn serve_cold_connection(
             Err(_) => {
                 tries += 1;
                 if tries >= 3 {
-                    crate::ui::debug(&format!(
-                        "filament: dropping a connection to {peer} (link recovering); the forward stays up"
+                    // #232: the client is staring at an empty reply, so this is
+                    // not a debug detail. It was invisible at the default level,
+                    // which is why the only thing the user saw was the premature
+                    // success line above.
+                    crate::ui::critical(&format!(
+                        "filament: could not open a stream to {peer} after 3 tries; this connection was dropped (the forward stays up)"
                     ));
                     return; // drop sock; accept loop keeps running
                 }

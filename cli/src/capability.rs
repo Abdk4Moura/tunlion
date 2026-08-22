@@ -25,6 +25,12 @@ pub use filament_cap::capability::*;
 pub const SHELL_OFF_REASON: &str =
     "shell serving is off there; run `filament up --shell` on that device";
 
+/// The L2 tunnel acceptor is OFF on the peer entirely, so `forward`, `netcat`
+/// and the ssh bootstrap have nothing to open against. Like SHELL_OFF_REASON
+/// this is not a capability problem and a grant does not help.
+pub const TUNNEL_OFF_REASON: &str =
+    "tunnelling is off there; run `filament up --shell` (or set FILAMENT_L2=1) on that device";
+
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a
 /// fresh invitation that includes the capability.
@@ -308,7 +314,9 @@ fn log_once(key: String, msg: &str, verbose: bool) {
             // narration: shown only at -v (ui::debug), never on the flagship path.
             crate::ui::debug(msg);
         } else {
-            eprintln!("{msg}");
+            // #231: loud, but through the ui layer so it respects NO_COLOR and
+            // pipe mode. Loud is the level; raw stderr was never the point.
+            crate::ui::critical(msg);
         }
     }
 }
@@ -636,12 +644,24 @@ pub fn cap_gate_effective(
         // Unprovisioned is logged once per resource so a fresh node never floods.
         match (legacy_allowed, outcome) {
             (true, CapOutcome::Denied(reason)) => {
-                eprintln!(
+                // #231 asks for exactly one thing to go quiet: the
+                // `[unprovisioned]` line, "which by its own text is the normal
+                // state". It says the CRITICAL variant "should keep printing
+                // loudly while shadow mode is live, since that one is a real
+                // disagreement".
+                //
+                // So this stays loud. What changes is only that it rides
+                // `ui::critical` instead of a raw `eprintln!`, which honours
+                // NO_COLOR and pipe mode and cannot be silenced by `-q`
+                // (critical is level 0). An earlier pass demoted this to debug,
+                // which was me overriding the issue author's explicit decision
+                // rather than implementing it.
+                crate::ui::critical(&format!(
                     "CAP-SHADOW CRITICAL: a header EXISTS and DENIES '{action}' on '{resource}' for dev={} user={} that legacy ALLOWED (reason: {reason}); a flip would BREAK this open [{}]",
                     hex::encode(dev),
                     hex::encode(usr),
                     cap_shadow_counts().summary(),
-                );
+                ));
             }
             (true, CapOutcome::Unprovisioned) => log_once(
                 format!("nh|{resource}"),
@@ -662,7 +682,7 @@ pub fn cap_gate_effective(
                     hex::encode(dev),
                     hex::encode(usr),
                 ),
-                false,
+                false, // #231: a WIDENING is a real disagreement; stays loud
             ),
             _ => {}
         }
