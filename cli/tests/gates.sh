@@ -33,7 +33,19 @@ if [ -n "${FILAMENT_GATE_RELEASE:-}" ]; then
 else
   GATE_PROFILE_DIR=debug; GATE_BUILD_FLAG=
 fi
-BIN="$CLI_DIR/target/$GATE_PROFILE_DIR/filament"
+# #249: this assumed cargo writes to cli/target, which is false on any machine
+# that sets `target-dir` (this one shares /root/.cargo-target across worktrees,
+# see ~/.cargo/config.toml). The build step below then SUCCEEDED while every gate
+# tried to exec a path that does not exist: "1 passed, 31 failed", each failure
+# reading `No such file or directory` rather than naming the cause. Ask cargo
+# where it actually writes instead of assuming.
+_target_dir() {
+    ( cd "$CLI_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null ) \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null \
+      || echo "$CLI_DIR/target"
+}
+GATE_TARGET_DIR="${CARGO_TARGET_DIR:-$(_target_dir)}"
+BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/filament"
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
@@ -74,7 +86,22 @@ trap cleanup EXIT
 # a timing-window lottery ('slow-down' flakes). Pinning it makes the claim
 # path deterministic. (Set FILAMENT_TEST_SERVER to point at an external
 # server and skip the autostart — but then you own the claim limit.)
-PYV0="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+# #249: this used to default to a hardcoded venv inside a job directory
+# (/root/.claude/jobs/330c2366/...) that no longer exists. The autostart below is
+# gated on `-x "$PYV0"`, so a missing interpreter SKIPPED the backend silently
+# and the run died two lines later on "no backend at ...", which reads as an
+# environment problem rather than a stale path in this script. That is a large
+# part of why the deterministic core has not been runnable, let alone wired into
+# CI. Prefer the override, then a venv if one is present, then whatever python3
+# is on PATH; the backend's deps are ordinary (flask, flask-socketio, eventlet).
+_pick_python() {
+    if [ -n "${FILAMENT_TEST_VENV:-}" ]; then echo "$FILAMENT_TEST_VENV"; return; fi
+    for c in "$CLI_DIR/../backend/.venv/bin/python" "$CLI_DIR/../.venv/bin/python"; do
+        [ -x "$c" ] && { echo "$c"; return; }
+    done
+    command -v python3 2>/dev/null || echo python3
+}
+PYV0="$(_pick_python)"
 OWN_BACKEND=""
 if [ -z "${FILAMENT_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   for pid in $(ss -tlnp 2>/dev/null | grep ":8077 " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done
@@ -86,10 +113,26 @@ if [ -z "${FILAMENT_TEST_SERVER:-}" ] && [ -x "$PYV0" ]; then
   OWN_BACKEND=$!
   for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 fi
-curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; exit 2; }
+curl -fsS "$SERVER/api/health" >/dev/null || {
+  echo "no backend at $SERVER"
+  echo "  interpreter tried: $PYV0"
+  [ -n "$OWN_BACKEND" ] && { echo "  it was started; its log:"; sed 's/^/    /' "$WORK/fixture-backend.log" 2>/dev/null | tail -8; } \
+                        || echo "  autostart was SKIPPED: that interpreter is not executable"
+  exit 2
+}
 # These gates drive env-gated test hooks (FILAMENT_TEST_*), which now ship ONLY
 # in a `--features test-hooks` build (stripped from default/release).
 ( cd "$CLI_DIR" && cargo build $GATE_BUILD_FLAG --features test-hooks -q ) || { echo "build failed"; exit 2; }
+# Assert the binary the gates will EXEC exists, rather than discovering it 31
+# failures later. A build that succeeded says nothing about where this script
+# then looks.
+[ -x "$BIN" ] || {
+  echo "built, but no executable at the path the gates use:"
+  echo "  BIN=$BIN"
+  echo "  target dir resolved to: $GATE_TARGET_DIR"
+  exit 2
+}
+echo "gates: using $BIN"
 
 # The browser gates load frontend/dist via the LOCAL backend, so the bundle
 # must be SAME-ORIGIN. `npm run build` bakes frontend/.env.production

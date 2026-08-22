@@ -2283,8 +2283,9 @@ fn certified_device_names(user_pub: &[u8; 32]) -> Vec<(String, identity::DeviceC
 /// cert trusted-for-that-name. No additional link-level cert-to-transport
 /// comparison is needed.
 ///
-/// Fail-closed to None on: no verified_name, no stored cert, cert expired
-/// or otherwise invalid.
+/// Fail-closed on: no verified_name, no stored cert, cert expired or
+/// otherwise invalid. For a DELEGATED peer "fail closed" cannot be a bare
+/// `return`: see `pin_delegated_denied`.
 fn resolve_peer_identity(link: &mut Link) {
     // Precedence rule: a Proven binding must NOT be downgraded to Inferred.
     // The identity-expose handler (possession-sig) sets Proven, and this
@@ -2297,9 +2298,13 @@ fn resolve_peer_identity(link: &mut Link) {
         Some(n) => n.clone(),
         None => return, // no proven name, nothing to resolve
     };
-    let Some(cert) = device_cert_for(&name) else { return };
+    let Some(cert) = device_cert_for(&name) else {
+        pin_delegated_denied(link, &name);
+        return;
+    };
     let now = crate::identity::now_secs();
     if cert.verify(now).is_err() {
+        pin_delegated_denied(link, &name);
         return;
     }
     link.identity_device_pub = Some(cert.device_pub);
@@ -2308,7 +2313,55 @@ fn resolve_peer_identity(link: &mut Link) {
     let (principal_kind, not_after, max_offline, last_seen) = persisted_principal_for_cert(&cert);
     let (deadline, _clock) = effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
     link.identity_cert_expires = Some(deadline);
-    link.principal_kind = principal_kind;
+    // A delegated principal runs on three clocks: cert expiry, an absolute stop
+    // time, and an offline budget. `effective_principal_deadline` already
+    // composes them, and `cap_gate_effective` composes `identity_cert_expires`
+    // into the outcome, but that composer is a no-op while the capability
+    // engine is in SHADOW mode, where the effective decision is the legacy one.
+    // The ceiling is the only thing enforcing a delegated principal in shadow,
+    // so a passed deadline has to empty the ceiling here (#272).
+    link.principal_kind = principal_after_liveness(principal_kind, deadline > now);
+}
+
+/// The principal a link must carry once liveness is known. `alive` is whether
+/// the peer's certificate verifies AND its composed deadline is still ahead.
+///
+/// A delegated principal that is not alive collapses to an EMPTY ceiling, which
+/// denies every action, because an empty `auth_key_caps` matches no action in
+/// `cap_gate_effective`. An owner device passes through unchanged: owner cert
+/// semantics are a separate question and this is not the place to answer it.
+///
+/// Pure on purpose. The bug this closes (#272) lived in the one branch that had
+/// no test, so the branch is now reachable without a `Link` or a config dir.
+fn principal_after_liveness(
+    stored: crate::capability::PrincipalKind,
+    alive: bool,
+) -> crate::capability::PrincipalKind {
+    match stored {
+        crate::capability::PrincipalKind::Delegated { .. } if !alive => {
+            crate::capability::PrincipalKind::Delegated { caps: Vec::new() }
+        }
+        other => other,
+    }
+}
+
+/// Pin a DELEGATED peer to a ceiling-less principal, which denies every action.
+/// A no-op for an owner device, whose semantics are unchanged.
+///
+/// This is what "fail closed" has to mean on the resolver's early-return paths.
+/// A bare `return` was not it (#272): a `Link` is constructed with
+/// `PrincipalKind::OwnerDevice`, and `auth_key_caps()` returns None for an
+/// owner device, so the ceiling check in `cap_gate_effective` is skipped
+/// entirely. Leaving the principal untouched therefore left an expired guest
+/// owner-equivalent, and the same guest was refused MORE while its certificate
+/// was still valid. Measured: a transfer-only guest whose cert had expired
+/// opened a TCP connection to an arbitrary port on the owner's loopback, which
+/// it could not do three minutes earlier.
+fn pin_delegated_denied(link: &mut Link, name: &str) {
+    if let Some(caps) = principal_ceiling_for(name) {
+        link.principal_kind =
+            principal_after_liveness(crate::capability::PrincipalKind::Delegated { caps }, false);
+    }
 }
 
 /// When a link becomes trusted, send a nonce challenge to the peer so it can
@@ -3999,7 +4052,25 @@ async fn init_experience(
     } else if background {
         true
     } else if caps.interactive {
-        !prompt_line("  Stay available in the background? [Y/n]: ")?.eq_ignore_ascii_case("n")
+        // `-y` means "answer this prompt with its default", and the default is Y.
+        // Without it `filament init --yes` BLOCKED on a real terminal: the
+        // identity was written, then it sat on "Stay available in the
+        // background? [Y/n]:" forever, because this arm never consulted
+        // `caps.yes`. Every other confirmation goes through
+        // `UiCapability::confirm`, which starts `if self.yes { return Ok(()); }`.
+        // This one called `prompt_line` directly and so escaped that contract.
+        //
+        // Invisible to every non-TTY check: piped, redirected and scripted runs
+        // all take the `else` branch and exit 0, so a build, a pipe and CI all
+        // said the first-run command was fine while it hung in a terminal.
+        //
+        // The check belongs INSIDE the interactive arm, not ahead of it. A
+        // non-TTY never saw this prompt, so there is no default for `-y` to
+        // supply and its answer must stay no. Hoisting it out flipped
+        // `init --yes` from a pipe to "install a service", which is how the
+        // capability harness (two piped `init --yes` at setup) started hanging
+        // on macOS and Windows.
+        caps.yes || !prompt_line("  Stay available in the background? [Y/n]: ")?.eq_ignore_ascii_case("n")
     } else {
         false
     };
@@ -20902,6 +20973,39 @@ mod tests {
     /// cosmetic: `apply_peer_identity` gates its device-pinning branch on
     /// `existing_scope == 0x01`, so storing User silently disarms that check for
     /// every later write to this petname on the path where the guard does run.
+    #[test]
+    fn a_delegated_principal_that_is_not_alive_loses_its_whole_ceiling() {
+        use crate::capability::PrincipalKind;
+        // The bug (#272): the resolver's early return left the link at its
+        // constructed default, PrincipalKind::OwnerDevice, whose auth_key_caps()
+        // is None, so the ceiling check was skipped and an EXPIRED guest was
+        // authorized for more than the same guest with a live certificate.
+        let live = PrincipalKind::Delegated { caps: vec!["transfer".to_string()] };
+        let dead = principal_after_liveness(live.clone(), false);
+        match &dead {
+            PrincipalKind::Delegated { caps } => assert!(
+                caps.is_empty(),
+                "a delegated principal past its deadline must keep no capability, got {caps:?}"
+            ),
+            other => panic!("must stay delegated, never widen to {other:?}"),
+        }
+        // An empty ceiling is what the gate consumes to deny: Some(&[]) matches
+        // no action, where None (an owner device) skips the check entirely.
+        assert_eq!(dead.auth_key_caps(), Some(&[][..]), "the gate must see an empty ceiling, not None");
+        assert_eq!(
+            live.auth_key_caps(),
+            Some(&["transfer".to_string()][..]),
+            "a live delegated principal keeps its ceiling"
+        );
+        // Alive is a pass-through, and an owner device is never touched here.
+        assert_eq!(principal_after_liveness(live.clone(), true), live);
+        assert_eq!(
+            principal_after_liveness(PrincipalKind::OwnerDevice, false),
+            PrincipalKind::OwnerDevice,
+            "owner cert semantics are a separate decision and must not change"
+        );
+    }
+
     #[test]
     fn vouch_scope_is_device_so_device_pinning_stays_armed() {
         let _guard = lock_test_config();
