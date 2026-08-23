@@ -165,7 +165,7 @@ H_SMALL=$(hashof "$SMALL"); H_BIG=$(hashof "$BIG")
 # ---------------------------------------------------------------- gate 0 ----
 say "0: unit tests"
 if ( cd "$CLI_DIR" && cargo test -q ) >"$WORK/g0.log" 2>&1; then ok "unit tests"; else bad "unit tests"; tail -n 5 "$WORK/g0.log"; fi
-PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="$PYV0"
 if [ -x "$PYV" ]; then
   if ( cd "$CLI_DIR/.." && "$PYV" -m unittest backend.tests.test_pair_codes ) >"$WORK/g0b.log" 2>&1; then
     ok "pair-code variance/security tests"
@@ -355,7 +355,7 @@ kill_port() { # fixture backends (werkzeug reloader forks; kill by port)
   done
 }
 kill_8078() { kill_port 8078; }
-VENV_PY="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+VENV_PY="$PYV0"
 
 # --------------------------------------------------------------- gate 12 ----
 # C1 against PRODUCTION's config: a backend serving chunkSize 65536 makes the
@@ -387,7 +387,7 @@ else
   echo "SKIP (needs playwright + backend venv)"
 fi
 
-if [ $WITH_RELAY -eq 1 ]; then
+if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1; then
   say "10: TURN relay path + route detection (C2/C17, docker coturn)"
   kill_8078; sleep 1
   TS=testsecret$RANDOM
@@ -397,7 +397,7 @@ if [ $WITH_RELAY -eq 1 ]; then
         --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --listening-port=3478 \
         --static-auth-secret="$TS" --realm=filament.test --no-tls --no-dtls \
         --allow-loopback-peers --cli-password=x 2>/dev/null)
-  VENV_PY="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+  VENV_PY="$PYV0"
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
       "$VENV_PY" app.py >"$WORK/g10-backend.log" 2>&1 ) &
   BK=$!; pids+=($BK); sleep 4
@@ -416,6 +416,15 @@ if [ $WITH_RELAY -eq 1 ]; then
      && grep -hq "route: relayed" "$WORK/g10-send.log" "$WORK/g10-recv.log"; then
     ok "relayed transfer via coturn; route: relayed reported"
   else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; fi
+elif [ $WITH_RELAY -eq 1 ]; then
+  # Was a FAILURE, not a skip. The gate launched its backend with a hardcoded
+  # interpreter path from a job directory that no longer exists, so it reported
+  # "relay (no code minted)" and "relay" when the truth was that no python ever
+  # ran. Gate 12 guarded on -x and skipped cleanly; this one did not, and three
+  # of the fourteen failures in the first complete run were that one missing
+  # file. A gate that cannot run must say so, not invent a product failure.
+  say "10: TURN relay path + route detection (C2/C17, docker coturn)"
+  echo "SKIP (needs a usable python and docker; set FILAMENT_TEST_VENV to point at one)"
 fi
 
 # --------------------------------------------------------------- gate 11 ----
