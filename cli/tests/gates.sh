@@ -61,6 +61,25 @@ say()  { printf '\n\033[1m== gate %s ==\033[0m\n' "$*"; }
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED_GATES="$FAILED_GATES $1"; }
 hashof() { sha256sum "$1" | cut -d' ' -f1; }
+# `kill -9 <pid>` on a `timeout`-wrapped background job kills only the wrapper.
+# SIGKILL cannot be caught, so timeout never forwards it and the real process is
+# ORPHANED. Measured: gate 11b's second receiver survived every run and was
+# still resident hours later, twice. Send TERM first, which timeout DOES
+# forward, give it a moment, then SIGKILL the wrapper and any surviving child.
+kill_tree() {
+  local pid
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    kill -TERM "$pid" 2>/dev/null
+  done
+  sleep 0.5
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    pkill -9 -P "$pid" 2>/dev/null
+    kill -9 "$pid" 2>/dev/null
+  done
+}
+
 wait_for_exit() {
   local pid="$1" seconds="$2" i
   for i in $(seq 1 $((seconds * 2))); do
@@ -207,7 +226,7 @@ for _ in $(seq 1 60); do
   [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
   sleep 0.5
 done
-kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
+kill_tree $R1; wait $R1 2>/dev/null
 echo "(killed receiver at $(stat -c %s "$D/big.bin.part" 2>/dev/null || echo '?') bytes)"
 sleep 2
 # The "resuming at" line is a DEBUG (resilience-internal) message, so the
@@ -492,7 +511,7 @@ FILAMENT_UID="livedev$$" timeout 120 "$BIN" receive -y --dir "$D2B" --server "$S
 R2B=$!; pids+=($R2B)
 RCS=99
 for _ in $(seq 1 120); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
-kill -9 $R1 $R2B 2>/dev/null
+kill_tree $R1 $R2B
 # True positive: assert the sender SAW the reconnect and DELIBERATELY kept the
 # link ("keeping active link") — not merely the absence of a supersede line,
 # which a never-arriving R2 would also produce.
