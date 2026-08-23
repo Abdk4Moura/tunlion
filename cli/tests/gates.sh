@@ -61,6 +61,16 @@ say()  { printf '\n\033[1m== gate %s ==\033[0m\n' "$*"; }
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad()  { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED_GATES="$FAILED_GATES $1"; }
 hashof() { sha256sum "$1" | cut -d' ' -f1; }
+wait_for_exit() {
+  local pid="$1" seconds="$2" i
+  for i in $(seq 1 $((seconds * 2))); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return; }
+    sleep 0.5
+  done
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  return 124
+}
 # L1-a: a `send --word <phrase>` now mints its OWN numeric nameplate (the phrase
 # is only the SPAKE2 password), so the receiver must claim the FULL minted code,
 # not the spoken phrase. CODE_WORD is a valid 2-word phrase (clears the >=2-word
@@ -221,7 +231,7 @@ printf '{"size":%s,"head":"00deadbeef"}' "$(stat -c %s "$SMALL")" > "$D/small.bi
 SP=$!; pids+=($SP)
 W=$(wait_code "$WORK/g3-send.log") || { bad "corruption guard (no code minted)"; tail -n 3 "$WORK/g3-send.log"; }
 # "different content" is a DEBUG (resilience-internal) line, so -v surfaces it.
-if [ -n "${W:-}" ] && timeout 90 "$BIN" -v recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g3-recv.log" 2>&1 \
+if [ -n "${W:-}" ] && timeout 90 "$BIN" -v receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g3-recv.log" 2>&1 \
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ] \
    && grep -q "different content" "$WORK/g3-recv.log"; then
   ok "head mismatch detected, restarted from 0, hash matches"
@@ -231,16 +241,17 @@ else bad "corruption guard"; tail -n 3 "$WORK/g3-recv.log"; fi
 say "4: directory tar + stdin pipe"
 D="$WORK/g4"; mkdir -p "$D" "$WORK/srcdir/sub"
 echo "hello" > "$WORK/srcdir/a.txt"; head -c 1048576 /dev/urandom > "$WORK/srcdir/sub/b.bin"
-"$BIN" receive -y --dir "$D" --server "$SERVER" >"$WORK/g4-recv.log" 2>&1 &
+R4="g4room$$"
+"$BIN" receive -y --dir "$D" --room "$R4" --server "$SERVER" >"$WORK/g4-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 G4=0
-timeout 60 "$BIN" send "$WORK/srcdir" --server "$SERVER" >"$WORK/g4-send.log" 2>&1 || G4=1
-wait $R 2>/dev/null
+timeout 60 "$BIN" send "$WORK/srcdir" --room "$R4" --server "$SERVER" >"$WORK/g4-send.log" 2>&1 || G4=1
+wait_for_exit $R 30 || G4=1
 tar tf "$D/srcdir.tar" >/dev/null 2>&1 || G4=1
-"$BIN" receive -y --dir "$D" --server "$SERVER" >"$WORK/g4b-recv.log" 2>&1 &
+"$BIN" receive -y --dir "$D" --room "$R4" --server "$SERVER" >"$WORK/g4b-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
-echo "pipe payload" | timeout 60 "$BIN" send - --name note.txt --server "$SERVER" >"$WORK/g4b-send.log" 2>&1 || G4=1
-wait $R 2>/dev/null
+echo "pipe payload" | timeout 60 "$BIN" send - --name note.txt --room "$R4" --server "$SERVER" >"$WORK/g4b-send.log" 2>&1 || G4=1
+wait_for_exit $R 30
 [ "$(cat "$D/note.txt" 2>/dev/null)" = "pipe payload" ] || G4=1
 [ $G4 -eq 0 ] && ok "dir tar + stdin round-trip" || bad "dir/stdin"
 
@@ -299,10 +310,11 @@ else bad "--to selection"; tail -n 3 "$WORK/g7-send.log"; fi
 # ---------------------------------------------------------------- gate 8 ----
 say "8: consent — no tty, no -y declines (C14)"
 D="$WORK/g8"; mkdir -p "$D"
-"$BIN" receive --dir "$D" --server "$SERVER" </dev/null >"$WORK/g8-recv.log" 2>&1 &
+R8="g8room$$"
+"$BIN" receive --dir "$D" --room "$R8" --server "$SERVER" </dev/null >"$WORK/g8-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 G8=0
-timeout 60 "$BIN" send "$SMALL" --server "$SERVER" >"$WORK/g8-send.log" 2>&1 || G8=1
+timeout 60 "$BIN" send "$SMALL" --room "$R8" --server "$SERVER" >"$WORK/g8-send.log" 2>&1 || G8=1
 kill $R 2>/dev/null
 if [ $G8 -eq 0 ] && grep -q "declined" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
   ok "offer declined without consent; sender exited cleanly"
@@ -316,13 +328,14 @@ say "9: bulk transfer completes (C8a backpressure regression guard)"
 # = ~0.33 MB/s; a working transfer beats that by 20-50x even under heavy
 # load). Speed is logged, never asserted.
 D="$WORK/g9"; mkdir -p "$D"
-"$BIN" receive -y --dir "$D" --server "$SERVER" >"$WORK/g9-recv.log" 2>&1 &
+R9="g9room$$"
+"$BIN" receive -y --dir "$D" --room "$R9" --server "$SERVER" >"$WORK/g9-recv.log" 2>&1 &
 R=$!; pids+=($R); sleep 3
 T0=$(date +%s.%N)
-timeout 240 "$BIN" send "$BIG" --server "$SERVER" >"$WORK/g9-send.log" 2>&1
+timeout 240 "$BIN" send "$BIG" --room "$R9" --server "$SERVER" >"$WORK/g9-send.log" 2>&1
 RC=$?
 T1=$(date +%s.%N)
-wait $R 2>/dev/null
+wait_for_exit $R 30
 RATE=$(python3 -c "print(f'{80/max(($T1-$T0)-4.5,0.1):.1f}')")
 echo "(~${RATE} MB/s effective — informational, not asserted)"
 if [ $RC -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ]; then
