@@ -4509,6 +4509,52 @@ fn pending_request_count(value: Option<&Value>) -> usize {
         .unwrap_or(0)
 }
 
+/// Report who, if anyone, joined through the invitation that carries `ttl_abs`
+/// as its absolute expiry (#275). Polls briefly, because the joiner's "joined"
+/// line and the daemon's write to the device store are separate events and the
+/// owner presses Enter between them.
+fn report_invitation_uptake(ttl_abs: u64) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let joined: Vec<(String, Vec<String>)> = std::fs::read_to_string(devices_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d["principalExpires"].as_u64() == Some(ttl_abs))
+            .filter_map(|d| {
+                let name = d["name"].as_str()?.to_string();
+                let caps = d["principalCeiling"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                Some((name, caps))
+            })
+            .collect();
+        if !joined.is_empty() {
+            for (name, caps) in joined {
+                ui::say(&format!(
+                    "{} '{name}' joined, may {}, access ends {}",
+                    ui::glyph_ok(),
+                    if caps.is_empty() { "nothing".to_string() } else { caps.join(" and ") },
+                    format_approval_expiry(ttl_abs)
+                ));
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            // Deliberately not "waiting" or "pending": we do not know that
+            // anyone ever scanned it. State only what is checkable.
+            ui::say(&format!(
+                "  no one has joined on this invitation yet; it stays usable until {}. `filament devices` will show them when they do.",
+                format_approval_expiry(ttl_abs)
+            ));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn format_approval_expiry(expires: u64) -> String {
     chrono::DateTime::from_timestamp(expires as i64, 0)
         .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
@@ -5454,6 +5500,21 @@ async fn add_for_cmd(
         let result = prompt_line("\n  Press Enter after the other device has captured it: ");
         let _ = execute!(err, terminal::LeaveAlternateScreen);
         result?;
+        // #275: this surface used to say nothing at all once the QR came down.
+        // The owner picked the duration and the ceiling, someone joined under
+        // them, and the one screen that knew what was offered never confirmed
+        // what was taken; you had to run `filament devices` to find out.
+        //
+        // The mint process cannot observe the enrollment directly, because the
+        // joiner talks to the running daemon and not to us. So match on the
+        // invitation's absolute expiry, which the daemon copies verbatim into
+        // `principalExpires`: a delegated record carrying THIS ttl_abs was
+        // enrolled by THIS invitation.
+        //
+        // Says nothing rather than something reassuring when no record appears.
+        // A claim of success we cannot support is worse than silence, which is
+        // the failure this issue is about in the first place.
+        report_invitation_uptake(ttl_abs);
     }
     if caps.json {
         println!("{}", serde_json::to_string_pretty(&json!({
@@ -12510,7 +12571,20 @@ async fn main() -> Result<()> {
                                         } else {
                                             println!("  identity:          {}", ui::paint(ui::Tone::Bold, &fingerprint));
                                             println!("  role:              joined device (no owner signing key)");
-                                            println!("  local certificate: expires {}", cert.expires);
+                                            // #275: this printed the raw epoch, on the one
+                                            // surface where a temporary guest's expiry is the
+                                            // most important fact on the screen. Routed through
+                                            // `device_countdown`, the same helper `devices`
+                                            // renders from, so the two cannot drift and #236's
+                                            // wording rules (nothing renews) apply here too.
+                                            println!(
+                                                "  local certificate: {}  ({})",
+                                                device_countdown(
+                                                    fleet_ui::devices::DeviceTier::Fleet,
+                                                    Some(&cert)
+                                                ),
+                                                format_approval_expiry(cert.expires)
+                                            );
                                         }
                                         return Ok(());
                                     }
