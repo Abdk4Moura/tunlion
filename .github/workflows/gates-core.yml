@@ -1,0 +1,98 @@
+# Deterministic-core ratchet for cli/tests/gates.sh (#249 item 1, #34).
+#
+# HONEST SCOPE, read this before trusting a green tick here. gates.sh does not
+# pass in full: at the time of writing 12 of 22 gates report PASS and the rest
+# have named, tracked causes in #249. This job does NOT assert the suite is
+# green. It asserts that every gate KNOWN to work still works.
+#
+# Two cheaper ways to get a green tick were rejected:
+#   continue-on-error   a step that reports success while proving nothing, which
+#                       is the exact defect #249 exists to fix
+#   a pass-count floor  a run can hit "12 passed" with a DIFFERENT twelve, so the
+#                       count says nothing about which behaviour still holds
+#
+# The expected-green list lives in cli/tests/gates-ratchet.sh and only grows:
+# repair a red gate, add it in the same commit.
+#
+# Runs WITH --with-relay, matching the exact configuration the expected-green
+# list was measured under. Gate 10 starts its own coturn and skips cleanly when
+# docker or a usable interpreter is absent (#284), so this costs nothing on a
+# runner that lacks either. The no-relay configuration was NOT verified: three
+# attempts to measure it locally were killed by concurrent builds on the shared
+# host, so shipping a list against it would be asserting something unobserved.
+
+name: Gates Core
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "cli/**"
+      - "backend/**"
+      - ".github/workflows/gates-core.yml"
+
+jobs:
+  ratchet:
+    name: deterministic core ratchet
+    runs-on: ubuntu-latest
+    # The suite genuinely takes this long: the CI attempt at 45 was cut off
+    # mid-run with a filament still resident, and a local release run measured
+    # roughly the same. This is slow feedback and that is a real cost, accepted
+    # because the job only triggers on cli/** and backend/** changes. If it
+    # becomes the bottleneck, the answer is to make gates faster or narrow the
+    # trigger, NOT to shorten this and have runs killed halfway, which reports
+    # a red board that says nothing about the code.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same pinned set as capability-ci.yml. gates.sh autostarts this backend
+      # on 8077 when FILAMENT_TEST_AUTOSTART=1 and a usable interpreter exists;
+      # without one it silently skipped and every gate reported "no backend",
+      # which is why the interpreter is resolved rather than hardcoded (#284).
+      - name: Backend deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build the gate binary
+        working-directory: cli
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
+        run: cargo build --bin filament --features test-hooks
+
+      # `|| true`: the suite is expected to exit nonzero while known-red gates
+      # remain. The ratchet, not the suite's exit code, is what gates this job.
+      # When the core reaches 22/22 this becomes a plain invocation and the
+      # ratchet becomes redundant, which is the intended end state.
+      - name: Run the deterministic core
+        working-directory: cli
+        env:
+          SKIP_BROWSER: "1"
+          FILAMENT_TEST_AUTOSTART: "1"
+          RUST_BACKTRACE: "1"
+          # NOT optional, and not a speed choice. The expected-green list was
+          # measured in RELEASE. In debug the #281 debug_assert is live, and a
+          # peer reaching the capability gate before identity resolution PANICS
+          # the receiving daemon instead of being refused, which takes several
+          # gates down with it (kill-resume, code transfer, corruption guard,
+          # dir/stdin, deferred-drop). Running this job in debug would fail the
+          # ratchet on day one against gates that are fine.
+          FILAMENT_GATE_RELEASE: "1"
+        run: bash tests/gates.sh --with-relay 2>&1 | tee /tmp/gates.log || true
+
+      - name: Ratchet
+        run: bash cli/tests/gates-ratchet.sh /tmp/gates.log
+
+      - name: Preserve the run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gates-core-log
+          path: /tmp/gates.log
+          if-no-files-found: warn

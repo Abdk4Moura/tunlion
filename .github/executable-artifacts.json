@@ -34,6 +34,17 @@
       ]
     },
     {
+      "path": "cli/tests/gates-ratchet.sh",
+      "disposition": "required",
+      "entrypoint": "bash cli/tests/gates-ratchet.sh <gates-output.log>",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/gates.sh",
       "disposition": "required",
       "entrypoint": "bash cli/tests/gates.sh",

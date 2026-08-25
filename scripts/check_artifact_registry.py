@@ -29,8 +29,10 @@ ISSUE_RE = re.compile(r"https://github\.com/Abdk4Moura/filament/issues/[1-9][0-9
 # correctly, never that CI invokes it (#249). These 14 predate that check. The
 # set may only SHRINK - wire one into CI, or re-disposition it honestly, and
 # delete its line. Adding a line is not a fix.
+# cli/tests/gates.sh left this set on 2026-08-24: the Gates Core workflow now
+# invokes it on every cli/** and backend/** change, and asserts a named
+# expected-green set via cli/tests/gates-ratchet.sh rather than a pass count.
 UNWIRED_REQUIRED = {
-    "cli/tests/gates.sh",
     "cli/tests/l1a/gate1_mutual_key.sh",
     "cli/tests/l1a/gate3_wrongpw_burn.sh",
     "cli/tests/l1a/gate6_downgrade.sh",

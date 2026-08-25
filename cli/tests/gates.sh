@@ -226,8 +226,26 @@ for _ in $(seq 1 60); do
   [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
   sleep 0.5
 done
-kill_tree $R1; wait $R1 2>/dev/null
-echo "(killed receiver at $(stat -c %s "$D/big.bin.part" 2>/dev/null || echo '?') bytes)"
+# NOT kill_tree: this receiver is started WITHOUT a timeout wrapper, so $R1 is
+# the real process and SIGKILL reaches it. kill_tree sends SIGTERM first, which
+# `filament receive` handles gracefully and uses to clean up its partial file,
+# leaving nothing for the resume half of this gate to resume from. The gate
+# needs an abrupt death, which is the whole premise of "receiver killed
+# mid-transfer". Regression from #287, whose commit message claimed it touched
+# only timeout-wrapped sites; this one is not, and I did not check before
+# changing it.
+kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
+# This used to render a missing .part as a bare `?` inside a success-path echo,
+# and it fired for five consecutive runs while reading as cosmetic. If there is
+# no partial file at the instant we have just killed a receiver mid-transfer,
+# the gate's PREMISE has already failed and everything after it measures
+# nothing. Fail here, loudly, instead of resuming from a file that is not there.
+G2SZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+echo "(killed receiver at ${G2SZ} bytes)"
+if [ "$G2SZ" -eq 0 ]; then
+  bad "kill-resume: no partial file to resume from (receiver wrote nothing, or cleaned up on exit)"
+  tail -n 3 "$WORK/g2-recv1.log" 2>/dev/null
+fi
 sleep 2
 # The "resuming at" line is a DEBUG (resilience-internal) message, so the
 # replacement receiver runs with -v to surface it for the assertion below. The
@@ -511,6 +529,13 @@ FILAMENT_UID="livedev$$" timeout 120 "$BIN" receive -y --dir "$D2B" --server "$S
 R2B=$!; pids+=($R2B)
 RCS=99
 for _ in $(seq 1 120); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
+# MIXED PAIR, deliberately. $R1 is unwrapped and $R2B is timeout-wrapped, so
+# only the second needs kill_tree's TERM-first forwarding. SIGTERM on $R1 is
+# safe HERE because this is teardown after the assertion loop has already waited
+# out $SP: R1 is deliberately left running as the surviving link and R2 is a
+# never-adopted bystander, so neither death is load-bearing. That is the fact
+# that makes it safe, and it was unwritten until now. Contrast gate 2, where an
+# abrupt kill IS the premise and TERM-first broke it.
 kill_tree $R1 $R2B
 # True positive: assert the sender SAW the reconnect and DELIBERATELY kept the
 # link ("keeping active link") — not merely the absence of a supersede line,
