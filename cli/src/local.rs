@@ -5,14 +5,13 @@
 //! zero-encryption, high-throughput transfers.
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::net::{Ev, Transport};
+use crate::net::Transport;
 
 const KIND_CONTROL: u8 = 0;
 const KIND_DATA: u8 = 1;

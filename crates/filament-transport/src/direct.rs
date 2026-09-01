@@ -303,9 +303,9 @@ fn parse_rule_list(csv: &str) -> Vec<CidrRule> {
 /// ("interfaces"), returns the raw JSON. For prefer, reads from config.
 fn read_iface_setting(key: &str, peer: Option<&str>) -> String {
     if key == "interfaces" {
-        return crate::settings::raw_membership(peer);
+        return crate::hooks::raw_membership(peer);
     }
-    crate::settings::get_str(key, peer).unwrap_or_default()
+    crate::hooks::settings_get_str(key, peer).unwrap_or_default()
 }
 
 /// Filter local IPs for candidate gathering using membership (avoid/only store)
@@ -365,7 +365,7 @@ fn filter_local_ips(ips: Vec<IpAddr>, peer: Option<&str>) -> Vec<IpAddr> {
         .collect();
 
     if kept.is_empty() {
-        crate::ui::debug("membership filter removed ALL host candidates");
+        crate::hooks::debug("membership filter removed ALL host candidates");
         return vec![];
     }
 
@@ -608,7 +608,7 @@ pub async fn gather_candidates(server: &str, port: u16) -> (Vec<String>, Option<
     let ips = filter_local_ips(all_local.clone(), peer);
     let mut cands: Vec<String> = ips.into_iter().map(|ip| cand_str(ip, port)).collect();
     if cands.is_empty() && !all_local.is_empty() {
-        crate::ui::debug("iface filter removed ALL host candidates; connectivity may fail");
+        crate::hooks::debug("iface filter removed ALL host candidates; connectivity may fail");
     }
     let mut adopted_server_public: Option<String> = None;
     if !suppress_public() {
@@ -635,7 +635,7 @@ pub async fn gather_candidates(server: &str, port: u16) -> (Vec<String>, Option<
                     // Diagnostic detail, demoted to -v. The HEADLINE is the
                     // fallback attribution in `expired_direct` (the moment of
                     // the symptom), not this forecast.
-                    crate::ui::debug(&format!(
+                    crate::hooks::debug(&format!(
                         "public candidate {s} is server-asserted (bootstrap hint) and unverified; the relay fallback will name it if it never answers"
                     ));
                 }
@@ -756,7 +756,7 @@ fn direct_transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(tc)
 }
 
-pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
+pub fn server_config() -> Result<quinn::ServerConfig> {
     let ck = rcgen::generate_simple_self_signed(vec!["filament-direct".to_string()])
         .context("self-signed cert")?;
     let cert_der = CertificateDer::from(ck.cert.der().clone());
@@ -777,7 +777,7 @@ pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
     Ok(sc)
 }
 
-pub(crate) fn client_config() -> Result<quinn::ClientConfig> {
+pub fn client_config() -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .context("client tls versions")?
@@ -1589,7 +1589,7 @@ pub async fn dial_workers(
                         if workers.len() >= count { break; }
                     }
                     Some(Err(e)) => {
-                        crate::ui::debug(&format!("worker dial: {e}"));
+                        crate::hooks::debug(&format!("worker dial: {e}"));
                     }
                     None => break,
                 }
@@ -1651,7 +1651,7 @@ pub async fn accept_workers(
                         if workers.len() >= count { break; }
                     }
                     Some(Err(e)) => {
-                        crate::ui::debug(&format!("worker accept: {e}"));
+                        crate::hooks::debug(&format!("worker accept: {e}"));
                     }
                     None => break,
                 }
@@ -1813,17 +1813,17 @@ pub async fn race_connect_labeled(
                     if let Ok(s) = std::str::from_utf8(&buf) {
                         if let Ok(ip) = s.trim().parse::<IpAddr>() {
                             record_observed_ip(ip).await;
-                            crate::ui::trace(&format!("filament: peer observed us from {ip}; supersedes whoami"));
+                            crate::hooks::trace(&format!("filament: peer observed us from {ip}; supersedes whoami"));
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     // A malformed frame is not an observation; the connection
                     // still works. Surface it so the operator can see it.
-                    crate::ui::debug(&format!("filament: observed-address exchange failed ({e}); skipping"));
+                    crate::hooks::debug(&format!("filament: observed-address exchange failed ({e}); skipping"));
                 }
                 Err(_) => {
-                    crate::ui::say("filament: peer agreed to the observed-address exchange but never sent the frame; skipping (inconsistent older build)");
+                    crate::hooks::say("filament: peer agreed to the observed-address exchange but never sent the frame; skipping (inconsistent older build)");
                 }
             }
         } else {
@@ -1910,7 +1910,7 @@ pub async fn race_connect_labeled(
                     // greppable. Dial failures (unreachable candidate) are noise.
                     let s = e.to_string();
                     if s.contains("DIRECT-AUTH-FAIL") {
-                        crate::ui::trace(&format!("filament: {s}"));
+                        crate::hooks::trace(&format!("filament: {s}"));
                     }
                     continue;
                 }
@@ -1930,7 +1930,7 @@ pub async fn race_connect_labeled(
     let (conn, send, recv, _is_dialer) = winner;
     // DEBUG, direct-connect diagnostic (the user-facing route label is the
     // `route:` line emitted in main.rs; this is the internal detail).
-    crate::ui::debug(&format!(
+    crate::hooks::debug(&format!(
         "filament: DIRECT-CONNECT ok (route: {}) peer={} remote={}",
         route,
         peer_id,

@@ -185,7 +185,8 @@ across the full 0.5-5 rung range, so condition instrumentation remains worth
 taking. This is an inventory only; it does not implement state preservation.
 
 Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
-`cli/src/net.rs`; a source change fails the model until its calibration is
+`crates/filament-transport/src/net.rs` (moved out of `cli/src` on 2026-08-27);
+a source change fails the model until its calibration is
 explicitly redone.
 
 Run it with:
@@ -245,3 +246,49 @@ mode we have chased (zombie links, ghost presence, the 15s stall) is a violation
 of a Tier-1 assumption — a real network fault — and Tier-1 proves each one
 recovers in bounded time. There is no GoodNet failure.** New protocol changes
 should update the model + mapping first, re-run this, and stay green.
+
+## Companion: the fleet auto-mesh proof
+
+`fleet_automesh_model.py` model-checks the membership plane added by
+`docs/design-fleet-automesh.md`: devices certified by one owner key discovering
+and admitting each other over a shared rendezvous channel, with revocation,
+fleet_rv rotation, and offline churn. Run it:
+
+```
+python3 fleet_automesh_model.py        # all three tiers
+python3 fleet_automesh_model.py 2      # only the intruder tier
+```
+
+| Tier | Assumptions | What is proven |
+|---|---|---|
+| **0 GoodNet** | every device online, no revocation | convergence to a full mesh under EVERY enrollment / subscribe / discover interleaving |
+| **2 Intruder** | GoodNet plus an uncertified device parked on every channel id it could learn | presence on the fleet channel authorizes **nothing**: admission needs an owner-signed cert, and the fleet still converges with a squatter present |
+| **1 Degraded** | GoodNet **minus** stability: revocation, epoch rotation, revocation-propagation lag, offline/online churn | no reachable state is a trap (the fleet can always still converge), rotation never permanently partitions the fleet, and a learned revocation is never undone |
+
+Liveness is checked by backward reachability from the goal, so the result is the
+strong form: not "the goal is reachable from the start" but "**no** reachable
+state is a trap".
+
+### Latest result
+
+```
+GoodNet  N=2 -> 9      N=3 -> 96     N=4 -> 4644
+Intruder N=2 -> 33     N=3 -> 708    N=2 K=1 -> 222
+Degraded N=2 K=1 -> 34               N=3 K=1 -> 3584
+```
+
+0 safety violations, 0 trap states, in all runs.
+
+### Negative controls (why a green run means something)
+
+The checker was validated by mutation, not by its own clean-run count. Deleting
+the local-revocation check makes Degraded fail `S2`; deleting the rotation
+delivery makes Degraded N=3 report 1088 trap states; deleting the certificate
+check makes Intruder fail `S1`.
+
+That last one is the reason the Intruder tier exists. Under tiers 0 and 1 alone,
+removing the cert check from `discover` changed **nothing**, because only an
+enrolled device could ever be on a channel, so `S1` was vacuous and passed on a
+model that could not express the attack. A check that cannot fail is not
+evidence. If you extend this model, mutate it and confirm it bites before
+trusting a green run.

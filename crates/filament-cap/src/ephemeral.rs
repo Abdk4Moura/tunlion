@@ -338,7 +338,7 @@ impl AuthKey {
 /// the field region with the PUBLIC key where `key` sits (the seed is never in
 /// the signed domain, so the payload needs no seed to verify).
 #[derive(Clone)]
-pub struct InvitationV2 {
+pub struct Invitation {
     pub issuer_fp: [u8; 8],
     pub caps: Vec<String>,
     pub expires: u64,
@@ -443,7 +443,7 @@ fn inv_field_fixed_len() -> usize {
     1 + 8 + 1 + 4 + 4 + 1 + 1 + 2
 }
 
-impl InvitationV2 {
+impl Invitation {
     /// Mint a compact invitation. `enroll_private_key` is the SEED the joiner
     /// must possess; the public half is derived from it and is what the
     /// signature binds and the verifier learns. `owner_uk` signs the signed
@@ -461,7 +461,7 @@ impl InvitationV2 {
         let caps = caps.iter().map(|c| super::capability::canonical_capability(c)).collect::<Result<Vec<_>>>()?;
         let owner_pub: [u8; 32] = owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?;
         let enroll_pub = pubkey_from_seed(&enroll_private_key);
-        let mut t = InvitationV2 {
+        let mut t = Invitation {
             issuer_fp: issuer_fingerprint(&owner_pub),
             caps,
             expires,
@@ -555,7 +555,7 @@ impl InvitationV2 {
         enroll_private_key.copy_from_slice(&raw[key_off..key_off + 32]);
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&raw[key_off + 32..]);
-        let t = InvitationV2 {
+        let t = Invitation {
             issuer_fp: raw[1..9].try_into().ok()?,
             caps: inv_caps_from_bitmask(raw[9]),
             expires: u32::from_le_bytes(raw[10..14].try_into().ok()?) as u64,
@@ -585,7 +585,7 @@ impl InvitationV2 {
         if key_off + 32 + 64 != raw.len() {
             return None;
         }
-        let t = InvitationV2 {
+        let t = Invitation {
             issuer_fp: raw[1..9].try_into().ok()?,
             caps: inv_caps_from_bitmask(raw[9]),
             expires: u32::from_le_bytes(raw[10..14].try_into().ok()?) as u64,
@@ -672,7 +672,7 @@ pub enum EnrollmentPrincipal {
     /// #186 compact-invitation join: the verifier checks the 8-byte owner
     /// fingerprint + the compact signature, then reconstructs the full AuthKey
     /// under its own issuer.
-    Compact(InvitationV2),
+    Compact(Invitation),
     /// Legacy mint/enroll path (hidden): a full AuthKey with its own issuer.
     Legacy(AuthKey),
 }
@@ -798,12 +798,18 @@ impl EnrollmentPayload {
     /// Nonce is NOT in the JSON — the verifier supplies its own.
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         use base64::Engine;
-        let principal = if let Some(b64) = v.get("inv_v2").and_then(|x| x.as_str()) {
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).ok()?;
-            EnrollmentPrincipal::Compact(InvitationV2::from_payload(&bytes)?)
-        } else {
-            EnrollmentPrincipal::Legacy(AuthKey::from_json(v.get("auth_key")?)?)
-        };
+        // ONE ACCEPTED SHAPE. This used to fall back to a Legacy principal read
+        // from an `auth_key` field. The producer of that shape was `ephemeral
+        // mint`, which no longer exists, so nothing could legitimately send it,
+        // and an enrolment parser that still accepts it is a second way to
+        // become a principal kept alive past its reason.
+        //
+        // Closing the request handler alone was NOT enough: the daemon reaches
+        // this function on the RESPONSE path, so the shape stayed reachable
+        // through a different door. Both are shut here.
+        let b64 = v.get("inv_v2").and_then(|x| x.as_str())?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64).ok()?;
+        let principal = EnrollmentPrincipal::Compact(Invitation::from_payload(&bytes)?);
         let device_pub: [u8; 32] = hex::decode(v.get("device_pub")?.as_str()?).ok()?.try_into().ok()?;
         let enroll_possession_sig: [u8; 64] = hex::decode(v.get("enroll_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
         let device_possession_sig: [u8; 64] = hex::decode(v.get("device_possession_sig")?.as_str()?).ok()?.try_into().ok()?;
@@ -1098,11 +1104,11 @@ mod tests {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
 
-    fn mint_v2(owner: &Ed25519KeyPair) -> InvitationV2 {
+    fn mint_v2(owner: &Ed25519KeyPair) -> Invitation {
         let rng = SystemRandom::new();
         let mut seed = [0u8; 32];
         rng.fill(&mut seed).unwrap();
-        InvitationV2::mint(
+        Invitation::mint(
             owner,
             seed,
             vec!["transfer".into(), "mount".into()],
@@ -1144,7 +1150,7 @@ mod tests {
         let owner = gen_keypair();
         let inv = mint_v2(&owner);
         let payload = inv.to_payload();
-        let parsed = InvitationV2::from_payload(&payload).unwrap();
+        let parsed = Invitation::from_payload(&payload).unwrap();
         // The verifier learns only the public key. A possession proof signed
         // with ANY seed other than the joiner's fails verification against it,
         // so an interceptor of the payload (or the verifier itself) cannot
@@ -1170,14 +1176,14 @@ mod tests {
         let owner = gen_keypair();
         let inv = mint_v2(&owner);
         let token = inv.to_token();
-        let parsed = InvitationV2::from_token(&token).unwrap();
+        let parsed = Invitation::from_token(&token).unwrap();
         // The joiner derives the public half from the seed; it must match the
         // minted value.
         assert_eq!(parsed.enroll_pub, inv.enroll_pub, "derived pub matches minted pub");
         assert_eq!(parsed.caps, inv.caps);
         assert_eq!(parsed.issuer_fp, inv.issuer_fp);
         let payload = parsed.to_payload();
-        let wire = InvitationV2::from_payload(&payload).unwrap();
+        let wire = Invitation::from_payload(&payload).unwrap();
         // The daemon verifies the owner signature over (fields + pub) and
         // learns only the pub.
         assert!(
@@ -1195,7 +1201,7 @@ mod tests {
         let mut payload = inv.to_payload();
         let flip = payload.len() - 64 - 32 - 4;
         payload[flip] ^= 0x01;
-        let wire = InvitationV2::from_payload(&payload).unwrap();
+        let wire = Invitation::from_payload(&payload).unwrap();
         assert!(
             !wire.verify_against_owner(&owner_pub(&owner)),
             "a tampered payload must fail the owner signature"
@@ -1204,7 +1210,7 @@ mod tests {
         let mut payload2 = inv.to_payload();
         let last = payload2.len() - 1;
         payload2[last] ^= 0x01;
-        let wire2 = InvitationV2::from_payload(&payload2).unwrap();
+        let wire2 = Invitation::from_payload(&payload2).unwrap();
         assert!(
             !wire2.verify_against_owner(&owner_pub(&owner)),
             "a tampered signature must fail the owner signature"
@@ -1836,10 +1842,16 @@ mod tests {
         let mut nonce = [0u8; 32];
         rng.fill(&mut nonce).unwrap();
 
-        let ak = AuthKey::mint(&owner, enroll_pub, vec!["shell".into()], vec![], 3600, Reuse::Once, "test".into()).unwrap();
-        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Legacy(ak), device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
+        // Round-trips the SURVIVING shape. It used to build a Legacy principal,
+        // and from_json now refuses that: nothing produces it since `ephemeral
+        // mint` was collapsed into `add --for runner`, and an enrolment parser
+        // that still accepted it was a second way to become a principal.
+        let _ = enroll_pub;
+        let inv = mint_v2(&owner);
+        let payload = EnrollmentPayload::build(EnrollmentPrincipal::Compact(inv), device_pub, &enroll_kp, &device_kp, nonce, verifier_pub);
         let json = payload.to_json();
-        let round = EnrollmentPayload::from_json(&json).unwrap();
+        let round = EnrollmentPayload::from_json(&json)
+            .expect("the one accepted shape must round-trip through JSON");
         assert_eq!(payload.device_pub, round.device_pub);
         assert_eq!(payload.enroll_possession_sig, round.enroll_possession_sig);
         assert_eq!(payload.device_possession_sig, round.device_possession_sig);

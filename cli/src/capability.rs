@@ -995,6 +995,74 @@ mod tests {
     /// trust. This is why certificate revocation is a separate operation and
     /// why the CLI warns after a capability-only revoke.
     #[test]
+    #[test]
+    fn revocation_is_only_consultable_once_identity_resolved() {
+        // Characterization, written to give the #161 question (WORK-STATE 1v/1w)
+        // an evidence base instead of an argument. It asserts what the gate DOES
+        // today, so any change to either case is visible in a diff.
+        //
+        // Case 1 is the security property that must hold: a RESOLVED device whose
+        // cert is revoked is denied even though legacy trust is present.
+        //
+        // Case 2 is the window the debug_assert at the top of cap_gate_effective
+        // probes. With no resolved identity, `cert_revoked_for(None)` is false,
+        // so revocation is not merely unenforced, it is UNKNOWABLE at gate time,
+        // and legacy trust carries the decision. That is benign when no cert
+        // exists at all (an anonymous code transfer has nothing to revoke) and is
+        // the real hazard when one does. Distinguishing those two is exactly what
+        // the current predicate cannot do.
+        //
+        // Note the unit-test scoping: `gate_live()` is false here, so the probe
+        // does not fire and case 2 is constructible. The existing tests below
+        // already rely on that.
+        let dk = [0x11; 32];
+        let uk = [0xaa; 32];
+
+        // 1. resolved + revoked -> denied, despite legacy trust.
+        let resolved_revoked = cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            CAP_TRANSFER,
+            "self",
+            Some(&dk),
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            !resolved_revoked.allowed(),
+            "a revoked device must be denied once its identity is resolved"
+        );
+
+        // 2. unresolved -> revocation cannot be consulted; legacy trust decides.
+        let unresolved = cap_gate_effective(
+            true,
+            &CapOutcome::Authorized,
+            CAP_TRANSFER,
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            unresolved.allowed(),
+            "documents the window: with no resolved identity the gate allows on \
+             legacy trust, because revocation is unknowable rather than absent. \
+             If this ever flips, the ordering was fixed and 1v can be closed."
+        );
+    }
+
     fn capability_revoke_alone_does_not_remove_fleet_trust() {
         let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap();
         let user_pub = [0xaa; 32];

@@ -18,7 +18,8 @@ Exhaustive over a bounded model == a definitive result for that bound: the
 checker finds EVERY stuck/invalid state, not just one we tripped over.
 
 Faithfulness: the FSM below is extracted from the deployed code
-  - cli/src/{net,main,session}.rs   (Rust client / `up` daemon)
+  - crates/filament-transport/src/net.rs + cli/src/{main,session}.rs
+    (Rust client / `up` daemon; net.rs moved out of cli/src on 2026-08-27)
   - frontend/src/lib/{webrtc,useFilament}.js   (web client)
   - signaling.py (the relay), CONTRACT.md, docs/observability-state-machine.md
 See proofs/README.md for the state<->code mapping. Both clients implement the

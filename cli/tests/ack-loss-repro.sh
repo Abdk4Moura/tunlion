@@ -28,7 +28,19 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="$CLI_DIR/target/debug/filament"
+# Ask cargo where the target dir actually IS, rather than assuming ./target.
+# This box sets a shared `target-dir` in ~/.cargo/config.toml, so the hardcoded
+# path did not exist: the script BUILT fine and then looked for the binary
+# somewhere cargo never writes, failing setup (exit 2) before any verdict. That
+# is a second, independent reason this reproducer produced no signal here.
+TARGET_DIR="${CARGO_TARGET_DIR:-$(cd "$CLI_DIR" && cargo metadata --format-version 1 --no-deps 2>/dev/null | tr ',' '\n' | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)}"
+# FILAMENT_BIN overrides the binary outright. Needed because the #161 debug_assert
+# in capability.rs PANICS the receiver on plain code-based receive (WORK-STATE
+# 1v), which kills this harness in its BASELINE round before any verdict. That
+# assertion is compiled out in release, so a `--release --features test-hooks`
+# build has the injection hooks AND no panic, which is the only way to get a
+# verdict out of this script until the ordering question is settled.
+BIN="${FILAMENT_BIN:-${TARGET_DIR:-$CLI_DIR/target}/debug/filament}"
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="$(mktemp -d /tmp/filament-ackloss.XXXXXX)"
 PYV="${FILAMENT_TEST_VENV:-/root/filament-bench/venv}/bin/python"

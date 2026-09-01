@@ -10,12 +10,20 @@
 //! attaches an IP plane to it. Each node's overlay address is derived from its
 //! Ed25519 overlay key (see `overlay`); peers learn and TRUST each other's address
 //! via a SIGNED `l3-announce` verified against the live link's channel binding
-//! (main.rs). Only direct-QUIC links carry datagrams; relay links are skipped for
-//! now (no L3 over relay yet).
+//! (main.rs).
+//!
+//! Both link kinds carry datagrams. A direct-QUIC link uses real QUIC datagrams.
+//! A relay/DataChannel link carries IP packets on a reserved sid
+//! (`net::L3_DATAGRAM_SID`), which is reliable and ordered where IP wants
+//! neither, so it head-of-line blocks and shares the channel with file transfer.
+//! It is still far better than the alternative it replaces, which was no route at
+//! all for a pair that cannot go direct. The transport ladder always prefers
+//! direct. The SENDER only installs a relayed route when the peer advertised
+//! `dg_relay` in its announce: an older peer discards the reserved sid silently,
+//! and a route that black-holes is worse than no route.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -264,6 +272,27 @@ impl L3 {
         self.names.lock().await.insert(pid.to_string(), (name.to_string(), v6, v4));
     }
 
+    /// Re-label an existing peer without touching its routes.
+    ///
+    /// A fleet peer can announce its overlay address BEFORE `fleet-hello` has
+    /// established what it is called, and the route must be installed at announce
+    /// time (that is what makes the mesh instant). The name is therefore whatever
+    /// the link was showing then, which for an unverified fleet link is a
+    /// placeholder. Once the certificate names the device, the MagicDNS entry has
+    /// to catch up, or the peer is reachable as a nonsense hostname.
+    /// Returns true when an entry was actually re-labelled.
+    pub async fn rename_peer(&self, pid: &str, name: &str) -> bool {
+        let mut names = self.names.lock().await;
+        match names.get(pid) {
+            Some((current, v6, v4)) if current != name => {
+                let (v6, v4) = (*v6, *v4);
+                names.insert(pid.to_string(), (name.to_string(), v6, v4));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Dial `dst:port` over the overlay, in BOTH modes: a kernel `TcpStream`
     /// (routed via filament0) or an in-process smoltcp connection. This is what lets
     /// a node reach a peer's OVERLAY-exposed service (an `expose` bound on the
@@ -303,7 +332,7 @@ impl L3 {
     /// Reverse MagicDNS: the petname of a verified peer by overlay address, so an
     /// `expose --peer` allowlist can match an incoming connection's source.
     pub async fn petname_of(&self, addr: IpAddr) -> Option<String> {
-        self.names.lock().await.values().find(|(n, v6, v4)| {
+        self.names.lock().await.values().find(|(_n, v6, v4)| {
             matches!(addr, IpAddr::V6(a) if a == *v6)
                 || matches!(addr, IpAddr::V4(a) if v4.map_or(false, |v| a == v))
         }).map(|(n, _, _)| n.clone())
@@ -988,7 +1017,7 @@ mod tests {
     #[tokio::test]
     async fn l3_start_with_ipv4() {
         use super::*;
-        let identity = Identity::load_or_create().unwrap();
+        let identity = crate::overlay::load_identity().unwrap();
         let expected_v4 = identity.addr_v4();
         let cidr = format!("{}/128", identity.addr());
         let l3 = L3::start(&cidr, 1280, Some(identity), L3Mode::Userspace).unwrap();

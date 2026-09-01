@@ -25,14 +25,26 @@ static = ["dep:openssl-sys"]
 # default `cargo build --release` (what users install) strips every test hook
 # from the binary — no `FILAMENT_TEST_*` env reads, no corruption/freeze/drop
 # injection logic. Build the gates' binary with `--features test-hooks`.
-test-hooks = []
+#
+# FORWARDED, not merely declared. Half these hooks now live in
+# filament-transport, and a bare `test-hooks = []` here enables nothing over
+# there: a feature is per-crate, so the freeze/unblock/flaky hooks the P1 and P5
+# gates inject with were compiled out even when the gates asked for them.
+test-hooks = ["filament-transport/test-hooks"]
 # Dev-debug logging (TRACE / STALL / worker-ports internals). Stripped from
 # default release builds so no debug strings reach the shipped binary.
-debug-logs = []
+debug-logs = ["filament-transport/debug-logs"]
 # Opt-in cross-platform mount adapters. Linux FUSE remains default-on and does
 # not require a feature. macOS needs macFUSE SDK; Windows needs WinFsp SDK.
 # These are OFF by default so stock CI runners (which lack the SDKs) stay green.
 mount-windows = ["dep:winfsp", "dep:winfsp-sys"]
+# DECLARED HERE because five cfgs already gate on it (mount_fuse.rs and four
+# sites in main.rs), and a cfg naming a feature its own crate does not declare is
+# UNCONDITIONALLY FALSE. So the macOS FUSE adapter was compiled out of every
+# build, and `cargo build --features mount-macos` failed outright as an unknown
+# feature: there was no way to turn macOS mount on at all. Same shape as the
+# test-hooks bug, found the same way, by reading what the warnings said.
+mount-macos = ["dep:fuser"]
 
 
 [dependencies]
@@ -72,6 +84,11 @@ filament-id = { path = "../crates/filament-id", version = "0.1.0" }
 # `crate::ephemeral` re-export it; the host-bound orchestration (store I/O, mode
 # flag, observability counters, DeviceCert-reading glue) stays in those modules.
 filament-cap = { path = "../crates/filament-cap", version = "0.1.1" }
+filament-transfer = { path = "../crates/filament-transfer", version = "0.1.0" }
+filament-proto = { path = "../crates/filament-proto", version = "0.1.0" }
+filament-overlay = { path = "../crates/filament-overlay", version = "0.1.0" }
+filament-fleet = { path = "../crates/filament-fleet", version = "0.1.0" }
+filament-transport = { path = "../crates/filament-transport", version = "0.1.0" }
 hex = "0.4"
 rand_core = "0.6"
 getrandom = "0.2"
@@ -121,6 +138,11 @@ libc = "0.2"
 # by mount-gates.sh.
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"
+
+# macOS needs the macFUSE SDK, so the adapter is opt-in via `mount-macos`; the
+# dependency is optional so a default macOS build neither needs nor builds it.
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.17", optional = true }
 
 
 

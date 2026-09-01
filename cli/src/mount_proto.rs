@@ -20,7 +20,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc;
 use crate::net::Transport;
 
@@ -371,7 +371,7 @@ impl MountClient {
             }
         });
         // Bridge: transport frames → MountClient receives bytes
-        let (rx_out, mut rx_in) = mpsc::unbounded_channel::<Bytes>();
+        let (rx_out, rx_in) = mpsc::unbounded_channel::<Bytes>();
         tokio::spawn(async move {
             while let Some(item) = rx.recv().await {
                 match item {
@@ -923,7 +923,7 @@ fn do_write(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset
     Ok(serde_json::json!({ "size": n }))
 }
 
-fn do_readdir(root: &PathBuf, open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, _offset: i64) -> Result<Value, MountError> {
+fn do_readdir(_root: &PathBuf, open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, _offset: i64) -> Result<Value, MountError> {
     let (_, dir_path) = open_files.get(&fh).ok_or_else(|| MountError { code: EBADF, msg: "bad fh".into() })?;
     // For directories, the "file" handle is the dir itself; we open with read_dir
     let entries: Vec<DirEntry> = match std::fs::read_dir(dir_path) {
@@ -1093,7 +1093,7 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
     // On Linux 5.6+, use openat2 with RESOLVE_BENEATH for strictest enforcement.
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
 
         let root_fd = std::fs::OpenOptions::new()

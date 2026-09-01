@@ -216,11 +216,17 @@ pub fn registry() -> &'static [Setting] {
             aliases: &["overlay"],
             store: "tun-addr",
             kind: Kind::Str,
-            default: "",
+            // DEFAULT-ON (2026-08-25). "auto" derives the address from the
+            // overlay key, so a fresh install has an IP plane to its paired
+            // devices without a second command. `filament init` asks for the
+            // one-time CAP_NET_ADMIN grant so the common case is a real kernel
+            // route; an unprivileged box still falls back to the userspace
+            // netstack. Set to "" to turn L3 off.
+            default: "auto",
             scope: ScopeKind::GlobalOnly,
             env: None,
             daemon: true,
-            help: "L3 overlay address as IP/PREFIX (e.g. 10.9.0.1/24); empty = L3 off",
+            help: "L3 overlay address as IP/PREFIX (e.g. 10.9.0.1/24), \"auto\" to derive it from your key, empty = L3 off",
         },
         Setting {
             key: "l3-mode",
@@ -1010,16 +1016,12 @@ fn render_missing_interactive(s: &Setting) {
     }
 }
 
-fn render_missing_steer(s: &Setting) {
-    let aff = build_affordance(s);
-    crate::interact::render_steer(&aff);
-}
 
-fn render_missing_json(s: &Setting) {
-    let aff = build_affordance(s);
-    crate::interact::render_json_steer(&aff);
-}
 
+// `render_missing_steer` / `render_missing_json` lived here. They were exact
+// duplicates of the inline json/plain branches of `set <key>` with no value, so
+// the nudge always DID render and these were leftovers, not a disconnected
+// affordance. Deleted after checking the branch that supersedes them.
 fn build_affordance(s: &Setting) -> crate::interact::Affordance {
     let (cur_val, _) = resolve(s, None);
     build_affordance_with_current(s, &cur_val)
@@ -1203,7 +1205,7 @@ fn readout(json_out: bool) -> Result<()> {
         }
         // Print peer overrides grouped under this key
         let key = k;
-        for (pk, pv, _pwh, _ph, _pd, _pc, pn) in peer_rows.iter().filter(|r| r.0 == *key) {
+        for (_pk, pv, _pwh, _ph, _pd, _pc, pn) in peer_rows.iter().filter(|r| r.0 == *key) {
             let indent = "   |- ";
             let label = "peer";
             let child = format!("{indent}{pn:wpad$}  {pv:w1$}  {label:w2$}",

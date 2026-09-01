@@ -1,0 +1,32 @@
+# filament-overlay — cryptographic overlay addressing, carved out of the CLI.
+#
+# An address here IS a public key: derive a ULA IPv6 (and an opt-in v4) address
+# from an Ed25519 key, and sign a claim to it that is BOUND to a specific link.
+# That binding is the point. A signed claim to an address, on its own, can be
+# replayed onto a different link by anyone who saw it; binding it to the link's
+# channel binding is what makes "this address is mine, here" checkable.
+#
+# This is a PARTIAL carve, same rule as filament-cap. Everything host-independent
+# lives here: address derivation, the announce build/verify ceremony, the replay
+# freshness rule, and the sequence-file logic in its path-taking form. The CLI
+# keeps the three places that touch this machine (where the key file lives, where
+# the sequence file lives, and generating the key on first use) and calls in.
+# This crate never calls back, so there is no cycle.
+[package]
+name = "filament-overlay"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Self-certifying overlay addresses: an IPv6 address derived from an Ed25519 key, with link-bound announcements"
+readme = "README.md"
+keywords = ["overlay", "ipv6", "ed25519", "self-certifying", "networking"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+anyhow = "1.0.102"
+ring = "0.17"
+sha2 = "0.11.0"
+base64 = "0.22"
+serde_json = "1.0.150"

@@ -1,0 +1,31 @@
+# filament-proto — the file-transfer wire vocabulary and its pure decisions,
+# carved out of the CLI.
+#
+# This crate is PURE by construction: bytes and state in, a decision out. No
+# timers, no retries, no transport, no filesystem. The stateful event loops own
+# the I/O and call in here; this crate never calls back, so there is no cycle.
+#
+# Two things live here. The control-message builders are the exact JSON shapes on
+# the wire, kept as one definition each instead of the inline json! literals that
+# used to be scattered through send_cmd and recv_cmd. The decision functions are
+# the ceremony's judgement calls (did the whole file verify, may we drop a link,
+# what happens when the delivery-ack window elapses), pulled out precisely so
+# they are unit-testable without a live peer.
+#
+# It mirrors frontend/src/net/protocol/transfer.js. That mirroring is the reason
+# the shapes must stay in one place: a divergence here is a silent interop break
+# with the browser peer.
+[package]
+name = "filament-proto"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Wire vocabulary and pure ceremony decisions for peer-to-peer file transfer"
+readme = "README.md"
+keywords = ["protocol", "transfer", "p2p", "wire-format"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+serde_json = "1.0.150"

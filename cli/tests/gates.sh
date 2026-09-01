@@ -513,7 +513,19 @@ else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; 
 say "11b: active same-uid link survives a live reconnect (#28)"
 D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
 # -v on the sender: "keeping active link" is a DEBUG (resilience-internal) line.
-"$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
+# The gate needs the transfer STILL FLOWING when R2 rejoins. Without a stall it
+# raced the machine: 80 MB at the ~96 MB/s gate 9 measures is under a second, and
+# the 8 MB threshold below is crossed in ~0.08s, inside the first poll. On a fast
+# runner the transfer finished before the reconnect, "keeping active link" never
+# printed, and the gate failed BECAUSE the machine was quick. Same problem, and
+# the same remedy, as FILAMENT_TEST_PAIR_STALL in gate 17b.
+#
+# 3ms is chosen, not guessed: 80 MB in ~60 KiB chunks is ~1365 chunks, so 3ms
+# each adds ~4.1s and the transfer lasts ~4.9s. R2 is spawned within ~0.6s (a
+# 0.5s poll plus process start), so the reconnect lands mid-flight with about 8x
+# margin, and the suite pays four seconds. 25ms would have added 34s.
+FILAMENT_TEST_TRANSFER_STALL_MS=${FILAMENT_TEST_TRANSFER_STALL_MS:-3} \
+  "$BIN" -v send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
 SP=$!; pids+=($SP)
 W2=$(wait_code "$WORK/g11b-send.log") || { bad "flow-preserve (no code minted)"; tail -n 3 "$WORK/g11b-send.log"; }
 FILAMENT_UID="livedev$$" "$BIN" receive "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
@@ -696,7 +708,7 @@ FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" add --name boxB --server "$SERVER"
 P17=$!; pids+=($P17); sleep 4
 C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
-FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" add "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
+FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" join "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
 CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
 CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
@@ -716,7 +728,7 @@ CR=$!; pids+=($CR); sleep 4
 CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
 FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
-  timeout 90 "$BIN" add "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
+  timeout 90 "$BIN" join "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
 RC=$?; T1=$(date +%s)
 kill $CR 2>/dev/null; wait $CR 2>/dev/null
 if [ $RC -ne 0 ] && [ $((T1 - T0)) -lt 30 ] \
@@ -846,7 +858,7 @@ FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" add --name boxB --server "$SERVER"
 P19=$!; pids+=($P19); sleep 4
 C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
-FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" add "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
+FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" join "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
 FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DB19" \
   timeout 120 "$BIN" up --dir "$D19" --server "$SERVER" </dev/null >"$WORK/g19-up.log" 2>&1 &

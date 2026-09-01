@@ -39,27 +39,57 @@ set -uo pipefail
 LOG="${1:-}"
 [ -n "$LOG" ] && [ -r "$LOG" ] || { echo "usage: gates-ratchet.sh <gates-output.log>" >&2; exit 2; }
 
+# "<substring of the PASS text>|<substring of the FAIL text>".
+#
+# A gate almost never announces failure under the name it announces success:
+# measured, 10 of the 11 below use a different label, e.g. it passes as
+# "active link preserved across same-uid reconnect ..." and fails as
+# "flow-preserve (#28)". Matching only the pass-text therefore made a real
+# failure indistinguishable from a gate that never ran, and every red here was
+# reported as though the gate had vanished. Carrying both labels is what lets
+# this say FAILED when the gate failed.
 EXPECTED_GREEN=(
-  "unit tests"
-  "pair-code variance/security tests"
-  "code transfer, hashes match"
-  "code burns on first use"
-  "head mismatch detected, restarted from 0"
-  "dir tar + stdin round-trip"
-  "offer declined without consent"
-  "transferred + hash match within ceiling"
-  "active link preserved across same-uid reconnect"
-  "deferred drop: flowing link survives its peer-left"
-  "stepped-away sender: held"
+  "unit tests|unit tests"
+  "pair-code variance/security tests|pair-code tests"
+  "code transfer, hashes match|code transfer"
+  "code burns on first use|code burn"
+  "head mismatch detected, restarted from 0|corruption guard"
+  "dir tar + stdin round-trip|dir/stdin"
+  "offer declined without consent|consent decline"
+  "transferred + hash match within ceiling|bulk transfer"
+  "active link preserved across same-uid reconnect|flow-preserve (#28)"
+  "deferred drop: flowing link survives its peer-left|deferred-drop (#28 trigger)"
+  "stepped-away sender: held|stepped-away wait"
 )
 
+# A missing PASS line has three different causes and they want different
+# responses: the gate FAILED, the gate never RAN (the suite died earlier, so
+# every later gate looks regressed at once), or it FLAKED. The verdict below is
+# unchanged - any missing PASS still fails the job - but saying WHICH is the
+# difference between a one-command diagnosis and re-reading the whole log.
+#
+# Measured 2026-08-28: three runs of this suite scored 12, 13 and 11 of the
+# expected-green gates, where the 11 differed from the 13 by one file
+# (.gitignore) and nothing else. So a red here is not on its own evidence that
+# the tree changed for the worse, and the message should not imply that it is.
 missing=0
-for want in "${EXPECTED_GREEN[@]}"; do
+not_run=0
+for entry in "${EXPECTED_GREEN[@]}"; do
+  want="${entry%%|*}"
+  fail_label="${entry#*|}"
   if grep -aq "^PASS:.*$want" "$LOG"; then
-    printf '  ok       %s\n' "$want"
-  else
-    printf '  REGRESSED %s\n' "$want"
+    printf '  ok         %s\n' "$want"
+  elif grep -aqF "FAIL: $fail_label" "$LOG"; then
+    # It ran and it failed. This is the case that actually wants attention.
+    printf '  FAILED     %s\n' "$want"
     missing=$((missing + 1))
+  else
+    # No PASS and no FAIL under either name: the gate produced no verdict, which
+    # usually means the suite died before reaching it and every later gate will
+    # look the same way.
+    printf '  NO VERDICT %s (did it run?)\n' "$want"
+    missing=$((missing + 1))
+    not_run=$((not_run + 1))
   fi
 done
 
@@ -70,6 +100,14 @@ printf '\n%s of %s expected-green gates held; run reported %s PASS / %s FAIL\n' 
 
 if [ "$missing" -gt 0 ]; then
   echo "FAIL: $missing gate(s) that used to pass no longer do. That is a regression, not a known-red gate." >&2
+  if [ "$not_run" -gt 0 ]; then
+    echo "NOTE: $not_run produced NO verdict at all, neither pass nor fail. That usually" >&2
+    echo "      means the suite died before reaching them, which marks every later gate" >&2
+    echo "      at once. Check the end of the run before treating them as regressions." >&2
+  fi
+  echo "NOTE: this suite is known to flake (see WORK-STATE.md, 1i: 12/13/11 of the" >&2
+  echo "      expected-green gates across three runs, one of which differed only in" >&2
+  echo "      .gitignore). Confirm against a re-run before concluding the tree broke." >&2
   exit 1
 fi
 echo "ratchet held. Known-red gates remain red and are tracked in #249; this job does not police them."

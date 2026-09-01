@@ -6,7 +6,8 @@
 # deadlocked, or cannot self-heal to CONNECTED. See proofs/README.md.
 #
 # The discipline this enforces: a protocol change must keep the proof green. If
-# you change the establishment FSM (cli/src/{net,main}.rs, frontend/src/lib/*.js,
+# you change the establishment FSM (crates/filament-transport/src/{net,direct}.rs,
+# cli/src/main.rs, frontend/src/lib/*.js,
 # signaling.py, CONTRACT.md), update proofs/establishment_model.py + its
 # state<->code mapping table FIRST, then make CI pass.
 
@@ -37,5 +38,7 @@ jobs:
         run: python3 proofs/transport_lifecycle_model.py
       - name: Model-check transport upgrade (destroy-then-race vs build-alongside)
         run: python3 proofs/transport_upgrade_model.py
+      - name: Model-check fleet auto-mesh (convergence / revocation / intruder)
+        run: python3 proofs/fleet_automesh_model.py
       - name: Model-check stall ladder (calibration and recovery boundary)
         run: python3 proofs/stall_ladder_model.py

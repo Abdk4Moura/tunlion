@@ -5,7 +5,6 @@
 // duress SILENT (no on-screen string).
 
 use crate::ui::{self, Tone};
-use super::{echo_cmd, meta, rule};
 
 /// Render the init recovery-phrase screen with forced ack.
 pub fn render_init_phrase(words: &[&str]) -> String {

@@ -31,7 +31,7 @@
 //! payloads this module produces. That keeps it unit-testable end to end (two
 //! in-process ceremonies, no sockets), see the tests at the bottom.
 
-use crate::pake::{self, PakeState};
+use crate::pake::PakeState;
 use serde_json::{json, Value};
 
 /// The capability set v2 first-pairing / ephemeral transfer-auth agrees on.

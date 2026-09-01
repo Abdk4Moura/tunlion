@@ -6,6 +6,15 @@
 > is not a mesh", which is no longer the decision. Read the reconciliation
 > first; the original note is kept unedited underneath because its reasoning
 > about federation and transitive trust is still the reasoning we hold.
+>
+> **Amendment (2026-08-25):** one narrow exception was accepted, and it is not
+> a weakening of the reconciliation below but an instance of it. Devices
+> certified by the SAME owner key auto-discover and connect without pairwise
+> pairing, which is exactly "membership requires a signature descending from
+> that mesh's owner" applied within one person's own mesh. Everything here
+> still holds between DIFFERENT owners, which is the case this note actually
+> reasoned about. See `docs/design-fleet-automesh.md` and the "Amendment"
+> section before "Guardrails".
 
 ## Reconciliation, 2026-08-15
 
@@ -585,11 +594,42 @@ third-party store-and-forward; centralized coordinator / become Tailscale (Path
 need, with its coordinator/trust tradeoff; filament does not stack on top of a
 mesh to gain reach.
 
+## Amendment (2026-08-25): same-owner fleets auto-mesh
+
+The argument above is sound, and it closed the question it asked. It reasoned
+about A, B and C as **different people**. Applied to one user's own devices it
+proves less than it appears to, because the step it turns on, "A reaches B
+because an admin paired the hubs, not because A decided about B", has no
+referent when there is one human and one key. The owner already made the
+decision, once, by certifying both devices.
+
+So the exception: a device that presents a `DeviceCert` chaining to the owner
+key a peer already holds is admitted without a separate pairing. This is not
+Path 4. Under Path 4 the trust flows along the graph (A trusts C because B
+vouches). Here B's assertion is not an input: remove B from the network and A
+still accepts C on identical evidence. Guardrail 1's real content, that no peer
+authorizes on another's behalf, is untouched.
+
+Two of the closing observations above also need a correction in this scope.
+"The gossip has nothing to carry" was right, and the amendment does not
+contradict it: fleet auto-mesh adds NO gossip and NO CRDT. It reuses the
+existing channel-presence roster, so the control plane still has no job. And
+"the reachability layer is already the private graph of authorized pairs"
+remains true, because the owner key is what authorizes, not the meeting point.
+
+What stays rejected, unchanged: hub federation, hub-tier gossip, transitive
+trust across owners, third-party store-and-forward, a central coordinator,
+multi-hop segmented routing, and any `hub` concept in the protocol. The
+mechanism is in `docs/design-fleet-automesh.md`.
+
 ## Guardrails
 
-1. **Pairwise authorization is absolute.** A talks securely to B only if A made
-   an explicit A-to-B trust decision. No relay, hub, or admin ever authorizes on
-   a peer's behalf.
+1. **Cross-user authorization is absolute.** A talks securely to B only if A
+   made an explicit A-to-B trust decision. No relay, hub, or admin ever
+   authorizes on a peer's behalf. (Amended 2026-08-25: within ONE owner key the
+   owner's signature on a DeviceCert is that explicit decision, made once and
+   covering every device it certifies. Trust still flows from the owner key, never
+   along the peer graph.)
 2. **The introducer reduces friction, not trust.** It is a key-exchange helper;
    the user (A) always confirms. It must not become an authorization delegate or
    a de facto coordinator.

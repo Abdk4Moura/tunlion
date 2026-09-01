@@ -506,7 +506,7 @@ async fn poll_loop(
     socks: &mut Vec<SockRec>,
     eph: &mut u16,
     my_addr: Ipv6Addr,
-    my_addr_v4: Option<Ipv4Addr>,
+    _my_addr_v4: Option<Ipv4Addr>,
     wake: Arc<Notify>,
     inject_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,

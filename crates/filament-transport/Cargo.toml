@@ -1,0 +1,70 @@
+# filament-transport — the transport ladder: an authenticated byte pipe to a peer
+# behind NAT, that fails over.
+#
+# Signalling and WebRTC (`net`), direct authenticated QUIC with the fallback
+# ladder (`direct`), and the `Transport` trait they both implement. What the host
+# must answer for it (terminal output, settings, config paths, interface
+# enumeration) is asked through `hooks`, which has a safe default for each, so a
+# consumer that installs none still gets a working transport.
+[package]
+name = "filament-transport"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Host hooks for filament's peer-to-peer transport ladder"
+readme = "README.md"
+keywords = ["transport", "p2p", "nat-traversal", "hooks"]
+categories = ["network-programming"]
+
+[features]
+# DECLARED HERE because the code in this crate gates on them. It was carved out
+# of cli/src with its `#[cfg(feature = "test-hooks")]` blocks intact, but the
+# feature declarations stayed behind in cli/Cargo.toml, and a cfg naming a
+# feature its own crate does not declare is UNCONDITIONALLY FALSE.
+#
+# So ~20 fault-injection hooks in direct.rs and net.rs (the data-path freeze, the
+# persistent freeze that forces relay fallback, the unblock that proves the
+# relay->direct upgrade, the flaky-standby no-flap probe) were compiled out of
+# EVERY build, including the gates' own `--features test-hooks` build. rustc had
+# been saying so all along: "unexpected cfg condition value: test-hooks", 20 of
+# them, sitting under the warning ratchet's total.
+#
+# That is worse than a missing feature. These hooks are the INSTRUMENT the P1 and
+# P5 resilience gates measure with, so results they produced after the carve were
+# taken with the faults never injected.
+test-hooks = []
+debug-logs = []
+# Fully static builds (musl): compile OpenSSL from source instead of linking the
+# system one. rust_socketio below hard-depends on native-tls, so a rustls-only
+# tree is not possible without forking it upstream (ledger C16).
+#
+# THE CLI HAD THIS AND THIS CRATE DID NOT, which is the asymmetry that makes a
+# carve look finished and not be: `cli` could build fully static via its own
+# `static` feature, and anything else depending on filament-transport had no
+# equivalent escape hatch. The crate compiles either way; it was the STATIC
+# build that was reachable only from inside this repo.
+#
+# Found by asking whether these crates are usable in other things and measuring
+# it, rather than by anything failing.
+static = ["dep:openssl-sys"]
+
+[dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
+# Versions copied verbatim from cli/Cargo.toml, so behaviour is byte-identical.
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+bytes = "1.11.1"
+futures-util = "0.3.32"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rust_socketio = { version = "0.6.0", features = ["async"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }
+webrtc = "0.17.1"
+rustls = { version = "0.23.40", features = ["ring"] }
+sha2 = "0.11.0"
+quinn-proto = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+reqwest = { version = "0.13.4", features = ["json"] }
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }

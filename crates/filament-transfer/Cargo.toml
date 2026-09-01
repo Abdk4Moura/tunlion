@@ -1,0 +1,29 @@
+# filament-transfer — the mechanics of moving and reassembling bytes, carved out
+# of the CLI.
+#
+# This is a PARTIAL carve, in the same spirit as filament-cap. What lives here is
+# everything that has NO opinion about how a peer was found, authenticated, or
+# displayed: out-of-order range reassembly (record_range / coverage_complete /
+# first_gap), the untrusted-name reduction (safe_incoming_name), and the
+# short-write-safe positional write (pwrite_at).
+#
+# The ORCHESTRATION stays in the CLI because it is bound to the host and to the
+# event loop: opening the .part file, the transport ladder, offers and accepts,
+# progress rendering, and the resume ceremony. Those call INTO this crate; this
+# crate never calls back, so there is no cycle.
+#
+# ZERO dependencies beyond std, deliberately. This is the layer someone can build
+# on without adopting filament's transport, its identity model, or its CLI.
+[package]
+name = "filament-transfer"
+version = "0.1.0"
+authors = ["Abdk4Moura <pro.kaiserlautern@gmail.com>"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/filament"
+description = "Out-of-order chunk reassembly and short-write-safe positional writes for file transfer"
+readme = "README.md"
+keywords = ["transfer", "reassembly", "chunks", "resume"]
+categories = ["filesystem", "network-programming"]
+
+[dependencies]

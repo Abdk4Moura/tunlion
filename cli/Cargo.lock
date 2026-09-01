@@ -1187,8 +1187,13 @@ dependencies = [
  "crossterm",
  "directories",
  "filament-cap",
+ "filament-fleet",
  "filament-id",
+ "filament-overlay",
  "filament-pair",
+ "filament-proto",
+ "filament-transfer",
+ "filament-transport",
  "flate2",
  "fuser",
  "futures-util",
@@ -1228,6 +1233,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filament-fleet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "filament-id",
+ "filament-overlay",
+ "serde_json",
+]
+
+[[package]]
 name = "filament-id"
 version = "0.1.2"
 dependencies = [
@@ -1242,6 +1257,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "filament-overlay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ring",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "filament-pair"
 version = "0.1.2"
 dependencies = [
@@ -1253,6 +1279,38 @@ dependencies = [
  "sha2 0.10.9",
  "spake2",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "filament-proto"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "filament-transfer"
+version = "0.1.0"
+
+[[package]]
+name = "filament-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "quinn",
+ "quinn-proto",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rust_socketio",
+ "rustls",
+ "serde_json",
+ "sha2 0.11.0",
+ "socket2 0.5.10",
+ "tokio",
+ "webrtc",
 ]
 
 [[package]]

@@ -41,15 +41,15 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve, serve_at, try_approve_request, try_bootstrap,
-    try_cap_status, try_deny_request, try_dial, try_list_mounts, try_list_pending, try_list_warm, try_mount,
-    try_mount_health, try_open, try_open_at, try_ping, try_pty, try_reconfigure, try_reload,
+    daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
+    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    try_approve_request, try_cap_status, try_deny_request, try_list_pending, try_list_warm, try_ping,
+    daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
+    try_list_pending, try_list_warm, try_ping,
     Req,
 };
 
@@ -155,6 +155,36 @@ mod imp {
     /// PTY stream; `None` (no daemon / no warm link) means fall back to a fresh
     /// establish. `session` keys the peer's persistent PTY for reattach.
     /// `cmd` is non-empty for one-shot exec (mirrors the cold pty-open cmd field).
+    /// Like `try_pty`, but reports WHY the daemon said no.
+    ///
+    /// `Err(None)` = no daemon / reuse disabled / malformed reply, i.e. "no warm
+    /// path, go cold". `Err(Some(reason))` = the daemon answered. A reason
+    /// beginning `refused:` is DEFINITIVE and the caller must not retry cold: the
+    /// peer has already answered, and a cold retry only converts a clear refusal
+    /// into a connect timeout.
+    pub async fn try_pty_reason(
+        peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str,
+    ) -> std::result::Result<UnixStream, Option<String>> {
+        if reuse_disabled() {
+            return Err(None);
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let mut req = json!({ "op": "pty", "peer": peer, "session": session, "cols": cols, "rows": rows, "term": term });
+        if !cmd.is_empty() {
+            req["cmd"] = json!(cmd);
+        }
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
+        line.push(b'\n');
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
+    }
+
     pub async fn try_pty(peer: &str, session: &str, cols: u16, rows: u16, term: &str, cmd: &str) -> Option<UnixStream> {
         if reuse_disabled() {
             return None;
@@ -433,6 +463,26 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask our daemon to broker a private rendezvous with a fleet sibling.
+    ///
+    /// Returns the one-time secret both ends will meet on. `None` when there is
+    /// no daemon, or it holds no verified link to that peer, in which case the
+    /// caller falls back to finding the peer itself.
+    pub async fn try_fleet_rendezvous(name: &str) -> Option<String> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let req = json!({ "op": "fleet-rendezvous", "name": name });
+        let mut line = serde_json::to_vec(&req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut s, 4096))
+            .await.ok()?.ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true))
+            .then(|| v["secret"].as_str().map(str::to_string))
+            .flatten()
+    }
+
     /// Ask the daemon to approve a pending request by id.
     pub async fn try_approve_request(id: u64, allow: &str, expires: u64) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
@@ -468,6 +518,7 @@ mod imp {
     // ----------------------------------------------------------------- daemon -
 
     /// What a warm-reuse client is asking the daemon to do over its warm link.
+    #[derive(Clone)]
     pub enum ReqKind {
         /// Open one raw L2 stream to `peer`'s localhost:`rport` (netcat/ssh/forward).
         Open { peer: String, rport: u16 },
@@ -523,6 +574,13 @@ mod imp {
         CapStatus,
         /// Snapshot already-held warm links without probing peers.
         ListWarm,
+        /// Broker a one-time private rendezvous with a fleet sibling.
+        ///
+        /// The daemon already holds a certificate-verified link to that sibling.
+        /// It mints a single-use secret, hands it over THAT link, and returns it
+        /// here. Both ends then meet on `channel_of(secret)`, where exactly two
+        /// parties exist, instead of the fleet channel where every sibling does.
+        FleetRendezvous { name: String },
         /// List pending consent requests.
         ListPending,
         /// Approve a pending request by id.
@@ -678,6 +736,10 @@ mod imp {
                     }
                     Some("cap-status") => ReqKind::CapStatus,
                     Some("list-warm") => ReqKind::ListWarm,
+                    Some("fleet-rendezvous") => {
+                        let Some(name) = v["name"].as_str().map(str::to_string) else { return };
+                        ReqKind::FleetRendezvous { name }
+                    }
                     Some("list-pending") => ReqKind::ListPending,
                     Some("approve-request") => {
                         let Some(id) = v["id"].as_u64() else { return };
@@ -822,6 +884,19 @@ mod stub {
     /// No control socket here, so there is no daemon consent queue to list.
     /// Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_list_pending() -> Option<Value> {
+        None
+    }
+
+    /// There is no control socket on this platform, so there is never a daemon
+    /// to reach. Callers use this to decide whether a daemon-mediated path is
+    /// available at all, and here it never is.
+    pub async fn daemon_present() -> bool {
+        false
+    }
+
+    /// No control socket here, so no daemon can broker a rendezvous. `None`
+    /// means the caller finds the peer itself, which is the pre-existing path.
+    pub async fn try_fleet_rendezvous(_name: &str) -> Option<String> {
         None
     }
 

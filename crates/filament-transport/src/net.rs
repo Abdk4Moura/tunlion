@@ -415,9 +415,10 @@ pub trait Transport: Send + Sync {
         true
     }
     // --- L3 data plane (serve_tun): IP packets over unreliable datagrams ---
-    /// Whether this transport can carry L3 datagrams. Only the direct-QUIC link
-    /// does today; relay/DataChannel links return false, so the daemon simply
-    /// does not start an L3 pump over them (no L3 on relay yet).
+    /// Whether this transport can carry L3 datagrams. Direct-QUIC links use real
+    /// QUIC datagrams; relay/DataChannel links carry them on a reserved sid (see
+    /// `L3_DATAGRAM_SID`). A transport with neither returns false and the daemon
+    /// does not start an L3 pump over it.
     fn supports_datagrams(&self) -> bool {
         false
     }
@@ -516,6 +517,23 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Sid reserved for L3 IP packets on a relay/DataChannel link.
+///
+/// The channel already distinguishes text (control JSON) from binary
+/// (`[u32 sid][u64 offset][payload]`). L3 rides the binary shape with a sid no
+/// L2 stream can allocate, so the wire format is unchanged and a peer that does
+/// not know about it simply sees an unknown stream. That is exactly why the
+/// SENDER gates on the peer advertising support (`Announce::relay_datagrams`):
+/// silently shipping packets into a peer that drops them would look like a route
+/// that exists and black-holes.
+pub const L3_DATAGRAM_SID: u32 = u32::MAX;
+
+/// Bound on queued L3 packets in either direction. IP packets are droppable by
+/// definition, so both ends `try_send` and DROP on a full queue rather than
+/// applying backpressure: blocking the tunnel to wait for a stale packet is
+/// strictly worse than losing it.
+const L3_QUEUE: usize = 256;
+
 pub struct DataChannelTransport {
     raw: Arc<RawDataChannel>,
     drained: Arc<Notify>,
@@ -533,6 +551,12 @@ pub struct DataChannelTransport {
     // half of the L2 sid space this end allocates from, so the two ends never
     // collide (Transport::sid_answerer).
     answerer: bool,
+    // L3-over-relay: inbound IP packets the read loop pulled off the sentinel
+    // sid, and the outbound queue drained by a writer task. `send_datagram` is
+    // SYNCHRONOUS in the trait (quinn's is non-blocking) while the DataChannel
+    // write is async, so the queue is what bridges the two.
+    l3_in: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Bytes>>,
+    l3_out: tokio::sync::mpsc::Sender<Bytes>,
 }
 
 impl DataChannelTransport {
@@ -603,6 +627,41 @@ impl Transport for DataChannelTransport {
         self.first_data
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    // --- L3 over relay ---
+    // A DataChannel is reliable and ordered, which IP does not need and pays for:
+    // a lost packet head-of-line blocks the ones behind it, and the tunnel shares
+    // the channel with file transfer. It is still much better than no route at
+    // all, which is what a relayed pair had before. A direct link is always
+    // preferred and the transport ladder already races for one.
+    fn supports_datagrams(&self) -> bool {
+        !self.is_dead()
+    }
+
+    fn send_datagram(&self, packet: &[u8]) -> Result<()> {
+        if self.is_dead() {
+            return Err(anyhow!("channel closed"));
+        }
+        // Drop, never block: see L3_QUEUE. A full queue means the channel is
+        // already behind, and delaying the tunnel to deliver a stale packet is
+        // worse than losing it.
+        match self.l3_out.try_send(Bytes::copy_from_slice(packet)) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow!("datagram writer stopped"))
+            }
+        }
+    }
+
+    async fn recv_datagram(&self) -> Result<Bytes> {
+        self.l3_in
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("datagram channel closed"))
     }
 
     async fn flush(&self) -> Result<()> {
@@ -705,7 +764,7 @@ fn dns_timeout_ms() -> u64 {
 }
 
 fn dns_cache_path() -> PathBuf {
-    crate::platform::Paths::config_path("signaling-dns.json")
+    crate::hooks::config_path("signaling-dns.json")
 }
 
 /// Pull `host` and `port` out of an `http(s)://` URL for resolution. Returns the
@@ -914,7 +973,7 @@ pub async fn fetch_auto_room(server: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no room in /api/room response"))
 }
 
-pub(crate) async fn http_get_json(url: &str) -> Result<Value> {
+pub async fn http_get_json(url: &str) -> Result<Value> {
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
     // 3 quick attempts: establish() refetches config per connection attempt
     // (C5), and one blip of the API mustn't kill a transfer in progress.
@@ -1230,7 +1289,7 @@ impl Peer {
         tx: mpsc::UnboundedSender<Ev>,
         generation: u32,
     ) -> Result<Arc<Peer>> {
-        crate::ui::debug(&format!(
+        crate::hooks::debug(&format!(
             "filament: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
             ice_servers.len(),
             ice_servers.iter().flat_map(|s| s.urls.clone()).collect::<Vec<_>>()
@@ -1272,11 +1331,11 @@ impl Peer {
         // P2P ICE diagnostic: log gathering state changes to see when/if
         // complete fires vs stalls (used for CI capability-harness debugging).
         pc.on_ice_gathering_state_change(Box::new(move |s| {
-            crate::ui::trace(&format!("[ice-gathering] state={}", s));
+            crate::hooks::trace(&format!("[ice-gathering] state={}", s));
             Box::pin(async {})
         }));
         pc.on_ice_connection_state_change(Box::new(move |s| {
-            crate::ui::trace(&format!("[ice-connection] state={}", s));
+            crate::hooks::trace(&format!("[ice-connection] state={}", s));
             Box::pin(async {})
         }));
 
@@ -1296,7 +1355,7 @@ impl Peer {
                         let typ = c.typ.to_string();
                         let addr = c.address.clone();
                         let port = c.port;
-                        crate::ui::trace(&format!("[ice-candidate] type={} addr={} port={}", typ, addr, port));
+                        crate::hooks::trace(&format!("[ice-candidate] type={} addr={} port={}", typ, addr, port));
                         if let Ok(init) = c.to_json() {
                             let _ = sio
                                 .emit(
@@ -1306,7 +1365,7 @@ impl Peer {
                                 .await;
                         }
                     } else {
-                        crate::ui::trace(&format!("[ice-candidate] gathering complete (null candidate)"));
+                        crate::hooks::trace(&format!("[ice-candidate] gathering complete (null candidate)"));
                     }
                 })
             }));
@@ -1317,7 +1376,7 @@ impl Peer {
             let closed = closed.clone();
             let pid = peer_id.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
-                crate::ui::trace(&format!("[pc-state] {} -> {}", pid, s));
+                crate::hooks::trace(&format!("[pc-state] {} -> {}", pid, s));
                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                     let _ = tx.send(Ev::PcState(pid.clone(), s.to_string()));
                 }
@@ -1496,7 +1555,7 @@ impl Peer {
                 };
                 for c in pending {
                     if let Err(e) = self.pc.add_ice_candidate(c).await {
-                        crate::ui::trace(&format!("filament: queued candidate failed: {e}"));
+                        crate::hooks::trace(&format!("filament: queued candidate failed: {e}"));
                     }
                 }
                 if is_offer {
@@ -1531,7 +1590,7 @@ impl Peer {
                 };
                 if !buffered {
                     if let Err(e) = self.pc.add_ice_candidate(init).await {
-                        crate::ui::trace(&format!("filament: addIceCandidate failed: {e}"));
+                        crate::hooks::trace(&format!("filament: addIceCandidate failed: {e}"));
                     }
                 }
             }
@@ -1642,7 +1701,7 @@ fn c3_needs_handoff_grace(
 
 /// The state-only portion of `Peer::is_live`, exposed so #246's executable
 /// invariant can pin the disconnected recovery boundary without a live PC.
-pub(crate) fn is_live_state(state: RTCPeerConnectionState) -> bool {
+pub fn is_live_state(state: RTCPeerConnectionState) -> bool {
     matches!(
         state,
         RTCPeerConnectionState::New
@@ -1713,10 +1772,10 @@ pub async fn describe_path(t: &dyn Transport, peer: Option<&Peer>) -> PathInfo {
     let mut info = PathInfo::default();
     if let Some(ra) = t.remote_addr() {
         info.remote = Some(ra.to_string());
-        info.class = Some(crate::doctor::ip_class(ra.ip()));
+        info.class = Some(crate::hooks::ip_class(ra.ip()));
         if let Some(la) = t.local_ip().or_else(|| source_ip_for(ra)) {
             info.local = Some(la.to_string());
-            if let Some((n, v)) = crate::doctor::iface_for_ip(la) {
+            if let Some((n, v)) = crate::hooks::iface_for_ip(la) {
                 info.iface = Some(n);
                 info.vpn = v;
             }
@@ -1728,10 +1787,10 @@ pub async fn describe_path(t: &dyn Transport, peer: Option<&Peer>) -> PathInfo {
             info.cand = Some(format!("{}\u{2194}{}", pp.local_typ, pp.remote_typ));
             info.relay = pp.relayed;
             if let Ok(rip) = pp.remote_ip.parse::<std::net::IpAddr>() {
-                info.class = Some(crate::doctor::ip_class(rip));
+                info.class = Some(crate::hooks::ip_class(rip));
             }
             if let Ok(lip) = pp.local_ip.parse::<std::net::IpAddr>() {
-                if let Some((n, v)) = crate::doctor::iface_for_ip(lip) {
+                if let Some((n, v)) = crate::hooks::iface_for_ip(lip) {
                     info.iface = Some(n);
                     info.vpn = v;
                 }
@@ -1827,16 +1886,12 @@ pub fn is_tailscale_addr(addr: &str) -> bool {
     }
 }
 
-/// Resolve a local IP address to an interface name by enumerating interfaces.
+/// Resolve a local IP address to an interface name.
+///
+/// Enumerating interfaces shells out on Linux, which is host business, so the
+/// whole lookup is a hook rather than dragging the interface type in here.
 fn resolve_iface_name(addr: &str) -> String {
-    if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
-        for iface in crate::interact::enumerate_interfaces() {
-            if iface.ips.iter().any(|i| *i == ip) {
-                return iface.name;
-            }
-        }
-    }
-    "?".to_string()
+    crate::hooks::resolve_iface_name(addr)
 }
 
 async fn wire_channel(
@@ -1858,7 +1913,7 @@ async fn wire_channel(
             let raw = match dc2.detach().await {
                 Ok(raw) => raw,
                 Err(e) => {
-                    crate::ui::trace(&format!("filament: data channel detach failed: {e}"));
+                    crate::hooks::trace(&format!("filament: data channel detach failed: {e}"));
                     return;
                 }
             };
@@ -1868,6 +1923,10 @@ async fn wire_channel(
             // never falsely treated as idle/supersedable (#28 guard).
             let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
             let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // L3-over-relay queues, created BEFORE the read loop so the reader
+            // owns the inbound sender and the transport owns the receiver.
+            let (l3_in_tx, l3_in_rx) = tokio::sync::mpsc::channel::<Bytes>(L3_QUEUE);
+            let (l3_out_tx, mut l3_out_rx) = tokio::sync::mpsc::channel::<Bytes>(L3_QUEUE);
 
             // C8a: one persistent buffered-amount-low subscription wakes all
             // parked senders.
@@ -1919,6 +1978,16 @@ async fn wire_channel(
                                     first_data
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                                    if sid == L3_DATAGRAM_SID {
+                                        // An IP packet, not a transfer frame. Never
+                                        // goes to Ev::Chunk: the L2 layer would look
+                                        // up a stream that does not exist. try_send
+                                        // so a slow tunnel drops packets instead of
+                                        // stalling the whole read loop, which also
+                                        // serves file transfer.
+                                        let _ = l3_in_tx.try_send(Bytes::copy_from_slice(&buf[12..n]));
+                                        continue;
+                                    }
                                     let offset = u64::from_be_bytes([
                                         buf[4], buf[5], buf[6], buf[7],
                                         buf[8], buf[9], buf[10], buf[11],
@@ -1963,8 +2032,36 @@ async fn wire_channel(
                         }
                     });
                 }
+                // L3 outbound pump: the trait's send_datagram is sync, the
+                // channel write is async, so one task drains the queue. It exits
+                // when the channel dies or the transport (and its sender) drops.
+                {
+                    let raw_d = raw.clone();
+                    let dead_d = dead.clone();
+                    tokio::spawn(async move {
+                        while let Some(pkt) = l3_out_rx.recv().await {
+                            if dead_d.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut framed = Vec::with_capacity(12 + pkt.len());
+                            framed.extend_from_slice(&L3_DATAGRAM_SID.to_be_bytes());
+                            framed.extend_from_slice(&0u64.to_be_bytes());
+                            framed.extend_from_slice(&pkt);
+                            // Deliberately NO backpressure park here: an IP packet
+                            // that cannot go now is dropped by the queue bound, and
+                            // parking would let the tunnel stall file transfer.
+                            if raw_d.write_data_channel(&Bytes::from(framed), false).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
                 let transport: Arc<dyn Transport> =
-                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity, first_data, answerer: polite });
+                    Arc::new(DataChannelTransport {
+                        raw, drained, dead, last_activity, first_data, answerer: polite,
+                        l3_in: tokio::sync::Mutex::new(l3_in_rx),
+                        l3_out: l3_out_tx,
+                    });
                 let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
             }
         })

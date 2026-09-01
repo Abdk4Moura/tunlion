@@ -255,20 +255,71 @@ fn render(prompt: &str, buf: &str, j: &Judgment) {
 /// one marked and colored. After the first paint the cursor is parked below the
 /// list, so subsequent paints move up `items+1` lines first. Raw mode disables
 /// newline translation, hence explicit `\r\n`.
-fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool) {
+/// Which slice of a list a picker shows, and how much is out of sight.
+///
+/// Split out because it is the only arithmetic in the renderer and it is the
+/// part that can be wrong in a way nobody notices: an off-by-one here either
+/// hides a row or reports a count that does not match what is drawn, and the
+/// redraw then rewinds the wrong number of lines and eats the scrollback.
+///
+/// Returns `(first, view, above, below)`.
+fn viewport_window(sel: usize, len: usize, max: usize) -> (usize, usize, usize, usize) {
+    let view = max.min(len);
+    if view == 0 {
+        return (0, 0, 0, 0);
+    }
+    // Keep the selection inside the window, scrolling only as far as needed.
+    let first = sel.saturating_sub(view - 1).min(len - view);
+    (first, view, first, len - first - view)
+}
+
+/// How many list rows a picker shows at once before it starts scrolling.
+const VIEWPORT: usize = 7;
+
+fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool, hints: &[(char, &str)]) {
     let mut err = std::io::stderr();
     let color = ui::caps().color;
+    // Header + items + (a hint line, when there are hints). The cursor rewind
+    // must count exactly what was drawn or the redraw walks up the scrollback.
+    // A viewport, so a long list does not scroll the terminal away. The window
+    // follows the selection and the counts below say how much is out of sight:
+    // a list that silently truncates is worse than one that admits its length.
+    let (first, view, above, below) = viewport_window(sel, items.len(), VIEWPORT);
+    let drawn =
+        view + 1 + usize::from(above > 0) + usize::from(below > 0) + usize::from(!hints.is_empty());
     if redraw {
-        let _ = write!(err, "\x1b[{}A", items.len() + 1);
+        let _ = write!(err, "\x1b[{drawn}A");
     }
     let _ = write!(err, "\r\x1b[2K{header}\r\n");
-    for (i, it) in items.iter().enumerate() {
+    let dim = if color { "\x1b[2m" } else { "" };
+    let reset0 = if color { "\x1b[0m" } else { "" };
+    if above > 0 {
+        let _ = write!(err, "\r\x1b[2K  {dim}\u{2191} {above} more{reset0}\r\n");
+    }
+    for (i, it) in items.iter().enumerate().skip(first).take(view) {
         let (mark, c, r) = if i == sel {
             ("\u{276f}", if color { "\x1b[36m" } else { "" }, if color { "\x1b[0m" } else { "" })
         } else {
             (" ", "", "")
         };
         let _ = write!(err, "\r\x1b[2K  {c}{mark} {it}{r}\r\n");
+    }
+    if below > 0 {
+        let _ = write!(err, "\r\x1b[2K  {dim}\u{2193} {below} more{reset0}\r\n");
+    }
+    // The ambient hint line. Always-visible keybindings beat a menu ITEM for the
+    // same job: an item consumes a slot, sits in the arrow-key path, and reads as
+    // a choice with the same weight as the real ones. A hint is present without
+    // competing, and the list stays about the actual decision.
+    if !hints.is_empty() {
+        let dim = if color { "\x1b[2m" } else { "" };
+        let reset = if color { "\x1b[0m" } else { "" };
+        let mut line = String::from("  \u{2191}\u{2193} move \u{b7} \u{23ce} select");
+        for (k, label) in hints {
+            line.push_str(&format!(" \u{b7} {k} {label}"));
+        }
+        line.push_str(" \u{b7} esc cancel");
+        let _ = write!(err, "\r\x1b[2K{dim}{line}{reset}\r\n");
     }
     let _ = err.flush();
 }
@@ -278,15 +329,47 @@ fn render_picker(header: &str, items: &[String], sel: usize, redraw: bool) {
 /// restored (RawGuard). Callers append their own "none of these" item if they want
 /// an in-list escape hatch.
 pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
+    match pick_with_keys(header, items, &[])? {
+        Picked::Item(i) => Ok(Some(i)),
+        Picked::Key(_) | Picked::Cancelled => Ok(None),
+    }
+}
+
+/// What a picker returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Picked {
+    /// An item was chosen.
+    Item(usize),
+    /// One of the caller's hint keys was pressed.
+    Key(char),
+    /// Esc, q, or Ctrl-C.
+    Cancelled,
+}
+
+/// `pick`, plus caller-defined keys advertised on an ambient hint line.
+///
+/// The alternative is an extra ITEM ("More options..."), and an item is worse
+/// for this job: it consumes a slot, sits in the arrow-key path between real
+/// choices, and reads with the same weight as them even though it decides
+/// nothing. A key is present without competing, so the list stays about the
+/// actual decision and the escape hatch is always visible.
+///
+/// Hint keys are matched WITHOUT modifiers and after the navigation keys, so a
+/// caller cannot accidentally shadow j/k/q or Ctrl-C.
+pub fn pick_with_keys(
+    header: &str,
+    items: &[String],
+    hints: &[(char, &str)],
+) -> std::io::Result<Picked> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     if items.is_empty() {
-        return Ok(None);
+        return Ok(Picked::Cancelled);
     }
     let _guard = RawGuard::enable()?;
     let mut sel = 0usize;
     let mut redraw = false;
     loop {
-        render_picker(header, items, sel, redraw);
+        render_picker(header, items, sel, redraw, hints);
         redraw = true;
         let ev = event::read()?;
         let Event::Key(k) = ev else { continue };
@@ -298,12 +381,15 @@ pub fn pick(header: &str, items: &[String]) -> std::io::Result<Option<usize>> {
             // crossterm may deliver the lone 0x03 byte WITHOUT the CONTROL
             // modifier. Match the raw control byte as well as the composed
             // Ctrl-C, so the keypress dismisses the picker on every platform.
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(None),
-            KeyCode::Char('\u{3}') => return Ok(None),
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return Ok(Picked::Cancelled),
+            KeyCode::Char('\u{3}') => return Ok(Picked::Cancelled),
             KeyCode::Up | KeyCode::Char('k') => sel = if sel == 0 { items.len() - 1 } else { sel - 1 },
             KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % items.len(),
-            KeyCode::Enter => return Ok(Some(sel)),
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            KeyCode::Enter => return Ok(Picked::Item(sel)),
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(Picked::Cancelled),
+            // AFTER navigation, so a hint key can never shadow j/k/q.
+            KeyCode::Char(c) if k.modifiers.is_empty()
+                && hints.iter().any(|(h, _)| *h == c) => return Ok(Picked::Key(c)),
             _ => {}
         }
     }
@@ -539,5 +625,44 @@ mod tests {
         // "cat-12345" -> split_chosen strips 12345, leaves "cat" = 1 token
         let j = judge("cat-12345", Mode::Create, NP);
         assert_eq!(j.level, Level::Incomplete);
+    }
+}
+
+#[cfg(test)]
+mod viewport_tests {
+    use super::viewport_window;
+
+    #[test]
+    fn a_short_list_shows_everything_and_claims_nothing_hidden() {
+        let (first, view, above, below) = viewport_window(0, 3, 7);
+        assert_eq!((first, view, above, below), (0, 3, 0, 0));
+    }
+
+    #[test]
+    fn a_long_list_admits_what_is_below_before_you_scroll() {
+        // 20 items, window of 7, sitting at the top: 13 are out of sight and the
+        // picker must say so. Silently truncating is the failure this prevents.
+        let (first, view, above, below) = viewport_window(0, 20, 7);
+        assert_eq!((first, view, above, below), (0, 7, 0, 13));
+    }
+
+    #[test]
+    fn the_window_follows_the_selection_and_the_counts_stay_consistent() {
+        for sel in 0..20 {
+            let (first, view, above, below) = viewport_window(sel, 20, 7);
+            assert!(sel >= first && sel < first + view, "selection {sel} must be visible");
+            assert_eq!(above + view + below, 20, "counts must account for every row");
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_list_pins_the_window_rather_than_running_past_it() {
+        let (first, view, above, below) = viewport_window(19, 20, 7);
+        assert_eq!((first, view, above, below), (13, 7, 13, 0));
+    }
+
+    #[test]
+    fn an_empty_list_is_not_a_panic() {
+        assert_eq!(viewport_window(0, 0, 7), (0, 0, 0, 0));
     }
 }

@@ -72,9 +72,14 @@ banner is not a security boundary, so past a threshold the deliberate tier is
 
 ## Adding a device
 
-Unchanged in flow: `filament add` on one machine, `filament add <code>` on the
-other, from any device holding an enrolment delegation, which is the point of
-the split.
+`filament add` on one machine, `filament join <code>` on the other, from any
+device holding an enrolment delegation, which is the point of the split.
+
+The verbs split by ROLE, not transport: `add` offers, `join` accepts, and
+whether the offer travelled as a spoken code or an invitation file is an
+argument. Add `--for device` to enrol the other side into the mesh rather than
+merely pair with it; `--for person` is the explicit external case. (`add <code>`
+still accepts a code, but `join <code>` is the spelling everything prints.)
 
 ```
   ✓ laptop joined your mesh

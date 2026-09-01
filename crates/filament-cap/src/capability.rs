@@ -1048,6 +1048,23 @@ pub enum BindingStrength {
 pub enum PrincipalKind {
     OwnerDevice,
     Delegated { caps: Vec<String> },
+    /// A same-owner FLEET device: identity proven by an owner-signed certificate
+    /// bound to the link, but NOT this machine's owner principal.
+    ///
+    /// Distinct from both neighbours on purpose:
+    ///   - not `Delegated`, because that carries an auth-key CEILING, and the
+    ///     ceiling check is unconditional and purely restrictive. A fleet sibling
+    ///     is not an auth-key borrower, and giving it an empty ceiling denied
+    ///     everything before the fleet policy in `cap_gate_effective` was ever
+    ///     consulted. (Delegated also means "ephemeral, drop on disconnect",
+    ///     which a persistent sibling is not.)
+    ///   - not `OwnerDevice`, so nothing reads it as the local primary.
+    ///
+    /// It carries no ceiling, which is safe precisely because
+    /// `cap_gate_effective` DISCARDS the owner shortcut for a same-owner peer and
+    /// recomputes from fleet policy: a scoped default within bounds plus Proven
+    /// is auto-authorized, and everything else stays grant-only.
+    FleetDevice,
 }
 
 impl PrincipalKind {
@@ -1055,6 +1072,8 @@ impl PrincipalKind {
     pub fn auth_key_caps(&self) -> Option<&[String]> {
         match self {
             PrincipalKind::OwnerDevice => None,
+            // No ceiling: the fleet policy in `cap_gate_effective` decides.
+            PrincipalKind::FleetDevice => None,
             PrincipalKind::Delegated { caps } => Some(caps),
         }
     }

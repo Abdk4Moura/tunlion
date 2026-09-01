@@ -32,7 +32,7 @@ enum PendingEnroll {
     Compact {
         enroll_seed: [u8; 32],
         device_pub: [u8; 32],
-        inv: InvitationV2,
+        inv: Invitation,
     },
     /// Legacy mint/enroll path (hidden): a full AuthKey with its own issuer.
     Legacy {
@@ -75,7 +75,7 @@ pub fn register_enrollment(
     peer_id: String,
     enroll_seed: [u8; 32],
     device_pub: [u8; 32],
-    inv: InvitationV2,
+    inv: Invitation,
 ) {
     let mut store = PENDING_ENROLLS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     store.insert(peer_id, PendingEnroll::Compact { enroll_seed, device_pub, inv });

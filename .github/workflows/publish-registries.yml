@@ -67,6 +67,16 @@ jobs:
             filament-pair-v*)    name="filament-pair";    dir="crates/filament-pair" ;;
             secret-write-v*)     name="secret-write";     dir="crates/secret-write" ;;
             authkeys-managed-v*) name="authkeys-managed"; dir="crates/authkeys-managed" ;;
+            # The later carves. They build standalone and carry the same
+            # README/licence/description metadata as the five above; they were
+            # simply never added here, so tagging one failed with "does not map
+            # to a known package". Listing them does NOT publish anything: a tag
+            # still has to be pushed deliberately.
+            filament-fleet-v*)     name="filament-fleet";     dir="crates/filament-fleet" ;;
+            filament-overlay-v*)   name="filament-overlay";   dir="crates/filament-overlay" ;;
+            filament-proto-v*)     name="filament-proto";     dir="crates/filament-proto" ;;
+            filament-transfer-v*)  name="filament-transfer";  dir="crates/filament-transfer" ;;
+            filament-transport-v*) name="filament-transport"; dir="crates/filament-transport" ;;
             *) echo "::error::tag '$tag' does not map to a known package"; exit 1 ;;
           esac
           # The tag version MUST match the crate's Cargo.toml version, so a tag can
@@ -79,8 +89,31 @@ jobs:
           echo "name=$name"   >> "$GITHUB_OUTPUT"
           echo "dir=$dir"     >> "$GITHUB_OUTPUT"
           echo "ver=$crtver"  >> "$GITHUB_OUTPUT"
+
       - name: Update Rust toolchain (edition 2024)
         run: rustup update stable && rustup default stable
+
+      - name: The crate must build OUTSIDE the workspace
+        run: |
+          # A crate that only compiles as part of this workspace is not usable by
+          # anyone else, which is the entire point of extracting it. Nothing
+          # checked this before, and filament-transport had drifted into exactly
+          # that state: it gated code on `test-hooks`/`debug-logs` features it
+          # never declared (so those blocks were silently dead), and the vendored
+          # openssl its native-tls dependency needs is declared only in
+          # cli/Cargo.toml, so the CLI had an escape hatch a consumer did not.
+          #
+          # Building from the crate's own directory, with its own target dir, is
+          # what a downstream user actually does. Cheap, and it fails BEFORE the
+          # irreversible crates.io publish rather than after.
+          #
+          # AFTER the toolchain update on purpose: the publish map includes
+          # cli-v*, and cli is edition 2024, so running this first would fail
+          # on the runner default toolchain for the one package most likely
+          # to be released.
+          cd "${{ steps.pkg.outputs.dir }}"
+          cargo build --quiet
+
       - name: Authenticate to crates.io (Trusted Publishing / OIDC)
         id: auth
         uses: rust-lang/crates-io-auth-action@v1

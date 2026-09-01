@@ -161,7 +161,7 @@ pub fn interactive_checklist(title: &str, subtitle: &str, opts: &[OptionEntry]) 
     }
 }
 
-fn paint_checklist(title: &str, subtitle: &str, opts: &[OptionEntry], selected: &[bool], cursor: usize, redraw: bool, vis_lines: usize) {
+fn paint_checklist(title: &str, _subtitle: &str, opts: &[OptionEntry], selected: &[bool], cursor: usize, redraw: bool, vis_lines: usize) {
     let mut err = std::io::stderr();
     let color = ui::caps().color;
 
@@ -192,7 +192,7 @@ fn paint_checklist(title: &str, subtitle: &str, opts: &[OptionEntry], selected: 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Strength { Soft, Hard }
 
-pub fn interactive_reorder(title: &str, subtitle: &str, opts: &[OptionEntry], initial_strength: Strength) -> Option<(String, Strength)> {
+pub fn interactive_reorder(title: &str, _subtitle: &str, opts: &[OptionEntry], initial_strength: Strength) -> Option<(String, Strength)> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
     if opts.is_empty() { return None; }

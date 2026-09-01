@@ -419,6 +419,17 @@
       ]
     },
     {
+      "path": "proofs/fleet_automesh_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/fleet_automesh_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
+    },
+    {
       "path": "proofs/stall_ladder_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/stall_ladder_model.py",

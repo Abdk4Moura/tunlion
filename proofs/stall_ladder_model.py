@@ -33,7 +33,22 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def source_ladder_constants():
     """Read the ladder bounds from the Rust tree this model claims to describe."""
     main = open(os.path.join(ROOT, "cli", "src", "main.rs")).read()
-    net = open(os.path.join(ROOT, "cli", "src", "net.rs")).read()
+    # net.rs moved to crates/filament-transport on 2026-08-27. This guard READS
+    # the source to keep the model calibrated against it, so a file move breaks
+    # it loudly, which is how the move was caught. Try the current home, fall
+    # back to the old one so the guard still works on older checkouts.
+    net_paths = [
+        os.path.join(ROOT, "crates", "filament-transport", "src", "net.rs"),
+        os.path.join(ROOT, "cli", "src", "net.rs"),
+    ]
+    net_path = next((p for p in net_paths if os.path.exists(p)), None)
+    if net_path is None:
+        raise SystemExit(
+            "stall-ladder guard: cannot find net.rs in any known location "
+            f"({net_paths}). This guard calibrates against the source, so it "
+            "must be pointed at the file rather than skipped."
+        )
+    net = open(net_path).read()
     attempts = re.search(r"const\s+MAX_ATTEMPTS:\s*u32\s*=\s*(\d+)", main)
     watchdog = re.search(r"pub\s+const\s+WATCHDOG_SECS:\s*u64\s*=\s*(\d+)", net)
     if not attempts or not watchdog:
