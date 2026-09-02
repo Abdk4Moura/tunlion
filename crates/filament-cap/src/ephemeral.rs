@@ -191,6 +191,12 @@ impl AuthKey {
         if caps.iter().any(|c| c.len() > MAX_CAP_LEN) {
             bail!("cap too long (max {} bytes)", MAX_CAP_LEN);
         }
+        // Refuse HERE, where there is still a caller to tell. The token encoder
+        // used to swallow this and emit an empty ceiling, so `add --allow route`
+        // produced a valid, signed invitation that granted nothing, and the
+        // failure only surfaced much later as "route is outside <device>'s
+        // invitation ceiling ()" on a machine that had done everything right.
+        inv_caps_to_bitmask(&caps)?;
         let now = now_secs();
         let mut k = AuthKey {
             issuer: owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?,
@@ -361,6 +367,12 @@ const INV_CAP_MOUNT: u8 = 1 << 1;
 const INV_CAP_SHELL: u8 = 1 << 2;
 const INV_CAP_WRITE: u8 = 1 << 3;
 const INV_CAP_ALL_PORTS: u8 = 1 << 4;
+// Bit 5. A capability that is grantable but NOT encodable here cannot be put in
+// an invitation ceiling, and since a grant may never widen a ceiling, no joined
+// device could ever legitimately hold it. Adding a capability to
+// CANONICAL_CAPABILITIES therefore obliges adding a bit here; the round-trip
+// test below fails if that is forgotten.
+const INV_CAP_ROUTE: u8 = 1 << 5;
 const INV_REUSE_REUSABLE: u8 = 255;
 
 fn inv_caps_to_bitmask(caps: &[String]) -> Result<u8> {
@@ -372,6 +384,7 @@ fn inv_caps_to_bitmask(caps: &[String]) -> Result<u8> {
             "shell" => INV_CAP_SHELL,
             "write" => INV_CAP_WRITE,
             "all-ports" => INV_CAP_ALL_PORTS,
+            "route" => INV_CAP_ROUTE,
             other => bail!("cannot encode capability '{other}' in a v2 invitation"),
         };
     }
@@ -385,6 +398,7 @@ fn inv_caps_from_bitmask(mask: u8) -> Vec<String> {
     if mask & INV_CAP_SHELL != 0 { out.push("shell".into()); }
     if mask & INV_CAP_WRITE != 0 { out.push("write".into()); }
     if mask & INV_CAP_ALL_PORTS != 0 { out.push("all-ports".into()); }
+    if mask & INV_CAP_ROUTE != 0 { out.push("route".into()); }
     out
 }
 
@@ -486,7 +500,15 @@ impl Invitation {
         let mut b = Vec::new();
         b.push(0x02);
         b.extend_from_slice(&self.issuer_fp);
-        let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
+        // `.unwrap_or(0)` here silently turned an unencodable capability into an
+        // EMPTY ceiling: the invitation still minted, still signed, still
+        // delivered, and conferred nothing. That is the worst available failure
+        // mode for a security artifact, because everything downstream reports
+        // success. mint_with_bounds now rejects unencodable caps up front, so
+        // this cannot be reached with bad data; expect() states the invariant
+        // rather than hiding its violation.
+        let mask = inv_caps_to_bitmask(&self.caps)
+            .expect("caps were validated as encodable at mint");
         b.push(mask);
         b.extend_from_slice(&(self.expires as u32).to_le_bytes());
         b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
@@ -504,7 +526,15 @@ impl Invitation {
         let mut b = Vec::new();
         b.push(0x02);
         b.extend_from_slice(&self.issuer_fp);
-        let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
+        // `.unwrap_or(0)` here silently turned an unencodable capability into an
+        // EMPTY ceiling: the invitation still minted, still signed, still
+        // delivered, and conferred nothing. That is the worst available failure
+        // mode for a security artifact, because everything downstream reports
+        // success. mint_with_bounds now rejects unencodable caps up front, so
+        // this cannot be reached with bad data; expect() states the invariant
+        // rather than hiding its violation.
+        let mask = inv_caps_to_bitmask(&self.caps)
+            .expect("caps were validated as encodable at mint");
         b.push(mask);
         b.extend_from_slice(&(self.expires as u32).to_le_bytes());
         b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
@@ -523,7 +553,15 @@ impl Invitation {
         let mut b = Vec::new();
         b.push(0x02);
         b.extend_from_slice(&self.issuer_fp);
-        let mask = inv_caps_to_bitmask(&self.caps).unwrap_or(0);
+        // `.unwrap_or(0)` here silently turned an unencodable capability into an
+        // EMPTY ceiling: the invitation still minted, still signed, still
+        // delivered, and conferred nothing. That is the worst available failure
+        // mode for a security artifact, because everything downstream reports
+        // success. mint_with_bounds now rejects unencodable caps up front, so
+        // this cannot be reached with bad data; expect() states the invariant
+        // rather than hiding its violation.
+        let mask = inv_caps_to_bitmask(&self.caps)
+            .expect("caps were validated as encodable at mint");
         b.push(mask);
         b.extend_from_slice(&(self.expires as u32).to_le_bytes());
         b.extend_from_slice(&(self.max_offline as u32).to_le_bytes());
@@ -1855,5 +1893,51 @@ mod tests {
         assert_eq!(payload.device_pub, round.device_pub);
         assert_eq!(payload.enroll_possession_sig, round.enroll_possession_sig);
         assert_eq!(payload.device_possession_sig, round.device_possession_sig);
+    }
+}
+
+
+#[cfg(test)]
+mod invitation_ceiling_codec_tests {
+    use super::*;
+
+    /// Every capability that can be GRANTED must survive a trip through the v2
+    /// invitation bitmask, because a grant may never widen a ceiling: a
+    /// capability missing from this codec can never legitimately reach a joined
+    /// device at all. `route` was absent, and because the encoder fell back to
+    /// an empty mask instead of failing, the whole ceiling silently vanished.
+    #[test]
+    fn every_canonical_capability_survives_the_invitation_bitmask() {
+        for cap in crate::capability::CANONICAL_CAPABILITIES {
+            let mask = inv_caps_to_bitmask(std::slice::from_ref(&cap.to_string()))
+                .unwrap_or_else(|e| panic!("'{cap}' cannot be encoded in an invitation: {e}"));
+            assert_ne!(mask, 0, "'{cap}' encoded to an EMPTY ceiling");
+            assert_eq!(
+                inv_caps_from_bitmask(mask),
+                vec![cap.to_string()],
+                "'{cap}' did not survive the bitmask round trip"
+            );
+        }
+    }
+
+    /// A multi-capability ceiling must not lose members.
+    #[test]
+    fn a_mixed_ceiling_round_trips_without_loss() {
+        let ceiling: Vec<String> =
+            ["transfer", "mount", "route"].iter().map(|s| s.to_string()).collect();
+        let mask = inv_caps_to_bitmask(&ceiling).expect("encodable");
+        let mut back = inv_caps_from_bitmask(mask);
+        back.sort();
+        let mut want = ceiling.clone();
+        want.sort();
+        assert_eq!(back, want);
+    }
+
+    /// An unencodable capability must be a LOUD failure at mint, never a
+    /// quietly-empty ceiling on a signed artifact.
+    #[test]
+    fn an_unencodable_capability_is_refused_not_silently_dropped() {
+        let err = inv_caps_to_bitmask(&["not-a-real-capability".to_string()]);
+        assert!(err.is_err(), "an unknown capability must not encode to a mask");
     }
 }

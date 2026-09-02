@@ -329,6 +329,24 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Withdraw a route previously installed by `add_route`.
+///
+/// A route that is already gone is SUCCESS, not an error: reconciliation runs on
+/// every advertisement, and a peer that withdraws a prefix twice must not turn
+/// into a stream of failures.
+pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
+    let fam = if cidr.contains(':') { "-6" } else { "-4" };
+    let out = std::process::Command::new("ip")
+        .args([fam, "route", "del", cidr, "dev", dev])
+        .output()
+        .context("exec ip route del")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() && !stderr.contains("No such process") {
+        bail!("ip {fam} route del {cidr} dev {dev}: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 /// Assign an ADDITIONAL address `cidr` to `dev` (the node's v4 overlay address on
 /// top of the primary v6 ULA, so the kernel delivers inbound v4 overlay packets
 /// locally). CAP_NET_ADMIN ambient is already raised by `KernelTun::open`, so the

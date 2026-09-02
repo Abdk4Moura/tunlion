@@ -197,7 +197,29 @@ impl Identity {
         let sig = self.keypair.sign(&msg);
         let mut sig64 = [0u8; 64];
         sig64.copy_from_slice(sig.as_ref());
-        Announce { pubkey: self.pubkey, addr: self.addr, seq, sig: sig64, relay_datagrams: true }
+        Announce {
+            pubkey: self.pubkey,
+            addr: self.addr,
+            seq,
+            sig: sig64,
+            relay_datagrams: true,
+            routes: Vec::new(),
+            routes_sig: None,
+        }
+    }
+
+    /// An announce that also advertises `routes`, each signed under its own
+    /// domain. Callers pass NORMALIZED CIDRs; the signature covers the exact
+    /// strings sent, so normalizing after signing would invalidate it.
+    pub fn announce_with_routes(&self, seq: u64, cb: &[u8], routes: Vec<String>) -> Announce {
+        let mut a = self.announce(seq, cb);
+        if routes.is_empty() {
+            return a;
+        }
+        let msg = routes_message(&self.pubkey, seq, cb, &routes);
+        a.routes_sig = Some(self.sign(&msg));
+        a.routes = routes;
+        a
     }
 
     /// Return the 32-byte Ed25519 public key (for cert signing / identity binding).
@@ -224,6 +246,40 @@ fn bind_message(addr: &Ipv6Addr, seq: u64, cb: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Domain for the SEPARATE signature over advertised routes.
+///
+/// Separate, and not folded into `bind_message`, for one reason: the base
+/// announce signature must keep covering exactly the bytes it covers today, or
+/// an older peer computing the digest without a routes field would fail to
+/// verify a newer peer's announce and interop would break on upgrade. A second
+/// signature over a second domain leaves the first untouched.
+const ROUTES_DOMAIN: &[u8] = b"filament-l3-routes-v1";
+
+/// Bytes signed to authenticate an advertised route set.
+///
+/// Binds `pubkey` (whose routes), `seq` (which announce generation) and `cb`
+/// (which link). `seq` is what stops a captured route set being spliced onto a
+/// later announce to resurrect a prefix the advertiser has since WITHDRAWN, and
+/// `cb` stops it being replayed onto a different link.
+///
+/// Each CIDR is length-prefixed. Plain concatenation would let `["10.0.0.0/2",
+/// "4"]` and `["10.0.0.0/24"]` produce identical bytes, so one signature would
+/// authenticate two different route sets.
+fn routes_message(pubkey: &[u8; 32], seq: u64, cb: &[u8], routes: &[String]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(ROUTES_DOMAIN.len() + 32 + 8 + cb.len() + 32 * routes.len());
+    msg.extend_from_slice(ROUTES_DOMAIN);
+    msg.extend_from_slice(pubkey);
+    msg.extend_from_slice(&seq.to_be_bytes());
+    msg.extend_from_slice(&(cb.len() as u32).to_be_bytes());
+    msg.extend_from_slice(cb);
+    msg.extend_from_slice(&(routes.len() as u32).to_be_bytes());
+    for r in routes {
+        msg.extend_from_slice(&(r.len() as u32).to_be_bytes());
+        msg.extend_from_slice(r.as_bytes());
+    }
+    msg
+}
+
 // ----------------------------------------------------------------- announce --
 
 /// A peer's signed claim to an overlay address over a specific link.
@@ -242,6 +298,22 @@ pub struct Announce {
     /// peer does not send it and cannot receive relay datagrams, so assuming
     /// support would install a route that silently black-holes.
     pub relay_datagrams: bool,
+    /// Prefixes this peer offers to carry, NORMALIZED by the sender.
+    ///
+    /// INSIDE a signature, unlike `relay_datagrams`, and the difference is not
+    /// caution. `relay_datagrams` selects a transport and authorizes nothing, so
+    /// tampering with it achieves only a denial the tamperer could cause anyway.
+    /// A route set is a statement of CURRENT INTENT whose withdrawal matters:
+    /// left unsigned, an attacker could re-add a prefix the peer was granted long
+    /// ago and has since stopped advertising, and the capability check would
+    /// still pass because the grant is real. Signing binds "I am advertising
+    /// this, now, on this link".
+    ///
+    /// Being signed is NOT authorization. It proves who said it; whether to
+    /// install it is a CAP_ROUTE decision plus the receiver's accept-routes.
+    pub routes: Vec<String>,
+    /// Signature over `routes_message`. `None` from a peer that advertises none.
+    pub routes_sig: Option<[u8; 64]>,
 }
 
 impl Announce {
@@ -268,6 +340,12 @@ impl Announce {
             "sig": b64(&self.sig),
             // Advisory capability flag; older peers ignore the unknown key.
             "dg_relay": self.relay_datagrams,
+            // Advertised prefixes and their signature. Older peers ignore both
+            // keys and verify the base announce unchanged, which is the whole
+            // reason routes got their OWN signature rather than joining
+            // bind_message.
+            "routes": self.routes,
+            "routes_sig": self.routes_sig.map(|s| b64(&s)),
         })
     }
 
@@ -286,7 +364,53 @@ impl Announce {
         let seq = v["seq"].as_u64().unwrap_or(0);
         // Absent (older peer) means NO. See the field's note.
         let relay_datagrams = v["dg_relay"].as_bool().unwrap_or(false);
-        Ok(Announce { pubkey, addr, seq, sig, relay_datagrams })
+        // Absent means "advertises nothing", the safe reading for an older peer.
+        let routes: Vec<String> = v["routes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let routes_sig = match v["routes_sig"].as_str() {
+            Some(s) => {
+                let raw = unb64(s)?;
+                let arr: [u8; 64] =
+                    raw.try_into().map_err(|_| anyhow!("announce routes_sig not 64 bytes"))?;
+                Some(arr)
+            }
+            None => None,
+        };
+        Ok(Announce { pubkey, addr, seq, sig, relay_datagrams, routes, routes_sig })
+    }
+
+    /// Verify the advertised route set, SEPARATELY from the announce itself.
+    ///
+    /// Returns the routes only if their signature checks out. Deliberately not
+    /// folded into `verify`: a bad route signature must not invalidate the
+    /// ADDRESS, because the address is self-certifying and still perfectly good.
+    /// Failing the whole announce would let a tamperer knock a peer off the
+    /// overlay entirely by corrupting a field that only ever adds routes.
+    ///
+    /// An empty result is the answer for a peer advertising nothing, for an
+    /// older peer that has no such field, and for a route set whose signature
+    /// fails. All three mean "install no prefixes from this peer", which is the
+    /// safe reading of each.
+    ///
+    /// PROVES AUTHORSHIP, NOT PERMISSION. The caller must still check CAP_ROUTE
+    /// for every prefix and the receiver's own accept-routes.
+    pub fn verify_routes(&self, cb: &[u8]) -> Vec<String> {
+        if self.routes.is_empty() {
+            return Vec::new();
+        }
+        let Some(sig) = self.routes_sig else {
+            return Vec::new(); // routes without a signature are not a claim
+        };
+        let msg = routes_message(&self.pubkey, self.seq, cb, &self.routes);
+        // Same primitive and same construction as `verify`, deliberately: one
+        // signature check in this file that behaves differently from the other
+        // is how the two drift.
+        match UnparsedPublicKey::new(&ED25519, &self.pubkey).verify(&msg, &sig) {
+            Ok(()) => self.routes.clone(),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Verify against the live link's channel binding `cb`. On success returns the
@@ -359,6 +483,90 @@ pub fn unb64(s: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signed_routes_survive_roundtrip_and_resist_the_attacks_they_exist_for() {
+        let id = ident();
+        let cb = b"channel-binding-A";
+        let routes = vec!["10.0.0.0/24".to_string(), "192.168.5.0/24".to_string()];
+
+        let a = id.announce_with_routes(7, cb, routes.clone());
+        // Survives the JSON hop the wire actually uses.
+        let a = Announce::from_json(&a.to_json()).unwrap();
+        assert_eq!(a.verify_routes(cb), routes, "honest advertisement verifies");
+        assert!(a.verify(cb).is_ok(), "and the announce itself still verifies");
+
+        // WRONG LINK. A route set captured on one channel must not apply to
+        // another, or a relay could replay it onto a different link.
+        assert!(a.verify_routes(b"channel-binding-B").is_empty(), "cb is bound");
+
+        // TAMPERED SET. Adding a prefix invalidates the signature, so a peer
+        // cannot be made to advertise something it did not.
+        let mut t = a.clone();
+        t.routes.push("172.16.0.0/12".into());
+        assert!(t.verify_routes(cb).is_empty(), "added prefix is rejected");
+
+        // REMOVED prefix is equally a different set, so a tamperer cannot
+        // silently narrow someone's advertisement either.
+        let mut t2 = a.clone();
+        t2.routes.pop();
+        assert!(t2.verify_routes(cb).is_empty(), "altered set is rejected");
+
+        // RESURRECTION. The seq binding is the point: a route set signed for
+        // announce 7 must not be splicable onto announce 8, which is how a
+        // WITHDRAWN prefix would otherwise come back while its grant is still
+        // valid.
+        let mut later = id.announce(8, cb);
+        later.routes = a.routes.clone();
+        later.routes_sig = a.routes_sig;
+        assert!(later.verify_routes(cb).is_empty(), "route set is bound to its seq");
+
+        // Routes with no signature are not a claim.
+        let mut unsigned = a.clone();
+        unsigned.routes_sig = None;
+        assert!(unsigned.verify_routes(cb).is_empty(), "unsigned routes are ignored");
+    }
+
+    #[test]
+    fn routes_never_invalidate_the_address_and_older_peers_are_unaffected() {
+        let id = ident();
+        let cb = b"cb";
+
+        // A CORRUPT route signature must not cost the peer its address. The
+        // address is self-certifying and still good; failing the whole announce
+        // would let a tamperer knock a peer off the overlay by corrupting a
+        // field that only ever ADDS routes.
+        let mut a = id.announce_with_routes(3, cb, vec!["10.0.0.0/24".into()]);
+        a.routes_sig = Some([0u8; 64]);
+        assert!(a.verify(cb).is_ok(), "address still verifies");
+        assert!(a.verify_routes(cb).is_empty(), "but no routes are taken");
+
+        // OLDER PEER: no routes keys at all. The base announce must verify
+        // exactly as before, which is why routes got their own signature instead
+        // of joining bind_message.
+        let plain = id.announce(4, cb);
+        let mut j = plain.to_json();
+        j.as_object_mut().unwrap().remove("routes");
+        j.as_object_mut().unwrap().remove("routes_sig");
+        let parsed = Announce::from_json(&j).unwrap();
+        assert!(parsed.verify(cb).is_ok(), "old-shape announce still verifies");
+        assert!(parsed.verify_routes(cb).is_empty(), "and advertises nothing");
+    }
+
+    #[test]
+    fn route_list_is_length_prefixed_so_two_sets_cannot_share_a_signature() {
+        // Plain concatenation would make ["10.0.0.0/2","4"] and ["10.0.0.0/24"]
+        // identical bytes, so one signature would authenticate both.
+        let pk = [1u8; 32];
+        let a = routes_message(&pk, 1, b"cb", &["10.0.0.0/2".into(), "4".into()]);
+        let b = routes_message(&pk, 1, b"cb", &["10.0.0.0/24".into()]);
+        assert_ne!(a, b, "split must not collide with joined");
+
+        // The channel binding is length-prefixed for the same reason.
+        let c = routes_message(&pk, 1, b"cbX", &["10.0.0.0/24".into()]);
+        let d = routes_message(&pk, 1, b"cb", &["X10.0.0.0/24".into()]);
+        assert_ne!(c, d, "cb boundary must not be ambiguous");
+    }
+
 
     // ---- announce sequence: replay rejection AND restart survival ----------
     //

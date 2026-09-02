@@ -208,6 +208,26 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Withdraw a route previously installed by `add_route`.
+///
+/// A route that is already gone is SUCCESS, not an error: reconciliation runs on
+/// every advertisement, and a peer that withdraws a prefix twice must not turn
+/// into a stream of failures.
+pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
+    let fam = if cidr.contains(':') { "-inet6" } else { "-inet" };
+    let out = std::process::Command::new("route")
+        .args(["-q", "-n", "delete", fam, cidr, "-interface", dev])
+        .output()
+        .context("exec route delete")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.contains("not in table") && !err.contains("No such process") {
+            bail!("route delete {cidr} -interface {dev}: {}", err.trim());
+        }
+    }
+    Ok(())
+}
+
 /// Assign an ADDITIONAL (alias) address `cidr` to `dev` (the node's v4 overlay
 /// address alongside the primary v6 ULA). Best-effort second family for the dual-
 /// stack overlay; an already-present alias is treated as success.

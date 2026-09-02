@@ -180,6 +180,31 @@ pub fn add_route(cidr: &str, dev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Withdraw a route previously installed by `add_route`.
+///
+/// A route that is already gone is SUCCESS, not an error: reconciliation runs on
+/// every advertisement, and a peer that withdraws a prefix twice must not turn
+/// into a stream of failures.
+pub fn del_route(cidr: &str, dev: &str) -> Result<()> {
+    let proto = if cidr.contains(':') { "ipv6" } else { "ipv4" };
+    let out = std::process::Command::new("netsh")
+        .args(["interface", proto, "delete", "route", cidr, &format!("interface={dev}")])
+        .output()
+        .context("exec netsh delete route")?;
+    if !out.status.success() {
+        // netsh writes diagnostics to stdout, so check both streams.
+        let msg = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !msg.contains("Element not found") && !msg.contains("not found") {
+            bail!("netsh {proto} delete route {cidr}: {}", msg.trim());
+        }
+    }
+    Ok(())
+}
+
 /// Assign an ADDITIONAL address `cidr` to `dev` (the node's v4 overlay address
 /// alongside the primary v6 ULA). `set` first (idempotent for an existing adapter),
 /// then `add`, mirroring `open`.

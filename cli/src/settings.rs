@@ -167,6 +167,53 @@ pub fn registry() -> &'static [Setting] {
             daemon: false,
             help: "Allow-list (closed set): only these interfaces or subnets are eligible. Complements avoid — setting either replaces the membership config.",
         },
+        // Subnet routing. Two settings because advertising and accepting are
+        // different trust decisions made by different people: the router's owner
+        // decides what to offer, and each peer's owner decides whether to believe
+        // it. Collapsing them into one flag would make believing automatic.
+        Setting {
+            key: "advertise-routes",
+            aliases: &["advertise"],
+            store: "advertise-routes",
+            kind: Kind::List,
+            default: "",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "CIDRs this machine can reach and offers to carry for peers (a subnet router). Reaching a LAN needs this on the machine that sits on it; peers additionally need accept-routes for this device.",
+        },
+        Setting {
+            key: "route-snat",
+            aliases: &["masquerade"],
+            kind: Kind::Bool,
+            store: "route-snat",
+            // ON by default: a LAN host replying to an overlay address it has no
+            // route for is the common case, and without masquerading the reply is
+            // simply lost. Off is correct only when the LAN routes back to the
+            // overlay, which is the rarer, deliberate setup.
+            default: "on",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "Masquerade forwarded subnet traffic as this machine, so LAN hosts can reply without a route back to the overlay. Turn off only if the LAN already routes to your overlay range.",
+        },
+        Setting {
+            key: "accept-routes",
+            aliases: &["accept"],
+            store: "accept-routes",
+            kind: Kind::Bool,
+            // DEFAULT OFF, and this is the security property, not a preference.
+            // An overlay ADDRESS is self-certifying: it derives from the peer's
+            // key, so an announce proves it. A PREFIX does not derive from any
+            // key, so "I can reach 10.0.0.0/24" is an unbacked claim, and any
+            // peer could otherwise claim to be the path to your bank. Off until
+            // a human says otherwise, per device.
+            default: "off",
+            scope: ScopeKind::GlobalOrPeer,
+            env: None,
+            daemon: true,
+            help: "Install subnet routes advertised by a device. OFF by default: a prefix is a claim about what someone can reach, and unlike an overlay address it is not provable from their key. Scope it per device with --peer.",
+        },
         Setting {
             key: "auto-extract",
             aliases: &["extract", "unzip"],

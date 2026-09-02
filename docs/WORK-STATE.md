@@ -1828,3 +1828,48 @@ amendment section in `docs/design-mesh-network.md`. Proof:
 3. **L3-over-relay performance.** The DataChannel is reliable and ordered, so the
    tunnel head-of-line blocks and shares the channel with file transfer. Fine as
    a fallback, worth a second unreliable channel if it ever carries real load.
+
+## 2026-09-01: subnet routes proven between two real machines
+
+`experiments/subnet-route-e2e.sh` runs the feature between do-vm and a KVM VPS
+(interserver-0x0) over the real internet, and it now passes end to end.
+
+**Result.** Two phases, identical in every respect except the owner-signed
+invitation ceiling:
+
+    ceiling transfer,mount        -> refused,   10.66.0.5 UNREACHABLE
+    ceiling transfer,mount,route  -> installed, 10.66.0.5 REACHABLE
+                                     (10.66.0.0/24 dev filament0)
+
+Both phases are in one run on purpose. Running only the success case would show
+that routes CAN install, not that authorization is what permits them; an
+unconditional `return true` would pass that test just as well.
+
+**Six defects found, all by running it.** Five lived in the seam between two
+components that were individually correct and fully unit-tested, which is why
+the suite was green throughout. Full write-up in `docs/design-subnet-routes.md`;
+in short: the advertisement was never put on the wire; no kernel route was ever
+installed; `route` was missing from the invitation bitmask whose encoder
+silently collapsed the entire ceiling to empty; `mint_capability` was a second
+hardcoded capability list; enforcement derived the owner key in a way that
+returns `None` on exactly the devices the feature is for; and the ceiling was
+read from a link principal that only carries caps on the first join.
+
+**Rig notes worth keeping.** `l3::ifname()` is a hardcoded const, so a second
+daemon on a host that already runs one cannot get a kernel TUN and silently
+degrades to the userspace overlay, which installs no kernel routes. Each test
+daemon therefore runs in its own network namespace. Test daemons must be killed
+by EXECUTABLE, not by config dir: `FILAMENT_CONFIG_DIR` is an env var and never
+appears in `/proc/<pid>/cmdline`, so three leaked daemons piled up before a
+"Text file busy" on rebuild gave it away. The rig pins its binary out of the
+shared `CARGO_TARGET_DIR` and asserts its hash.
+
+**Verification.** cli 401 tests pass, filament-cap 97 pass, warning ratchet 116
+against a baseline of 116. The release binary that produced the green run is
+byte-identical (`58e9123b3d13db9da16a`) to a rebuild of the committed tree.
+
+**Open decision for the owner.** A ceiling records an ACTION and no resource, so
+`route` in a ceiling authorizes any prefix that fleet member advertises,
+including `0.0.0.0/0`. It is bounded by `accept-routes` being off by default and
+per-peer settable. Narrowing to a per-prefix ceiling requires a v3 invitation
+token, since v2 encodes caps as an 8-bit mask with nowhere for a CIDR.

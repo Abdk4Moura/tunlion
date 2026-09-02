@@ -61,7 +61,16 @@ pub fn is_fleet_channel(ch: &str) -> bool {
 /// certificate, then hand both to the crate to assemble.
 pub fn make_hello(cb: &[u8], name: &str) -> Result<Value> {
     let id = crate::overlay::load_identity()?;
-    let ann = id.announce(crate::overlay::next_announce_seq(), cb);
+    // Same reason as L3::make_announce: `announce` carries no routes, so a
+    // fleet hello from a subnet router advertised nothing. Both announce paths
+    // have to carry them, since either one may be the first the peer sees.
+    let seq = crate::overlay::next_announce_seq();
+    let routes = crate::l3::advertised_prefixes();
+    let ann = if routes.is_empty() {
+        id.announce(seq, cb)
+    } else {
+        id.announce_with_routes(seq, cb, routes)
+    };
     let cert = crate::local_device_cert()
         .ok_or_else(|| anyhow!("this device holds no certificate to present"))?;
     Ok(filament_fleet::build_hello(&ann, &cert, name))

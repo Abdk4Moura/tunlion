@@ -18,6 +18,7 @@
 mod codeentry;
 mod armed;
 mod ctl;
+mod subnet_forward;
 mod diag;
 use filament_transport::direct;
 mod doctor;
@@ -1035,7 +1036,7 @@ enum Cmd {
     Grant {
         /// Known device (petname), or omit with --tag
         device: String,
-        /// Capability to grant (e.g. `shell`)
+        /// Capability to grant (e.g. `shell`, or `route:10.0.0.0/24`)
         capability: String,
         /// Target a tag instead of a device
         #[arg(long)]
@@ -5031,13 +5032,42 @@ fn mint_capability(raw: &str) -> Result<String> {
     match raw {
         "send" => Ok("transfer".to_string()),
         "write" => Ok("mount".to_string()),
-        "shell" | "mount" | "all-ports" | "transfer" => Ok(raw.to_string()),
+        // `all-ports` shapes an invitation, it is not a cap-store action, so it
+        // is deliberately absent from CANONICAL_CAPABILITIES and stays explicit.
+        "all-ports" => Ok(raw.to_string()),
         "reuse" => bail!("reuse is a lifetime option, not a capability"),
         "mesh" => {
             let (message, _) = fleet_ui::mint::err_mesh_not_grantable();
             bail!("{message}")
         }
-        other => bail!("unsupported capability '{other}'"),
+        // DERIVED from the canonical list, not a second hardcoded copy of it.
+        // This arm used to spell out shell|mount|transfer, so adding `route` to
+        // CANONICAL_CAPABILITIES left `add --allow route` rejecting a capability
+        // every other layer already accepted. The visible symptom was the CLI
+        // printing "re-invite with route in the invitation" as the remedy for a
+        // ceiling error and then refusing that exact command. Two lists that
+        // must agree, and only one of them was updated.
+        other if crate::capability::CANONICAL_CAPABILITIES.contains(&other) => {
+            Ok(other.to_string())
+        }
+        other => bail!(
+            "unsupported capability '{other}' (valid: {}, all-ports)",
+            crate::capability::CANONICAL_CAPABILITIES.join(", ")
+        ),
+    }
+}
+
+#[test]
+fn every_canonical_capability_is_mintable_in_an_invitation() {
+    // The ceiling vocabulary and the cap-store vocabulary are the same
+    // vocabulary. If a capability can be granted but cannot be written into the
+    // invitation that bounds it, no joined device can ever legitimately hold it.
+    for cap in crate::capability::CANONICAL_CAPABILITIES {
+        assert_eq!(
+            mint_capability(cap).ok().as_deref(),
+            Some(*cap),
+            "`add --allow {cap}` is rejected, so no invitation can ever confer it"
+        );
     }
 }
 
@@ -6703,6 +6733,11 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
         let n = interrupted.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
+            // Remove any subnet-router forwarding rules this process installed.
+            // A FORWARD ACCEPT that outlives the daemon keeps the machine
+            // forwarding for an overlay that is gone, and nothing would report
+            // it.
+            subnet_forward::cleanup();
             n.notify_one();
         });
     }
@@ -9315,6 +9350,23 @@ struct DirectPending {
 /// owner-equivalence, the escalation `adopt_direct` fail-safes against and whose
 /// comment records a REVOKED device delivering a file. `None` keeps the old
 /// default, since it means the link vanished and that is a separate question.
+/// The owner public key that names this machine's resources.
+///
+/// Prefers the local user key (an owner device holds one), and falls back to the
+/// `user_pub` inside this device's own certificate (a joined device does not).
+/// Both are the SAME key: a device certificate is signed by the owner, and
+/// carries the owner's public half. Using only the first is a bug that silently
+/// disables capability resources on every fleet member.
+fn owner_pub_for_resources() -> Option<[u8; 32]> {
+    if let Ok(Some(k)) = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+        return Some(k.public_key_bytes());
+    }
+    let raw = std::fs::read_to_string(local_device_cert_path()).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let cert = crate::identity::DeviceCert::from_json(&record["cert"])?;
+    Some(cert.user_pub)
+}
+
 fn upgrade_principal(
     carried: &Option<(bool, crate::capability::PrincipalKind)>,
 ) -> (bool, crate::capability::PrincipalKind) {
@@ -13730,16 +13782,24 @@ async fn main() -> Result<()> {
             doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
         }
         Cmd::Grant { device, capability, tag } => {
-            let capability = crate::capability::canonical_capability(&capability)?;
+            // The owner key resolves the RESOURCE, so it is needed before the
+            // capability name is final: `route:10.0.0.0/24` names an owner-bound
+            // resource, while `shell` names "self".
+            let spec = capability;
             let config_dir = crate::settings::config_dir();
             let mut store = crate::capability::load_cap_store(&config_dir);
 
             if let Some(ref t) = tag {
                 // Grant to tag
+                // The tag path SIGNS the CapOp below with the owner keypair, so
+                // unlike the device path it genuinely needs the signing key, not
+                // just the public half. Keep requiring a full identity here.
                 let Some(user_key) = load_owner_key() else {
                     bail!("identity not initialized");
                 };
                 let pk = user_key.public_key_bytes();
+                let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                let (capability, resource) = (g.action.clone(), g.resource.clone());
                 let target_bytes = crate::capability::make_tag_target(&pk, t);
                 let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
                 let mut op = crate::capability::CapOp {
@@ -13747,7 +13807,7 @@ async fn main() -> Result<()> {
                     grantor: pk,
                     target_kind: 0x03,
                     target: target_bytes,
-                    resource: "self".to_string(),
+                    resource: resource.clone(),
                     permissions: vec![capability.clone()],
                     expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
                     issued_at: crate::capability::now_secs(),
@@ -13761,13 +13821,74 @@ async fn main() -> Result<()> {
                 println!("granted '{capability}' to tag '{t}'.");
                 return Ok(());
             }
-            // Original device grant path (unchanged)
+            // Device path. The owner PUBLIC key is needed up front for the same
+            // reason as the tag path: it resolves a `route:CIDR` spec to its
+            // owner-bound resource id.
+            //
+            // The SIGNING key, deliberately. Naming the resource would only need
+            // the public half, but the grant below is issued as an owner-signed
+            // CapOp, and a joined device cannot mint one. That restriction is the
+            // security model rather than an oversight: if a fleet member could
+            // sign its own route authorization, any member could authorize any
+            // prefix for itself and the capability would gate nothing.
+            //
+            // Verification is the asymmetric half and needs only the public key,
+            // which is why enforcement uses owner_pub_for_resources() and this
+            // does not. What WAS wrong here is the diagnosis printed on failure:
+            // a joined device has an identity, so "Run `filament init` first" is
+            // both false and unactionable. See the error below.
+            let owner_pk = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
+                .ok()
+                .flatten()
+                .map(|k| k.public_key_bytes());
+            let (capability, cap_resource, cap_nonce) = match owner_pk {
+                Some(pk) => {
+                    let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                    (g.action, g.resource, g.nonce)
+                }
+                None => {
+                    // No identity: only the legacy self-scoped verbs are possible.
+                    if spec.contains(':') {
+                        // Distinguish "no identity at all" from "an identity that
+                        // cannot sign". Telling a joined device to run `init` is
+                        // wrong twice over: it already has an identity, and init
+                        // is not what would make this work.
+                        if owner_pub_for_resources().is_some() {
+                            bail!(
+                                "'{spec}' must be granted by the fleet owner. This is a joined device, \
+                                 which holds no owner signing key and so cannot issue an owner-signed \
+                                 grant. Run this on the owner's machine:\n  filament grant {device} {spec}"
+                            );
+                        }
+                        bail!(
+                            "'{spec}' names a resource, which needs an identity to bind it to. Run `filament init` first."
+                        );
+                    }
+                    (
+                        crate::capability::canonical_capability(&spec)?,
+                        "self".to_string(),
+                        crate::capability::self_resource_nonce(),
+                    )
+                }
+            };
+
             // A delegated device's authority comes from its enrollment ceiling,
             // which enforcement reads from its fleet certificate; a grant targets
             // a key the device never presents, so it cannot bind. Refuse rather
             // than report a success enforcement will not honour.
             if let Some(ceiling) = principal_ceiling_for(&device) {
-                if ceiling.iter().any(|c| c == &capability) {
+                // A ceiling records an ACTION and nothing else. It has no
+                // resource dimension, so it cannot express WHICH prefix a router
+                // may advertise: `route` in a ceiling means "may carry routes",
+                // not "may carry 10.66.0.0/24". A resource-scoped grant is
+                // therefore strictly NARROWER than the ceiling entry, not
+                // redundant with it, and refusing it as redundant left the
+                // prefix permanently unauthorized: the ceiling satisfied this
+                // check while enforcement, which asks about the prefix-bound
+                // resource id, still found nothing and declined every route.
+                // Only a bare, self-scoped grant can be genuinely redundant.
+                let resource_scoped = cap_resource != "self";
+                if !resource_scoped && ceiling.iter().any(|c| c == &capability) {
                     bail!(
                         "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
                     );
@@ -13784,15 +13905,22 @@ async fn main() -> Result<()> {
                 let mut store = crate::capability::load_cap_store(&config_dir);
                 let pk = user_key.public_key_bytes();
 
-                // Ensure a genesis header exists for resource "self"
+                // Ensure a genesis header exists for the resource being granted.
+                // Keyed by the RESOURCE, so a route prefix gets its own header
+                // rather than riding on "self": each prefix is a distinct
+                // resource with its own succession, which is what lets one
+                // prefix be revoked without touching another.
                 let has_header = store.iter().any(|e| {
                     e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                        && e["resource"].as_str() == Some("self")
+                        && e["resource"].as_str() == Some(cap_resource.as_str())
                 });
                 if !has_header {
                     let pk = user_key.public_key_bytes();
-                    let nonce = crate::capability::self_resource_nonce();
-                    let resource = crate::capability::self_resource_id(&pk);
+                    // The nonce must match the one the resource id was derived
+                    // from, or the header does not describe the resource it is
+                    // filed under.
+                    let nonce = cap_nonce;
+                    let resource = cap_resource.clone();
                     let mut hdr = crate::capability::CapHeader {
                         resource,
                         epoch: 0,
@@ -13813,7 +13941,7 @@ async fn main() -> Result<()> {
                     // the grant-creation path, not the authorize path). Consistent with
                     // Cmd::Grant which does the same. The header is trusted local state
                     // in the owner's own caps.json, not a cross-verified object.
-                    hdr_json["resource"] = serde_json::json!("self");
+                    hdr_json["resource"] = serde_json::json!(cap_resource.clone());
                     store.push(hdr_json);
                 }
 
@@ -13855,7 +13983,7 @@ async fn main() -> Result<()> {
                     grantor: pk,
                     target_kind: 0x00, // User
                     target: target_arr,
-                    resource: "self".to_string(),
+                    resource: cap_resource.clone(),
                     permissions: vec![capability.clone()],
                     expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
                     issued_at: crate::capability::now_secs(),
@@ -17284,6 +17412,41 @@ async fn recv_cmd(
                     match l3::L3::start(&cidr, 1280, identity, mode) {
                         Ok(m) => {
                             let addr = m.my_addr().map(|a| a.to_string()).unwrap_or(cidr);
+
+                            // Subnet router: if this machine offers prefixes, make
+                            // the kernel actually carry them. Only in kernel-TUN
+                            // mode, because userspace has no kernel route to
+                            // forward FROM, and saying "routing" while forwarding
+                            // nothing is the failure this whole module is written
+                            // against.
+                            // Same reader the announce paths use, so what the
+                            // kernel is told to forward and what the wire
+                            // advertises cannot diverge.
+                            let advertised: Vec<String> = crate::l3::advertised_prefixes();
+                            if !advertised.is_empty() {
+                                if m.is_userspace() {
+                                    ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                                        "  advertise-routes is set ({}) but L3 is in userspace mode; a subnet router needs the kernel TUN, so nothing is being carried",
+                                        advertised.join(", ")
+                                    )));
+                                } else {
+                                    let snat = settings::get_bool("route-snat", None);
+                                    match subnet_forward::enable(l3::ifname(), &advertised, snat) {
+                                        Ok(_applied) => ui::say(&format!(
+                                            "  {} carrying {} for peers{}",
+                                            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                            advertised.join(", "),
+                                            if snat { " (masqueraded)" } else { "" }
+                                        )),
+                                        // LOUD, not swallowed: a router that cannot
+                                        // forward must not look like one that can.
+                                        Err(e) => ui::say(&ui::paint(ui::Tone::Err, &format!(
+                                            "  cannot carry {}: {e}",
+                                            advertised.join(", ")
+                                        ))),
+                                    }
+                                }
+                            }
                             if m.is_userspace() {
                                 ui::say(&format!(
                                     "  {} L3 overlay {} (userspace, zero privilege)",
@@ -19654,9 +19817,157 @@ async fn recv_cmd(
                                                 ));
                                                 continue;
                                             }
-                                            l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t).await;
+                                            l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone()).await;
                                             ui::say(&format!("  {} L3 peer {who}.mesh ({ip} / {v4})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                                             devices_touch(&who, Some(ip), Some(v4));
+
+                                            // Subnet routes, after the peer is on
+                                            // the overlay. Three conditions, in
+                                            // increasing cost: the advertisement
+                                            // must be SIGNED (verify_routes, which
+                                            // also covers seq so a withdrawn prefix
+                                            // cannot be resurrected), this machine
+                                            // must ACCEPT routes from this device,
+                                            // and the owner must have GRANTED each
+                                            // prefix by name.
+                                            let advertised = ann.verify_routes(&cb);
+                                            if !advertised.is_empty() {
+                                                let accept = crate::settings::get_str(
+                                                    "accept-routes",
+                                                    Some(&who),
+                                                )
+                                                .map(|v| v == "on" || v == "true")
+                                                .unwrap_or(false);
+                                                let config_dir = crate::settings::config_dir();
+                                                // The OWNER's public key, which is
+                                                // not the same as holding the
+                                                // owner's signing key.
+                                                //
+                                                // FOUND BY RUNNING IT, not by a
+                                                // test: `UserKey::load` returns
+                                                // None on a JOINED device, because
+                                                // a fleet member has no user
+                                                // signing key. Deriving the
+                                                // resource from it therefore made
+                                                // every fleet member refuse every
+                                                // route, which is precisely the
+                                                // population subnet routes exist
+                                                // for. The owner's PUBLIC key is
+                                                // carried in the device's own
+                                                // certificate, which the owner
+                                                // signed, so a joined device knows
+                                                // it without holding anything
+                                                // secret.
+                                                let owner_pk = owner_pub_for_resources();
+                                                let idev = conn
+                                                    .link(&pid)
+                                                    .and_then(|l| l.identity_device_pub);
+                                                let iusr = conn
+                                                    .link(&pid)
+                                                    .and_then(|l| l.identity_user_pub);
+                                                // A DELEGATED principal's authority
+                                                // is its enrollment ceiling, which
+                                                // the owner signed inside the
+                                                // invitation and enrollment
+                                                // verified. That is the same source
+                                                // transfer and mount are authorized
+                                                // from, so route reads it too.
+                                                //
+                                                // Why it is needed at all: no grant
+                                                // can bind to a fleet member (a
+                                                // CapOp targets the owner user key
+                                                // that every member presents, so it
+                                                // cannot name one device), which is
+                                                // why `grant` refuses outright. With
+                                                // only the cap-store path, a router
+                                                // that is a fleet member could never
+                                                // be authorized by any route at all.
+                                                //
+                                                // KNOWN COARSENESS, deliberately
+                                                // recorded rather than hidden: a
+                                                // ceiling carries an ACTION and no
+                                                // resource, so `route` in a ceiling
+                                                // authorizes ANY prefix that member
+                                                // advertises, including 0.0.0.0/0.
+                                                // It is bounded by accept-routes
+                                                // being off by default and settable
+                                                // per peer, so nothing installs
+                                                // without the receiver opting in.
+                                                // Narrowing it to a per-prefix
+                                                // ceiling needs a v3 invitation
+                                                // token, since v2 encodes caps as an
+                                                // 8-bit mask with nowhere to put a
+                                                // CIDR. See docs/design-subnet-routes.md.
+                                                // Read the ceiling from the PERSISTED
+                                                // record, not from the link's
+                                                // principal. Which admission path ran
+                                                // decides what the link says: a peer
+                                                // that reconnects through fleet-hello
+                                                // is admitted by admit_fleet as
+                                                // FleetDevice, which carries no caps
+                                                // at all, while only a fresh
+                                                // enrollment produces Delegated{caps}.
+                                                // Matching on Delegated therefore
+                                                // worked exactly once per join and
+                                                // silently stopped after the first
+                                                // reconnect. The stored ceiling is the
+                                                // same source `devices` renders and
+                                                // `grant` consults, so all three agree
+                                                // by construction.
+                                                let delegated_route = principal_ceiling_for(&who)
+                                                    .map(|c| {
+                                                        c.iter().any(|x| {
+                                                            x.as_str() == crate::capability::CAP_ROUTE
+                                                        })
+                                                    })
+                                                    .unwrap_or(false);
+                                                let ok = crate::l3::installable_routes(
+                                                    &advertised,
+                                                    accept,
+                                                    |cidr| {
+                                                        if delegated_route { return true; }
+                                                        let Some(pk) = owner_pk else { return false };
+                                                        let Ok(res) =
+                                                            crate::capability::route_resource_id(
+                                                                &pk, cidr,
+                                                            )
+                                                        else {
+                                                            return false;
+                                                        };
+                                                        matches!(
+                                                            crate::capability::cap_authorize(
+                                                                &config_dir,
+                                                                &res,
+                                                                crate::capability::CAP_ROUTE,
+                                                                idev.as_ref(),
+                                                                iusr.as_ref(),
+                                                                None,
+                                                            ),
+                                                            crate::capability::CapOutcome::Authorized
+                                                        )
+                                                    },
+                                                );
+                                                let declined = advertised.len() - ok.len();
+                                                if declined > 0 {
+                                                    // Say so rather than silently
+                                                    // dropping: an advertisement
+                                                    // that vanishes without a word
+                                                    // is indistinguishable from one
+                                                    // that was never sent.
+                                                    ui::debug(&format!(
+                                                        "  {declined} of {} route(s) from {who} not installed (accept-routes={accept}, or not granted)",
+                                                        advertised.len()
+                                                    ));
+                                                }
+                                                if !ok.is_empty() {
+                                                    l3.set_peer_subnets(&pid, &t, &ok).await;
+                                                    ui::say(&format!(
+                                                        "  {} routes via {who}: {}",
+                                                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                        ok.join(", ")
+                                                    ));
+                                                }
+                                            }
                                         }
                                         Err(e) => ui::debug(&ui::paint(ui::Tone::Warn, &format!("  L3 announce rejected: {e}"))),
                                     },

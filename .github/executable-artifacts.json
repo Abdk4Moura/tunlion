@@ -4,9 +4,9 @@
     {
       "path": "cli/tests/ack-loss-repro.sh",
       "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/133",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/294",
       "owner": "chief-ux",
-      "expires": "2026-09-01"
+      "expires": "2026-10-15"
     },
     {
       "path": "cli/tests/cap-verbs-gates.sh",
