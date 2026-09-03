@@ -172,3 +172,117 @@ two phases is the owner-signed ceiling.
 
     ceiling without route:  refused, LAN unreachable
     ceiling with route:     10.66.0.0/24 dev filament0, LAN REACHABLE
+
+## Exit nodes (2026-09-02): the plan, and why only the guard is landed
+
+An exit node is a subnet router advertising a default route, so the wire
+protocol, the capability, the ceiling and the forwarding are already done. The
+ADVERTISING side works today: set `advertise-routes 0.0.0.0/0` and the router
+masquerades and forwards exactly as it does for a LAN prefix.
+
+Accepting one is a different problem. `10.66.0.0/24 dev filament0` is additive.
+`0.0.0.0/0 dev filament0` captures every packet the machine sends, including the
+ones carrying the overlay. Installed into the main table it routes the tunnel
+through the tunnel: the link dies, the route is withdrawn, the link returns, and
+the machine oscillates. The first packet lost is usually the one to the
+signaling server, so the node cannot even be told to stop.
+
+### The plan
+
+Put the default route in a dedicated table (51820) with a rule at priority 5182,
+above the main-table rule, and carve the untouchable traffic back out by longest
+prefix INSIDE that table. Carve-outs belong in the table rather than as
+higher-priority rules so that tearing the table down removes them too; a
+carve-out that outlives its default route is a silent hole in the user's routing.
+
+Carved out, each mandatory rather than tidy:
+
+- **the peer's own underlay address**, or the tunnel runs through the tunnel.
+- **the signaling server**, or the node cannot renegotiate, cannot be told to
+  stop, and cannot recover by itself.
+- **loopback and link-local**, which were never ours to capture.
+- **RFC1918 by default.** An exit node is for reaching the internet. Silently
+  capturing the LAN breaks printers and NAS boxes with no symptom other than
+  "the network broke when I turned this on". A subnet route deliberately
+  advertised for a LAN prefix still wins inside the table by being longer.
+
+Two ordering constraints make partial states safe. On the way IN, carve-outs are
+installed before the default route: a crash then leaves a table of exceptions,
+which is harmless, rather than a table containing only a trap. On the way OUT,
+the rule is deleted before the table is flushed: while the rule exists a
+consulted-but-empty table black-holes instead of falling through.
+
+### What is landed, and what blocks the rest
+
+Landed and wired: detection, plus a guard in `L3::sync_kernel_subnets` that
+refuses a peer's default route out loud instead of installing it. That guard
+fixes a real hazard introduced when subnet routes landed, because until now a
+peer advertising `0.0.0.0/0` to a node with `accept-routes` on would have had it
+written straight into the main table.
+
+Not landed: the planner. The carve-out for the peer needs its underlay address
+and `net::Transport` has no endpoint accessor, so the code would have been
+correct, tested, and called by nothing. This repository has already been burned
+by exactly that (the WireGuard L3 module: declared, zero callers, described in
+the roadmap as ready), and the artifact registry's own rule is that the unwired
+set may only shrink. Adding `Transport::remote_endpoint` is the next step, and
+the plan above is the specification for what to wire to it.
+
+## Exit nodes: working, measured on two machines (2026-09-03)
+
+`experiments/exit-node-e2e.sh` measures the only thing that settles it, the public
+address the receiver presents to the world:
+
+    before:         165.22.207.231   (the receiver's own address)
+    with exit node: 162.35.114.254   (the router's address)
+
+Reproduced on three consecutive runs. The link carrying the route stays up
+throughout, which is the hard part.
+
+The receiver runs inside a network namespace while the control channel runs in
+the root namespace. That is not tidiness: a wrong default route disconnects the
+machine that installs it, and this arrangement means a failure costs a namespace
+rather than the box.
+
+### Corrections the rig forced, none of which a unit test could reach
+
+1. **`Transport::remote_addr` already existed.** An earlier note here claimed
+   exit nodes were blocked on adding it. That was wrong, and wrong in a specific
+   way worth naming: the trait was inspected with a line-range that stopped at
+   line 400, and the method is at 474. A blocker asserted from a truncated read.
+2. **IPv6 carve-outs killed every install.** `signaling_addrs` returns AAAA
+   records too, and `ip route ... via <v4 gateway>` rejects a v6 destination
+   ("inet6 address is expected"). An IPv4 default route never captures v6
+   traffic, so those carve-outs were both impossible and unnecessary.
+3. **The router masqueraded to loopback.** `egress_for` asked
+   `ip route get 0.0.0.0`, which answers `local 0.0.0.0 dev lo`, because 0.0.0.0
+   is a local special address and not a destination. The receiver's policy
+   routing was perfect and the packets went nowhere. A default route must probe
+   a routable address to learn which interface reaches the internet.
+4. **Clearing a list setting was refused.** `set advertise-routes ''` failed with
+   "needs a comma-separated list", so a node could start carrying its peers'
+   traffic with no supported way to stop.
+5. **An empty advertisement was treated as nothing to do.** Both the outer and
+   inner guards skipped the block when a peer advertised no routes, but
+   `set_peer_subnets` is a full restatement, so an empty set is precisely how a
+   WITHDRAWAL is applied. A withdrawn route stayed installed forever.
+
+### Withdrawal and dead links (closed)
+
+The exit route is now torn down both when a peer WITHDRAWS it and when the link
+carrying it DIES, and the difference matters: a withdrawal arrives as an
+announce, and a dead peer sends nothing at all. An announce-driven reconciler is
+deaf to exactly the event it most needs to hear, so reconciliation also runs on a
+15s timer.
+
+Liveness is applied to default routes ONLY, deliberately. A stale subnet route is
+a nuisance, packets for one prefix go nowhere until the link returns, and links
+drop and re-establish constantly, so evicting on every transient drop would churn
+the table for no gain. A stale default route is a disconnected machine, because
+it captures everything, so it must not outlive its link even briefly.
+
+Measured end to end, the full cycle:
+
+    before:           165.22.207.231
+    with exit node:   162.35.114.254
+    after withdrawal: 165.22.207.231

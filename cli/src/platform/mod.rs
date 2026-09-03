@@ -1298,3 +1298,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work);
     }
 }
+
+/// Policy routing for exit nodes, kept behind the platform adapter so the rest
+/// of the tree stays free of `cfg(target_os)`.
+///
+/// The exit-node design (docs/design-subnet-routes.md) is expressed in iproute2
+/// terms: a dedicated table, a rule, and carve-outs. That vocabulary is Linux's.
+/// macOS and Windows have policy routing, but neither speaks these commands, so
+/// the honest portable contract is "supported, or say so", not a silent no-op
+/// that would leave a caller believing traffic is tunnelled when it is not.
+pub mod policy_route {
+    /// Whether this platform can install the exit-route policy at all.
+    pub fn supported() -> bool {
+        cfg!(target_os = "linux")
+    }
+
+    /// The current default gateway, if one can be determined.
+    pub fn default_gateway() -> Option<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let out = std::process::Command::new("ip")
+                .args(["-4", "route", "show", "default"])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut fields = text.split_whitespace();
+            while let Some(f) = fields.next() {
+                if f == "via" {
+                    return fields.next().map(str::to_string);
+                }
+            }
+            None
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Run one `ip` plan produced by `exit_route`.
+    ///
+    /// Every step is attempted even after one fails, because a partly-applied
+    /// plan whose CARVE-OUTS succeeded is strictly safer than one abandoned
+    /// after the default route went in. Deleting something already absent is
+    /// success, not failure: reconciliation is repeated and idempotent.
+    pub fn run_plan(plan: &[Vec<String>]) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut failures = Vec::new();
+            for step in plan {
+                match std::process::Command::new("ip").args(step).output() {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        if !err.contains("No such process") && !err.contains("not found") {
+                            failures.push(format!("ip {}: {err}", step.join(" ")));
+                        }
+                    }
+                    Err(e) => failures.push(format!("ip {}: {e}", step.join(" "))),
+                }
+            }
+            return if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = plan;
+            Err("policy routing is implemented for Linux only".to_string())
+        }
+    }
+}

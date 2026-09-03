@@ -44,6 +44,27 @@ fn run(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The address to ask the routing table about, for a given advertised prefix.
+///
+/// Normally the network address of the prefix. NOT for a DEFAULT route: asking
+/// `ip route get 0.0.0.0` answers `local 0.0.0.0 dev lo`, because 0.0.0.0 is a
+/// local special address rather than a destination. An exit node built on that
+/// answer masquerades to LOOPBACK and forwards nothing, which is exactly how it
+/// failed the first time it was run: the policy routing on the receiver was
+/// correct, the route installed, and the packets went nowhere.
+///
+/// For a default route the question we actually mean is "which interface
+/// reaches the internet", so probe a routable public address.
+pub fn probe_addr_for(prefix: &str) -> String {
+    let net = prefix.split('/').next().unwrap_or(prefix);
+    let len = prefix.split('/').nth(1).and_then(|l| l.parse::<u8>().ok());
+    if len == Some(0) || net == "0.0.0.0" {
+        // Any routable public address; only the chosen INTERFACE is used.
+        return "1.1.1.1".to_string();
+    }
+    net.to_string()
+}
+
 /// Which interface this host would use to reach `addr`.
 ///
 /// Asked of the kernel rather than guessed from interface names: the operator
@@ -132,8 +153,7 @@ pub fn enable(tun: &str, prefixes: &[String], snat: bool) -> Result<Applied> {
     }
     let mut seen_lans: Vec<String> = Vec::new();
     for p in prefixes {
-        let addr = p.split('/').next().unwrap_or(p);
-        let lan = egress_for(addr)?;
+        let lan = egress_for(&probe_addr_for(p))?;
         if lan == tun {
             bail!("{p} routes back over the overlay itself; refusing to forward it into a loop");
         }
@@ -190,6 +210,17 @@ pub fn disable(applied: &Applied) {
 
 #[cfg(test)]
 mod tests {
+    use super::probe_addr_for;
+
+    /// `ip route get 0.0.0.0` answers "local ... dev lo", so an exit node built
+    /// on it masquerades to loopback and forwards nothing.
+    #[test]
+    fn a_default_route_probes_the_internet_not_the_unspecified_address() {
+        assert_eq!(probe_addr_for("0.0.0.0/0"), "1.1.1.1");
+        assert_eq!(probe_addr_for("10.66.0.0/24"), "10.66.0.0");
+        assert_eq!(probe_addr_for("192.168.1.0/24"), "192.168.1.0");
+    }
+
     use super::*;
 
     /// Real-kernel check, opt-in via FILAMENT_NETNS_RIG=1 because it needs root

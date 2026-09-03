@@ -154,6 +154,21 @@ impl UserKey {
         Ok(UserKey { keypair })
     }
 
+    /// Build a user key deterministically from a 32-byte seed, touching no
+    /// key store.
+    ///
+    /// This is the same derivation the recovery path performs once it has
+    /// turned a phrase into a seed; it is exposed so callers that must not
+    /// write to disk (tests, and any future in-memory ceremony) can hold an
+    /// identity without a `KeyStore`. It deliberately does NOT persist: a key
+    /// that is written is a key that must be zeroized and pathed, and that is
+    /// what `generate` and `recover` are for.
+    pub fn from_seed(seed: &[u8; 32]) -> Result<Self> {
+        let keypair = Ed25519KeyPair::from_seed_unchecked(seed)
+            .map_err(|_| anyhow!("failed to derive user identity key from seed"))?;
+        Ok(UserKey { keypair })
+    }
+
     pub fn public_key_bytes(&self) -> [u8; 32] {
         let mut buf = [0u8; 32];
         buf.copy_from_slice(self.keypair.public_key().as_ref());

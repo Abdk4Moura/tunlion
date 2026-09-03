@@ -164,6 +164,9 @@ pub struct L3 {
     /// rather than re-read from the kernel so filament only ever deletes routes
     /// it created, and never a route the operator put there.
     kernel_subnets: Mutex<std::collections::HashSet<String>>,
+    /// Whether the policy-routing exit route is currently in force, so it is
+    /// installed once and withdrawn exactly once.
+    exit_route_installed: Mutex<bool>,
     /// Highest announce sequence ACCEPTED from each peer identity, so a stale
     /// announce cannot roll an address back. Keyed by the announcing PUBKEY,
     /// not by pid: pid is a session artefact, and the signature binds the key.
@@ -239,6 +242,7 @@ impl L3 {
             by_pid: Mutex::new(HashMap::new()),
             identity,
             kernel_subnets: Mutex::new(std::collections::HashSet::new()),
+            exit_route_installed: Mutex::new(false),
             seen_seq: Mutex::new(HashMap::new()),
             names: Mutex::new(HashMap::new()),
             netstack,
@@ -522,6 +526,30 @@ impl L3 {
         self.routes.lock().await.subnets.iter().map(|(n, l, _)| (*n, *l)).collect()
     }
 
+    /// The underlay address of every transport currently carrying a DEFAULT
+    /// route, and whether any of them could not report one.
+    ///
+    /// `Transport::remote_addr` is `None` on a relay link, whose path is an ICE
+    /// candidate pair rather than a single UDP 5-tuple. Without an address there
+    /// is no carve-out, and without a carve-out the tunnel routes through
+    /// itself, so the caller must refuse rather than guess. The bool is that
+    /// signal, kept separate from an empty list because "no default routes" and
+    /// "a default route we cannot make safe" are opposite situations.
+    async fn default_route_underlay(&self) -> (Vec<IpAddr>, bool) {
+        let mut addrs = Vec::new();
+        let mut unknown = false;
+        for (net, len, t) in self.routes.lock().await.subnets.iter() {
+            if !crate::exit_route::is_default_route(*net, *len) {
+                continue;
+            }
+            match t.remote_addr() {
+                Some(sa) => addrs.push(sa.ip()),
+                None => unknown = true,
+            }
+        }
+        (addrs, unknown)
+    }
+
     pub async fn set_peer_subnets(
         &self,
         pid: &str,
@@ -552,6 +580,110 @@ impl L3 {
         self.sync_kernel_subnets().await;
     }
 
+    /// Of the advertised default routes, those whose transport is still alive.
+    ///
+    /// A default route pointing into a dead tunnel is indistinguishable from
+    /// having lost the internet, so a peer that has gone away must stop being an
+    /// exit node immediately rather than at the next announce, which by
+    /// definition never arrives from a peer that is gone.
+    async fn live_default_routes(&self, defaults: &[(IpAddr, u8)]) -> Vec<(IpAddr, u8)> {
+        if defaults.is_empty() {
+            return Vec::new();
+        }
+        let table = self.routes.lock().await;
+        defaults
+            .iter()
+            .filter(|(n, l)| {
+                table
+                    .subnets
+                    .iter()
+                    .any(|(sn, sl, t)| sn == n && sl == l && t.is_alive())
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Re-evaluate the routes this node has installed.
+    ///
+    /// Called on a timer as well as on an inbound announce, because the event
+    /// that most needs handling is a peer going SILENT, and a silent peer sends
+    /// no announce to trigger anything.
+    pub async fn reconcile_routes(&self) {
+        self.sync_kernel_subnets().await;
+    }
+
+    /// Install or withdraw an accepted DEFAULT route, using policy routing so it
+    /// cannot capture the traffic that carries it. See `exit_route`.
+    async fn sync_exit_route(&self, defaults: &[(IpAddr, u8)]) {
+        if !crate::platform::policy_route::supported() {
+            if !defaults.is_empty() {
+                crate::ui::say(&format!(
+                    "  {} ignoring an exit route: policy routing is implemented for Linux only",
+                    crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
+                ));
+            }
+            return;
+        }
+        {
+            let mut installed = self.exit_route_installed.lock().await;
+            if defaults.is_empty() {
+                if *installed {
+                    if let Err(e) = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan())
+                    {
+                        crate::ui::debug(&format!("  could not withdraw the exit route: {e}"));
+                    }
+                    *installed = false;
+                    crate::ui::say("  exit route withdrawn; traffic uses the ordinary path again");
+                }
+                return;
+            }
+            if *installed {
+                return; // already in force; nothing changed
+            }
+            let (mut underlay, unknown) = self.default_route_underlay().await;
+            if unknown {
+                // A relay link cannot name its own endpoint, so there is no
+                // carve-out to make and installing anyway would route the tunnel
+                // through itself. Refuse loudly rather than disconnect.
+                crate::ui::say(&format!(
+                    "  {} not accepting an exit route over a relay link: its underlay address is unknown, so it cannot be excluded from the route it offers",
+                    crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
+                ));
+                return;
+            }
+            // The signaling server, or the node cannot renegotiate, cannot be
+            // told to stop, and cannot recover on its own.
+            underlay.extend(crate::exit_route::signaling_addrs());
+            if underlay.is_empty() {
+                crate::ui::say(&format!(
+                    "  {} not accepting an exit route: no underlay address to exclude",
+                    crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
+                ));
+                return;
+            }
+            let gw = crate::platform::policy_route::default_gateway();
+            let plan = crate::exit_route::install_plan(ifname(), gw.as_deref(), &underlay);
+            match crate::platform::policy_route::run_plan(&plan) {
+                Ok(()) => {
+                    *installed = true;
+                    crate::ui::say(&format!(
+                        "  {} exit route active: all traffic via the mesh, except {} excluded address(es)",
+                        crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok()),
+                        underlay.len()
+                    ));
+                }
+                Err(e) => {
+                    // Do not leave a half-applied policy in place.
+                    let _ = crate::platform::policy_route::run_plan(&crate::exit_route::teardown_plan());
+                    crate::ui::say(&format!(
+                        "  {} could not install the exit route ({e}); reverted",
+                        crate::ui::paint(crate::ui::Tone::Warn, crate::ui::glyph_warn())
+                    ));
+                }
+            }
+        }
+    }
+
     /// Make the KERNEL routing table match the prefixes we accepted.
     ///
     /// Without this the whole path is invisible to the operating system: the
@@ -578,12 +710,37 @@ impl L3 {
         if self.netstack.is_some() {
             return;
         }
-        let desired: std::collections::HashSet<String> = self
+        // A DEFAULT ROUTE IS NOT A SUBNET ROUTE. `10.66.0.0/24 dev filament0` is
+        // additive; `0.0.0.0/0 dev filament0` captures every packet this machine
+        // sends, including the ones carrying the overlay. Installed into the main
+        // table it routes the tunnel through the tunnel: the link dies, the route
+        // is withdrawn, the link returns, and the machine oscillates, having
+        // usually lost the path to the signaling server first, so it cannot even
+        // be told to stop.
+        //
+        // Accepting one safely needs the policy-routing plan in `exit_route`
+        // (separate table, rule, and carve-outs for the peer's own endpoint and
+        // the signaling server). The carve-out for the PEER needs its underlay
+        // address, and `net::Transport` does not expose one, so this refuses
+        // loudly instead of installing something that disconnects the machine.
+        // Advertising a default route already works; it is accepting one that
+        // waits on that accessor.
+        let (defaults, subnets): (Vec<_>, Vec<_>) = self
             .subnet_prefixes()
             .await
             .into_iter()
-            .map(|(n, l)| format!("{n}/{l}"))
-            .collect();
+            .partition(|(n, l)| crate::exit_route::is_default_route(*n, *l));
+        // LIVENESS APPLIES TO DEFAULT ROUTES ONLY, and the asymmetry is
+        // deliberate. A stale subnet route is a nuisance: packets for one prefix
+        // go nowhere until the link returns, and links drop and re-establish
+        // constantly, so evicting on every transient drop would churn the
+        // routing table for no gain. A stale DEFAULT route is a disconnected
+        // machine, because it captures everything, so it must not outlive the
+        // link that carries it even briefly.
+        let live_defaults = self.live_default_routes(&defaults).await;
+        self.sync_exit_route(&live_defaults).await;
+        let desired: std::collections::HashSet<String> =
+            subnets.into_iter().map(|(n, l)| format!("{n}/{l}")).collect();
         let mut installed = self.kernel_subnets.lock().await;
         for cidr in desired.difference(&installed).cloned().collect::<Vec<_>>() {
             match crate::tun::add_route(&cidr, ifname()) {
@@ -1221,6 +1378,7 @@ mod tests {
             by_pid: tokio::sync::Mutex::new(HashMap::new()),
             identity: None,
             kernel_subnets: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            exit_route_installed: tokio::sync::Mutex::new(false),
             seen_seq: Mutex::new(HashMap::new()),
             names: tokio::sync::Mutex::new(HashMap::new()),
             netstack: Some(ns),

@@ -35,6 +35,8 @@ use filament_transfer::{
     coverage_complete, first_gap, pwrite_at, record_range, safe_incoming_name, Outgoing,
 };
 mod fleet_enrollment;
+mod fleet_renewal;
+mod exit_route;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
@@ -6245,6 +6247,195 @@ async fn enroll_and_send_cmd(
 /// Step 1: rate-limit BEFORE expensive ops (anti-flood).
 /// Step 2: verify auth key against owner.
 /// Step 3: generate CSPRNG nonce, store, send challenge.
+/// The requesting device's standing, lifted from its stored record.
+///
+/// Keyed by DEVICE KEY, not by name: names are re-usable and renewal must
+/// follow the identity, not the label.
+fn renewal_standing_for(device_pub: &[u8; 32]) -> crate::fleet_renewal::Standing {
+    let Some(record) = devices_find_by_device_pub(device_pub) else {
+        return crate::fleet_renewal::Standing::default();
+    };
+    let stored = record["deviceCert"]["devicePub"]
+        .as_str()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+    crate::fleet_renewal::Standing {
+        known: true,
+        revoked: record["certRevoked"].as_bool() == Some(true)
+            || record["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED),
+        lapsed: record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED),
+        stored_device_pub: stored,
+    }
+}
+
+/// OWNER SIDE: re-sign a fleet device's certificate, or refuse.
+///
+/// THE DEVICE KEY COMES FROM THE PROVEN LINK, never from the message body. A
+/// renewal names a device, so if the caller could name it, any peer could ask us
+/// to re-sign somebody else's certificate and then present the result. The link
+/// binding is the only statement about who is actually talking, so it is the
+/// only thing allowed to answer that question.
+///
+/// Refusals are logged locally and answered with a bare error to the peer. A
+/// refusal that explains itself turns this into an oracle for probing which
+/// device keys the owner knows.
+async fn respond_to_cert_renew_request(conn: &mut Conn, pid: String) {
+    let Some(link) = conn.link(&pid) else { return };
+    let proven = link.identity_binding == crate::capability::BindingStrength::Proven;
+    let device_pub = link.identity_device_pub;
+    let (Some(device_pub), true) = (device_pub, proven) else {
+        ui::debug("  cert renewal refused: requester is not identity-proven on this link");
+        if let Some(t) = conn.transport_of(&pid) {
+            let _ = t
+                .send_control(&json!({"type": "identity-cert-renew-error"}))
+                .await;
+        }
+        return;
+    };
+
+    // Only a machine holding the owner SIGNING key can renew. A fleet member
+    // that is asked simply declines: it is not a failure, it is not a primary.
+    let Some(owner_key) = load_owner_key() else {
+        ui::debug("  cert renewal declined: this device holds no owner signing key");
+        if let Some(t) = conn.transport_of(&pid) {
+            let _ = t
+                .send_control(&json!({"type": "identity-cert-renew-error"}))
+                .await;
+        }
+        return;
+    };
+
+    let standing = renewal_standing_for(&device_pub);
+    match crate::fleet_renewal::owner_decides(&standing, device_pub) {
+        crate::fleet_renewal::Decision::Refuse(why) => {
+            ui::debug(&format!("  cert renewal refused: {why}"));
+            if let Some(t) = conn.transport_of(&pid) {
+                let _ = t
+                    .send_control(&json!({"type": "identity-cert-renew-error"}))
+                    .await;
+            }
+        }
+        crate::fleet_renewal::Decision::Renew => {
+            let now = identity::now_secs();
+            // The lifetime the device ALREADY has, not the global default. See
+            // fleet_renewal::renewal_ttl: renewing a one-hour guest into a
+            // 90-day member would widen the exact bound renewal enforces.
+            let ttl = match devices_find_by_device_pub(&device_pub)
+                .as_ref()
+                .and_then(|r| identity::DeviceCert::from_json(&r["deviceCert"]))
+            {
+                Some(current) => {
+                    crate::fleet_renewal::renewal_ttl(&current, identity::CERT_TTL_SECS)
+                }
+                None => identity::CERT_TTL_SECS,
+            };
+            let Ok(fresh) = identity::DeviceCert::certify(&owner_key, device_pub, now, ttl)
+            else {
+                ui::debug("  cert renewal failed: could not sign");
+                return;
+            };
+            // Keep OUR copy in step, so the roster and every expiry readout
+            // agree with what the device now holds. A renewal the owner cannot
+            // see is how "renews in 87d" became a lie the first time.
+            if let Some(record) = devices_find_by_device_pub(&device_pub) {
+                if let Some(name) = record["name"].as_str() {
+                    let _ = devices_upsert_atomic(
+                        name,
+                        None,
+                        Some(&fresh),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+            if let Some(t) = conn.transport_of(&pid) {
+                let _ = t
+                    .send_control(&json!({
+                        "type": "identity-cert-renew-ack",
+                        "cert": fresh.to_json(),
+                    }))
+                    .await;
+            }
+            ui::debug(&format!(
+                "  renewed certificate for {}",
+                hex::encode(device_pub).chars().take(8).collect::<String>()
+            ));
+        }
+    }
+}
+
+/// REQUESTING SIDE: adopt a renewed certificate, or keep the one we have.
+///
+/// Every check lives in `fleet_renewal::accept_renewal`, which refuses a changed
+/// device key, a changed owner, a different signer, and a replayed older cert.
+/// Nothing here is trusted just because it arrived on a link we like.
+async fn handle_cert_renew_ack(v: &Value) {
+    let Some(fresh) = identity::DeviceCert::from_json(&v["cert"]) else {
+        ui::debug("  renewal ack carried no readable certificate");
+        return;
+    };
+    let Some(current) = local_device_cert() else {
+        // Nothing to renew FROM. Adopting a cert here would be accepting an
+        // identity rather than extending one.
+        ui::debug("  renewal ack ignored: this device holds no certificate to extend");
+        return;
+    };
+    let owner_pub = current.user_pub;
+    if let Err(e) =
+        crate::fleet_renewal::accept_renewal(&current, &fresh, &owner_pub, identity::now_secs())
+    {
+        ui::debug(&format!("  renewal rejected: {e}"));
+        return;
+    }
+    let path = local_device_cert_path();
+    let record = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let name = record
+        .as_ref()
+        .and_then(|r| r["name"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let body = json!({ "name": name, "cert": fresh.to_json() });
+    // SecretFile::write_str, the same writer enrollment uses for this exact
+    // file, not write_owner_only_file. That helper opens with create_new(true)
+    // because it exists to mint invitations, so it refuses to clobber and every
+    // renewal failed on the last line of the whole flow: the owner signed, the
+    // device accepted, and then could not save it. The chain reported success
+    // at every step except the one that mattered.
+    match crate::platform::SecretFile::write_str(
+        &path,
+        &serde_json::to_string_pretty(&body).unwrap_or_default(),
+    ) {
+        Ok(()) => ui::debug(&format!(
+            "  certificate renewed, now valid for {}",
+            fmt_short_duration(fresh.expires.saturating_sub(identity::now_secs()))
+        )),
+        Err(e) => ui::debug(&format!("  could not persist renewed certificate: {e}")),
+    }
+}
+
+/// Ask a peer to renew our certificate, if it is time and we are a fleet member.
+///
+/// Cheap and idempotent: not-due is the common case and returns immediately, so
+/// this can be called on every link that comes up. An owner device has no one to
+/// ask and never asks.
+async fn maybe_request_cert_renewal(conn: &Conn, pid: &str) {
+    if load_owner_key().is_some() {
+        return; // we sign our own; there is nothing to request
+    }
+    let Some(cert) = local_device_cert() else { return };
+    if !crate::fleet_renewal::renewal_due(&cert, identity::now_secs()) {
+        return;
+    }
+    if let Some(t) = conn.transport_of(pid) {
+        let _ = t
+            .send_control(&json!({"type": "identity-cert-renew-request"}))
+            .await;
+    }
+}
+
 async fn respond_to_auth_key_enroll_request(
     conn: &mut Conn,
     pid: String,
@@ -17746,6 +17937,8 @@ async fn recv_cmd(
     // observation revived them). State-only; the gate already denies past the
     // deadline, the sweep is what makes LAPSED visible in `devices`.
     let mut last_sweep = Instant::now();
+    let mut last_renewal_check = Instant::now();
+    let mut last_route_reconcile = Instant::now();
     // Owner-only roster push: mint + push the mesh roster on membership change,
     // validity refresh, or a newly-established link.
     let mut last_roster_push = Instant::now();
@@ -18259,6 +18452,43 @@ async fn recv_cmd(
             let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
             if lapsed > 0 {
                 ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
+            }
+        }
+
+        // ROUTE RECONCILE: re-evaluate installed routes on a timer, not only on
+        // an inbound announce. The case that matters most is a peer going
+        // SILENT, and a silent peer sends no announce, so an announce-driven
+        // reconciler is deaf to exactly the event it most needs to hear. For an
+        // exit node that gap is the difference between a stale entry and a
+        // machine holding a default route into a tunnel nobody is carrying.
+        if daemon && last_route_reconcile.elapsed() >= Duration::from_secs(15) {
+            last_route_reconcile = Instant::now();
+            if let Some(l3) = l3.as_ref() {
+                l3.reconcile_routes().await;
+            }
+        }
+
+        // RENEWAL: ask a primary to re-sign this device's certificate before it
+        // expires. ON A TIMER, not only when a link comes up: a device that
+        // stays connected for its whole certificate lifetime would otherwise
+        // never re-check and would expire while online, which is exactly the
+        // silent death renewal exists to prevent. Found by running it, not by
+        // reading it: the link-up trigger alone left a live device dying.
+        //
+        // Cheap: `maybe_request_cert_renewal` returns immediately unless this
+        // device is a fleet member whose certificate is in its last third, so
+        // the common case is a few comparisons. It asks every live peer because
+        // only a primary can answer and we do not know which one that is.
+        if daemon && last_renewal_check.elapsed() >= Duration::from_secs(30) {
+            last_renewal_check = Instant::now();
+            let live: Vec<String> = conn
+                .links
+                .iter()
+                .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+                .map(|(pid, _)| pid.clone())
+                .collect();
+            for pid in live {
+                maybe_request_cert_renewal(&conn, &pid).await;
             }
         }
 
@@ -19686,6 +19916,13 @@ async fn recv_cmd(
                                             }
                                         }
                                         ui::say(&format!("fleet device '{shown}' joined the mesh"));
+                                        // A link to a fleet peer is the only
+                                        // chance a joined device gets to reach a
+                                        // primary. Ask here rather than on a
+                                        // timer: a device that is only
+                                        // occasionally connected would otherwise
+                                        // tick past its own expiry while offline.
+                                        maybe_request_cert_renewal(&conn, &pid).await;
                                     }
                                 }
                                 Err(e) => {
@@ -19831,7 +20068,23 @@ async fn recv_cmd(
                                             // and the owner must have GRANTED each
                                             // prefix by name.
                                             let advertised = ann.verify_routes(&cb);
-                                            if !advertised.is_empty() {
+                                            // NO EMPTY-SET SHORTCUT. An announce
+                                            // carrying no routes is not "nothing
+                                            // to do", it is a WITHDRAWAL, and
+                                            // set_peer_subnets is a full
+                                            // restatement of what this peer
+                                            // carries. Skipping the block left a
+                                            // withdrawn route installed forever:
+                                            // the operator cleared
+                                            // advertise-routes, the peer stopped
+                                            // advertising, and the receiver kept
+                                            // routing through it. For an exit
+                                            // node that is not a stale entry, it
+                                            // is a default route pointing into a
+                                            // tunnel nobody is carrying, which
+                                            // is indistinguishable from the
+                                            // machine losing the internet.
+                                            {
                                                 let accept = crate::settings::get_str(
                                                     "accept-routes",
                                                     Some(&who),
@@ -19959,8 +20212,24 @@ async fn recv_cmd(
                                                         advertised.len()
                                                     ));
                                                 }
+                                                // ALWAYS restate, including the
+                                                // empty case. set_peer_subnets is
+                                                // a full restatement of what this
+                                                // peer carries, so an empty list
+                                                // is how a WITHDRAWAL is applied.
+                                                // Skipping it left a withdrawn
+                                                // route installed forever: the
+                                                // operator ran
+                                                // `set advertise-routes ''`, the
+                                                // peer stopped advertising, and
+                                                // the receiver kept routing
+                                                // through it. With an exit node
+                                                // that is not a stale route, it
+                                                // is a machine with a default
+                                                // route pointing into a tunnel
+                                                // nobody is carrying.
+                                                l3.set_peer_subnets(&pid, &t, &ok).await;
                                                 if !ok.is_empty() {
-                                                    l3.set_peer_subnets(&pid, &t, &ok).await;
                                                     ui::say(&format!(
                                                         "  {} routes via {who}: {}",
                                                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
@@ -20014,6 +20283,23 @@ async fn recv_cmd(
                             .unwrap_or_default();
                         let _ = tx.send(ports);
                     }
+                }
+                // Certificate renewal. Expiry is the only bound this system has,
+                // so renewal is also how removal works: an owner that stops
+                // renewing evicts a device without needing to reach it.
+                Some("identity-cert-renew-request") => {
+                    respond_to_cert_renew_request(&mut conn, pid.clone()).await;
+                }
+                Some("identity-cert-renew-ack") => {
+                    handle_cert_renew_ack(&v).await;
+                }
+                Some("identity-cert-renew-error") => {
+                    // Deliberately quiet and deliberately not fatal. A refusal
+                    // may mean "removed", but it may equally mean the peer we
+                    // asked is not a primary. Falling out at expiry is the
+                    // correct failure direction either way, so we simply keep
+                    // the certificate we have and ask again on the next link.
+                    ui::debug("  peer declined to renew our certificate");
                 }
                 // Auth key enrollment (challenge/response flow)
                 Some("identity-auth-key-enroll-request") => {

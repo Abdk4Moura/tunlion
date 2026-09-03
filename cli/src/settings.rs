@@ -656,9 +656,11 @@ fn canonicalize(s: &Setting, raw: &str) -> Result<String> {
             Ok(raw.to_string())
         }
         Kind::List => {
-            if raw.is_empty() {
-                bail!("'{}' needs a comma-separated list (e.g. wl1,eth0)", s.key);
-            }
+            // An EMPTY list is how a list setting is cleared, and clearing is
+            // not an edge case: `advertise-routes ''` is how a subnet router or
+            // exit node WITHDRAWS what it offers. Refusing it meant a node could
+            // start carrying traffic for its peers and had no way to stop short
+            // of editing config by hand.
             Ok(raw.to_string())
         }
     }
@@ -1341,6 +1343,18 @@ pub fn extract_archive(path: &Path, into: &Path) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Clearing a list is how a node WITHDRAWS what it offers. `set
+    /// advertise-routes ''` is the documented way to stop being a subnet router
+    /// or exit node, and it used to fail with "needs a comma-separated list",
+    /// so a node could start carrying its peers' traffic and had no supported
+    /// way to stop.
+    #[test]
+    fn an_empty_list_clears_the_setting_rather_than_failing() {
+        let spec = lookup("advertise-routes").expect("advertise-routes is a registered key");
+        assert_eq!(canonicalize(spec, "").ok().as_deref(), Some(""));
+        assert_eq!(canonicalize(spec, "10.0.0.0/8").ok().as_deref(), Some("10.0.0.0/8"));
+    }
     use super::*;
 
     // FILAMENT_CONFIG_DIR is process-global, so config-dir tests must not run

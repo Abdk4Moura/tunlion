@@ -1873,3 +1873,52 @@ byte-identical (`58e9123b3d13db9da16a`) to a rebuild of the committed tree.
 including `0.0.0.0/0`. It is bounded by `accept-routes` being off by default and
 per-peer settable. Narrowing to a per-prefix ceiling requires a v3 invitation
 token, since v2 encodes caps as an 8-bit mask with nowhere for a CIDR.
+
+## 2026-09-02: certificate renewal, so the mesh stops dying on a timer
+
+`docs/design-pairing-ux.md` rule 2 has always said expiry is the only bound,
+that fleet certs are short and auto-renewed, and that removing a device is
+"stop renewing". None of it was built. #236 found the UI promising
+"renews in 87d" and fixed the SENTENCE, which left both halves broken: devices
+silently fell off the mesh when their certificate lapsed, and a removed device
+kept full fleet trust until a 90-day certificate ran out.
+
+`cli/src/fleet_renewal.rs` is the decision core (pure, 13 unit tests) and
+`experiments/cert-renewal-e2e.sh` proves it between do-vm and the KVM VPS:
+
+    good standing:  1788350731 -> 1788350950   renewed on a LIVE link
+    revoked:        unchanged                  refused, left to expire
+
+**The rule-2 / rule-3 tension, resolved deliberately.** Rule 3 forbids any
+ambient or remote signing path. Renewal is not a new trust decision: it re-signs
+a device the owner already admitted, same key, same ceiling, moving only the
+clock, so it renews good standing and can never ADMIT. Absent, revoked and
+lapsed all refuse. Lapsed is the interesting one: enrollment revives a lapsed
+device because a human issued a fresh invitation, and renewal has no human in
+it, so allowing it to revive would build exactly the ambient path rule 3 bans.
+
+**Two bugs the rig caught that unit tests could not.**
+1. Renewal only triggered on link-up, so a device connected for its whole
+   certificate lifetime never re-checked and expired while online, which is the
+   silent death the feature exists to prevent. Now also on a 30s timer.
+2. Persistence used `write_owner_only_file`, which opens `create_new(true)`
+   because it exists to mint invitations, so it refused to clobber. The owner
+   signed, the device accepted, and the last line failed. Every step reported
+   success except the one that mattered. Now uses `SecretFile::write_str`, the
+   same writer enrollment uses for that exact file.
+
+**Renewal cannot widen.** `renewal_ttl` re-signs for the lifetime the current
+certificate already has, clamped to the default. A guest invited with
+`--expires 1h` renewing into a 90-day member would widen the very bound renewal
+enforces. Verified in the rig: a 300s invitation renewed to 297s, not 90 days.
+
+**Recorded honestly:** in the revoked arm the refusal came from
+"requester is not identity-proven on this link", not from the revocation branch.
+Revoking the certificate denies the device at the capability gate before it can
+reach that check, so the property holds by two independent refusals, but the
+`Decision::Refuse("device is revoked")` branch is covered only by its unit test,
+not by the end-to-end run.
+
+**Still open.** Certificates remain 90 days by default. Rule 2 wants days, and
+renewal is what makes short certs survivable, so shortening the default is now
+possible and is a deliberate policy call rather than a code change.
