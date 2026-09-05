@@ -9311,7 +9311,7 @@ fn active_binding_matches(
 
 struct Conn {
     server: String,
-    sio: rust_socketio::asynchronous::Client,
+    sio: filament_signal::Client,
     tx: mpsc::UnboundedSender<Ev>,
     my_uid: String,
     my_id: String,
@@ -9578,7 +9578,7 @@ impl Conn {
     /// own literal on purpose, it is a different (non-command) session.
     fn for_command(
         server: &str,
-        sio: rust_socketio::asynchronous::Client,
+        sio: filament_signal::Client,
         tx: mpsc::UnboundedSender<Ev>,
         my_uid: String,
         relay_only: bool,
@@ -13000,11 +13000,52 @@ fn install_transport_hooks() {
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // F2: both ring (webrtc) and aws-lc (reqwest) end up in the dep tree;
-    // rustls refuses to guess between two providers, so pick ring explicitly
-    // BEFORE anything touches TLS.
+/// Commands that do no concurrent work and so need no worker threads.
+///
+/// OPT-IN, and the polarity is the point. `#[tokio::main]` builds a
+/// multi-threaded runtime unconditionally, which spawns one worker per CPU
+/// before `main` runs: `strace` shows four `clone3` calls on a 4-core box just
+/// to print `--version`, and that cost scales with core count, so the bigger the
+/// machine the slower the trivial commands feel. These verbs are pure local I/O
+/// (read some files, print), so they get a current-thread runtime instead.
+///
+/// Anything NOT listed keeps the multi-threaded runtime, so an unrecognised or
+/// future command behaves exactly as it does today. A wrong answer here is a
+/// throughput question, never a correctness one: a current-thread runtime still
+/// runs every future and still has a blocking pool for `spawn_blocking`. The one
+/// API that would panic is `block_in_place`, and the tree contains none.
+fn is_light_command(first_arg: Option<&str>) -> bool {
+    match first_arg {
+        // Bare `filament` is the tour: three file reads and a printout.
+        None => true,
+        Some(a) => matches!(
+            a,
+            "--version" | "-V" | "--help" | "-h" | "help"
+                | "devices" | "id" | "status" | "addr" | "set" | "completions" | "man"
+        ),
+    }
+}
+
+fn main() -> Result<()> {
+    // Build the runtime AFTER deciding how much of one is needed. This is the
+    // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
+    // before anything can look at the command.
+    let first = std::env::args().nth(1);
+    let rt = if is_light_command(first.as_deref()) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+    };
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
+    // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
+    // purpose: skipping it for local-only commands was tried and measured at
+    // exactly zero (6.7ms either way), so the conditional bought nothing and
+    // would have put a branch in front of crypto initialisation for free.
+    // `filament_signal::connect` also installs it, idempotently, so no call
+    // site has to remember.
     rustls::crypto::ring::default_provider().install_default().ok();
     // Tell the transport how to reach this host. It no longer reaches sideways
     // into the CLI for terminal output, settings, config paths or interface
@@ -17042,7 +17083,7 @@ async fn apply_reconfigure(
     shell_user: &mut Option<String>,
     l2_enabled: bool,
     sess: &mut session::Session,
-    sio: &rust_socketio::asynchronous::Client,
+    sio: &filament_signal::Client,
     my_uid: &str,
 ) -> bool {
     match key {
@@ -24088,6 +24129,33 @@ mod tests {
     fn confirm_yes_passes() {
         let caps = UiCapability { interactive: false, json: false, yes: true, color: false };
         assert!(caps.confirm("delete it").is_ok());
+    }
+
+    #[test]
+    fn trivial_commands_do_not_spawn_worker_threads() {
+        // strace showed four clone3 calls to print a version string on a 4-core
+        // box; on a 16-core machine that is sixteen threads for a file read.
+        for light in
+            [None, Some("--version"), Some("--help"), Some("devices"), Some("id"), Some("status")]
+        {
+            assert!(is_light_command(light), "{light:?} needs no worker threads");
+        }
+    }
+
+    /// The polarity matters more than the list: an unknown or future command
+    /// must keep today's multi-threaded behaviour rather than quietly lose it.
+    #[test]
+    fn anything_unrecognised_keeps_the_multi_threaded_runtime() {
+        for heavy in [
+            Some("up"),
+            Some("send"),
+            Some("receive"),
+            Some("mount"),
+            Some("shell"),
+            Some("a-verb-added-next-year"),
+        ] {
+            assert!(!is_light_command(heavy), "{heavy:?} must keep worker threads");
+        }
     }
 
     #[test]

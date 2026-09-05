@@ -50,6 +50,25 @@ jobs:
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # `cargo test` in cli/ runs the CLI package's tests only: a path
+      # dependency is BUILT, never tested. Every crate under crates/ therefore
+      # had unit tests that no CI job ran, so they could rot silently. Named
+      # explicitly rather than globbed so adding a crate is a deliberate act
+      # that shows up in review.
+      - name: Test the local crates
+        run: |
+          set -e
+          for c in filament-signal filament-cap filament-id filament-overlay \
+                   filament-fleet filament-pair filament-proto filament-transfer; do
+            if [ -f "crates/$c/Cargo.toml" ]; then
+              echo "::group::$c"
+              cargo test --release --manifest-path "crates/$c/Cargo.toml"
+              echo "::endgroup::"
+            fi
+          done
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
           CC: sccache cc
           CXX: sccache c++
       - name: Show sccache stats

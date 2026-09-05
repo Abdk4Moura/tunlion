@@ -1201,7 +1201,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// the same device, otherwise the acceptor sees two same-device peers at once
 /// and its C6 supersede/adopt logic churns (one link gets dropped mid-use).
 pub struct LinkGuard {
-    sio: Option<rust_socketio::asynchronous::Client>,
+    sio: Option<filament_signal::Client>,
     peer: Option<Arc<Peer>>,
 }
 

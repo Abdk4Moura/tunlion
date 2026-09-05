@@ -13,7 +13,7 @@
 //! `lossy_emit`, so gate L (`FILAMENT_TEST_EMIT_LOSS` + `_SEED`) adversarially
 //! drops them and the suite proves convergence survives.
 
-use rust_socketio::asynchronous::Client;
+use filament_signal::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 

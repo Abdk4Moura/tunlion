@@ -1,0 +1,18 @@
+[package]
+name = "filament-signal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Minimal Engine.IO v4 / Socket.IO v5 websocket client for filament's signaling, on rustls."
+
+[dependencies]
+anyhow = "1.0"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+# rustls, deliberately: replacing rust_socketio's hard native-tls dependency is
+# the entire point of this crate. webpki-roots rather than the platform store so
+# the binary is self-contained and does not link system libssl/libcrypto.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }

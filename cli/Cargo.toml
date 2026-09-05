@@ -16,9 +16,11 @@ name = "filament"
 path = "src/main.rs"
 
 [features]
-# Fully static builds (musl): compile OpenSSL from source instead of linking
-# the system one. rust_socketio hard-depends on native-tls, so a rustls-only
-# tree is not possible without forking it upstream (ledger C16).
+# Fully static builds (musl): historically this compiled OpenSSL from source
+# because rust_socketio hard-depended on native-tls, which made a rustls-only
+# tree impossible without forking it (ledger C16). That dependency is gone,
+# replaced by filament-signal, so the tree no longer needs system TLS at all.
+# The feature is kept for musl builds that still want a vendored OpenSSL.
 static = ["dep:openssl-sys"]
 # Env-gated fault/injection hooks used ONLY by the resilience gates
 # (runner/sim/*). NOT in `default` and NOT pulled by the release profile, so a
@@ -56,10 +58,10 @@ bytes = "1.11.1"
 chrono = "0.4"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 futures-util = "0.3.32"
-reqwest = { version = "0.13.4", features = ["json"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "http2", "charset", "system-proxy"] }
 directories = "6"
-rust_socketio = { version = "0.6.0", features = ["async"] }
-rustls = { version = "0.23.40", features = ["ring"] }
+filament-signal = { path = "../crates/filament-signal", version = "0.1.0" }
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = "1.0.228"
 serde_json = "1.0.150"
 sha2 = "0.11.0"
@@ -168,8 +170,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 strip = true
 
 # Fast functional iteration for real-binary gates. This is not release evidence:
@@ -180,3 +182,46 @@ opt-level = 1
 lto = false
 debug = 0
 incremental = true
+
+# SIZE: optimise the COLD crates for size, the hot ones for speed.
+#
+# opt-level "z" costs throughput, so it is applied only where throughput is not
+# the point. These crates run once per connection or once per process: argument
+# parsing, the HTTPS control plane to the signaling server, and WebRTC's
+# session setup. The bulk data path (ring, quinn, tokio, smoltcp, and filament's
+# own crates) stays at the default so file transfer speed is untouched.
+#
+# Verified by measurement, not assumption: throughput is re-measured against the
+# two-machine rig after any change here.
+[profile.release.package.clap_builder]
+opt-level = "z"
+[profile.release.package.clap_mangen]
+opt-level = "z"
+[profile.release.package.clap_complete]
+opt-level = "z"
+[profile.release.package.reqwest]
+opt-level = "z"
+[profile.release.package.hyper]
+opt-level = "z"
+[profile.release.package.hyper-util]
+opt-level = "z"
+[profile.release.package.h2]
+opt-level = "z"
+[profile.release.package.webrtc]
+opt-level = "z"
+[profile.release.package.webrtc-ice]
+opt-level = "z"
+[profile.release.package.webrtc-sctp]
+opt-level = "z"
+[profile.release.package.interceptor]
+opt-level = "z"
+[profile.release.package.rtcp]
+opt-level = "z"
+[profile.release.package.turn]
+opt-level = "z"
+[profile.release.package.qrcode]
+opt-level = "z"
+[profile.release.package.zip]
+opt-level = "z"
+[profile.release.package.tar]
+opt-level = "z"

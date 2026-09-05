@@ -22,8 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::FutureExt;
 use quinn::{Connection, RecvStream, SendStream};
-use rust_socketio::asynchronous::{Client, ClientBuilder};
-use rust_socketio::{Event as SioEvent, Payload, TransportType};
+use filament_signal::Client;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -1032,78 +1031,46 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         let _ = resolve_warm(&host, port).await;
     }
 
-    let fwd = |variant: fn(Value) -> Ev, tx: mpsc::UnboundedSender<Ev>| {
-        move |payload: Payload, _c: Client| {
-            let tx = tx.clone();
-            let v = match payload {
-                Payload::Text(mut vals) if !vals.is_empty() => Some(vals.remove(0)),
-                _ => None,
-            };
-            async move {
-                if let Some(v) = v {
-                    let _ = tx.send(variant(v));
-                }
-            }
-            .boxed()
-        }
-    };
-
-    // P2 (GAP-2): forward socket.io's close/error to the event loop as
-    // Ev::SignalingDown. `down` carries a reason string but the loop only needs
-    // the wake-up, the outer reconnect re-dials regardless of cause.
-    let down = {
+    // ONE channel instead of a dozen boxed callbacks. Every handler this
+    // replaced did the same thing: take the first JSON argument and forward it,
+    // ignoring the client argument entirely. Naming the mapping here makes the
+    // set of events the client understands readable in one place, and an event
+    // the server adds later shows up in the debug line rather than vanishing.
+    let sio = filament_signal::connect(server, {
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
         let tx = tx.clone();
-        move |reason: &'static str| {
-            let tx = tx.clone();
-            move |_p: Payload, _c: Client| {
-                let tx = tx.clone();
-                async move {
-                    let _ = tx.send(Ev::SignalingDown(reason.to_string()));
+        tokio::spawn(async move {
+            while let Some(msg) = raw_rx.recv().await {
+                let ev = match msg {
+                    filament_signal::Incoming::Down(reason) => Ev::SignalingDown(reason),
+                    filament_signal::Incoming::Event { name, data } => match name.as_str() {
+                        "welcome" => Ev::Welcome(data),
+                        "peer-joined" => Ev::PeerJoined(data),
+                        "peer-left" => Ev::PeerLeft(data),
+                        "signal" => Ev::Signal(data),
+                        "pair-code" => Ev::PairCode(data),
+                        "pair-ok" => Ev::PairOk(data),
+                        "pair-matched" => Ev::PairMatched(data),
+                        "pair-used" => Ev::PairUsed(data),
+                        "pair-error" => Ev::PairError(data),
+                        "known-peer" => Ev::KnownPeer(data),
+                        "known-peer-left" => Ev::KnownPeerLeft(data),
+                        "synced" => Ev::Synced(data),
+                        other => {
+                            crate::hooks::debug(&format!("  signaling: ignoring event '{other}'"));
+                            continue;
+                        }
+                    },
+                };
+                if tx.send(ev).is_err() {
+                    break;
                 }
-                .boxed()
             }
-        }
-    };
-
-    // We keep `reconnect(false)` ON PURPOSE (the explicit-outer-loop decision,
-    // P2): socket.io's own reconnect would silently bring a FRESH sid back
-    // without re-firing our join/subscribe/sync, and it can't be observed
-    // cleanly from the event loop where the C-series perfect-negotiation / glare
-    // handling lives. Owning the loop ourselves means every reconnect re-asserts
-    // presence through the C30 session module on a fresh `welcome`, integrating
-    // with the existing machinery rather than racing it. The triggers are the
-    // close/error callbacks below (fast path) PLUS the silence watchdog in the
-    // acceptor loop (the authoritative path, a hard TCP sever fires no callback).
-    // Connect over a RAW websocket, never long-polling. The default
-    // (TransportType::Any) handshakes on polling and only upgrades "if
-    // possible"; behind Cloudflare the upgrade leg 400s, so it gets STUCK on
-    // long-polling, where consecutive poll requests die and the server's 5 s
-    // engine.io pings never arrive. The client then sees 30 s of silence, the
-    // acceptor watchdog re-dials, and every reconnect re-announces presence to
-    // every known device, a churn storm that prevents any link (ssh included)
-    // from holding. A direct websocket (proven to traverse Cloudflare) carries
-    // the pings reliably and removes the silence/reconnect cycle entirely.
-    let sio = ClientBuilder::new(server)
-        .transport_type(TransportType::Websocket)
-        .reconnect(false)
-        .on(SioEvent::Connect, |_p: Payload, _c: Client| async {}.boxed())
-        .on(SioEvent::Close, down("close"))
-        .on(SioEvent::Error, down("error"))
-        .on("welcome", fwd(Ev::Welcome, tx.clone()))
-        .on("peer-joined", fwd(Ev::PeerJoined, tx.clone()))
-        .on("peer-left", fwd(Ev::PeerLeft, tx.clone()))
-        .on("signal", fwd(Ev::Signal, tx.clone()))
-        .on("pair-code", fwd(Ev::PairCode, tx.clone()))
-        .on("pair-ok", fwd(Ev::PairOk, tx.clone()))
-        .on("pair-matched", fwd(Ev::PairMatched, tx.clone()))
-        .on("pair-used", fwd(Ev::PairUsed, tx.clone()))
-        .on("pair-error", fwd(Ev::PairError, tx.clone()))
-        .on("known-peer", fwd(Ev::KnownPeer, tx.clone()))
-        .on("known-peer-left", fwd(Ev::KnownPeerLeft, tx.clone()))
-        .on("synced", fwd(Ev::Synced, tx.clone()))
-        .connect()
-        .await
-        .with_context(|| format!("socket.io connect to {server}"))?;
+        });
+        raw_tx
+    })
+    .await
+    .with_context(|| format!("signaling connect to {server}"))?;
     Ok(sio)
 }
 
@@ -1128,20 +1095,10 @@ pub async fn reconnect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) ->
 /// is already gone, which the close/error fast-path handles, so errors here are
 /// benign and swallowed.
 pub async fn heartbeat(sio: &Client, payload: Value, tx: mpsc::UnboundedSender<Ev>) {
-    let _ = sio
-        .emit_with_ack(
-            "sync",
-            payload,
-            std::time::Duration::from_secs(5),
-            move |_p: Payload, _c: Client| {
-                let tx = tx.clone();
-                async move {
-                    let _ = tx.send(Ev::SignalingAlive);
-                }
-                .boxed()
-            },
-        )
-        .await;
+    if let Ok(Some(_)) = sio.emit_with_ack("sync", payload, std::time::Duration::from_secs(5)).await
+    {
+        let _ = tx.send(Ev::SignalingAlive);
+    }
 }
 
 /// Subscribe to presence channels and DETERMINISTICALLY discover the members
@@ -1165,24 +1122,20 @@ pub async fn heartbeat(sio: &Client, payload: Value, tx: mpsc::UnboundedSender<E
 /// if the socket is already gone; errors are benign and swallowed (the caller's
 /// re-subscribe cadence retries).
 pub async fn subscribe_with_ack(sio: &Client, channels: Vec<String>, tx: mpsc::UnboundedSender<Ev>) {
-    let _ = sio
+    // A timeout is Ok(None), not an error: the caller's re-subscribe cadence
+    // retries, and treating a slow round trip as a failure would be wrong.
+    if let Ok(Some(args)) = sio
         .emit_with_ack(
             "subscribe",
             json!({ "channels": channels }),
             std::time::Duration::from_secs(5),
-            move |payload: Payload, _c: Client| {
-                let tx = tx.clone();
-                async move {
-                    if let Payload::Text(vals) = payload {
-                        for p in roster_from_ack(&vals) {
-                            let _ = tx.send(Ev::KnownPeer(p));
-                        }
-                    }
-                }
-                .boxed()
-            },
         )
-        .await;
+        .await
+    {
+        for p in roster_from_ack(&args) {
+            let _ = tx.send(Ev::KnownPeer(p));
+        }
+    }
 }
 
 /// Pull the `peers` roster entries out of a `subscribe` ACK payload. The ack is
