@@ -603,6 +603,35 @@ impl L3 {
             .collect()
     }
 
+    /// Every peer on the overlay, with the transport its packets currently ride.
+    ///
+    /// Returned as a snapshot so a caller can decide about each peer without
+    /// holding the route-table lock across an await.
+    pub async fn peers_with_transport(&self) -> Vec<(String, IpAddr, Arc<dyn Transport>)> {
+        let names = self.names.lock().await.clone();
+        let by_pid = self.by_pid.lock().await.clone();
+        let table = self.routes.lock().await;
+        let mut out = Vec::new();
+        for (pid, ips) in by_pid {
+            // The v6 ULA is the peer's canonical overlay address; the v4 alias
+            // points at the same transport, so one entry per peer is right.
+            let Some(v6) = ips.iter().find(|i| i.is_ipv6()).copied() else { continue };
+            if let Some(t) = table.hosts.get(&v6) {
+                let name = names.get(&pid).map(|(n, _, _)| n.clone()).unwrap_or_else(|| pid.clone());
+                out.push((name, v6, t.clone()));
+            }
+        }
+        out
+    }
+
+    /// The overlay address a given link's peer holds, if it is on the plane.
+    pub fn peer_overlay_of(&self, pid: &str) -> Option<IpAddr> {
+        // Blocking lock: called from the control-message path, which is already
+        // inside the daemon's single event loop.
+        let by_pid = self.by_pid.try_lock().ok()?;
+        by_pid.get(pid)?.iter().find(|i| i.is_ipv6()).copied()
+    }
+
     /// Re-evaluate the routes this node has installed.
     ///
     /// Called on a timer as well as on an inbound announce, because the event

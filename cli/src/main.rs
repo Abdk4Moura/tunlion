@@ -5482,6 +5482,9 @@ async fn add_for_cmd(
     // because owner-equivalent access to a stranger should stay a deliberate
     // flag rather than a menu item one keypress away.
     let mut interactive_shell = false;
+    // Prefixes pulled out of `--allow route:<cidr>`; empty for every other kind
+    // of invitation, which keeps those tokens byte-identical v2.
+    let mut route_prefixes: Vec<String> = Vec::new();
     if allow.is_empty() && kind == "device" && caps.interactive {
         let choices = vec![
             "Send files, and mount my folders".to_string(),
@@ -5508,7 +5511,24 @@ async fn add_for_cmd(
             vec!["transfer".to_string()]
         }
     } else {
-        allow.into_iter().map(|capability| mint_capability(&capability)).collect::<Result<Vec<_>>>()?
+        // `route:10.0.0.0/24` carries its scope in the flag. Split the prefixes
+        // out here so they can travel in the SIGNED ceiling: a bare `route` is
+        // refused at mint, because a ceiling that cannot say which prefix is not
+        // a scope at all, and it previously authorised every prefix a member
+        // chose to advertise, 0.0.0.0/0 included.
+        let mut caps = Vec::new();
+        for entry in allow {
+            match entry.split_once(':') {
+                Some((name, cidr)) if mint_capability(name).ok().as_deref() == Some(crate::capability::CAP_ROUTE) => {
+                    caps.push(crate::capability::CAP_ROUTE.to_string());
+                    for one in cidr.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                        route_prefixes.push(one.to_string());
+                    }
+                }
+                _ => caps.push(mint_capability(&entry)?),
+            }
+        }
+        caps
     };
     ceiling.sort();
     ceiling.dedup();
@@ -5573,6 +5593,7 @@ async fn add_for_cmd(
         crate::ephemeral::Reuse::Once,
         ephemeral,
         display_name(),
+        route_prefixes.clone(),
     )?;
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
@@ -6660,6 +6681,9 @@ async fn handle_auth_key_enroll_response(
                         return;
                     }
                 };
+            // `ak.caps` already carries the route scope as `route:<cidr>`:
+            // Invitation::to_auth_key does that conversion once, so nothing here
+            // has to reassemble it.
             let stored_name = if persistent {
                 match devices_upsert_atomic(
                     &requested_name,
@@ -6929,6 +6953,12 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
             // forwarding for an overlay that is gone, and nothing would report
             // it.
             subnet_forward::cleanup();
+            // A WireGuard interface must not outlive the daemon that made it:
+            // left behind, it keeps routing a peer's overlay address into a
+            // tunnel with nobody on the other end, which looks exactly like the
+            // network breaking. Best-effort and idempotent, like the rest of
+            // teardown.
+            crate::wg::teardown(crate::wg::WG_DEV);
             n.notify_one();
         });
     }
@@ -17980,6 +18010,7 @@ async fn recv_cmd(
     let mut last_sweep = Instant::now();
     let mut last_renewal_check = Instant::now();
     let mut last_route_reconcile = Instant::now();
+    let mut last_wg_check = Instant::now();
     // Owner-only roster push: mint + push the mesh roster on membership change,
     // validity refresh, or a newly-established link.
     let mut last_roster_push = Instant::now();
@@ -18493,6 +18524,63 @@ async fn recv_cmd(
             let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
             if lapsed > 0 {
                 ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
+            }
+        }
+
+        // WIREGUARD RECONCILE. On a timer, and deliberately NOT on an event.
+        //
+        // The first version hooked the moment a peer joined the L3 plane, which
+        // is when its ANNOUNCE arrives. A link that starts relayed and upgrades
+        // to direct upgrades AFTER that, so the hook saw the relay transport and
+        // declined forever: the rig showed "DIRECT-CONNECT ok (route:
+        // direct-quic)" in the same log as "WireGuard skipped". Reconciling on a
+        // tick is order-independent, picks up a link that goes direct later, and
+        // is idempotent, which an event hook can only approximate.
+        //
+        // Each attempt is spawned rather than awaited: the two ends rendezvous
+        // on a QUIC bi-stream, so whichever side ticks first waits for the
+        // other, and blocking the daemon loop on that would stall everything.
+        if daemon
+            && last_wg_check.elapsed() >= Duration::from_secs(10)
+            && crate::settings::get_str("wireguard", None)
+                .map(|v| v == "on" || v == "true")
+                .unwrap_or(false)
+        {
+            last_wg_check = Instant::now();
+            if let Some(l3) = l3.as_ref() {
+                if crate::wg::usable() {
+                    let ours = l3.my_addr().map(|a| a.to_string()).unwrap_or_default();
+                    for (who, addr, t) in l3.peers_with_transport().await {
+                        // Direct links only: WireGuard needs a real UDP endpoint
+                        // to send to, and a relay link has none to name.
+                        let Some(sa) = t.remote_addr() else { continue };
+                        if t.quic_connection().is_none() {
+                            continue;
+                        }
+                        if !crate::wg::claim_attempt(&addr.to_string()) {
+                            continue; // already announced to this peer
+                        }
+                        let (pubkey, port) = match crate::wg::local_offer() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                crate::wg::release_attempt(&addr.to_string());
+                                ui::debug(&format!("  wg: cannot bring up the interface ({e})"));
+                                continue;
+                            }
+                        };
+                        let _ = sa;
+                        // Straight down the peer's own transport: the control
+                        // channel every other filament message uses.
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "wg-key",
+                                "pubkey": pubkey,
+                                "port": port,
+                            }))
+                            .await;
+                        ui::debug(&format!("  wg: announced our key to {who}"));
+                    }
+                }
             }
         }
 
@@ -20177,21 +20265,6 @@ async fn recv_cmd(
                                                 // that is a fleet member could never
                                                 // be authorized by any route at all.
                                                 //
-                                                // KNOWN COARSENESS, deliberately
-                                                // recorded rather than hidden: a
-                                                // ceiling carries an ACTION and no
-                                                // resource, so `route` in a ceiling
-                                                // authorizes ANY prefix that member
-                                                // advertises, including 0.0.0.0/0.
-                                                // It is bounded by accept-routes
-                                                // being off by default and settable
-                                                // per peer, so nothing installs
-                                                // without the receiver opting in.
-                                                // Narrowing it to a per-prefix
-                                                // ceiling needs a v3 invitation
-                                                // token, since v2 encodes caps as an
-                                                // 8-bit mask with nowhere to put a
-                                                // CIDR. See docs/design-subnet-routes.md.
                                                 // Read the ceiling from the PERSISTED
                                                 // record, not from the link's
                                                 // principal. Which admission path ran
@@ -20208,18 +20281,35 @@ async fn recv_cmd(
                                                 // same source `devices` renders and
                                                 // `grant` consults, so all three agree
                                                 // by construction.
-                                                let delegated_route = principal_ceiling_for(&who)
-                                                    .map(|c| {
-                                                        c.iter().any(|x| {
-                                                            x.as_str() == crate::capability::CAP_ROUTE
+                                                //
+                                                // SCOPED, not a bare yes. The ceiling
+                                                // entries are `route:<cidr>`, taken
+                                                // from the signed invitation, so this
+                                                // asks whether the advertised prefix
+                                                // is INSIDE one the owner allowed. A
+                                                // bare `route` used to authorise every
+                                                // prefix a member cared to advertise,
+                                                // 0.0.0.0/0 included, which is an exit
+                                                // node the owner never agreed to.
+                                                let ceiling_routes: Vec<String> =
+                                                    principal_ceiling_for(&who)
+                                                        .unwrap_or_default()
+                                                        .iter()
+                                                        .filter_map(|c| {
+                                                            c.strip_prefix("route:")
+                                                                .map(str::to_string)
                                                         })
-                                                    })
-                                                    .unwrap_or(false);
+                                                        .collect();
                                                 let ok = crate::l3::installable_routes(
                                                     &advertised,
                                                     accept,
                                                     |cidr| {
-                                                        if delegated_route { return true; }
+                                                        if crate::capability::cidr_within_any(
+                                                            cidr,
+                                                            &ceiling_routes,
+                                                        ) {
+                                                            return true;
+                                                        }
                                                         let Some(pk) = owner_pk else { return false };
                                                         let Ok(res) =
                                                             crate::capability::route_resource_id(
@@ -20323,6 +20413,81 @@ async fn recv_cmd(
                             })
                             .unwrap_or_default();
                         let _ = tx.send(ports);
+                    }
+                }
+                // WireGuard key announcement. Symmetric: whoever hears one
+                // configures that peer and answers with its own if it has not
+                // already, so two messages converge and neither end waits for
+                // the other to move first. This rides the control channel
+                // because an out-of-band QUIC stream races with filament's own
+                // stream acceptor: the first version opened one and both ends
+                // hung after creating their interface.
+                Some("wg-key") => {
+                    let enabled = crate::settings::get_str("wireguard", None)
+                        .map(|x| x == "on" || x == "true")
+                        .unwrap_or(false);
+                    if enabled && crate::wg::usable() {
+                        let peer_pub = v["pubkey"].as_str().unwrap_or_default().to_string();
+                        let peer_port = v["port"].as_u64().unwrap_or(0) as u16;
+                        let underlay = conn.transport_of(&pid).and_then(|t| t.remote_addr());
+                        let peer_overlay = l3
+                            .as_ref()
+                            .map(|l| l.peer_overlay_of(&pid))
+                            .unwrap_or(None);
+                        let ours = l3
+                            .as_ref()
+                            .and_then(|l| l.my_addr())
+                            .map(|a| a.to_string())
+                            .unwrap_or_default();
+                        match (underlay, peer_overlay) {
+                            (Some(sa), Some(po)) if !peer_pub.is_empty() && peer_port != 0 => {
+                                match crate::wg::local_offer() {
+                                    Ok((our_pub, our_port)) => {
+                                        // The peer's real endpoint and port are
+                                        // no longer needed: WireGuard talks to a
+                                        // loopback stand-in and filament carries
+                                        // the frames, so NAT never sees a
+                                        // WireGuard packet.
+                                        if let Err(e) = crate::wg::adopt_peer(
+                                            &peer_pub,
+                                            &po.to_string(),
+                                            &ours,
+                                            1380,
+                                            sa.ip(),
+                                            peer_port,
+                                        )
+                                        .await
+                                        {
+                                            ui::debug(&format!("  wg: could not adopt peer ({e})"));
+                                        } else {
+                                            ui::say(&format!(
+                                                "  {} WireGuard tunnel to {}",
+                                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                                conn.link(&pid).map(|l| l.shown()).unwrap_or_default()
+                                            ));
+                                        }
+                                        // Answer once, so the other end can
+                                        // adopt us too. claim_attempt makes this
+                                        // idempotent across repeats.
+                                        if crate::wg::claim_attempt(&po.to_string()) {
+                                            if let Some(t) = conn.transport_of(&pid) {
+                                                let _ = t
+                                                    .send_control(&json!({
+                                                        "type": "wg-key",
+                                                        "pubkey": our_pub,
+                                                        "port": our_port,
+                                                    }))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        ui::debug(&format!("  wg: no local interface ({e})"))
+                                    }
+                                }
+                            }
+                            _ => ui::debug("  wg: key announcement ignored (no direct endpoint or overlay address yet)"),
+                        }
                     }
                 }
                 // Certificate renewal. Expiry is the only bound this system has,
@@ -25874,6 +26039,7 @@ mod tests {
             Reuse::Once,
             false,
             "alice".into(),
+            Vec::new(),
         )
         .unwrap();
         let token = format!(

@@ -249,3 +249,43 @@ nobody re-derives it and assumes it works.
 What remains is genuinely small and would need evidence from a machine where
 startup is actually slow, since none of the profiling here reproduces the
 original report. `experiments/startup-bench.sh` exists for exactly that.
+
+## WireGuard vs the QUIC-datagram plane: measured
+
+`experiments/wireguard-throughput.sh` pushes a TCP stream over the OVERLAY
+(not filament's file-transfer path, which has its own framing and would measure
+that instead) between do-vm and a KVM VPS, and reports MB/s.
+
+| plane | runs | median | spread |
+|---|---|---|---|
+| QUIC datagrams | 13.82, 9.15, 7.18, 10.47 | **9.81 MB/s** | 7.18-13.82 (68% of median) |
+| WireGuard | 7.24, 9.23, 7.91, 7.66 | **7.79 MB/s** | 7.24-9.23 (26% of median) |
+
+An earlier QUIC sample the same evening was 4.89-15.38 MB/s, median 10.80.
+
+### Reading this honestly
+
+WireGuard measures about **20% slower** here, and that is INSIDE the noise, not a
+result. The QUIC arm's own spread is 68% of its median and it ranged 4.89 to
+15.38 MB/s across the session: a 20% gap between two samples drawn from that is
+not a difference anyone should act on. The only claim these numbers support is
+that **WireGuard is in the same class**, not that it is faster or slower.
+
+Two things do stand out and are worth keeping:
+
+- **WireGuard is markedly more CONSISTENT** (26% spread against 68%). That is
+  what one would expect from moving crypto into the kernel and off a
+  single-threaded userspace loop, but with four runs it is a hint, not a finding.
+- **The bottleneck is almost certainly the internet path, not either plane.**
+  Both sit near 8-11 MB/s on a link whose file-transfer throughput has been
+  measured at 18-19 MB/s elsewhere in the session, so this benchmark is probably
+  measuring the sink, the single TCP stream, or the path rather than the data
+  plane.
+
+### What would actually settle it
+
+A same-host measurement between two namespaces, where the wire is not the
+bottleneck, with enough runs to separate the medians. Until that exists,
+`wireguard` stays OPT-IN: there is no evidence it is faster, and shipping a data
+plane change on a hint would be the opposite of how the rest of this work was
+done.

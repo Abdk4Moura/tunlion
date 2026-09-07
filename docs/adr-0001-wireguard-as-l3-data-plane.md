@@ -193,3 +193,210 @@ WireGuard is still the admin-mode default for non-browser users.
    the portfolio's path selection.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
+
+## 2026-09-07: the relay is deleted, and boringtun is NOT the answer here
+
+The loopback relay is gone. It was dominated, as recorded below. But the
+replacement it was supposed to make way for, boringtun over filament's transport,
+should NOT be built, and the reason is specific to filament rather than a
+judgement about boringtun.
+
+**filament's transport is already an authenticated encrypted channel.** A direct
+link is QUIC with rustls/TLS 1.3; a relayed link is a WebRTC DataChannel over
+DTLS. Running WireGuard inside either encrypts the same bytes twice and
+authenticates a peer that the transport has already authenticated. It costs CPU
+and buys nothing.
+
+**That is exactly where filament differs from Tailscale.** Tailscale needs
+wireguard-go because DERP is a dumb packet forwarder with no per-peer crypto of
+its own: WireGuard IS its security layer, so it must run somewhere, and userspace
+is the only place they can own the socket. filament's relay is not DERP. It is a
+mutually authenticated tunnel in its own right, so the security layer already
+exists and the QUIC-datagram plane already carries a NATed peer over the same
+punched path.
+
+So the honest shape is two planes, not three:
+
+1. **Kernel WireGuard, direct**, when the peer's endpoint is reachable. Kernel
+   crypto, kernel data path, no userspace at all. This is the whole reason to use
+   kernel WireGuard, and it is the case that is worth having.
+2. **The existing QUIC-datagram plane** for everyone else. Already written,
+   already measured, already encrypted and authenticated.
+
+A peer whose direct WireGuard path does not handshake within 8s has its peer
+entry REMOVED rather than re-pointed at a tunnel-inside-a-tunnel, so it stays on
+the plane it was already using and no route is left pointing into something that
+carries nothing.
+
+What would change this: if filament ever gains a transport that forwards
+ciphertext without authenticating peers (a true DERP equivalent), WireGuard would
+become the security layer for that path and boringtun would earn its place.
+
+## 2026-09-07, correction: kernel-direct works, and my rig said otherwise
+
+Plain kernel WireGuard between do-vm and the KVM VPS, no filament involved:
+
+    endpoint: 162.35.114.254:51999
+    latest handshake: 11 seconds ago
+    3 packets transmitted, 3 received, rtt avg 76.345 ms
+
+So the earlier conclusion that kernel-to-kernel could not handshake was WRONG,
+and it was wrong because of the test rig, not the code. Each daemon runs in a
+network namespace (l3::ifname() is a const, so two daemons on one host cannot
+both hold filament0), and those namespaces reach the internet through a
+MASQUERADE I wrote. That self-inflicted NAT is what had no inbound mapping for
+WireGuard's port. Both machines have PUBLIC IPs; in the real topology the NAT
+does not exist. An artificial constraint in the harness was read as a property of
+the system.
+
+### What this changes
+
+**Kernel-direct is the default, not a rung.** For any peer whose WireGuard port
+is reachable (a public IP, a port-forward), there is no userspace in the data
+path at all, which is the entire reason to use kernel WireGuard. That covers
+servers, which is where throughput matters most.
+
+**Reachability, not privilege, is the only thing that can force a fallback.**
+Privilege decides whether kernel WireGuard is available; NAT decides whether its
+socket can be reached. They are independent, and the second is the harder one:
+filament punches holes with its OWN socket, and kernel WireGuard cannot share it.
+
+### On the fallback, and what Tailscale actually does
+
+Tailscale does not use kernel WireGuard for this. It ships **wireguard-go**, a
+USERSPACE implementation, precisely so it owns the UDP socket and can do its own
+endpoint discovery and DERP relaying. Owning the socket is what makes NAT
+traversal possible at all, and they pay userspace crypto to get it.
+
+That is the lesson, and it says the loopback relay currently in the tree is the
+wrong fallback. It costs kernel WireGuard -> userspace relay -> transport, two
+extra context switches per packet, to get what an in-process userspace WireGuard
+gets in one: encrypt in process, hand straight to the transport.
+
+So the shape should be:
+
+1. **Kernel WireGuard, direct** when the peer's endpoint is reachable. Default.
+   No userspace in the path. Proven above.
+2. **boringtun** (an audited Rust WireGuard) over filament's transport when it is
+   not. This is Tailscale's model and strictly cheaper than the loopback relay.
+3. **Delete the loopback relay** once 2 exists; it is dominated by it.
+
+And explicitly NOT: reimplementing the WireGuard protocol over QUIC. The protocol
+is the valuable part and it is already implemented well; a rewrite would inherit
+the risk of hand-rolled crypto for none of the benefit. Using boringtun is the
+same idea done with a library.
+
+## Status 2026-09-07: WORKING. Kernel WireGuard over filament's transport.
+
+A kernel WireGuard tunnel between two machines, keyed over filament's own
+authenticated connection, with a completed handshake, verified by
+`experiments/wireguard-2machine.sh`:
+
+    peers: 1
+    endpoint: 127.0.0.1:57333
+    allowed ips: fdf1:1af7:c30d:a2:a7e7:1a0d:e2e1:40e8/128
+    latest handshake: 1 second ago
+    transfer: 124 B received, 180 B sent
+
+### The design, and why it is decision 2 of this ADR rather than a workaround
+
+Kernel WireGuard owns its UDP socket, so it does its own NAT traversal, and it
+has none: both ends announced their INTERNAL listen port, the NAT had no inbound
+mapping, and every handshake was dropped. The answer is not to teach WireGuard
+about NAT. It is to stop WireGuard touching the network at all.
+
+Each side points its peer's endpoint at a filament-owned UDP socket on LOOPBACK,
+and filament carries the frames over the path it has already punched:
+
+    kernel WG --UDP--> 127.0.0.1:relay --filament transport--> peer's relay --> its WG
+
+That is exactly "WireGuard rides on top of whichever underlay path won": filament
+keeps identity, discovery, NAT traversal and relay fallback; WireGuard gets the
+data plane. The `endpoint: 127.0.0.1` in the output above is the whole point.
+
+**The demux needs no format change.** Datagrams already carry raw IP packets and
+the receiver reads the version nibble. A WireGuard frame's first byte is its
+message type, 1..=4, which cannot collide with 0x4_ (IPv4) or 0x6_ (IPv6), so a
+WireGuard frame is self-identifying on the existing datagram channel. The L3
+pump splits them: WireGuard frames go to the peer's relay, everything else to the
+TUN, where a WireGuard frame would have been a malformed IP packet.
+
+**It is not slower than the plane it joins.** The hot path was
+`TUN read -> transport`; it is now `UDP read -> transport`, the same number of
+userspace copies, with the crypto moved into the kernel and onto WireGuard's
+multi-threaded data path instead of the single-threaded QUIC-datagram loop this
+ADR was written to replace.
+
+### Still to do before it is the default
+
+- It is opt-in (`filament set wireguard on`) and stays that way until the
+  throughput case is measured against the QUIC plane on the two-machine rig.
+- The relay socket binds `127.0.0.1:0` per peer. Anything that could reach it
+  could inject frames the peer never sent, which is why it is loopback-only;
+  a shared socket with per-peer demux would be tidier and is not required.
+- macOS and Windows are untouched: `usable()` answers no there, and the QUIC
+  plane carries everything as before.
+
+## Status 2026-09-07: keys exchange and peers configure; the handshake is blocked by NAT
+
+The module had `mod wg;` and ZERO callers. It is now wired, reconciling, and both
+ends configure each other. What it does NOT yet do is complete a handshake, and
+the reason is architectural rather than a bug.
+
+### What works
+
+`filament set wireguard on` (off by default: this changes the DATA PLANE).
+Reconciliation runs on a 10s TICK, not an event, because a link that starts
+relayed upgrades to direct AFTER the announce and an event hook missed it.
+
+The key exchange rides the CONTROL CHANNEL, the same path certificate renewal
+uses. The first version opened a raw QUIC bi-stream and both ends hung forever
+after creating their interface: filament multiplexes its own protocol over that
+connection and runs its own stream acceptor, so an out-of-band stream races with
+it. The exchange is now symmetric with no initiator: each side announces its key,
+each configures the other on receipt, and two messages converge.
+
+Measured between two machines over the real internet: both logged
+`WireGuard tunnel to <peer>`, `wg show` reported **1 peer** with the right
+endpoint and allowed-ips, and 148 B was sent.
+
+### What does not, and why it is not a bug to fix in wg.rs
+
+**0 B received, no handshake.** The endpoint each side announces is its own
+WireGuard listen port, and both daemons sit behind NAT. The announced port is the
+INTERNAL one; the NAT has no inbound mapping for it, so handshake packets are
+dropped. WireGuard opened its own UDP socket instead of using the path filament
+had already punched.
+
+That is exactly what decision point 2 of this ADR says must not happen:
+"WireGuard rides on top of whichever underlay path won... The direct-TCP arm
+stops being a competing L3 plane and becomes a path option *under* WireGuard."
+A WireGuard peer with its own socket is a SECOND connectivity story, and it
+inherits none of filament's NAT traversal.
+
+### The next step, concretely
+
+Two options, and they are not equivalent:
+
+1. **Userspace WireGuard over filament's transport** (boringtun-style): WG frames
+   ride filament's existing punched path as datagrams. Keeps every property
+   filament already has, is the ADR's stated design, and is the larger job.
+2. **Kernel WireGuard with a punched endpoint**: teach the exchange to announce
+   the EXTERNAL mapped address, which means either reusing filament's ICE result
+   for the WG socket or port-forwarding. Cheaper, but it re-implements NAT
+   traversal that filament already owns, which is what the ADR warns against.
+
+Option 1 is the right one. `experiments/wireguard-2machine.sh` reproduces the
+current state end to end and fails on the handshake assertion, which is the
+correct place for it to fail.
+
+## Status 2026-09-06: wired and reconciling; the key exchange does not yet complete
+
+See the commit history for detail. The module is wired (warnings 115 -> 95),
+reconciles on a 10s tick, and creates `filament-wg` on both machines. The peer is
+not configured yet: `wg show` reports zero peers, so no tunnel has carried a
+packet. Three real bugs were found and fixed on the way (a probe interface name
+one character over the Linux 15-char limit, which made the capability check
+always answer no; both ends able to pick the same exchange role; and no timeout
+on the exchange, which made that deadlock silent). Reproduce with
+`experiments/wireguard-2machine.sh`.
