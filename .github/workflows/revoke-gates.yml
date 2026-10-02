@@ -25,7 +25,7 @@
 #
 # Also carries forward-refusal-gates (#232/#268): the same question, asked of a
 # peer that refuses an l2-open rather than one that revokes. It lives here
-# because it is the same fixture family and the same property, what filament
+# because it is the same fixture family and the same property, what tunlion
 # tells you when the far side says no. There was no gate for it at all, which is
 # why #268 had to be found by hand across two machines.
 #
@@ -95,7 +95,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Build filament
+      - name: Build tunlion
         working-directory: cli
         run: cargo build --release
 
@@ -107,7 +107,7 @@ jobs:
       # lines is what makes "green" mean "the gates ran AND passed".
       - name: Run revocation gates
         env:
-          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/filament
+          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/tunlion
         run: |
           set -uo pipefail
           # Full paths, not bare names under a working-directory. The registry

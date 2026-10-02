@@ -1,4 +1,4 @@
-//! The receive command (`filament recv`) and its event loop, lifted out of `main.rs`.
+//! The receive command (`tunlion recv`) and its event loop, lifted out of `main.rs`.
 //!
 //! One unit, moved without splitting the body: the setup phase that builds the
 //! connection, then the single `loop` + `select!` that drives it. Nothing inside was
@@ -490,7 +490,7 @@ async fn handle_pty_open(
     if !l2_enabled {
         let sid = l2::wire_sid(&v).unwrap_or(0);
         let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `filament up --shell` on that device" }))
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `tunlion up --shell` on that device" }))
                 .await;
         return;
     }
@@ -792,7 +792,7 @@ pub(crate) async fn recv_cmd(
                 "ask before each offer"
             }
         );
-        let mut replay = vec!["filament".to_string(), "receive".to_string()];
+        let mut replay = vec!["tunlion".to_string(), "receive".to_string()];
         if let Some(code) = code.as_deref() {
             replay.push(command_arg(code));
         }
@@ -922,7 +922,7 @@ pub(crate) async fn recv_cmd(
     // concurrent candidate ceremonies; further candidates are ignored (the real
     // sender is, in practice, among the first to share the room with the claimer).
     const RECV_MAX_CANDIDATES: usize = 8;
-    // #211: the control socket must be ACCEPTING before "filament up" is printed.
+    // #211: the control socket must be ACCEPTING before "tunlion up" is printed.
     // A sibling `mint` can race the bind and silently fail to arm otherwise.
     // Create the control channel here (before the banner) and spawn the server
     // with a readiness signal the banner awaits. `ctl_tx` is held for the loop's
@@ -940,7 +940,7 @@ pub(crate) async fn recv_cmd(
                 if let Err(e) =
                     ctl::serve_at(crate::ctl::control_sock_path(), ctl_tx, Some(ready_tx)).await
                 {
-                    crate::ui::trace(&format!("filament: control socket disabled: {e}"));
+                    crate::ui::trace(&format!("tunlion: control socket disabled: {e}"));
                 }
             });
         }
@@ -1017,7 +1017,7 @@ pub(crate) async fn recv_cmd(
             sess.emit(&sio, "subscribe", json!({ "channels": c })).await;
             sess.channels = c;
             ui::say(&format!(
-                "  {} filament up, {} known device{} {} {}",
+                "  {} tunlion up, {} known device{} {} {}",
                 ui::paint(ui::Tone::Brand, "●"),
                 devices.len(),
                 if devices.len() == 1 { "" } else { "s" },
@@ -1026,7 +1026,7 @@ pub(crate) async fn recv_cmd(
             ));
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                "  trusted devices only · invisible to strangers · Ctrl-C or `filament down` to stop",
+                "  trusted devices only · invisible to strangers · Ctrl-C or `tunlion down` to stop",
             ));
             // C29: this is a SESSION, like a browser tab, pairing and petname
             // management happen right here.
@@ -1079,7 +1079,7 @@ pub(crate) async fn recv_cmd(
     // on (you can't ssh in without the acceptor). See its second use below.
     // L2/shell is ON when: an `--shell`/`--shell-only` policy turns it on, the
     // FILAMENT_L2 opt-in is set, OR any known device has been `grant`ed shell (so
-    // `filament grant <dev> shell` works on a plain `up` without restarting with a
+    // `tunlion grant <dev> shell` works on a plain `up` without restarting with a
     // flag, matching what the grant command tells the user). The per-device gate
     // below still denies every non-granted device, so this never widens access.
     let l2_enabled = shell_policy.enables_l2()
@@ -1103,7 +1103,7 @@ pub(crate) async fn recv_cmd(
         // L2/ssh acceptor, OR when this is the long-lived `up` daemon. Any acceptor
         // MUST answer the initiator's transport-offer (direct-QUIC over the
         // reachable host candidate, e.g. Tailscale) rather than build a colliding
-        // WebRTC peer (glare). For `up --shell` this kills the `filament shell --ssh`
+        // WebRTC peer (glare). For `up --shell` this kills the `tunlion shell --ssh`
         // "stuck while connecting" failure; for a plain `up` it kills the up<->up
         // glare/supersede churn (two known daemons each racing to be the WebRTC
         // initiator). See `direct_ok_for`. One-shot send/recv/pair (daemon=false)
@@ -1144,7 +1144,7 @@ pub(crate) async fn recv_cmd(
         });
     }
     // C29: the stdin owner also runs for an INTERACTIVE daemon (a terminal-
-    // attached `filament up` is a session); `up --install` under systemd has
+    // attached `tunlion up` is a session); `up --install` under systemd has
     // no tty, so headless daemons stay stdin-free.
     let interactive = !daemon || std::io::stdin().is_terminal();
     let tty_guard = if interactive && std::io::stdin().is_terminal() {
@@ -1281,10 +1281,10 @@ pub(crate) async fn recv_cmd(
                                     "    host firewall/nftables are NOT enforced here; only mesh membership + the expose allowlist gate access",
                                 ));
                                 ui::say(
-                                    "    native tools reach <peer>.mesh via `filament forward <peer>:<port> --socks` (no kernel route in userspace)",
+                                    "    native tools reach <peer>.mesh via `tunlion forward <peer>:<port> --socks` (no kernel route in userspace)",
                                 );
                                 // Auto-start SOCKS5 proxy when kernel TUN is unavailable.
-                                // Opt-out via --no-proxy-fallback or `filament set auto-proxy off`.
+                                // Opt-out via --no-proxy-fallback or `tunlion set auto-proxy off`.
                                 let auto_proxy =
                                     settings::get_bool("auto-proxy", None) && !no_proxy_fallback;
                                 if auto_proxy {
@@ -1334,7 +1334,7 @@ pub(crate) async fn recv_cmd(
                             }
                             // Add this machine's own address to MagicDNS so
                             // `<name>.mesh` resolves locally (not just peers).
-                            // Uses the filament device name (from `filament set name`
+                            // Uses the tunlion device name (from `tunlion set name`
                             // or hostname if unset), sanitized for DNS.
                             if let Some(id) = m.identity_ref() {
                                 let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
@@ -1371,7 +1371,7 @@ pub(crate) async fn recv_cmd(
     } else {
         None
     };
-    // `filament expose`: once the overlay is up, bind the persisted ports on the
+    // `tunlion expose`: once the overlay is up, bind the persisted ports on the
     // overlay address and forward each to its local target. Reconciled live on a
     // ReloadExpose control request (expose/unexpose without a restart).
     #[cfg(l3)]
@@ -1392,7 +1392,7 @@ pub(crate) async fn recv_cmd(
                         "  expose.json NOT honored: L3 fell back to userspace (host firewall is bypassed there).",
                     ));
                     ui::say(
-                        "    opt in with `filament up --userspace` or `filament set l3-mode userspace` to expose in userspace mode",
+                        "    opt in with `tunlion up --userspace` or `tunlion set l3-mode userspace` to expose in userspace mode",
                     );
                 }
                 let ex = expose::Exposer::new(m.clone());
@@ -1446,7 +1446,7 @@ pub(crate) async fn recv_cmd(
     let mut pending_bootstrap: PendingBootstraps = HashMap::new();
     // Warm-link reuse: ONLY the registered `up` daemon exposes the local control
     // socket (a short-lived `recv`/`send` must never bind it and steal the
-    // daemon's path). When a sibling `filament shell --ssh`/`netcat`/`forward` asks to
+    // daemon's path). When a sibling `tunlion shell --ssh`/`netcat`/`forward` asks to
     // reach a peer we already hold a link to, we open a new L2 stream over that
     // warm link instead of making the sibling establish a fresh one. `ctl_tx`
     // was created (and `serve` spawned, when we are the daemon) before the
@@ -1472,7 +1472,7 @@ pub(crate) async fn recv_cmd(
     let _saw_known_peer: HashSet<String> = HashSet::new();
     // C12 live-pairing: the roster (`devices`) is loaded ONCE at startup, and
     // KnownPeer events only fire for channels we've SUBSCRIBED. A device paired
-    // into the shared store by a SEPARATE `filament pair` process AFTER the
+    // into the shared store by a SEPARATE `tunlion pair` process AFTER the
     // daemon is up was therefore invisible until restart, it never got a
     // subscription, so its "appeared, connecting" flow never fired and it
     // could not connect (no transfer, no web-shell). We now re-scan the store
@@ -1629,7 +1629,7 @@ pub(crate) async fn recv_cmd(
                     // stashes the socket in pending_bootstrap instead.
                     #[cfg(unix)]
                     {
-                        // `filament set` live-reconfigure: re-read the changed key
+                        // `tunlion set` live-reconfigure: re-read the changed key
                         // into this loop's live state, then report whether it took
                         // without a restart. Handled here (we own dir/policy/sess).
                         if let ctl::ReqKind::Reconfigure { key } = &req.kind {
@@ -1640,7 +1640,7 @@ pub(crate) async fn recv_cmd(
                             ).await;
                             req.reply(&json!({ "ok": true, "live": live })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ReloadExpose) {
-                            // `filament expose`/`unexpose`: reconcile overlay
+                            // `tunlion expose`/`unexpose`: reconcile overlay
                             // listeners from expose.json. live:true only if L3 is up.
                             let (live, count): (bool, usize) = {
                                 #[cfg(l3)]
@@ -1657,7 +1657,7 @@ pub(crate) async fn recv_cmd(
                             };
                             req.reply(&json!({ "ok": true, "live": live, "count": count })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::Reload) {
-                            // `filament update` reload: only safe when a supervisor
+                            // `tunlion update` reload: only safe when a supervisor
                             // will bring us back (systemd sets INVOCATION_ID). Reply
                             // FIRST (the shutdown closes the ctl socket), then take the
                             // SAME graceful path SIGTERM does - which cleanly closes the
@@ -1669,7 +1669,7 @@ pub(crate) async fn recv_cmd(
                             let supervised = std::env::var("INVOCATION_ID").is_ok();
                             req.reply(&json!({ "ok": true, "reloading": supervised })).await;
                             if supervised {
-                                ui::say("filament: reloading onto the updated binary (graceful restart)");
+                                ui::say("tunlion: reloading onto the updated binary (graceful restart)");
                                 #[cfg(unix)]
                                 unsafe { libc::raise(libc::SIGTERM); }
                             }
@@ -2403,7 +2403,7 @@ pub(crate) async fn recv_cmd(
                 .collect();
             for pid in dead {
                 ui::debug(&format!(
-                    "filament: link to '{pid}' died, dropping so it can re-connect"
+                    "tunlion: link to '{pid}' died, dropping so it can re-connect"
                 ));
                 conn.drop_link(&pid);
                 l2_muxes.remove(&pid);
@@ -2486,7 +2486,7 @@ pub(crate) async fn recv_cmd(
                         };
                         let _ = sa;
                         // Straight down the peer's own transport: the control
-                        // channel every other filament message uses.
+                        // channel every other tunlion message uses.
                         let _ = t
                             .send_control(&json!({
                                 "type": "wg-key",
@@ -2581,7 +2581,7 @@ pub(crate) async fn recv_cmd(
 
         // WARM-HOLD: periodically check for warm peers that need connections.
         // This keeps recently-used and explicitly configured peers connected
-        // so `filament reach`/`ssh` is instant. Runs every 10s, daemon-only.
+        // so `tunlion reach`/`ssh` is instant. Runs every 10s, daemon-only.
         if daemon && last_warm_hold_tick.elapsed() >= Duration::from_secs(10) {
             last_warm_hold_tick = Instant::now();
             // Warm-all is the DEFAULT (auto-warm setting, opt-out). L3 forces it on:
@@ -2591,7 +2591,7 @@ pub(crate) async fn recv_cmd(
         }
 
         // C12 live-pairing: pick up devices paired AFTER we started (a separate
-        // `filament pair` writes them into the shared store atomically). Re-read
+        // `tunlion pair` writes them into the shared store atomically). Re-read
         // every ~2s, subscribe to any channel we don't already watch, and feed
         // them into `devices` so the KnownPeer handler recognizes them. We never
         // re-subscribe existing channels or touch live links. Daemon-only: a
@@ -2951,7 +2951,7 @@ pub(crate) async fn recv_cmd(
             Ev::DropLink(pid) => {
                 if conn.links.contains_key(&pid) {
                     ui::debug(&format!(
-                        "filament: dropping zombie warm link to '{pid}' (black-holed a stream)"
+                        "tunlion: dropping zombie warm link to '{pid}' (black-holed a stream)"
                     ));
                     conn.drop_link(&pid);
                     l2_muxes.remove(&pid);
@@ -3139,7 +3139,7 @@ pub(crate) async fn recv_cmd(
                 ui::say("");
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  say it aloud; they type it in the web app or `filament join <code>` / one claim / 10 min",
+                    "  say it aloud; they type it in the web app or `tunlion join <code>` / one claim / 10 min",
                 ));
             }
             Ev::PairUsed(_) => {
@@ -3798,7 +3798,7 @@ pub(crate) async fn recv_cmd(
                                     let v4 = pending.addr_v4();
                                     l3.add_peer(&pid, &who, ip.into(), Some(v4.into()), t.clone())
                                         .await;
-                                    // Store overlay addresses for `filament addr <device>`
+                                    // Store overlay addresses for `tunlion addr <device>`
                                     devices_touch(&who, Some(ip), Some(v4));
                                 } else {
                                     ui::debug(&format!(
@@ -4071,7 +4071,7 @@ pub(crate) async fn recv_cmd(
                                     // that holds grants.
                                     let proven_name = device_name_for_pub(&ok.device_pub);
                                     // The ceiling comes from the RECORD, which is
-                                    // what `filament grant` edits. Hardcoding it
+                                    // what `tunlion grant` edits. Hardcoding it
                                     // empty made auto-mesh peers ungrantable: the
                                     // grant landed in devices.json and the live
                                     // link kept refusing, so `grant` silently did
@@ -4129,7 +4129,7 @@ pub(crate) async fn recv_cmd(
                                         // the claimed display name, presentation only.
                                         let shown =
                                             proven_name.clone().unwrap_or(ok.claimed_name.clone());
-                                        // Record the sibling so `filament devices`
+                                        // Record the sibling so `tunlion devices`
                                         // can show the fleet. Deliberately with NO
                                         // pair secret: devices_load() filter-maps on
                                         // `secret`, so this record can never become a
@@ -4665,7 +4665,7 @@ pub(crate) async fn recv_cmd(
                 // configures that peer and answers with its own if it has not
                 // already, so two messages converge and neither end waits for
                 // the other to move first. This rides the control channel
-                // because an out-of-band QUIC stream races with filament's own
+                // because an out-of-band QUIC stream races with tunlion's own
                 // stream acceptor: the first version opened one and both ends
                 // hung after creating their interface.
                 Some("wg-key") => {
@@ -4691,7 +4691,7 @@ pub(crate) async fn recv_cmd(
                                     Ok((our_pub, our_port)) => {
                                         // The peer's real endpoint and port are
                                         // no longer needed: WireGuard talks to a
-                                        // loopback stand-in and filament carries
+                                        // loopback stand-in and tunlion carries
                                         // the frames, so NAT never sees a
                                         // WireGuard packet.
                                         if let Err(e) = crate::wg::adopt_peer(
@@ -4889,7 +4889,7 @@ pub(crate) async fn recv_cmd(
                 // The write happens only here (over the authenticated channel)
                 // into a clearly-marked, removable authorized_keys block.
                 // Warm-bootstrap (INITIATOR side): the peer answered a
-                // `shell-bootstrap` we relayed over its warm link for a `filament
+                // `shell-bootstrap` we relayed over its warm link for a `tunlion
                 // ssh`. Complete the stashed reply socket(s) for this pid; the
                 // client then pins these host keys and skips the cold establish.
                 #[cfg(unix)]
@@ -4914,7 +4914,7 @@ pub(crate) async fn recv_cmd(
                 // through and be IGNORED. The initiator has already committed a
                 // client to that stream, so it waits for an answer that is never
                 // coming: measured cross-machine, curl hung for its full 25s
-                // timeout while filament printed nothing at either end.
+                // timeout while tunlion printed nothing at either end.
                 //
                 // `shell-bootstrap` directly below already refuses explicitly in
                 // this exact state. The tunnel open, which is the more common
@@ -4960,9 +4960,9 @@ pub(crate) async fn recv_cmd(
                 // because both outcomes still build.
                 // Shell serving is OFF here. Without this arm the message falls
                 // through the match and the acceptor says NOTHING, so the caller
-                // can only time out: `filament shell X --ssh` burned its full
+                // can only time out: `tunlion shell X --ssh` burned its full
                 // bootstrap deadline and then guessed, while plain
-                // `filament shell X` printed the reason immediately. The refusal
+                // `tunlion shell X` printed the reason immediately. The refusal
                 // exists; only this path failed to send it. Measured across three
                 // machines, not inferred.
                 #[cfg(unix)]
@@ -5148,7 +5148,7 @@ pub(crate) async fn recv_cmd(
                             let hostkeys = sshkeys::host_pubkeys();
                             let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
                             // Tell the initiator whether an sshd is actually
-                            // listening on the port `filament shell --ssh` will dial here,
+                            // listening on the port `tunlion shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
                             // spawning ssh into a refused/black-holed connection.
                             let ssh_port = v["ssh_port"]
@@ -5337,7 +5337,7 @@ pub(crate) async fn recv_cmd(
                             _ => false,
                         };
                         // #42 HOLD-OUT (advisor call): the mount scoped-DEFAULT is not
-                        // shipped in this release. It is not drivable today (filament
+                        // shipped in this release. It is not drivable today (tunlion
                         // mount has no --auth-key, and an OwnerDevice cannot reach
                         // Proven), so its scope enforcement (within_share /
                         // path_within_canonical + the read-only EROFS path) has NEVER
@@ -5534,7 +5534,7 @@ pub(crate) async fn recv_cmd(
                                 .await
                                 .ok();
                             ui::say(&format!(
-                                "  {} {} mutually remembered, rename anytime: filament devices rename {n} <new>",
+                                "  {} {} mutually remembered, rename anytime: tunlion devices rename {n} <new>",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
@@ -5598,7 +5598,7 @@ pub(crate) async fn recv_cmd(
                             .ok();
                             ceremony_secret = fresh_secret(); // never reuse across devices
                             ui::say(&format!(
-                                "  {} {} mutually remembered, rename anytime: filament devices rename {n} <new>",
+                                "  {} {} mutually remembered, rename anytime: tunlion devices rename {n} <new>",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
@@ -7037,13 +7037,13 @@ pub(crate) async fn recv_cmd(
                 // One string served two situations. "partials kept; run the
                 // same command to resume" is exactly right for an interrupted
                 // transfer and meaningless for a daemon, which has no partials
-                // to keep: Ctrl-C out of `filament up` printed a transfer's
+                // to keep: Ctrl-C out of `tunlion up` printed a transfer's
                 // recovery advice. Observed on two machines. The daemon's own
-                // banner already says "Ctrl-C or `filament down` to stop", so
+                // banner already says "Ctrl-C or `tunlion down` to stop", so
                 // say the thing that banner promised.
                 if daemon {
                     ui::say(&format!(
-                        "  {} stopped serving; `filament up` starts again",
+                        "  {} stopped serving; `tunlion up` starts again",
                         ui::paint(ui::Tone::Dim, "·")
                     ));
                 } else {
@@ -7149,7 +7149,7 @@ pub(crate) async fn recv_cmd(
                     .await?;
                     if st.completed == 0 {
                         bail!(
-                            "lost the sender after {} attempts; the partial is kept, re-run `filament receive <code>` to resume",
+                            "lost the sender after {} attempts; the partial is kept, re-run `tunlion receive <code>` to resume",
                             MAX_ATTEMPTS
                         );
                     }
@@ -7169,7 +7169,7 @@ pub(crate) async fn recv_cmd(
                     .await?;
                     if st.completed == 0 {
                         bail!(
-                            "lost the sender after {} attempts; the partial is kept, re-run `filament receive <code>` to resume",
+                            "lost the sender after {} attempts; the partial is kept, re-run `tunlion receive <code>` to resume",
                             MAX_ATTEMPTS
                         );
                     }

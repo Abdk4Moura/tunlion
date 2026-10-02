@@ -189,7 +189,7 @@ fn applied_slot() -> &'static std::sync::Mutex<Option<Applied>> {
 ///
 /// MUST run on the way out. A FORWARD ACCEPT rule that outlives the daemon is a
 /// hole nobody can see: the machine keeps forwarding for an overlay that is no
-/// longer running, and nothing in `filament status` would ever mention it.
+/// longer running, and nothing in `tunlion status` would ever mention it.
 pub fn cleanup() {
     if let Some(a) = applied_slot().lock().ok().and_then(|mut g| g.take()) {
         disable(&a);

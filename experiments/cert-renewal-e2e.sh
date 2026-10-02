@@ -33,10 +33,10 @@
 # case that actually matters: a device connected for its whole certificate
 # lifetime must not quietly expire while online.
 set -uo pipefail
-BIN=${FILAMENT_BIN:-/tmp/sr-bin/filament}
+BIN=${FILAMENT_BIN:-/tmp/sr-bin/tunlion}
 PEER=${PEER:-interserver-0x0}
-LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/filament}
-W=/tmp/cr-e2e; RDIR=/tmp/cr-peer; RBIN=/tmp/sr-peer-bin/filament
+LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/tunlion}
+W=/tmp/cr-e2e; RDIR=/tmp/cr-peer; RBIN=/tmp/sr-peer-bin/tunlion
 TTL=300; MYNAME=cr-owner
 FAIL=0
 

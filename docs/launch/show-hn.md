@@ -2,10 +2,10 @@
 
 ## Title (pick one; first is recommended)
 
-> Show HN: Filament – P2P file sharing that shows you the route your bytes take
+> Show HN: Tunlion – P2P file sharing that shows you the route your bytes take
 
 Alternates:
-> Show HN: Filament – browser file transfer with visible routing and resumable P2P
+> Show HN: Tunlion – browser file transfer with visible routing and resumable P2P
 > Show HN: I rebuilt my abandoned 2024 file-sharing app and documented every failure mode
 
 ## URL
@@ -13,7 +13,7 @@ https://tunlion.autumated.com
 
 ## Text (paste into the text field)
 
-Filament sends files directly between two browsers over WebRTC — no upload, no
+Tunlion sends files directly between two browsers over WebRTC — no upload, no
 account, no size limit. Devices on the same WiFi find each other automatically;
 across networks you pair with a one-time spoken code ("clever-lynx-63") that
 burns on first use.

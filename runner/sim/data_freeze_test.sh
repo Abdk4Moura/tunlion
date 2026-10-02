@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Filament — P0 DATA-PATH FREEZE gate (the "stuck at 0%" hang, deterministic).
+# Tunlion — P0 DATA-PATH FREEZE gate (the "stuck at 0%" hang, deterministic).
 #
 # This is the SLO-measurement gate for transport-resilience §P0 (GAP-1): the
 # bytes-moved STALL DETECTOR + least-disruptive self-correction. It reproduces
@@ -35,7 +35,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CLI_DIR="$ROOT/cli"
-BIN="${FILJOB_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`

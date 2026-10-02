@@ -29,8 +29,8 @@ class MemoryPressureMonitorTests(unittest.TestCase):
                 self.assertEqual(MONITOR.main(lambda: danger), 1)
                 self.assertEqual(MONITOR.main(lambda: fine), 0)
                 self.assertEqual([subject for subject, _ in alerts], [
-                    "[filament] sustained memory pressure",
-                    "[filament] memory pressure RECOVERED",
+                    "[tunlion] sustained memory pressure",
+                    "[tunlion] memory pressure RECOVERED",
                 ])
                 self.assertIn("cargo/rustc detected", alerts[0][1])
                 self.assertIn("rustc[7] 1200 MiB", alerts[0][1])

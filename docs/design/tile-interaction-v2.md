@@ -39,7 +39,7 @@ the invariant that survives both.
 
 Read against the code on `main`:
 
-### `frontend/src/ui/Filament.jsx` — `PeerTile({ peer, onSendFiles, onOpenSheet, … })`
+### `frontend/src/ui/Tunlion.jsx` — `PeerTile({ peer, onSendFiles, onOpenSheet, … })`
 - **`onClick`** → `ready && inp.current.click()` — opens the OS file picker (SEND).
 - **`onContextMenu`** → `if (showMore) { preventDefault(); openSheet() }` — desktop
   right-click opens the sheet.
@@ -75,7 +75,7 @@ Read against the code on `main`:
 - A visible `⌘K` `paletteBtn` sits in both top bars (discoverable; doubles as the
   mobile launcher).
 
-### Root wiring (`Filament` default export)
+### Root wiring (`Tunlion` default export)
 - `openSheet = (peer, rect) => setSheet({ peer, rect })`; `sheetPeer` re-derived from
   the live roster each render.
 - `openSession`/`SessionsStrip`/`activeSessionId` — the Phase-2 session model
@@ -107,7 +107,7 @@ deletes the too-small-target complaint at the root.
 
 ```
 ┌───────────────────────────────┐
-│ filament  [a7c]      ⌘K ● ◐    │
+│ tunlion  [a7c]      ⌘K ● ◐    │
 ├───────────────────────────────┤
 │ peers (3)        transfers (1) │
 ├───────────────────────────────┤
@@ -372,7 +372,7 @@ no `runner/`/`cli/`/daemon changes. Steps are independently shippable.
 - No other sheet changes; Rename/Forget/Info stay.
 
 ### Step 2 — Mobile: tile tap opens the sheet; drop still sends; drop the `⋯`
-- `Filament.jsx` `PeerTile`: thread the existing `narrow` down to the tile (or read
+- `Tunlion.jsx` `PeerTile`: thread the existing `narrow` down to the tile (or read
   it) so the tile can branch. On **mobile**:
   - `onClick` → `openSheet()` **instead of** `inp.current.click()`, **except** when
     the peer is a stranger (`!known` ⇒ keep `inp.click()` direct-send, since the

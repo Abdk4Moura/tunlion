@@ -14,14 +14,14 @@
 //!
 //! ## LIMIT — WireGuard / serve-tun mesh (accepted posture)
 //!
-//! The WG mesh is a COARSER trust tier. Mesh-join (filament serve-tun) grants
+//! The WG mesh is a COARSER trust tier. Mesh-join (tunlion serve-tun) grants
 //! L3 IP reach to raw TCP services bound on the overlay address (SSH, exposed
 //! ports). These services are NOT constrained by L2 capability gates (l2-open,
 //! mount-open, pty-open) because the WG data path is L3 IP, not L2 control-plane
 //! streams over QUIC/WebRTC.
 //!
 //! Everything reachable by WG peers with ONLY L3 IP: SSH daemon on overlay
-//! address, any port exposed via `filament expose`. Everything else (forward,
+//! address, any port exposed via `tunlion expose`. Everything else (forward,
 //! netcat, proxy, file transfer, mount, PTY) requires an L2 control channel
 //! that a WG-only peer lacks.
 //!
@@ -340,10 +340,10 @@ pub fn hash_header(header: &CapHeader) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// CapOp  (domain b"filament/capability-op/v1")
+// CapOp  (domain b"tunlion/capability-op/v1")
 // ---------------------------------------------------------------------------
 
-const CAPOP_SIGN_DOMAIN: &[u8] = b"filament/capability-op/v1";
+const CAPOP_SIGN_DOMAIN: &[u8] = b"tunlion/capability-op/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapOpKind {
@@ -874,7 +874,7 @@ impl TagBindingObj {
             buf.extend_from_slice(f);
         }
         let mut v = Vec::new();
-        v.extend_from_slice(b"filament/tag-binding/v1");
+        v.extend_from_slice(b"tunlion/tag-binding/v1");
         lp(&mut v, &self.tag_ref);
         lp(&mut v, &[self.subject_kind]);
         lp(&mut v, &self.subject);
@@ -1003,10 +1003,10 @@ impl TagBindingObj {
 }
 
 // ---------------------------------------------------------------------------
-// CapHeader  (domain b"filament/capability-header/v1")
+// CapHeader  (domain b"tunlion/capability-header/v1")
 // ---------------------------------------------------------------------------
 
-const CAPHEADER_SIGN_DOMAIN: &[u8] = b"filament/capability-header/v1";
+const CAPHEADER_SIGN_DOMAIN: &[u8] = b"tunlion/capability-header/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapFloor {
@@ -2627,9 +2627,9 @@ mod tests {
         let op_canon = op.canonical_for_signing();
         let header_canon = header.canonical_for_signing();
 
-        let op_domain: &[u8] = b"filament/capability-op/v1";
-        let header_domain: &[u8] = b"filament/capability-header/v1";
-        let cert_domain: &[u8] = b"filament/identity-device-cert/v1";
+        let op_domain: &[u8] = b"tunlion/capability-op/v1";
+        let header_domain: &[u8] = b"tunlion/capability-header/v1";
+        let cert_domain: &[u8] = b"tunlion/identity-device-cert/v1";
 
         assert_ne!(op_domain, header_domain);
         assert_ne!(op_domain, cert_domain);

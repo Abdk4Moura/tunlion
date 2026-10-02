@@ -3,7 +3,7 @@
 A provider is the netlab-style abstraction: the topology is provider-agnostic and
 says only "carry the overlay between node a and node b"; the provider decides HOW
 the bytes move. The SAME two-node topology runs over any provider, so they can be
-compared side by side (`lab up two-nodes --link pipe|wg|filament`).
+compared side by side (`lab up two-nodes --link pipe|wg|tunlion`).
 
 Each provider implements two functions::
 
@@ -22,22 +22,22 @@ out of node-b's tunnel and vice-versa. The four providers differ only in the
   wg     — a real WireGuard tunnel between the two netns (kernel datapath, or a
            userspace wireguard-go/boringtun fallback). Proves the provider
            abstraction against production-grade crypto carriage.
-  filament — filament's data channel as the carrier. Since native serve_tun (L3)
+  tunlion — tunlion's data channel as the carrier. Since native serve_tun (L3)
            does NOT exist yet, this tunnels the TUN packets over an existing
-           filament L2 forward/netcat stream between two isolated filament
+           tunlion L2 forward/netcat stream between two isolated tunlion
            identities. The integration target; clearly marked as an approximation.
 
 All four share the tun + route + frame + (optionally) fault primitives.
 """
 
-from providers import pipe, udp, wg, filament  # noqa: F401
+from providers import pipe, udp, wg, tunlion  # noqa: F401
 
 REGISTRY = {
     "pipe": pipe,
     "veth": pipe,      # alias
     "udp": udp,
     "wg": wg,
-    "filament": filament,
+    "tunlion": tunlion,
 }
 
 

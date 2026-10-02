@@ -1,4 +1,4 @@
-// Characterization tests for the filament wire codec. Plain Node ESM (no deps),
+// Characterization tests for the tunlion wire codec. Plain Node ESM (no deps),
 // run with: node frontend/src/net/protocol/__tests__/wire.test.mjs
 // These pin the byte-level behavior the consolidation rewrite must preserve.
 import {

@@ -99,7 +99,7 @@ impl SecretFile {
 /// `whoami /user` reads the calling process's token directly (the same
 /// TokenUser SID an interactive user would get), is present on every supported
 /// Windows SKU, and needs no added dependency, so it works identically whether
-/// filament runs interactively or as a service. Fail-closed: if no SID can be
+/// tunlion runs interactively or as a service. Fail-closed: if no SID can be
 /// parsed we return Err (the caller fails loud) rather than guessing a
 /// principal.
 #[cfg(windows)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Where does `filament` spend its startup?
+# Where does `tunlion` spend its startup?
 #
 # WHY AN INSTRUMENT AND NOT A GUESS. Startup cost is dominated by whichever of
 # these your machine is worst at, and they differ by an order of magnitude
@@ -16,11 +16,11 @@
 # sample (posix_fadvise DONTNEED, so it does not disturb the rest of the
 # system the way dropping all caches would).
 #
-# Usage:  experiments/startup-bench.sh [path-to-filament] [samples]
+# Usage:  experiments/startup-bench.sh [path-to-tunlion] [samples]
 set -uo pipefail
-BIN=${1:-$(command -v filament || echo "$HOME/.local/bin/filament")}
+BIN=${1:-$(command -v tunlion || echo "$HOME/.local/bin/tunlion")}
 N=${2:-10}
-[ -x "$BIN" ] || { echo "no filament binary at $BIN"; exit 2; }
+[ -x "$BIN" ] || { echo "no tunlion binary at $BIN"; exit 2; }
 
 EVICT=$(mktemp /tmp/evict-XXXX.py)
 cat > "$EVICT" <<'PY'

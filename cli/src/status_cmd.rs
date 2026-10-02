@@ -35,14 +35,14 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Bare-command tour: what filament is, the current state, and the two or three
+/// Bare-command tour: what tunlion is, the current state, and the two or three
 /// things you'd actually do next, adapted to whether you've paired anyone yet. No
 /// flags to learn; `--help` still has the full surface. (CLI-UX work, point #2.)
 pub(crate) fn tour_cmd() -> Result<()> {
     let color = ui::stdout_color();
     ui::say(&format!(
         "  {}  {}",
-        ui::paint_when(color, ui::Tone::Brand, "filament"),
+        ui::paint_when(color, ui::Tone::Brand, "tunlion"),
         ui::paint_when(color, ui::Tone::Dim, "/ one thread across every device"),
     ));
     ui::say("");
@@ -59,8 +59,8 @@ pub(crate) fn tour_cmd() -> Result<()> {
     let n = devices_load().len();
     let identity = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
     ui::say(&format!("  {n} device{}", if n == 1 { "" } else { "s" }));
-    // U1: this screen READS the identity, it does not mint one. Bare `filament`
-    // is the command people run to see what filament is, and it must not write
+    // U1: this screen READS the identity, it does not mint one. Bare `tunlion`
+    // is the command people run to see what tunlion is, and it must not write
     // a private key as a side effect of being looked at, nor fail on the two
     // devices that cannot mint (joined, opt-out set). What U1 changes here is
     // the verdict: a missing identity stopped being a warning, because `init`
@@ -82,20 +82,20 @@ pub(crate) fn tour_cmd() -> Result<()> {
     ui::say("");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  do this:"));
     let act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));
-    act("filament send <file>", "send something");
+    act("tunlion send <file>", "send something");
     if n == 0 {
-        act("filament add", "add a device or person");
+        act("tunlion add", "add a device or person");
     } else {
-        act("filament mount", "open files from another device");
-        act("filament shell <device>", "open an authorized terminal");
+        act("tunlion mount", "open files from another device");
+        act("tunlion shell <device>", "open an authorized terminal");
     }
-    act("filament receive", "receive once");
-    act("filament up", "serve: receive, mount (shell with --shell)");
-    act("filament up --install", "the same, always-on");
+    act("tunlion receive", "receive once");
+    act("tunlion up", "serve: receive, mount (shell with --shell)");
+    act("tunlion up --install", "the same, always-on");
     ui::say(&ui::paint_when(
         color,
         ui::Tone::Dim,
-        "  more:  filament --help  /  filament devices  /  filament id",
+        "  more:  tunlion --help  /  tunlion devices  /  tunlion id",
     ));
     Ok(())
 }
@@ -129,7 +129,7 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
         )),
         None => ui::say(&format!(
-            "  {} not running, start with: filament up",
+            "  {} not running, start with: tunlion up",
             ui::paint(ui::Tone::Dim, "·")
         )),
     }
@@ -217,7 +217,7 @@ pub(crate) fn delegated_device_state(
     Some((format!("{n}{unit} left ({clock_label})"), ui::Tone::Dim))
 }
 
-/// CLI handler for `filament requests`
+/// CLI handler for `tunlion requests`
 pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
     match action {
         None | Some(RequestsAction::List { all: false }) => {
@@ -303,7 +303,7 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
 ///
 /// This exists as ONE function because it is the only place a DeviceCert is
 /// minted for somebody else. It was written inline in the enrol handler, and the
-/// pairing ceremony could not produce one, which is why `filament add` left a
+/// pairing ceremony could not produce one, which is why `tunlion add` left a
 /// device paired but not on the mesh. Hand-writing it a second time is how the
 /// fleet handshake ended up with four per-peer bugs in copies that had drifted.
 ///
@@ -343,7 +343,7 @@ pub(crate) fn mesh_enrolment(
 }
 
 /// this terminal. The detached child writes the pidfile and serves; its console
-/// output goes to {config}/daemon.log so `filament logs` can follow it. The
+/// output goes to {config}/daemon.log so `tunlion logs` can follow it. The
 /// detach itself is one portable operation in `platform::spawn_detached`, whose
 /// two arms ship together (#215 was the half-written version: the Windows arm
 /// computed the log path and threw it away).

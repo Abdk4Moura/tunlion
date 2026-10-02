@@ -1,6 +1,6 @@
 // journey-phone-to-laptop.cjs — Maya journey 2: a file goes phone → laptop.
 //
-// Maya's "phone" is a REAL filament peer (a CLI `send` in the shared auto-room).
+// Maya's "phone" is a REAL tunlion peer (a CLI `send` in the shared auto-room).
 // Her laptop is the browser. The phone pushes a file; the laptop shows the
 // incoming offer, Maya taps to receive, and it ARRIVES (the save/download
 // affordance appears, byte-for-byte the file the phone sent). This is the

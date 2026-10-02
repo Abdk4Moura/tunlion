@@ -20,7 +20,7 @@ Key finding: the channel writer proves the transport layer can sustain
 
 ## Executive summary
 
-Raw TCP localhost achieves 3.5 GB/s on this machine. The filament protocol
+Raw TCP localhost achieves 3.5 GB/s on this machine. The tunlion protocol
 structure (offer/accept/data/end/ack) reduces this to 1.6 GB/s in Python
 (binary encoding) and 251 MB/s (JSON encoding). The Rust implementation
 currently achieves 8.6 MB/s with the full protocol (JSON control + per-frame

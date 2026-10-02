@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# peers.sh — stand up / tear down REAL local filament peers for the e2e pipeline.
+# peers.sh — stand up / tear down REAL local tunlion peers for the e2e pipeline.
 #
-# CORE PRINCIPLE: these are GENUINE filament peers, not mocks. We use the
-# LOCALLY-BUILT binary (cli/target/release/filament — built if missing), each
+# CORE PRINCIPLE: these are GENUINE tunlion peers, not mocks. We use the
+# LOCALLY-BUILT binary (cli/target/release/tunlion — built if missing), each
 # with its OWN isolated FILAMENT_CONFIG_DIR under $PIPE_TMP, all signaling through
 # a local backend we start on a free port. The CLI peer *is* a real peer; the
 # browser pairs with it for real (see pairing.sh).
 #
 # HARD SAFETY (mirrors rig/lib.sh):
-#  - Never touch the user's ~/.config/filament. Every filament call sets
+#  - Never touch the user's ~/.config/tunlion. Every tunlion call sets
 #    FILAMENT_CONFIG_DIR under $PIPE_TMP.
 #  - Never kill a process we did not start. We track our own PIDs and stamp every
 #    backend with FIL_UX_RIG=1; cleanup matches only that marker + tracked PIDs.
-#  - We never touch the installed ~/.local/bin/filament, the user's `up --shell`
+#  - We never touch the installed ~/.local/bin/tunlion, the user's `up --shell`
 #    daemon, the gallery server, or another agent's rig.
 set -uo pipefail
 : "${ZSH_VERSION:=}"
@@ -25,7 +25,7 @@ REPO_ROOT="$(cd "$UX_ROOT/../.." && pwd)"
 # When provided externally it is trusted as-is (FILAMENT_BIN_EXPLICIT); otherwise
 # pipe_ensure_binary rebuilds it WITH the test-hooks feature.
 FILAMENT_BIN_EXPLICIT="${FILAMENT_BIN:+1}"
-FILAMENT_BIN="${FILAMENT_BIN:-$REPO_ROOT/cli/target/release/filament}"
+FILAMENT_BIN="${FILAMENT_BIN:-$REPO_ROOT/cli/target/release/tunlion}"
 
 # A python that can run the signaling backend (flask-socketio + eventlet). Prefer
 # an explicit PIPE_VENV; else the runner's venv; else a system python that imports
@@ -71,7 +71,7 @@ pipe_track() { PIPE_PIDS+=("$1"); }
 pipe_kill_tracked() {
   local p
   for p in "${PIPE_PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-  # reap any filament peer that carries one of OUR config dirs under PIPE_TMP
+  # reap any tunlion peer that carries one of OUR config dirs under PIPE_TMP
   for p in $(pgrep -f "$FILAMENT_BIN" 2>/dev/null); do
     tr '\0' ' ' < "/proc/$p/environ" 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$PIPE_TMP" && kill "$p" 2>/dev/null
   done
@@ -95,7 +95,7 @@ pipe_reap_backends() {
 # FILAMENT_BIN was provided, trust it as-is.
 pipe_ensure_binary() {
   if [ -n "${FILAMENT_BIN_EXPLICIT:-}" ] && [ -x "$FILAMENT_BIN" ]; then return 0; fi
-  echo "[peers] building filament (cargo build --release --features test-hooks)…" >&2
+  echo "[peers] building tunlion (cargo build --release --features test-hooks)…" >&2
   ( cd "$REPO_ROOT/cli" && cargo build --release --features test-hooks >"$PIPE_WORK/cargo-build.log" 2>&1 ) || {
     echo "[peers] cargo build FAILED — see $PIPE_WORK/cargo-build.log" >&2; return 1; }
   [ -x "$FILAMENT_BIN" ]
@@ -136,7 +136,7 @@ pipe_backend_start() {
 pipe_backend_stop() { [ -n "$PIPE_BACKEND_PID" ] && kill "$PIPE_BACKEND_PID" 2>/dev/null; PIPE_BACKEND_PID=""; }
 
 # ---- same-origin frontend (real app, served by our backend) ----------------
-# Builds frontend/dist with VITE_FILAMENT_API= (empty => same-origin signaling)
+# Builds frontend/dist with VITE_TUNLION_API= (empty => same-origin signaling)
 # if it is missing or points at the prod API. The REAL built app, no mock seam.
 pipe_ensure_frontend() {
   local dist="$REPO_ROOT/frontend/dist/index.html"
@@ -144,7 +144,7 @@ pipe_ensure_frontend() {
     return 0
   fi
   echo "[peers] (re)building frontend same-origin…" >&2
-  ( cd "$REPO_ROOT/frontend" && VITE_FILAMENT_API= npm run build >"$PIPE_WORK/frontbuild.log" 2>&1 ) || {
+  ( cd "$REPO_ROOT/frontend" && VITE_TUNLION_API= npm run build >"$PIPE_WORK/frontbuild.log" 2>&1 ) || {
     echo "[peers] frontend build FAILED — see $PIPE_WORK/frontbuild.log" >&2; return 1; }
 }
 

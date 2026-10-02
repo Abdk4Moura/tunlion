@@ -1,6 +1,6 @@
 // Relay-honesty UX gate (transport-resilience P1, frontend half).
 // Relay (TURN) is still E2E-encrypted but is NOT a direct link, so it must be
-// LOUD and HONEST. This drives the REAL Filament component (focused render
+// LOUD and HONEST. This drives the REAL Tunlion component (focused render
 // harness, mirroring pakekeep-harness) with an injected roster of two relayed
 // peers + one direct peer, and asserts:
 //   1. a relayed peer's tile shows the amber ⚠ "RELAY" chip + "· via relay";
@@ -46,11 +46,11 @@ function buildHarness() {
       // which is Vite syntax esbuild has no loader for. `file` emits a URL,
       // which is what ?url means, so the bundle matches what the app sees.
       '--loader:.wasm=file',
-      // iife has no `import.meta`, so `import.meta.env.VITE_FILAMENT_API`
+      // iife has no `import.meta`, so `import.meta.env.VITE_TUNLION_API`
       // threw and the component rendered nothing. Same-origin is what the
       // harness wants anyway: an empty base means requests go to the
       // harness server, not to production.
-      '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
+      '--define:import.meta.env={"VITE_TUNLION_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;

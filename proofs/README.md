@@ -1,4 +1,4 @@
-# Filament establishment proof
+# Tunlion establishment proof
 
 An exhaustive, re-runnable correctness check for the peer-to-peer
 connection-establishment protocol. Run it:
@@ -225,10 +225,10 @@ proof, so it is spelled out. Both clients implement the same protocol
 | glare: impolite ignores / polite rebuilds-or-rolls-back | `net.rs:1233-1252`, `main.rs:4043-4058` | `webrtc.js:540-553` |
 | deliver offer -> answer | `net.rs:1254-1281` | `webrtc.js:547-553` |
 | deliver answer -> connected (ICE succeeds, A4) | `net.rs:1247-1264` | `webrtc.js:468-471,653` |
-| establishment watchdog (15s) -> retry/FAIL | `net.rs:48`, `main.rs:3101` (MAX_ATTEMPTS=3) | `webrtc.js:524`, `useFilament.js:471` (cap 2) |
+| establishment watchdog (15s) -> retry/FAIL | `net.rs:48`, `main.rs:3101` (MAX_ATTEMPTS=3) | `webrtc.js:524`, `useTunlion.js:471` (cap 2) |
 | disconnect grace (6s) -> retry/FAIL | `main.rs:3870` GraceExpired | `webrtc.js:499-505` |
 | stall ladder: repair -> relay (once) -> clean FAIL | `main.rs:3284` correct_stall (STALL_MAX_REPAIRS=5) | `stall.js`, `recovery.js:22-27` |
-| supersede on reconnect (same uid, new sid) | `main.rs:2534-2563` | `useFilament.js:292-308` |
+| supersede on reconnect (same uid, new sid) | `main.rs:2534-2563` | `useTunlion.js:292-308` |
 | self-heal from FAIL (known-peer / re-pair) | C12 channels, `subscribe` | `lib/devices.js`, digest reconcile |
 | fault: lost signal | (network) | (network) |
 | fault: black-holed link (the zombie) | the verify-before-accept fix, beta.23 | n/a |

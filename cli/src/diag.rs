@@ -1,6 +1,6 @@
 // Establishment telemetry (the CLI sibling of frontend/src/lib/tel.js +
 // linkdiag.js). It exists to make the L2/ssh bring-up STALL visible: ssh over a
-// filament netcat ProxyCommand sometimes burns the whole connect budget on the
+// tunlion netcat ProxyCommand sometimes burns the whole connect budget on the
 // first try and only succeeds after several retries, and until now the CLI
 // emitted NOTHING, so the stall was invisible on live devices.
 //
@@ -12,7 +12,7 @@
 // Two sinks per event, BOTH best-effort and OFF the data channel (the wire
 // protocol is frozen; telemetry never rides the control/data path):
 //   (a) a local rotating JSONL at {config}/diag.jsonl, the rich timeline a
-//       future `filament doctor` can replay,
+//       future `tunlion doctor` can replay,
 //   (b) a fire-and-forget POST to {server}/api/telemetry (the same endpoint the
 //       browser beacons to), so a live device's stalls surface in the backend
 //       `TEL web:<ev>` log without the user having to ship a file.
@@ -256,7 +256,7 @@ impl Attempt {
 
 /// Rotating local JSONL sink. Appends one compact line; truncates the file when
 /// it grows past `MAX_JSONL_BYTES` (keeps the most recent run, the only window a
-/// `filament doctor` cares about). All errors are swallowed: telemetry must
+/// `tunlion doctor` cares about). All errors are swallowed: telemetry must
 /// never break a connect.
 const MAX_JSONL_BYTES: u64 = 512 * 1024;
 
@@ -308,7 +308,7 @@ fn beacon(server: &str, body: Value) {
 //
 // `summarize` turns the passive JSONL telemetry into an instant local report:
 // the last N connect spans, their median total time, the phase most often over
-// budget, and the stall rate. This is what `filament doctor` (no device) prints
+// budget, and the stall rate. This is what `tunlion doctor` (no device) prints
 // under "history", the trail of what the live daemon's own connects looked like.
 
 /// A digest of the recent connect spans in the local JSONL. All counts are over
@@ -347,7 +347,7 @@ fn phase_from_label(s: &str) -> Option<Phase> {
 }
 
 /// Read the local diag JSONL and digest the most recent `limit` terminal spans.
-/// Reads from `{FILAMENT_CONFIG_DIR else ~/.config/filament}/diag.jsonl`. A
+/// Reads from `{FILAMENT_CONFIG_DIR else ~/.config/tunlion}/diag.jsonl`. A
 /// missing/empty file yields an all-zero `Summary` (a fresh install with no
 /// history, not an error).
 pub fn summarize(limit: usize) -> Summary {

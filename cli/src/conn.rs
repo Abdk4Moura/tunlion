@@ -17,7 +17,7 @@
 //!
 //! BACK-EDGES -- what a future peer-loop carve still owes. This module calls
 //! back into `main.rs` for host- or config-bound helpers (see
-//! docs/design-libfilament.md, "the rule for what may leave"):
+//! docs/design-libtunlion.md, "the rule for what may leave"):
 //! `devices_load`, `load_owner_key`, `local_device_cert_path`,
 //! `resolve_peer_identity`, `peer_entry`, `is_self_uid`, `rejoin_unwarned`,
 //! `relay_banner`, `relay_forbidden`, and the FLEET/REJOIN/WARM constants.
@@ -321,10 +321,10 @@ pub(crate) struct RejoinState {
 }
 
 /// WARM-HOLD state: keeps connections alive to recently-used and explicitly
-/// configured peers so `filament reach`/`ssh` is instant.
+/// configured peers so `tunlion reach`/`ssh` is instant.
 ///
 /// Design:
-/// - EXPLICIT peers: from `filament set warm-peers dovm,popos` (always connected)
+/// - EXPLICIT peers: from `tunlion set warm-peers dovm,popos` (always connected)
 /// - RECENT peers: LRU of last 5 peers used for send/ssh/ping (auto-connected)
 /// - RECONNECT: exponential backoff (1s, 2s, 4s, 8s, 16s, 30s cap) on drop
 /// - DORMANT: go dormant after 5 failed attempts; resume on peer presence
@@ -943,7 +943,7 @@ pub(crate) struct Conn {
     /// when multi-streaming is disabled (`direct_streams() == 1`).
     pub(crate) direct_endpoint: Option<quinn::Endpoint>,
     /// WARM-HOLD: keeps connections alive to recently-used and explicitly
-    /// configured peers so `filament reach`/`ssh` is instant. Tracked per-peer
+    /// configured peers so `tunlion reach`/`ssh` is instant. Tracked per-peer
     /// with LRU eviction and exponential backoff on failures.
     pub(crate) warm_hold: WarmHold,
     /// Oneshot senders for per-endpoint worker port negotiation, keyed by pid.
@@ -1250,7 +1250,7 @@ impl Conn {
         // first thing every new user tries).
         self.roster.insert(peer_id.clone(), v.clone());
         ui::debug(&format!(
-            "filament: ADOPT peer={peer_id} source={source:?} want_active={want_active}"
+            "tunlion: ADOPT peer={peer_id} source={source:?} want_active={want_active}"
         ));
 
         // C6: same device on a NEW sid, supersede the stale link.
@@ -1312,7 +1312,7 @@ impl Conn {
             .as_ref()
             .is_none_or(|binding| active_binding_matches(binding, &peer_id, peer_uid.as_deref()));
         if want_active && !binding_allows {
-            ui::debug("filament: ADOPT refused: peer is not the authenticated code sender");
+            ui::debug("tunlion: ADOPT refused: peer is not the authenticated code sender");
         }
         if want_active
             && binding_allows
@@ -1722,7 +1722,7 @@ impl Conn {
             },
         );
         ui::debug(&format!(
-            "filament: ESTABLISH peer={peer_id} caller={caller}"
+            "tunlion: ESTABLISH peer={peer_id} caller={caller}"
         ));
         Ok(())
     }
@@ -1940,7 +1940,7 @@ impl Conn {
                     // registered yet, so the fallback reaper has nothing to
                     // expire. The caller must retain a working path on failure.
                     ui::debug(&format!(
-                        "filament: direct disabled (endpoint bind failed: {e}); WebRTC retained"
+                        "tunlion: direct disabled (endpoint bind failed: {e}); WebRTC retained"
                     ));
                     return;
                 }
@@ -2034,7 +2034,7 @@ impl Conn {
             .await;
         // TRACE, direct-offer / signaling detail.
         ui::trace(&format!(
-            "filament: {} sent to {name} ({pid}), port {} srflx {}",
+            "tunlion: {} sent to {name} ({pid}), port {} srflx {}",
             if probe {
                 "UPGRADE-PROBE-OFFER"
             } else {
@@ -2225,14 +2225,14 @@ impl Conn {
                     if v["type"] == "tcp-localhost" {
                         if let Some(port) = v["port"].as_u64() {
                             let addr = format!("127.0.0.1:{port}");
-                            ui::trace(&format!("filament: trying TCP localhost to {addr}"));
+                            ui::trace(&format!("tunlion: trying TCP localhost to {addr}"));
                             match crate::local::LocalTransport::connect(&addr).await {
                                 Ok(t) => {
                                     let _ = tx.send(mk(pid_s, Arc::new(t), "local-tcp"));
                                     return;
                                 }
                                 Err(e) => {
-                                    ui::trace(&format!("filament: TCP localhost failed: {e}"));
+                                    ui::trace(&format!("tunlion: TCP localhost failed: {e}"));
                                 }
                             }
                         }
@@ -2268,7 +2268,7 @@ impl Conn {
                 if let (Some(sock), Some(peer_srflx)) = (punch_sock, peer_srflx_addr) {
                     // TRACE, direct/hole-punch detail.
                     ui::trace(&format!(
-                        "filament: rung-1 failed, attempting hole-punch to {peer_srflx}"
+                        "tunlion: rung-1 failed, attempting hole-punch to {peer_srflx}"
                     ));
                     if let Some(t) = holepunch::connect(
                         sock,
@@ -2570,7 +2570,7 @@ impl Conn {
             self.direct_pending.remove(&pid);
             // DEBUG, resilience internal (upgrade probe found no path).
             ui::debug(&format!(
-                "filament: UPGRADE-PROBE for {pid} found no direct path in budget, staying on relay"
+                "tunlion: UPGRADE-PROBE for {pid} found no direct path in budget, staying on relay"
             ));
             self.mark_probe_failed(&pid);
         }
@@ -2610,7 +2610,7 @@ impl Conn {
                     None => {
                         // DEBUG, resilience internal (direct→WebRTC fallback).
                         ui::debug(&format!(
-                            "filament: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
+                            "tunlion: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
                             p.secret.0
                         ))
                     }
@@ -2681,7 +2681,7 @@ impl Conn {
         if attempts >= MAX_ATTEMPTS {
             let was_active = self.is_active(pid);
             ui::debug(&format!(
-                "filament: STALL-LADDER-EXHAUSTED peer={pid} attempts={attempts} reason={why}"
+                "tunlion: STALL-LADDER-EXHAUSTED peer={pid} attempts={attempts} reason={why}"
             ));
             ui::debug(&ui::paint(
                 ui::Tone::Dim,

@@ -9,7 +9,7 @@ gate without re-proving it can discriminate.
 Two client network namespaces, two MASQUERADE routers, and a WAN namespace
 containing signaling, STUN, and the capture point. It tried to (1) prove both
 NATs were "cone" and (2) assert a hole-punched, byte-exact transfer between two
-Filament peers behind them.
+Tunlion peers behind them.
 
 ## Why it was retired (evidence)
 

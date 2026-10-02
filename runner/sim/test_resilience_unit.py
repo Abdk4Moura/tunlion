@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """DETERMINISTIC unit test of the runner's resilience LOGIC — no real transport.
 
-The flaky-link e2e (flaky_sim_test.sh) proves the behaviour over the real filament
+The flaky-link e2e (flaky_sim_test.sh) proves the behaviour over the real tunlion
 WebRTC transport, but its timing depends on WebRTC establishment through the proxy.
 This test pins the THREE resilience guarantees deterministically, in seconds, by
-driving FileRunnerBox + watcher.Watcher against a FAKE `filament` CLI (a tiny script
+driving FileRunnerBox + watcher.Watcher against a FAKE `tunlion` CLI (a tiny script
 that moves files like the real `send`/`up` do) whose behaviour we can script:
 
   1. RETRY-UNTIL-PEER: the fake `send` is told to FAIL its first N invocations
@@ -46,7 +46,7 @@ def _sha(p):
     return h.hexdigest()
 
 
-# --- a fake `filament` CLI -----------------------------------------------------
+# --- a fake `tunlion` CLI -----------------------------------------------------
 # It implements just enough of `send <paths> --to X` and `up --dir D`: a "send"
 # copies the given files into a shared MAILBOX dir keyed by the --to peer; an "up
 # --dir D" drains its peer's mailbox into D. A control file lets the test force the
@@ -68,7 +68,7 @@ cmd = a[0]
 def mailbox(peer):
     d = os.path.join(MAILROOT, "to-" + peer); os.makedirs(d, exist_ok=True); return d
 if cmd == "send":
-    # filament send <paths...> --to PEER [--server S] [--relay]
+    # tunlion send <paths...> --to PEER [--server S] [--relay]
     paths=[]; to=None; i=1
     while i < len(a):
         if a[i] == "--to": to=a[i+1]; i+=2
@@ -91,7 +91,7 @@ if cmd == "send":
             dst = os.path.join(mb, f"{base}.{n}"); n+=1
         trunc = c.get("truncate_once")
         # write to a temp name then atomically rename, so a concurrent `up` drain
-        # never sees a half-written file (mirrors filament's atomic delivery).
+        # never sees a half-written file (mirrors tunlion's atomic delivery).
         tmpd = dst + ".part"
         if trunc and base == trunc:
             with open(p,"rb") as fsrc, open(tmpd,"wb") as fo: fo.write(fsrc.read(7000))  # 7KB partial
@@ -124,7 +124,7 @@ if cmd == "up":
             try: os.rename(src,dst)
             except Exception: pass
         time.sleep(0.2)
-if cmd=="--version": print("fake-filament 0"); sys.exit(0)
+if cmd=="--version": print("fake-tunlion 0"); sys.exit(0)
 sys.exit(0)
 '''
 
@@ -133,7 +133,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="filjob_unit_")
     mailroot = os.path.join(tmp, "mail")
     os.makedirs(mailroot, exist_ok=True)
-    fake = os.path.join(tmp, "filament")
+    fake = os.path.join(tmp, "tunlion")
     with open(fake, "w") as f:
         f.write(FAKE)
     os.chmod(fake, 0o755)

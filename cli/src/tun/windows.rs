@@ -7,7 +7,7 @@
 //! awaits; `send` allocates from the ring and is effectively non-blocking. Wintun
 //! packets are bare IP (no framing), like Linux with IFF_NO_PI, so callers exchange
 //! plain packets. Requires Administrator (adapter creation) and `wintun.dll` beside
-//! filament.exe.
+//! tunlion.exe.
 
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
@@ -30,9 +30,9 @@ impl KernelTun {
     /// Open (or create) the `name` adapter, assign `cidr`, set `mtu`, and start
     /// pumping. Needs Administrator + wintun.dll.
     pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
-        let wintun = load_wintun().context("load wintun.dll (bundle it beside filament.exe)")?;
+        let wintun = load_wintun().context("load wintun.dll (bundle it beside tunlion.exe)")?;
         let adapter = wintun::Adapter::open(&wintun, name)
-            .or_else(|_| wintun::Adapter::create(&wintun, name, "Filament", None))
+            .or_else(|_| wintun::Adapter::create(&wintun, name, "Tunlion", None))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "create Wintun adapter '{name}': {e}. L3 on Windows needs Administrator and wintun.dll."
@@ -122,7 +122,7 @@ impl Drop for KernelTun {
     }
 }
 
-/// Load wintun.dll from a TRUSTED absolute path only: beside filament.exe, else
+/// Load wintun.dll from a TRUSTED absolute path only: beside tunlion.exe, else
 /// System32. Both are admin-writable-only locations.
 ///
 /// SECURITY: we deliberately never fall back to the loader's ambient search
@@ -143,8 +143,8 @@ fn load_wintun() -> Result<wintun::Wintun> {
         system32
     } else {
         bail!(
-            "wintun.dll not found next to filament.exe or in System32; refusing to search CWD/PATH \
-             (DLL-hijack guard). Reinstall filament, or place WireGuard's signed wintun.dll beside filament.exe."
+            "wintun.dll not found next to tunlion.exe or in System32; refusing to search CWD/PATH \
+             (DLL-hijack guard). Reinstall tunlion, or place WireGuard's signed wintun.dll beside tunlion.exe."
         );
     };
     unsafe { wintun::load_from_path(&dll) }.map_err(|e| anyhow::anyhow!("load {}: {e}", dll.display()))
@@ -221,7 +221,7 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 /// Windows has no capability model; Wintun adapter creation needs Administrator.
 /// We can't self-elevate, so guide; the real check is the adapter-create error.
 pub fn ensure_net_admin_for_l3() -> bool {
-    eprintln!("  L3 on Windows needs Administrator and wintun.dll beside filament.exe.");
+    eprintln!("  L3 on Windows needs Administrator and wintun.dll beside tunlion.exe.");
     true
 }
 

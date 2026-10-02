@@ -5,7 +5,7 @@ one rule.
 
 ## The rule
 
-**A test asserts an invariant, not an exit code.** `filament devices forget phone`
+**A test asserts an invariant, not an exit code.** `tunlion devices forget phone`
 returning 0 proves nothing. The scenario that earns its runtime is the one that
 also checks another device's granted `shell` cap survived the forget, because
 that is the bug that happened.

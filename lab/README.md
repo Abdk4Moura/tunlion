@@ -1,17 +1,17 @@
-# filament networking dev-lab (`lab/`)
+# tunlion networking dev-lab (`lab/`)
 
-A careful, reproducible **"lab as code"** for developing and testing filament's
+A careful, reproducible **"lab as code"** for developing and testing tunlion's
 networking — built immediately to develop **L3** (an IP-level tunnel: a TUN
-device whose packets ride filament's data channel) but designed as a general
+device whose packets ride tunlion's data channel) but designed as a general
 place to build smaller networking things too.
 
 Nodes are **Linux network namespaces** on this one host (no cloud, no
 containers). Links between nodes are **pluggable providers**. The same topology
-runs over a bare veth, a real WireGuard tunnel, or filament's data channel — so
+runs over a bare veth, a real WireGuard tunnel, or tunlion's data channel — so
 you can compare them side by side.
 
 > **Status:** baseline proven. The *same* `two-nodes` topology pings across
-> `pipe`, `wg`, **and** `filament` links (see [Proof](#proof)). Teardown is
+> `pipe`, `wg`, **and** `tunlion` links (see [Proof](#proof)). Teardown is
 > leak-free; a `doctor` preflight gates each carrier.
 
 ---
@@ -25,7 +25,7 @@ net tools only**:
 | netlab idea we adopted | how the lab does it |
 | --- | --- |
 | Declarative **topology-as-code** | `topologies/*.yml`: nodes + links + per-node params, with `defaults` + overrides. `lab up <topology>` realizes it; `lab down` destroys it. Idempotent + reproducible. |
-| **Provider / abstraction split** | the topology is provider-agnostic; the *link* between two nodes is a pluggable provider (`providers/`). `lab up two-nodes --link pipe\|udp\|wg\|filament`. |
+| **Provider / abstraction split** | the topology is provider-agnostic; the *link* between two nodes is a pluggable provider (`providers/`). `lab up two-nodes --link pipe\|udp\|wg\|tunlion`. |
 | **Defaults + overrides, labels, clean lifecycle** | `defaults:` merge under per-node params; everything is `lab-`-prefixed; `up`/`down`/`status`/`probe` are the lifecycle. |
 
 We did **not** depend on netlab itself, nor adopt its Ansible provisioning,
@@ -50,10 +50,10 @@ host. There are two addressing planes:
 networking**. Every interface/address/route/qdisc lives inside a lab-created
 namespace (run via `ip netns exec`). The only host-namespace operations are
 `ip netns add/del` and creating a veth pair that is *immediately* moved into the
-lab namespaces. The lab never touches the running `filament up` daemon, the
-installed `~/.local/bin/filament`, `~/.config/filament`, the live site, or the
-live T4. The `filament` link uses the **locally-built**
-`cli/target/release/filament` and **fully isolated** `FILAMENT_CONFIG_DIR`
+lab namespaces. The lab never touches the running `tunlion up` daemon, the
+installed `~/.local/bin/tunlion`, `~/.config/tunlion`, the live site, or the
+live T4. The `tunlion` link uses the **locally-built**
+`cli/target/release/tunlion` and **fully isolated** `FILAMENT_CONFIG_DIR`
 identities.
 
 ---
@@ -74,16 +74,16 @@ Each is a small module with a documented interface (`primitives/`,
      (proves the frame primitive + a real socket hop).
    - `wg` — a **real WireGuard** tunnel between the namespaces (kernel datapath
      if the module is present, else `wireguard-go`/`boringtun` userspace).
-   - `filament` — **filament's data channel as the carrier** (the integration
+   - `tunlion` — **tunlion's data channel as the carrier** (the integration
      target — see [below](#the-filament-link-today-vs-the-serve_tun-target)).
 3. **frame** (`primitives/frame.py`) — IP packet ⇄ length-prefixed link frame;
-   shared by the udp and filament stream carriers.
+   shared by the udp and tunlion stream carriers.
 4. **route** (`primitives/route.py`) — the allowed-IPs table: dest IP → peer
    (WireGuard's cryptokey-routing model), longest-prefix match.
 5. **crypto** (`primitives/crypto.py`) — a declarative selector: `none` |
    `wg-noise` | `dtls`. The lab does **not** roll its own crypto; this records
    *which layer* provides confidentiality and validates it against the carrier
-   (e.g. `filament` ⇒ `none`, because the data channel is already DTLS +
+   (e.g. `tunlion` ⇒ `none`, because the data channel is already DTLS +
    pair-proof).
 6. **fault** (`primitives/fault.py`) — induce `loss` / `latency` / `bandwidth`
    (tc netem) and especially **`stall`** (100% loss: freeze the data path while
@@ -119,7 +119,7 @@ YAML is parsed by a tiny built-in subset parser (no PyYAML required; used if
 present). JSON topologies are also accepted.
 
 Bundled topologies (`topologies/`): `two-nodes` (the baseline, any `--link`),
-`wg-pair` (wg by default), `filament-l3` (filament by default).
+`wg-pair` (wg by default), `filament-l3` (tunlion by default).
 
 ---
 
@@ -141,7 +141,7 @@ sudo lab/lab down --all --purge-logs         # tear down everything + sweep stra
 ```
 
 Add `--json` to any command for machine-readable output (the `/lab` Claude skill
-relies on this). Run the same topology with `--link pipe|udp|wg|filament` to
+relies on this). Run the same topology with `--link pipe|udp|wg|tunlion` to
 compare carriers side by side.
 
 You can drive the lab three ways: the **`lab` CLI** (`lab/lab`), the
@@ -169,41 +169,41 @@ You can drive the lab three ways: the **`lab` CLI** (`lab/lab`), the
 
 ---
 
-## The filament link: today vs the `serve_tun` target
+## The tunlion link: today vs the `serve_tun` target
 
-**Native `filament serve_tun` (L3) does not exist yet — building it is the whole
-point of this lab.** So the `filament` provider today is a **first
-approximation**: it tunnels the TUN's IP packets over an existing filament **L2
-forward/netcat stream** between two isolated filament identities.
+**Native `tunlion serve_tun` (L3) does not exist yet — building it is the whole
+point of this lab.** So the `tunlion` provider today is a **first
+approximation**: it tunnels the TUN's IP packets over an existing tunlion **L2
+forward/netcat stream** between two isolated tunlion identities.
 
 Datapath today (`a → b`):
 
 ```
 TUN-a (node-a ns)
   → fil_relay(connect)  --TCP 127.0.0.1:LPORT (host ns)-->
-  → `filament forward LPORT labB RPORT`   (isolated config A, host ns)
-  ==[ filament DATA CHANNEL / L2 stream ]==>
-  → `filament up` acceptor   (isolated config B, host ns, FILAMENT_L2=1)
+  → `tunlion forward LPORT labB RPORT`   (isolated config A, host ns)
+  ==[ tunlion DATA CHANNEL / L2 stream ]==>
+  → `tunlion up` acceptor   (isolated config B, host ns, FILAMENT_L2=1)
   → dials 127.0.0.1:RPORT
   → fil_relay(listen)
   → TUN-b (node-b ns)
 ```
 
-The two filament endpoints run in the **host** netns (they need outbound
+The two tunlion endpoints run in the **host** netns (they need outbound
 signaling); the TUN fds are opened by the relays via `setns` into the node
 namespaces, so **no veth-to-host is created** and host networking is untouched.
 The two identities are fully isolated (`FILAMENT_CONFIG_DIR=.state/logs/<lab>/fil-{A,B}`),
-pre-seeded with a shared pair secret, and never see `~/.config/filament` or the
+pre-seeded with a shared pair secret, and never see `~/.config/tunlion` or the
 running daemon.
 
 > **`TODO(serve_tun)`** — replace the whole TCP-stream hop (`forward` + two
-> relays + framing) with a native `filament serve_tun` that reads/writes IP
+> relays + framing) with a native `tunlion serve_tun` that reads/writes IP
 > packets on the data channel directly. When that lands, this provider collapses
 > to "create TUN in each netns; run `serve_tun` on each side" and the same
 > `filament-l3` topology runs over it unchanged. This provider is the scaffold
 > and the integration test for that work.
 
-**Honest note / a real finding:** on this single host, two isolated filament
+**Honest note / a real finding:** on this single host, two isolated tunlion
 identities connecting to *each other's loopback* over `direct-quic` exhibit
 periodic link **flapping** ("direct connection closed" every few seconds). The
 lab works around it (the acceptor gets a signaling head-start so the *first*
@@ -226,14 +226,14 @@ lab is for):
 ========== lab up two-nodes --link wg ==========
 [OK] ping a->b    loss=0.0%  rtt avg=0.31ms      (real WireGuard, kernel datapath)
 
-========== lab up two-nodes --link filament ==========
-[OK] ping a->b    loss=0.0%  rtt avg=1.21ms      (filament data channel, direct-quic)
+========== lab up two-nodes --link tunlion ==========
+[OK] ping a->b    loss=0.0%  rtt avg=1.21ms      (tunlion data channel, direct-quic)
 
 FINAL LEAK CHECK: netns=0  host-ifaces=0  relays=0
 ```
 
 Throughput (`lab probe iperf two-nodes`): pipe ≈ 19 Gbps, wg ≈ 1.46 Gbps,
-filament ≈ 0.45 Gbps — the carrier cost is visible end to end.
+tunlion ≈ 0.45 Gbps — the carrier cost is visible end to end.
 
 `stall` demonstrated: under `lab fault stall`, ping fails (frozen path, link
 still "up"); `lab fault clear` restores it.
@@ -256,7 +256,7 @@ Light by design: **bash + Python 3 stdlib** + standard net tools —
 `iproute2` (`ip`, `tc`), `iputils-ping`, and per-carrier: `wireguard-tools`
 (+ kernel `wireguard` module *or* `wireguard-go`/`boringtun`) for `wg`,
 `iperf3` for the throughput probe, `curl` for the curl probe, and the
-locally-built `cli/target/release/filament` for the `filament` link. `lab
+locally-built `cli/target/release/tunlion` for the `tunlion` link. `lab
 doctor` reports exactly what's present/missing with install hints.
 
 ---
@@ -276,7 +276,7 @@ lab/
     doctor.py          preflight checks
     cli.py             the argparse front-end
   primitives/          tun, tun_io, frame, route, crypto, fault
-  providers/           pipe, udp, wg, filament (+ underlay, relays)
+  providers/           pipe, udp, wg, tunlion (+ underlay, relays)
   probe/               ping / iperf3 / curl / counters
   topologies/          two-nodes.yml, wg-pair.yml, filament-l3.yml
   resources/           topology schema, primitives reference, safety runbook

@@ -1,4 +1,4 @@
-//! `filament sync <local-dir> <device>:<remote-dir>`: rsync-shaped delta
+//! `tunlion sync <local-dir> <device>:<remote-dir>`: rsync-shaped delta
 //! transfer between paired devices. The sender walks the tree into a manifest
 //! (whole-file sha256 plus per-chunk sha256), the receiver answers with what it
 //! lacks, and only those chunks cross. Every landed file is verified by the same
@@ -431,7 +431,7 @@ async fn sync_inner(
         }
     })
     .await
-    .map_err(|_| fail(5, "unreachable", format!("no answer from '{peer}' (is `filament up` running there?)")))?;
+    .map_err(|_| fail(5, "unreachable", format!("no answer from '{peer}' (is `tunlion up` running there?)")))?;
     if let Err(reason) = ack {
         return Err(fail(4, "denied", format!("'{peer}' refused sync: {reason}")));
     }

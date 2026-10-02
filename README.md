@@ -1,7 +1,7 @@
 # Tunlion
 
-> **Filament is now Tunlion.** Same project, same people, new name. The old name
-> collided with [Filament](https://filamentphp.com) the Laravel admin panel, which
+> **Tunlion is now Tunlion.** Same project, same people, new name. The old name
+> collided with [Tunlion](https://tunlionphp.com) the Laravel admin panel, which
 > owns the search results, so this one is ours alone.
 >
 > `tunlion.autumated.com` redirects here and old GitHub links redirect to this repo,
@@ -16,7 +16,7 @@ Tunlion started as the file transfer nothing else does: the **receiving end need
 
 Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other — it never sees a byte.
 
-![filament demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
+![tunlion demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
 
 ## Install
 
@@ -34,21 +34,21 @@ Or a package manager:
 
 | Manager | Command |
 |---|---|
-| **winget** (Windows) | `winget install Abdk4Moura.Filament` |
-| **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/filament` |
+| **winget** (Windows) | `winget install Abdk4Moura.Tunlion` |
+| **Homebrew** (macOS/Linux) | `brew install abdk4moura/tap/tunlion` |
 | **Cargo** (Rust) | `cargo install filament-cli` |
 | **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
 
-Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `filament update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
+Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `tunlion update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
 
 ## Send a file
 
 ```sh
-filament send video.mp4 --code       # speak the code aloud
-filament receive clever-lynx-63      # …or open the website on the other device
+tunlion send video.mp4 --code       # speak the code aloud
+tunlion receive clever-lynx-63      # …or open the website on the other device
 
-filament add --name phone            # remember a device (no file needed)
-filament up                          # receive in the background
+tunlion add --name phone            # remember a device (no file needed)
+tunlion up                          # receive in the background
 ```
 
 - **The other end can be a browser** — your wife's phone with nothing installed opens a URL and taps accept.
@@ -61,20 +61,20 @@ filament up                          # receive in the background
 Once two machines are paired, they share a crypto-addressed overlay — each device's public key *is* its address. On top of that:
 
 ```sh
-filament dovm                        # open a shell on a paired device
-filament reach dovm                  # is it reachable, and over which route?
-filament reach dovm --until-direct   # wait for the link to leave the relay
-filament expose 5432                 # publish a local port on the mesh
-filament forward 5432 dovm:5432      # forward a remote port to localhost
-filament mount dovm:~/data ./data    # mount a remote folder (sshfs over the mesh)
+tunlion dovm                        # open a shell on a paired device
+tunlion reach dovm                  # is it reachable, and over which route?
+tunlion reach dovm --until-direct   # wait for the link to leave the relay
+tunlion expose 5432                 # publish a local port on the mesh
+tunlion forward 5432 dovm:5432      # forward a remote port to localhost
+tunlion mount dovm:~/data ./data    # mount a remote folder (sshfs over the mesh)
 ```
 
 No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.
 
-## Why Filament over the alternatives
+## Why Tunlion over the alternatives
 
-- **vs croc / magic-wormhole**: superb tools, but both ends must install them. Filament's other end can be a browser with nothing installed. The CLI also resumes across restarts (croc parity), and a browser can be either side.
-- **vs Snapdrop / PairDrop**: same-network discovery is the *starting* point here. Filament adds speakable one-time codes, resumable + content-verified transfers, a native CLI for servers and scripts, and the device mesh (shell/forward/mount).
+- **vs croc / magic-wormhole**: superb tools, but both ends must install them. Tunlion's other end can be a browser with nothing installed. The CLI also resumes across restarts (croc parity), and a browser can be either side.
+- **vs Snapdrop / PairDrop**: same-network discovery is the *starting* point here. Tunlion adds speakable one-time codes, resumable + content-verified transfers, a native CLI for servers and scripts, and the device mesh (shell/forward/mount).
 - **vs Tailscale / ngrok** (for the mesh): no account, no coordination server holding your keys — identity is client-side crypto, and the data plane is pure P2P. It's lighter-weight and self-hostable end to end.
 - **vs WeTransfer / Drive / email**: nothing is uploaded, ever. No size limit, no account, no link on someone's server. Bytes go device to device, encrypted.
 - **Self-hostable end to end**: Flask signaling + Redis + coturn in one `docker compose up`. Point the apps at your instance with one env var.

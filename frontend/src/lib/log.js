@@ -8,8 +8,8 @@
 //
 // Raising the level, three ways (query wins, then persists):
 //   - ?log=debug   in the URL              (also accepts a number, e.g. ?log=3)
-//   - localStorage.setItem('filamentLog','debug')
-//   - window.__filamentLog.setLevel('trace')   (live, from devtools)
+//   - localStorage.setItem('tunlionLog','debug')
+//   - window.__tunlionLog.setLevel('trace')   (live, from devtools)
 //
 // tel.js is UNCHANGED, it still beacons lifecycle to /api/telemetry for ops.
 // log.js is purely the console tier; the two are independent.
@@ -37,13 +37,13 @@ function resolveLevel() {
   } catch {}
   if (fromQuery != null) {
     try {
-      localStorage.setItem('filamentLog', NAMES[fromQuery])
+      localStorage.setItem('tunlionLog', NAMES[fromQuery])
     } catch {}
     return fromQuery
   }
   let fromStore = null
   try {
-    fromStore = parseLevel(localStorage.getItem('filamentLog'))
+    fromStore = parseLevel(localStorage.getItem('tunlionLog'))
   } catch {}
   return fromStore != null ? fromStore : DEFAULT
 }
@@ -51,10 +51,10 @@ function resolveLevel() {
 let level = resolveLevel()
 
 // Emit at `lvl` only if it's at or below the current level. Each line is tagged
-// `[filament]` plus a short scope so the firehose is greppable in devtools.
+// `[tunlion]` plus a short scope so the firehose is greppable in devtools.
 function emit(lvl, method, scope, args) {
   if (lvl > level) return
-  const tag = scope ? `[filament:${scope}]` : '[filament]'
+  const tag = scope ? `[tunlion:${scope}]` : '[tunlion]'
   // eslint-disable-next-line no-console
   console[method](tag, ...args)
 }
@@ -85,17 +85,17 @@ function setLevel(name) {
   if (n == null) return NAMES[level]
   level = n
   try {
-    localStorage.setItem('filamentLog', NAMES[n])
+    localStorage.setItem('tunlionLog', NAMES[n])
   } catch {}
   return NAMES[n]
 }
 
 export const log = make(null)
 
-// Expose for flipping live in devtools: window.__filamentLog.setLevel('trace').
+// Expose for flipping live in devtools: window.__tunlionLog.setLevel('trace').
 try {
   if (typeof window !== 'undefined') {
-    window.__filamentLog = {
+    window.__tunlionLog = {
       setLevel,
       getLevel: () => NAMES[level],
       get level() {

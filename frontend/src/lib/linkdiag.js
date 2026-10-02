@@ -66,7 +66,7 @@ function _resolveEnabled() {
     const q = new URLSearchParams(window.location.search).get('diag')
     if (q === '0') return false
     if (q === '1') return true
-    const ls = localStorage.getItem('filamentDiag')
+    const ls = localStorage.getItem('tunlionDiag')
     if (ls === '0') return false
     if (ls === '1') return true
   } catch {}
@@ -77,7 +77,7 @@ enabled = _resolveEnabled()
 export function setEnabled(on) {
   enabled = !!on
   try {
-    localStorage.setItem('filamentDiag', on ? '1' : '0')
+    localStorage.setItem('tunlionDiag', on ? '1' : '0')
   } catch {}
   record('diag', { enabled }) // a marker in the timeline itself
 }

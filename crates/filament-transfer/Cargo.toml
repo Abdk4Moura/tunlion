@@ -13,7 +13,7 @@
 # crate never calls back, so there is no cycle.
 #
 # ZERO dependencies beyond std, deliberately. This is the layer someone can build
-# on without adopting filament's transport, its identity model, or its CLI.
+# on without adopting tunlion's transport, its identity model, or its CLI.
 [package]
 name = "filament-transfer"
 version = "0.1.0"

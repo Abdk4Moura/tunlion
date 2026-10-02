@@ -203,13 +203,13 @@ pub fn mount_caps_for_root(root: &std::path::Path) -> MountCaps {
 /// too-old caps so the client never silently falls back to a broken path.
 pub fn parse_mount_caps(value: serde_json::Value) -> Result<MountCaps> {
     if value.is_null() {
-        anyhow::bail!("peer did not advertise mount capabilities; upgrade filament");
+        anyhow::bail!("peer did not advertise mount capabilities; upgrade tunlion");
     }
     let caps: MountCaps = serde_json::from_value(value)
-        .map_err(|e| anyhow::anyhow!("peer mount capabilities unreadable ({e}); upgrade filament"))?;
+        .map_err(|e| anyhow::anyhow!("peer mount capabilities unreadable ({e}); upgrade tunlion"))?;
     if caps.protocol_version < 2 {
         anyhow::bail!(
-            "peer mount protocol version {} unsupported (need v2); upgrade filament",
+            "peer mount protocol version {} unsupported (need v2); upgrade tunlion",
             caps.protocol_version
         );
     }

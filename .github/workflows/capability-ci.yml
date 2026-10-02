@@ -3,7 +3,7 @@
 # Test each capability END TO END on ubuntu/macos/windows at ZERO privilege
 # (userspace netstack, no TUN/admin, stock GitHub runners). Uses the
 # Python Flask signaling backend (bundled with the repo) to pair two local
-# filament daemons, then exercises real capabilities.
+# tunlion daemons, then exercises real capabilities.
 #
 # "Green" = this CI is green on ALL three OSes, read from `gh pr checks`,
 # NOT a local `cargo test` on Linux. This CI exists because local-Linux-green
@@ -136,12 +136,12 @@ jobs:
             cli/target/release/.fingerprint/
             cli/target/release/deps/
             cli/target/release/build/
-            cli/target/release/libfilament_cli*
+            cli/target/release/libtunlion_cli*
           key: ${{ runner.os }}-target-${{ hashFiles('cli/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-target-
 
-      - name: Build filament (test-hooks)
+      - name: Build tunlion (test-hooks)
         working-directory: cli
         run: cargo build --features test-hooks --release
         env:
@@ -153,7 +153,7 @@ jobs:
 
       - name: Codesign binary (macOS)
         if: runner.os == 'macOS'
-        run: codesign --force --sign - cli/target/release/filament
+        run: codesign --force --sign - cli/target/release/tunlion
 
       - name: Run capability harness
         working-directory: cli

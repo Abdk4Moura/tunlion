@@ -2,7 +2,7 @@
 
 > Status: design. Formalizes one line from `docs/design-mesh-network.md`
 > ("make the signaling server self-hostable; let a stable peer double as the
-> rendezvous"). The claim: **any filament node can be a rendezvous; the global
+> rendezvous"). The claim: **any tunlion node can be a rendezvous; the global
 > server is demoted to a cold-start default**, not a dependency. This is a UX /
 > plumbing note, not a crypto change. Three of the four hard parts already exist.
 
@@ -52,7 +52,7 @@ Three of the four hard parts already exist:
   value"). `is_private_addr` (`cli/src/net.rs:1699`) already tells a node
   whether its address is routable. A node can decide "I can be a rendezvous"
   with code that already ships.
-- **The always-on box already exists.** `filament up --install` (systemd) is the
+- **The always-on box already exists.** `tunlion up --install` (systemd) is the
   standing public-address daemon a rendezvous needs.
 - **The `--server` swap point already exists** (above), and rendezvous vs relay
   are deliberately distinct commands (`docs/design-mesh-network.md:207`, "keep
@@ -73,11 +73,11 @@ The **two genuinely-new pieces are both UX / plumbing, not crypto:**
 
 **Sharp edge, with a clean answer.** A self-hosted rendezvous must also serve
 `/api/config` (clients fetch it before connect). But a public-IP node *is* a STUN
-reflector, so `filament up --rendezvous` can auto-serve its own config (its own
+reflector, so `tunlion up --rendezvous` can auto-serve its own config (its own
 `ip:port` as a STUN entry, TURN list optional / inherited) with zero operator
 env vars.
 
-**Net UX:** `filament up --rendezvous` + address-over-introducer +
+**Net UX:** `tunlion up --rendezvous` + address-over-introducer +
 server-as-raced-list.
 
 ## Multi-rendezvous mechanics and scale
@@ -139,7 +139,7 @@ reintroducing the central coordinator the project rejects
 2. **Server-as-a-raced-list.** Turn the single `server` value into an ordered
    list (hosted default + self-hosted), raced like the transport ladder, with
    HRW selection over the list for paired peers.
-3. **`filament up --rendezvous` self-serving `/api/config`.** A public-IP node
+3. **`tunlion up --rendezvous` self-serving `/api/config`.** A public-IP node
    auto-serves its own STUN config (it is already a reflector), so standing up a
    self-hosted rendezvous needs zero operator env vars.
 
@@ -149,6 +149,6 @@ Global, Sybil-resistant stranger discovery (open DHT rendezvous). That is the
 unsolved frontier; the hosted floor covers the no-shared-context case until it
 is solved elsewhere.
 
-See also: `docs/design-mesh-network.md` (why filament stays pairwise; the
+See also: `docs/design-mesh-network.md` (why tunlion stays pairwise; the
 signaling-is-not-the-coordinator section this note builds on),
 `docs/design-edge-signaling.md` (per-channel sharding and cache-and-dial).

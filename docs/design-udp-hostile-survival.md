@@ -1,11 +1,11 @@
 # Design: detect and survive UDP-hostile networks
 
-Status: DESIGN (pre-implementation). Owner: filament core. Reviewers: claude-advisor
+Status: DESIGN (pre-implementation). Owner: tunlion core. Reviewers: claude-advisor
 (security), then a coding agent implements per the phasing below with a live rig gate.
 
 ## 1. Problem and the current reality
 
-filament connects peers with two transports: a WebRTC DataChannel (DTLS/SCTP over
+tunlion connects peers with two transports: a WebRTC DataChannel (DTLS/SCTP over
 ICE, via webrtc-rs) and a direct-QUIC transport (quinn, UDP-only), plus a TURN relay
 (coturn) as fallback. On networks that block or throttle UDP — corporate firewalls,
 hotel/airport wifi, mobile carriers, DPI that only passes TCP/443 — a P2P tool quietly
@@ -137,8 +137,8 @@ DERP by node key; we authenticate by the pairing signaling already performed):
   signaling server issues each a short-lived **relay ticket**:
   `ticket = { pair_id, side, exp, mac }` where
   - Two subkeys are derived from the shared key `k` with **domain separation** so no value
-    can be reinterpreted across uses: `k_id = HKDF(k, "filament/relay/pair-id")` and
-    `k_mac = HKDF(k, "filament/relay/ticket-mac")`. (Without this, `pair_id` and `mac` use
+    can be reinterpreted across uses: `k_id = HKDF(k, "tunlion/relay/pair-id")` and
+    `k_mac = HKDF(k, "tunlion/relay/ticket-mac")`. (Without this, `pair_id` and `mac` use
     one key for two purposes and a `pair_id` handed to a peer could coincide with a valid
     `mac` — the same key-reuse class as the cold key signing both device certs and cap ops,
     and the overlay key's multiple duties. Domain separation makes the question disappear.)
@@ -226,7 +226,7 @@ exactly where it is most used. So:
   already end-to-end, and the same inner-session binding is used, so there is one binding
   mechanism for both dialers.
 - **The bound value is the inner TLS session's EXPORTER** (RFC 5705 / 9266;
-  `rustls::ConnectionCommon::export_keying_material` with a filament label). The exporter is
+  `rustls::ConnectionCommon::export_keying_material` with a tunlion label). The exporter is
   session-unique by construction, which collapses invariant 3 into the primitive instead of
   leaving "add a session-unique input" as a rule to remember: two sessions between the same
   peers produce *different* exporters, whereas cert fingerprints identify the keys and would
@@ -300,7 +300,7 @@ even attempted. Replace with a staggered parallel race:
 - **ALPN / cleartext-fingerprint hygiene.** On our own TLS-TCP transport we control the
   ClientHello. Present browser-like ALPN (`h2`/`http/1.1` for the WSS relay so it looks
   like the web traffic it rides among; ordinary extension ordering; no custom protocol
-  name that fingerprints as "filament"). Audit the direct-QUIC and DataChannel handshakes
+  name that fingerprints as "tunlion"). Audit the direct-QUIC and DataChannel handshakes
   for any product-identifying cleartext string (ALPN is the likeliest offender), and any
   product string in the signaling handshake. Skip padding/timing (obfuscation territory).
 

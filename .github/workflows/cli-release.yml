@@ -1,13 +1,13 @@
-# Build and attach filament CLI binaries to a GitHub release.
+# Build and attach tunlion CLI binaries to a GitHub release.
 # Trigger: push a tag like cli-v0.1.0. The release process is exactly:
 #
 #     git tag cli-vX.Y.Z && git push origin cli-vX.Y.Z
 #
 # Everything else — matrix builds, SHA256SUMS, provenance attestation, the
 # release itself — happens here. The curl|sh installer
-# (https://tunlion.autumated.com/install), `filament update`, the Homebrew
+# (https://tunlion.autumated.com/install), `tunlion update`, the Homebrew
 # tap, and the winget manifests all consume these exact artifact names:
-#     filament-<target>.tar.gz   (unix)   /  filament-<target>.zip (windows)
+#     tunlion-<target>.tar.gz   (unix)   /  tunlion-<target>.zip (windows)
 #     SHA256SUMS
 # Ledger C16 / gap G-e: docs/cli-resilience.md.
 
@@ -70,7 +70,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          BIN="cli/target/${{ matrix.target }}/release/filament"
+          BIN="cli/target/${{ matrix.target }}/release/tunlion"
           # Per-chunk/per-frame profiling logging must stay compile-stripped (behind
           # the `debug-logs` feature) and MUST NOT ship in a default release build.
           # If any marker is present, a dev-debug log leaked - fail the release.
@@ -83,21 +83,21 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.target }}" == *musl* ]]; then
-            file "cli/target/${{ matrix.target }}/release/filament" | grep -qi "static" || { echo "not static!"; exit 1; }
+            file "cli/target/${{ matrix.target }}/release/tunlion" | grep -qi "static" || { echo "not static!"; exit 1; }
           fi
           mkdir -p out
-          cp "cli/target/${{ matrix.target }}/release/filament" out/
-          tar -C out -czf "filament-${{ matrix.target }}.tar.gz" filament
+          cp "cli/target/${{ matrix.target }}/release/tunlion" out/
+          tar -C out -czf "tunlion-${{ matrix.target }}.tar.gz" tunlion
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # Bundle wintun.dll (WireGuard LLC's signed userspace TUN driver) beside
-          # filament.exe so the L3 overlay works on Windows out of the box; the CLI
+          # tunlion.exe so the L3 overlay works on Windows out of the box; the CLI
           # loads it from its own directory. amd64 build for x86_64-pc-windows-msvc.
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          Copy-Item "cli/target/${{ matrix.target }}/release/filament.exe" out/
+          Copy-Item "cli/target/${{ matrix.target }}/release/tunlion.exe" out/
           # Supply-chain integrity: pin the archive to its known SHA256 before
           # extracting anything, then require a valid WireGuard LLC Authenticode
           # signature on the DLL itself. Either check failing aborts the release.
@@ -111,13 +111,13 @@ jobs:
           if ($sig.Status -ne "Valid") { throw "wintun.dll Authenticode not Valid: $($sig.Status)" }
           if ($sig.SignerCertificate.Subject -notmatch "WireGuard LLC") { throw "wintun.dll not signed by WireGuard LLC: $($sig.SignerCertificate.Subject)" }
           Copy-Item $dll out/
-          Compress-Archive -Path "out/*" -DestinationPath "filament-${{ matrix.target }}.zip"
+          Compress-Archive -Path "out/*" -DestinationPath "tunlion-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: pkg-${{ matrix.target }}
           path: |
-            filament-*.tar.gz
-            filament-*.zip
+            tunlion-*.tar.gz
+            tunlion-*.zip
           if-no-files-found: error
 
   release:
@@ -135,16 +135,16 @@ jobs:
           merge-multiple: true
           # Assemble into a dedicated directory so the release globs below can
           # never see the repo tree. actions/checkout puts CHANGELOG.md and any
-          # repo-root file into the working directory, and a bare `filament-*`
-          # glob would silently include a repo-root file named filament-*.
+          # repo-root file into the working directory, and a bare `tunlion-*`
+          # glob would silently include a repo-root file named tunlion-*.
           path: dist
       - name: Checksums
         run: |
-          (cd dist && sha256sum filament-*.tar.gz filament-*.zip > SHA256SUMS)
+          (cd dist && sha256sum tunlion-*.tar.gz tunlion-*.zip > SHA256SUMS)
           cat dist/SHA256SUMS
       # #151: pin the release asset set to EXACTLY the four platform artifacts
       # plus SHA256SUMS. cli-v0.7.7 published three repo-root docs under
-      # filament-*.md because the release job gained a checkout (for
+      # tunlion-*.md because the release job gained a checkout (for
       # changelog-driven notes) and the bare globs widened. This check fails
       # the release on any extra or missing asset.
       - name: Release asset hygiene check
@@ -153,15 +153,15 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            dist/filament-*.tar.gz
-            dist/filament-*.zip
+            dist/tunlion-*.tar.gz
+            dist/tunlion-*.zip
             dist/SHA256SUMS
       # WHY THIS EXISTS
       #
       # The release body below used to be a static install + quick-start
       # template with no reference to CHANGELOG.md. So a change could be
       # written up correctly in the changelog and still be invisible in the
-      # release notes, which is what a user actually reads when `filament
+      # release notes, which is what a user actually reads when `tunlion
       # update` or winget offers them a new version.
       #
       # That was found on 2026-08-04 while landing a security entry under
@@ -221,9 +221,9 @@ jobs:
           # A tag with a hyphen (cli-v0.2.1-beta.1) is a PRERELEASE: GitHub
           # hides it from /releases/latest, and the installer + self-update
           # skip it unless explicitly opted in (FILAMENT_CHANNEL=beta /
-          # `filament update --beta`).
+          # `tunlion update --beta`).
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') }}
           files: |
-            dist/filament-*.tar.gz
-            dist/filament-*.zip
+            dist/tunlion-*.tar.gz
+            dist/tunlion-*.zip
             dist/SHA256SUMS

@@ -3,7 +3,7 @@ name = "filament-signal"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Minimal Engine.IO v4 / Socket.IO v5 websocket client for filament's signaling, on rustls."
+description = "Minimal Engine.IO v4 / Socket.IO v5 websocket client for tunlion's signaling, on rustls."
 
 [dependencies]
 anyhow = "1.0"

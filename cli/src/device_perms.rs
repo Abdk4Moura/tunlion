@@ -1,4 +1,4 @@
-//! `filament devices --caps [<device>]`: what a device can do to me, until when.
+//! `tunlion devices --caps [<device>]`: what a device can do to me, until when.
 //!
 //! Read-only over `devices.json` and `caps.json`. The view does not compute its
 //! own truth. The tier is `device_view::tier_for`, the derivation `devices`
@@ -345,7 +345,7 @@ fn to_json(d: &DevicePerms) -> Value {
 pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
     let mut out = Vec::new();
     if devices.is_empty() {
-        out.push(ui::paint(ui::Tone::Dim, "  No devices yet; see `filament add`."));
+        out.push(ui::paint(ui::Tone::Dim, "  No devices yet; see `tunlion add`."));
     }
     for d in devices {
         let fp = d.fingerprint.as_deref().unwrap_or("no certificate");
@@ -411,7 +411,7 @@ pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
     out.join("\n")
 }
 
-/// `filament devices --caps [<device>]`. Exit 3 for an unknown name.
+/// `tunlion devices --caps [<device>]`. Exit 3 for an unknown name.
 pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
     let now = capability::now_secs();
     let all = all_device_perms(now);
@@ -420,7 +420,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
         Some(n) => all.iter().filter(|d| d.name == n).collect(),
     };
     if name.is_some() && selected.is_empty() {
-        let message = format!("no device named '{}', see `filament devices`", name.unwrap_or(""));
+        let message = format!("no device named '{}', see `tunlion devices`", name.unwrap_or(""));
         if json {
             println!(
                 "{}",

@@ -1,4 +1,4 @@
-# Filament Showcase (R2-backed, isolated from the app)
+# Tunlion Showcase (R2-backed, isolated from the app)
 
 A public "dev-effort + reels" showcase served at
 **https://tunlion.autumated.com/showcase/** — a dark/mono build-log page with
@@ -8,13 +8,13 @@ job-runner contact sheet.
 
 ## Why this is safe (the whole point)
 
-The main app (`filament` Worker, the SPA) is bound to the **entire hostname**
+The main app (`tunlion` Worker, the SPA) is bound to the **entire hostname**
 `tunlion.autumated.com` via a Worker **Custom Domain**. This showcase is a
 **separate** Worker (`filament-showcase`) attached to a more-specific **zone
 route** `tunlion.autumated.com/showcase/*`. Cloudflare resolves the
 more-specific path route ahead of the catch-all Custom Domain, so:
 
-- `GET /` and everything else → main `filament` app (untouched).
+- `GET /` and everything else → main `tunlion` app (untouched).
 - `GET /showcase/*` → this showcase Worker → R2.
 
 Nothing about the main app's Worker, `wrangler.jsonc`, or `dist` is modified.

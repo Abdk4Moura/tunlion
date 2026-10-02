@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the filament signaling monitor every 3 minutes
+Description=Run the tunlion signaling monitor every 3 minutes
 
 [Timer]
 OnBootSec=2min

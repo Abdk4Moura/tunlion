@@ -10,7 +10,7 @@ the checked-in test estate, not a claim that every test runs in every workflow.
 | Capability CI | Two daemons on one hosted runner | Local signaling and same-host WebRTC/UDP; loopback is enabled on Linux and Windows | None. A host interface hairpin is possible, but there is no NAT boundary | `cli/tests/capability_harness.rs:117-121`, `:172-176`; `.github/workflows/capability-ci.yml:59-60`, `:175-182` |
 | Default CLI gates | Two local CLI processes | Fixture backend on `127.0.0.1`; direct and WebRTC paths stay on one host | None | `cli/tests/transport-gates.sh:23-25`, `:40-48`, `:61-77`; `cli/tests/gates.sh:37-48` |
 | L2 and SSH gates | Two local daemons plus local sshd | `127.0.0.1` services and a same-host data channel | None | `cli/tests/l2-gates.sh:25`, `:96-115`, `:148-163`; `cli/tests/ssh-gates.sh:32`, `:60-65` |
-| Local lab | Two Linux network namespaces on one host | Direct veth, userspace UDP, WireGuard, or filament carrier over a private underlay | None. Namespaces are isolated, but no NAT or Internet edge is configured | `lab/README.md:8-15`, `:37-57`, `:69-78`; `lab/topologies/two-nodes.yml:18-21` |
+| Local lab | Two Linux network namespaces on one host | Direct veth, userspace UDP, WireGuard, or tunlion carrier over a private underlay | None. Namespaces are isolated, but no NAT or Internet edge is configured | `lab/README.md:8-15`, `:37-57`, `:69-78`; `lab/topologies/two-nodes.yml:18-21` |
 | Relay gate | Two local peers and local coturn | Forced TURN relay on `127.0.0.1` | Relay transport is covered, but not NAT traversal | `cli/tests/gates.sh:329-347` |
 | NAT mapping probe | One Linux NAT namespace | MASQUERADE with and without `--random-fully` | Measures UDP mapping classification only (endpoint-independent vs endpoint-dependent); it is not NAT traversal coverage and not a cone-NAT claim | `cli/tests/natprobe-test.sh`; `cli/tests/natprobe.py` |
 
@@ -69,7 +69,7 @@ it tested direct candidates over a real interface, a NAT, or a forced relay.
 ## Cheapest Real-NAT Recommendation
 
 Keep the opt-in netns hole-punch gates as a fast deterministic regression suite,
-then add one scheduled two-host smoke test. Run one Filament daemon on each of
+then add one scheduled two-host smoke test. Run one Tunlion daemon on each of
 two small machines or CI runners on different networks, use the existing
 signaling service and TURN endpoint, and record the observed route plus a
 byte-exact transfer. Start with one ordinary home NAT and one mobile hotspot;

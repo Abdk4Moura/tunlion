@@ -1,6 +1,6 @@
 # Connection resilience & state machines
 
-Filament has three interacting state machines:
+Tunlion has three interacting state machines:
 
 1. **Room / signaling** — `signaling.py` (server) + `signaling.js` (client). Tracks
    who is in a room and relays opaque WebRTC payloads. Convention: roles are
@@ -44,7 +44,7 @@ The thrown error was swallowed, leaving the peer stuck.
 collision the impolite peer **ignores** the incoming offer and the polite peer
 rolls back. No reliance on ordering, so it's race-proof.
 *Files:* `webrtc.js` (constructor, `onnegotiationneeded`, `_handleSignal`),
-`useFilament.js` (`makeLink` computes `polite` from `myIdRef`).
+`useTunlion.js` (`makeLink` computes `polite` from `myIdRef`).
 
 ## 2. Unserialized signals drop ICE candidates
 
@@ -62,7 +62,7 @@ candidate buffer: candidates that arrive before a remote description is set are
 held in `_pendingCandidates` and flushed by `_flushCandidates()` right after
 `setRemoteDescription`.
 *Files:* `webrtc.js` (`enqueueSignal`, `_handleSignal`, `_flushCandidates`),
-`useFilament.js` (signal handler calls `enqueueSignal`).
+`useTunlion.js` (signal handler calls `enqueueSignal`).
 
 ## 3. Ghost peer tiles after teardown
 
@@ -79,7 +79,7 @@ late `onStatus`/`onRoute` re-`upsert`ed (re-created) the tile we'd just removed.
 closed; (b) split the hook's `upsertPeer` into `addPeer` (used only by
 `makeLink`) and `updatePeer` (status/route — **never adds**). A late callback
 can no longer resurrect a removed tile.
-*Files:* `webrtc.js` (`close`, `_detectRoute`), `useFilament.js` (`addPeer` /
+*Files:* `webrtc.js` (`close`, `_detectRoute`), `useTunlion.js` (`addPeer` /
 `updatePeer`).
 
 ## 4. Concurrent transfers corrupt each other
@@ -139,7 +139,7 @@ duplicate message from a departed peer.
 
 **Solution.** Only an incoming **offer** (`description` of type `offer`) may
 create a new link; stray answers/candidates from unknown sids are ignored.
-*Files:* `useFilament.js` (signal handler).
+*Files:* `useTunlion.js` (signal handler).
 
 ## 8. No negotiation watchdog → stuck at "connecting" forever
 
@@ -164,7 +164,7 @@ nothing retries. Infinite "connecting".
   `setLocalDescription()`, which throws on older Safari and silently killed
   the handshake.
 *Files:* `webrtc.js` (`politeRole`, watchdog, `onnegotiationneeded`,
-`_handleSignal`), `useFilament.js` (`onStuck` retry loop, `attemptsRef`).
+`_handleSignal`), `useTunlion.js` (`onStuck` retry loop, `attemptsRef`).
 
 ## 9. Stale TURN credentials in long-lived tabs
 
@@ -180,7 +180,7 @@ allocation → no relay candidates → relay-dependent pairs fail.
 every **10 minutes** in the background, so new links always carry fresh
 credentials; the server-side TTL was raised to 6h so long-running relayed
 sessions can keep refreshing their allocations.
-*Files:* `useFilament.js` (status-handler + interval refresh), droplet `.env`
+*Files:* `useTunlion.js` (status-handler + interval refresh), droplet `.env`
 (`FIL_TURN_TTL`).
 
 ## 10. Zombie registry entries → duplicate peer tiles
@@ -198,7 +198,7 @@ during a reconnect, `peer-joined` (new sid) can arrive before `peer-left` (old
 sid), briefly duplicating the tile.
 
 **Solution.** Two layers:
-- **Server — liveness leases:** every connection holds a `filament:live:{sid}`
+- **Server — liveness leases:** every connection holds a `tunlion:live:{sid}`
   key (`EX 120`) refreshed every 45s by the instance that owns it; `peers_in`
   returns only leased entries and **lazily deletes** dead ones the first time
   anyone looks. Orphans now disappear ≤2 minutes after any crash/restart.
@@ -207,7 +207,7 @@ sid), briefly duplicating the tile.
   link/tile is replaced immediately. This also erases the transient
   reconnect-window duplicate.
 *Files:* `backend/signaling.py` (`LIVE_TTL`, `refresh`, lease-aware
-`peers_in`, `_lease_loop`), `useFilament.js` (`makeLink` supersede).
+`peers_in`, `_lease_loop`), `useTunlion.js` (`makeLink` supersede).
 
 ## 11. One-time pairing codes (feature)
 
@@ -231,7 +231,7 @@ the first argument — `generateCode(keyword)` must type-guard (`typeof keyword
 === 'string'`) and the server's `_norm_code` must reject non-strings, else the
 event object crashed the handler and the button silently did nothing.
 *Files:* `backend/signaling.py` (`pair_create`/`pair_claim`, events),
-`signaling.js`, `useFilament.js`, `Filament.jsx` ('pair' scope).
+`signaling.js`, `useTunlion.js`, `Tunlion.jsx` ('pair' scope).
 
 ## 12. Mobile file-picker backgrounding kills the peer link
 
@@ -250,7 +250,7 @@ re-offer never-accepted sends, not only paused ones.
 idle. (b) The reconnect path (visibilitychange nudge -> rejoin -> uid
 supersede -> onChannelOpen) re-offers every unfinished outgoing transfer for
 that peer, including status 'offered'.
-*Files:* `webrtc.js` (grace), `useFilament.js` (onChannelOpen re-offer).
+*Files:* `webrtc.js` (grace), `useTunlion.js` (onChannelOpen re-offer).
 
 ---
 

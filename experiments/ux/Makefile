@@ -1,4 +1,4 @@
-# Filament e2e TEST + live-record pipeline — standard entry points.
+# Tunlion e2e TEST + live-record pipeline — standard entry points.
 # Run from experiments/ux/ (or `make -C experiments/ux <target>`).
 #
 #   make e2e         full suite (real app + real peers + reels)

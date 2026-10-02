@@ -1,5 +1,5 @@
 /**
- * Filament Showcase Worker
+ * Tunlion Showcase Worker
  * ------------------------
  * Serves the static showcase (build-log page + reels/gifs) from R2 at
  *   https://tunlion.autumated.com/showcase/*
@@ -7,7 +7,7 @@
  * Mapping: GET /showcase/<path>  ->  R2 object <path> (in the `filament-showcase`
  * bucket). `/showcase` and `/showcase/` serve `index.html`.
  *
- * This Worker is wired ONLY to the /showcase/* route; the main `filament` app
+ * This Worker is wired ONLY to the /showcase/* route; the main `tunlion` app
  * Worker (the SPA on `/`) is never touched.
  */
 

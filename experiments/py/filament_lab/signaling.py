@@ -1,4 +1,4 @@
-"""Filament signaling client — a reusable python-socketio wrapper.
+"""Tunlion signaling client — a reusable python-socketio wrapper.
 
 Speaks the exact Socket.IO contract the Rust CLI (cli/src/net.rs) and the
 backend (backend/signaling.py) use:
@@ -41,7 +41,7 @@ def default_log(kind: str, msg: str = "") -> None:
 
 
 class Signaling:
-    """One Socket.IO connection to a filament signaling server.
+    """One Socket.IO connection to a tunlion signaling server.
 
     Records observed state (my_id, peers, signals, pair_state) AND fans events
     out to any callbacks registered via .on(event, fn). The peer/driver layers

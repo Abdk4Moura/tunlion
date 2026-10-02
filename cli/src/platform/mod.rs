@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-/// Platform-specific paths for the filament CLI.
+/// Platform-specific paths for the tunlion CLI.
 ///
 /// Uses the `directories` crate for proper OS placement:
-/// - Linux:   `$XDG_CONFIG_HOME/filament` (falls back to `$HOME/.config/filament`)
-/// - macOS:   `$HOME/Library/Application Support/filament`
-/// - Windows: `%APPDATA%/filament`
+/// - Linux:   `$XDG_CONFIG_HOME/tunlion` (falls back to `$HOME/.config/tunlion`)
+/// - macOS:   `$HOME/Library/Application Support/tunlion`
+/// - Windows: `%APPDATA%/tunlion`
 ///
 /// All paths honor `FILAMENT_CONFIG_DIR` as an override (hermetic tests,
 /// custom deployments).
@@ -16,7 +16,7 @@ pub struct Paths;
 impl Paths {
     /// Config directory root.
     ///
-    /// On first access, checks for legacy `./.config/filament` (cwd-relative,
+    /// On first access, checks for legacy `./.config/tunlion` (cwd-relative,
     /// the broken Windows fallback when HOME was unset) and migrates contents
     /// to the platform-correct path.
     pub fn config_dir() -> PathBuf {
@@ -27,12 +27,12 @@ impl Paths {
     }
 
     fn platform_config_dir() -> PathBuf {
-        if let Some(proj) = directories::ProjectDirs::from("", "", "filament") {
+        if let Some(proj) = directories::ProjectDirs::from("", "", "tunlion") {
             return proj.config_dir().to_path_buf();
         }
         // #184: route through home_dir() (USERPROFILE on Windows) instead of a
         // bare HOME read that falls back to "." on Windows.
-        Self::home_dir().join(".config").join("filament")
+        Self::home_dir().join(".config").join("tunlion")
     }
 
     /// Resolve a config-relative path (file or subdirectory).
@@ -70,18 +70,18 @@ impl Paths {
         Ok(repaired)
     }
 
-    /// Migrate state from a legacy `$HOME/.config/filament` directory (the
+    /// Migrate state from a legacy `$HOME/.config/tunlion` directory (the
     /// broken Windows fallback when HOME was unset, which resolved relative to
     /// the process cwd). Best-effort, safe to call repeatedly.
     ///
     /// Two guards, both earned:
     /// 1. An explicit FILAMENT_CONFIG_DIR override means the caller knows where
     ///    their config lives; migrating INTO it would copy whatever a
-    ///    cwd-relative ".config/filament" resolves to — the production identity
+    ///    cwd-relative ".config/tunlion" resolves to — the production identity
     ///    when the shell's cwd is $HOME (issue #149, a key clone). Never
     ///    migrate under an override.
     /// 2. The legacy location is pinned to home_dir(), not the process cwd.
-    ///    "./.config/filament" names a different directory in every process;
+    ///    "./.config/tunlion" names a different directory in every process;
     ///    with the default shell cwd of $HOME it was indistinguishable from the
     ///    live production config, which is exactly what let the override case
     ///    clone keys. When HOME is unset, home_dir() falls back to ".", which
@@ -90,7 +90,7 @@ impl Paths {
         if std::env::var_os("FILAMENT_CONFIG_DIR").is_some() {
             return;
         }
-        let legacy = Self::home_dir().join(".config").join("filament");
+        let legacy = Self::home_dir().join(".config").join("tunlion");
         if !legacy.is_dir() {
             return;
         }
@@ -134,7 +134,7 @@ impl Paths {
     /// Resolution order (first match wins):
     /// 1. `shell_program` (from `--shell-program` flag)
     /// 2. `FILAMENT_SHELL` env var
-    /// 3. `filament set shell` config (passed via `shell_config`)
+    /// 3. `tunlion set shell` config (passed via `shell_config`)
     /// 4. `$SHELL` on Unix / powershell→cmd on Windows
     /// 5. Hardcoded fallback (`/bin/bash` → `/bin/sh` / `cmd.exe`)
     ///
@@ -318,7 +318,7 @@ impl filament_id::KeyStore for PlatformKeyStore {
 /// under a holder. The sidecar is never replaced.
 ///
 /// Unix: flock(LOCK_EX). Windows: LockFileEx. Other platforms: the file is
-/// opened but not locked (filament targets unix + windows).
+/// opened but not locked (tunlion targets unix + windows).
 pub struct DevicesFileLock {
     _file: std::fs::File,
 }
@@ -412,7 +412,7 @@ impl Drop for DevicesFileLock {
 /// - **system**: privileged, kernel TUN, autostart at boot (requires admin).
 /// - **user**: unprivileged, userspace-only, autostart at logon.
 ///
-/// `filament up --install` tries system first (elevation popup), falls back to
+/// `tunlion up --install` tries system first (elevation popup), falls back to
 /// user on decline. `--uninstall` removes whatever was installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceHost {
@@ -454,7 +454,7 @@ impl ServiceHost {
             ServiceHost::Systemd => "",
             ServiceHost::Launchd => "On macOS, create a LaunchAgent plist in ~/Library/LaunchAgents/ and load it with launchctl.",
             ServiceHost::WindowsService => "On Windows, create a Scheduled Task (trigger: at logon) or register a Service with sc.exe.",
-            ServiceHost::None => "No service manager detected. Start filament with `filament up` in a terminal, or configure your init system manually.",
+            ServiceHost::None => "No service manager detected. Start tunlion with `tunlion up` in a terminal, or configure your init system manually.",
         }
     }
 
@@ -522,38 +522,38 @@ impl ServiceHost {
         match self {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
-                let unit = std::path::Path::new("/etc/systemd/system/filament.service");
+                let unit = std::path::Path::new("/etc/systemd/system/tunlion.service");
                 std::fs::write(unit, format!(
-                    "[Unit]\nDescription=Filament drop target\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=multi-user.target\n",
+                    "[Unit]\nDescription=Tunlion drop target\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=multi-user.target\n",
                     exe.display(), shell_args
                 ))?;
                 let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
-                let _ = std::process::Command::new("systemctl").args(["enable", "--now", "filament"]).status();
+                let _ = std::process::Command::new("systemctl").args(["enable", "--now", "tunlion"]).status();
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
                 // 0.8.5 (rec 4): a machine-wide Windows service cannot work yet.
-                // `sc create` registers the exe as an SCM service, but filament
+                // `sc create` registers the exe as an SCM service, but tunlion
                 // is a plain console program with no service protocol, so
                 // `sc start` always times out (exit 1053). Until that protocol
                 // exists, refuse clearly instead of half-installing. The default
                 // per-user autostart (HKCU Run) is unaffected and never reaches
                 // this path.
                 anyhow::bail!(
-                    "a machine-wide Windows service is not supported yet: filament has no service protocol, \
+                    "a machine-wide Windows service is not supported yet: tunlion has no service protocol, \
                      so the installed service could never start. The per-user autostart (the default) is \
                      already installed. See #177."
                 );
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
-                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.filament.plist");
+                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.tunlion.plist");
                 std::fs::write(plist, format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>autumated.filament</string>
+  <key>Label</key><string>autumated.tunlion</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>up</string>{}</array>
   <key>RunAtLoad</key><true/>
@@ -599,10 +599,10 @@ impl ServiceHost {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
                 let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "disable", "--now", "filament"])
+                    .args(["--user", "disable", "--now", "tunlion"])
                     .status();
                 let _ = std::process::Command::new("systemctl")
-                    .args(["disable", "--now", "filament"])
+                    .args(["disable", "--now", "tunlion"])
                     .status();
             }
             #[cfg(target_os = "windows")]
@@ -612,7 +612,7 @@ impl ServiceHost {
                 // with the HKCU Run entry, which needs no elevation.
                 if self.is_elevated() {
                     let _ = std::process::Command::new("sc")
-                        .args(["delete", "filament"])
+                        .args(["delete", "tunlion"])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();
@@ -621,14 +621,14 @@ impl ServiceHost {
                     .args([
                         "delete",
                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                        "/v", "Filament",
+                        "/v", "Tunlion",
                         "/f",
                     ])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
                 let _ = std::process::Command::new("schtasks")
-                    .args(["/delete", "/tn", "Filament", "/f"])
+                    .args(["/delete", "/tn", "Tunlion", "/f"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
@@ -636,7 +636,7 @@ impl ServiceHost {
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
                 let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", "gui/501/autumated.filament"])
+                    .args(["bootout", "gui/501/autumated.tunlion"])
                     .status();
             }
             _ => {}
@@ -778,16 +778,16 @@ fn install_systemd_user(exe: &Path, shell_args: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
-    let unit = unit_dir.join("filament.service");
+    let unit = unit_dir.join("tunlion.service");
     std::fs::write(&unit, format!(
-        "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
         exe.display(), shell_args
     ))?;
     let ok = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()
-        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "filament"]).status())
+        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "tunlion"]).status())
         .map(|s| s.success()).unwrap_or(false);
     if !ok {
-        anyhow::bail!("systemctl --user enable --now filament failed; run it manually or check journalctl --user -u filament");
+        anyhow::bail!("systemctl --user enable --now tunlion failed; run it manually or check journalctl --user -u tunlion");
     }
     Ok(())
 }
@@ -802,7 +802,7 @@ fn install_run_key(exe: &Path, shell_args: &str) -> Result<()> {
         .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v", "Filament",
+            "/v", "Tunlion",
             "/t", "REG_SZ",
             "/d", &cmd,
             "/f",
@@ -829,7 +829,7 @@ fn install_scheduled_task(exe: &Path, shell_args: &str) -> Result<()> {
     let tmp = std::env::temp_dir().join("filament-task.xml");
     std::fs::write(&tmp, &task_xml)?;
     let out = std::process::Command::new("schtasks")
-        .args(["/create", "/tn", "Filament", "/xml", &tmp.to_string_lossy(), "/f"])
+        .args(["/create", "/tn", "Tunlion", "/xml", &tmp.to_string_lossy(), "/f"])
         .output()?;
     let _ = std::fs::remove_file(&tmp);
     if !out.status.success() {
@@ -844,13 +844,13 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = PathBuf::from(&home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir)?;
-    let plist = dir.join("autumated.filament.plist");
+    let plist = dir.join("autumated.tunlion.plist");
     std::fs::write(&plist, format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>autumated.filament</string>
+  <key>Label</key><string>autumated.tunlion</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>up</string>{}</array>
   <key>RunAtLoad</key><true/>
@@ -867,7 +867,7 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
 pub fn add_firewall_rule(exe: &Path) {
     let _ = std::process::Command::new("netsh")
         .args(["advfirewall", "firewall", "add", "rule",
-            "name=Filament QUIC", "dir=in", "action=allow",
+            "name=Tunlion QUIC", "dir=in", "action=allow",
             "protocol=udp",
             "program=", &exe.display().to_string(),
             "enable=yes"])
@@ -991,7 +991,7 @@ pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
 
 // ------------------------------------------------------- InstallSource --
 
-/// How filament was installed. Used to gate `filament update`:
+/// How tunlion was installed. Used to gate `tunlion update`:
 /// package-manager installs must be updated via their manager, not
 /// by overwriting the binary directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1035,12 +1035,12 @@ impl InstallSource {
         InstallSource::SelfInstalled
     }
 
-    /// Upgrade command the user should run instead of `filament update`.
+    /// Upgrade command the user should run instead of `tunlion update`.
     pub fn upgrade_hint(&self) -> &'static str {
         match self {
-            InstallSource::Homebrew => "brew upgrade filament",
-            InstallSource::Winget => "winget upgrade Abdk4Moura.Filament",
-            InstallSource::Scoop => "scoop update filament",
+            InstallSource::Homebrew => "brew upgrade tunlion",
+            InstallSource::Winget => "winget upgrade Abdk4Moura.Tunlion",
+            InstallSource::Scoop => "scoop update tunlion",
             InstallSource::Cargo => "cargo install filament-cli",
             InstallSource::SelfInstalled => "",
         }
@@ -1168,42 +1168,42 @@ mod tests {
 
     #[test]
     fn install_source_classify_brew() {
-        let p = Path::new("/opt/homebrew/Cellar/filament/0.4.1/bin/filament");
+        let p = Path::new("/opt/homebrew/Cellar/tunlion/0.4.1/bin/tunlion");
         assert_eq!(InstallSource::classify(p), InstallSource::Homebrew);
-        let p2 = Path::new("/home/linuxbrew/.linuxbrew/bin/filament");
+        let p2 = Path::new("/home/linuxbrew/.linuxbrew/bin/tunlion");
         assert_eq!(InstallSource::classify(p2), InstallSource::Homebrew);
-        let p3 = Path::new("/usr/local/Cellar/filament/0.3.1/bin/filament");
+        let p3 = Path::new("/usr/local/Cellar/tunlion/0.3.1/bin/tunlion");
         assert_eq!(InstallSource::classify(p3), InstallSource::Homebrew);
     }
 
     #[test]
     fn install_source_classify_winget() {
-        let p = Path::new("C:\\Users\\kabir\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Abdk4Moura.Filament_filament\\filament.exe");
+        let p = Path::new("C:\\Users\\kabir\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Abdk4Moura.Tunlion_tunlion\\tunlion.exe");
         assert_eq!(InstallSource::classify(p), InstallSource::Winget);
     }
 
     #[test]
     fn install_source_classify_scoop() {
-        let p = Path::new("C:\\Users\\kabir\\scoop\\apps\\filament\\0.4.1\\filament.exe");
+        let p = Path::new("C:\\Users\\kabir\\scoop\\apps\\tunlion\\0.4.1\\tunlion.exe");
         assert_eq!(InstallSource::classify(p), InstallSource::Scoop);
     }
 
     #[test]
     fn install_source_classify_cargo() {
-        let p = Path::new("/home/kabir/.cargo/bin/filament");
+        let p = Path::new("/home/kabir/.cargo/bin/tunlion");
         assert_eq!(InstallSource::classify(p), InstallSource::Cargo);
     }
 
     #[test]
     fn install_source_classify_self_installed() {
-        let p = Path::new("/home/kabir/.local/bin/filament");
+        let p = Path::new("/home/kabir/.local/bin/tunlion");
         assert_eq!(InstallSource::classify(p), InstallSource::SelfInstalled);
     }
 
     #[test]
     fn install_source_upgrade_hints() {
-        assert_eq!(InstallSource::Homebrew.upgrade_hint(), "brew upgrade filament");
-        assert_eq!(InstallSource::Winget.upgrade_hint(), "winget upgrade Abdk4Moura.Filament");
+        assert_eq!(InstallSource::Homebrew.upgrade_hint(), "brew upgrade tunlion");
+        assert_eq!(InstallSource::Winget.upgrade_hint(), "winget upgrade Abdk4Moura.Tunlion");
         assert_eq!(InstallSource::Cargo.upgrade_hint(), "cargo install filament-cli");
         assert_eq!(InstallSource::SelfInstalled.upgrade_hint(), "");
     }
@@ -1270,8 +1270,8 @@ mod tests {
 
     /// Regression for #149: setting FILAMENT_CONFIG_DIR to a fresh path from a
     /// shell whose cwd is $HOME must NOT migrate the production identity into
-    /// it. Before the fix, `.config/filament` (cwd-relative) resolved to
-    /// $HOME/.config/filament, the live production config, and the migration
+    /// it. Before the fix, `.config/tunlion` (cwd-relative) resolved to
+    /// $HOME/.config/tunlion, the live production config, and the migration
     /// copied it wholesale into the override: a key clone.
     #[cfg(unix)]
     #[test]
@@ -1279,7 +1279,7 @@ mod tests {
         let uid = format!("{}-cfgdir-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         let work = std::env::temp_dir().join(format!("fil-cfg-{uid}"));
         let home = work.join("home");
-        let legacy = home.join(".config").join("filament");
+        let legacy = home.join(".config").join("tunlion");
         let target = work.join("target");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("identity.ed25519"), b"production key").unwrap();

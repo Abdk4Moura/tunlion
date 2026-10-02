@@ -1,17 +1,17 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
-PackageIdentifier: Abdk4Moura.Filament
+PackageIdentifier: Abdk4Moura.Tunlion
 PackageVersion: "0.4.1"
 PackageLocale: en-US
 Publisher: Abdulkabir Agboola
 PublisherUrl: https://github.com/Abdk4Moura
 PublisherSupportUrl: https://github.com/Abdk4Moura/tunlion/issues
-PackageName: Filament
+PackageName: Tunlion
 PackageUrl: https://tunlion.autumated.com
 License: MIT
 LicenseUrl: https://github.com/Abdk4Moura/tunlion/blob/main/LICENSE
 ShortDescription: P2P file transfer between terminals and browsers - no upload, no account
 Description: |-
-  Filament sends files directly between devices over WebRTC. The other end
+  Tunlion sends files directly between devices over WebRTC. The other end
   can be another terminal or any browser at tunlion.autumated.com - nothing
   to install on the receiving phone or laptop. One-time speakable pairing
   codes, resumable transfers that survive restarts, and visible routing

@@ -1,4 +1,4 @@
-# Deploying Filament
+# Deploying Tunlion
 
 Split deploy, tuned for a **shared droplet that also runs other important
 services**: nothing binds the host's public web ports, the image is built in CI
@@ -32,7 +32,7 @@ scales up/down in seconds.
   droplet / DO cloud firewall. Nothing else.
 
 ## 1. Cloudflare Tunnel (one-time)
-Zero Trust → Networks → Tunnels → **Create a tunnel** (named, e.g. `filament`):
+Zero Trust → Networks → Tunnels → **Create a tunnel** (named, e.g. `tunlion`):
 1. Add a **Public Hostname**: `api.filament.autumated.com` → type `HTTP` →
    URL `api:8000`. (That hostname is the api service on the droplet's compose
    network — cloudflared runs there.)
@@ -40,8 +40,8 @@ Zero Trust → Networks → Tunnels → **Create a tunnel** (named, e.g. `filame
 
 ## 2. Bring the stack up on the droplet (one-time)
 ```bash
-sudo git clone https://github.com/Abdk4Moura/tunlion.git /opt/filament
-cd /opt/filament/deploy
+sudo git clone https://github.com/Abdk4Moura/tunlion.git /opt/tunlion
+cd /opt/tunlion/deploy
 cp .env.example .env
 # edit .env: paste CF_TUNNEL_TOKEN, set FIL_SECRET + FIL_TURN_SECRET
 # (openssl rand -hex 32 each). Domains + DROPLET_IP are already filled.
@@ -57,7 +57,7 @@ package public first, step 4, or `docker login ghcr.io` once.) Check:
 New Pages project from the repo:
 - Build command: `cd frontend && npm install && npm run build`
 - Output directory: `backend/dist`
-- Env var: `VITE_FILAMENT_API = https://api.filament.autumated.com`
+- Env var: `VITE_TUNLION_API = https://api.filament.autumated.com`
 - After first deploy, add custom domain `tunlion.autumated.com`.
 Pages rebuilds on every push; `_redirects` handles SPA deep links.
 
@@ -76,13 +76,13 @@ the tiny api container restarts; cloudflared/redis/coturn are untouched.
   | `DROPLET_HOST` | `165.22.207.231` |
   | `DROPLET_USER` | SSH user (e.g. `root`) |
   | `DROPLET_SSH_KEY` | a private deploy key (public half in droplet `authorized_keys`) |
-  | `DEPLOY_PATH` | `/opt/filament` |
+  | `DEPLOY_PATH` | `/opt/tunlion` |
   | `DROPLET_PORT` | (optional) default `22` |
 
 ## 5. Scaling — fast, up or down
 The api is **stateless behind Redis**, so add/remove replicas in seconds:
 ```bash
-cd /opt/filament/deploy
+cd /opt/tunlion/deploy
 ./scale.sh 4      # 4 api replicas
 ./scale.sh 1      # back to one
 ```

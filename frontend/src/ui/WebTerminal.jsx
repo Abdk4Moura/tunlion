@@ -64,7 +64,7 @@ function makeSessionId(instanceId) {
   return 'pty-' + base
 }
 
-// viewportPinned: the host (the terminal overlay in Filament.jsx, and the
+// viewportPinned: the host (the terminal overlay in Tunlion.jsx, and the
 // preview wrapper) already sizes itself to the VISUAL viewport, so the visible
 // box already excludes the soft keyboard. In that case we must NOT also lift the
 // accessory bar by kbInset (that would double-count the keyboard, leaving a gap

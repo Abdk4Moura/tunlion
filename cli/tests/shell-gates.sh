@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# `filament shell` (native PTY) denial + positive gates. Standalone, hermetic,
+# `tunlion shell` (native PTY) denial + positive gates. Standalone, hermetic,
 # fixture port 8103 ONLY. Proves that a shell refusal reaches the initiator as a
 # nonzero exit + a reason, instead of an empty success (the #219/#223 defect).
 #
-#   FILAMENT_BIN=/path/to/filament ./shell-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./shell-gates.sh
 #
 # Gates:
 #   A  NEGATIVE no-cap — a paired device WITHOUT a shell grant is refused; exit
 #      nonzero and the reason names the capability.
-#   B  POSITIVE granted — `filament shell <peer> -- 'echo HELLO'` returns 0 with
+#   B  POSITIVE granted — `tunlion shell <peer> -- 'echo HELLO'` returns 0 with
 #      HELLO on stdout.
 #   C  NEIGHBOUR `-- true` — a legitimately fast-exiting remote command stays
 #      exit 0 with no output; it must NOT be reported as a denial.
@@ -25,7 +25,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8103
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

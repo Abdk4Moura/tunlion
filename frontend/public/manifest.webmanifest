@@ -1,6 +1,6 @@
 {
-  "name": "Filament — P2P file transfer & shell",
-  "short_name": "Filament",
+  "name": "Tunlion — P2P file transfer & shell",
+  "short_name": "Tunlion",
   "description": "Send files directly between devices and open a terminal into your own machines, from the browser. Peer-to-peer, no upload, no account.",
   "start_url": "/",
   "scope": "/",

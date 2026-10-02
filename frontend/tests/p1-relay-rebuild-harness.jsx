@@ -8,7 +8,7 @@
 //   2. webrtc.js _correctStall ladder: a genuinely stalled in-flight transfer
 //      must climb rungs a -> b -> c and at rung (c) fire
 //      onStall({reason:'persistent'}). This is the P0->P1 handoff.
-//   3. useFilament.js onStall handler: the EXACT hook wiring (a faithful copy
+//   3. useTunlion.js onStall handler: the EXACT hook wiring (a faithful copy
 //      kept in lockstep, asserted below to invoke makeLink with relayOnly:true)
 //      must (a) rebuild relay-preferred ONCE, (b) NOT re-escalate when the link
 //      is already relayOnly, (c) NOT escalate on a non-persistent reason, and
@@ -84,7 +84,7 @@ async function run() {
   }
 
   // -- TEST 3: the hook's onStall handler -> rebuild relay-preferred, bounded ----
-  // This mirrors useFilament.js makeLink's onStall EXACTLY (kept in lockstep). It
+  // This mirrors useTunlion.js makeLink's onStall EXACTLY (kept in lockstep). It
   // exercises the real decision: relayedRef at-most-once, the relayOnly guard, the
   // non-persistent guard, and that the rebuild passes relayOnly:true + the SAME
   // hook-owned stores (resume, not restart).

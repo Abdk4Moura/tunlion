@@ -1,11 +1,11 @@
-# libfilament: the ideas, usable without the product
+# libtunlion: the ideas, usable without the product
 
 > Status: direction agreed 2026-08-27. Partly built. This is the map, and the
 > rule for deciding what may leave the CLI.
 
 ## The goal
 
-Someone should be able to build on filament's ideas without adopting filament.
+Someone should be able to build on tunlion's ideas without adopting tunlion.
 Not "vendor the CLI and shell out to it" — take the piece they need, as a crate,
 with a public API and no obligation to bring the rest.
 

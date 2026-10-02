@@ -6,12 +6,12 @@
 >
 > The surface that came out of it:
 >
->     filament add                             offer a code, ordinary pair
->     filament add --for device                ...and enrol into your mesh
->     filament add --for person                ...explicitly external
->     filament add --for device --out f.json   ...delivered as a file
->     filament join <code>                     accept a code
->     filament join --invite-file f.json       accept a file
+>     tunlion add                             offer a code, ordinary pair
+>     tunlion add --for device                ...and enrol into your mesh
+>     tunlion add --for person                ...explicitly external
+>     tunlion add --for device --out f.json   ...delivered as a file
+>     tunlion join <code>                     accept a code
+>     tunlion join --invite-file f.json       accept a file
 >
 > `--internal`, added in the first pass, was deleted in the second: `--for`
 > already asked that question on the invitation path, so the code path did not
@@ -22,7 +22,7 @@
 
 ## The report
 
-`filament add` and `filament add <code>` do not join a device to the mesh. They
+`tunlion add` and `tunlion add <code>` do not join a device to the mesh. They
 behave as though pairing were for external people only, and mesh membership
 comes solely from the invitation path.
 
@@ -30,9 +30,9 @@ comes solely from the invitation path.
 
 Fresh owner, fresh device, nothing else:
 
-    owner:   filament init --yes --name owner
-    owner:   filament add --word "gigantic element" --name laptop
-    device:  filament add GIGANTIC-ELEMENT-9982 --name owner
+    owner:   tunlion init --yes --name owner
+    owner:   tunlion add --word "gigantic element" --name laptop
+    device:  tunlion add GIGANTIC-ELEMENT-9982 --name owner
 
 Both sides report success ("mutually remembered, verified end-to-end"). Then:
 

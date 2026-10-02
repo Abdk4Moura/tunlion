@@ -1,5 +1,5 @@
 [Unit]
-Description=Filament signaling health check (one-shot; driven by filament-monitor.timer)
+Description=Tunlion signaling health check (one-shot; driven by filament-monitor.timer)
 After=network-online.target
 
 [Service]

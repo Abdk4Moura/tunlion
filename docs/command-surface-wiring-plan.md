@@ -1,4 +1,4 @@
-# filament — command-surface wiring plan
+# tunlion — command-surface wiring plan
 
 Status: analysis (no code edits). Companion to `design-command-surface.md` (the
 simplification spec) and `ux-copy-final.md` (the buildable copy). Owner: orchestrator,
@@ -10,44 +10,44 @@ after the security core lands.
 
 | # | Current variant | Line | Disposition | After | Guardrail / citation |
 |---|---|---|---|---|---|
-| 1 | `Send` | 398 | positional + keep | `filament <file>` sends; `send` stays explicit | design line 36 |
-| 2 | `Recv` | 426 | positional + keep | `filament <code>` receives; `recv` stays explicit | design line 37 |
-| 3 | `Pair` | 459 | keep (everyday) | `filament pair` | design line 49 |
-| 4 | `Devices` (sub: Forget, Rename) | 472 | keep + absorb | `filament devices` (+ `promote`, `vouch`) | design line 50 |
-| 5 | `Up` | 479 | keep (everyday) | `filament up` | design line 54; "up is everyday; namespacing the most common daemon action to hide two rare siblings is backwards" (line 165) |
+| 1 | `Send` | 398 | positional + keep | `tunlion <file>` sends; `send` stays explicit | design line 36 |
+| 2 | `Recv` | 426 | positional + keep | `tunlion <code>` receives; `recv` stays explicit | design line 37 |
+| 3 | `Pair` | 459 | keep (everyday) | `tunlion pair` | design line 49 |
+| 4 | `Devices` (sub: Forget, Rename) | 472 | keep + absorb | `tunlion devices` (+ `promote`, `vouch`) | design line 50 |
+| 5 | `Up` | 479 | keep (everyday) | `tunlion up` | design line 54; "up is everyday; namespacing the most common daemon action to hide two rare siblings is backwards" (line 165) |
 | 6 | `Status` | 517 | keep + absorb | absorbs `ping`, `cap-status`, `addr --json` | design line 56 |
-| 7 | `Down` | 524 | keep | `filament down` | design line 55 |
-| 8 | `Introduce` (hidden) | 527 | alias→devices vouch | `filament devices vouch <a> <b>`; `introduce` = hidden deprecated alias | design line 51 |
+| 7 | `Down` | 524 | keep | `tunlion down` | design line 55 |
+| 8 | `Introduce` (hidden) | 527 | alias→devices vouch | `tunlion devices vouch <a> <b>`; `introduce` = hidden deprecated alias | design line 51 |
 | 9 | `Set` | 534 | keep + absorb | `set K V` write; `set K` read; `set K --unset` reset; absorbs `get` and `unset` | design line 60 |
-| 10 | `Addr` | 571 | keep (thin) | `filament addr`; device-info → `devices <name>` | design line 59 |
-| 11 | `Get` (hidden) | 580 | alias→set | `filament set <k>`; `get` = hidden alias (bare stdout preserved) | design line 61 |
-| 12 | `Unset` (hidden) | 597 | flag→set | `filament set <k> --unset`; `unset` = hidden alias | design line 62 |
-| 13 | `ServeTun` (hidden) | 611 | ns:net | `filament net serve-tun`; alias kept | design line 48, design line 162 |
+| 10 | `Addr` | 571 | keep (thin) | `tunlion addr`; device-info → `devices <name>` | design line 59 |
+| 11 | `Get` (hidden) | 580 | alias→set | `tunlion set <k>`; `get` = hidden alias (bare stdout preserved) | design line 61 |
+| 12 | `Unset` (hidden) | 597 | flag→set | `tunlion set <k> --unset`; `unset` = hidden alias | design line 62 |
+| 13 | `ServeTun` (hidden) | 611 | ns:net | `tunlion net serve-tun`; alias kept | design line 48, design line 162 |
 | 14 | `Config` (hidden) | 634 | alias | hidden raw escape hatch stays | design line 63 |
-| 15 | `Update` | 637 | keep (tail) | `filament update` | design line 65 |
+| 15 | `Update` | 637 | keep (tail) | `tunlion update` | design line 65 |
 | 16 | `Completions` (hidden) | 646 | keep hidden | plumbing | design line 66 |
 | 17 | `Man` (hidden) | 651 | keep hidden | plumbing | design line 66 |
-| 18 | `Netcat` (hidden) | 656 | alias→reach | `filament reach <dev>:<rport>`; `netcat` = hidden alias | design line 40 |
-| 19 | `Dial` | 668 | alias→reach | `filament reach <dev>:<port>`; `dial` = hidden alias | design line 41 |
+| 18 | `Netcat` (hidden) | 656 | alias→reach | `tunlion reach <dev>:<rport>`; `netcat` = hidden alias | design line 40 |
+| 19 | `Dial` | 668 | alias→reach | `tunlion reach <dev>:<port>`; `dial` = hidden alias | design line 41 |
 | 20 | `Pty` (hidden) | 677 | alias→shell | folded into `shell`; `pty` = hidden alias | design line 39 |
-| 21 | `Forward` | 686 | keep + positional | `filament <dev>:<rport>` (persistent listener); verb stays | design line 42 |
-| 22 | `Expose` | 700 | keep | `filament expose <port>` (`--list`, `--peer`, `--off`) | design line 44 |
-| 23 | `Unexpose` | 714 | flag→expose | `filament expose <port> --off`; `unexpose` = hidden alias | design line 45 |
-| 24 | `Proxy` | 724 | flag→reach | `filament reach --socks [--port]`; `proxy` = hidden alias | design line 43 |
-| 25 | `Ssh` | 736 | alias→shell | `filament shell <dev>` / bare `filament <dev>`; `ssh` = hidden alias (arg passthrough preserved) | design line 38, design line 159 |
-| 26 | `Ping` (hidden) | 748 | merge→status/doctor | `filament status <dev>` / `doctor <dev>`; alias kept | design line 57 |
-| 27 | `Doctor` (hidden) | 768 | keep (everyday) | `filament doctor [dev]` | design line 58 |
+| 21 | `Forward` | 686 | keep + positional | `tunlion <dev>:<rport>` (persistent listener); verb stays | design line 42 |
+| 22 | `Expose` | 700 | keep | `tunlion expose <port>` (`--list`, `--peer`, `--off`) | design line 44 |
+| 23 | `Unexpose` | 714 | flag→expose | `tunlion expose <port> --off`; `unexpose` = hidden alias | design line 45 |
+| 24 | `Proxy` | 724 | flag→reach | `tunlion reach --socks [--port]`; `proxy` = hidden alias | design line 43 |
+| 25 | `Ssh` | 736 | alias→shell | `tunlion shell <dev>` / bare `tunlion <dev>`; `ssh` = hidden alias (arg passthrough preserved) | design line 38, design line 159 |
+| 26 | `Ping` (hidden) | 748 | merge→status/doctor | `tunlion status <dev>` / `doctor <dev>`; alias kept | design line 57 |
+| 27 | `Doctor` (hidden) | 768 | keep (everyday) | `tunlion doctor [dev]` | design line 58 |
 | 28 | `TagBind` (hidden) | 900 | remove | tags superseded by scoped-trust design | design line 69 (identity group absorbs) |
-| 29 | `Grant` (hidden) | 910 | keep | `filament grant <dev> <cap>` | design line 148; NOT merged with revoke |
-| 30 | `Revoke` (hidden) | 922 | keep (first-class) | `filament revoke <dev> <cap>` — NOT `grant --off` | design lines 53, 150-153 |
-| 31 | `Mount` | 937 | keep | `filament mount <dev>:<dir> <mnt>` (`--off`) | design line 46 |
-| 32 | `Unmount` | 975 | flag→mount | `filament mount --off <mnt>`; `unmount` = hidden alias | design line 47 |
-| 33 | `CapStatus` | 986 | merge→status | `filament status` absorbs cap-status | design line 56 |
-| 34 | `Backup` | 991 | keep (tail) | `filament backup` | design line 64 |
-| 35 | `Requests` (sub: List, Approve, Deny) | 1015 | keep (everyday) | `filament requests` | design line 68 |
-| 36 | `Identity` (sub: Init, Show, Certify) | 7471 | keep + expand | `filament identity {init,show,restore,rotate,revoke,guardians,certify}` | design line 69 |
+| 29 | `Grant` (hidden) | 910 | keep | `tunlion grant <dev> <cap>` | design line 148; NOT merged with revoke |
+| 30 | `Revoke` (hidden) | 922 | keep (first-class) | `tunlion revoke <dev> <cap>` — NOT `grant --off` | design lines 53, 150-153 |
+| 31 | `Mount` | 937 | keep | `tunlion mount <dev>:<dir> <mnt>` (`--off`) | design line 46 |
+| 32 | `Unmount` | 975 | flag→mount | `tunlion mount --off <mnt>`; `unmount` = hidden alias | design line 47 |
+| 33 | `CapStatus` | 986 | merge→status | `tunlion status` absorbs cap-status | design line 56 |
+| 34 | `Backup` | 991 | keep (tail) | `tunlion backup` | design line 64 |
+| 35 | `Requests` (sub: List, Approve, Deny) | 1015 | keep (everyday) | `tunlion requests` | design line 68 |
+| 36 | `Identity` (sub: Init, Show, Certify) | 7471 | keep + expand | `tunlion identity {init,show,restore,rotate,revoke,guardians,certify}` | design line 69 |
 
-**Legend:** **keep** — stays as-is. **positional** — `filament <thing>` shortcut. **alias→X** — hidden deprecated alias. **flag→X** — folded into a flag. **ns:X** — namespaced under X. **merge→X** — absorbed into X. **remove** — deleted.
+**Legend:** **keep** — stays as-is. **positional** — `tunlion <thing>` shortcut. **alias→X** — hidden deprecated alias. **flag→X** — folded into a flag. **ns:X** — namespaced under X. **merge→X** — absorbed into X. **remove** — deleted.
 
 ---
 
@@ -56,7 +56,7 @@ after the security core lands.
 ```rust
 #[derive(Subcommand)]
 enum Cmd {
-    // === Positional (filament <thing> resolves by shape) ===
+    // === Positional (tunlion <thing> resolves by shape) ===
     Send {
         paths: Vec<String>,
         #[arg(long)] code: bool,
@@ -313,8 +313,8 @@ enum NetAction {
 Every renamed verb becomes a `#[command(hide = true)]` alias that still runs, prints one dim stderr line teaching the new form, and exits with the same status it always did:
 
 ```
-note: `filament netcat` is now `filament reach`. Same behavior.
-↳ filament reach laptop:5432
+note: `tunlion netcat` is now `tunlion reach`. Same behavior.
+↳ tunlion reach laptop:5432
 ```
 
 **Rules:** stderr only (stdout stays script-clean), once per invocation, suppressible with `FILAMENT_NO_DEPRECATION=1`, never changes exit code or output, `--json` consumers never see it. Aliases live the whole 0.x line; earliest removal is a 1.0 major with a migration note.
@@ -323,19 +323,19 @@ note: `filament netcat` is now `filament reach`. Same behavior.
 
 | Old invocation | New invocation | Stderr note |
 |---|---|---|
-| `filament ssh <dev>` | `filament shell <dev>` | `filament ssh` is now `filament shell` |
-| `filament pty <dev>` | `filament shell <dev>` | `filament pty` is now `filament shell` |
-| `filament netcat <dev> <rport>` | `filament reach <dev>:<rport>` | `filament netcat` is now `filament reach` |
-| `filament dial <dev> <port>` | `filament reach <dev>:<port>` | `filament dial` is now `filament reach` |
-| `filament proxy --port <p>` | `filament reach --socks --port <p>` | `filament proxy` is now `filament reach --socks` |
-| `filament unexpose <port>` | `filament expose <port> --off` | `filament unexpose` is now `filament expose --off` |
-| `filament unmount <mnt>` | `filament mount --off <mnt>` | `filament unmount` is now `filament mount --off` |
-| `filament get <k>` | `filament set <k>` | `filament get` is now `filament set` |
-| `filament unset <k>` | `filament set <k> --unset` | `filament unset` is now `filament set --unset` |
-| `filament ping <dev>` | `filament status <dev>` | `filament ping` is now `filament status` |
-| `filament cap-status` | `filament status` | `filament cap-status` is now `filament status` |
-| `filament introduce <a> <b>` | `filament devices vouch <a> <b>` | `filament introduce` is now `filament devices vouch` |
-| `filament serve-tun` | `filament net serve-tun` | `filament serve-tun` is now `filament net serve-tun` |
+| `tunlion ssh <dev>` | `tunlion shell <dev>` | `tunlion ssh` is now `tunlion shell` |
+| `tunlion pty <dev>` | `tunlion shell <dev>` | `tunlion pty` is now `tunlion shell` |
+| `tunlion netcat <dev> <rport>` | `tunlion reach <dev>:<rport>` | `tunlion netcat` is now `tunlion reach` |
+| `tunlion dial <dev> <port>` | `tunlion reach <dev>:<port>` | `tunlion dial` is now `tunlion reach` |
+| `tunlion proxy --port <p>` | `tunlion reach --socks --port <p>` | `tunlion proxy` is now `tunlion reach --socks` |
+| `tunlion unexpose <port>` | `tunlion expose <port> --off` | `tunlion unexpose` is now `tunlion expose --off` |
+| `tunlion unmount <mnt>` | `tunlion mount --off <mnt>` | `tunlion unmount` is now `tunlion mount --off` |
+| `tunlion get <k>` | `tunlion set <k>` | `tunlion get` is now `tunlion set` |
+| `tunlion unset <k>` | `tunlion set <k> --unset` | `tunlion unset` is now `tunlion set --unset` |
+| `tunlion ping <dev>` | `tunlion status <dev>` | `tunlion ping` is now `tunlion status` |
+| `tunlion cap-status` | `tunlion status` | `tunlion cap-status` is now `tunlion status` |
+| `tunlion introduce <a> <b>` | `tunlion devices vouch <a> <b>` | `tunlion introduce` is now `tunlion devices vouch` |
+| `tunlion serve-tun` | `tunlion net serve-tun` | `tunlion serve-tun` is now `tunlion net serve-tun` |
 
 ---
 
@@ -410,55 +410,55 @@ match cli.cmd {
 
     // === Deprecated aliases ===
     Some(Cmd::Ssh { peer, args }) => {
-        eprintln!("note: `filament ssh` is now `filament shell`. Same behavior.\n↳ filament shell {peer}");
+        eprintln!("note: `tunlion ssh` is now `tunlion shell`. Same behavior.\n↳ tunlion shell {peer}");
         l2::ssh_cmd(&server, &peer, &args, relay).await
     },
     Some(Cmd::Netcat { peer, rport }) => {
-        eprintln!("note: `filament netcat` is now `filament reach`. Same behavior.\n↳ filament reach {peer}:{rport}");
+        eprintln!("note: `tunlion netcat` is now `tunlion reach`. Same behavior.\n↳ tunlion reach {peer}:{rport}");
         l2::netcat_cmd(&server, &peer, rport, relay).await
     },
     Some(Cmd::Dial { peer, port }) => {
-        eprintln!("note: `filament dial` is now `filament reach`. Same behavior.\n↳ filament reach {peer}:{port}");
+        eprintln!("note: `tunlion dial` is now `tunlion reach`. Same behavior.\n↳ tunlion reach {peer}:{port}");
         l2::dial_cmd(&peer, port).await
     },
     Some(Cmd::Proxy { port, bind, http_port }) => {
-        eprintln!("note: `filament proxy` is now `filament reach --socks`. Same behavior.\n↳ filament reach --socks --port {port}");
+        eprintln!("note: `tunlion proxy` is now `tunlion reach --socks`. Same behavior.\n↳ tunlion reach --socks --port {port}");
         l2::proxy_cmd(&server, &bind, port, http_port, relay).await
     },
     Some(Cmd::Unexpose { port }) => {
-        eprintln!("note: `filament unexpose` is now `filament expose {port} --off`. Same behavior.");
+        eprintln!("note: `tunlion unexpose` is now `tunlion expose {port} --off`. Same behavior.");
         expose::unexpose_cmd(port).await
     },
     Some(Cmd::Unmount { path }) => {
-        eprintln!("note: `filament unmount` is now `filament mount --off {path}`. Same behavior.");
+        eprintln!("note: `tunlion unmount` is now `tunlion mount --off {path}`. Same behavior.");
         mount::unmount_cmd(&path)
     },
     Some(Cmd::Get { key, peer, show_origin, default, json }) => {
-        eprintln!("note: `filament get` is now `filament set {key}`. Same behavior.");
+        eprintln!("note: `tunlion get` is now `tunlion set {key}`. Same behavior.");
         settings::run_get(&key, &peer, show_origin, default, json)
     },
     Some(Cmd::Unset { key, peer }) => {
-        eprintln!("note: `filament unset` is now `filament set {key} --unset`. Same behavior.");
+        eprintln!("note: `tunlion unset` is now `tunlion set {key} --unset`. Same behavior.");
         settings::run_unset(&key, &peer)
     },
     Some(Cmd::Ping { peer, count, json }) => {
-        eprintln!("note: `filament ping` is now `filament status {peer}` or `filament doctor {peer}`. Same behavior.");
+        eprintln!("note: `tunlion ping` is now `tunlion status {peer}` or `tunlion doctor {peer}`. Same behavior.");
         ping::ping_cmd(&server, &peer, count, json, relay).await
     },
     Some(Cmd::CapStatus { json }) => {
-        eprintln!("note: `filament cap-status` is now `filament status`. Same behavior.");
+        eprintln!("note: `tunlion cap-status` is now `tunlion status`. Same behavior.");
         cap_status_cmd(json).await
     },
     Some(Cmd::Introduce { a, b }) => {
-        eprintln!("note: `filament introduce` is now `filament devices vouch`. Same behavior.");
+        eprintln!("note: `tunlion introduce` is now `tunlion devices vouch`. Same behavior.");
         introduce_cmd(&server, &a, &b, relay).await
     },
     Some(Cmd::ServeTun { .. }) => {
-        eprintln!("note: `filament serve-tun` is now `filament net serve-tun`. Same behavior.");
+        eprintln!("note: `tunlion serve-tun` is now `tunlion net serve-tun`. Same behavior.");
         serve_tun_cmd(/* fields */)
     },
     Some(Cmd::Pty { peer, cmd }) => {
-        eprintln!("note: `filament pty` is now `filament shell`. Same behavior.");
+        eprintln!("note: `tunlion pty` is now `tunlion shell`. Same behavior.");
         l2::pty_cmd(&server, &peer, relay, cmd).await
     },
 
@@ -490,11 +490,11 @@ match cli.cmd {
 
 1. **`promote` placement.** `design-command-surface.md` line 69 lists `promote` under
    `identity {init,restore,rotate,revoke,certify,promote}`, but `ux-copy-final.md` Surface
-   3e shows `filament devices promote old-laptop`. Recommend: `promote` stays under
+   3e shows `tunlion devices promote old-laptop`. Recommend: `promote` stays under
    `devices` — it's about sorting a device into fleet/external, not identity key admin.
 
 2. **`requests --notify` flag.** `ux-copy-final.md` Surface 3f shows
-   `filament requests --notify 'notify-send %s'` (also webhook, email). The current
+   `tunlion requests --notify 'notify-send %s'` (also webhook, email). The current
    `RequestsAction::List` has no `--notify` flag. This is a new addition needed for the
    notification surface.
 
@@ -505,5 +505,5 @@ match cli.cmd {
 4. **`identity revoke` vs top-level `revoke`.** The design doc has both: top-level
    `revoke <device> <cap>` (capability revocation) and `identity revoke` (certificate
    revocation). These are different verbs with different semantics. The dispatch must
-   route correctly — `filament revoke laptop shell` is capability, `filament identity
+   route correctly — `tunlion revoke laptop shell` is capability, `tunlion identity
    revoke laptop` is cert.

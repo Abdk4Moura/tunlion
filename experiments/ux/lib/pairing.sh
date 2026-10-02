@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pairing.sh — REAL pairing helpers. A genuine CLI peer mints a PAKE code; the
 # browser (Playwright) types it into the real pair box. The CLI side is a real
-# filament peer using the locally-built binary + an isolated config dir.
+# tunlion peer using the locally-built binary + an isolated config dir.
 #
 # These return the minted CODE on stdout (other diagnostics go to stderr/logs) so
 # a case can: code=$(pipe_mint_code <cfg> <name>); then hand it to the browser.
@@ -55,7 +55,7 @@ pipe_start_shell_peer() {
     --server "$PIPE_SERVER" "$@" </dev/null >"$log" 2>&1 &
   local pid=$!; pipe_track "$pid"
   PIPE_LAST_UP_PID="$pid"
-  pipe_wait_log "$log" 'filament up —|known device|listening|ready' 20 0.2
+  pipe_wait_log "$log" 'tunlion up —|known device|listening|ready' 20 0.2
 }
 
 # pipe_start_up_peer <cfgdir> <name> <dropdir> <logfile> [extra up args...]
@@ -67,5 +67,5 @@ pipe_start_up_peer() {
     --server "$PIPE_SERVER" "$@" </dev/null >"$log" 2>&1 &
   local pid=$!; pipe_track "$pid"
   PIPE_LAST_UP_PID="$pid"
-  pipe_wait_log "$log" 'filament up —|listening|ready' 20 0.2
+  pipe_wait_log "$log" 'tunlion up —|listening|ready' 20 0.2
 }

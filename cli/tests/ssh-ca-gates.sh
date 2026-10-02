@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `filament shell --ssh` via local CA, end to end. Standalone, hermetic,
+# `tunlion shell --ssh` via local CA, end to end. Standalone, hermetic,
 # fixture port 8120 ONLY. No system files are touched: the throwaway sshd
 # listens on 127.0.0.1:9123 (reached through the mesh tunnel because
 # FILAMENT_SSH_PORT overrides the dial port), with temp hostkeys, temp
@@ -7,7 +7,7 @@
 # managed-key bootstrap block (removable `# BEGIN/END filament-managed`
 # in root's authorized_keys -- the same residue any `shell --ssh` leaves).
 #
-#   FILAMENT_BIN=/path/to/filament ./ssh-ca-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./ssh-ca-gates.sh
 #
 # Gates:
 #   A  POSITIVE cert login -- ephemeral key signed over the mesh, real sshd
@@ -28,7 +28,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8120
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"
@@ -54,7 +54,7 @@ sleep 1
 pids+=($!)
 for _ in $(seq 1 30); do curl -fsS "$SERVER/api/health" >/dev/null 2>&1 && break; sleep 0.5; done
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat "$WORK/backend.log"; exit 2; }
-[ -x "$BIN" ] || { echo "build first: FILAMENT_BIN=/path/to/filament"; exit 2; }
+[ -x "$BIN" ] || { echo "build first: FILAMENT_BIN=/path/to/tunlion"; exit 2; }
 command -v sshd >/dev/null || { echo "no sshd on PATH"; exit 2; }
 command -v ssh-keygen >/dev/null || { echo "no ssh-keygen on PATH"; exit 2; }
 command -v ssh >/dev/null || { echo "no ssh on PATH"; exit 2; }

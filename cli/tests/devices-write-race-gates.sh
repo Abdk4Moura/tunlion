@@ -5,7 +5,7 @@
 # revoke intermittently reported success and did not stick. Standalone, hermetic,
 # fixture port 8117 ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament ./devices-write-race-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./devices-write-race-gates.sh
 #
 # Vacuity guard: the race only exists while the daemon's 8s liveness sweep is
 # actually running against a live link. The gate keeps a live shell open for the
@@ -14,7 +14,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8117
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

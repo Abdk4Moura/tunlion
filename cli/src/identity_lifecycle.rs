@@ -431,7 +431,7 @@ pub(crate) fn handle_identity_expose(
     {
         match update_peer_identity(&petname, &cert, VOUCH_CERT_SCOPE) {
             Ok(()) => ui::say(&format!(
-                "  {} first identity for '{}' pinned; `filament revoke {} --certificate` can now reach it",
+                "  {} first identity for '{}' pinned; `tunlion revoke {} --certificate` can now reach it",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                 petname,
                 petname
@@ -445,7 +445,7 @@ pub(crate) fn handle_identity_expose(
                     "its certificate was not stored ({e}), so revoke has nothing to key on."
                 )),
                 &[format!(
-                    "remove it instead: filament devices forget {petname}"
+                    "remove it instead: tunlion devices forget {petname}"
                 )],
             ),
         }

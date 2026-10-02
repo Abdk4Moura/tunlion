@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Filament CLI — standing test gates (docs/cli-resilience.md Part 4).
+# Tunlion CLI — standing test gates (docs/cli-resilience.md Part 4).
 #
 # Every ledger item that claims VERIFIED is exercised here. Run against a
 # local backend (default http://127.0.0.1:8077, started for you if absent
@@ -45,7 +45,7 @@ _target_dir() {
       || echo "$CLI_DIR/target"
 }
 GATE_TARGET_DIR="${CARGO_TARGET_DIR:-$(_target_dir)}"
-BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/filament"
+BIN="$GATE_TARGET_DIR/$GATE_PROFILE_DIR/tunlion"
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
@@ -170,9 +170,9 @@ echo "gates: using $BIN"
 # (cost: a full suite of red herrings, 2026-06-07). Rebuild with the
 # override if the poison marker is present.
 FRONT="$CLI_DIR/../frontend"
-if grep -qs "api\.filament\.autumated\.com" "$FRONT"/dist/assets/*.js 2>/dev/null; then
+if grep -qs "api\.tunlion\.autumated\.com" "$FRONT"/dist/assets/*.js 2>/dev/null; then
   echo "dist is prod-pointing — rebuilding same-origin for gates…"
-  ( cd "$FRONT" && VITE_FILAMENT_API= npm run build >/dev/null 2>&1 ) || { echo "frontend rebuild failed"; exit 2; }
+  ( cd "$FRONT" && VITE_TUNLION_API= npm run build >/dev/null 2>&1 ) || { echo "frontend rebuild failed"; exit 2; }
 fi
 
 # payloads
@@ -228,7 +228,7 @@ for _ in $(seq 1 60); do
 done
 # NOT kill_tree: this receiver is started WITHOUT a timeout wrapper, so $R1 is
 # the real process and SIGKILL reaches it. kill_tree sends SIGTERM first, which
-# `filament receive` handles gracefully and uses to clean up its partial file,
+# `tunlion receive` handles gracefully and uses to clean up its partial file,
 # leaving nothing for the resume half of this gate to resume from. The gate
 # needs an abrupt death, which is the whole premise of "receiver killed
 # mid-transfer". Regression from #287, whose commit message claimed it touched
@@ -432,7 +432,7 @@ if [ $WITH_RELAY -eq 1 ] && [ -x "$PYV0" ] && command -v docker >/dev/null 2>&1;
   # and in this hermetic setup BOTH peers are 127.0.0.1. Test-only flag.
   CT=$(docker run -d --rm --network host coturn/coturn -n \
         --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 --listening-port=3478 \
-        --static-auth-secret="$TS" --realm=filament.test --no-tls --no-dtls \
+        --static-auth-secret="$TS" --realm=tunlion.test --no-tls --no-dtls \
         --allow-loopback-peers --cli-password=x 2>/dev/null)
   VENV_PY="$PYV0"
   ( cd "$CLI_DIR/../backend" && PORT=8078 FIL_TURN_HOST="turn:127.0.0.1:3478" FIL_TURN_SECRET="$TS" \
@@ -880,7 +880,7 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # PORT 8093 (NOT 8077 — this suite's fixture), because the PAKE security
 # properties want their own deterministic, two-tier harness:
 #
-#   gate L1a-1 mutual-key       gate1_mutual_key.sh  — two real `filament pair`
+#   gate L1a-1 mutual-key       gate1_mutual_key.sh  — two real `tunlion pair`
 #       processes, same code → byte-identical pinned secret; confirmation passes.
 #   gate L1a-2 adversarial      adversary (pake bin) — NEGATIVE security test:
 #       a relay/MITM without the password cannot derive K nor substitute a key
@@ -930,7 +930,7 @@ if [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] \
    && [ $R20J -eq 0 ] && ! grep -q "created your identity" "$WORK/g20-j.err" && [ -f "$D20J/identity.ed25519" ] \
    && [ $R20T -eq 0 ] && grep -q "do this:" "$WORK/g20-t.log" && [ ! -e "$D20T/identity.ed25519" ] \
    && [ $R20N -eq 0 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
-   && [ $R20G -ne 0 ] && grep -q "filament init" "$WORK/g20-g.log" && [ ! -e "$D20N/identity.ed25519" ]; then
+   && [ $R20G -ne 0 ] && grep -q "tunlion init" "$WORK/g20-g.log" && [ ! -e "$D20N/identity.ed25519" ]; then
   ok "U1: created once ($N20A line, key $M20K, dir $M20D), second run silent, init refuses, --json silent, tour and opt-out mint nothing"
 else
   bad "u1-implicit-init"

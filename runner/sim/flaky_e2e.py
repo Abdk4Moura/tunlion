@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Flaky-link e2e DRIVER (host side) — drives the runner while inducing outages.
 
-Run by flaky_sim_test.sh. Every filament client (this host, the box din acceptor,
+Run by flaky_sim_test.sh. Every tunlion client (this host, the box din acceptor,
 the box watcher) talks to the signaling backend THROUGH the flaky proxy; this
 driver toggles the proxy's down-flag to choreograph the three failure modes, on
 top of the proxy's background random flapper. It then asserts the runner recovered:

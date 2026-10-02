@@ -52,14 +52,14 @@ Adjacent work the tickets depend on or that came out of the same design:
 
 | Item | State | Where |
 |---|---|---|
-| `filament exec` | done | main (#302) |
+| `tunlion exec` | done | main (#302) |
 | SSH certificates from the shell grant | done | main (#303) |
 | Enrolment-ceiling `scoped_in_bounds` + settle-then-evaluate | done | main (#323 carried it; #309 closed as superseded) |
 | Bootstrap card (fc1) contract + vectors | done | main (#314) |
 | Capability ledger contract L1-L13 + model | done | main (#311) |
 | Capability ledger L14-L18 + model | done | main (#319) |
 | Relationship UX design + contract frames + this ticket list | done | main (#313) |
-| `filament sync` (delta transfer verb) | in PR | #338 (head `work/sync-verb2-rebased`) |
+| `tunlion sync` (delta transfer verb) | in PR | #338 (head `work/sync-verb2-rebased`) |
 | `devices --caps` (what can this device do to me, until when) | in PR | #325 (head `work/device-caps2`) |
 | Agent-grade output audit (23 tickets, envelope, exit codes) | done | main (#307) |
 | CLI fixes: shell help text, `logs -f` teardown | in PR | #308 (rebased and pushed 2026-09-18) |
@@ -75,16 +75,16 @@ Adjacent work the tickets depend on or that came out of the same design:
 
 Add a lazy accessor that mints the user keypair on first use and prints one
 past-tense line. `UserKey::generate` has one call site today
-(`identity_flow.rs:285`); route the seven "no identity. Run `filament init`
+(`identity_flow.rs:285`); route the seven "no identity. Run `tunlion init`
 first" bails through the accessor instead
 (`add_for.rs:206-207`, `dispatch.rs:701,762,1449,1515`, `status_cmd.rs:68`).
-`filament init` keeps every flag; it stops being required. The precedent to
+`tunlion init` keeps every flag; it stops being required. The precedent to
 follow is `local_device_cert()` (`identity_flow.rs:119-176`), which already
 mints a device cert on demand.
 
-*Accept:* from a clean config dir, `filament send f --code` prints
+*Accept:* from a clean config dir, `tunlion send f --code` prints
 `created your identity` once and proceeds; a second run prints no such line.
-`filament init` on a machine that already has an identity still fails with the
+`tunlion init` on a machine that already has an identity still fails with the
 existing message (`identity_flow.rs:246`), unchanged. A gate in
 `cli/tests/gates.sh` runs both halves against a temp `FILAMENT_CONFIG`.
 
@@ -100,11 +100,11 @@ returns `Some` (`pake_ceremony.rs:190`) into the existing PTY session opener
 rather than into `devices_store_v2`. Refuse an unknown scope byte on the
 confirm path. Persist nothing.
 
-*Accept:* two terminals in `cli/tests/gates.sh`. `filament serve shell --yes`
-prints a code matching `^[a-z]+-[a-z]+-[0-9]{4}$`; `filament shell <code>` on
+*Accept:* two terminals in `cli/tests/gates.sh`. `tunlion serve shell --yes`
+prints a code matching `^[a-z]+-[a-z]+-[0-9]{4}$`; `tunlion shell <code>` on
 the second opens a PTY and prints the `this is a SESSION` line; a second
-`filament shell <code>` with the same code fails saying the code is spent; and
-`filament mount <code>:/tmp` with a `shell` code fails key confirmation, with
+`tunlion shell <code>` with the same code fails saying the code is spent; and
+`tunlion mount <code>:/tmp` with a `shell` code fails key confirmation, with
 no mount attempted. After all of it, `devices.json` is byte-identical to before.
 
 ### U3 — `reach --until-direct` · `helper` · **B**
@@ -114,9 +114,9 @@ uses (`:33-44`), printing one line per sample, until `route` is not a relay
 label (`is_relay`, `:52-55`) or `--timeout` elapses. Exit 0 on direct, 5 on
 timeout with the last route seen. No new transport code.
 
-*Accept:* `filament reach <peer> --until-direct --timeout 2s` against a peer
+*Accept:* `tunlion reach <peer> --until-direct --timeout 2s` against a peer
 with no daemon exits 5 and its last line names a route; against a warm direct
-link it exits 0 within one sample. `filament reach <peer> --until-direct --json`
+link it exits 0 within one sample. `tunlion reach <peer> --until-direct --json`
 emits one record per sample on stdout and all of stdout parses as JSONL.
 
 ---
@@ -144,7 +144,7 @@ listening for the ack and printing "mutually remembered" off the flag alone
 (`:1613-1634`); the working ceremony is the older non-PAKE one in `recv_cmd.rs`
 (`:186,2998-3006,4798-4841`). One implementation replaces both.
 
-*Accept:* `filament remember <peer>` on one side and `--yes` on the other leaves
+*Accept:* `tunlion remember <peer>` on one side and `--yes` on the other leaves
 a record on BOTH; declining leaves a record on NEITHER; letting the session end
 with no answer leaves a record on neither (the v2 behaviour change). A gate
 asserts `send --remember` now writes a record, which it does not today, and the
@@ -166,13 +166,13 @@ cert`; a record with neither renders `PAIRED`. Grep gate: `NEEDS REVIEW` and
 
 ### U7 — `forget` at top level · `helper` · **B**
 
-Promote `DevicesAction::Forget` (`cli_def.rs:806-807`) to `filament forget
+Promote `DevicesAction::Forget` (`cli_def.rs:806-807`) to `tunlion forget
 <name>`, keeping `devices forget` as an alias, and make the confirmation state
 what it deletes. Answers question 1 in the design's open list only if the answer
 is "local"; if it is not, this ticket blocks on that decision.
 
-*Accept:* `filament forget nope; echo $?` prints 3 (`UnknownDevice`, per the
-audit's §3); `filament devices forget <x>` and `filament forget <x>` take the
+*Accept:* `tunlion forget nope; echo $?` prints 3 (`UnknownDevice`, per the
+audit's §3); `tunlion devices forget <x>` and `tunlion forget <x>` take the
 same path; without a TTY and without `-y` it exits 2.
 
 ### U8 — resource-scoped capability strings and the lattice · `pi` · **B**
@@ -185,8 +185,8 @@ Refuse unknown actions and unparseable targets at ingest. Refuse a path pattern
 containing `..` rather than normalizing it.
 
 *Accept:* a property test that `covers` is reflexive, transitive, and that
-`covers("forward:K:8080", "forward:K")` is FALSE; `filament grant ws
-forward:ws:8080` succeeds and `filament grant ws forward:ws:../etc` exits 2;
+`covers("forward:K:8080", "forward:K")` is FALSE; `tunlion grant ws
+forward:ws:8080` succeeds and `tunlion grant ws forward:ws:../etc` exits 2;
 existing `route:10.0.0.0/24` behaviour is unchanged, pinned by the existing
 gate.
 
@@ -211,8 +211,8 @@ widening separately, apply the narrowing immediately, and hold the widening as
 an offer. Before U14 lands the offer has nowhere to go, so this ticket ships the
 narrowing half and prints the widening half as "not yet available; re-enrol".
 
-*Accept:* `filament certify nas --scope transfer,mount` on a device whose
-ceiling includes `shell` removes `shell` immediately and `filament devices`
+*Accept:* `tunlion certify nas --scope transfer,mount` on a device whose
+ceiling includes `shell` removes `shell` immediately and `tunlion devices`
 shows it gone; the same command with a longer `--expiry` prints the widening as
 deferred and does NOT extend anything; the record's `principalMaxOffline` is
 unchanged by both (the silent-reset hazard in open question 10).
@@ -226,22 +226,22 @@ target has never connected since the op was written; the heading says
 `waiting on them` and the row says how it was determined, because an
 approximation rendered as a fact is the defect this whole document is about.
 
-*Accept:* `filament requests` prints both sections with an empty OUT section on
-a fresh machine; `filament requests approve <id>` still works and is absent from
-`--help`; `filament requests --json | jq -e '.data.in and .data.out'` (blocked
+*Accept:* `tunlion requests` prints both sections with an empty OUT section on
+a fresh machine; `tunlion requests approve <id>` still works and is absent from
+`--help`; `tunlion requests --json | jq -e '.data.in and .data.out'` (blocked
 on audit ticket 3).
 
 ### U12 — `pause` and `resume` · `worker` · **B**
 
-A local, interval-bounded suppression: `filament pause <dev> --until <t>` and
-`filament resume <dev>`. Before the ledger it is a local record consulted by the
+A local, interval-bounded suppression: `tunlion pause <dev> --until <t>` and
+`tunlion resume <dev>`. Before the ledger it is a local record consulted by the
 same gate that consults grants, and the refusal it produces says `paused`, never
 `denied`. U14 re-points it at the `Pause` op without changing the verb or the
 message.
 
-*Accept:* two terminals: after `filament pause <b> --until +1h` on A, `filament
+*Accept:* two terminals: after `tunlion pause <b> --until +1h` on A, `tunlion
 shell A` on B is refused with a message containing `paused` and the time, and
-`filament devices` on A shows the overlay; `filament resume <b>` restores it
+`tunlion devices` on A shows the overlay; `tunlion resume <b>` restores it
 within one command. The refusal's exit code is 4 (`Denied`) and a gate asserts
 the word `revoked` appears nowhere in it.
 
@@ -291,7 +291,7 @@ grants have all lapsed renders `DORMANT` with the lapse date, not `STRANGER`.
 Time-boxed elevation, scheduled off `valid_until` rather than a per-path timer.
 One re-evaluation at `valid_until` replaces every revoke ticker (L3, L9).
 
-*Accept:* `filament grant <b> shell --expires 30s`, accepted; at +31s `filament
+*Accept:* `tunlion grant <b> shell --expires 30s`, accepted; at +31s `tunlion
 shell` from B is refused and the message names the prior authority it fell back
 to; no timer thread exists for the grant (gate: grep for a spawned ticker in the
 grant path returns nothing).
@@ -302,8 +302,8 @@ The subject side of every widening: `requests accept <id>` signs an `Accept`
 naming one op id, ships it, and the author ingests it. Completes U10's widening
 half and U11's OUT rows.
 
-*Accept:* `filament certify nas --expiry 90d` shows as an OUT row on the owner
-and an IN row on `nas`; after `filament requests accept` on `nas`, both rows
+*Accept:* `tunlion certify nas --expiry 90d` shows as an OUT row on the owner
+and an IN row on `nas`; after `tunlion requests accept` on `nas`, both rows
 clear and the expiry is live; an `Accept` signed by anyone but the subject is
 refused at ingest.
 
@@ -313,9 +313,9 @@ The `Pass` op, the device budget, the card carrier, and the `guests` view.
 Depends on U8 (resource scoping), U9 (direction) and U16 (`Accept`). Refuse
 re-delegation and over-budget `Accept`s at ingest, with reason `budget`.
 
-*Accept:* `filament pass jane --allow forward:ws:8080 --expires 7d --devices 2`
+*Accept:* `tunlion pass jane --allow forward:ws:8080 --expires 7d --devices 2`
 mints a card; two of jane's devices accept and the third is refused with
-`budget`; `filament guests` shows `2 of 2`; a pass authored by a principal whose
+`budget`; `tunlion guests` shows `2 of 2`; a pass authored by a principal whose
 own authority is a pass is refused at ingest; revoking the person's pass cuts
 both devices in one command.
 
@@ -325,7 +325,7 @@ both devices in one command.
 without being in it. Builds on `docs/design-groups-tags-caps.md` §3.2.
 
 *Accept:* a guest granted `see:tag:lab` sees exactly the tagged devices in
-`filament devices` and nothing else; removing the tag binding removes the rows
+`tunlion devices` and nothing else; removing the tag binding removes the rows
 within one command.
 
 ### U19 — two-axis state in `--json` · `helper` · **A**
@@ -334,7 +334,7 @@ Whatever open question 12 resolves to, applied everywhere at once: `devices`,
 `status`, `requests`, `guests`. Blocked on audit tickets 1-3 and on that
 decision.
 
-*Accept:* `filament devices --json | jq -e '.data.devices[0]'` exposes the
+*Accept:* `tunlion devices --json | jq -e '.data.devices[0]'` exposes the
 agreed shape, and a schema test asserts every surface uses the same field names.
 
 ---

@@ -1,8 +1,8 @@
-# Mesh networking: why filament stays pairwise
+# Mesh networking: why tunlion stays pairwise
 
 > Status: **partly superseded (2026-08-15).** The 2026-07-16 analysis below
-> answered "should filament grow an open mesh control plane" and answered no.
-> That answer stands for what it was asked about. It was then read as "filament
+> answered "should tunlion grow an open mesh control plane" and answered no.
+> That answer stands for what it was asked about. It was then read as "tunlion
 > is not a mesh", which is no longer the decision. Read the reconciliation
 > first; the original note is kept unedited underneath because its reasoning
 > about federation and transitive trust is still the reasoning we hold.
@@ -18,10 +18,10 @@
 
 ## Reconciliation, 2026-08-15
 
-**filament is a mesh.** Specifically: every user has their own personal, private
+**tunlion is a mesh.** Specifically: every user has their own personal, private
 mesh. Two meshes can be connected, by a user sharing one device into another
 mesh. Two meshes can be merged. That is the model, and the line below saying
-"filament will not build a mesh" is stale.
+"tunlion will not build a mesh" is stale.
 
 **There is no open join.** Membership in a mesh requires a signature descending
 from that mesh's owner, so nothing can insert itself. No admission policy to
@@ -225,30 +225,30 @@ Written carefully, because this is the paragraph most likely to end up in launch
 copy and two earlier drafts of it overclaimed.
 
 **What is true.** This removes a rendezvous dependency that Tailscale requires.
-A filament rendezvous holds no policy and no node registry.
+A tunlion rendezvous holds no policy and no node registry.
 
 **What that is not.** It is not "matching Tailscale on coordination
 decentralisation". A Tailscale coordination server does rendezvous *and*
 distributes the node registry and keys. This decentralises rendezvous only.
-filament does not decentralise membership distribution because filament does not
+tunlion does not decentralise membership distribution because tunlion does not
 do membership distribution at all: on `b9808062` each spoke lists only the
 issuer. The scope is smaller, not the achievement larger.
 
 **And it is not "ahead of Tailscale on trust model", in the present tense.** Their
 coordination server holds a registry because something has to hold membership.
-When filament solves membership it will hold something too. The current candidate,
+When tunlion solves membership it will hold something too. The current candidate,
 an encrypted blob at a meeting point, genuinely is better, and it does not exist.
 
 **On "a Tailscale replacement for a personal mesh".** Defensible as an
 architectural statement, and dangerous as product copy, because a Tailscale user's
 baseline expectation is that removing a device removes its access, and today
-filament has no renewal, no membership distribution, and a revocation that does
+tunlion has no renewal, no membership distribution, and a revocation that does
 not tear down an established session (#235, live in 0.8.5). That sentence would
 be true about the architecture and read as a claim about the product, which is
 the shape `docs/ui/OUTPUT.md` now names.
 
-**What to keep saying:** filament declines subnet routers and exit nodes. Anyone
-who needs to reach a printer that will never run filament needs a different tool.
+**What to keep saying:** tunlion declines subnet routers and exit nodes. Anyone
+who needs to reach a printer that will never run tunlion needs a different tool.
 That half is accurate and does real work by naming what is excluded.
 
 ### Decided 2026-08-16: subnet routers and exit nodes are IN scope
@@ -261,9 +261,9 @@ how #198 shipped and how `design-pairing-ux.md` rule 3 nearly went.
 **What the old decision got right, and why it no longer decides this.** The
 argument was: anything needing multi-hop segmented routing is out of scope,
 because "if two nodes already share a tailnet, that mesh has already connected
-them and filament adds nothing between them". That reasoning is about filament
+them and tunlion adds nothing between them". That reasoning is about tunlion
 stacking *onto* another mesh to gain reach. Subnet routing is the opposite case:
-filament *being* the mesh, for devices that will never run it. A printer, a
+tunlion *being* the mesh, for devices that will never run it. A printer, a
 camera, a NAS appliance, a landlord's thermostat. The old argument does not
 address that case, it addresses a different one.
 
@@ -282,7 +282,7 @@ sequence, so this lands after #235, renewal, and membership distribution.
 
 #### The constraint that must not be relaxed
 
-**Destinations behind a subnet router have no filament identity, so the
+**Destinations behind a subnet router have no tunlion identity, so the
 capability system cannot govern them.** A printer at `192.168.1.50` has no key,
 no certificate and no ceiling. Access to it can only be governed by prefix policy
 on the router.
@@ -339,7 +339,7 @@ on an identified peer, so the capability system governs it and revocation works
 through the path that already exists. **Crossing a trust boundary should use the
 model that has identity in it.**
 
-**And for narrower cases there is already a tool.** `filament forward
+**And for narrower cases there is already a tool.** `tunlion forward
 <peer>:<port> --socks` runs a SOCKS5 proxy through a peer. That is
 per-application rather than device-wide, does not capture DNS by default, is a
 service on an identified device so the capability system covers it, and is
@@ -354,7 +354,7 @@ through someone else's machine should require them to have handed you the machin
 
 The old note declined hub federation partly on the grounds that federation's
 value "genuinely reappears in one place: segmented / enterprise networks [...]
-That is precisely the subnet-router / exit-node space filament chose not to
+That is precisely the subnet-router / exit-node space tunlion chose not to
 enter." Entering that space removes that justification.
 
 Federation is still declined, on the surviving argument rather than that one:
@@ -449,11 +449,11 @@ out.
 
 ## Summary / decision
 
-filament will **not** build a mesh: no hub federation, no gossip control plane,
+tunlion will **not** build a mesh: no hub federation, no gossip control plane,
 no transitive trust, no kernel-L3 mesh, no third-party store-and-forward. These
 were steelmanned and rejected on the merits.
 
-What filament builds instead, to serve both small trusted teams and larger
+What tunlion builds instead, to serve both small trusted teams and larger
 agent/team meshes with the *same* primitives:
 
 - **Transport hardening** (highest-utility move): happy-eyeballs path racing,
@@ -468,12 +468,12 @@ agent/team meshes with the *same* primitives:
 
 Anything that genuinely needs multi-hop segmented routing is **out of scope**.
 For that need, a mesh product (Tailscale, WireGuard, Yggdrasil) is the right tool
-*instead of* filament, not under it: if two nodes already share a tailnet, that
-mesh has already connected them and filament adds nothing between them. This is
-the same boundary filament already draws by having no subnet routers and no exit
+*instead of* tunlion, not under it: if two nodes already share a tailnet, that
+mesh has already connected them and tunlion adds nothing between them. This is
+the same boundary tunlion already draws by having no subnet routers and no exit
 nodes, and it comes with the coordinator / account / admin-controlled-membership
-tradeoff filament exists to avoid. filament does not compose *onto* a mesh to
-gain reach; it declines the use case. (Distinct and legitimate: filament may
+tradeoff tunlion exists to avoid. tunlion does not compose *onto* a mesh to
+gain reach; it declines the use case. (Distinct and legitimate: tunlion may
 select an existing `tailscale0` interface as one candidate path for its own
 pairwise connection, per `cli/docs/filament-routing.md`. That is transport-interface
 selection, not a mesh-reach strategy, and it is redundant if raw connectivity is
@@ -483,7 +483,7 @@ all you want.)
 
 Warm-hold turns the daemon from a set of on-demand tunnels into a standing graph
 of connected peers. That standing graph is the substrate a mesh control plane
-would need, so the natural question was: should filament grow one? Propagate
+would need, so the natural question was: should tunlion grow one? Propagate
 presence, rosters, and capabilities by gossip; route to peers through on-path
 peers ("reach C through B"); hold mail for offline peers. And could a single
 design serve both small trusted teams and an agent/team mesh at scale?
@@ -515,7 +515,7 @@ full decentralized overlay (libp2p/Yggdrasil), (7) compose over an existing mesh
 
 Two independent analyses converged on the same live frontier: **1, 2, 7, 8, 9**,
 with transport hardening (1) as the top move. Rejected as dominated or
-against filament's ethos: (4) transitive trust kills the pairwise identity, (5)
+against tunlion's ethos: (4) transitive trust kills the pairwise identity, (5)
 loses to Tailscale on its own turf, (6) is the wrong scale and a research-grade
 routing protocol, kernel-L3 mesh loses to WireGuard/Tailscale/Yggdrasil. Third-
 party store-and-forward is a distributed untrusted encrypted storage system
@@ -528,7 +528,7 @@ the core argument below.
 
 ## The core argument: reachability vs authorization
 
-filament's word "pairwise" quietly conflates two different things:
+tunlion's word "pairwise" quietly conflates two different things:
 
 - **Reachability**: who can route bytes to me (a network property).
 - **Authorization**: who I will open a secure channel with (a trust property).
@@ -540,15 +540,15 @@ splits by what the hub is allowed to authorize, and every branch fails:
 1. **If a hub relays ciphertext only (no authorization power):** then two peers
    can talk only if they *already* authorized each other (direct pairing or an
    introducer the user confirmed). In that case they already have each other's
-   keys and addressing, and filament already connects them via
+   keys and addressing, and tunlion already connects them via
    direct/holepunch/relay. Federation adds value *only* in the corner case where
    direct fails, single-hop relay fails, but a multi-hop hub path works, which
    requires two authorized peers each reachable to different hubs but to no
-   common relay. Rare in filament's topologies.
+   common relay. Rare in tunlion's topologies.
 
 2. **If a hub authorizes on peers' behalf:** that is transitive trust (Path 4).
    A reaches B because an admin paired the hubs, not because A decided about B.
-   That breaks filament's actual user contract ("I only talk to devices I
+   That breaks tunlion's actual user contract ("I only talk to devices I
    authorized") and is exactly the identity-killer the project rejects.
 
 There is no third option. And two further observations close it:
@@ -559,7 +559,7 @@ There is no third option. And two further observations close it:
   only hub-gossip-worthy payload is transitive membership, which is Path 4. So
   the control plane has no job.
 - **The internet analogy leaks.** On the internet the reachability layer is
-  *open* (any host may send to any host; TLS then authorizes). In filament the
+  *open* (any host may send to any host; TLS then authorizes). In tunlion the
   reachability layer is *already* the private graph of authorized pairs, so there
   is no general substrate for federation to optimize. It is "pairwise tunnels
   plus optional multi-hop stitching," and the stitching only pays in the corner
@@ -572,11 +572,11 @@ new architecture.
 
 Federation's value genuinely reappears in one place: segmented / enterprise
 networks where no single relay crosses a boundary but local nodes can bridge
-segments. That is precisely the subnet-router / exit-node space filament chose
-not to enter. So this whole analysis re-derives filament's founding scope
+segments. That is precisely the subnet-router / exit-node space tunlion chose
+not to enter. So this whole analysis re-derives tunlion's founding scope
 decision from first principles: no federation, for the same reason there are no
 subnet routers. That segmented use case belongs to a mesh product used *instead
-of* filament (with its coordinator/trust-model tradeoff), not to filament stacked
+of* tunlion (with its coordinator/trust-model tradeoff), not to tunlion stacked
 on top of one.
 
 ## Decision
@@ -590,8 +590,8 @@ third-party store-and-forward; centralized coordinator / become Tailscale (Path
 5); kernel-L3 mesh; full decentralized overlay (Path 6).
 
 **Out of scope.** Multi-hop segmented routing. If a user needs it, a mesh product
-(Tailscale/WireGuard/Yggdrasil) is the right tool *instead of* filament for that
-need, with its coordinator/trust tradeoff; filament does not stack on top of a
+(Tailscale/WireGuard/Yggdrasil) is the right tool *instead of* tunlion for that
+need, with its coordinator/trust tradeoff; tunlion does not stack on top of a
 mesh to gain reach.
 
 ## Amendment (2026-08-25): same-owner fleets auto-mesh
@@ -633,7 +633,7 @@ mechanism is in `docs/design-fleet-automesh.md`.
 2. **The introducer reduces friction, not trust.** It is a key-exchange helper;
    the user (A) always confirms. It must not become an authorization delegate or
    a de facto coordinator.
-3. **No `hub` concept in the protocol.** A relay-peer is "filament on a stable
+3. **No `hub` concept in the protocol.** A relay-peer is "tunlion on a stable
    node with a public address," an ordinary peer that happens to be reachable.
    The protocol treats it as a peer. Adding a `hub` type to the protocol starts
    selling a different product.
@@ -648,7 +648,7 @@ mechanism is in `docs/design-fleet-automesh.md`.
 
 ## The signaling server is not the coordinator we rejected
 
-Rejecting a central coordinator (Path 5) raises an obvious question: filament
+Rejecting a central coordinator (Path 5) raises an obvious question: tunlion
 already has a hosted signaling server, so isn't that a central dependency? No,
 and the distinction matters. The signaling server is a **rendezvous /
 NAT-traversal helper** (STUN-like), not a coordinator of trust or policy:
@@ -667,7 +667,7 @@ by the same logic as the self-hosted relay flag:
 1. **Make it self-hostable** (a team runs its own rendezvous, no hosted infra).
 2. **Let the stable relay-peer double as the rendezvous**, so a self-hosted setup
    needs one public-address node for both relay and signaling and depends on zero
-   hosted filament infrastructure. Consistent with "a relay-peer is an ordinary
+   hosted tunlion infrastructure. Consistent with "a relay-peer is an ordinary
    peer," no new protocol concept.
 3. **Keep it minimal**: rendezvous only (addresses/candidates, ephemeral). It
    becomes a coordinator in disguise the moment it gains any of: persistent
@@ -677,18 +677,18 @@ by the same logic as the self-hosted relay flag:
    denial-of-service and metadata observation, not authorization or policy,
    which is why the STUN-vs-coordinator line holds.
 4. **Keep rendezvous and relay distinct in the protocol**, even when one
-   self-hosted node hosts both (`filament rendezvous <addr>` and
-   `filament relay <addr>` are separate services). Co-locating them is a
+   self-hosted node hosts both (`tunlion rendezvous <addr>` and
+   `tunlion relay <addr>` are separate services). Co-locating them is a
    deployment choice; the protocol must not assume "signaling = relay," or that
    monoculture becomes a hidden single point.
 
-Honest caveat: the signaling server is filament's one genuinely centralized
+Honest caveat: the signaling server is tunlion's one genuinely centralized
 dependency and a metadata vantage point (it sees who wants to connect to whom,
 never content). The principled trajectory is to minimize dependence on it, not
 grow it: LAN peers via mDNS need no signaling, known-address peers need no
 signaling, and everything else can use a self-hosted rendezvous. The hosted
 server is then a convenience default for zero-config first-connect, not a
-requirement, which keeps filament honestly self-hostable end to end.
+requirement, which keeps tunlion honestly self-hostable end to end.
 
 ## Relationship to the roadmap
 

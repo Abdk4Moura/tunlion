@@ -55,7 +55,7 @@ jobs:
       - name: Build a same-origin dist
         working-directory: frontend
         env:
-          VITE_FILAMENT_API: ""
+          VITE_TUNLION_API: ""
         run: npm run build
 
       - name: relay-honesty

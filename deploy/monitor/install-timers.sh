@@ -7,7 +7,7 @@
 # The unit files in this directory were added on 2026-06-27 and the signaling
 # monitor's own docstring said "Run by a systemd timer (see the .timer /
 # .service in this directory)". On 2026-08-04 that was checked for the first
-# time: `systemctl list-timers --all | grep filament` returned nothing, no unit
+# time: `systemctl list-timers --all | grep tunlion` returned nothing, no unit
 # file existed under /etc/systemd/system, and no cron entry referenced the
 # script anywhere on the box. Its state file was last written on 2026-07-31 by a
 # hand-run, and that hand-run had recorded a real DOWN and recovery. So the

@@ -1,4 +1,4 @@
-# Filament signaling API — production image.
+# Tunlion signaling API — production image.
 # Build context is the REPO ROOT (see docker-compose.yml), so paths are backend/*.
 FROM python:3.12-slim
 

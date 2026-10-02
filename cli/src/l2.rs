@@ -1,4 +1,4 @@
-// L2, ssh / raw TCP tunnelled over the Filament WebRTC data channel.
+// L2, ssh / raw TCP tunnelled over the Tunlion WebRTC data channel.
 //
 // Productionizes docs/L2-tunnel-design.md (spike: cli/spike/l2spike.rs). L2
 // multiplexes logical TCP streams over the SAME data channel that moves files
@@ -12,12 +12,12 @@
 // will eventually carry is the only piece deferred.
 //
 // Three surfaces, smallest-primitive-first (each is sugar over the one below):
-//   * `filament netcat <peer> <rport>`            stdio  <-> one L2 stream
-//   * `filament forward <lport> <peer> <rport>`   local TCP listener; conn=stream
-//   * `filament shell --ssh <peer> [args...]`             real ssh -o ProxyCommand=netcat
+//   * `tunlion netcat <peer> <rport>`            stdio  <-> one L2 stream
+//   * `tunlion forward <lport> <peer> <rport>`   local TCP listener; conn=stream
+//   * `tunlion shell --ssh <peer> [args...]`             real ssh -o ProxyCommand=netcat
 //
 // The ACCEPTOR (the side that dials the localhost target) is NOT a subcommand:
-// it lives inside `filament up` / `filament recv`, gated on the existing
+// it lives inside `tunlion up` / `tunlion recv`, gated on the existing
 // proof-verified `trusted` flag (the capability placeholder) + localhost-only
 // dialing (the SSRF defense). See `Mux::on_open` and main.rs's recv loop.
 
@@ -1018,7 +1018,7 @@ pub async fn spawn_pty_session(
                         crate::ui::critical("pty: peer revoked, closing the live session");
                         revoked_reason = Some(crate::capability::REVOKED_REASON);
                         if let Some(b) = &bind {
-                            let msg = format!("\r\n[filament: {}]\r\n", crate::capability::REVOKED_REASON);
+                            let msg = format!("\r\n[tunlion: {}]\r\n", crate::capability::REVOKED_REASON);
                             let _ = b.transport.send_frame(b.sid, 0, msg.as_bytes()).await;
                         }
                         break;
@@ -1383,7 +1383,7 @@ pub(crate) async fn bring_up_to_known(
                 None => match (crate::fleet_indexed_name(peer_name), crate::fleet::rv()) {
                     (true, Some(rv)) => (rv, true),
                     _ => bail!(
-                        "no known device named '{peer_name}', run `filament add` first (see `filament devices`)"
+                        "no known device named '{peer_name}', run `tunlion add` first (see `tunlion devices`)"
                     ),
                 },
             }
@@ -1422,7 +1422,7 @@ pub(crate) async fn bring_up_to_known(
     // `connect_signaling` returns, it can land before the socket.io connection is
     // fully ready and be silently dropped, the server then never runs `_do_join`,
     // never emits `welcome`, and this loop waits for a Welcome that never comes,
-    // stranding `filament shell --ssh` in "waiting for known device" (~30% of attempts in
+    // stranding `tunlion shell --ssh` in "waiting for known device" (~30% of attempts in
     // the isolated repro). So we RE-EMIT join on the same cadence as the
     // re-subscribe below until Welcome lands (idempotent: a repeat join to the
     // same solo room is a no-op server-side once it took).
@@ -1464,7 +1464,7 @@ pub(crate) async fn bring_up_to_known(
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
     // consume this endpoint into the race. UNCONDITIONAL here: `bring_up_to_known`
     // only ever serves L2 (netcat/ssh/forward), which always wants direct, and
-    // `filament shell --ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
+    // `tunlion shell --ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
@@ -1485,15 +1485,15 @@ pub(crate) async fn bring_up_to_known(
     };
 
     // Distinct wording for the shell-auth pre-flight so the two sequential
-    // bring-ups of `filament shell --ssh` (the bootstrap link, then the netcat data link)
+    // bring-ups of `tunlion shell --ssh` (the bootstrap link, then the netcat data link)
     // do not read as a flap/retry of one connection. "bootstrap" has its own
     // wording; "reconnect" is silent (post-warm resume check — the link was
     // already up; re-reporting it after a clean logout is noise).
     let silent = role.starts_with("reconnect");
     if !silent {
         crate::ui::say(&match role {
-            "bootstrap" => format!("filament: authenticating with '{peer_name}'..."),
-            _ => format!("\rfilament: waiting for known device '{peer_name}'..."),
+            "bootstrap" => format!("tunlion: authenticating with '{peer_name}'..."),
+            _ => format!("\rtunlion: waiting for known device '{peer_name}'..."),
         });
     }
 
@@ -1585,12 +1585,12 @@ pub(crate) async fn bring_up_to_known(
                                 endpoint = Some(ep);
                                 // TRACE, direct-offer detail.
                                 crate::ui::trace(&format!(
-                                    "filament: DIRECT-OFFER sent to '{peer_name}', port {port}"
+                                    "tunlion: DIRECT-OFFER sent to '{peer_name}', port {port}"
                                 ));
                             }
                             Err(e) => {
                                 crate::ui::trace(&format!(
-                                    "filament: direct disabled (endpoint bind failed: {e}), WebRTC only"
+                                    "tunlion: direct disabled (endpoint bind failed: {e}), WebRTC only"
                                 ));
                             }
                         }
@@ -1621,7 +1621,7 @@ pub(crate) async fn bring_up_to_known(
             _ = heartbeat.tick() => {
                 if role != "doctor" {
                     crate::ui::say(&format!(
-                        "filament: still reaching '{peer_name}'... ({}s)",
+                        "tunlion: still reaching '{peer_name}'... ({}s)",
                         connect_started.elapsed().as_secs()
                     ));
                 }
@@ -1737,7 +1737,7 @@ pub(crate) async fn bring_up_to_known(
                         let l2_dialed = Arc::new(AtomicBool::new(false));
                         // DEBUG, resilience/direct internal (racing a direct path).
                         crate::ui::debug(&format!(
-                            "filament: got transport-offer ({} cand), racing direct-quic",
+                            "tunlion: got transport-offer ({} cand), racing direct-quic",
                             peer_cands.len()
                         ));
                         let secret = secret.clone();
@@ -1812,11 +1812,11 @@ pub(crate) async fn bring_up_to_known(
                         )
                         .await?;
                         if let Err(e) = p.handle_signal(offer).await {
-                            crate::ui::trace(&format!("filament: signal: {e}"));
+                            crate::ui::trace(&format!("tunlion: signal: {e}"));
                         }
                         peer = Some(p);
                     }
-                    Err(e) => crate::ui::trace(&format!("filament: signal: {e}")),
+                    Err(e) => crate::ui::trace(&format!("tunlion: signal: {e}")),
                 }
             }
             Ev::DirectReady(_pid, t, route) => {
@@ -1834,7 +1834,7 @@ pub(crate) async fn bring_up_to_known(
                 // and for reconnect roles (post-warm resume noise suppression).
                 if !role.starts_with("reconnect") && role != "bootstrap" {
                     crate::ui::debug(&format!(
-                        "\rfilament: tunnel up to '{peer_name}' (route: {route})"
+                        "\rtunlion: tunnel up to '{peer_name}' (route: {route})"
                     ));
                 }
                 // Transport is up: the Establishing race is won. Record Ready;
@@ -1871,7 +1871,7 @@ pub(crate) async fn bring_up_to_known(
                     // wedged and we rotate. Record a stall (the "burns the budget
                     // then succeeds on retry" signal we are hunting).
                     diag.stall(crate::diag::Phase::Establishing, candidate_secs * 1000);
-                    crate::ui::debug("filament: candidate unresponsive, rotating");
+                    crate::ui::debug("tunlion: candidate unresponsive, rotating");
                     queue.push_back((pid, peer_uid.take(), peer_present));
                 }
             }
@@ -1896,7 +1896,7 @@ pub(crate) async fn bring_up_to_known(
                 // `forget()`s it (keep alive); the bootstrap `close().await`s it
                 // (tear down before the second link).
                 if !role.starts_with("reconnect") && role != "bootstrap" {
-                    crate::ui::say(&format!("filament: tunnel up to '{peer_name}'"));
+                    crate::ui::say(&format!("tunlion: tunnel up to '{peer_name}'"));
                 }
                 // Transport is up via WebRTC: Establishing race won. Record Ready;
                 // the caller records the L2Open round trip and the final `up`.
@@ -1924,7 +1924,7 @@ pub(crate) async fn bring_up_to_known(
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
-                    crate::ui::debug(&format!("filament: connection {s}, rotating"));
+                    crate::ui::debug(&format!("tunlion: connection {s}, rotating"));
                     queue.push_back((pid, peer_uid.take(), peer_present));
                 }
             }
@@ -1937,7 +1937,7 @@ pub(crate) async fn bring_up_to_known(
 
 // ------------------------------------------------------------- DOCTOR PROBE --
 //
-// `filament doctor <device>` drives this: an "establish then drop" probe that
+// `tunlion doctor <device>` drives this: an "establish then drop" probe that
 // runs the EXACT same bring-up as netcat (`bring_up_to_known` with role
 // "doctor"), opens one L2 stream so the L2Open round trip is exercised, then
 // IMMEDIATELY tears the link down. It never opens a shell or moves payload. The
@@ -1960,8 +1960,8 @@ pub struct ProbeOutcome {
     /// On failure, the error string.
     pub error: Option<String>,
     /// On success, the path the probe link actually took (interface, address
-    /// class, endpoints) - so `filament doctor` shows the route in the same fine
-    /// detail as `filament reach`. `None` when the link never came up.
+    /// class, endpoints) - so `tunlion doctor` shows the route in the same fine
+    /// detail as `tunlion reach`. `None` when the link never came up.
     pub path: Option<crate::net::PathInfo>,
 }
 
@@ -2093,7 +2093,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                 mux.on_frame(sid, data).await;
             }
             Ev::PcState(_, s) if s == "failed" || s == "closed" || s == "disconnected" => {
-                crate::ui::debug(&format!("filament: tunnel {s}, closing streams"));
+                crate::ui::debug(&format!("tunlion: tunnel {s}, closing streams"));
                 mux.shutdown_all().await;
             }
             _ => {}
@@ -2432,7 +2432,7 @@ async fn pump_warm_pty_stdio(
 
 /// Pump a one-shot warm pty: stream output to stdout until the command exits.
 /// No raw mode, no SIGWINCH, no interactive features. Forwards stdin to match
-/// cold path parity (supports `echo hi | filament shell peer -- cat`).
+/// cold path parity (supports `echo hi | tunlion shell peer -- cat`).
 #[cfg(unix)]
 async fn pump_warm_pty_one_shot(
     sock: tokio::net::UnixStream,
@@ -2495,7 +2495,7 @@ async fn pump_warm_pty_one_shot(
     Ok(())
 }
 
-/// `filament forward <peer> <port>`: wire this process's stdio to a service the peer
+/// `tunlion forward <peer> <port>`: wire this process's stdio to a service the peer
 /// EXPOSED on its overlay address, over L3 (the overlay-port counterpart of
 /// `netcat`; also an ssh ProxyCommand for an overlay-exposed sshd). Goes through the
 /// local daemon, which resolves the peer to its verified overlay address and dials
@@ -2512,10 +2512,10 @@ pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
 
 #[cfg(not(unix))]
 pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("filament forward needs the local daemon's control socket (unix only)")
+    bail!("tunlion forward needs the local daemon's control socket (unix only)")
 }
 
-/// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
+/// `tunlion netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
 /// This is the ssh ProxyCommand primitive.
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
     // WARM-LINK FAST PATH: if a local `up` daemon already holds a link to `peer`,
@@ -2527,7 +2527,7 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
     if !relay {
         if let Some(sock) = crate::ctl::try_open(peer, rport).await {
             crate::ui::trace(&format!(
-                "filament: reusing warm link to '{peer}' (no establish)"
+                "tunlion: reusing warm link to '{peer}' (no establish)"
             ));
             return pump_stdio_over(sock).await;
         }
@@ -2548,20 +2548,20 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
         Ok(inner) => inner?,
         Err(_) => {
             crate::ui::problem(
-                &format!("filament netcat: can't reach '{peer}'"),
+                &format!("tunlion netcat: can't reach '{peer}'"),
                 &format!(
                     "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
                     format!(
                         "check it's reachable: {}",
-                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("tunlion reach {peer}"))
                     ),
                     format!(
                         "diagnose the connect: {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            &format!("filament doctor {peer}")
+                            &format!("tunlion doctor {peer}")
                         )
                     ),
                 ],
@@ -2801,7 +2801,7 @@ async fn pty_attach_once(
         )
     };
     // `session` makes reconnects REATTACH the same shell (acceptor keys it per
-    // verified device); a fresh per-invocation id means two `filament shell` runs
+    // verified device); a fresh per-invocation id means two `tunlion shell` runs
     // never collide. `term` is forwarded so the remote matches THIS terminal.
     mux.transport()
         .send_control(&{
@@ -2975,7 +2975,7 @@ async fn pty_attach_once(
     }
 }
 
-/// Warm fast path for `filament shell`: if the local daemon already holds a link to
+/// Warm fast path for `tunlion shell`: if the local daemon already holds a link to
 /// `peer`, open the PTY over it (via the control socket) and bridge this process's
 /// stdio to it - raw mode + SIGWINCH forwarded as a `resize` op. Returns
 /// `Some(result)` once it has handled the session (stdio EOF = shell exit or a
@@ -3010,7 +3010,7 @@ async fn try_warm_pty(
     };
     if interactive {
         crate::ui::trace(&format!(
-            "filament: reusing warm link to '{peer}' for pty (no establish)"
+            "tunlion: reusing warm link to '{peer}' for pty (no establish)"
         ));
         if raw.is_none() {
             match RawGuard::enable() {
@@ -3038,7 +3038,7 @@ async fn try_warm_pty(
     } else {
         // One-shot (scripted): no raw mode, no SIGWINCH, just stream output.
         crate::ui::trace(&format!(
-            "filament: reusing warm link to '{peer}' for one-shot pty"
+            "tunlion: reusing warm link to '{peer}' for one-shot pty"
         ));
         // NOTE: neither the cold path nor this warm path propagates the remote
         // command's exit status - both return Ok(()) regardless. This is a known
@@ -3047,14 +3047,14 @@ async fn try_warm_pty(
     }
 }
 
-/// `filament shell <peer>`: open a PTY shell on the peer and bridge it to this
+/// `tunlion shell <peer>`: open a PTY shell on the peer and bridge it to this
 /// terminal (the CLI sibling of the browser web-shell). On a real terminal it is
 /// a FULL interactive client - real tty size, raw mode, SIGWINCH, $TERM - AND
 /// RESUMABLE: a per-invocation random session id lets a dropped link reconnect
 /// and reattach the SAME live shell (mosh/tmux-style, the acceptor replays its
 /// output buffer), so a flaky link (e.g. a Coder workspace reconnecting every
 /// ~90s) no longer loses the session. The session id lives only in THIS process,
-/// so a separate `filament shell` run always gets a fresh shell, never this one.
+/// so a separate `tunlion shell` run always gets a fresh shell, never this one.
 /// A non-tty stdio (a pipe) keeps the plain cooked, non-resuming bridge.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) -> Result<()> {
     let one_shot = cmd.join(" ");
@@ -3177,11 +3177,11 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         "the peer's certificate was revoked; restore it with {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            "filament devices restore <this-device>"
+                            "tunlion devices restore <this-device>"
                         )
                     )
                 } else if reason == crate::capability::CEILING_REASON {
-                    // A grant cannot widen an enrolment ceiling, and `filament
+                    // A grant cannot widen an enrolment ceiling, and `tunlion
                     // grant` says so when you run it. Prescribing it here sent
                     // the owner to a command that refuses, and the refusal named
                     // the real fix. Name it here instead, one step earlier.
@@ -3189,7 +3189,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            "filament add --for <this-device> --allow shell"
+                            "tunlion add --for <this-device> --allow shell"
                         )
                     )
                 } else {
@@ -3197,7 +3197,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         "grant shell on the peer: {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            &format!("filament grant <this-device> shell")
+                            &format!("tunlion grant <this-device> shell")
                         )
                     )
                 };
@@ -3223,7 +3223,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 last_up = std::time::Instant::now();
                 backoff = Duration::from_millis(300);
                 role = "reconnect";
-                eprint!("\r\n\x1b[2m[filament: link dropped, reconnecting...]\x1b[0m\r\n");
+                eprint!("\r\n\x1b[2m[tunlion: link dropped, reconnecting...]\x1b[0m\r\n");
                 continue;
             }
             Err(e) => {
@@ -3246,8 +3246,8 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         .then_some(msg)
                     };
                     if let Some(reason) = refused {
-                        // Both verbs here used to be invented: `filament pty` and
-                        // `filament request`. Neither exists, so the hint sent the
+                        // Both verbs here used to be invented: `tunlion pty` and
+                        // `tunlion request`. Neither exists, so the hint sent the
                         // user to a command that would not run. main's
                         // printed_hints_name_verbs_that_exist gate caught it on
                         // merge, which is exactly what that gate is for.
@@ -3257,18 +3257,18 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         // What helps is knowing it was queued and how the other
                         // side answers it.
                         crate::ui::problem(
-                            &format!("filament shell: '{peer}' refused the shell"),
+                            &format!("tunlion shell: '{peer}' refused the shell"),
                             &reason,
                             &[
                                 format!(
                                     "on {peer}, approve it: {}",
-                                    crate::ui::paint(crate::ui::Tone::Brand, "filament requests")
+                                    crate::ui::paint(crate::ui::Tone::Brand, "tunlion requests")
                                 ),
                                 format!(
                                     "or on {peer}, grant it outright: {}",
                                     crate::ui::paint(
                                         crate::ui::Tone::Brand,
-                                        "filament grant <this device> shell"
+                                        "tunlion grant <this device> shell"
                                     )
                                 ),
                             ],
@@ -3281,7 +3281,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                         .filter(|n| *n > 0)
                         .unwrap_or(45);
                     crate::ui::problem(
-                        &format!("filament shell: can't reach '{peer}'"),
+                        &format!("tunlion shell: can't reach '{peer}'"),
                         &format!(
                             "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                         ),
@@ -3290,14 +3290,14 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                                 "check it's reachable: {}",
                                 crate::ui::paint(
                                     crate::ui::Tone::Brand,
-                                    &format!("filament reach {peer}")
+                                    &format!("tunlion reach {peer}")
                                 )
                             ),
                             format!(
                                 "diagnose the connect: {}",
                                 crate::ui::paint(
                                     crate::ui::Tone::Brand,
-                                    &format!("filament doctor {peer}")
+                                    &format!("tunlion doctor {peer}")
                                 )
                             ),
                         ],
@@ -3309,7 +3309,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // stop a bit under that so we don't reattach into a fresh shell.
                 if last_up.elapsed() > Duration::from_secs(150) {
                     eprint!(
-                        "\r\n\x1b[2m[filament: session expired, reconnect window passed]\x1b[0m\r\n"
+                        "\r\n\x1b[2m[tunlion: session expired, reconnect window passed]\x1b[0m\r\n"
                     );
                     return Ok(());
                 }
@@ -3322,7 +3322,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     }
 }
 
-/// Build the user-facing message for the case where `filament forward` could
+/// Build the user-facing message for the case where `tunlion forward` could
 /// not bind its local listener because the requested port is in use. The
 /// tunnel itself is healthy; only the local bind failed. We suggest
 /// lport+1 with a saturating increment so the suggestion is always a valid
@@ -3331,7 +3331,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
 fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
     let suggested = lport.saturating_add(1);
     format!(
-        "filament: local port {lport} is already in use, pick another (e.g. filament forward {suggested} {peer} {rport})"
+        "tunlion: local port {lport} is already in use, pick another (e.g. tunlion forward {suggested} {peer} {rport})"
     )
 }
 
@@ -3348,7 +3348,7 @@ async fn bridge_streams(
         .map(|_| ())
 }
 
-/// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
+/// `tunlion forward <lport> <peer> <rport>`: local TCP listener; every accepted
 /// connection opens a fresh L2 stream to `peer:127.0.0.1:rport`.
 ///
 /// WARM-LINK FAST PATH: when a local daemon already holds a link to `peer`, each
@@ -3412,7 +3412,7 @@ impl ForwardActivity {
     fn line(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         crate::ui::status(&format!(
-            "filament: forwarding to {}:{} - {} active, {} total",
+            "tunlion: forwarding to {}:{} - {} active, {} total",
             self.peer,
             self.rport,
             self.active.load(Relaxed),
@@ -3445,7 +3445,7 @@ impl ForwardActivity {
             return;
         }
         crate::ui::critical(&format!(
-            "filament: {}:{} refused the connection: {reason}",
+            "tunlion: {}:{} refused the connection: {reason}",
             self.peer, self.rport
         ));
     }
@@ -3471,7 +3471,7 @@ impl ForwardActivity {
             // outcome channel that several other callers must NOT inherit, so it
             // is a follow-up rather than a claim made loosely here.
             crate::ui::say(&format!(
-                "filament: first connection accepted, opening to {}:{}",
+                "tunlion: first connection accepted, opening to {}:{}",
                 self.peer, self.rport
             ));
         }
@@ -3497,7 +3497,7 @@ impl Drop for ConnGuard {
         use std::sync::atomic::Ordering::Relaxed;
         self.active.fetch_sub(1, Relaxed);
         crate::ui::status(&format!(
-            "filament: forwarding to {}:{} - {} active, {} total",
+            "tunlion: forwarding to {}:{} - {} active, {} total",
             self.peer,
             self.rport,
             self.active.load(Relaxed),
@@ -3506,7 +3506,7 @@ impl Drop for ConnGuard {
     }
 }
 
-/// `filament mount <peer> <remote>`: open a mesh-native mount stream to the
+/// `tunlion mount <peer> <remote>`: open a mesh-native mount stream to the
 /// peer and serve the remote filesystem over the mount protocol. No sshd,
 /// no sshfs — the server runs the mount handler on the peer's side of the
 /// authenticated mesh stream, and the client drives it via `MountClient`.
@@ -3538,9 +3538,9 @@ pub async fn forward_cmd(
     // and the generic "no known device" error hides what actually happened.
     if forward_target_is_self(peer) {
         bail!(
-            "filament: '{peer}' is this device - a forward reaches a DIFFERENT machine. \
+            "tunlion: '{peer}' is this device - a forward reaches a DIFFERENT machine. \
              Whatever runs on this host's :{rport} is already here as 127.0.0.1:{rport}; \
-             point the forward at another peer (see `filament devices`)."
+             point the forward at another peer (see `tunlion devices`)."
         );
     }
     // Resolve the peer against the paired devices UP FRONT, so an unknown/typo'd
@@ -3551,8 +3551,8 @@ pub async fn forward_cmd(
         .any(|(n, _)| n.eq_ignore_ascii_case(peer))
     {
         bail!(
-            "filament: no known device named '{peer}'. Add it first with `filament add`, \
-             then `filament devices` shows who you can reach."
+            "tunlion: no known device named '{peer}'. Add it first with `tunlion add`, \
+             then `tunlion devices` shows who you can reach."
         );
     }
     // Bind first so a port conflict fails fast, before any network work.
@@ -3563,19 +3563,19 @@ pub async fn forward_cmd(
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             bail!(
-                "filament: cannot bind 127.0.0.1:{lport}: permission denied. Local ports below \
-                 1024 need root; pick a higher local port (e.g. `filament forward 8{lport:0>3} {peer} {rport}`) \
+                "tunlion: cannot bind 127.0.0.1:{lport}: permission denied. Local ports below \
+                 1024 need root; pick a higher local port (e.g. `tunlion forward 8{lport:0>3} {peer} {rport}`) \
                  or run with sudo."
             );
         }
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!(
-                "filament: failed to bind 127.0.0.1:{lport} for forward to {peer}:127.0.0.1:{rport}"
+                "tunlion: failed to bind 127.0.0.1:{lport} for forward to {peer}:127.0.0.1:{rport}"
             )));
         }
     };
     crate::ui::say(&format!(
-        "filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"
+        "tunlion: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"
     ));
 
     // Ride a local `up` daemon's warm link when one exists (unix control socket):
@@ -3602,18 +3602,18 @@ pub async fn forward_cmd(
             Some(facts) => {
                 let route = facts["route"].as_str().unwrap_or("link");
                 crate::ui::say(&format!(
-                    "filament: ready - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})"
+                    "tunlion: ready - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})"
                 ));
             }
             None => {
                 crate::ui::say(&format!(
-                    "filament: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `filament reach {peer}`)"
+                    "tunlion: listening on 127.0.0.1:{lport} -> {peer}:{rport} via the local daemon; no live link to {peer} yet - it opens on the first connection (check with `tunlion reach {peer}`)"
                 ));
             }
         }
         None
     } else {
-        crate::ui::status(&format!("filament: bringing up the link to {peer} ..."));
+        crate::ui::status(&format!("tunlion: bringing up the link to {peer} ..."));
         let (tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
         {
             let (server, peer_s) = (server.to_string(), peer.to_string());
@@ -3623,12 +3623,12 @@ pub async fn forward_cmd(
         while rx.borrow().is_none() {
             if rx.changed().await.is_err() {
                 bail!(
-                    "filament: could not establish the link to {peer}; is it online? check with `filament reach {peer}` (or `filament devices`)"
+                    "tunlion: could not establish the link to {peer}; is it online? check with `tunlion reach {peer}` (or `tunlion devices`)"
                 );
             }
         }
         crate::ui::say(&format!(
-            "filament: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `filament up` here to avoid a separate presence on {peer})"
+            "tunlion: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})"
         ));
         Some(rx)
     };
@@ -3640,7 +3640,7 @@ pub async fn forward_cmd(
         let sock = match listener.accept().await {
             Ok((s, _)) => s,
             Err(e) => {
-                crate::ui::status(&format!("filament: accept paused ({e}), retrying..."));
+                crate::ui::status(&format!("tunlion: accept paused ({e}), retrying..."));
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 continue;
             }
@@ -3666,7 +3666,7 @@ pub async fn forward_cmd(
         // exists, then serve over the current live link.
         if cold_rx.is_none() {
             crate::ui::debug(&format!(
-                "filament: no warm link to {peer}, using a direct link for forwarding"
+                "tunlion: no warm link to {peer}, using a direct link for forwarding"
             ));
             let (tx, rx) = tokio::sync::watch::channel::<Option<Arc<Mux>>>(None);
             let (server, peer_s) = (server.to_string(), peer.to_string());
@@ -3691,10 +3691,10 @@ pub async fn forward_cmd(
     }
 }
 
-/// `filament proxy`: a local SOCKS5 proxy that reaches mesh peers by name with NO
+/// `tunlion proxy`: a local SOCKS5 proxy that reaches mesh peers by name with NO
 /// TUN and NO privilege (Tailscale's userspace-networking model). A SOCKS5 CONNECT
 /// to `<peer>.mesh:<port>` opens an L2 stream to that peer's `localhost:<port>` over
-/// filament (warm via a local daemon, else a self-healing cold link); any other
+/// tunlion (warm via a local daemon, else a self-healing cold link); any other
 /// host is dialed directly, so the proxy is a drop-in that only diverts `.mesh`.
 /// Pure userspace: no CAP_NET_ADMIN, no sudo, works in containers.
 ///
@@ -3710,16 +3710,16 @@ pub async fn proxy_cmd(
     let listener = match TcpListener::bind((bind, port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            bail!("filament: {bind}:{port} is already in use; pick another with --port");
+            bail!("tunlion: {bind}:{port} is already in use; pick another with --port");
         }
         Err(e) => {
             return Err(
-                anyhow::Error::new(e).context(format!("filament: failed to bind {bind}:{port}"))
+                anyhow::Error::new(e).context(format!("tunlion: failed to bind {bind}:{port}"))
             );
         }
     };
     crate::ui::say(&format!(
-        "filament: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"
+        "tunlion: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"
     ));
     crate::ui::say(&format!(
         "  point apps here; {}.mesh rides the mesh, everything else connects directly",
@@ -3732,7 +3732,7 @@ pub async fn proxy_cmd(
     if !crate::ctl::daemon_present().await {
         crate::ui::say(&crate::ui::paint(
             crate::ui::Tone::Dim,
-            "  note: no local daemon; each .mesh connection brings up its own link. `filament up` makes them instant.",
+            "  note: no local daemon; each .mesh connection brings up its own link. `tunlion up` makes them instant.",
         ));
     }
     // Per-peer self-healing cold links, started lazily on first use of a peer (only
@@ -3745,16 +3745,16 @@ pub async fn proxy_cmd(
             Ok(l) => l,
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 bail!(
-                    "filament: {bind}:{http_port} is already in use; pick another with --http-port"
+                    "tunlion: {bind}:{http_port} is already in use; pick another with --http-port"
                 );
             }
             Err(e) => {
                 return Err(anyhow::Error::new(e)
-                    .context(format!("filament: failed to bind {bind}:{http_port}")));
+                    .context(format!("tunlion: failed to bind {bind}:{http_port}")));
             }
         };
         crate::ui::say(&format!(
-            "filament: HTTP CONNECT proxy on {bind}:{http_port}"
+            "tunlion: HTTP CONNECT proxy on {bind}:{http_port}"
         ));
         crate::ui::say(&format!(
             "  PAC file: http://127.0.0.1:{http_port}/proxy.pac"
@@ -3770,7 +3770,7 @@ pub async fn proxy_cmd(
                     Ok((s, _)) => s,
                     Err(e) => {
                         crate::ui::status(&format!(
-                            "filament: HTTP accept paused ({e}), retrying..."
+                            "tunlion: HTTP accept paused ({e}), retrying..."
                         ));
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         continue;
@@ -3780,7 +3780,7 @@ pub async fn proxy_cmd(
                 let (server, cold) = (server_http.clone(), cold_http.clone());
                 tokio::spawn(async move {
                     if let Err(e) = handle_http(sock, &server, port, relay, cold).await {
-                        crate::ui::debug(&format!("filament: HTTP proxy connection ended: {e}"));
+                        crate::ui::debug(&format!("tunlion: HTTP proxy connection ended: {e}"));
                     }
                 });
             }
@@ -3790,7 +3790,7 @@ pub async fn proxy_cmd(
         let sock = match listener.accept().await {
             Ok((s, _)) => s,
             Err(e) => {
-                crate::ui::status(&format!("filament: accept paused ({e}), retrying..."));
+                crate::ui::status(&format!("tunlion: accept paused ({e}), retrying..."));
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 continue;
             }
@@ -3799,7 +3799,7 @@ pub async fn proxy_cmd(
         let (server, cold) = (server.to_string(), cold.clone());
         tokio::spawn(async move {
             if let Err(e) = handle_socks(sock, &server, relay, cold).await {
-                crate::ui::debug(&format!("filament: proxy connection ended: {e}"));
+                crate::ui::debug(&format!("tunlion: proxy connection ended: {e}"));
             }
         });
     }
@@ -3812,7 +3812,7 @@ async fn socks_reply(sock: &mut TcpStream, code: u8) -> std::io::Result<()> {
 }
 
 /// Handle one SOCKS5 client: no-auth handshake, parse the CONNECT target, then
-/// route `<peer>.mesh:<port>` over filament (warm-first, cold fallback) or dial any
+/// route `<peer>.mesh:<port>` over tunlion (warm-first, cold fallback) or dial any
 /// other host directly. Errors here only affect this one connection.
 async fn handle_socks(
     mut sock: TcpStream,
@@ -3909,7 +3909,7 @@ async fn handle_socks(
         }
         None => {
             // Not a mesh name: behave like a plain SOCKS5 proxy (dial directly), so
-            // the user can set filament as their one proxy and only .mesh is diverted.
+            // the user can set tunlion as their one proxy and only .mesh is diverted.
             match TcpStream::connect((host.as_str(), dport)).await {
                 Ok(mut up) => {
                     let _ = up.set_nodelay(true);
@@ -4108,7 +4108,7 @@ async fn serve_cold_connection(
                     // which is why the only thing the user saw was the premature
                     // success line above.
                     crate::ui::critical(&format!(
-                        "filament: could not open a stream to {peer} after 3 tries; this connection was dropped (the forward stays up)"
+                        "tunlion: could not open a stream to {peer} after 3 tries; this connection was dropped (the forward stays up)"
                     ));
                     return; // drop sock; accept loop keeps running
                 }
@@ -4146,7 +4146,7 @@ async fn manage_cold_link(
             }
             Err(e) => {
                 crate::ui::status(&format!(
-                    "filament: reaching {peer} failed ({e}), retrying..."
+                    "tunlion: reaching {peer} failed ({e}), retrying..."
                 ));
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(8000);
@@ -4155,7 +4155,7 @@ async fn manage_cold_link(
         };
         backoff_ms = 500;
         if had_link {
-            crate::ui::say(&format!("filament: link to {peer} recovered"));
+            crate::ui::say(&format!("tunlion: link to {peer} recovered"));
         }
         had_link = true;
         if tx.send(Some(mux.clone())).is_err() {
@@ -4168,7 +4168,7 @@ async fn manage_cold_link(
                 return;
             }
             if !mux.transport().is_alive() {
-                crate::ui::status(&format!("filament: link to {peer} lost, reconnecting..."));
+                crate::ui::status(&format!("tunlion: link to {peer} lost, reconnecting..."));
                 let _ = tx.send(None);
                 break;
             }
@@ -4176,7 +4176,7 @@ async fn manage_cold_link(
     }
 }
 
-/// Seamless-shell bootstrap (initiator): over the already-authenticated filament
+/// Seamless-shell bootstrap (initiator): over the already-authenticated tunlion
 /// channel, hand the acceptor our managed pubkey and fetch its host keys, so a
 /// user with ZERO ssh setup gets a no-prompt shell. The exchange is pure control
 /// JSON over the transport `bring_up_to_known` returns (no mux needed).
@@ -4187,7 +4187,7 @@ async fn manage_cold_link(
 /// fall through to a key-less ssh attempt (that would be a muddy auth failure
 /// instead of a clear "zero shell" denial).
 /// Result of installing our managed key on a peer (warm or cold path). `sshd` is
-/// the peer's report of whether an sshd is listening on the port `filament shell --ssh`
+/// the peer's report of whether an sshd is listening on the port `tunlion shell --ssh`
 /// will dial: `Some(true)` reachable, `Some(false)` nothing there (so ssh would
 /// fail blindly - caller bails with a clear message), `None` when the peer is an
 /// older build that didn't report it (caller proceeds, status unknown).
@@ -4204,7 +4204,7 @@ async fn shell_bootstrap(
     ssh_port: u16,
     cert_only: bool,
 ) -> Result<BootstrapInfo> {
-    // Managed keypair lives under the filament config dir, NEVER ~/.ssh. In
+    // Managed keypair lives under the tunlion config dir, NEVER ~/.ssh. In
     // cert mode it is NOT generated and NOT offered: `shell --ssh` now
     // authenticates with an ephemeral certificate, so this exchange exists
     // only to learn the peer's host keys and sshd status (the acceptor
@@ -4232,20 +4232,20 @@ async fn shell_bootstrap(
         Ok(inner) => inner?,
         Err(_) => {
             crate::ui::problem(
-                &format!("filament shell --ssh: can't reach '{peer}'"),
+                &format!("tunlion shell --ssh: can't reach '{peer}'"),
                 &format!(
                     "couldn't establish a link to '{peer}' in {connect_secs}s - it may be offline or unreachable from here."
                 ),
                 &[
                     format!(
                         "check it's reachable: {}",
-                        crate::ui::paint(crate::ui::Tone::Brand, &format!("filament reach {peer}"))
+                        crate::ui::paint(crate::ui::Tone::Brand, &format!("tunlion reach {peer}"))
                     ),
                     format!(
                         "diagnose the connect: {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            &format!("filament doctor {peer}")
+                            &format!("tunlion doctor {peer}")
                         )
                     ),
                 ],
@@ -4276,7 +4276,7 @@ async fn shell_bootstrap(
         if remaining.is_zero() {
             break Err(anyhow!(
                 "shell bootstrap timed out with no answer from '{peer}'. If it is running \
-                 `filament up`, the shell acceptor may be off there (`filament up --shell`)."
+                 `tunlion up`, the shell acceptor may be off there (`tunlion up --shell`)."
             ));
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
@@ -4292,8 +4292,8 @@ async fn shell_bootstrap(
                 // The acceptor SAYS why it refused, in an l2-close `err`. This
                 // arm used to fall through to `_ => continue`, so `--ssh` threw
                 // that sentence away, spun for the full 20s, and then guessed
-                // at a cause: "is '<peer>' running `filament up` with shell
-                // access granted?" The plain `filament shell` path surfaces the
+                // at a cause: "is '<peer>' running `tunlion up` with shell
+                // access granted?" The plain `tunlion shell` path surfaces the
                 // same message immediately. Same refusal, same wire, two very
                 // different errors, and the useless one was on the path a user
                 // reaches for when the first attempt fails.
@@ -4332,18 +4332,18 @@ async fn shell_bootstrap(
                     // ceiling is the reason.
                     // One reason, one remedy. Appending a grant hint to every
                     // refusal produced "shell serving is off there; run
-                    // `filament up --shell` on that device. Run `filament grant
+                    // `tunlion up --shell` on that device. Run `tunlion grant
                     // <this-device> shell`" — two instructions, the second
                     // irrelevant to the stated cause. A reason that already
                     // carries its own fix gets no second one bolted on.
                     let fix = if why == crate::capability::CEILING_REASON {
                         format!(
-                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `filament add --for <this-device> --allow shell` on '{peer}'."
+                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `tunlion add --for <this-device> --allow shell` on '{peer}'."
                         )
                     } else if why == crate::capability::SHELL_OFF_REASON {
                         String::new()
                     } else {
-                        format!(" Run `filament grant <this-device> shell` on '{peer}'.")
+                        format!(" Run `tunlion grant <this-device> shell` on '{peer}'.")
                     };
                     break Err(anyhow!("shell refused by '{peer}': {why}.{fix}"));
                 }
@@ -4365,7 +4365,7 @@ async fn shell_bootstrap(
 /// run the `shell-bootstrap` over its already-established link (instant, no cold
 /// establish), and fall back to a fresh `shell_bootstrap` on a miss/deny/timeout,
 /// under `--relay`, or off-unix. This is what closes the last gap that left
-/// `filament shell --ssh` slow while `pty` was already warm: the bootstrap was the only
+/// `tunlion shell --ssh` slow while `pty` was already warm: the bootstrap was the only
 /// remaining cold establish in the ssh path.
 async fn bootstrap_key(
     server: &str,
@@ -4388,7 +4388,7 @@ async fn bootstrap_key(
                 .unwrap_or_default();
             if !hostkeys.is_empty() {
                 crate::ui::trace(&format!(
-                    "filament: reusing warm link to '{peer}' for ssh bootstrap (no establish)"
+                    "tunlion: reusing warm link to '{peer}' for ssh bootstrap (no establish)"
                 ));
                 return Ok(BootstrapInfo {
                     hostkeys,
@@ -4415,11 +4415,11 @@ fn resolve_login(remote_user: Option<String>) -> String {
 }
 
 /// Spawn the real `ssh`, pointed EXCLUSIVELY at the ephemeral cert identity
-/// (fresh key + B-signed cert) + known_hosts, with a `filament netcat`
+/// (fresh key + B-signed cert) + known_hosts, with a `tunlion netcat`
 /// ProxyCommand. Returns ssh's exit code. The cert is acquired FIRST over a
 /// fresh L2 link and the flow fails CLOSED without it (clear error, never a
 /// managed-key fallback: silently downgrading would make the CA decorative).
-/// The destination is always `<login>@filament-<peer>`.
+/// The destination is always `<login>@tunlion-<peer>`.
 /// Run the ssh session, preferring the resilient L3 overlay. Both paths use
 /// the SAME cert identity; L3 just connects to the stable overlay address
 /// directly (no ProxyCommand), so the session survives a link repair.
@@ -4473,14 +4473,14 @@ async fn run_ssh(
                     sigwatch.abort();
                     return Ok(code);
                 }
-                crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
+                crate::ui::say("tunlion: L3 ssh failed, falling back to the tunnel");
             } else if revive {
                 // The route exists but the overlay path looks dead (a lapsed/zombie
                 // transport). Kick the revive nudge in the BACKGROUND and fall back to
                 // L2 immediately. The user must never wait the revive ceiling for an
                 // interactive ssh; the next ssh will find L3 up if the revive worked.
                 crate::ui::say(&format!(
-                    "filament: L3 overlay to '{peer}' down, falling back to the tunnel; reviving in background"
+                    "tunlion: L3 overlay to '{peer}' down, falling back to the tunnel; reviving in background"
                 ));
                 let peer = peer.to_string();
                 tokio::spawn(async move {
@@ -4580,7 +4580,7 @@ fn spawn_ssh(
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new")
         // Bound the ssh-side connect and detect a dead session, so the data link
-        // (the filament netcat ProxyCommand) can't hang ssh indefinitely either.
+        // (the tunlion netcat ProxyCommand) can't hang ssh indefinitely either.
         .arg("-o")
         .arg("ConnectTimeout=25")
         .arg("-o")
@@ -4608,12 +4608,12 @@ fn spawn_ssh(
     Ok(cmd.status()?.code().unwrap_or(1))
 }
 
-/// `filament shell --ssh <peer> [args...]`: seamless shell over the trusted channel.
+/// `tunlion shell --ssh <peer> [args...]`: seamless shell over the trusted channel.
 ///
 /// With zero pre-existing ssh setup: bootstrap our managed key + the peer's host
-/// key over the authenticated filament channel, pin them, then run ssh pointed
+/// key over the authenticated tunlion channel, pin them, then run ssh pointed
 /// EXCLUSIVELY at filament-managed material (-o IdentityFile / IdentitiesOnly /
-/// UserKnownHostsFile) with a `filament netcat` ProxyCommand. No prompts, no
+/// UserKnownHostsFile) with a `tunlion netcat` ProxyCommand. No prompts, no
 /// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
 /// peer lacks the `shell` cap we abort HERE, before invoking ssh.
 /// Resolve `<peer>.mesh` (the MagicDNS /etc/hosts entry) to its overlay socket
@@ -4672,7 +4672,7 @@ pub(crate) async fn ensure_peer_bootstrap(
     relay: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let _host = format!("filament-{peer}");
+    let _host = format!("tunlion-{peer}");
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -4691,7 +4691,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
     cert_only: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("filament-{peer}");
+    let host = format!("tunlion-{peer}");
 
     let cached = if crate::sshkeys::host_pinned(&host) {
         crate::sshkeys::bootstrap_cache_get(peer)
@@ -4723,7 +4723,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
 /// Invalidate bootstrap cache and re-bootstrap a peer (for retry after exit 255).
 pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool, cert_only: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("filament-{peer}");
+    let host = format!("tunlion-{peer}");
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -4794,7 +4794,7 @@ pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
 /// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
 #[cfg(target_os = "linux")]
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
-    let peer = info.host.strip_prefix("filament-").unwrap_or(&info.host);
+    let peer = info.host.strip_prefix("tunlion-").unwrap_or(&info.host);
     let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
 
     // Retry with increasing timeouts (like run_ssh does with revive+poll).
@@ -4838,7 +4838,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     // the device rotated its key/host-key or revoked the cap. Invalidate, run a
     // real bootstrap, and retry ssh ONCE.
     if code == 255 && info.took_fast_path {
-        crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
+        crate::ui::say(&format!("tunlion: re-authenticating with '{peer}'..."));
         let retry = rebootstrap_peer(server, peer, relay, true).await?;
         // revive=false: don't pay the L3 revive-wait twice on the same invocation.
         let code = run_ssh(
@@ -4867,7 +4867,7 @@ fn ssh_failed_hint(peer: &str, code: i32) {
         crate::ui::say(&crate::ui::paint(
             crate::ui::Tone::Dim,
             &format!(
-                "  tip: `filament {peer}` opens a filament shell instead (no sshd needed, survives link repairs)"
+                "  tip: `tunlion {peer}` opens a tunlion shell instead (no sshd needed, survives link repairs)"
             ),
         ));
     }
@@ -4891,11 +4891,11 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
         return;
     }
     crate::ui::problem(
-        &format!("filament shell --ssh: no sshd on '{peer}'"),
+        &format!("tunlion shell --ssh: no sshd on '{peer}'"),
         &format!(
             "'{peer}' is reachable, but nothing is listening on localhost:{rport} for ssh. \
              (sshd may be bound to a non-localhost address like the mesh ULA — \
-             `filament shell --ssh` connects to localhost:{rport} on the peer.)",
+             `tunlion shell --ssh` connects to localhost:{rport} on the peer.)",
         ),
         &[
             format!("start an sshd on '{peer}' listening on localhost (or all interfaces)"),
@@ -4905,7 +4905,7 @@ async fn ensure_sshd(peer: &str, rport: u16, reported: Option<bool>) {
             ),
             format!(
                 "use {} for a shell that needs no sshd",
-                crate::ui::paint(crate::ui::Tone::Brand, &format!("filament shell {peer}"))
+                crate::ui::paint(crate::ui::Tone::Brand, &format!("tunlion shell {peer}"))
             ),
         ],
     );
@@ -5562,7 +5562,7 @@ mod h1_tests {
     }
 
     /// The `port_in_use_msg` helper must surface the conflicting port and a
-    /// `filament forward <lport+1> <peer> <rport>` retry hint, so a user
+    /// `tunlion forward <lport+1> <peer> <rport>` retry hint, so a user
     /// staring at a "port in use" error can recover in one copy-paste.
     #[test]
     fn port_in_use_msg_names_port_and_suggests_forward() {
@@ -5572,8 +5572,8 @@ mod h1_tests {
             "message must name the conflicting port: {msg}"
         );
         assert!(
-            msg.contains("filament forward"),
-            "message must suggest a filament forward retry: {msg}"
+            msg.contains("tunlion forward"),
+            "message must suggest a tunlion forward retry: {msg}"
         );
         assert!(
             msg.contains("8081"),
@@ -5608,7 +5608,7 @@ mod h1_tests {
 
     // ---- warm-reuse zombie self-heal (the popos pty/ssh hang) ----------------
 
-    /// THE proof for "filament definitively works no matter what": warm-reuse over
+    /// THE proof for "tunlion definitively works no matter what": warm-reuse over
     /// a ZOMBIE held link (alive at QUIC, black-holing new streams: NOTHING ever
     /// arrives inbound) must NOT hang. `open_stream_verified` bails within the
     /// window with an `Err`, removes the half-open stream, and sends an `l2-close`

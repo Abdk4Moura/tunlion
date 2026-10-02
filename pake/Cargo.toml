@@ -1,4 +1,4 @@
-# Filament PAKE core — the ONE SPAKE2 implementation shared by the CLI
+# Tunlion PAKE core — the ONE SPAKE2 implementation shared by the CLI
 # (native rlib) and the browser (wasm32 via wasm-bindgen). Promoted from the
 # L1-0 spike (spike/pake-core) into production: OsRng (not the spike's seeded
 # RNG), wasm-bindgen objects (not the spike's C-ABI Mutex handle table).
@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 license = "MIT"
-description = "Shared SPAKE2 PAKE core for Filament first-pairing (CLI + browser)."
+description = "Shared SPAKE2 PAKE core for Tunlion first-pairing (CLI + browser)."
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -1,4 +1,4 @@
-//! The send command (`filament send`) and its single-stream helper.
+//! The send command (`tunlion send`) and its single-stream helper.
 //!
 //! Moved as one unit: `send_cmd` drives the send-side ceremony and the
 //! transfer loop, and `stream_one` streams one file for it -- `send_cmd` is its
@@ -79,9 +79,9 @@ pub(crate) async fn send_cmd(
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
 
-    // #230: `filament send <file>` with no --to and no --code fell through to
+    // #230: `tunlion send <file>` with no --to and no --code fell through to
     // local-network discovery and printed a raw room id, while the bare
-    // `filament <file>` minted a speakable code. Same intent, two experiences,
+    // `tunlion <file>` minted a speakable code. Same intent, two experiences,
     // and the banner documented the code on the verb that lacked it.
     //
     // This defaulting must come AFTER opened_flow, and the first version of the
@@ -163,7 +163,7 @@ pub(crate) async fn send_cmd(
                 );
             }
             bail!(
-                "send --to '{target}': no known device by that name; run `filament devices` to see who you can reach"
+                "send --to '{target}': no known device by that name; run `tunlion devices` to see who you can reach"
             );
         }
     }
@@ -363,7 +363,7 @@ pub(crate) async fn send_cmd(
             })
         );
         eprintln!("  proof    receiver must acknowledge the whole-file hash");
-        let mut replay = vec!["filament".to_string(), "send".to_string()];
+        let mut replay = vec!["tunlion".to_string(), "send".to_string()];
         replay.extend(paths.iter().map(|path| command_arg(path)));
         if let Some(target) = to.as_deref() {
             replay.extend(["--to".to_string(), command_arg(target)]);
@@ -447,7 +447,7 @@ pub(crate) async fn send_cmd(
             {
                 bail!(
                     "send --to '{t}': your daemon has no verified link to it right now, so it \
-                     cannot broker a private rendezvous. Start `filament up` on both devices and \
+                     cannot broker a private rendezvous. Start `tunlion up` on both devices and \
                      retry, or use its mesh address ({t}.mesh)."
                 );
             }
@@ -965,7 +965,7 @@ pub(crate) async fn send_cmd(
                     ui::paint(
                         ui::Tone::Dim,
                         &format!(
-                            "terminal: filament receive {full}   browser: {} (RECEIVE WITH CODE)",
+                            "terminal: tunlion receive {full}   browser: {} (RECEIVE WITH CODE)",
                             ui::link(&site, &site.replace("https://", ""))
                         )
                     )
@@ -1860,7 +1860,7 @@ pub(crate) async fn send_cmd(
                     .await?
                 {
                     bail!(
-                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `filament send` to resume",
+                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
                         MAX_ATTEMPTS
                     );
                 }
@@ -1868,7 +1868,7 @@ pub(crate) async fn send_cmd(
             Ev::GraceExpired(pid, generation) => {
                 if conn.on_stuck(&pid, generation, "lost").await? {
                     bail!(
-                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `filament send` to resume",
+                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
                         MAX_ATTEMPTS
                     );
                 }

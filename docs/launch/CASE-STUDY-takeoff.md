@@ -1,4 +1,4 @@
-# How comparable projects took off - and Filament's takeoff plan
+# How comparable projects took off - and Tunlion's takeoff plan
 
 A case-study-driven growth playbook. Researched 2026-06-11 from primary sources
 (GitHub API, the HN/Algolia API, maintainer interviews, and the tools' own
@@ -6,8 +6,8 @@ blogs). This is the *analysis* behind the tactical drafts already in
 `docs/launch/` (Show HN, Reddit, AlternativeTo, awesome-selfhosted) and the
 `docs/launch-checklist.md` - read this for the *why*, read those for the *paste*.
 
-Positioning rule throughout: always **"Filament file sharing"**, never bare
-"filament" (3D-printing collision).
+Positioning rule throughout: always **"Tunlion file sharing"**, never bare
+"tunlion" (3D-printing collision).
 
 ---
 
@@ -23,7 +23,7 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
    "default recommendation" loop**, not a one-day spike. Snapdrop/PairDrop grow
    because the product *is a URL you tell someone*; Syncthing/ngrok grow because
    they're the reflexive answer in every relevant thread and tutorial.
-3. **Filament's real moat survived the one event that should scare us.** In
+3. **Tunlion's real moat survived the one event that should scare us.** In
    Nov 2025 Google shipped native **Quick Share ↔ AirDrop** interop (Pixel 10),
    expanding through 2026 to Samsung/Xiaomi/OPPO/vivo/Honor/OnePlus flagships.
    That **validates the demand and partly solves the flagship-phone↔phone slice**
@@ -55,7 +55,7 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
   The maintainer is explicit: *download counts*, not stars, were the real signal;
   *"99% of consumers don't care how many stars the repo has."* Today it's in
   F-Droid, Flathub, winget, Homebrew, Scoop, Snap, Chocolatey + both app stores.
-- **Filament takeaways:** (a) the **self-describing "open-source AirDrop
+- **Tunlion takeaways:** (a) the **self-describing "open-source AirDrop
   alternative" hook is free SEO** that re-seeds blog/HN coverage for years;
   (b) **distribution = being installable everywhere people already look**
   (package managers + app stores), not a repo link; (c) **one well-placed feature
@@ -74,7 +74,7 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
   **flagged as badware by uBlock Origin's uAssets**. This is a cautionary tale
   about who ends up owning the canonical URL.
 - **PairDrop (schlagmichdoch), repo 2023-01-07**, "Fork of Snapdrop," **actively
-  maintained**, ~10.5k stars. Added what Filament also has: **transfer over the
+  maintained**, ~10.5k stars. Added what Tunlion also has: **transfer over the
   internet, pairing via 6-digit code/QR persisting across sessions, temporary
   public rooms.** It grew through **repeated small organic HN re-submissions**
   (often by other users) + the **self-hosting community** (LinuxServer.io Docker
@@ -84,7 +84,7 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
   pairdrop.net." Traffic is **~68% direct** (people typing/bookmarking/telling
   others the URL) + **~24% from Google**. Every successful transfer **teaches a
   second person the URL** - virality is built into the product shape.
-- **Filament takeaways:** (a) **the share is the URL** - make
+- **Tunlion takeaways:** (a) **the share is the URL** - make
   `tunlion.autumated.com` trivially memorable/tellable and the in-person
   "what's the link?" moment frictionless; (b) **own your canonical URL and
   privacy promise** so you can't become the cautionary LimeWire story; (c) you
@@ -111,10 +111,10 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
   issue **#71 (2018)** critiqued it against wormhole's PAKE; croc **rewrote to
   PAKE in v6.0.0 (2019)**. Responding to a credible critique *publicly and
   quickly* became part of the trust story.
-- **Filament takeaways:** (a) Filament already has the **speakable-code hook**
+- **Tunlion takeaways:** (a) Tunlion already has the **speakable-code hook**
   *and* a stronger one - **the receiver needs nothing installed at all**, beating
   even croc's "download a binary"; (b) **"resumable, survives restarts" is a
-  proven star-driver** - Filament has it; say it loudly; (c) lean into the
+  proven star-driver** - Tunlion has it; say it loudly; (c) lean into the
   **honest engineering-failure-modes writeup** (`docs/resilience.md`) - this
   audience rewards candor and verifiable artifacts.
   > Sources: schollz.com/posts/croc · croc#71 · croc v6.0.0 · HN 14649727, 41275920, 37619151 · GitHub API.
@@ -161,7 +161,7 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
   single-day dev-tool referrer**, but treat it as **one shot that seeds the
   loop**, not the strategy.
 - **Reddit converts when you're a participant, not a poster.** Best-fit subs for
-  Filament: **r/selfhosted** (~650k weekly), **r/coolgithubprojects**,
+  Tunlion: **r/selfhosted** (~650k weekly), **r/coolgithubprojects**,
   **r/opensource**, plus r/webdev, r/sideproject, r/androidapps, r/fossdroid.
   Governing rule: Reddit's **10% self-promo rule** + per-sub promo days
   ("Self-Promotion Sunday"). Lead with a **GIF**, frame as "I built X to solve
@@ -197,13 +197,13 @@ by MacRumors, AppleInsider, 9to5Google.*
 **What it solved:** the headline "Android↔iPhone has no AirDrop" pain - **for
 recent flagship phones, phone-to-phone, in person.**
 
-**What it did NOT solve (Filament's actual territory):**
+**What it did NOT solve (Tunlion's actual territory):**
 - **Older / mid-range / unsupported devices** - no timeline announced.
 - **Phone ↔ PC, and iPhone ↔ Windows / Linux** - the OS feature is phone-to-phone.
 - **Headless / servers** - a Linux box with no GUI can't run Quick Share;
-  `filament send` on the box → a browser on the phone still has no rival.
+  `tunlion send` on the box → a browser on the phone still has no rival.
 - **Browser-only / "nothing installed" device** - the OS feature needs the OS
-  feature on *both* ends; Filament's receiver needs only a URL.
+  feature on *both* ends; Tunlion's receiver needs only a URL.
 - **Self-hosted / no-account / route-visible** - privacy/control story untouched.
 
 **Conclusion:** the OS move is **tailwind, not headwind** - it spent Google's
@@ -214,7 +214,7 @@ took; own the larger slice it can't reach.**
 
 ---
 
-## Part 4 - Filament's positioning (the 2-3 angles that will resonate)
+## Part 4 - Tunlion's positioning (the 2-3 angles that will resonate)
 
 Ranked by defensibility against the 2026 landscape:
 
@@ -234,7 +234,7 @@ Ranked by defensibility against the 2026 landscape:
 
 3. **"Resumable, content-verified, self-hostable - the engineering is
    documented failure-by-failure."** croc/wormhole proved resume + a candid
-   writeup drive stars. Filament's `docs/resilience.md` + `docs/cli-resilience.md`
+   writeup drive stars. Tunlion's `docs/resilience.md` + `docs/cli-resilience.md`
    (every fix gated by a test) is a credibility asset most projects can't match.
 
 **Channel positioning (already in the checklist, reaffirmed):**
@@ -316,7 +316,7 @@ Track these instead:
 - **Launching to silence** - no working repo / no README / no demo at announce.
 - **No clear one-liner** - jargon over the plain "what + why."
 - **Over-claiming** - hyping vision over the actual code destroys credibility,
-  sometimes permanently. (Filament's honesty - documented limits, route badges
+  sometimes permanently. (Tunlion's honesty - documented limits, route badges
   including the unflattering `relayed` - is an *asset*; keep it.)
 - **Drive-by promotion** - posting a link then vanishing; tanks HN and Reddit.
 - **Wrong subreddit / breaking the 10% rule** - generic cross-posting gets pulled.

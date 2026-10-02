@@ -1,7 +1,7 @@
-# Filament e2e TEST + live-record pipeline (`pipeline.sh`)
+# Tunlion e2e TEST + live-record pipeline (`pipeline.sh`)
 
-A flag-controlled, async, GPU-aware pipeline that **tests** the filament UX by
-driving the **REAL built app** against **REAL local filament peers** — and, when
+A flag-controlled, async, GPU-aware pipeline that **tests** the tunlion UX by
+driving the **REAL built app** against **REAL local tunlion peers** — and, when
 recording, captures each flow live to an mp4 reel. It is a TEST first: it exits
 **nonzero** if any selected case fails.
 
@@ -10,11 +10,11 @@ recording, captures each flow live to an mp4 reel. It is a TEST first: it exits
 There is **no `?preview=` mock seam** in the e2e path. Every case stands up
 genuine peers and drives the genuine UI:
 
-- **Real peers.** The locally-built binary `cli/target/release/filament` (built
+- **Real peers.** The locally-built binary `cli/target/release/tunlion` (built
   on demand if missing), each with its own isolated `FILAMENT_CONFIG_DIR` under
   `/tmp/ux-pipeline`, all signaling through a **local backend** we start on a free
-  port. The CLI *is* a real peer (`filament up`, `filament up --shell`).
-- **Real pairing.** A CLI peer mints a PAKE code (`filament pair`); Playwright
+  port. The CLI *is* a real peer (`tunlion up`, `tunlion up --shell`).
+- **Real pairing.** A CLI peer mints a PAKE code (`tunlion pair`); Playwright
   **types it into the real pair box** ("pair with code" → `ENTER CODE` → `pair`) —
   the actual human gesture. Each case then asserts genuine DOM / `localStorage`
   state (e.g. the device landing in `filament-known-devices`, a live `ready` link,
@@ -41,7 +41,7 @@ experiments/ux/pipeline.sh --only pair-device,web-shell --sync
 | `--speed <x>` | gesture/playback speed hint |
 | `--parallel <n>` | max concurrent web cases (default 1 — single-host ICE is contention-sensitive) |
 | `--quality auto\|high\|min` | encode tier (default auto) |
-| `--gpu-node <name>` | OPT-IN: offload the final encode to a filament GPU node (guarded) |
+| `--gpu-node <name>` | OPT-IN: offload the final encode to a tunlion GPU node (guarded) |
 | `--async` / `--sync` | background the heavy encode/gallery (default) / wait |
 | `--out <dir>` | reel output dir (default `gallery/`) |
 | `--update-gallery` / `--no-update-gallery` | rebuild `index.html` + `reels.html` |
@@ -74,7 +74,7 @@ the open-source build with no H.264) to a real **H.264 mp4**, choosing a tier:
 - **GPU present** (local `nvidia-smi` + `h264_nvenc` in ffmpeg) → **high** tier:
   high res/bitrate via **NVENC**. NVENC uses the **CPU-decode** path (full-cuda
   decode is broken on our T4) — only the encode is on the GPU.
-- **`--gpu-node <name>`** (opt-in) → offload the final encode to a filament GPU
+- **`--gpu-node <name>`** (opt-in) → offload the final encode to a tunlion GPU
   node by **submitting an NVENC ffmpeg job** to the box via `runner/runner_cli.py`
   (the worked example from the runner docs) and fetching `out.mp4`. **Guarded**:
   it refuses unless you provide the box config (`FILJOB_HOST_CFG`,

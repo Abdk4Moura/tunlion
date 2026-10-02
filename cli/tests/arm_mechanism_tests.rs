@@ -11,7 +11,7 @@
 use std::process::Command;
 
 fn filament_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_filament")
+    env!("CARGO_BIN_EXE_tunlion")
 }
 
 #[test]

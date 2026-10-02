@@ -1,6 +1,6 @@
 # filament-transport
 
-Host hooks for [filament](https://github.com/Abdk4Moura/tunlion)'s transport
+Host hooks for [tunlion](https://github.com/Abdk4Moura/tunlion)'s transport
 ladder.
 
 The ladder itself (the `Transport` trait, direct QUIC, WebRTC, relay failover)

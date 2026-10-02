@@ -83,7 +83,7 @@ flip until #312 is fixed and AUTH-A is green first-try.
 
 Was a flip blocker; fixed and now gated first-try by `cli/tests/fleet-cert-gates.sh`
 gate AUTH-A. The possession challenge was being answered by nobody because the
-exec open travels on the one-shot `filament exec` client's link, which had no
+exec open travels on the one-shot `tunlion exec` client's link, which had no
 identity responder -- so the link could never become Proven, the open parked and
 expired, and each retry minted a fresh equally silent link. The client now answers
 challenges through the SAME shared responder the daemon uses (one
@@ -184,7 +184,7 @@ RECONCILE: WOULD remove` log lines), but is not a gating concern for this flip.
         * DENY-BY-DEFAULT enforced: an unprovisioned transfer that legacy ALLOWS (delivered
           in shadow) is DECLINED under FILAMENT_CAP_AUTHORITATIVE=1;
         * #19 real reason surfaced: "resource unprovisioned (no capability header); run
-          filament grant/init" (the true cap cause, not a legacy assertion);
+          tunlion grant/init" (the true cap cause, not a legacy assertion);
         * ROLLBACK: unsetting the flag returns to legacy gating, the transfer delivers again;
         * SANDBOX HELD: the live destructive reconciler ran under sandboxed HOME; do-vm's
           real ~/.ssh/authorized_keys byte-identical before/after.

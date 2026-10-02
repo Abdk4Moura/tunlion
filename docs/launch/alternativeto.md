@@ -1,6 +1,6 @@
 # AlternativeTo listing — ready to paste
 
-**Name:** Filament
+**Name:** Tunlion
 **URL:** https://tunlion.autumated.com
 **Category:** File Sharing / File Transfer
 **License:** Open Source (GitHub: https://github.com/Abdk4Moura/tunlion)
@@ -11,7 +11,7 @@ Send files directly between devices from the browser. Peer-to-peer over
 WebRTC, no upload, no app, no account, no size limit.
 
 **Full description:**
-Filament transfers files straight between two browsers. Devices on the same
+Tunlion transfers files straight between two browsers. Devices on the same
 WiFi discover each other automatically (like AirDrop, but cross-platform);
 devices on different networks pair with a one-time spoken code that works
 exactly once. Files never touch a server: they stream peer-to-peer over an

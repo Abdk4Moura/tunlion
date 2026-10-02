@@ -1,4 +1,4 @@
-"""Runtime configuration for the Filament backend.
+"""Runtime configuration for the Tunlion backend.
 
 Everything the frontend needs in order to bootstrap is exposed through
 ``public_config()`` and served at ``GET /api/config`` so the React app never
@@ -36,7 +36,7 @@ DEFAULT_ICE = [{"urls": "stun:stun.l.google.com:19302"}]
 # use-auth-secret scheme): a time-limited username + an HMAC of it, so the
 # browser never holds a long-lived TURN password.
 #   FIL_TURN_HOST   comma-separated TURN urls, e.g.
-#                   "turn:turn.filament.example.com:3478,turn:turn.filament.example.com:3478?transport=tcp"
+#                   "turn:turn.tunlion.example.com:3478,turn:turn.tunlion.example.com:3478?transport=tcp"
 #   FIL_TURN_SECRET must equal coturn's `static-auth-secret`
 #   FIL_TURN_TTL    credential lifetime in seconds (default 1h)
 TURN_HOST = os.environ.get("FIL_TURN_HOST")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""filament job-runner — host CLI.
+"""tunlion job-runner — host CLI.
 
-Submit a single declared job to a paired filament box and get artifacts + a
+Submit a single declared job to a paired tunlion box and get artifacts + a
 manifest back. Thin wrapper over filament_runner.RunnerBox.
 
 Examples
@@ -34,9 +34,9 @@ DEFAULT_SERVER = "https://api.filament.autumated.com"
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Submit a filament compute job (file-driven; no PTY) and fetch artifacts.")
+        description="Submit a tunlion compute job (file-driven; no PTY) and fetch artifacts.")
     ap.add_argument("--server", default=os.environ.get("FILJOB_SERVER", DEFAULT_SERVER))
-    ap.add_argument("--bin", default=os.environ.get("FILAMENT_BIN", "filament"))
+    ap.add_argument("--bin", default=os.environ.get("FILAMENT_BIN", "tunlion"))
     ap.add_argument("--host-cfg", required=True, help="host config dir (din+dout secrets)")
     ap.add_argument("--dout-cfg", required=True, help="host dout sink config dir (dout secret)")
     ap.add_argument("--remote-inbox", default="~/filament-jobs/.inbox", help="box din drop dir (informational)")

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Filament Local — a spike of true offline LAN discovery (the LocalSend model).
+// Tunlion Local — a spike of true offline LAN discovery (the LocalSend model).
 //
 // A browser tab can't see other devices on the WiFi: JS has no UDP/multicast and
 // no mDNS. So discovery that works with NO internet and NO server needs a tiny
@@ -9,7 +9,7 @@
 //                and listens for everyone else's. (A pragmatic stand-in for full
 //                mDNS / Bonjour — same idea: announce + discover over multicast.)
 //   • Bridge:    it exposes whoever it found at http://127.0.0.1:53317/peers, so
-//                the Filament web app (running locally) can render LAN devices
+//                the Tunlion web app (running locally) can render LAN devices
 //                even with the internet unplugged. WebRTC/HTTP handoff for the
 //                actual transfer would build on top of this.
 //

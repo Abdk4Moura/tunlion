@@ -1,4 +1,4 @@
-"""labkit — the filament networking dev-lab engine.
+"""labkit — the tunlion networking dev-lab engine.
 
 A small, dependency-light (Python stdlib + iproute2/wg/tc/iperf3) "lab as code"
 engine inspired by netlab (https://netlab.tools) but with none of its heavy deps

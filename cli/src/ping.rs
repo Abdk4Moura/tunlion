@@ -1,4 +1,4 @@
-// `filament reach <peer>`: show the live link to a known device, including route, RTT, and
+// `tunlion reach <peer>`: show the live link to a known device, including route, RTT, and
 // whether ssh/pty will be instant. Mirrors `tailscale ping` and elevates it with
 // two things Tailscale has no concept of: WARM vs COLD (is a link already held by
 // the local `up` daemon, so ssh/pty is instant?) and VERIFIED identity (paired +
@@ -127,7 +127,7 @@ pub async fn ping_cmd(server: &str, peer: &str, count: u32, json_out: bool, rela
 
     ui::say(&format!(
         "{} {}",
-        ui::paint(Tone::Dim, "filament reach →"),
+        ui::paint(Tone::Dim, "tunlion reach →"),
         ui::paint(Tone::Brand, peer)
     ));
 
@@ -170,12 +170,12 @@ pub async fn reach_until_direct(
     // has no control socket), so the same error covers "not running" and
     // "cannot run here" without a platform branch in this file.
     if !crate::ctl::daemon_present().await {
-        bail!("no local `filament up` daemon: `--until-direct` watches the daemon's link to {peer}. Start `filament up` first.");
+        bail!("no local `tunlion up` daemon: `--until-direct` watches the daemon's link to {peer}. Start `tunlion up` first.");
     }
     if !json_out {
         ui::say(&format!(
             "{} {} {}",
-            ui::paint(Tone::Dim, "filament reach →"),
+            ui::paint(Tone::Dim, "tunlion reach →"),
             ui::paint(Tone::Brand, peer),
             ui::paint(Tone::Dim, &format!("(until direct, {timeout_s}s)"))
         ));
@@ -293,7 +293,7 @@ fn print_warm_verdict(peer: &str, v: &Value) {
 
 /// No live link held locally: measure what a fresh connect would cost (the honest
 /// number (that IS what ssh/pty would pay), via the same establish-then-drop
-/// probe `filament doctor` uses.
+/// probe `tunlion doctor` uses.
 async fn print_cold(server: &str, peer: &str, relay: bool) {
     match crate::l2::establish_probe(server, peer, relay).await {
         Ok(o) if o.established => {
@@ -304,7 +304,7 @@ async fn print_cold(server: &str, peer: &str, relay: bool) {
             ));
             ui::say(&format!(
                 "  {}",
-                ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} would establish a fresh link; run `filament up` to keep it warm"))
+                ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} would establish a fresh link; run `tunlion up` to keep it warm"))
             ));
         }
         Ok(o) => {
@@ -316,7 +316,7 @@ async fn print_cold(server: &str, peer: &str, relay: bool) {
             ));
             ui::say(&format!(
                 "  {}",
-                ui::paint(Tone::Dim, &format!("─ {peer} may be offline, or not running `filament up` / `--shell`"))
+                ui::paint(Tone::Dim, &format!("─ {peer} may be offline, or not running `tunlion up` / `--shell`"))
             ));
         }
         Err(e) => {

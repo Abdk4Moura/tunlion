@@ -23,7 +23,7 @@ daemon). Earlier milestone runs:
 **15/15, 2026-06-06**, plus live-production runs through
 `api.filament.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
 (`route: relayed` both ends), and the real `tunlion.autumated.com` site
-sending 64 KiB-framed files to `filament recv`.
+sending 64 KiB-framed files to `tunlion recv`.
 
 ---
 
@@ -64,7 +64,7 @@ the same way, but is no longer required for correctness).
 chunkSize 65536 — the exact production config — browser sends two 65,540-byte-
 framed files, hashes match), and a LIVE run against the real production site:
 headless Chromium on `https://tunlion.autumated.com` sent 4 MB to
-`filament recv` through `api.filament.autumated.com`, hash identical,
+`tunlion recv` through `api.filament.autumated.com`, hash identical,
 10.3 MB/s (2026-06-06). The failure mode no longer occurs in the live system.
 
 ### C2. Route label disagreement — **VERIFIED** (with documented residual)
@@ -189,7 +189,7 @@ revisit with QUIC speeds).
 ### C12. No stable device identity across invocations — **VERIFIED (shipped in 0.2.0)**
 The persistent-pairing layer landed: `--remember` exchanges a pair secret
 END-TO-END over the DataChannel; presence via `subscribe` with hashed
-channels; `--to <device>` resolves by identity; `filament introduce A B`
+channels; `--to <device>` resolves by identity; `tunlion introduce A B`
 vouches two known devices to each other over C20-verified links; per-install
 `device.id` keeps a sender from adopting its own daemon (presence-channel
 scope only — room loopback still works). **Verified by:** gate 14 plus the
@@ -230,10 +230,10 @@ end-to-end against the LIVE release:
 - `curl -fsSL https://tunlion.autumated.com/install | sh` downloads,
   checksum-verifies, installs, and the installed binary completed a real
   transfer through production.
-- `filament update`: a 0.0.9 build detected 0.1.0, downloaded, verified the
+- `tunlion update`: a 0.0.9 build detected 0.1.0, downloaded, verified the
   checksum, and atomically replaced itself.
 - Homebrew tap (Abdk4Moura/homebrew-tap) pushed with real hashes +
-  `Formula/filament.rb` committed in-repo; `cargo publish --dry-run` clean.
+  `Formula/tunlion.rb` committed in-repo; `cargo publish --dry-run` clean.
 - winget manifests rendered with the real Windows-zip SHA and schema-validated
   (`packaging/winget/0.1.0/`). The only remaining step is the PR to
   microsoft/winget-pkgs — an external submission under the maintainer's
@@ -262,7 +262,7 @@ prerequisite for the daemon (C19), pairing-while-paired, and introductions.
 **Verify with:** gate: CLI + two headless browsers in one room, all three
 pairwise connections reach connected, transfer still completes.
 
-### C19. Daemon (`filament up`) — **VERIFIED (shipped in 0.2.0)**
+### C19. Daemon (`tunlion up`) — **VERIFIED (shipped in 0.2.0)**
 Implemented per the locked design: joins NO room (presence subscriptions
 only — invisible to strangers; the gate asserts no "listening in room" line);
 accepts solely fingerprint-verified known devices, silent-declines everything
@@ -376,7 +376,7 @@ Gate 16 covers all three: consent-gated store, channel rendezvous, decline
 purge.
 
 ### C28. Presence was fire-and-forget — **FIXED**
-Field report: `filament up` couldn't see a known browser until a page
+Field report: `tunlion up` couldn't see a known browser until a page
 reload. Third instance of one disease: an emit dying in a half-open socket
 (join → rejoin belt #14; create-code → C24; now `subscribe`). The channel
 registry is sid-keyed, and `known-peer` is only emitted AT subscribe time —
@@ -394,9 +394,9 @@ send --to, introduce) — `up`'s subscribe-once-at-startup had the same hole.
 ### C29. Pairing required pretending to transfer a file — **FIXED (gate 17)**
 Maintainer: "I should be able to simply add a device and remember it
 without having to pretend to send something." Two additions:
-`filament pair [code] [--name X]` — a first-class ceremony: mint or claim,
+`tunlion pair [code] [--name X]` — a first-class ceremony: mint or claim,
 connect, hand the secret over the encrypted link (C27 consent applies),
-confirm mutuality, exit. And `filament up` became a SESSION (the CLI's
+confirm mutuality, exit. And `tunlion up` became a SESSION (the CLI's
 browser tab): with a terminal attached, type a code to pair (remember
 ceremony runs in-session, device usable immediately — channel raised
 live), `pair` mints a code, `devices`/`forget <name>` manage petnames.
@@ -562,7 +562,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   CLI→browser direction only. Untested: Safari/WebKit (the iPad — crypto.subtle
   and fingerprint parsing should hold, but Private Browsing silently refuses
   localStorage: the secret won't persist, console.warn flags it) and the
-  reverse direction (browser sending to a `filament up` daemon, where the
+  reverse direction (browser sending to a `tunlion up` daemon, where the
   daemon must verify the BROWSER's proof to auto-accept).
 - **G-k — VERIFIED (gate 18)** recv's clean exit no longer depends on `peer-left`
   DELIVERY. Originally observed once (gate 6 under load, 2026-06-07) — both

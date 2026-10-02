@@ -1,7 +1,7 @@
-// net/protocol/wire.js — the filament wire CODEC (PROTOCOL layer).
+// net/protocol/wire.js — the tunlion wire CODEC (PROTOCOL layer).
 //
 // Pure, dependency-free, browser-API-free: framing + control encode/decode +
-// the message-type registry. This is the byte-level half of the filament
+// the message-type registry. This is the byte-level half of the tunlion
 // protocol; it must stay identical to the CLI's framing (CONTRACT.md). Because
 // it touches no browser globals it runs under plain `node` — see
 // net/protocol/__tests__/wire.test.mjs (the characterization net for the

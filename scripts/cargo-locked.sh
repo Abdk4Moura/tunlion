@@ -2,7 +2,7 @@
 # Serialize local Cargo work on the shared 4-core build host.
 set -euo pipefail
 
-LOCK_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/filament"
+LOCK_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/tunlion"
 LOCK_FILE="$LOCK_DIR/cargo-build.lock"
 STATUS_FILE="$LOCK_DIR/cargo-build.status"
 # Release tests take minutes. Ten minutes permits ordinary queueing but fails

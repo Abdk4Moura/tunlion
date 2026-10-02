@@ -3,7 +3,7 @@
 # shell, and the denial must reach the initiator as a nonzero exit with a reason,
 # never as a clean exit or a hang. Standalone, hermetic, fixture port 8113 ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament ./pty-revoke-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./pty-revoke-gates.sh
 #
 # The discriminator is a streaming counter, not a single post-revoke command: a
 # fresh TICK-N proves continuous data-plane liveness (not a buffer replay).
@@ -15,7 +15,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8113
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

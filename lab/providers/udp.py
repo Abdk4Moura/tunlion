@@ -3,8 +3,8 @@
 Each node runs a small relay (udp_relay.py) INSIDE its netns: TUN packets are
 sent as UDP datagrams to the peer's underlay (veth) address and vice-versa. This
 proves the lab works with a real socket hop and a userspace datapath (the same
-shape the filament carrier uses), without any crypto — the honest middle ground
-between the bare `pipe` and the encrypted `wg`/`filament` carriers.
+shape the tunlion carrier uses), without any crypto — the honest middle ground
+between the bare `pipe` and the encrypted `wg`/`tunlion` carriers.
 
 Datapath (a -> b)::
     TUN-a -> udp_relay(a) --UDP veth--> udp_relay(b) -> TUN-b

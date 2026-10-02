@@ -1,7 +1,7 @@
 # Web-Shell Security Review
 
 **Feature:** "web-shell" — a browser opens an interactive PTY (login shell) on a
-device running `filament up --shell`, carried over a WebRTC data channel (or a
+device running `tunlion up --shell`, carried over a WebRTC data channel (or a
 direct-QUIC link), gated by a pairing proof plus a `shell` capability grant.
 
 **Scope reviewed:** `cli/src/l2.rs`, `cli/src/main.rs` (the L2/PTY/pair-proof/
@@ -182,7 +182,7 @@ selects a Unix `runuser -l <user>` boundary (main.rs:2433–2447;
 platform/mod.rs:107–113). `serve_pty` inherits the daemon's full environment and
 spawns the shell directly (l2.rs:271–285). A shell grant is therefore
 **OWNER-EQUIVALENT at any uid**: the PTY runs as a real account and can act as
-that account, including reading its Filament configuration. If `filament up`
+that account, including reading its Tunlion configuration. If `tunlion up`
 runs as root, root additionally gives the shell machine-wide reach.
 
 The gate is enforced before daemon startup by `require_shell_owner_ack` in
@@ -279,7 +279,7 @@ that refusal happens before signaling. `up --shell-user <name>`
 drops the web-shell/ssh PTY to a named account via `runuser -l <user>`. Without
 that flag, `require_shell_owner_ack` refuses any shell-enabled startup unless
 the operator passes `--i-know`. This applies at **any uid** because the PTY runs
-as a real account and can act as that account, including reading its Filament
+as a real account and can act as that account, including reading its Tunlion
 configuration. When the daemon is root, the shell additionally has machine-wide
 reach. With `--shell-user`, file access is bounded only when the selected account
 cannot read `FILAMENT_CONFIG_DIR`; the PTY remains a real-account shell, not a

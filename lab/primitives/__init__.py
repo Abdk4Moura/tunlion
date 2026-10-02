@@ -6,7 +6,7 @@ providers (the LINK primitive) compose the others. The seven:
   1. tun    (tun.py)    — create a TUN iface in a node's netns, assign IP/subnet.
   2. link   (../providers/) — the pluggable carrier between two endpoints.
   3. frame  (frame.py)  — IP packet <-> link frame (length-prefix); shared by the
-                          udp and filament carriers.
+                          udp and tunlion carriers.
   4. route  (route.py)  — the allowed-IPs / dest-IP -> peer table (the WG model).
   5. crypto (crypto.py) — none | wg-noise | dtls (a declarative selector; the
                           carrier supplies the actual encryption).

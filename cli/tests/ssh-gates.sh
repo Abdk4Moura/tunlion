@@ -6,11 +6,11 @@
 #
 # Gates:
 #   A  POSITIVE no-keys bootstrap — client has NO ssh keypair and NO ~/.ssh;
-#      `grant boxA shell` on the acceptor, then `filament ssh boxB 'hostname'`
+#      `grant boxA shell` on the acceptor, then `tunlion ssh boxB 'hostname'`
 #      returns the acceptor's hostname. Full bootstrap: key gen + authorized_keys
 #      install + host-key pin + ssh, zero prompts.
 #   B  NEGATIVE no-cap refusal — a paired device WITHOUT the shell cap is REFUSED
-#      the bootstrap (shell-bootstrap-deny); `filament ssh` aborts BEFORE invoking
+#      the bootstrap (shell-bootstrap-deny); `tunlion ssh` aborts BEFORE invoking
 #      ssh. Zero shell, clear denial.
 #   C  marked + removable — the # BEGIN/END filament-managed block is present
 #      after grant and GONE after `revoke`.
@@ -18,8 +18,8 @@
 #      (no accept-new) against the pre-pinned known_hosts succeeds, proving the
 #      pin actually matched (not a silent TOFU).
 #
-# Topology mirrors l2-gates.sh: side B = acceptor (`filament up`, FILAMENT_L2=1),
-# side A = initiator (`filament ssh`). Reciprocal pair secret => B trusts A.
+# Topology mirrors l2-gates.sh: side B = acceptor (`tunlion up`, FILAMENT_L2=1),
+# side A = initiator (`tunlion ssh`). Reciprocal pair secret => B trusts A.
 # The acceptor runs with HOME sandboxed to a temp dir so its authorized_keys
 # write never touches the real home; a throwaway sshd reads that sandboxed
 # authorized_keys and serves a hostkey the acceptor reports via FILAMENT_SSH_HOSTKEY.
@@ -27,7 +27,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="$CLI_DIR/target/release/filament"
+BIN="$CLI_DIR/target/release/tunlion"
 PORT=8098
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
@@ -135,14 +135,14 @@ grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "
 
 # ===================================================================== GATE A ==
 # POSITIVE: with the cap granted and NO pre-existing ssh setup on the client,
-# `filament ssh boxB hostname` lands a shell and returns the acceptor's hostname.
+# `tunlion ssh boxB hostname` lands a shell and returns the acceptor's hostname.
 say A
 ACCEPTOR_HOST=$(hostname)
 OUTA=$(timeout 60 "${A_ENV[@]}" "$BIN" --server "$SERVER" ssh boxB 'hostname' 2>"$WORK/sshA.err" </dev/null)
 rcA=$?
 echo "## (granted) rc=$rcA out='$OUTA' expect-host='$ACCEPTOR_HOST'"
 if [ "$rcA" = "0" ] && echo "$OUTA" | grep -qx "$ACCEPTOR_HOST"; then
-  ok "gateA: no-keys bootstrap — filament ssh returned the peer's hostname (rc=0)"
+  ok "gateA: no-keys bootstrap — tunlion ssh returned the peer's hostname (rc=0)"
 else
   echo "-- sshA.err --"; tail -25 "$WORK/sshA.err"; echo "-- up.log tail --"; tail -25 "$WORK/up.log"
   echo "-- managed key present? --"; ls -la "$DA/ssh" 2>/dev/null
@@ -168,7 +168,7 @@ fi
 
 # ===================================================================== GATE D ==
 # Host-key pin is REAL: connect once with StrictHostKeyChecking=yes (NO accept-new)
-# straight to the throwaway sshd, using the known_hosts filament PINNED during
+# straight to the throwaway sshd, using the known_hosts tunlion PINNED during
 # gate A. If the pin never matched, strict mode rejects the host key and this
 # fails — so a green here proves the pin actually functioned (not a silent TOFU).
 say D
@@ -198,7 +198,7 @@ if [ -f "$KH" ] && grep -q "^$HOST " "$KH"; then
   fi
 else
   echo "-- known_hosts ($KH) --"; cat "$KH" 2>/dev/null
-  bad "gateD: no pinned host key for $HOST in filament known_hosts"
+  bad "gateD: no pinned host key for $HOST in tunlion known_hosts"
 fi
 
 # ===================================================================== GATE E ==

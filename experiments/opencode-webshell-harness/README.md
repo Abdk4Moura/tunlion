@@ -2,17 +2,17 @@
 
 Throwaway test rig (NOT part of the shipped app, not bundled by vite) used to
 isolate why `opencode` (an opentui-based TUI doing heavy terminal-capability
-detection) would not open in the Filament web shell while plain TUIs (vim/htop/
+detection) would not open in the Tunlion web shell while plain TUIs (vim/htop/
 less) work.
 
 It runs `opencode` in the SAME xterm.js the web shell uses (@xterm/xterm 6.0.0 +
 @xterm/addon-fit 0.11.0, with the exact WebTerminal.jsx options) wired to a real
-PTY via node-pty over a plain websocket, NOT over the filament data channel. That
+PTY via node-pty over a plain websocket, NOT over the tunlion data channel. That
 splits the problem cleanly:
 
 - Case A: opencode fails even here, so the gap is xterm.js capabilities/options.
-- Case B: opencode works here but not in the filament shell, so the gap is the
-  filament PTY bridge.
+- Case B: opencode works here but not in the tunlion shell, so the gap is the
+  tunlion PTY bridge.
 
 ## Result: Case B. opencode renders and is fully interactive in plain xterm.js.
 
@@ -70,8 +70,8 @@ nothing, to prove it does not hang on unanswered queries.
 The first version mis-rendered (0 bytes reached xterm) because node-pty hands
 onData a JS STRING and ws.send(string) sends a TEXT frame, which index.html was
 parsing as a control JSON message and dropping. The fix was to send PTY output as
-a BINARY frame (Buffer). The REAL filament bridge already frames PTY bytes as
+a BINARY frame (Buffer). The REAL tunlion bridge already frames PTY bytes as
 binary in BOTH directions (cli send_frame -> raw bytes; frontend _onMessage ->
 Uint8Array via DataView), so it does not have this class of bug. This is exactly
 the kind of text-vs-binary mistake to rule out in any PTY transport, and it is
-ruled out for filament.
+ruled out for tunlion.

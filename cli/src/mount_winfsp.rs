@@ -238,15 +238,15 @@ pub struct WinFspContext {
     dir_buffer: Option<DirBuffer>,
 }
 
-pub struct FilamentWinFs {
+pub struct TunlionWinFs {
     client: Mutex<MountClient>,
     escaper: NameEscaper,
 }
 
-impl FilamentWinFs {
+impl TunlionWinFs {
     pub fn new(client: MountClient) -> Self {
         let escaper = NameEscaper::from_caps(&client.caps);
-        FilamentWinFs { client: Mutex::new(client), escaper }
+        TunlionWinFs { client: Mutex::new(client), escaper }
     }
 
     fn call(&self, op: MountOp) -> FspResult<serde_json::Value> {
@@ -307,13 +307,13 @@ impl FilamentWinFs {
 
 // ------------------------------------------------------ FileSystemContext ---
 
-impl FileSystemContext for FilamentWinFs {
+impl FileSystemContext for TunlionWinFs {
     type FileContext = WinFspContext;
 
     fn get_volume_info(&self, volume_info: &mut VolumeInfo) -> FspResult<()> {
         volume_info.total_size = 1024 * 1024 * 1024 * 1024;
         volume_info.free_size = 1024 * 1024 * 1024 * 1024;
-        volume_info.set_volume_label("Filament");
+        volume_info.set_volume_label("Tunlion");
         Ok(())
     }
 
@@ -575,11 +575,11 @@ impl FileSystemContext for FilamentWinFs {
 /// Blocks the calling thread until unmounted.
 pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
     let _ = detect_winfsp()?;
-    let fs = FilamentWinFs::new(client);
+    let fs = TunlionWinFs::new(client);
     let mountpoint_str = mountpoint.to_str()
         .ok_or_else(|| anyhow::anyhow!("mountpoint is not valid UTF-8"))?;
     let mut vol_params = VolumeParams::new();
-    vol_params.filesystem_name("Filament");
+    vol_params.filesystem_name("Tunlion");
     vol_params.prefix("\\");
     let mut host = FileSystemHost::new(vol_params, fs)
         .map_err(|e| anyhow::anyhow!("WinFsp mount failed: {e}"))?;

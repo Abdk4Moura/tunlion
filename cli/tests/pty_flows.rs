@@ -1,12 +1,12 @@
 //! Interactive flows driven through a real terminal.
 //!
-//! Everything else we test drives filament as a program: arguments in, exit
+//! Everything else we test drives tunlion as a program: arguments in, exit
 //! code and bytes out. That cannot see the class of bug the owner keeps hitting
 //! on Windows, because those bugs are about what the *terminal* is left looking
-//! like after filament has finished with it. #197 is the current example: after
+//! like after tunlion has finished with it. #197 is the current example: after
 //! Ctrl-C out of the picker, PowerShell draws its prompt twice.
 //!
-//! So these tests open a pty, start a real shell inside it, run filament from
+//! So these tests open a pty, start a real shell inside it, run tunlion from
 //! that shell the way a person does, and then read what the terminal shows.
 //! portable-pty gives the same interface on ConPTY, so the identical test runs
 //! on Windows in CI, which is the only reason this layer is worth building.
@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Deliberately not a shell metacharacter and not a word filament prints. The
+/// Deliberately not a shell metacharacter and not a word tunlion prints. The
 /// whole test is a count of this string, so anything that could appear for
 /// another reason would silently change the answer.
 const MARK: &str = "PMARKQ7";
@@ -169,7 +169,7 @@ impl Drop for Term {
     }
 }
 
-/// Drive `filament add --for` to the picker, then leave it with `leave_key`.
+/// Drive `tunlion add --for` to the picker, then leave it with `leave_key`.
 /// Returns how many prompts were drawn after the picker was dismissed.
 fn prompts_after_leaving_picker(leave_key: &str, label: &str) -> usize {
     let dir = std::env::temp_dir().join(format!("filament-pty-{label}-{}", std::process::id()));
@@ -178,10 +178,10 @@ fn prompts_after_leaving_picker(leave_key: &str, label: &str) -> usize {
 
     assert!(t.wait_for(&format!("{MARK}> "), 20), "shell never prompted:\n{}", t.text());
 
-    let exe = env!("CARGO_BIN_EXE_filament");
+    let exe = env!("CARGO_BIN_EXE_tunlion");
     // The call operator is required on PowerShell. A line that STARTS with a
     // quoted string is parsed as a string expression, not a command, so
-    //   "C:\...\filament.exe" add --for
+    //   "C:\...\tunlion.exe" add --for
     // fails with "Unexpected token 'add' in expression or statement" and the
     // program never runs. That, not any product bug, is why the Windows cell
     // reported "picker never drew" three runs in a row.
@@ -201,7 +201,7 @@ fn prompts_after_leaving_picker(leave_key: &str, label: &str) -> usize {
 
     // Wait for the shell to come back BEFORE settling. The first version
     // settled on 1.2s of quiet and then counted, which returned ~1.25s after
-    // the keypress with nothing on screen yet: filament had not finished
+    // the keypress with nothing on screen yet: tunlion had not finished
     // exiting, so every platform reported 0 prompts and the two cells could not
     // be told apart. A quiet terminal is not the same as a finished one.
     let returned = t.wait_for_from(before, &format!("{MARK}> "), 25);

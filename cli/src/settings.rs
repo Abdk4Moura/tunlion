@@ -1,5 +1,5 @@
-//! Typed, discoverable persistent settings: the backing for `filament set`,
-//! `filament get`, and `filament unset`.
+//! Typed, discoverable persistent settings: the backing for `tunlion set`,
+//! `tunlion get`, and `tunlion unset`.
 //!
 //! Design follows the evidence on world-class CLI config surfaces (clig.dev,
 //! the 12-factor CLI doc, and how git/gh/aws actually behave), chosen over the
@@ -9,7 +9,7 @@
 //!
 //!  - `key value` is the canonical surface (git/gh/npm/aws lineage): it scales
 //!    without flag explosion and stays compatible with the legacy
-//!    `filament config <key> <value>` file (`key value` lines).
+//!    `tunlion config <key> <value>` file (`key value` lines).
 //!  - `set` is strictly imperative and PARTIAL: it touches only the key you
 //!    name, never resetting anything you did not mention (the exact Tailscale
 //!    bug, designed out here).
@@ -20,7 +20,7 @@
 //!    pipe gets tab-separated `key<TAB>value<TAB>scope` rows with no color and
 //!    no borders; `--json` gives the complete structured view either way.
 //!  - Values go to stdout, all messaging/confirmation to stderr, so
-//!    `$(filament get drop-dir)` is exactly the value.
+//!    `$(tunlion get drop-dir)` is exactly the value.
 //!
 //! Storage: global settings live in the existing `config` file (one `key value`
 //! line each, so name/server/dir stay byte-compatible with the old `config`
@@ -106,7 +106,7 @@ pub fn registry() -> &'static [Setting] {
             aliases: &["dir"],
             store: "dir",
             kind: Kind::Path,
-            default: "~/Filament",
+            default: "~/Tunlion",
             scope: ScopeKind::GlobalOnly,
             env: None,
             daemon: true,
@@ -121,7 +121,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: true,
-            help: "Relay policy: auto (direct, fall back to relay), always (force TURN), never (direct-only). Per-peer: filament set relay never --peer dovm",
+            help: "Relay policy: auto (direct, fall back to relay), always (force TURN), never (direct-only). Per-peer: tunlion set relay never --peer dovm",
         },
         Setting {
             key: "shell-program",
@@ -250,7 +250,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: true,
-            help: "Accept seamless `filament ssh` from paired devices (per-peer with --peer)",
+            help: "Accept seamless `tunlion ssh` from paired devices (per-peer with --peer)",
         },
         Setting {
             key: "shell-user",
@@ -281,7 +281,7 @@ pub fn registry() -> &'static [Setting] {
             kind: Kind::Str,
             // DEFAULT-ON (2026-08-25). "auto" derives the address from the
             // overlay key, so a fresh install has an IP plane to its paired
-            // devices without a second command. `filament init` asks for the
+            // devices without a second command. `tunlion init` asks for the
             // one-time CAP_NET_ADMIN grant so the common case is a real kernel
             // route; an unprivileged box still falls back to the userspace
             // netstack. Set to "" to turn L3 off.
@@ -344,7 +344,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOnly,
             env: Some("FILAMENT_AUTO_PROXY"),
             daemon: true,
-            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `filament set auto-proxy off`.",
+            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `tunlion set auto-proxy off`.",
         },
         Setting {
             key: "verbosity",
@@ -730,7 +730,7 @@ fn require_peer_known(device: &str) -> Result<()> {
     if crate::devices_load().iter().any(|(n, _)| n == device) {
         Ok(())
     } else {
-        bail!("no device named '{device}' (see `filament devices`)")
+        bail!("no device named '{device}' (see `tunlion devices`)")
     }
 }
 
@@ -786,14 +786,14 @@ pub fn unset(key: &str, peer: Option<&str>) -> Result<Change> {
 
 fn lookup(key: &str) -> Result<&'static Setting> {
     find(key).ok_or_else(|| match did_you_mean(key) {
-        Some(s) => anyhow::anyhow!("unknown key '{key}' - did you mean '{s}'? (`filament set` lists all)"),
-        None => anyhow::anyhow!("unknown key '{key}' (`filament set` lists all keys)"),
+        Some(s) => anyhow::anyhow!("unknown key '{key}' - did you mean '{s}'? (`tunlion set` lists all)"),
+        None => anyhow::anyhow!("unknown key '{key}' (`tunlion set` lists all keys)"),
     })
 }
 
 // ----------------------------------------------------------- CLI handlers --
 
-/// `filament get <key> [--show-origin] [--default <v>] [--json] [--peer <d>]`
+/// `tunlion get <key> [--show-origin] [--default <v>] [--json] [--peer <d>]`
 pub fn run_get(
     key: &str,
     peer: Option<&str>,
@@ -827,7 +827,7 @@ pub fn run_get(
             ui::paint_when(color, ui::Tone::Dim, &format!("({})", origin.label()))
         );
     } else {
-        // Bare value: $(filament get drop-dir) is exactly the value.
+        // Bare value: $(tunlion get drop-dir) is exactly the value.
         println!("{value}");
     }
     Ok(())
@@ -846,10 +846,10 @@ async fn announce_to_daemon(key: &str, color: bool) {
             _ => {}
         }
     }
-    eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `filament up`"));
+    eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `tunlion up`"));
 }
 
-/// `filament unset <key> [--peer a,b]`. `peers` empty = clear the global value;
+/// `tunlion unset <key> [--peer a,b]`. `peers` empty = clear the global value;
 /// one or more = remove each device's per-peer override.
 pub async fn run_unset(key: &str, peers: &[String]) -> Result<()> {
     let s = lookup(key)?;
@@ -877,7 +877,7 @@ pub async fn run_unset(key: &str, peers: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `filament set` with key+value, or no args (readout), or --reset.
+/// `tunlion set` with key+value, or no args (readout), or --reset.
 /// `peers` empty = global; one or more = a per-peer override applied to each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_set(
@@ -1045,7 +1045,7 @@ fn run_reset(dry_run: bool, yes: bool) -> Result<()> {
 
 /// No-args readout. TTY: aligned colored table. Pipe: tab-separated rows.
 /// `--json`: complete structured array (global rows + per-peer overrides).
-/// Build an Affordance when `filament set <key>` is given without a value.
+/// Build an Affordance when `tunlion set <key>` is given without a value.
 /// Renders interactively (TTY), as steer (non-TTY), or as JSON (--json).
 fn render_missing_interactive(s: &Setting) {
     let (cur_val, origin) = resolve(s, None);
@@ -1092,13 +1092,13 @@ fn render_missing_interactive(s: &Setting) {
             let color = ui::stdout_color();
             println!("{} {} = {}  ({})", s.key, ui::paint_when(color, ui::Tone::Dim, &origin.label()), cur_val, s.help);
             match s.kind {
-                Kind::Bool => println!("  on / off  (example: filament set {} on)", s.key),
-                Kind::Enum(vals) => println!("  values: {}  (example: filament set {} {})", vals.join(" / "), s.key, vals[0]),
-                Kind::Str | Kind::Path => println!("  example: filament set {} <value>", s.key),
+                Kind::Bool => println!("  on / off  (example: tunlion set {} on)", s.key),
+                Kind::Enum(vals) => println!("  values: {}  (example: tunlion set {} {})", vals.join(" / "), s.key, vals[0]),
+                Kind::Str | Kind::Path => println!("  example: tunlion set {} <value>", s.key),
                 _ => {}
             }
             println!();
-            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: filament set <key> <value> [--peer <peer>]"));
+            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: tunlion set <key> <value> [--peer <peer>]"));
         }
     }
 }
@@ -1117,11 +1117,11 @@ fn build_affordance(s: &Setting) -> crate::interact::Affordance {
 fn build_affordance_with_current(s: &Setting, cur_val: &str) -> crate::interact::Affordance {
     let command = format!("set {}", s.key);
     let (needs, example) = match s.kind {
-        Kind::Bool => ("on / off".into(), format!("filament set {} on", s.key)),
-        Kind::Enum(vals) => (vals.join(" / "), format!("filament set {} {}", s.key, vals[0])),
-        Kind::List => ("interface name, group, or CIDR".into(), format!("filament set {} wl1", s.key)),
-        Kind::Str => ("a value".into(), format!("filament set {} <value>", s.key)),
-        Kind::Path => ("a path".into(), format!("filament set {} ~/Downloads", s.key)),
+        Kind::Bool => ("on / off".into(), format!("tunlion set {} on", s.key)),
+        Kind::Enum(vals) => (vals.join(" / "), format!("tunlion set {} {}", s.key, vals[0])),
+        Kind::List => ("interface name, group, or CIDR".into(), format!("tunlion set {} wl1", s.key)),
+        Kind::Str => ("a value".into(), format!("tunlion set {} <value>", s.key)),
+        Kind::Path => ("a path".into(), format!("tunlion set {} ~/Downloads", s.key)),
     };
 
     let options = if matches!(s.kind, Kind::List) {
@@ -1303,7 +1303,7 @@ fn readout(json_out: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        ui::paint_when(color, ui::Tone::Dim, "edit: filament set <key>   change: filament set <key> <value> [--peer <peer>]   reset: filament unset <key>")
+        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset: tunlion unset <key>")
     );
     Ok(())
 }

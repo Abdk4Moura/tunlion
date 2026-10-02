@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Filament — P2 SIGNALING-DROP gate (the acceptor-zombie / "no peer connected",
+# Tunlion — P2 SIGNALING-DROP gate (the acceptor-zombie / "no peer connected",
 # deterministic). This is the SLO-measurement gate for transport-resilience §P2
 # (GAP-2): a long-lived `up`/`up --dir` acceptor must SELF-RECOVER natively after
 # its signaling link is severed — reconnect, re-join its room(s), re-subscribe to
@@ -13,8 +13,8 @@
 # patched OUTSIDE the binary by runner/up_supervisor.sh (proactive restart). P2
 # fixes it IN-CORE; this gate runs the acceptor DIRECTLY (no supervisor).
 #
-# HOW THE DROP IS INDUCED: flaky_proxy.py sits between every filament client and
-# the LOCAL backend. filament's discovery + SDP/ICE ride that socket.io TCP, so
+# HOW THE DROP IS INDUCED: flaky_proxy.py sits between every tunlion client and
+# the LOCAL backend. tunlion's discovery + SDP/ICE ride that socket.io TCP, so
 # raising the down-flag severs the live signaling link (and refuses new conns)
 # exactly like the WAN path dropping; lowering it heals.
 #
@@ -34,14 +34,14 @@
 #
 # Isolated: own backend on a private port, own proxy port, own FILAMENT_CONFIG_DIRs,
 # the BUILT release binary. NEVER touches the live `up --shell` daemon, the
-# installed ~/.local/bin/filament, the live T4, or the production servers.
+# installed ~/.local/bin/tunlion, the live T4, or the production servers.
 #
 # Usage (from repo root or anywhere):  runner/sim/signaling_drop_test.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CLI_DIR="$ROOT/cli"
-BIN="${FILJOB_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
@@ -180,7 +180,7 @@ for n in $(seq 1 "$RUNS"); do
   UPLOG="$WORK/$tag-up.log"; SENDLOG="$WORK/$tag-send.log"; GOT="$WORK/$tag-drop/big.bin"
 
   # (i) the acceptor established + announced through the proxy.
-  if grep -hqE "filament up|listening|known device" "$UPLOG"; then
+  if grep -hqE "tunlion up|listening|known device" "$UPLOG"; then
     ok "[$tag] (i) acceptor ESTABLISHED + announced (no supervisor)"
   else
     bad "[$tag] (i) acceptor never announced"; tail -n 6 "$UPLOG"; GATE_OK=0

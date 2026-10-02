@@ -1,13 +1,13 @@
-// net/contracts.js — the layer boundaries for the filament networking stack.
+// net/contracts.js — the layer boundaries for the tunlion networking stack.
 //
 // This file defines (as JSDoc interfaces — no runtime code) the three seams the
 // consolidation is built on. The whole point: each layer depends only on the
 // INTERFACE of the layer below, never its implementation. See
 // docs/archive/plans/consolidation-plan-2026-06-15.md for the why; CONTRACT.md for the wire bytes.
 //
-//   ┌─ APPLICATION (useFilament, web-shell) ─────────────────────────┐
+//   ┌─ APPLICATION (useTunlion, web-shell) ─────────────────────────┐
 //   ├─ ORCHESTRATION (PeerLink: wires the three below per peer) ──────┤
-//   ├─ RESILIENCE ───────────────┬─ PROTOCOL (the filament protocol) ─┤
+//   ├─ RESILIENCE ───────────────┬─ PROTOCOL (the tunlion protocol) ─┤
 //   └─ TRANSPORT (the physical link; WebRTC here) ───────────────────-┘
 //
 // The ONE rule that keeps PROTOCOL and RESILIENCE un-mangled:
@@ -33,7 +33,7 @@
 /** @typedef {'local'|'direct'|'relayed'} TransportRoute */
 
 /**
- * PROTOCOL CODEC — the filament wire format. Pure functions, no I/O, no timers,
+ * PROTOCOL CODEC — the tunlion wire format. Pure functions, no I/O, no timers,
  * no browser APIs (so it runs under plain `node` in characterization tests and
  * stays byte-identical to the Rust side per CONTRACT.md). Ceremony state machines
  * (PAKE pairing, file-transfer) are separate PROTOCOL modules that build on this.

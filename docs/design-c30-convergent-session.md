@@ -14,7 +14,7 @@ lost edge = permanent divergence**:
 |---|---|---|
 | roomless ghost (Android reconnect, ignored by all) | room membership | rejoin belt (#14): re-join on every socket-up |
 | zombie create-code (phone tab minted unclaimables) | creator lease | self-healing mint + lease refresh (C24) |
-| invisible known device (`filament up` needed a page reload) | channel subscriptions | acked subscribe + 45 s reconcile (C28) |
+| invisible known device (`tunlion up` needed a page reload) | channel subscriptions | acked subscribe + 45 s reconcile (C28) |
 | recv hung after a complete transfer | peer departure | quiet-exit fallback (G-k) |
 | "never met a fella like you" (one-sided trust) | pairing belief | keep/proof acks (C27) |
 
@@ -111,7 +111,7 @@ Playwright runs: `?telLoss=0.3`.)
 1. Server `sync` handler (idempotent ensure + digest ack) — additive, old
    clients unaffected.
 2. CLI `session` module; recv/up/send/pair loops swap their belts for it.
-3. Browser `lib/session.js`; useFilament swaps its belts.
+3. Browser `lib/session.js`; useTunlion swaps its belts.
 4. Gate L (CLI flavor), wired into the suite.
 5. Phase 2 roster digest + recv exit generalization; gate L extended to
    assert tile/roster convergence.

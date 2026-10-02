@@ -13,7 +13,7 @@ slow.
 
 ## What startup was actually spending
 
-`strace -c` on `filament --version`, which does nothing but print a string:
+`strace -c` on `tunlion --version`, which does nothing but print a string:
 
     4 clone3      227 syscalls      7.0ms of syscall time
 
@@ -70,7 +70,7 @@ tool with a daemon half, in rough order of how much they matter:
    on a small box at all.
 2. **Idle CPU / wakeups.** The battery metric. A daemon that wakes constantly is
    worse than one using more RAM, and it never appears in a throughput
-   benchmark. Filament is at 0 ticks per 10 idle seconds, meaning it genuinely
+   benchmark. Tunlion is at 0 ticks per 10 idle seconds, meaning it genuinely
    waits rather than polls. This is already good and worth not regressing.
 3. **Binary size.** What you ship, and the hard limit on flash-constrained
    targets.
@@ -102,7 +102,7 @@ compiles has proved nothing.
 **Cold crates optimised for size: 1.3MB.** `opt-level = "z"` costs throughput, so
 it is applied per-package to crates that are not on the bulk-data path: argument
 parsing, the HTTPS control plane, and WebRTC session setup. `ring`, `quinn`,
-`tokio`, `smoltcp` and filament's own crates stay at full optimisation.
+`tokio`, `smoltcp` and tunlion's own crates stay at full optimisation.
 **16.9MB to 15.6MB**, and throughput was re-measured on the two-machine rig
 rather than assumed: 4 runs each of a 30MB transfer, median 18.1 MB/s before and
 18.6 MB/s after, with run-to-run variance far exceeding the difference.
@@ -142,9 +142,9 @@ is 8.1MB. Measured the same way on the same machine:
 | openssl | 1.0 MB | 8.9 MB |
 | tmux | 1.1 MB | 8.1 MB |
 
-So curl, the canonical "small" tool, actually pulls in MORE than filament does.
+So curl, the canonical "small" tool, actually pulls in MORE than tunlion does.
 
-Against tools in filament's own class, which carry their own TLS, crypto and
+Against tools in tunlion's own class, which carry their own TLS, crypto and
 protocol stacks rather than borrowing the system's:
 
 | tool | size | what it does |
@@ -157,26 +157,26 @@ protocol stacks rather than borrowing the system's:
 | cc1 (GCC's actual compiler) | 32.6 MB | C compiler backend |
 | **tailscale (CLI)** | **31.6 MB** | mesh VPN client |
 | rustc / cargo | 19.9 MB | compiler / build tool |
-| **filament** | **15.6 MB** | mesh + transfer + mount + shell |
+| **tunlion** | **15.6 MB** | mesh + transfer + mount + shell |
 | croc | 14.9 MB | file transfer only |
 
-filament is **half the size of the Tailscale CLI and 2.6x smaller than
+tunlion is **half the size of the Tailscale CLI and 2.6x smaller than
 tailscaled**, while doing more than either: the mesh, plus file transfer, plus a
 FUSE mount, plus a web shell. It is within a megabyte of croc, which only
 transfers files. `gcc` is a 1MB driver that execs `cc1`, and `cc1` is 32.6MB, so
-"as big as a C compiler" would in fact be twice filament's size.
+"as big as a C compiler" would in fact be twice tunlion's size.
 
 The conclusion is not that size stopped mattering. It is that the target should
-be croc's ~15MB rather than tmux's apparent 1.1MB, and filament is already there.
+be croc's ~15MB rather than tmux's apparent 1.1MB, and tunlion is already there.
 
 ## Ledger C16 closed: rust_socketio replaced
 
-filament used to link the system `libssl`/`libcrypto` because `rust_engineio`
+tunlion used to link the system `libssl`/`libcrypto` because `rust_engineio`
 (under `rust_socketio`) depends on `native-tls` UNCONDITIONALLY, not behind a
 feature. That was recorded as ledger C16 and treated as unfixable without
 forking upstream.
 
-It did not need a fork, because filament used almost none of that crate. The
+It did not need a fork, because tunlion used almost none of that crate. The
 client already forced `TransportType::Websocket` (polling behind Cloudflare
 caused a documented reconnect storm) with `reconnect(false)`, every handler only
 pulled the first JSON value out of a payload and forwarded it to one channel,
@@ -187,7 +187,7 @@ and Socket.IO's `42["name",data]` and `43<id>[...]`.
 `crates/filament-signal` is that, on rustls, in about 300 lines with 7 protocol
 tests. Scope is deliberately narrow and anything outside it is an error rather
 than a silent no-op: websocket only, no polling upgrade, no binary attachments,
-no library-level reconnect (filament's outer loop must re-run join/subscribe/sync,
+no library-level reconnect (tunlion's outer loop must re-run join/subscribe/sync,
 which a silent reconnect would skip).
 
 Acks were the part that mattered. Two callers depend on them and both fixed real
@@ -232,7 +232,7 @@ estimated.
 ## Where startup stands, and what did not help
 
 After the runtime and size work, `--version` measures 6.7ms against a 3.7ms
-process floor on this box: about **3ms is filament**. The profile says there is
+process floor on this box: about **3ms is tunlion**. The profile says there is
 not much left to take:
 
 - 94 syscalls, 1.55ms of syscall time, of which `execve` alone is 0.59ms. That
@@ -255,7 +255,7 @@ original report. `experiments/startup-bench.sh` exists for exactly that.
 ## WireGuard vs the QUIC-datagram plane: measured
 
 `experiments/wireguard-throughput.sh` pushes a TCP stream over the OVERLAY
-(not filament's file-transfer path, which has its own framing and would measure
+(not tunlion's file-transfer path, which has its own framing and would measure
 that instead) between do-vm and a KVM VPS, and reports MB/s.
 
 | plane | runs | median | spread |

@@ -1,4 +1,4 @@
-//! `filament add --for`: the invitation and approval path.
+//! `tunlion add --for`: the invitation and approval path.
 //!
 //! `add_for_cmd` is the handler `Cmd::Add` reaches when the caller names who the
 //! addition is for -- it mints a capability for that subject, writes or prints
@@ -68,7 +68,7 @@ fn report_invitation_uptake(ttl_abs: u64) {
             // Deliberately not "waiting" or "pending": we do not know that
             // anyone ever scanned it. State only what is checkable.
             ui::say(&format!(
-                "  no one has joined on this invitation yet; it stays usable until {}. `filament devices` will show them when they do.",
+                "  no one has joined on this invitation yet; it stays usable until {}. `tunlion devices` will show them when they do.",
                 format_approval_expiry(ttl_abs)
             ));
             return;
@@ -193,10 +193,10 @@ pub(crate) async fn add_for_cmd(
                 "a script has to say where the invitation goes (it holds a credential):"
                     .to_string(),
                 String::new(),
-                format!("  filament add {who} --out {}", suggested.display()),
+                format!("  tunlion add {who} --out {}", suggested.display()),
                 String::new(),
                 format!(
-                    "  Then on that machine:  filament join {}",
+                    "  Then on that machine:  tunlion join {}",
                     suggested.display()
                 ),
             ]
@@ -315,7 +315,7 @@ pub(crate) async fn add_for_cmd(
         // #275: this surface used to say nothing at all once the QR came down.
         // The owner picked the duration and the ceiling, someone joined under
         // them, and the one screen that knew what was offered never confirmed
-        // what was taken; you had to run `filament devices` to find out.
+        // what was taken; you had to run `tunlion devices` to find out.
         //
         // The mint process cannot observe the enrollment directly, because the
         // joiner talks to the running daemon and not to us. So match on the
@@ -357,7 +357,7 @@ pub(crate) async fn add_for_cmd(
     if !caps.interactive && daemon_alive().is_none() {
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running; start `filament up --install` before anyone claims this invitation.",
+            "  note: the always-on receiver is not running; start `tunlion up --install` before anyone claims this invitation.",
         ));
     }
     Ok(())

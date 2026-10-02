@@ -1,8 +1,8 @@
-// Local control socket: warm-link reuse between sibling filament processes.
+// Local control socket: warm-link reuse between sibling tunlion processes.
 //
-// WHY: a one-shot `filament ssh`/`netcat`/`forward` normally establishes a FRESH
+// WHY: a one-shot `tunlion ssh`/`netcat`/`forward` normally establishes a FRESH
 // link to the peer (signaling + presence + the direct-QUIC race, ~1s). But if a
-// local `filament up` daemon already holds an established link to that peer, the
+// local `tunlion up` daemon already holds an established link to that peer, the
 // new session can ride THAT link instead, skipping establishment. The daemon
 // exposes a unix-domain socket; a sibling process connects, names a peer and a
 // remote port, and on success the socket becomes a raw byte pipe for one L2
@@ -22,12 +22,12 @@
 // user who runs the daemon can talk to it. That is the same authority boundary as
 // the daemon itself (it already acts on behalf of the local user); a peer is only
 // reachable if it was paired AND its acceptor grants L2, exactly as for a cold
-// `filament ssh`. The remote side is UNCHANGED and re-verifies trust per link.
+// `tunlion ssh`. The remote side is UNCHANGED and re-verifies trust per link.
 
 use std::path::PathBuf;
 
 /// `{config_dir}/control.sock`, honoring FILAMENT_CONFIG_DIR (hermetic tests),
-/// else `~/.config/filament`. Mirrors `devices_path()` / `pidfile()`. Portable
+/// else `~/.config/tunlion`. Mirrors `devices_path()` / `pidfile()`. Portable
 /// (just path math); only used on unix where the socket is actually bound.
 pub fn control_sock_path() -> PathBuf {
     crate::platform::Paths::config_path("control.sock")
@@ -246,7 +246,7 @@ mod imp {
     }
 
     /// Ask a local daemon what its warm link to `peer` looks like (for
-    /// `filament ping`): returns the facts JSON (`{"ok":true,"warm":true,"route":…,
+    /// `tunlion ping`): returns the facts JSON (`{"ok":true,"warm":true,"route":…,
     /// "remote_addr":…,"rtt_ms":…,"direct":…,"verified":…}`) when the daemon holds
     /// a live link, or `None` (no daemon / no warm link) so the caller falls back
     /// to a cold establish-probe. Bounded so a wedged daemon can't hang ping.
@@ -269,11 +269,11 @@ mod imp {
     }
 
     /// Tell a running `up` daemon that setting `key` changed, so it re-reads its
-    /// prefs and applies the change to its live state (the `filament set` live
+    /// prefs and applies the change to its live state (the `tunlion set` live
     /// path). Returns the daemon's reply (`{"ok":true,"live":<bool>}`) or `None`
     /// when there is no daemon / it did not answer, so the caller can fall back to
     /// the "takes effect on next up" message. Bounded so a wedged daemon can't
-    /// hang `filament set`.
+    /// hang `tunlion set`.
     pub async fn try_reconfigure(key: &str) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
         let req = json!({ "op": "reconfigure", "key": key });
@@ -299,7 +299,7 @@ mod imp {
     /// about the banner meaning "serving", not about arming.
 
     /// Ask the running daemon to re-read `expose.json` and reconcile its overlay
-    /// listeners (used by `filament expose`/`unexpose`). Returns the daemon reply
+    /// listeners (used by `tunlion expose`/`unexpose`). Returns the daemon reply
     /// (`{"ok":true,"live":<bool>,"count":<n>}`) or `None` if no daemon answered.
     pub async fn try_reload_expose() -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
@@ -316,7 +316,7 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
-    /// Ask a running `up` daemon to RELOAD onto a freshly `filament update`d binary
+    /// Ask a running `up` daemon to RELOAD onto a freshly `tunlion update`d binary
     /// with no manual restart and no sudo. The daemon gracefully shuts down (the
     /// same path a `systemctl restart` / SIGTERM takes, which cleanly closes the
     /// QUIC links so peers re-establish and L3 recovers) and its supervisor
@@ -358,7 +358,7 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
-    /// Ask the daemon to unmount a filament mount point. Returns the daemon's
+    /// Ask the daemon to unmount a tunlion mount point. Returns the daemon's
     /// reply (`{"ok":true}`) or `None` if no daemon answered.
     pub async fn try_unmount(target: &str) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
@@ -412,7 +412,7 @@ mod imp {
     /// Ask the daemon for its live capability shadow counters (synchronous).
     /// Returns the daemon's reply (`{"ok":true,"counts":{...}}`) or `None` if
     /// no daemon answered. A fresh process has zero counters; only the running
-    /// daemon (`filament up`) accumulates them across live opens.
+    /// daemon (`tunlion up`) accumulates them across live opens.
     pub async fn try_cap_status() -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
         let req = json!({ "op": "cap-status" });
@@ -536,35 +536,35 @@ mod imp {
         /// fresh cold establish: install our managed `pubkey` on `peer` and return
         /// the peer's host keys + login. The reply is deferred (it awaits the
         /// peer's ack via the event loop), so the daemon stashes the socket rather
-        /// than answering inline. `ssh_port` is the port `filament ssh` will dial
+        /// than answering inline. `ssh_port` is the port `tunlion ssh` will dial
         /// on the peer's loopback, so the peer can report whether an sshd is
         /// actually listening there (else ssh would fail blindly).
         Bootstrap { peer: String, pubkey: String, ssh_port: u16 },
-        /// Report the daemon's live link to `peer` for `filament ping`: route,
+        /// Report the daemon's live link to `peer` for `tunlion ping`: route,
         /// remote address, RTT, verified name. Answered INLINE (synchronous): all
         /// the facts are local to the daemon (quinn's RTT/addr, the link table), so
         /// unlike Bootstrap there is nothing to await from the peer.
         Ping { peer: String },
-        /// Tell the running daemon a setting changed (`filament set`). The daemon
+        /// Tell the running daemon a setting changed (`tunlion set`). The daemon
         /// re-reads its prefs and applies `key` to its live state where it safely
         /// can (drop-dir, shell policy/user, name, auto-extract), replying
         /// `{"ok":true,"live":<bool>}`: `live:true` = applied without a restart;
         /// `live:false` = the key is woven into startup (relay/server, or arming
-        /// the L2 acceptor from cold) and needs `filament up`. Answered INLINE.
+        /// the L2 acceptor from cold) and needs `tunlion up`. Answered INLINE.
         Reconfigure { key: String },
         /// Tell the daemon to re-read `expose.json` and reconcile its overlay
-        /// listeners (`filament expose`/`unexpose`). Answered INLINE with
+        /// listeners (`tunlion expose`/`unexpose`). Answered INLINE with
         /// `{"ok":true,"live":true,"count":<n>}` where `n` is the number of ports
         /// now bound; `live:false` if L3 is not up in the daemon.
         ReloadExpose,
-        /// Gracefully restart to pick up an updated binary (`filament update`).
+        /// Gracefully restart to pick up an updated binary (`tunlion update`).
         /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
         /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
         Reload,
         /// Mount a remote directory via sshfs through the daemon. The daemon
         /// spawns sshfs, tracks the mount, and monitors its health centrally.
         Mount { peer: String, remote: String, local: String, read_only: bool, auto_restore: bool, port: u16 },
-        /// Unmount a filament mount point by local path.
+        /// Unmount a tunlion mount point by local path.
         Unmount { target: String },
         /// List all daemon-managed mounts and their health status.
         ListMounts,
@@ -656,7 +656,7 @@ mod imp {
         if let Some(ready) = ready {
             let _ = ready.send(());
         }
-        crate::ui::trace(&format!("filament: control socket at {}", path.display()));
+        crate::ui::trace(&format!("tunlion: control socket at {}", path.display()));
         loop {
             let (mut sock, _) = match listener.accept().await {
                 Ok(v) => v,

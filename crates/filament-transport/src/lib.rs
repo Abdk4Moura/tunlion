@@ -16,7 +16,7 @@
 //!
 //! That separation is why this could become a crate at all, and it was done as
 //! its own step, verified live, BEFORE the files moved: the transport is what
-//! filament's reliability rests on, and a half-verified transport is worse than
+//! tunlion's reliability rests on, and a half-verified transport is worse than
 //! a coupled one.
 
 pub mod direct;

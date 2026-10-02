@@ -58,7 +58,7 @@ pub fn render_post_ack_nudge() -> String {
         add = format!(
             "     {} {}  (strongly recommended)",
             ui::paint(Tone::Warn, ui::glyph_extern()),
-            ui::paint(Tone::Dim, "add a second primary:  filament pair --fleet")
+            ui::paint(Tone::Dim, "add a second primary:  tunlion pair --fleet")
         ),
     )
 }
@@ -67,7 +67,7 @@ pub fn render_post_ack_nudge() -> String {
 pub fn render_restore_header() -> String {
     format!(
         "{}",
-        ui::paint(Tone::Brand, "  filament restore — recover your identity from your 12 words")
+        ui::paint(Tone::Brand, "  tunlion restore — recover your identity from your 12 words")
     )
 }
 
@@ -99,7 +99,7 @@ pub fn render_lost_response() -> String {
          {rotate}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
         pending = ui::paint(Tone::Dim, "  7-day pending window: if an old device is still out there, it can object."),
-        rotate = ui::paint(Tone::Dim, "  Bring any old primary online to confirm instantly.\n  ↳ filament identity rotate   (optional — replaces the old key sooner)"),
+        rotate = ui::paint(Tone::Dim, "  Bring any old primary online to confirm instantly.\n  ↳ tunlion identity rotate   (optional — replaces the old key sooner)"),
     )
 }
 
@@ -119,11 +119,11 @@ pub fn render_stolen_response() -> String {
         line2 = "    already holds. There is no server to phone; no global kill-switch exists (by design).",
         what_do = ui::paint(Tone::Bold, "    What you CAN do right now:"),
         revoke = format!(
-            "      • filament revoke <device>   tell your OTHER devices to stop trusting the stolen one\n\
+            "      • tunlion revoke <device>   tell your OTHER devices to stop trusting the stolen one\n\
              {}",
             ui::paint(Tone::Dim, "                                   (takes effect as each one is reached; bounded by cert expiry)")
         ),
-        rotate = "      • filament identity rotate   move to a new key; devices re-verify on next contact".to_string(),
+        rotate = "      • tunlion identity rotate   move to a new key; devices re-verify on next contact".to_string(),
         guardians = format!(
             "{}",
             ui::paint(Tone::Dim, "    What actually closes the door: guardians. If you'd set 3-of-5 guardians, they\n    could co-sign a revocation the thief can't stop. Without them, revoke + rotate\n    is best-effort and races the thief until the old certs expire.")
@@ -154,7 +154,7 @@ pub fn render_posture_choice() -> String {
 pub fn render_guardians_header() -> String {
     format!(
         "{}",
-        ui::paint(Tone::Brand, "  filament identity guardians — people who can co-sign your recovery")
+        ui::paint(Tone::Brand, "  tunlion identity guardians — people who can co-sign your recovery")
     )
 }
 
@@ -191,7 +191,7 @@ pub fn render_guardian_recovery_requested(started: &str, activates: &str) -> Str
     format!(
         "{warn} A recovery for YOUR identity was requested from a new device.\n\
          Started: {started} · Activates: {activates} (7-day hold) unless you cancel.\n\
-         Not you?  filament identity freeze   — stops it cold; the new device gets nothing.\n\
+         Not you?  tunlion identity freeze   — stops it cold; the new device gets nothing.\n\
          It's you? Ask your guardians to co-sign, or bring an old primary online.",
         warn = ui::paint(Tone::Warn, ui::glyph_warn()),
     )
@@ -241,8 +241,8 @@ mod tests {
         let s = render_stolen_response();
         assert!(s.contains("recovers you from LOSS, not from THEFT"), "must contain the load-bearing honesty line");
         assert!(s.contains("no server to phone"), "must explain no central kill-switch");
-        assert!(s.contains("filament revoke"), "must suggest revoke");
-        assert!(s.contains("filament identity rotate"), "must suggest rotate");
+        assert!(s.contains("tunlion revoke"), "must suggest revoke");
+        assert!(s.contains("tunlion identity rotate"), "must suggest rotate");
         assert!(s.contains("guardians"), "must mention guardians");
     }
 
@@ -251,7 +251,7 @@ mod tests {
         let s = render_lost_response();
         assert!(s.contains("Recovering"), "must confirm recovery");
         assert!(s.contains("7-day pending window"), "must explain pending window");
-        assert!(s.contains("filament identity rotate"), "must suggest rotate");
+        assert!(s.contains("tunlion identity rotate"), "must suggest rotate");
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
         let s = render_guardian_recovery_requested("Aug 3", "Aug 10");
         assert!(s.contains("recovery"), "must mention recovery");
         assert!(s.contains("7-day hold"), "must mention hold period");
-        assert!(s.contains("filament identity freeze"), "must suggest freeze");
+        assert!(s.contains("tunlion identity freeze"), "must suggest freeze");
     }
 
     #[test]
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn restore_header() {
         let s = render_restore_header();
-        assert!(s.contains("filament restore"), "must contain restore command");
+        assert!(s.contains("tunlion restore"), "must contain restore command");
         assert!(s.contains("12 words"), "must mention 12 words");
     }
 
@@ -309,6 +309,6 @@ mod tests {
     fn post_ack_nudge() {
         let s = render_post_ack_nudge();
         assert!(s.contains("primary"), "must mention primary");
-        assert!(s.contains("filament pair --fleet"), "must suggest fleet pair");
+        assert!(s.contains("tunlion pair --fleet"), "must suggest fleet pair");
     }
 }

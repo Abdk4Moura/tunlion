@@ -27,17 +27,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use sha2::{Digest, Sha256};
 
-/// Fixed filament overlay prefix: `fdf1:1af7:c30d::/48`. `fd..` is a ULA
-/// (RFC 4193, never routed on the Internet); the next 40 bits tag the filament
+/// Fixed tunlion overlay prefix: `fdf1:1af7:c30d::/48`. `fd..` is a ULA
+/// (RFC 4193, never routed on the Internet); the next 40 bits tag the tunlion
 /// overlay so the whole network shares one prefix and the kernel routes it to the
 /// single TUN with one route. The low 80 bits are the key hash.
 const PREFIX: [u8; 6] = [0xfd, 0xf1, 0x1a, 0xf7, 0xc3, 0x0d];
 const PREFIX_LEN: u8 = 48;
 
 /// Domain-separation tags so a hash/signature here can never be mistaken for one
-/// from another filament protocol (or a future overlay version).
-const ADDR_DOMAIN: &[u8] = b"filament/overlay-addr/v1\0";
-const BIND_DOMAIN: &[u8] = b"filament/overlay-bind/v1\0";
+/// from another tunlion protocol (or a future overlay version).
+const ADDR_DOMAIN: &[u8] = b"tunlion/overlay-addr/v1\0";
+const BIND_DOMAIN: &[u8] = b"tunlion/overlay-bind/v1\0";
 
 /// The overlay prefix as a `<addr>/48` string for route installation.
 pub fn prefix_cidr() -> String {
@@ -79,7 +79,7 @@ const V4_PREFIX_LEN: u8 = 15;
 /// Low 17 bits = the host part of a `/15`.
 const V4_HOST_MASK: u32 = 0x0001_FFFF;
 /// Domain tag for the v4 host derivation, distinct from the v6 addr tag.
-const ADDR_V4_DOMAIN: &[u8] = b"filament/overlay-v4-addr/v1\0";
+const ADDR_V4_DOMAIN: &[u8] = b"tunlion/overlay-v4-addr/v1\0";
 
 /// The v4 overlay prefix as a CIDR string for route installation.
 pub fn prefix_v4_cidr() -> String {
@@ -649,7 +649,7 @@ mod tests {
         let pk = [7u8; 32];
         let a = addr_from_pubkey(&pk);
         assert_eq!(a, addr_from_pubkey(&pk), "deterministic");
-        assert_eq!(a.octets()[..6], PREFIX, "carries the filament ULA prefix");
+        assert_eq!(a.octets()[..6], PREFIX, "carries the tunlion ULA prefix");
     }
 
     #[test]

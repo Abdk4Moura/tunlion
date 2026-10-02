@@ -64,8 +64,8 @@ timeout -k 5 "$CAST_TIMEOUT" "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time
   --cols "$COLS" --rows "$ROWS" \
   -c "bash '$HERE/scenarios.sh' '$ID'" "$CAST" >/dev/null 2>&1 || true
 # kill any children the boxed (possibly-wedged) recorded run left behind:
-# our filament procs (matched by cfg dir) AND scenario 06's throwaway sshd.
-for p in $(pgrep -f "$FILAMENT" 2>/dev/null); do
+# our tunlion procs (matched by cfg dir) AND scenario 06's throwaway sshd.
+for p in $(pgrep -f "$TUNLION" 2>/dev/null); do
   tr '\0' '\n' < /proc/$p/environ 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$UX_TMP/s${ID}" && kill -9 "$p" 2>/dev/null
 done
 for p in $(pgrep -f "sshd_config" 2>/dev/null); do

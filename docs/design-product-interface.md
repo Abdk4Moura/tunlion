@@ -1,4 +1,4 @@
-# Design: the filament product interface (local API + SDK)
+# Design: the tunlion product interface (local API + SDK)
 
 > Status: design (2026-07-26). Formalizes the existing control socket (`ctl.rs`)
 > into the stable interface that PRODUCTS build on. Stress-tested adversarially.
@@ -7,17 +7,17 @@
 
 ## Why
 
-filament is the core/platform; products (a GPU compute product, and others) are
+tunlion is the core/platform; products (a GPU compute product, and others) are
 SEPARATE codebases that consume it. Today `ctl.rs` is an internal, unstable local
 socket the CLI uses to talk to its own `up` daemon (~15 ops: open/dial/pty/mount/
 ...). This design turns that seam into a stable, versioned, documented public
-contract plus a thin SDK, so a product builds ON filament instead of shelling out
+contract plus a thin SDK, so a product builds ON tunlion instead of shelling out
 to the CLI or reaching into internals.
 
-Boundary it enforces: filament owns pairing, authorized channels, streams, grants,
+Boundary it enforces: tunlion owns pairing, authorized channels, streams, grants,
 transfer, mount, and this interface. Products own their domain logic (GPU sandbox,
 job protocol, inference routing) on the consumer side of the SDK. Nothing
-product-specific lives in filament core.
+product-specific lives in tunlion core.
 
 ## Transport and protocol
 
@@ -90,7 +90,7 @@ that can answer the ask in real time; the tray/companion app is that surface. Th
 is **live approval (push)**. A CLI cannot be a prompt surface, so when no display
 product is connected the daemon must not hang: the critical-lane timeout DENIES
 (fail-safe), and the request drops into a **pending-requests queue** the owner sees
-in-band (`filament requests`, plus a line in `filament devices`) alongside any
+in-band (`tunlion requests`, plus a line in `tunlion devices`) alongside any
 configured notify hook. The other mode, **deliberate grant (pull)**, needs none of
 this: the owner issues `grant` ahead of time and the inbound `open` authorizes with
 no prompt at all. See `docs/design-identity-access-ux.md`, "the one recurring
