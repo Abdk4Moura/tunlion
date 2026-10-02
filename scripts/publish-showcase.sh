@@ -5,7 +5,7 @@
 # Architecture (see showcase/ and docs/SHOWCASE.md):
 #   • Media + the page live in Cloudflare R2 (bucket: filament-showcase).
 #   • A dedicated Worker (filament-showcase) serves them at
-#       https://filament.autumated.com/showcase/*
+#       https://tunlion.autumated.com/showcase/*
 #     via a zone route — the main `filament` app Worker is never touched.
 #   • Publishing == uploading objects to R2. No app/Worker redeploy needed.
 #
@@ -31,7 +31,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 GALLERY="${GALLERY:-$REPO_ROOT/experiments/ux/gallery}"
 BUCKET="${BUCKET:-filament-showcase}"
-SITE_URL="${SITE_URL:-https://filament.autumated.com/showcase/}"
+SITE_URL="${SITE_URL:-https://tunlion.autumated.com/showcase/}"
 
 # Build artifacts go to a temp staging dir (never committed).
 STAGE="$(mktemp -d)"
@@ -92,7 +92,7 @@ build_page() {
     </p>
     <div class="meta">
       <span class="dot"></span> media + page served from R2 ·
-      <a href="https://filament.autumated.com/">← back to the app</a>
+      <a href="https://tunlion.autumated.com/">← back to the app</a>
     </div>
   </div>
 </header>

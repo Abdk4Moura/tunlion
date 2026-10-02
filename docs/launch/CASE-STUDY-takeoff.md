@@ -85,7 +85,7 @@ Positioning rule throughout: always **"Filament file sharing"**, never bare
   others the URL) + **~24% from Google**. Every successful transfer **teaches a
   second person the URL** - virality is built into the product shape.
 - **Filament takeaways:** (a) **the share is the URL** - make
-  `filament.autumated.com` trivially memorable/tellable and the in-person
+  `tunlion.autumated.com` trivially memorable/tellable and the in-person
   "what's the link?" moment frictionless; (b) **own your canonical URL and
   privacy promise** so you can't become the cautionary LimeWire story; (c) you
   don't need a hero launch - **a steady drip of organic HN/Reddit re-posts** (by
@@ -299,7 +299,7 @@ Stars are a *vanity* lagging metric (and partly distrusted post-fake-star-era).
 Track these instead:
 - **First-30-min HN velocity** on launch day (upvotes + comments) - the only
   thing that predicts front page.
-- **Direct vs. search traffic split** to filament.autumated.com over time - the
+- **Direct vs. search traffic split** to tunlion.autumated.com over time - the
   PairDrop tell: rising **direct** traffic = the word-of-mouth "tell them the
   URL" loop is working; rising **search** traffic = the SEO loop is working.
 - **Returning unique senders/receivers** and **completed transfers** - the
@@ -325,7 +325,7 @@ Track these instead:
 - **Treating the launch as the strategy** - every analogue's real growth was the
   *loop after* the launch, not the launch.
 - **Losing control of the canonical URL/promise** - Snapdrop→LimeWire is the
-  warning. Guard `filament.autumated.com` and the no-upload promise.
+  warning. Guard `tunlion.autumated.com` and the no-upload promise.
 
 ---
 

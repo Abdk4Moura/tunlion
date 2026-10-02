@@ -185,7 +185,7 @@ class RegistryValidationTests(unittest.TestCase):
                     {
                         "path": "gate.sh",
                         "disposition": "diagnostic",
-                        "issue": "https://github.com/Abdk4Moura/filament/issues/133",
+                        "issue": "https://github.com/Abdk4Moura/tunlion/issues/133",
                         "owner": "chief-ux",
                         "expires": "2026-08-03",
                     }

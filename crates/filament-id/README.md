@@ -6,7 +6,7 @@ Multi-device identity with no certificate authority: one **user key** signs a
 possession of that device's private key — no directory, no online check.
 
 This is the identity layer of
-[filament](https://github.com/Abdk4Moura/filament), extracted for reuse.
+[filament](https://github.com/Abdk4Moura/tunlion), extracted for reuse.
 
 ## What's inside
 

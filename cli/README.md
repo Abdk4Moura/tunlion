@@ -1,6 +1,6 @@
 # filament CLI
 
-The terminal end of [Filament](https://filament.autumated.com): P2P file
+The terminal end of [Filament](https://tunlion.autumated.com): P2P file
 transfer that works anywhere, where **a browser is a first-class peer**. Send from a headless
 server straight to a phone with nothing installed on it, or between two
 terminals, or terminal → browser → terminal. Same signaling, same WebRTC
@@ -12,7 +12,7 @@ filament send video.mp4 --code
 #   code: clever-lynx-63
 # other machine:
 filament receive clever-lynx-63
-# or: open filament.autumated.com on any phone and claim the code there
+# or: open tunlion.autumated.com on any phone and claim the code there
 
 # same network? no code needed: auto-discovery
 filament receive -y --dir ~/Drops       # this terminal
@@ -46,13 +46,13 @@ filament send x.bin --server https://your-instance.example
 
 ```
 # Linux / macOS: verifies checksums, installs to ~/.local/bin, no sudo
-curl -fsSL https://filament.autumated.com/install | sh
+curl -fsSL https://tunlion.autumated.com/install | sh
 
 # Windows
 winget install Abdk4Moura.Filament
 
 # Homebrew / Cargo
-brew tap abdk4moura/filament https://github.com/Abdk4Moura/filament
+brew tap abdk4moura/filament https://github.com/Abdk4Moura/tunlion
 brew install abdk4moura/filament/filament
 cargo install filament-cli
 ```

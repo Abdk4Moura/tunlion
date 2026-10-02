@@ -4,7 +4,7 @@
 > collided with [Filament](https://filamentphp.com) the Laravel admin panel, which
 > owns the search results, so this one is ours alone.
 >
-> `filament.autumated.com` redirects here and old GitHub links redirect to this repo,
+> `tunlion.autumated.com` redirects here and old GitHub links redirect to this repo,
 > so nothing you have bookmarked breaks. The published `filament-cli` crate and the
 > `cli-v0.8.5` release assets keep working unchanged; new releases ship under the new
 > name. **`api.filament.autumated.com` is deliberately unchanged** and stays up: every
@@ -24,10 +24,10 @@ Runs on **Linux, macOS, and Windows** (all first-class), or use it with **nothin
 
 ```sh
 # Linux / macOS — curl | sh
-curl -fsSL https://filament.autumated.com/install | sh
+curl -fsSL https://tunlion.autumated.com/install | sh
 
 # Windows — PowerShell one-liner
-irm https://filament.autumated.com/install.ps1 | iex
+irm https://tunlion.autumated.com/install.ps1 | iex
 ```
 
 Or a package manager:
@@ -39,7 +39,7 @@ Or a package manager:
 | **Cargo** (Rust) | `cargo install filament-cli` |
 | **npm** (Node) | `npm i -g @abdk4moura/filament-cli` |
 
-Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `filament update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[filament.autumated.com](https://filament.autumated.com)** on both devices.
+Every prebuilt binary is checksummed against the release `SHA256SUMS` and carries a GitHub build-provenance attestation. `filament update` self-updates a direct install and defers to your package manager when it manages the binary. Or skip all of it and open **[tunlion.autumated.com](https://tunlion.autumated.com)** on both devices.
 
 ## Send a file
 

@@ -1,13 +1,13 @@
 #!/bin/sh
-# filament installer — https://filament.autumated.com/install
+# filament installer — https://tunlion.autumated.com/install
 #
-#   curl -fsSL https://filament.autumated.com/install | sh
+#   curl -fsSL https://tunlion.autumated.com/install | sh
 #
 # Detects your platform, downloads the latest release binary from GitHub,
 # verifies its SHA-256 against the release's SHA256SUMS, and installs to
 # ~/.local/bin (override with FILAMENT_INSTALL_DIR). No sudo, no telemetry,
 # fully static binary on Linux. Source: scripts/install.sh in
-# https://github.com/Abdk4Moura/filament
+# https://github.com/Abdk4Moura/tunlion
 set -eu
 
 REPO="Abdk4Moura/filament"
@@ -118,4 +118,4 @@ esac
 
 say ""
 say "try it:   filament send <file> --code"
-say "          (the other end can be a terminal — or any browser at https://filament.autumated.com)"
+say "          (the other end can be a terminal — or any browser at https://tunlion.autumated.com)"

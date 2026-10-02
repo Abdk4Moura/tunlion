@@ -2,7 +2,7 @@
  * Filament Showcase Worker
  * ------------------------
  * Serves the static showcase (build-log page + reels/gifs) from R2 at
- *   https://filament.autumated.com/showcase/*
+ *   https://tunlion.autumated.com/showcase/*
  *
  * Mapping: GET /showcase/<path>  ->  R2 object <path> (in the `filament-showcase`
  * bucket). `/showcase` and `/showcase/` serve `index.html`.

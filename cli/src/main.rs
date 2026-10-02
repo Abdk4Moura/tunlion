@@ -1,7 +1,7 @@
 // filament, anywhere-to-anywhere P2P file transfer, CLI end.
 //
 // Speaks the exact same wire protocol as the browser app at
-// https://filament.autumated.com: Socket.IO signaling, perfect-negotiation
+// https://tunlion.autumated.com: Socket.IO signaling, perfect-negotiation
 // WebRTC, one-time pairing codes, and sid-framed chunk transfer with
 // offset-based resume. A browser is a first-class peer: `filament send` can
 // deliver straight to a phone with nothing installed on it.

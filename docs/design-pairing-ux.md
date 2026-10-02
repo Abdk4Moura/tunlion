@@ -237,7 +237,7 @@ $ filament mint --fleet --shell --fleet-open --ttl 1h
   fk_7b7e03e8_9d2a…   (valid 1h)
 
 # one line in cloud-init / Ansible / Dockerfile for every VM:
-  curl -fsSL https://filament.autumated.com/install | sh && \
+  curl -fsSL https://tunlion.autumated.com/install | sh && \
     filament identity join --key fk_7b7e03e8_9d2a… && filament up --shell
 ```
 

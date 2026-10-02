@@ -26,15 +26,15 @@ Things r/selfhosted might specifically care about:
 - **Resilience is documented, not vibes**: every failure mode I hit (signaling
   glare, dropped ICE candidates, zombie presence after restarts, stale TURN
   creds in long-lived tabs) is written up with its fix:
-  https://github.com/Abdk4Moura/filament/blob/main/docs/resilience.md
+  https://github.com/Abdk4Moura/tunlion/blob/main/docs/resilience.md
 - Transfers pause/resume across drops; multiple concurrent transfers are
   chunk-framed so they can't corrupt each other.
 
 Honest limits: both ends must be online (nothing is stored, by design), and
 resume needs the sender's tab alive — page reload revokes browser file handles.
 
-Live instance: https://filament.autumated.com
-Code + deploy guide: https://github.com/Abdk4Moura/filament
+Live instance: https://tunlion.autumated.com
+Code + deploy guide: https://github.com/Abdk4Moura/tunlion
 
 Happy to answer anything about the WebRTC failure modes — that turned out to
 be the real project.

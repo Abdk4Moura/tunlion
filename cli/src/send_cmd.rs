@@ -949,7 +949,7 @@ pub(crate) async fn send_cmd(
                 let ttl = v["ttl"].as_u64().unwrap_or(600);
                 let full = format!("{send_words}-{send_nameplate}");
                 let site = if server == DEFAULT_SERVER {
-                    "https://filament.autumated.com".to_string()
+                    "https://tunlion.autumated.com".to_string()
                 } else {
                     server.to_string()
                 };

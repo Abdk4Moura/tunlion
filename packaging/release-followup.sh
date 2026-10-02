@@ -37,7 +37,7 @@ render() { sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA_LINUX@/$SHA_LINUX/g" \
 
 # ------------------------------------------------------------------ homebrew
 # The tap lives INSIDE this repo (Formula/) — no extra repo needed:
-#   brew tap abdk4moura/filament https://github.com/Abdk4Moura/filament
+#   brew tap abdk4moura/filament https://github.com/Abdk4Moura/tunlion
 #   brew install abdk4moura/filament/filament
 # (If a dedicated Abdk4Moura/homebrew-tap repo exists, it is updated too.)
 render "$HERE/brew/filament.rb.tmpl" > "$OUT/filament.rb"

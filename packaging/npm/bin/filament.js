@@ -9,7 +9,7 @@ const { binaryPath } = require('../scripts/paths')
 const bin = binaryPath()
 if (!fs.existsSync(bin)) {
   console.error('filament: binary missing — reinstall with `npm i -g filament-cli`,')
-  console.error('or install another way: https://filament.autumated.com')
+  console.error('or install another way: https://tunlion.autumated.com')
   process.exit(1)
 }
 

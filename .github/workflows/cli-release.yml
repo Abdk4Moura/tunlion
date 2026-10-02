@@ -5,7 +5,7 @@
 #
 # Everything else — matrix builds, SHA256SUMS, provenance attestation, the
 # release itself — happens here. The curl|sh installer
-# (https://filament.autumated.com/install), `filament update`, the Homebrew
+# (https://tunlion.autumated.com/install), `filament update`, the Homebrew
 # tap, and the winget manifests all consume these exact artifact names:
 #     filament-<target>.tar.gz   (unix)   /  filament-<target>.zip (windows)
 #     SHA256SUMS

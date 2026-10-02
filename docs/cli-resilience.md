@@ -22,7 +22,7 @@ Last full run: **18/18, 2026-06-07** (incl. gate 13 multi-link and gate 14
 daemon). Earlier milestone runs:
 **15/15, 2026-06-06**, plus live-production runs through
 `api.filament.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
-(`route: relayed` both ends), and the real `filament.autumated.com` site
+(`route: relayed` both ends), and the real `tunlion.autumated.com` site
 sending 64 KiB-framed files to `filament recv`.
 
 ---
@@ -63,7 +63,7 @@ the same way, but is no longer required for correctness).
 **Verified by:** gate 6 (61440 framing), gate 12 (a fixture backend serving
 chunkSize 65536 — the exact production config — browser sends two 65,540-byte-
 framed files, hashes match), and a LIVE run against the real production site:
-headless Chromium on `https://filament.autumated.com` sent 4 MB to
+headless Chromium on `https://tunlion.autumated.com` sent 4 MB to
 `filament recv` through `api.filament.autumated.com`, hash identical,
 10.3 MB/s (2026-06-06). The failure mode no longer occurs in the live system.
 
@@ -227,7 +227,7 @@ Release **cli-v0.1.0 is published** (GitHub Actions, run 27075331708): four
 platform binaries (linux-musl static, macOS arm64, macOS x86_64 cross-built on
 arm64, Windows MSVC), SHA256SUMS, and build-provenance attestations. Verified
 end-to-end against the LIVE release:
-- `curl -fsSL https://filament.autumated.com/install | sh` downloads,
+- `curl -fsSL https://tunlion.autumated.com/install | sh` downloads,
   checksum-verifies, installs, and the installed binary completed a real
   transfer through production.
 - `filament update`: a 0.0.9 build detected 0.1.0, downloaded, verified the

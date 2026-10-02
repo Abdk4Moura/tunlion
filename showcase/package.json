@@ -2,7 +2,7 @@
   "name": "filament-showcase",
   "version": "1.0.0",
   "private": true,
-  "description": "Dedicated R2-backed Worker serving filament.autumated.com/showcase/* (isolated from the main app Worker).",
+  "description": "Dedicated R2-backed Worker serving tunlion.autumated.com/showcase/* (isolated from the main app Worker).",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev"

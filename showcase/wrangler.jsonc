@@ -1,11 +1,11 @@
 {
   // ── Filament Showcase Worker ────────────────────────────────────────────────
   // A *dedicated, isolated* Worker that serves the dev-effort + reels showcase at
-  //   https://filament.autumated.com/showcase/*
+  //   https://tunlion.autumated.com/showcase/*
   // backed entirely by R2 (zero egress, no big mp4s in git or the app's dist).
   //
   // This Worker is INTENTIONALLY separate from the main `filament` app Worker.
-  // The main app is bound to the *whole hostname* filament.autumated.com via a
+  // The main app is bound to the *whole hostname* tunlion.autumated.com via a
   // Worker Custom Domain. This Worker attaches a zone route for the more-specific
   // path pattern `/showcase/*`, which Cloudflare resolves ahead of the catch-all
   // Custom Domain for that path only. `/` and the SPA keep hitting `filament`,
@@ -27,7 +27,7 @@
   // /showcase/* is captured here; everything else stays on the main app.
   "routes": [
     {
-      "pattern": "filament.autumated.com/showcase/*",
+      "pattern": "tunlion.autumated.com/showcase/*",
       "zone_name": "autumated.com"
     }
   ]

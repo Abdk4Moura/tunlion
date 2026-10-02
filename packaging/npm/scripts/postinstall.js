@@ -65,7 +65,7 @@ async function main() {
   const tgt = target()
   if (!tgt) {
     console.error(`filament: no prebuilt binary for ${process.platform}/${process.arch}.`)
-    console.error('Install another way: https://filament.autumated.com  or  cargo install filament-cli')
+    console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   }
   const asset = `filament-${tgt.t}.${tgt.ext}`
@@ -94,7 +94,7 @@ async function main() {
     console.log(`filament: installed ${TAG} for ${tgt.t}`)
   } catch (e) {
     console.error(`filament: install failed — ${e.message}`)
-    console.error('Install another way: https://filament.autumated.com  or  cargo install filament-cli')
+    console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })

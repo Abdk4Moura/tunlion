@@ -4,7 +4,7 @@
     {
       "path": "cli/tests/ack-loss-repro.sh",
       "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/294",
+      "issue": "https://github.com/Abdk4Moura/tunlion/issues/294",
       "owner": "chief-ux",
       "expires": "2026-10-15"
     },
@@ -219,12 +219,12 @@
       "path": "cli/tests/livelock-nat-gates.sh",
       "disposition": "retired",
       "reason": "Its netns/coturn transport lab was never committed and does not exist (the script exits 2 without it), so it cannot run here or in CI. Its deterministic content lives in the cargo unit test link_dead_and_live_predicates_encode_246_without_suppressing_disconnected_recovery (cli/src/tests.rs), and its own header disclaims its end-to-end half as a verdict: it only reddens under box load. Issue #246 is closed.",
-      "reference": "https://github.com/Abdk4Moura/filament/issues/246"
+      "reference": "https://github.com/Abdk4Moura/tunlion/issues/246"
     },
     {
       "path": "cli/tests/mount-gates.sh",
       "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/318",
+      "issue": "https://github.com/Abdk4Moura/tunlion/issues/318",
       "owner": "pi-director",
       "expires": "2026-10-18"
     },
@@ -243,7 +243,7 @@
       "path": "cli/tests/nat-cone-gate.sh",
       "disposition": "retired",
       "reason": "Its probe proves only endpoint-independent MAPPING, which is not a cone NAT (cone also requires endpoint-independent filtering, which Linux MASQUERADE does not provide), and its hole-punch transfer assertion has never passed on any NAT topology in this emulation. The mapping-probe harness survives as natprobe-test.sh.",
-      "reference": "https://github.com/Abdk4Moura/filament/issues/134"
+      "reference": "https://github.com/Abdk4Moura/tunlion/issues/134"
     },
     {
       "path": "cli/tests/natprobe-test.sh",
@@ -339,7 +339,7 @@
       "path": "cli/tests/stun-server.py",
       "disposition": "retired",
       "reason": "Its only consumer was the retired nat-cone-gate.sh emulation.",
-      "reference": "https://github.com/Abdk4Moura/filament/issues/134"
+      "reference": "https://github.com/Abdk4Moura/tunlion/issues/134"
     },
     {
       "path": "cli/tests/transport-gates.sh",
@@ -540,7 +540,7 @@
     {
       "path": "cli/tests/reach-until-direct-gates.sh",
       "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/316",
+      "issue": "https://github.com/Abdk4Moura/tunlion/issues/316",
       "owner": "claude-advisor",
       "expires": "2026-10-18"
     }

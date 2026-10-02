@@ -8,7 +8,7 @@ NestedInstallerFiles:
     PortableCommandAlias: filament
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/Abdk4Moura/filament/releases/download/cli-v0.2.1-beta.25/filament-x86_64-pc-windows-msvc.zip
+    InstallerUrl: https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.2.1-beta.25/filament-x86_64-pc-windows-msvc.zip
     InstallerSha256: "db32499a24f34d621f5c9422b627c6d8d6564ce93fab0d38bb6df73b3326c19a"
 Dependencies:
   PackageDependencies:

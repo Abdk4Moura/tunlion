@@ -5,13 +5,13 @@ services**: nothing binds the host's public web ports, the image is built in CI
 (no build load on the droplet), every container is resource-capped, and the api
 scales up/down in seconds.
 
-- **Frontend** — static on Cloudflare Pages (`filament.autumated.com`).
+- **Frontend** — static on Cloudflare Pages (`tunlion.autumated.com`).
 - **API** — Flask signaling, reached via a **Cloudflare Tunnel** (no open ports).
 - **Redis** — shared room registry + Socket.IO message queue (lets the api scale).
 - **coturn** — self-hosted STUN/TURN (`turn.filament.autumated.com:3478`).
 
 ```
-   browser ───── static SPA ─────► Cloudflare Pages (filament.autumated.com)
+   browser ───── static SPA ─────► Cloudflare Pages (tunlion.autumated.com)
       │
       │  REST + Socket.IO          ┌─────────── droplet (165.22.207.231) ───────────┐
       │  api.filament.autumated.com│  cloudflared ──► api ×N ──► redis               │
@@ -26,7 +26,7 @@ scales up/down in seconds.
 - `api.filament.autumated.com` → **created automatically** by the tunnel. Don't make it.
 - `turn.filament.autumated.com` → **A record → `165.22.207.231`, DNS-only (grey
   cloud)**. The only manual record (UDP can't go through the tunnel).
-- `filament.autumated.com` → added as a custom domain in the Pages project.
+- `tunlion.autumated.com` → added as a custom domain in the Pages project.
 - Firewall: open **`3478/tcp+udp`**, **`443/tcp+udp`** (TURN fallback) and
   **`49160-49200/udp`** (coturn) on the
   droplet / DO cloud firewall. Nothing else.
@@ -40,7 +40,7 @@ Zero Trust → Networks → Tunnels → **Create a tunnel** (named, e.g. `filame
 
 ## 2. Bring the stack up on the droplet (one-time)
 ```bash
-sudo git clone https://github.com/Abdk4Moura/filament.git /opt/filament
+sudo git clone https://github.com/Abdk4Moura/tunlion.git /opt/filament
 cd /opt/filament/deploy
 cp .env.example .env
 # edit .env: paste CF_TUNNEL_TOKEN, set FIL_SECRET + FIL_TURN_SECRET
@@ -58,7 +58,7 @@ New Pages project from the repo:
 - Build command: `cd frontend && npm install && npm run build`
 - Output directory: `backend/dist`
 - Env var: `VITE_FILAMENT_API = https://api.filament.autumated.com`
-- After first deploy, add custom domain `filament.autumated.com`.
+- After first deploy, add custom domain `tunlion.autumated.com`.
 Pages rebuilds on every push; `_redirects` handles SPA deep links.
 
 ## 4. Auto-deploy the backend (GitHub Actions)
@@ -102,7 +102,7 @@ controller at `./scale.sh`, or move to an orchestrator (Swarm/Nomad/k8s HPA) —
 the Redis groundwork here makes the api ready for it.
 
 ## 6. Verify end-to-end
-1. Open `https://filament.autumated.com` in two devices — tiles appear.
+1. Open `https://tunlion.autumated.com` in two devices — tiles appear.
 2. Send a file.
 3. Route badge: `LAN` / `P2P` / `RELAY`. Force a relay across two networks to
    exercise coturn.

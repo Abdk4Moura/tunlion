@@ -1,9 +1,9 @@
 # AlternativeTo listing — ready to paste
 
 **Name:** Filament
-**URL:** https://filament.autumated.com
+**URL:** https://tunlion.autumated.com
 **Category:** File Sharing / File Transfer
-**License:** Open Source (GitHub: https://github.com/Abdk4Moura/filament)
+**License:** Open Source (GitHub: https://github.com/Abdk4Moura/tunlion)
 **Platforms:** Web (works on Android, iPhone, Mac, Windows, Linux — any browser)
 
 **Short description (tagline field):**
