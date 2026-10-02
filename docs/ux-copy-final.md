@@ -38,11 +38,11 @@ integration step (owner: orchestrator, after the security core lands).
 
 ---
 
-# SURFACE 1 — `filament mint` guided form + danger microcopy
+# SURFACE 1 — `tunlion mint` guided form + danger microcopy
 
 ### 1a. Header (all key types)
 ```
-  filament mint — a key that lets a machine join, scoped and expiring   [Brand]
+  tunlion mint — a key that lets a machine join, scoped and expiring   [Brand]
 ```
 
 ### 1b. Key-type picker (first screen)
@@ -117,25 +117,25 @@ Best-effort honesty (shown only when reuse ≠ once and no audience pinned):
 ```
   ✓ Minted. Share this with the machine that's joining:                          [Ok]
 
-       filament join clever-lynx-63-brave-otter                                  [Bold]
+       tunlion join clever-lynx-63-brave-otter                                  [Bold]
 
   ● fleet key · once · expires 14:38 (in 1h) · shell                             [Dim]
-  ↳ filament mint --fleet --ttl 1h --reuse once --allow shell                    [Dim]
+  ↳ tunlion mint --fleet --ttl 1h --reuse once --allow shell                    [Dim]
 ```
 
 ### 1g. Headless / non-TTY errors (all `Err` glyph, fix line `Dim`)
 ```
 ✗ --shell is not a flag. Shell is deliberate access.
-  To grant it on purpose:  filament mint --fleet --ttl 1h --allow shell
+  To grant it on purpose:  tunlion mint --fleet --ttl 1h --allow shell
 ```
 ```
 ✗ mint needs a key type in non-interactive mode.
-  filament mint --fleet | --external <peer> | --ci
+  tunlion mint --fleet | --external <peer> | --ci
   (add --ttl; for external, at least one --allow)
 ```
 ```
 ✗ --yes will not enable a deliberate option you didn't name.
-  Say it explicitly:  filament mint --fleet --ttl 1h --allow reuse --yes
+  Say it explicitly:  tunlion mint --fleet --ttl 1h --allow reuse --yes
 ```
 ```
 ✗ external keys expire within 24h (this key type's ceiling).
@@ -172,7 +172,7 @@ Best-effort honesty (shown only when reuse ≠ once and no audience pinned):
 Success:
 ```
   ✓ pixel-7 joined your fleet.                                                    [Ok]
-  ↳ filament pair --fleet --name pixel-7                                          [Dim]
+  ↳ tunlion pair --fleet --name pixel-7                                          [Dim]
 ```
 
 ### 2c. SOMEONE-ELSE banner (full-width rules + text = `Warn`)
@@ -226,7 +226,7 @@ Shell row reuses the type-`SHELL`-to-confirm interaction from 1d. Success:
 ### 2f. Non-TTY `pair` (must not open a form)
 ```
 ✗ pair is interactive (it needs the spoken-words step). For automation, mint a key instead:
-  filament mint --external carol --ttl 1h --allow transfer
+  tunlion mint --external carol --ttl 1h --allow transfer
 ```
 
 ---
@@ -246,17 +246,17 @@ Shell row reuses the type-`SHELL`-to-confirm interaction from 1d. Success:
 
   ◐ NEEDS REVIEW  — paired before scoped trust; promote to sort into a tier      [Warn]
      ◐ old-laptop     offline    (full legacy trust)        promote to continue
-       ↳ filament devices promote old-laptop                                     [Dim]
+       ↳ tunlion devices promote old-laptop                                     [Dim]
 
-  2 requests waiting · filament requests                                         [Dim]
+  2 requests waiting · tunlion requests                                         [Dim]
   This is a local index; each device's own capability list is authoritative.     [Dim]
 ```
 
 ### 3b. `devices` — empty
 ```
   No devices yet.
-  Add your own:     filament pair             (run on both, same identity)
-   Let someone in:   filament mint --external <them> --ttl 1h --allow transfer
+  Add your own:     tunlion pair             (run on both, same identity)
+   Let someone in:   tunlion mint --external <them> --ttl 1h --allow transfer
 ```
 
 ### 3c. `devices` — degraded / no-primary-online (calm + dated)
@@ -295,15 +295,15 @@ Once lapsed (dimmed "left" line, not deleted, for one listing):
   1   ○ carol  wants to  send you files                                          [Dim index / Warn ○]
          asked 3m ago · via one-time word "amber-lantern-ferry"
          fingerprint 7f3a 9c21… [compare]
-         [ filament requests approve 1 ]   [ filament requests deny 1 ]
+         [ tunlion requests approve 1 ]   [ tunlion requests deny 1 ]
 
   2   ○ dave   wants to  open a shell ⚠                                          [Warn on the cap]
          asked 18m ago · introduced by carol
          ⚠ this is deliberate access — a real terminal on this machine           [Warn]
-          [ filament requests approve 2 ]   [ deny 2 ]
+          [ tunlion requests approve 2 ]   [ deny 2 ]
 
-  Nothing pushes to you yet — check `filament requests`, or wire a hook:          [Dim]
-    filament requests --notify 'notify-send %s'   (also: webhook, email)
+  Nothing pushes to you yet — check `tunlion requests`, or wire a hook:          [Dim]
+    tunlion requests --notify 'notify-send %s'   (also: webhook, email)
 ```
 
 ### 3g. `requests` — empty
@@ -314,7 +314,7 @@ Once lapsed (dimmed "left" line, not deleted, for one listing):
 ### 3h. `requests approve` — deliberate guard
 ```
 ✗ request 2 asks for shell — deliberate access. Name it and bound it:
-  filament requests approve 2
+  tunlion requests approve 2
 ```
 Safe approve success:
 ```
@@ -350,12 +350,12 @@ After ack — ≥2-primaries nudge (consequence-framed, non-blocking):
 ```
   ✓ Saved. Now make sure you're never one dead device from lockout:              [Ok]
      ✓ this device (primary)
-     ○ add a second primary:  filament pair --fleet   (strongly recommended)     [Warn ○ / Dim]
+     ○ add a second primary:  tunlion pair --fleet   (strongly recommended)     [Warn ○ / Dim]
 ```
 
 ### 4b. `restore` — loss-vs-theft honesty, user CHOOSES posture (load-bearing)
 ```
-  filament restore — recover your identity from your 12 words                     [Brand]
+  tunlion restore — recover your identity from your 12 words                     [Brand]
 
   Enter your 12 recovery words:  harbor velvet cinder …▌
 
@@ -369,7 +369,7 @@ If LOST:
   ✓ Recovering. Your new device is now a primary.                               [Ok]
   7-day pending window: if an old device is still out there, it can object.       [Dim]
   Bring any old primary online to confirm instantly.
-  ↳ filament identity rotate   (optional — replaces the old key sooner)          [Dim]
+  ↳ tunlion identity rotate   (optional — replaces the old key sooner)          [Dim]
 ```
 If STOLEN — the honest truth:
 ```
@@ -379,9 +379,9 @@ If STOLEN — the honest truth:
     already holds. There is no server to phone; no global kill-switch exists (by design).
 
     What you CAN do right now:
-      • filament revoke <device>   tell your OTHER devices to stop trusting the stolen one
+      • tunlion revoke <device>   tell your OTHER devices to stop trusting the stolen one
                                    (takes effect as each one is reached; bounded by cert expiry)
-      • filament identity rotate   move to a new key; devices re-verify on next contact
+      • tunlion identity rotate   move to a new key; devices re-verify on next contact
 
     What actually closes the door: guardians. If you'd set 3-of-5 guardians, they
     could co-sign a revocation the thief can't stop. Without them, revoke + rotate
@@ -398,7 +398,7 @@ Posture choice (user OWNS it):
 ### 4c. Guardians — revoke / install split (for when we add it)
 Install is easy + reversible; a guardian ACTING is slow + loud.
 ```
-  filament identity guardians — people who can co-sign your recovery              [Brand]
+  tunlion identity guardians — people who can co-sign your recovery              [Brand]
 
   ● Installed  (3 of 5 — tolerates 2 offline)                                     [Brand]
      ● bff        added in person        ● sister     added in person
@@ -412,7 +412,7 @@ Guardian ACTING (recovery request) — deliberately slow + notified:
 ```
   ⚠ A recovery for YOUR identity was requested from a new device.                [Warn]
      Started: Aug 3 · Activates: Aug 10 (7-day hold) unless you cancel.
-     Not you?  filament identity freeze   — stops it cold; the new device gets nothing.
+     Not you?  tunlion identity freeze   — stops it cold; the new device gets nothing.
      It's you? Ask your guardians to co-sign, or bring an old primary online.
 ```
 Removing a guardian:

@@ -10,7 +10,7 @@
 ## 1. The goal: ACL-grade expressiveness, no central file
 
 Tailscale ACLs express "who can reach what on which port" via a central JSON
-file. filament rejects the central file and the port model. This note extends
+file. tunlion rejects the central file and the port model. This note extends
 the existing edge-local owner-signed capability model so it matches Tailscale
 on expressiveness (groups, tags, wildcards, subject-to-object rules) and beats
 it on legibility via semantic actions (`shell`, `mount`, `forward`, `gpu-run`)
@@ -183,7 +183,7 @@ Group with special semantics:
 ### 4.3 True `*` (mesh-add)
 
 A grant targeting `*` (anyone who can reach this resource) is weighty and
-rare. filament has no tailnet boundary, so `*` means anyone on the mesh who
+rare. tunlion has no tailnet boundary, so `*` means anyone on the mesh who
 can resolve a path to you.
 
 ```
@@ -211,10 +211,10 @@ Properties:
 
 ### 4.4 What `*` is NOT
 
-- Not a mesh-join shortcut. Mesh-join (`filament serve-tun`) grants L3 IP
+- Not a mesh-join shortcut. Mesh-join (`tunlion serve-tun`) grants L3 IP
   reach and is a separate, coarser trust tier (see the WG mesh boundary in
   `capability.rs`). A `*` capability grant does not confer mesh join.
-- Not a tailnet. `*` on filament is `*` on the public mesh. If the mesh has
+- Not a tailnet. `*` on tunlion is `*` on the public mesh. If the mesh has
   10k nodes and you grant `* shell`, every one of them can `shell` you. The
   blast radius is honest and loud.
 
@@ -270,12 +270,12 @@ in the capability store (`caps.json`), same lifecycle as `cap_grant` entries:
 
 ## 7. Multi-owner and the boundary
 
-filament capabilities are edge-local and owner-signed. A Group contains only
+tunlion capabilities are edge-local and owner-signed. A Group contains only
 members the owner chose. A Tag binding is only asserted by the tag's owner. No
 third party can add you to a group or tag your resource.
 
 **Out of scope (stated explicitly):** a third-party admin authoring global
-policy over resources they do not own. In filament, only the resource owner
+policy over resources they do not own. In tunlion, only the resource owner
 grants access. Multi-owner central authoring is the enterprise envelope (task
 #6, demand-pulled, built last). Single-owner fleet ergonomics come from groups
 and tags. An org admin who wants to enforce "every device tagged `prod` must
@@ -382,7 +382,7 @@ grants apply to CI runners.
   SYNC path insert an unverified `cap_group`, `cap_tag`, or
   `cap_tag_binding`? If yes, resolution-time verification is mandatory
   (security-critical). If no (all insertion paths go through verify-then-store),
-  resolution-time verification is defense-in-depth. This is for filament-0x1
+  resolution-time verification is defense-in-depth. This is for tunlion-0x1
   (owns apply_cap_op) and claude-advisor to settle. Until resolved, the safe
   posture is resolution-time verify.
 - **Group-as-contact-book auto-population.** Should the auto-contacts group be

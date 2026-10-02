@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render Filament's transport matrix + session state machine as PNGs."""
+"""Render Tunlion's transport matrix + session state machine as PNGs."""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -48,7 +48,7 @@ def newfig(w, h, title):
     return fig, ax
 
 # ============================================================ 1. MATRIX
-fig, ax = newfig(13, 8, "Filament — transport per client pair (who speaks what)")
+fig, ax = newfig(13, 8, "Tunlion — transport per client pair (who speaks what)")
 ax.text(50, 92, "WebRTC is the browser's constraint, not the CLI's", ha="center", color=MUT, fontsize=11)
 
 brow = box(ax, 22, 80, 30, 9, "BROWSER\nWebRTC only — sandboxed, no raw sockets", AMB_F, AMB_E, AMB_T, 10)
@@ -97,7 +97,7 @@ def stub(ax, a, b, label="", color=RED_E, tc=RED_T, left=False):
         ax.text((sx+ex)/2, y1+1.6, label, ha="center", va="center", color=tc,
                 fontsize=8, family="DejaVu Sans", zorder=4)
 
-fig, ax = newfig(15, 13, "Filament — the session state machine (every state a client can be in)")
+fig, ax = newfig(15, 13, "Tunlion — the session state machine (every state a client can be in)")
 ax.text(50, 95.5, "vertical spine = the happy path   ·   red stubs = divergence (tel-watch.py)   ·   green = terminal-good",
         ha="center", color=MUT, fontsize=10)
 

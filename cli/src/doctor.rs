@@ -1,19 +1,19 @@
-// `filament doctor`: an on-demand local probe that shows WHERE SSH/L2 connect
+// `tunlion doctor`: an on-demand local probe that shows WHERE SSH/L2 connect
 // establishment is slow or stalls. Two modes:
 //
-//   * `filament doctor <device>`  -> run the establish-then-drop probe
+//   * `tunlion doctor <device>`  -> run the establish-then-drop probe
 //     (l2::establish_probe) and print the per-phase ladder + a one-line verdict.
 //     `--repeat N` / `--watch` run it many times and print a distribution (the
 //     key tool for the intermittent "fails on the first try" case). `--json`
 //     emits the timings + verdict for scripting.
 //
-//   * `filament doctor`           -> environment preflight + history: signaling
+//   * `tunlion doctor`           -> environment preflight + history: signaling
 //     reachability (timed GET /api/config), one STUN binding (srflx + class),
 //     local interfaces (flagging a tailscale/vpn confounder), and a digest of
 //     the local diag.jsonl (diag::summarize). `--json` emits the whole report.
 //
 // It reuses the SAME diag phases/budgets a real connect records (over_budget,
-// budget_ms), so a probe ladder matches what a live `filament ssh` would hit.
+// budget_ms), so a probe ladder matches what a live `tunlion ssh` would hit.
 // It is purely additive: it changes no wire framing or control messages.
 
 use crate::diag::{self, Phase};
@@ -72,7 +72,7 @@ async fn probe_mode(
     let mut outcomes = Vec::with_capacity(runs as usize);
     for i in 0..runs {
         if !json_out {
-            ui::say(&format!("filament doctor: probe {}/{} to '{device}'...", i + 1, runs));
+            ui::say(&format!("tunlion doctor: probe {}/{} to '{device}'...", i + 1, runs));
         }
         let outcome = crate::l2::establish_probe(server, device, relay).await?;
         if !json_out {
@@ -143,10 +143,10 @@ fn verdict(o: &crate::l2::ProbeOutcome) -> Verdict {
 }
 
 /// Render one probe's phase ladder + verdict to stdout (the house style: an
-/// aligned, colored listing like `filament devices`).
+/// aligned, colored listing like `tunlion devices`).
 fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
     println!();
-    println!("{}", ui::paint(Tone::Bold, &format!("filament doctor: probe to '{device}'")));
+    println!("{}", ui::paint(Tone::Bold, &format!("tunlion doctor: probe to '{device}'")));
     println!();
     // Column widths: phase label (longest is "establishing" = 12) + time.
     for t in &o.timings {
@@ -167,7 +167,7 @@ fn print_ladder(device: &str, o: &crate::l2::ProbeOutcome) {
             }
         }
     }
-    // The path the link actually took: same fine detail as `filament ping` so the
+    // The path the link actually took: same fine detail as `tunlion ping` so the
     // diagnosis names the interface + endpoints, not just the timings.
     if let Some(p) = &o.path {
         println!("  {:<13} {:>6}  {}", "path", "", fmt_path(p));
@@ -222,7 +222,7 @@ fn print_distribution(device: &str, outcomes: &[crate::l2::ProbeOutcome]) {
     println!();
     println!(
         "{}",
-        ui::paint(Tone::Bold, &format!("filament doctor: {n} probes to '{device}'"))
+        ui::paint(Tone::Bold, &format!("tunlion doctor: {n} probes to '{device}'"))
     );
     println!();
 
@@ -378,7 +378,7 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     }
 
     println!();
-    println!("{}", ui::paint(Tone::Bold, "filament doctor: environment preflight"));
+    println!("{}", ui::paint(Tone::Bold, "tunlion doctor: environment preflight"));
     println!();
 
     // Signaling.
@@ -463,7 +463,7 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
 
 fn print_history(h: &diag::Summary) {
     if h.considered == 0 {
-        println!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (run `filament doctor <device>` or connect once)"));
+        println!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (run `tunlion doctor <device>` or connect once)"));
         return;
     }
     println!("  attempts     {}", h.considered);
@@ -605,7 +605,7 @@ fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
     o[0] == 100 && (64..=127).contains(&o[1])
 }
 
-/// Coarse class for a bare IP. `filament ping`/`doctor` path display reuses the
+/// Coarse class for a bare IP. `tunlion ping`/`doctor` path display reuses the
 /// doctor's taxonomy so "public"/"private (RFC1918)"/"CGNAT (100.64/10)" read
 /// identically everywhere. (Tailscale hands out CGNAT addresses, so a local end
 /// in 100.64/10 on a `tailscale0` interface is the tailnet, stated as data.)

@@ -1,24 +1,24 @@
-"""fil_relay.py — the userspace TUN<->TCP bridge for the `filament` carrier.
+"""fil_relay.py — the userspace TUN<->TCP bridge for the `tunlion` carrier.
 
-Run as a standalone process (one per node), spawned by the filament provider. It
-bridges ONE node's TUN device to a TCP socket; filament's L2 forward/netcat moves
+Run as a standalone process (one per node), spawned by the tunlion provider. It
+bridges ONE node's TUN device to a TCP socket; tunlion's L2 forward/netcat moves
 the TCP bytes between the two nodes' relays. Length-prefix framing (primitive
 `frame`) delimits packets on the byte stream.
 
 Why a separate process / why setns: the TUN fd must be opened INSIDE the node's
-netns, but the TCP socket must reach the filament processes in the HOST netns
+netns, but the TCP socket must reach the tunlion processes in the HOST netns
 localhost. So this process opens the TUN by momentarily entering the node netns
 (setns), then does its socket I/O in the host netns. No veth-to-host, so host
 networking is never modified.
 
 Two roles:
   --role listen  : bind 127.0.0.1:<port> and accept ONE connection (node-b side;
-                   filament's `up` acceptor dials this as the forward target).
-  --role connect : connect to 127.0.0.1:<port> (node-a side; filament `forward`
+                   tunlion's `up` acceptor dials this as the forward target).
+  --role connect : connect to 127.0.0.1:<port> (node-a side; tunlion `forward`
                    listens there).
 
-This is the L2-FORWARD APPROXIMATION of an L3 filament tunnel. The TODO is to
-replace the whole TCP-stream hop with a native `filament serve_tun` that carries
+This is the L2-FORWARD APPROXIMATION of an L3 tunlion tunnel. The TODO is to
+replace the whole TCP-stream hop with a native `tunlion serve_tun` that carries
 IP packets directly on the data channel (see lab/README.md).
 """
 
@@ -126,7 +126,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, required=True)
     args = ap.parse_args()
 
-    # The TUN fd is opened ONCE and reused across reconnects. The filament L2
+    # The TUN fd is opened ONCE and reused across reconnects. The tunlion L2
     # link can drop + re-establish (e.g. a transient direct-quic reconnect on
     # rapid bring-up); when it does, the local TCP socket dies and we must wire a
     # FRESH one to the new stream — keeping the TUN so the node never loses its

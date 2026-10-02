@@ -1,7 +1,7 @@
 //! Kernel-WireGuard L3 carrier for `serve-tun --wireguard` (ADR-0001 data plane).
 //!
-//! filament owns identity, authentication and reachability; WireGuard moves the
-//! bytes. The flow: filament first establishes its normal authenticated
+//! tunlion owns identity, authentication and reachability; WireGuard moves the
+//! bytes. The flow: tunlion first establishes its normal authenticated
 //! (channel-bound) connection, then each side generates a Curve25519 WireGuard
 //! keypair and swaps {public key, WG listen-port} over that authenticated stream.
 //! With the peer's key and endpoint in hand, a kernel WireGuard interface carries
@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 /// Deliberately quiet and cheap: it creates and immediately removes a probe
 /// interface, which is the only way to learn whether the module and the
 /// capability are both present without waiting for a real failure mid-session.
-/// The interface filament manages. One device carries every peer, as WireGuard
+/// The interface tunlion manages. One device carries every peer, as WireGuard
 /// intends: peers are distinguished by public key and allowed-ips, not by device.
 pub const WG_DEV: &str = "filament-wg";
 
@@ -133,7 +133,7 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
     ip(&["link", "set", "dev", dev, "up"]).with_context(|| format!("bring {dev} up"))?;
 
     // If 51820 was taken the set above failed; retry on an ephemeral port so a
-    // second filament on the same host still works, just unforwardably.
+    // second tunlion on the same host still works, just unforwardably.
     if Command::new("wg").args(["show", dev, "listen-port"]).output().map(|o| !o.status.success()).unwrap_or(true) {
         let mut child = Command::new("wg")
             .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "0"])
@@ -177,7 +177,7 @@ pub fn configure_peer(
     // whole establish down with it.
     if let Err(e) = ip(&["addr", "add", addr_cidr, "dev", dev]) {
         // BOTH wordings. iproute2 says "File exists" for IPv4 and "address
-        // already assigned" for IPv6, and filament's overlay is an IPv6 ULA, so
+        // already assigned" for IPv6, and tunlion's overlay is an IPv6 ULA, so
         // matching only the IPv4 phrasing meant every retry and every second
         // peer failed here and took the whole adopt down with it.
         let msg = e.to_string();
@@ -229,7 +229,7 @@ pub async fn adopt_peer(
     // DIRECT FIRST: kernel to kernel, no userspace in the data path at all.
     //
     // This is the point of using kernel WireGuard. Routing frames through
-    // filament's transport keeps the crypto in the kernel but puts a userspace
+    // tunlion's transport keeps the crypto in the kernel but puts a userspace
     // hop back in the path, which inherits the very thing WireGuard is here to
     // escape. So the peer's real endpoint is tried first, and the relay exists
     // only for the case where it cannot work.

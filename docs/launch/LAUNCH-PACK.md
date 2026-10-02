@@ -1,4 +1,4 @@
-# Filament — Final Launch Pack (paste-ready)
+# Tunlion — Final Launch Pack (paste-ready)
 
 Everything below is final and meant to be pasted as-is. The HN and Reddit
 sections contain no em dashes on purpose. CLI is at v0.2.0 stable with a
@@ -12,7 +12,7 @@ Source: https://github.com/Abdk4Moura/tunlion
 **Title (paste this exact line):**
 
 ```
-Show HN: Filament - P2P file sharing that shows the route your bytes take
+Show HN: Tunlion - P2P file sharing that shows the route your bytes take
 ```
 
 **URL field:**
@@ -23,7 +23,7 @@ https://tunlion.autumated.com
 
 **Text field (paste as-is):**
 
-Filament sends files directly between two browsers over WebRTC. No upload, no
+Tunlion sends files directly between two browsers over WebRTC. No upload, no
 account, no size limit. Devices on the same WiFi find each other automatically.
 Across networks you pair with a one-time spoken code ("clever-lynx-63") that
 burns on first use, so an overheard code is worthless.
@@ -89,7 +89,7 @@ https://abdk4moura.github.io/post.html?post=webrtc-file-transfer-failures.md
 **Title (paste this exact line):**
 
 ```
-Filament: self-hostable P2P file drop with visible routing (LAN/P2P/RELAY), resumable transfers, and one-time pairing codes
+Tunlion: self-hostable P2P file drop with visible routing (LAN/P2P/RELAY), resumable transfers, and one-time pairing codes
 ```
 
 **Flair:** Release
@@ -99,7 +99,7 @@ Filament: self-hostable P2P file drop with visible routing (LAN/P2P/RELAY), resu
 I revived an old project of mine into something I now use daily with my family,
 and it is fully self-hostable, so I am sharing it here.
 
-Filament is browser-to-browser file transfer over WebRTC. Same-WiFi devices
+Tunlion is browser-to-browser file transfer over WebRTC. Same-WiFi devices
 discover each other automatically. Across networks you pair with a one-time
 spoken code ("clever-lynx-63") that burns after a single use. Files are never
 uploaded anywhere. They go direct peer to peer, with your own coturn as the
@@ -145,7 +145,7 @@ the real project.
 **Name:**
 
 ```
-Filament
+Tunlion
 ```
 
 **URL:**
@@ -168,7 +168,7 @@ no upload, no app, no account, no size limit.
 
 **Full description (paste as-is):**
 
-Filament transfers files straight between two browsers. Devices on the same WiFi
+Tunlion transfers files straight between two browsers. Devices on the same WiFi
 discover each other automatically (like AirDrop, but cross-platform). Devices on
 different networks pair with a one-time spoken code that works exactly once.
 Files never touch a server: they stream peer to peer over an encrypted WebRTC
@@ -192,16 +192,16 @@ No registration · No file size limit · Peer-to-peer · End-to-end encrypted tr
 ```
 
 **Verification of each "alternative to" claim:**
-- Snapdrop / PairDrop: same-WiFi browser file drop. Filament does this plus
+- Snapdrop / PairDrop: same-WiFi browser file drop. Tunlion does this plus
   cross-network burn codes and resume. Defensible.
-- AirDrop / Quick Share: local device-to-device sharing. Filament is the
+- AirDrop / Quick Share: local device-to-device sharing. Tunlion is the
   cross-platform browser equivalent. Defensible (Quick Share dropped from the
   paste line to keep it tight; add it back if you want).
 - Send Anywhere: code-based cross-device transfer. Direct analog. Defensible.
-- WeTransfer: link-based file sending. Filament is the no-upload, no-link,
+- WeTransfer: link-based file sending. Tunlion is the no-upload, no-link,
   no-account counterpart. Defensible (positioned as the opposite model, which is
   the selling point).
-- magic-wormhole / croc: code-phrase peer-to-peer transfer. Filament's pitch is
+- magic-wormhole / croc: code-phrase peer-to-peer transfer. Tunlion's pitch is
   that the other end can be a browser with nothing installed. Defensible.
 
 ---
@@ -224,7 +224,7 @@ property if you want the blog post indexed there.
 - [ ] For the blog deep-dive
       (`https://abdk4moura.github.io/post.html?post=webrtc-file-transfer-failures.md`),
       request indexing under the **abdk4moura.github.io** property, not the
-      filament one. Note: it is a query-string route off post.html, so Google may
+      tunlion one. Note: it is a query-string route off post.html, so Google may
       index it slowly; the canonical page is post.html.
 
 Sitemap/robots status: PRESENT (not missing). robots.txt allows all and points
@@ -244,7 +244,7 @@ no change is needed there.
 - Swapped the failure-mode link from the in-repo `docs/resilience.md` to the
   live blog URL in the first comment and in the Reddit body, per the launch
   plan; the Show HN body keeps the narrative and defers the link to the comment.
-- Did NOT add `filament pair` or remembered-devices as a selling point. Those
+- Did NOT add `tunlion pair` or remembered-devices as a selling point. Those
   are v0.2.1-beta features, and the drafts lean on the stable one-time burn
   codes; promoting beta features as stable was explicitly out of scope.
 - Added the CLI version reality (v0.2.0 stable, v0.2.1-beta available) and the

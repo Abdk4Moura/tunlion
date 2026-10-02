@@ -6,7 +6,7 @@
 #   • Media + the page live in Cloudflare R2 (bucket: filament-showcase).
 #   • A dedicated Worker (filament-showcase) serves them at
 #       https://tunlion.autumated.com/showcase/*
-#     via a zone route — the main `filament` app Worker is never touched.
+#     via a zone route — the main `tunlion` app Worker is never touched.
 #   • Publishing == uploading objects to R2. No app/Worker redeploy needed.
 #
 # What it does:
@@ -75,19 +75,19 @@ build_page() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Filament — build log &amp; reels</title>
-<meta name="description" content="What shipped this session on Filament: web-shell, device sheet, sessions dock, ⌘K palette, tile-interaction v2, PWA self-update, and the GPU job-runner — each with a real reel.">
+<title>Tunlion — build log &amp; reels</title>
+<meta name="description" content="What shipped this session on Tunlion: web-shell, device sheet, sessions dock, ⌘K palette, tile-interaction v2, PWA self-update, and the GPU job-runner — each with a real reel.">
 <link rel="stylesheet" href="showcase.css">
 </head>
 <body>
 <header class="masthead">
   <div class="wrap">
-    <div class="kicker">filament · build log</div>
+    <div class="kicker">tunlion · build log</div>
     <h1>Shipped this session <span class="cursor"></span></h1>
     <p class="lede">
-      A run of UI and runtime work on <strong>Filament</strong> — the
+      A run of UI and runtime work on <strong>Tunlion</strong> — the
       peer-to-peer device mesh. Every claim below is backed by a real reel:
-      Playwright driving the actual app against real filament peers (real PAKE
+      Playwright driving the actual app against real tunlion peers (real PAKE
       pairing, real PTYs, real WebRTC). Recordings are webm→mp4, GPU-encoded.
     </p>
     <div class="meta">
@@ -118,11 +118,11 @@ HTMLHEAD
     echo '  </section>'
   }
 
-  # ── "What you can do with filament" — the use-case JOURNEY suite. ───────────
+  # ── "What you can do with tunlion" — the use-case JOURNEY suite. ───────────
   # Real user stories (persona → journey → reel), each enacted with REAL peers,
   # recorded live, with an ergonomics step-counter burned into the footage. This
   # section leads (it's the "why"); the feature/e2e reels below are the "how".
-  echo '  <section class="entry wide journeys"><div class="entry-head"><span class="tag">what you can do</span><h2>What you can do with filament</h2></div><p class="caption">Real people, real tasks, real peers — each journey is enacted in the actual app against genuine filament CLI peers, recorded as it runs, with an ergonomics step-counter (&ldquo;paired once · 1 drag · auto-healed 1 blip&rdquo;) burned into the reel so the EASE is visible, not just claimed.</p></section>'
+  echo '  <section class="entry wide journeys"><div class="entry-head"><span class="tag">what you can do</span><h2>What you can do with tunlion</h2></div><p class="caption">Real people, real tasks, real peers — each journey is enacted in the actual app against genuine tunlion CLI peers, recorded as it runs, with an ergonomics step-counter (&ldquo;paired once · 1 drag · auto-healed 1 blip&rdquo;) burned into the reel so the EASE is visible, not just claimed.</p></section>'
 
   # Maya — motion designer (café → home)
   echo '  <section class="entry wide persona"><div class="entry-head"><span class="tag">persona · maya</span><h2>Maya — motion designer (café → home)</h2></div><p class="caption">Big exports, a flaky café uplink, a render box at home.</p></section>'
@@ -242,7 +242,7 @@ HTMLHEAD
   cat <<HTMLFOOT
 </main>
 <footer class="wrap foot">
-  <span>Filament — p2p device mesh.</span>
+  <span>Tunlion — p2p device mesh.</span>
   <span class="muted">page + media served from Cloudflare R2 · generated ${gendate}</span>
 </footer>
 </body>
@@ -369,4 +369,4 @@ done
 
 echo
 echo "✓ published. Live at: $SITE_URL"
-echo "  (the main filament app on / is untouched — separate Worker + route.)"
+echo "  (the main tunlion app on / is untouched — separate Worker + route.)"

@@ -23,19 +23,19 @@ set -uo pipefail
 # PINNED OUT OF THE SHARED CARGO_TARGET_DIR: a concurrent build in another
 # checkout has silently replaced a rig binary mid-run before, which makes every
 # number after it a measurement of something else.
-BIN=${FILAMENT_BIN:-/tmp/sr-bin/filament}
+BIN=${FILAMENT_BIN:-/tmp/sr-bin/tunlion}
 WANT_SHA=${WANT_SHA:-}
 PEER=${PEER:-interserver-0x0}
-LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/filament}   # drives the remote PTY
+LOCAL_BIN=${LOCAL_BIN:-$HOME/.local/bin/tunlion}   # drives the remote PTY
 W=/tmp/wgx; MYNAME=wgx-owner
-RBIN=/tmp/sr-peer-bin/filament; RDIR=/tmp/wgx-peer
+RBIN=/tmp/sr-peer-bin/tunlion; RDIR=/tmp/wgx-peer
 FAIL=0
 
 say()  { printf '\n=== %s\n' "$*"; }
 ok()   { printf '  PASS  %s\n' "$*"; }
 bad()  { printf '  FAIL  %s\n' "$*"; FAIL=1; }
 
-# Remote execution over filament's native PTY.
+# Remote execution over tunlion's native PTY.
 # SENTINEL-DELIMITED, not tail -1: a PTY echoes the command and the prompt, so
 # positional extraction reads the prompt as the answer.
 # CR STRIPPED: a PTY sends CRLF, so "UNREACHABLE\r" != "UNREACHABLE" and every
@@ -47,7 +47,7 @@ rsh() {
         | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\x1b\]3008;[^\\]*\\//g; s/\r//g')
   printf '%s\n' "$out" | awk '/__B__/{f=1;next} /__E__/{f=0} f' | grep -vE '^\s*$'
 }
-# NEVER `export` FILAMENT_CONFIG_DIR: rsh drives the REAL local filament, the
+# NEVER `export` FILAMENT_CONFIG_DIR: rsh drives the REAL local tunlion, the
 # only thing that can reach the peer at all. Pointing it at the throwaway config
 # breaks every remote step in a way that looks like a network fault.
 own() { ip netns exec srr env FILAMENT_CONFIG_DIR="$W/rtr" "$BIN" "$@"; }
@@ -198,11 +198,11 @@ if ip netns exec srr wg show filament-wg >/dev/null 2>&1; then
   ip netns exec srr wg show filament-wg 2>/dev/null | grep -E "endpoint|allowed ips|handshake|transfer" | sed 's/^/    /'
   [ "${P:-0}" -ge 1 ] && ok "a peer is configured" || bad "no peer on the interface"
   # WHICH PATH won matters as much as whether one did: a 127.0.0.1 endpoint means
-  # frames are taking a userspace hop through filament, which is the thing kernel
+  # frames are taking a userspace hop through tunlion, which is the thing kernel
   # WireGuard is meant to avoid.
   EP=$(ip netns exec srr wg show filament-wg endpoints 2>/dev/null | awk '{print $2}' | head -1)
   case "$EP" in
-    127.0.0.1:*) echo "  path: RELAY (via filament transport, one userspace hop)" ;;
+    127.0.0.1:*) echo "  path: RELAY (via tunlion transport, one userspace hop)" ;;
     "")          echo "  path: unknown (no endpoint)" ;;
     *)           echo "  path: DIRECT kernel-to-kernel ($EP)" ;;
   esac
@@ -222,7 +222,7 @@ fi
 say "RESULT"
 if [ "$FAIL" = "0" ]; then
   echo "  ALL CHECKS PASSED"
-  echo "  A WireGuard tunnel between two machines, keyed over filament's own"
+  echo "  A WireGuard tunnel between two machines, keyed over tunlion's own"
   echo "  authenticated QUIC connection, with a completed handshake."
 else
   echo "  SOME CHECKS FAILED"

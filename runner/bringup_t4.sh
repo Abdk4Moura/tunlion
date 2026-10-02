@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# filament job-runner — T4 BRING-UP (SSH-FREE).
+# tunlion job-runner — T4 BRING-UP (SSH-FREE).
 #
 # Paste this on a fresh, ephemeral Tesla T4 (Colab-style, glibc 2.35, no inbound
-# SSH) to turn it into a filament job-runner NODE. It installs only what jobs
-# need, drops the STATIC musl `filament` binary (a dynamic binary won't run on the
+# SSH) to turn it into a tunlion job-runner NODE. It installs only what jobs
+# need, drops the STATIC musl `tunlion` binary (a dynamic binary won't run on the
 # T4's glibc), plants the pairing secrets, and starts the box-side din acceptor +
 # the FILE-DRIVEN WATCHER. It NEVER installs openssh/sshd (that shuts the box down).
 #
 # CONTROL PLANE: file-driven (watcher.py), NOT an interactive PTY. The watcher
-# polls the inbox for a job spec + its inputs, runs the job, and `filament send
+# polls the inbox for a job spec + its inputs, runs the job, and `tunlion send
 # --relay`s the manifest + outputs back to the host on the dout channel. This
 # survives the unstable Colab->do-vm WAN link that killed the v1 PTY control
 # session (see docs/runner/jobrunner-challenges.md). The `ctl` PTY is DEPRECATED;
@@ -20,11 +20,11 @@
 #
 # ---------------------------------------------------------------------------
 # WHAT YOU PROVIDE (env or edit the CONFIG block):
-#   FILJOB_SERVER   signaling server (default: the public filament server)
+#   FILJOB_SERVER   signaling server (default: the public tunlion server)
 #   SEC_CTL/SEC_DIN/SEC_DOUT   the three 64-hex pair secrets shared with the host
 #       (generate with:  openssl rand -hex 32   — run THREE times on the host,
 #        give the same three to both sides; keep them secret).
-#   FILAMENT_URL    URL to fetch the static musl binary (or place ./filament next
+#   FILAMENT_URL    URL to fetch the static musl binary (or place ./tunlion next
 #                   to this script / set FILAMENT_BIN to an existing path).
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -43,7 +43,7 @@ HOST_DOUT_NAME="${HOST_DOUT_NAME:-host-out}"
 
 ROOT_DIR="${FILJOB_ROOT:-$HOME/filament-jobs}"
 INBOX="$ROOT_DIR/.inbox"
-BIN="${FILAMENT_BIN:-$ROOT_DIR/filament}"
+BIN="${FILAMENT_BIN:-$ROOT_DIR/tunlion}"
 FILAMENT_URL="${FILAMENT_URL:-}"          # optional: fetch the static binary
 INSTALL_RCLONE="${INSTALL_RCLONE:-0}"      # 1 to install rclone for R2 durability
 # ===========================================================================
@@ -79,40 +79,40 @@ else
   log "WARNING: h264_nvenc not listed by ffmpeg — NVENC jobs will fail; CPU jobs still work"
 fi
 
-# --- 2. the static filament binary -----------------------------------------
+# --- 2. the static tunlion binary -----------------------------------------
 if [ ! -x "$BIN" ]; then
   if [ -n "$FILAMENT_URL" ]; then
-    log "fetching static filament binary from $FILAMENT_URL"
-    dl="$ROOT_DIR/.filament.dl"
+    log "fetching static tunlion binary from $FILAMENT_URL"
+    dl="$ROOT_DIR/.tunlion.dl"
     curl -fsSL "$FILAMENT_URL" -o "$dl"
     # Standard release assets are .tar.gz; the one-off asset is a raw binary.
     # Detect and handle BOTH (tar -tzf succeeds only on a real gzip tarball).
     if tar -tzf "$dl" >/dev/null 2>&1; then
-      log "  asset is a tarball — extracting the filament binary"
+      log "  asset is a tarball — extracting the tunlion binary"
       tar -xzf "$dl" -C "$ROOT_DIR"
-      f="$(find "$ROOT_DIR" -maxdepth 2 -type f -name filament 2>/dev/null | head -1)"
-      [ -n "$f" ] || { log "ERROR: no 'filament' binary inside the tarball"; exit 1; }
+      f="$(find "$ROOT_DIR" -maxdepth 2 -type f -name tunlion 2>/dev/null | head -1)"
+      [ -n "$f" ] || { log "ERROR: no 'tunlion' binary inside the tarball"; exit 1; }
       mv "$f" "$BIN"
     else
       mv "$dl" "$BIN"
     fi
     rm -f "$dl"
     chmod +x "$BIN"
-  elif [ -x "$(dirname "$0")/filament" ]; then
-    cp "$(dirname "$0")/filament" "$BIN"; chmod +x "$BIN"
+  elif [ -x "$(dirname "$0")/tunlion" ]; then
+    cp "$(dirname "$0")/tunlion" "$BIN"; chmod +x "$BIN"
   else
-    log "ERROR: no filament binary. Build it on the host with:"
+    log "ERROR: no tunlion binary. Build it on the host with:"
     log "  cargo build --release --target x86_64-unknown-linux-musl"
-    log "then host it (FILAMENT_URL) or copy it next to this script as ./filament"
+    log "then host it (FILAMENT_URL) or copy it next to this script as ./tunlion"
     exit 1
   fi
 fi
 # verify it actually runs on this glibc (static-pie => should always run)
-"$BIN" --version >/dev/null 2>&1 || { log "ERROR: filament binary does not run here (not static?)"; exit 1; }
-log "filament binary OK: $("$BIN" --version 2>/dev/null | head -1)"
+"$BIN" --version >/dev/null 2>&1 || { log "ERROR: tunlion binary does not run here (not static?)"; exit 1; }
+log "tunlion binary OK: $("$BIN" --version 2>/dev/null | head -1)"
 
-# put filament on PATH (the watcher invokes `filament send` for results)
-ln -sf "$BIN" /usr/local/bin/filament 2>/dev/null || true
+# put tunlion on PATH (the watcher invokes `tunlion send` for results)
+ln -sf "$BIN" /usr/local/bin/tunlion 2>/dev/null || true
 
 # --- 2b. deliver the box-side python (watcher + executor) -------------------
 # The watcher runs the job and ships results; it imports box_executor for the
@@ -158,13 +158,13 @@ PY
 
 # --- 4. start the din acceptor + the FILE-DRIVEN WATCHER (NO sshd, NO PTY) ---
 # din    : up --dir   -> receives the pushed job spec + inputs into the inbox.
-# watcher: polls the inbox, runs jobs, `filament send --relay`s results on dout.
+# watcher: polls the inbox, runs jobs, `tunlion send --relay`s results on dout.
 # The dout channel needs NO daemon on the box: the watcher only `send`s on it
 # (the host stands up the dout sink transiently while awaiting results).
 # Kill only PREVIOUSLY-tracked processes via their pid files — never pkill -f on
 # a pattern that also appears in THIS script's own command line (when the script
 # is run via `bash -c "$(curl …)"`, the whole script text is the process argv, so
-# a `pkill -f "filament up …cfg-din"` would match and SIGTERM this very process).
+# a `pkill -f "tunlion up …cfg-din"` would match and SIGTERM this very process).
 for p in "$ROOT_DIR/ctl.pid" "$ROOT_DIR/din.pid" "$ROOT_DIR/watcher.pid"; do
   [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true
 done
@@ -172,7 +172,7 @@ sleep 1
 
 log "starting din acceptor (--relay -> $INBOX)"
 # P2 (GAP-2): run the acceptor DIRECTLY — no up_supervisor.sh wrapper. As of
-# filament v0.2.1-beta.5 the long-lived `up --dir` SELF-RECOVERS in-core after a
+# tunlion v0.2.1-beta.5 the long-lived `up --dir` SELF-RECOVERS in-core after a
 # signaling drop (an outer reconnect loop re-dials + re-announces presence), so the
 # severed-acceptor zombie that needed proactive restarting is closed in the binary.
 # Proven by runner/sim/signaling_drop_test.sh (baseline with the loop reverted
@@ -192,7 +192,7 @@ log "watcher up — pid $(cat "$ROOT_DIR/watcher.pid"), log: $ROOT_DIR/watcher.l
 
 # --- 4b. OPS SHELL (debug/inspection ONLY — not the job control plane) -------
 # A small `up --shell --relay` acceptor on the ctl channel so an operator can
-# `filament pty box` into the node to inspect it (logs, manifests, nvidia-smi,
+# `tunlion pty box` into the node to inspect it (logs, manifests, nvidia-smi,
 # disk). This is deliberately separate from job control — jobs still run over the
 # robust file-driven watcher; this is just a human/ops door. `--relay` for
 # stability over flaky NAT. Disable with FILJOB_OPS_SHELL=0.
@@ -202,7 +202,7 @@ if [ "${FILJOB_OPS_SHELL:-1}" != "0" ]; then
     nohup "$BIN" up --server "$FILJOB_SERVER" --shell --relay --name-as filjob-box-ops \
     --dir "$ROOT_DIR/ctldrop" >"$ROOT_DIR/ctl.log" 2>&1 &
   echo $! > "$ROOT_DIR/ctl.pid"
-  log "ops shell up — pid $(cat "$ROOT_DIR/ctl.pid")  (host: filament pty box --relay)"
+  log "ops shell up — pid $(cat "$ROOT_DIR/ctl.pid")  (host: tunlion pty box --relay)"
 fi
 
 sleep 3
@@ -210,7 +210,7 @@ log "din acceptor + watcher up. logs: $ROOT_DIR/din.log  $ROOT_DIR/watcher.log"
 log "node ready. On the HOST, point FileRunnerBox / runner_cli at:"
 log "  remote_inbox = $INBOX     (host pushes job+inputs here via din)"
 log "  host-cfg knows box-in (din); dout-cfg is the host results sink (box-out)"
-log "DONE — this box is now a file-driven filament job-runner node (no SSH, no PTY)."
+log "DONE — this box is now a file-driven tunlion job-runner node (no SSH, no PTY)."
 
 # --- 5. keep the launching cell alive (persistence) -------------------------
 # Colab-style cells stay alive only while the foreground command runs. Tail the

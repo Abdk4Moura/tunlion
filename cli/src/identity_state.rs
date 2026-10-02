@@ -177,13 +177,13 @@ pub(crate) fn owner_cap_header() -> Option<Value> {
 ///
 /// #241: `reach DGMFA` on a name that had never been paired reported
 /// "unreachable, gave up at the establishing phase (~0ms) — DGMFA may be
-/// offline, or not running `filament up`". It described a lookup miss as a
+/// offline, or not running `tunlion up`". It described a lookup miss as a
 /// reachability outcome and sent the user to go and check a machine that was
 /// not in their store. The `~0ms` was the tell: it gave up instantly because
 /// there was nothing to look up.
 ///
 /// The realistic case is a stale name, not a typo. A device that existed before
-/// a `filament reset` and came back under a different name is exactly what
+/// a `tunlion reset` and came back under a different name is exactly what
 /// someone reaches for.
 ///
 /// This is #221 in another verb. That one was fixed for `send --to` and left
@@ -206,11 +206,11 @@ pub(crate) fn require_known_device(name: &str) -> Result<()> {
     }
     if known.is_empty() {
         bail!(
-            "no device named '{name}'. You have not paired any devices yet: `filament add` to pair one"
+            "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
         );
     }
     bail!(
-        "no device named '{name}'. Known devices: {}\n  filament devices   to see them\n  filament add       to pair a new one",
+        "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
         known.join(", ")
     )
 }

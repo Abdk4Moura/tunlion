@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """filament-native job runner — host side.
 
-A thin compute-job orchestration layer on top of filament's existing P2P
+A thin compute-job orchestration layer on top of tunlion's existing P2P
 transport (PTY + file channel). It lets us offload a declared compute job (e.g.
 an NVENC transcode) to a remote filament-reachable box and get artifacts back —
 WITHOUT the ad-hoc remote-shell pattern. The host pushes a job *spec* plus a
@@ -26,12 +26,12 @@ on for stability. This replaces the v1 PTY control plane that hung on the flaky
 Colab->do-vm link (docs/runner/jobrunner-challenges.md).
 
 LEGACY (PTY control, DEPRECATED for WAN) — `RunnerBox`, kept for reference/local
-parity. A filament "device" is a pair secret; a petname is a local alias. It used
+parity. A tunlion "device" is a pair secret; a petname is a local alias. It used
 THREE channels, each with exactly one acceptor:
 
-  ctl  : box `up --shell`        ; host `filament pty`   (control — DROPS on a flaky link)
-  din  : box `up --dir <inbox>`  ; host `filament send`  (push inputs)
-  dout : host `up --dir <outbox>`; box  `filament send`  (pull outputs)
+  ctl  : box `up --shell`        ; host `tunlion pty`   (control — DROPS on a flaky link)
+  din  : box `up --dir <inbox>`  ; host `tunlion send`  (push inputs)
+  dout : host `up --dir <outbox>`; box  `tunlion send`  (pull outputs)
 
 The file-driven path REUSES the same din/dout secrets — `ctl` is simply unused,
 so no re-pairing is needed when moving off the PTY.
@@ -50,7 +50,7 @@ API
     rb.fetch(job, local_output_dir="/path/for/outputs")    # pull declared outputs + manifest.json
     manifest = rb.manifest(job)                             # the recorded manifest dict
 
-Stdlib-only on the host side too (uses subprocess to drive the `filament` CLI).
+Stdlib-only on the host side too (uses subprocess to drive the `tunlion` CLI).
 
 P4 RETIREMENT NOTE (transport-resilience §P4 / GAP-5): the host-side whole-file
 sha256 cross-check + the `ack-<job_id>` push that pairs with watcher.py's re-ship
@@ -143,13 +143,13 @@ class RunnerBox:
         petname_dout: str,
         server: str,
         host_config_dir: str,
-        filament_bin: str = "filament",
+        filament_bin: str = "tunlion",
         # petnames as the BOX knows them (for the box-side `send --to <host>`):
         box_petname_for_host_dout: str = "host-out",
         remote_jobs_root: str = "~/filament-jobs",
         remote_inbox: str = "~/filament-jobs/.inbox",
         # box-side config dir holding ONLY the dout secret — used by the PTY
-        # `filament send` so it doesn't share a channel with the ctl daemon.
+        # `tunlion send` so it doesn't share a channel with the ctl daemon.
         box_dout_config_dir: str = "~/.filament-dout",
         remote_python: str = "python3",
         connect_grace_s: float = 4.0,
@@ -174,7 +174,7 @@ class RunnerBox:
         self._sess_t = None
         self._sess_get = None
 
-    # ---- low-level filament invocations ----------------------------------
+    # ---- low-level tunlion invocations ----------------------------------
 
     def _env(self, extra=None, config_dir=None):
         env = dict(os.environ)
@@ -189,7 +189,7 @@ class RunnerBox:
         return env
 
     def _send(self, paths, to, timeout=300):
-        """filament send <paths> --to <to> (host is initiator)."""
+        """tunlion send <paths> --to <to> (host is initiator)."""
         cmd = [self.bin, "send", *paths, "--to", to, "--server", self.server]
         r = subprocess.run(cmd, env=self._env(), capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
@@ -446,7 +446,7 @@ class RunnerBox:
         """Pull declared outputs + manifest.json back over the dout file channel.
 
         The host stands up a transient `up` acceptor on the dout channel; the box
-        (over the ctl PTY) runs `filament send <outputs> manifest.json --to <host>`."""
+        (over the ctl PTY) runs `tunlion send <outputs> manifest.json --to <host>`."""
         os.makedirs(local_output_dir, exist_ok=True)
         dcfg = dout_config_dir or (self.cfg + "-dout")
         scratch = self.remote_scratch(job)
@@ -457,7 +457,7 @@ class RunnerBox:
         send_cmd = (
             f"cd {scratch} && "
             f"FILAMENT_CONFIG_DIR={self.box_dout_config_dir} FILAMENT_L2=1 "
-            f"filament send {quoted} --to {shlex.quote(self.box_host_dout)} "
+            f"tunlion send {quoted} --to {shlex.quote(self.box_host_dout)} "
             f"--server {shlex.quote(self.server)} && echo FILJOB_FETCH_OK"
         )
 
@@ -510,7 +510,7 @@ class RunnerBox:
                         if up.poll() is not None:
                             break
                         continue
-                    if b"filament up" in line or b"known device" in line:
+                    if b"tunlion up" in line or b"known device" in line:
                         break
                 time.sleep(1.0)  # small settle margin after subscribe
                 # the transfer time is independent of the job's compute timeout
@@ -584,7 +584,7 @@ class RunnerBox:
 # FileRunnerBox uses ONLY discrete file transfers, which the diagnosis proved
 # survive the drops (they retry/resume and the bytes land):
 #
-#   submit : `filament send --relay` job<id>.json + inputs -> box inbox (din).
+#   submit : `tunlion send --relay` job<id>.json + inputs -> box inbox (din).
 #            A box-side watcher.py picks the job up, runs it, and sends results.
 #   await  : stand up a transient `up --dir <results> --relay` sink (host-dout
 #            config) and POLL for manifest.json (which the box sends LAST) + the
@@ -610,7 +610,7 @@ class FileRunnerBox:
         server: str,
         host_config_dir: str,        # host config (knows box-in for the `send`)
         host_dout_config_dir: str,   # host dout sink config (knows `box-out`)
-        filament_bin: str = "filament",
+        filament_bin: str = "tunlion",
         remote_inbox: str = "~/filament-jobs/.inbox",  # informational
         relay: bool = True,          # force TURN relay for WAN robustness
         send_timeout_s: int = 1800,
@@ -774,13 +774,13 @@ class FileRunnerBox:
             except (FileNotFoundError, IsADirectoryError, PermissionError):
                 pass
 
-        # SUPERVISED dout SINK: the filament socket.io client is reconnect(false),
+        # SUPERVISED dout SINK: the tunlion socket.io client is reconnect(false),
         # so on a flaky link a long-lived `up` sink can be severed and zombie out —
         # then the box's resends have nothing to land on and await would hang to the
         # deadline. We instead RESTART the sink on a cadence (and immediately if it
         # dies), so a fresh, re-announcing sink is always available within
         # sink_cadence_s. Restarting `up --dir` is idempotent (it just receives into
-        # local_output_dir; filament keeps partials), and the integrity gate below
+        # local_output_dir; tunlion keeps partials), and the integrity gate below
         # still guarantees we only accept a complete, sha256-correct set.
         import threading as _threading
         stop_sink = _threading.Event()

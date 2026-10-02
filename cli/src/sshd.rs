@@ -2,11 +2,11 @@ use anyhow::{bail, Result};
 use std::path::Path;
 
 const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
-const FILAMENT_MARKER: &str = "# Added by filament for L3 overlay access";
+const FILAMENT_MARKER: &str = "# Added by tunlion for L3 overlay access";
 
 /// Configure sshd to listen on the L3 overlay addresses AND localhost.
 /// Appends ListenAddress entries for both IPv6 and IPv4 overlay addresses,
-/// plus 127.0.0.1 and ::1 so `filament ssh` (which dials localhost via the
+/// plus 127.0.0.1 and ::1 so `tunlion ssh` (which dials localhost via the
 /// L2 tunnel) continues to work. Without the localhost entries, sshd's
 /// default all-interfaces listen is REPLACED by the explicit overlay entries
 /// and localhost becomes unreachable (a regression).
@@ -104,7 +104,7 @@ pub fn is_configured() -> bool {
     content.contains(FILAMENT_MARKER)
 }
 
-const SSHD_CA_MARKER: &str = "# Added by filament for SSH certificates (shell --ssh)";
+const SSHD_CA_MARKER: &str = "# Added by tunlion for SSH certificates (shell --ssh)";
 /// Default location of the CA public key the TrustedUserCAKeys line points at.
 /// (The operator places the daemon's CA pub here out of band.)
 pub const SSHD_CA_PUB_DEFAULT: &str = "/etc/ssh/filament_ca.pub";
@@ -365,12 +365,12 @@ mod tests {
     fn ca_block_is_a_daemon_user_match_with_both_lines() {
         let block = render_sshd_ca_block(
             Path::new("/etc/ssh/filament_ca.pub"),
-            "filament",
+            "tunlion",
             Path::new("/etc/ssh/filament_principals/%u"),
         );
         assert_eq!(
             block,
-            "\n# Added by filament for SSH certificates (shell --ssh)\nMatch User filament\n    TrustedUserCAKeys /etc/ssh/filament_ca.pub\n    AuthorizedPrincipalsFile /etc/ssh/filament_principals/%u\n"
+            "\n# Added by tunlion for SSH certificates (shell --ssh)\nMatch User tunlion\n    TrustedUserCAKeys /etc/ssh/filament_ca.pub\n    AuthorizedPrincipalsFile /etc/ssh/filament_principals/%u\n"
         );
     }
 

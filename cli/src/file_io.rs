@@ -106,7 +106,7 @@ pub(crate) fn parse_duration_secs(input: &str) -> Result<u64> {
     Ok(seconds)
 }
 
-/// CLI handler for `filament ephemeral`
+/// CLI handler for `tunlion ephemeral`
 pub(crate) fn parse_mint_ttl(raw: &str) -> Result<u64> {
     let raw = raw.trim().to_ascii_lowercase();
     let (number, unit) = raw.split_at(

@@ -1,16 +1,16 @@
 //! Tests for warm one-shot shell (native PTY) behavior.
 //!
-//! These tests verify that `filament shell <peer> -- cmd` reuses the daemon's
+//! These tests verify that `tunlion shell <peer> -- cmd` reuses the daemon's
 //! held warm link and returns without redundant cold establish.
 
 use std::process::Command;
 
-/// Get the path to the filament binary built with test-hooks feature.
+/// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
-    path.push("filament");
+    path.push("tunlion");
     path
 }
 
@@ -31,7 +31,7 @@ fn one_shot_pty_timeout_respects_env_var() {
         .arg("echo")
         .arg("hi")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
     let elapsed = start.elapsed();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -71,7 +71,7 @@ fn one_shot_pty_instant_eof_cold_path() {
         .arg("hi")
         .stdin(std::process::Stdio::null()) // instant stdin-EOF
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
     let elapsed = start.elapsed();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -117,7 +117,7 @@ fn one_shot_pty_stdin_forwarding() {
         .arg("cat")
         .stdin(std::process::Stdio::piped())
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 

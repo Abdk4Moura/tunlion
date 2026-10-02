@@ -3,7 +3,7 @@
 #
 # Proves the baseline for every available carrier and asserts ZERO leaks after
 # teardown. Safe: everything is in lab-prefixed namespaces; the host, the running
-# filament daemon, and ~/.config/filament are never touched.
+# tunlion daemon, and ~/.config/tunlion are never touched.
 #
 #   sudo lab/tests/test_e2e.sh            # all carriers
 #   sudo lab/tests/test_e2e.sh pipe wg    # a subset
@@ -12,7 +12,7 @@ set -uo pipefail
 LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAB="$LAB_DIR/lab"
 TOPO=two-nodes
-CARRIERS=("${@:-pipe udp wg filament}")
+CARRIERS=("${@:-pipe udp wg tunlion}")
 read -ra CARRIERS <<< "${CARRIERS[*]}"
 
 if [[ "$(id -u)" -ne 0 ]]; then

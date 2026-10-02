@@ -60,7 +60,7 @@ jobs:
           # PINNED = the manifest schema version our templates target, read from
           # the template itself so this never drifts out of sync with the files.
           pinned=$(grep -oE 'winget-manifest\.installer\.[0-9]+\.[0-9]+\.[0-9]+' \
-            packaging/winget/Abdk4Moura.Filament.installer.yaml.tmpl \
+            packaging/winget/Abdk4Moura.Tunlion.installer.yaml.tmpl \
             | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
           # LATEST = newest manifest schema microsoft/winget-cli publishes.
           latest=$(gh api repos/microsoft/winget-cli/contents/schemas/JSON/manifests \

@@ -2,7 +2,7 @@
 
 The lab is built to be **careful**: everything is sandboxed in network
 namespaces, teardown is leak-free even after a crash, and the host / live
-filament are never touched. This runbook is the operational contract.
+tunlion are never touched. This runbook is the operational contract.
 
 ## Hard invariants (never violated)
 
@@ -10,9 +10,9 @@ filament are never touched. This runbook is the operational contract.
    `lab-`-prefixed netns, applied via `ip netns exec`. The only host-namespace
    operations are `ip netns add/del` and creating a veth pair that is
    *immediately* moved into the lab namespaces.
-2. **Never touch the live system.** Not the running `filament up` daemon, not
-   `~/.local/bin/filament`, not `~/.config/filament`, not the live site/T4. The
-   `filament` link uses the **locally-built** `cli/target/release/filament` and
+2. **Never touch the live system.** Not the running `tunlion up` daemon, not
+   `~/.local/bin/tunlion`, not `~/.config/tunlion`, not the live site/T4. The
+   `tunlion` link uses the **locally-built** `cli/target/release/tunlion` and
    **isolated** `FILAMENT_CONFIG_DIR` identities under `.state/logs/<lab>/`.
 3. **Root only where needed.** netns/tun/wg require root; `lab doctor` and every
    `up` check it and fail clearly otherwise.
@@ -59,12 +59,12 @@ ls lab/.state/*.json                       # expect: no ledgers for torn-down la
   for ns in $(ls /var/run/netns | grep '^lab-'); do sudo ip netns del "$ns"; done
   for i in $(ip -br link | awk '{print $1}' | grep -E '^lab(tun|u-|wg)'); do sudo ip link del "$i"; done
   pkill -f 'fil_relay.py'; pkill -f 'udp_relay.py'
-  # isolated filament endpoints (lab only — NEVER the real daemon):
+  # isolated tunlion endpoints (lab only — NEVER the real daemon):
   pkill -f 'FILAMENT_CONFIG_DIR=.*\.state/logs'
   rm -f lab/.state/*.json
   ```
-- **Confirm the real daemon is untouched:** `filament status` should still show
-  the live `up` daemon (its pid in `~/.config/filament/up.pid`). The lab's
+- **Confirm the real daemon is untouched:** `tunlion status` should still show
+  the live `up` daemon (its pid in `~/.config/tunlion/up.pid`). The lab's
   isolated endpoints never write there.
 
 ## Faults are namespaced too

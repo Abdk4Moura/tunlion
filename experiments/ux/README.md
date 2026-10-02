@@ -1,28 +1,28 @@
-# Filament CLI — visual UX test harness
+# Tunlion CLI — visual UX test harness
 
 > **New: the e2e TEST + live-record pipeline (`pipeline.sh`).** A flag-controlled,
 > async, GPU-aware pipeline that drives the **REAL built app** against **REAL
-> local filament peers** (no mock seams) — real PAKE pairing typed into the real
+> local tunlion peers** (no mock seams) — real PAKE pairing typed into the real
 > pair box, real PTYs over the data channel, live Playwright video → mp4 reels. It
 > is a TEST first (nonzero exit on any failure). Entry point: `make e2e` (or
 > `./pipeline.sh --help`). See **[README.pipeline.md](README.pipeline.md)** for the
 > real-peer model, flags, quality tiers, async, and workflow integration. The
 > cli↔cli/cli↔web GIF harness below (`run.sh`) is the older recorder and still works.
 
-A self-contained, human-watchable test harness for the Filament CLI's user-facing
-flows. Each scenario drives the **real** `/root/.local/bin/filament` against a
+A self-contained, human-watchable test harness for the Tunlion CLI's user-facing
+flows. Each scenario drives the **real** `/root/.local/bin/tunlion` against a
 **local** signaling backend and asserts an invariant (sha256 of transferred
 bytes, mutual device recognition, stored caps, remote command output), never a
 bare exit code. Recording is strictly optional: the default `./run.sh` is
 **verify-only** (no asciinema recorder, so presentation can never change a
 verdict); `UX_RECORD=1 ./run.sh` also records casts and builds the gallery.
 
-The harness is **self-safe**: every `filament` call points at a throwaway
+The harness is **self-safe**: every `tunlion` call points at a throwaway
 `FILAMENT_CONFIG_DIR` under `/tmp/ux`, each backend runs on a free loopback port
 (base 8071+, skipping ports other tenants own) and carries the marker
 `FIL_UX_RIG=1`, and teardown kills **only** processes this harness started
 (tracked children + backends bearing that marker). The user's real
-`~/.config/filament`, their running `filament up` daemon, the Vite dev servers on
+`~/.config/tunlion`, their running `tunlion up` daemon, the Vite dev servers on
 5180/5181, and a gallery server on 8095 are never touched.
 
 ## Run it
@@ -94,7 +94,7 @@ Open `gallery/index.html` to see every flow with its caption and PASS/FAIL badge
 | **Playwright 1.52 + chromium** | drive the web app, record the tab as webm | `npm i` in this dir; `npx playwright install chromium` (cached under `~/.cache/ms-playwright`) |
 | **ffmpeg** | webm → GIF (palette), side-by-side `hstack` compose | system package |
 | **gifsicle 1.94** | final lossy + `-O3` optimize pass on the composed GIF | `apt-get install gifsicle` |
-| **Filament backend** | local signaling server (eventlet) on port 8077 | repo `backend/app.py`, run from a venv python; frontend rebuilt same-origin with `VITE_FILAMENT_API=` |
+| **Tunlion backend** | local signaling server (eventlet) on port 8077 | repo `backend/app.py`, run from a venv python; frontend rebuilt same-origin with `VITE_TUNLION_API=` |
 
 ## Scenarios
 
@@ -105,7 +105,7 @@ Open `gallery/index.html` to see every flow with its caption and PASS/FAIL badge
 | 03 | cli↔cli | `send --word` one-time code → `receive <full code>`; bytes sha256-verified end-to-end |
 | 04 | cli↔cli | `send --to` a known device: no code, auto-accepted, whole-file sha256 verified |
 | 05 | cli↔cli | always-on receiver `up` / `status` / `down`, with a paired send into it; bytes verified |
-| 06 | cli↔cli | `grant shell` (deny-by-default consent) then `shell --ssh` over the data-channel tunnel. **Currently FAILS on the shipping 0.8.5 binary**: `shell --ssh`'s ProxyCommand calls `filament netcat`, which is not a verb in 0.8.5 (product bug; the grant half works). |
+| 06 | cli↔cli | `grant shell` (deny-by-default consent) then `shell --ssh` over the data-channel tunnel. **Currently FAILS on the shipping 0.8.5 binary**: `shell --ssh`'s ProxyCommand calls `tunlion netcat`, which is not a verb in 0.8.5 (product bug; the grant half works). |
 | 11 | cli↔cli | live pairing: a device `add`ed MID-SESSION while the always-on `up` daemon runs is picked up live, no restart; real ceremony writes the store |
 | 12 | cli↔cli | `down` targets ONE daemon: a system-managed and a user-managed daemon coexist (own units, distinct config dirs); `down -y` for one config dir stops only that daemon, the other survives untouched. Requires root; verification-only, not a gallery cast. |
 | 08 | cli↔web | CLI sends → the web app accepts the offer and reaches the download (save) affordance (moving to Playwright, new-renewer) |
@@ -157,7 +157,7 @@ failures, no leftover-process starvation between runs. Raise `JOBS` / shrink
 >   `backend_start` retries on a fresh port if a boot is starved; and a
 >   per-scenario `cleanup_all` only kills its **own** backend (a suite-wide marker
 >   sweep runs once, at the very end — never while siblings are live).
-> - All `filament` invocations are `timeout -k 5`-boxed so a `receive`/`send` that
+> - All `tunlion` invocations are `timeout -k 5`-boxed so a `receive`/`send` that
 >   ignores SIGTERM (rejoin-window linger) gets SIGKILLed and can't hang the suite.
 > - The decoupled scenarios' verdicts always come from their no-recorder verify
 >   passes, so a wedged cast never produces a wrong PASS/FAIL.
@@ -177,7 +177,7 @@ twice over (a no-recorder verify pass **and** a best-effort visual pass).
   backend + config root + room, so the suite finishes near the slowest scenario
   (09's solo tail) rather than the sum. `SEQUENTIAL=1` falls back to one-at-a-time.
 - **Event waits, not blind sleeps** — scenarios now wait on deterministic signals
-  (the `filament up —` ready banner, `receive`'s `● listening` line, the sender's
+  (the `tunlion up —` ready banner, `receive`'s `● listening` line, the sender's
   `code <word>` line, the sshd port opening) via the `wait_for` / `wait_log`
   helpers in `rig/lib.sh`, instead of fixed `sleep 3/4`. Faster and less flaky.
 - **`FILAMENT_REJOIN_SECS` low** (set to 2–3 in the scenarios) — a completed
@@ -241,11 +241,11 @@ These are real product behaviors the harness surfaced (not harness bugs):
 2. **`receive -y` lingers** the full rejoin window after a completed transfer when
    the sender disconnects first — no prompt-exit on success. Slows demos; needs a
    low `FILAMENT_REJOIN_SECS` or an outer `timeout`.
-3. **`filament devices` does not surface granted capabilities.** You can't see
+3. **`tunlion devices` does not surface granted capabilities.** You can't see
    which devices hold `shell` without reading `devices.json` by hand.
 4. **`shell --ssh` is broken in the shipping 0.8.5 binary.** Its ProxyCommand
-   invokes `filament netcat <peer> <port>`, and `netcat` is not a verb in the
-   0.8.5 surface (`filament netcat` → "unknown command or device"). sc_06's
+   invokes `tunlion netcat <peer> <port>`, and `netcat` is not a verb in the
+   0.8.5 surface (`tunlion netcat` → "unknown command or device"). sc_06's
    grant half works; the ssh half cannot pass until the product fixes the
    ProxyCommand to a current raw-stream verb.
 5. **Single-host CLI↔browser WebRTC is unusable without disabling chromium mDNS,**

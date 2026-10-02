@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Live-pairing regression gate (C12).
 #
-# THE BUG: `filament up` loads the known-devices roster ONCE at startup and
+# THE BUG: `tunlion up` loads the known-devices roster ONCE at startup and
 # subscribes to each device's presence channel then. A device paired into the
-# shared store by a SEPARATE `filament pair` process AFTER the daemon is already
+# shared store by a SEPARATE `tunlion pair` process AFTER the daemon is already
 # running was never picked up — the daemon never subscribed to the new device's
 # channel, so the "known device 'X' appeared — connecting" flow never fired for
 # it and that device could not connect (no transfer, no web-shell) until the
@@ -27,14 +27,14 @@
 #
 #   ./live-pairing-gate.sh
 #
-# Honors: FILAMENT_BIN (default cli/target/release/filament),
+# Honors: FILAMENT_BIN (default cli/target/release/tunlion),
 #         FILAMENT_TEST_SERVER (else autostarts a local backend),
 #         FILAMENT_TEST_VENV (python with flask_socketio+eventlet).
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 SERVER="${FILAMENT_TEST_SERVER:-}"
 WORK="$(mktemp -d /tmp/filament-livepair.XXXXXX)"
 PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
@@ -65,7 +65,7 @@ wait_log() {
   return 1
 }
 
-[ -x "$BIN" ] || { echo "no filament binary at $BIN (build it: cargo build --release)"; exit 2; }
+[ -x "$BIN" ] || { echo "no tunlion binary at $BIN (build it: cargo build --release)"; exit 2; }
 
 # ---- backend ---------------------------------------------------------------
 free_port() { python3 - <<'PY'
@@ -111,7 +111,7 @@ say "start the always-on daemon (knows only 'old')"
 FILAMENT_CONFIG_DIR="$UP" timeout -k 5 70 "$BIN" up --dir "$DROP" --server "$SERVER" \
   </dev/null >"$WORK/up.log" 2>&1 &
 UPPID=$!; PIDS+=("$UPPID")
-wait_log "$WORK/up.log" 'filament up —' 20 0.2 || { bad "daemon never printed its ready banner"; exit 1; }
+wait_log "$WORK/up.log" 'tunlion up —' 20 0.2 || { bad "daemon never printed its ready banner"; exit 1; }
 echo "daemon ready; roster at startup = { old }"
 
 # --- sanity: the device known AT STARTUP connects (startup path not regressed) -
@@ -133,7 +133,7 @@ rm -f "$DROP"/* 2>/dev/null
 # --- THE BUG: pair a NEW device into the SHARED store while up is RUNNING -----
 say "pair a NEW device into the store while the daemon is RUNNING (no restart)"
 # Atomic-ish: write the new record into the daemon's own store, exactly as a
-# separate `filament pair` process would. (We append; the real pair path uses
+# separate `tunlion pair` process would. (We append; the real pair path uses
 # devices_store, which we exercise indirectly — the store shape is identical.)
 seed_store "$UP" "[{\"name\":\"old\",\"secret\":\"$sec_old\"},{\"name\":\"new\",\"secret\":\"$sec_new\"}]"
 echo "store now = { old, new } — daemon was NOT restarted"

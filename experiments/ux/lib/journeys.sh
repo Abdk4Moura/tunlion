@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # journeys.sh — the USE-CASE "journey" suite: real user stories enacted with REAL
-# filament peers, recorded live, asserting BOTH "it works" (byte-correct / output
+# tunlion peers, recorded live, asserting BOTH "it works" (byte-correct / output
 # present) AND "look how few steps" (an ergonomics step-counter baked into each
 # reel's caption + a chip burned into the reel itself).
 #
 # These build ON the real-peer pipeline (peers.sh / pairing.sh / the Playwright
 # drivers / the freeze fault primitive). No mock-state seams: every journey stands
-# up genuine locally-built `filament` CLI peers with isolated configs + private
+# up genuine locally-built `tunlion` CLI peers with isolated configs + private
 # ports, pairs for real in the browser, and drives the UI exactly as the persona.
 #
 # Personas / journeys:

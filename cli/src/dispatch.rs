@@ -119,18 +119,18 @@ pub(crate) async fn async_main() -> Result<()> {
     // ordering-window probe fires here (and in the harness) but not in unit
     // tests that construct the window state deliberately.
     crate::capability::set_gate_live();
-    // Migrate state from legacy cwd-relative .config/filament (the broken
+    // Migrate state from legacy cwd-relative .config/tunlion (the broken
     // Windows fallback when HOME was unset) to the platform-correct path.
     platform::Paths::migrate_legacy();
     match platform::Paths::repair_sensitive_permissions() {
         Ok(repaired) if repaired > 0 => {
-            eprintln!("filament: repaired permissions on {repaired} sensitive config path(s)");
+            eprintln!("tunlion: repaired permissions on {repaired} sensitive config path(s)");
         }
         Ok(_) => {}
-        Err(e) => eprintln!("filament: sensitive config permission repair failed: {e}"),
+        Err(e) => eprintln!("tunlion: sensitive config permission repair failed: {e}"),
     }
-    // Bare-arg comfort dispatch: `filament <path>` sends it with a code;
-    // `filament <something-like-a-code>` claims it. Subcommands still win.
+    // Bare-arg comfort dispatch: `tunlion <path>` sends it with a code;
+    // `tunlion <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
         // The real subcommand set, derived from clap so it can NEVER go stale. A
@@ -166,7 +166,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     argv.push("--help".into());
                 }
                 BareTarget::Send => {
-                    // `filament <path>` mints a one-time code so the other side can
+                    // `tunlion <path>` mints a one-time code so the other side can
                     // claim it without having been paired first.
                     argv.insert(1, "send".into());
                     argv.push("--code".into());
@@ -177,9 +177,9 @@ pub(crate) async fn async_main() -> Result<()> {
                     // or `recv`; a bare code is ambiguous. We keep routing it to
                     // `pair` (the long-standing bare-code behavior, 4-digit codes
                     // were always pairing codes), so existing muscle memory is
-                    // preserved. To RECEIVE a transfer code, run `filament recv
+                    // preserved. To RECEIVE a transfer code, run `tunlion recv
                     // <code>` explicitly (the `send --code` output prints exactly
-                    // that hint), or `filament pair <code>` to remember the device.
+                    // that hint), or `tunlion pair <code>` to remember the device.
                     argv.insert(1, "add".into());
                 }
                 BareTarget::Receive => {
@@ -189,7 +189,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     argv.insert(1, "receive".into());
                 }
                 BareTarget::Forward { lport, peer, rport } => {
-                    // `filament device:port` -> `filament forward device:port`.
+                    // `tunlion device:port` -> `tunlion forward device:port`.
                     // The local and remote ports are the same number.
                     argv.remove(1);
                     argv.insert(1, "forward".into());
@@ -200,23 +200,23 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
                 BareTarget::Reach(dev_port) => {
-                    // `filament device.mesh` or `filament device.mesh:port` ->
-                    // `filament reach <device>.mesh[:port]`.
+                    // `tunlion device.mesh` or `tunlion device.mesh:port` ->
+                    // `tunlion reach <device>.mesh[:port]`.
                     argv.remove(1);
                     argv.insert(1, "reach".into());
                     argv.insert(2, dev_port);
                 }
                 BareTarget::Shell => {
-                    // Bare device name = shell in. `filament dovm` opens an interactive
-                    // PTY. `filament dovm <cmd...>` runs a one-shot command over PTY
+                    // Bare device name = shell in. `tunlion dovm` opens an interactive
+                    // PTY. `tunlion dovm <cmd...>` runs a one-shot command over PTY
                     // (no sshd needed; the PTY protocol handles it).
                     argv.insert(1, "shell".into());
                 }
                 BareTarget::AmbiguousFileDevice => {
                     // The token is both a file and a known device. Refuse to guess
                     // which the user meant; naming both readings lets them pick.
-                    let send_cmd = format!("filament send {first}");
-                    let shell_cmd = format!("filament shell {first}");
+                    let send_cmd = format!("tunlion send {first}");
+                    let shell_cmd = format!("tunlion shell {first}");
                     let width = send_cmd.len().max(shell_cmd.len());
                     eprintln!(
                         "{} \"{first}\" is both a file here and a device you know. Say which:",
@@ -251,9 +251,9 @@ pub(crate) async fn async_main() -> Result<()> {
                         _ => None,
                     };
                     if let Some(h) = legacy {
-                        eprintln!("filament: '{first}' is not a command");
+                        eprintln!("tunlion: '{first}' is not a command");
                         eprintln!(
-                            "  did you mean '{h}'?  the command was renamed; `filament --help` lists everything"
+                            "  did you mean '{h}'?  the command was renamed; `tunlion --help` lists everything"
                         );
                         std::process::exit(2);
                     }
@@ -265,12 +265,12 @@ pub(crate) async fn async_main() -> Result<()> {
                         .filter(|(d, _)| *d <= 2)
                         .min_by_key(|(d, _)| *d)
                         .map(|(_, c)| c.clone());
-                    eprintln!("filament: unknown command or device '{first}'");
+                    eprintln!("tunlion: unknown command or device '{first}'");
                     if let Some(h) = hint {
                         eprintln!("  did you mean '{h}'?");
                     }
                     eprintln!(
-                        "  see what you can do:  filament  ·  filament --help  ·  filament devices"
+                        "  see what you can do:  tunlion  ·  tunlion --help  ·  tunlion devices"
                     );
                     std::process::exit(2);
                 }
@@ -284,8 +284,8 @@ pub(crate) async fn async_main() -> Result<()> {
     if argv.get(1).map(String::as_str) == Some("devices")
         && argv.get(2).map(String::as_str) == Some("remove")
     {
-        eprintln!("filament: `devices remove` is not a command");
-        eprintln!("  did you mean `filament devices forget <name>`?");
+        eprintln!("tunlion: `devices remove` is not a command");
+        eprintln!("  did you mean `tunlion devices forget <name>`?");
         std::process::exit(2);
     }
     if argv.len() == 1 && std::io::stdin().is_terminal() {
@@ -295,7 +295,7 @@ pub(crate) async fn async_main() -> Result<()> {
         } else {
             "PAUSED"
         };
-        let header = format!("FILAMENT  /  {device_count} DEVICES  /  {availability}");
+        let header = format!("TUNLION  /  {device_count} DEVICES  /  {availability}");
         let owner = identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some();
         let joined = !owner && local_device_cert().is_some();
         let actions = first_screen_actions(owner, joined, device_count);
@@ -320,7 +320,7 @@ pub(crate) async fn async_main() -> Result<()> {
     // Clap answers it with "unexpected argument", which tells someone with the
     // old habit nothing about where the verb went. Name the replacement instead:
     // a removed spelling should point at its successor, once, and then be gone.
-    // Global flags precede the verb (`filament --no-interactive add <code>`), so
+    // Global flags precede the verb (`tunlion --no-interactive add <code>`), so
     // find `add` rather than assuming argv[1], and inspect the token after it.
     if let Some(i) = argv.iter().position(|a| a == "add") {
         if let Some(next) = argv.get(i + 1).cloned() {
@@ -332,7 +332,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // "a device name may contain dashes but no digits". That held while
             // the name only arrived via --for. `add <name>` is positional now,
             // so the same token is a legitimate name and the loose rule refuses
-            // it: `add my-laptop-2` was answered with "run filament join
+            // it: `add my-laptop-2` was answered with "run tunlion join
             // my-laptop-2". Tightened against the format codes actually have.
             //
             //   brave-otter-ruby-3141  3 dashes, last 4 digits  -> code
@@ -341,7 +341,7 @@ pub(crate) async fn async_main() -> Result<()> {
             let looks_like_code = token_is_pairing_code(&next);
             if looks_like_code {
                 bail!(
-                    "`add` offers, `join` accepts. To claim that code run:  filament join {next}"
+                    "`add` offers, `join` accepts. To claim that code run:  tunlion join {next}"
                 );
             }
         }
@@ -398,7 +398,7 @@ pub(crate) async fn async_main() -> Result<()> {
         cli.server.clone()
     };
     let server = server.trim_end_matches('/').to_string();
-    // Bare `filament` (no subcommand): a short, state-aware tour of what you'd do
+    // Bare `tunlion` (no subcommand): a short, state-aware tour of what you'd do
     // next, instead of clap's wall of subcommands. Power users still get --help.
     let Some(cmd) = cli.cmd else {
         return tour_cmd();
@@ -551,7 +551,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 let all = devices_load();
                 let entry = all.iter().find(|(n, _)| n == &name);
                 if entry.is_none() && !device_record_exists(&name) {
-                    bail!("no device named '{name}', see `filament devices`");
+                    bail!("no device named '{name}', see `tunlion devices`");
                 }
                 // main's effective_device_caps (it folds in expiry and revocation
                 // rather than reading the raw list) with the fleet-safe channel:
@@ -716,13 +716,13 @@ pub(crate) async fn async_main() -> Result<()> {
                                 );
                             } else if local_device_cert_path().exists() {
                                 crate::ui::say(&format!(
-                                    "this device holds a joined certificate that could not be read; `filament join` again from a clean device."
+                                    "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
                                 ));
                             } else {
                                 // The opt-out path: implicit minting is off, so
                                 // this is the pre-U1 answer, verbatim.
                                 println!(
-                                    "no identity yet. Run 'filament init' or 'filament join'."
+                                    "no identity yet. Run 'tunlion init' or 'tunlion join'."
                                 );
                             }
                         }
@@ -836,7 +836,7 @@ pub(crate) async fn async_main() -> Result<()> {
             }
             // Flags win; otherwise fall back to persistent settings. Per-peer
             // `shell on` overrides fold into the shell-only allowlist so
-            // `filament set shell on --peer laptop` unifies with --shell-only.
+            // `tunlion set shell on --peer laptop` unifies with --shell-only.
             let shell = shell || settings::get_bool("shell", None);
             let shell_user = shell_user.or_else(|| settings::get_str("shell-user", None));
             let peer_shell = settings::peers_with("shell", "on");
@@ -885,7 +885,7 @@ pub(crate) async fn async_main() -> Result<()> {
             out,
             via,
         } => {
-            // `filament add laptop` == `filament add --for laptop`. `--for`
+            // `tunlion add laptop` == `tunlion add --for laptop`. `--for`
             // already accepts a device NAME (that is how --for my-laptop works),
             // so the positional needs no new meaning, only a shorter spelling of
             // the one thing the operator always knows.
@@ -995,7 +995,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     bail!(
                         "`add --for device` enrols the other side into your mesh, which \
                          needs this machine's owner key. Only the device you ran \
-                         `filament init` on holds it: run it there, or use \
+                         `tunlion init` on holds it: run it there, or use \
                          `--for person` to pair without enrolling."
                     );
                 }
@@ -1105,7 +1105,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 Some(DevicesAction::Forget { name }) => {
                     let had = device_record_exists(&name);
                     if !had {
-                        bail!("no device named '{name}', see `filament devices`");
+                        bail!("no device named '{name}', see `tunlion devices`");
                     }
                     // advisor's anti-theatre point: deleting the record also
                     // discards any revocation on it, and the copy must say so.
@@ -1142,7 +1142,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     // along (remove+store dropped the renamed device's caps).
                     with_devices_mut(|arr| {
                         if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
-                            bail!("no device named '{old}', see `filament devices`");
+                            bail!("no device named '{old}', see `tunlion devices`");
                         }
                         if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
                             bail!("'{new}' already exists, forget it first or pick another name");
@@ -1163,17 +1163,17 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 Some(DevicesAction::Revoke { name }) => {
                     if !device_record_exists(&name) {
-                        bail!("no device named '{name}', see `filament devices`");
+                        bail!("no device named '{name}', see `tunlion devices`");
                     }
                     ui_caps.confirm(&format!("durably revoke {name} (it will stop being recognized and cannot rejoin until restored)"))?;
                     set_device_revoked(&name, true)?;
                     println!(
-                        "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `filament devices restore {name}` can)"
+                        "revoked '{name}'; it is denied on reconnect and a fresh invitation cannot revive it (only `tunlion devices restore {name}` can)"
                     );
                 }
                 Some(DevicesAction::Restore { name }) => {
                     if !device_record_exists(&name) {
-                        bail!("no device named '{name}', see `filament devices`");
+                        bail!("no device named '{name}', see `tunlion devices`");
                     }
                     set_device_revoked(&name, false)?;
                     println!("restored '{name}'; it is recognized again under its prior record");
@@ -1187,7 +1187,7 @@ pub(crate) async fn async_main() -> Result<()> {
             clap_complete::generate(
                 shell,
                 &mut Cli::command(),
-                "filament",
+                "tunlion",
                 &mut std::io::stdout(),
             );
             Ok(())
@@ -1202,7 +1202,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 if std::io::stdout().is_terminal() {
                     eprintln!("no manual page '{p}'; available: routing");
                     eprintln!(
-                        "try `filament man` for the full help, or `filament man routing` for the connection model."
+                        "try `tunlion man` for the full help, or `tunlion man routing` for the connection model."
                     );
                 } else {
                     // Piped: still emit roff for backward compatibility
@@ -1211,7 +1211,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 return Ok(());
             }
-            // Bare `filament man`: readable on TTY, roff when piped
+            // Bare `tunlion man`: readable on TTY, roff when piped
             if std::io::stdout().is_terminal() {
                 use clap::CommandFactory;
                 Cli::command().print_long_help()?;
@@ -1228,7 +1228,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 None if ui_caps.interactive => {
                     let devices = devices_load();
                     if devices.is_empty() {
-                        bail!("no devices are connected; start with `filament add`");
+                        bail!("no devices are connected; start with `tunlion add`");
                     }
                     let labels = devices
                         .iter()
@@ -1239,7 +1239,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     devices[selected].0.clone()
                 }
                 None => {
-                    bail!("shell needs a device in non-interactive mode: filament shell <device>")
+                    bail!("shell needs a device in non-interactive mode: tunlion shell <device>")
                 }
             };
             require_known_device(&peer)?;
@@ -1262,14 +1262,14 @@ pub(crate) async fn async_main() -> Result<()> {
                 eprintln!(
                     "  channel  {}",
                     if ssh {
-                        "SSH over Filament"
+                        "SSH over Tunlion"
                     } else {
                         "native encrypted PTY"
                     }
                 );
                 eprintln!("  access   the remote device enforces its shell grant and OS account");
                 eprintln!(
-                    "  command  filament shell {}{}",
+                    "  command  tunlion shell {}{}",
                     command_arg(&peer),
                     if ssh { " --ssh" } else { "" }
                 );
@@ -1297,7 +1297,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 None if ui_caps.interactive => {
                     let devices = devices_load();
                     if devices.is_empty() {
-                        bail!("no devices are connected; start with `filament add`");
+                        bail!("no devices are connected; start with `tunlion add`");
                     }
                     let labels = devices
                         .iter()
@@ -1309,7 +1309,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 None => {
                     bail!(
-                        "exec needs a device in non-interactive mode: filament exec <device> -- <cmd>"
+                        "exec needs a device in non-interactive mode: tunlion exec <device> -- <cmd>"
                     )
                 }
             };
@@ -1326,7 +1326,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             }
             if argv.is_empty() {
-                bail!("exec needs a command: filament exec <device> -- <cmd>");
+                bail!("exec needs a command: tunlion exec <device> -- <cmd>");
             }
             // --shell wraps here, visibly, on the initiator side: the receiver
             // never invokes a shell on its own.
@@ -1359,7 +1359,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 ui::problem(
                     "sync needs a destination",
                     "the destination is <device>:<remote-dir>",
-                    &["filament sync ./photos laptop:photos".to_string()],
+                    &["tunlion sync ./photos laptop:photos".to_string()],
                 );
                 std::process::exit(2);
             };
@@ -1376,13 +1376,13 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Reach { dev, until_direct, timeout, json, socks } => {
             if socks {
                 bail!(
-                    "`reach --socks` moved to `forward --socks`: reach now probes only. Run `filament forward <device>:<port> --socks`"
+                    "`reach --socks` moved to `forward --socks`: reach now probes only. Run `tunlion forward <device>:<port> --socks`"
                 );
             }
             let json = json || ui_caps.json;
             match dev {
                 Some(d) if d.contains(':') => bail!(
-                    "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `filament forward {d}`"
+                    "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `tunlion forward {d}`"
                 ),
                 Some(d) => {
                     require_known_device(&d)?;
@@ -1398,7 +1398,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         // where a script parsing `reach` output would collect it.
                         ui::say(&format!(
                             "{} {}",
-                            ui::paint(ui::Tone::Dim, "filament reach →"),
+                            ui::paint(ui::Tone::Dim, "tunlion reach →"),
                             ui::paint(ui::Tone::Brand, &d)
                         ));
                         ui::say(&format!(
@@ -1418,7 +1418,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
                 None => bail!(
-                    "reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."
+                    "reach needs a device to probe: `tunlion reach <device>`. To tunnel a port use `tunlion forward <device>:<port>`."
                 ),
             }
         }
@@ -1438,7 +1438,7 @@ pub(crate) async fn async_main() -> Result<()> {
                         anyhow!("invalid port in '{target}'; expected <device>:<port>")
                     })?,
                 ),
-                None => bail!("forward needs <device>:<port>, e.g. `filament forward laptop:5432`"),
+                None => bail!("forward needs <device>:<port>, e.g. `tunlion forward laptop:5432`"),
             };
             if stdio {
                 // #202: the netcat shape - pipe stdio to the peer's port (the
@@ -1544,7 +1544,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // Verification is the asymmetric half and needs only the public key,
             // which is why enforcement uses owner_pub_for_resources() and this
             // does not. What WAS wrong here is the diagnosis printed on failure:
-            // a joined device has an identity, so "Run `filament init` first" is
+            // a joined device has an identity, so "Run `tunlion init` first" is
             // both false and unactionable. See the error below.
             let owner_pk = crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
                 .ok()
@@ -1566,7 +1566,7 @@ pub(crate) async fn async_main() -> Result<()> {
                             bail!(
                                 "'{spec}' must be granted by the fleet owner. This is a joined device, \
                                  which holds no owner signing key and so cannot issue an owner-signed \
-                                 grant. Run this on the owner's machine:\n  filament grant {device} {spec}"
+                                 grant. Run this on the owner's machine:\n  tunlion grant {device} {spec}"
                             );
                         }
                         // U1: not joined and no key, so this is the first use;
@@ -1606,7 +1606,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     );
                 }
                 bail!(
-                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  filament add --for {device} --allow {capability} --yes",
+                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
                     ceiling.join(", ")
                 );
             }
@@ -1764,7 +1764,7 @@ pub(crate) async fn async_main() -> Result<()> {
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
-                    "OWNER-EQUIVALENT: they can act as you through `filament shell --ssh` (their key is installed on first connect)."
+                    "OWNER-EQUIVALENT: they can act as you through `tunlion shell --ssh` (their key is installed on first connect)."
                 } else {
                     ""
                 }
@@ -1787,7 +1787,7 @@ pub(crate) async fn async_main() -> Result<()> {
                             // vouched device got an error and no route. A record with no
                             // certificate is removed by forgetting it, and nothing else
                             // said so.
-                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `filament devices`).\n  To remove its access: filament devices forget {device}"
+                            "device '{device}' has no stored fleet certificate, so there is nothing to revoke.\n  It was paired by secret rather than certified (see `tunlion devices`).\n  To remove its access: tunlion devices forget {device}"
                         ))?;
                 let owner = load_owner_key().ok_or_else(|| anyhow!("no local user identity"))?;
                 if cert.user_pub != owner.public_key_bytes() {
@@ -1808,7 +1808,7 @@ pub(crate) async fn async_main() -> Result<()> {
             if let Some(ceiling) = principal_ceiling_for(&device) {
                 if ceiling.iter().any(|c| c == &capability) {
                     bail!(
-                        "'{capability}' cannot be revoked from {device}: its access comes from the enrollment ceiling on its fleet certificate, not from a grant. Revoke the certificate:\n  filament revoke {device} --certificate"
+                        "'{capability}' cannot be revoked from {device}: its access comes from the enrollment ceiling on its fleet certificate, not from a grant. Revoke the certificate:\n  tunlion revoke {device} --certificate"
                     );
                 }
                 bail!(
@@ -1953,10 +1953,10 @@ pub(crate) async fn async_main() -> Result<()> {
                             )),
                             &[
                                 format!(
-                                    "restart the daemon without it, or scope it: filament up --shell-only <others>"
+                                    "restart the daemon without it, or scope it: tunlion up --shell-only <others>"
                                 ),
                                 format!(
-                                    "or remove the device entirely: filament devices forget {device}"
+                                    "or remove the device entirely: tunlion devices forget {device}"
                                 ),
                             ],
                         );

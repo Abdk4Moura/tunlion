@@ -4,9 +4,9 @@
 # remembered v2 devices reconnect via channel_of/proof_for unchanged.
 set -uo pipefail
 # Configurable for any environment (defaults match gate9's local fixture):
-#   BIN     path to the release filament binary
+#   BIN     path to the release tunlion binary
 #   SERVER  signaling backend URL (a LOCAL fixture, never prod)
-BIN=${BIN:-../../target/release/filament}
+BIN=${BIN:-../../target/release/tunlion}
 SERVER=${SERVER:-http://127.0.0.1:8093}
 T=${T:-/tmp/l1a-gate7}
 rm -rf "$T/g7"; mkdir -p "$T/g7"

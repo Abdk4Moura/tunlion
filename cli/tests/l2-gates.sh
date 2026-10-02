@@ -6,13 +6,13 @@
 #   ./l2-gates.sh
 #
 # Gates:
-#   1 ssh round-trip      real `filament ssh` runs a remote command, rc=0, exact
-#   2 forward TCP         byte-exact through `filament forward` -> echo server
+#   1 ssh round-trip      real `tunlion ssh` runs a remote command, rc=0, exact
+#   2 forward TCP         byte-exact through `tunlion forward` -> echo server
 #   3 half-close          client shutdown(WR); peer EOFs; both clean
 #   4 capability/SSRF     non-loopback dial refused; non-trusted refused
 #   5 teardown            kill one side; the other's stream aborts (no hang)
 #
-# Topology: side B runs `filament up` (the ACCEPTOR — dials localhost targets,
+# Topology: side B runs `tunlion up` (the ACCEPTOR — dials localhost targets,
 # gated on the proof-verified `trusted` flag + localhost-only). Side A runs the
 # initiator subcommands (netcat/forward/ssh). The two share a reciprocal pair
 # secret so B marks A trusted (the capability placeholder).
@@ -20,7 +20,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="$CLI_DIR/target/release/filament"
+BIN="$CLI_DIR/target/release/tunlion"
 PORT=8097
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
@@ -86,7 +86,7 @@ else
 fi
 
 # ===================================================================== gate 2 ==
-# forward TCP byte-exact through `filament forward` -> echo server on B.
+# forward TCP byte-exact through `tunlion forward` -> echo server on B.
 say 2
 ECHO_PORT=9201
 "$PYV" - "$ECHO_PORT" <<'PY' >"$WORK/echo.log" 2>&1 &
@@ -136,7 +136,7 @@ fi
 kill $FWD 2>/dev/null
 
 # ===================================================================== gate 1 ==
-# ssh round-trip: real `filament ssh` runs a remote command, rc=0, exact output.
+# ssh round-trip: real `tunlion ssh` runs a remote command, rc=0, exact output.
 say 1
 SSHD="$WORK/sshd"; mkdir -p "$SSHD"
 mkdir -p /run/sshd 2>/dev/null
@@ -162,9 +162,9 @@ pids+=($!)
 sleep 1
 ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$SSHD/sshd.log"; }
 
-# `filament ssh boxB <ssh-args>` -> ssh -o ProxyCommand="filament netcat boxB 22".
+# `tunlion ssh boxB <ssh-args>` -> ssh -o ProxyCommand="tunlion netcat boxB 22".
 # Our sshd listens on $SSHD_PORT, not 22, so we drive netcat directly via
-# ProxyCommand to that port (filament ssh hardcodes 22; for the gate we point a
+# ProxyCommand to that port (tunlion ssh hardcodes 22; for the gate we point a
 # custom ProxyCommand at our throwaway sshd to avoid needing real :22).
 PROXY="$BIN --server $SERVER netcat boxB $SSHD_PORT"
 OUT=$(FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA timeout 60 ssh \
@@ -172,10 +172,10 @@ OUT=$(FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA timeout 60 ssh \
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -i "$SSHD/id" -o BatchMode=yes \
   "$USERNAME@filament-peer" \
-  'echo SSH-OVER-FILAMENT-OK; id -un' 2>"$WORK/ssh.err")
+  'echo SSH-OVER-TUNLION-OK; id -un' 2>"$WORK/ssh.err")
 rc1=$?
 echo "## ssh rc=$rc1"; echo "$OUT" | sed 's/^/##   /'
-if [ "$rc1" = "0" ] && echo "$OUT" | grep -q "SSH-OVER-FILAMENT-OK" && echo "$OUT" | grep -qx "$USERNAME"; then
+if [ "$rc1" = "0" ] && echo "$OUT" | grep -q "SSH-OVER-TUNLION-OK" && echo "$OUT" | grep -qx "$USERNAME"; then
   ok "gate1: real ssh remote command over the tunnel (rc=0, exact output)"
 else
   echo "-- ssh.err --"; tail -20 "$WORK/ssh.err"; echo "-- up.log tail --"; tail -15 "$WORK/up.log"
@@ -218,7 +218,7 @@ kill "$HOLDER" 2>/dev/null
 sleep 3
 # Assert the acceptor didn't deadlock: it must still be alive AND responsive
 # (a fresh forward still works after the abort).
-if kill -0 "$OWN_BACKEND" 2>/dev/null && grep -q "filament up" "$WORK/up.log"; then
+if kill -0 "$OWN_BACKEND" 2>/dev/null && grep -q "tunlion up" "$WORK/up.log"; then
   # quick liveness: open another short stream
   "$PYV" - 9401 <<'PY' >"$WORK/echo5.log" 2>&1 &
 import socket,sys

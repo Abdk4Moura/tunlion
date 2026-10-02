@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Filament protocol experiments - testing acknowledgment strategies.
+"""Tunlion protocol experiments - testing acknowledgment strategies.
 
-Tests the actual filament file-transfer protocol over TCP localhost:
+Tests the actual tunlion file-transfer protocol over TCP localhost:
 1. Baseline: send chunks, wait for each ACK
 2. Burst mode: send multiple chunks before waiting for ACK
 3. Pipeline mode: send all chunks without waiting for ACK
 
 Usage:
-  python3 experiments/py/test_filament_protocol.py
+  python3 experiments/py/test_tunlion_protocol.py
 """
 import hashlib
 import json
@@ -22,8 +22,8 @@ KIND_DATA = 1
 MAX_PAYLOAD = 1024 * 1024  # 1 MiB
 
 
-class FilamentProtocol:
-    """Implements the filament file-transfer protocol over TCP."""
+class TunlionProtocol:
+    """Implements the tunlion file-transfer protocol over TCP."""
     
     def __init__(self, sock: socket.socket):
         self.sock = sock
@@ -61,7 +61,7 @@ def sender_baseline(files, port):
     
     conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     conn.connect(('127.0.0.1', port))
-    proto = FilamentProtocol(conn)
+    proto = TunlionProtocol(conn)
     
     start = time.time()
     total_bytes = 0
@@ -118,7 +118,7 @@ def sender_burst(files, port, burst_size=10):
     
     conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     conn.connect(('127.0.0.1', port))
-    proto = FilamentProtocol(conn)
+    proto = TunlionProtocol(conn)
     
     start = time.time()
     total_bytes = 0
@@ -179,7 +179,7 @@ def sender_pipeline(files, port):
     
     conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     conn.connect(('127.0.0.1', port))
-    proto = FilamentProtocol(conn)
+    proto = TunlionProtocol(conn)
     
     start = time.time()
     total_bytes = 0
@@ -231,7 +231,7 @@ def sender_pipeline(files, port):
 
 
 def receiver(actual_port):
-    """Receive files using the filament protocol."""
+    """Receive files using the tunlion protocol."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(('127.0.0.1', actual_port[0]))
@@ -239,7 +239,7 @@ def receiver(actual_port):
     server.listen(1)
     
     conn, _ = server.accept()
-    proto = FilamentProtocol(conn)
+    proto = TunlionProtocol(conn)
     
     files_received = {}
     while True:
@@ -314,7 +314,7 @@ def run_experiment(name, sender_func, files, port):
 
 
 def main():
-    print("=== Filament Protocol Experiments ===\n")
+    print("=== Tunlion Protocol Experiments ===\n")
     
     # Create test files (unique, different sizes)
     test_dir = tempfile.mkdtemp()

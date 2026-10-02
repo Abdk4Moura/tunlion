@@ -117,20 +117,20 @@ struct CachedDir {
     entries: Vec<(u64, FileType, OsString)>,
 }
 
-pub struct FilamentFs {
+pub struct TunlionFs {
     client: Mutex<MountClient>,
     inodes: Mutex<InodeMap>,
     // Keyed by the server file handle returned from opendir.
     dirs: Mutex<HashMap<u64, CachedDir>>,
 }
 
-impl FilamentFs {
+impl TunlionFs {
     pub fn new(client: MountClient) -> Self {
         // The mount protocol is v2+. A v1 client reaching here is a programming
         // error; fail fast rather than silently return empty data.
-        assert!(client.binary_frames, "FilamentFs requires a v2 MountClient");
+        assert!(client.binary_frames, "TunlionFs requires a v2 MountClient");
         let case_sensitive = client.caps.case_sensitive;
-        FilamentFs {
+        TunlionFs {
             client: Mutex::new(client),
             inodes: Mutex::new(InodeMap::new(case_sensitive)),
             dirs: Mutex::new(HashMap::new()),
@@ -232,7 +232,7 @@ fn parse_stat(v: &Value) -> Result<FileStat, i32> {
     serde_json::from_value(v.clone()).map_err(|_| EIO)
 }
 
-impl Filesystem for FilamentFs {
+impl Filesystem for TunlionFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.path_of(parent.0) {
             Ok(p) => p,
@@ -815,7 +815,7 @@ mod tests {
 
 pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
     let max_read = client.caps.max_read_size;
-    let fs = FilamentFs::new(client);
+    let fs = TunlionFs::new(client);
     let mut cfg = Config::default();
     // FSName labels the mount in /proc/mounts. max_read matches the server's
     // advertised cap so the kernel never requests a single read larger than
@@ -823,14 +823,14 @@ pub fn run_mount(client: MountClient, mountpoint: &Path) -> anyhow::Result<()> {
     // allow_other and a fuse.conf tweak); teardown is driven explicitly by the
     // caller via fusermount -u / ctrl-c.
     cfg.mount_options = vec![
-        MountOption::FSName("filament".into()),
+        MountOption::FSName("tunlion".into()),
         MountOption::CUSTOM(format!("max_read={max_read}")),
     ];
     // macOS-specific mount options for macFUSE.
     #[cfg(target_os = "macos")]
     {
         cfg.mount_options.extend([
-            MountOption::CUSTOM("volname=Filament".into()),
+            MountOption::CUSTOM("volname=Tunlion".into()),
             MountOption::CUSTOM("local".into()),
             MountOption::CUSTOM("noappledouble".into()),
             MountOption::CUSTOM("daemon_timeout=60".into()),

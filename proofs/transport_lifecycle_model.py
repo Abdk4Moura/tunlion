@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filament transport-LIFECYCLE model checker.
+"""Tunlion transport-LIFECYCLE model checker.
 
 The companion to `establishment_model.py`. That model proves the *signaling*
 protocol (offer -> answer -> ICE -> CONNECTED) is glare-free, deadlock-free and

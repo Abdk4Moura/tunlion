@@ -1,13 +1,13 @@
 // Focused render harness for the L1-a PakeKeepBanner consent prompt.
 // Full E2E PAKE pairing needs two crypto peers + a live SPAKE2 ceremony, which
-// isn't feasible headless. Filament is a PURE presentation component driven by
+// isn't feasible headless. Tunlion is a PURE presentation component driven by
 // `state` + callbacks, so we mount it directly with an injected pendingPakeKeep
 // and assert the banner renders with an editable name + remember/not-now. The
 // accept callback writes its (peerId, name) onto window so the test can assert
 // the editable-name path actually fires.
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import Filament from '../src/ui/Filament.jsx'
+import Tunlion from '../src/ui/Tunlion.jsx'
 
 const baseState = {
   roomScope: 'link',
@@ -30,7 +30,7 @@ window.__pakeAccept = null
 window.__pakeDecline = null
 
 function Harness() {
-  return React.createElement(Filament, {
+  return React.createElement(Tunlion, {
     state: baseState,
     onAcceptPakeKeep: (peerId, name) => { window.__pakeAccept = { peerId, name } },
     onDeclinePakeKeep: (peerId) => { window.__pakeDecline = { peerId } },

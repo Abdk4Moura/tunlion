@@ -14,7 +14,7 @@
 
 ## 0. Why this document exists
 
-Filament already has every piece of a relationship model. It has a pair secret
+Tunlion already has every piece of a relationship model. It has a pair secret
 in `devices.json`, an owner-signed device certificate, a capability store, a
 mesh roster, and a tier computed for display in `cli/src/device_view.rs:307-315`.
 What it does not have is one account of what a relationship **is**, how it
@@ -39,7 +39,7 @@ The absence shows up as four concrete defects a user can hit today:
    available to the one job that needs it least.
 4. **A waiting party is blind.** When one side does something that needs the
    other side's consent, nothing tells the other side. The consent inbox
-   (`filament requests`) only carries requests that came *in*.
+   (`tunlion requests`) only carries requests that came *in*.
 
 ## 1. The state model
 
@@ -241,20 +241,20 @@ recomputed from a different substrate without a migration, it was never state.
 A keypair is not a ceremony. A name and a fleet are.
 
 Today `UserKey::generate` has exactly one call site, `identity_flow.rs:285`,
-reachable only from `filament init`, and seven separate places bail with some
-variant of "no identity. Run `filament init` first"
+reachable only from `tunlion init`, and seven separate places bail with some
+variant of "no identity. Run `tunlion init` first"
 (`add_for.rs:206-207`, `dispatch.rs:701,762,1449,1515`, `status_cmd.rs:68`).
 Every one of those is a dead end a user hits for a reason that is not their
 problem.
 
 The change: one lazy accessor mints the keypair on first use and says so in one
-line. `filament init` stays, and keeps every flag it has, because naming the
+line. `tunlion init` stays, and keeps every flag it has, because naming the
 device, choosing the drop directory and installing the service *are* ceremonies.
 What it stops being is a precondition.
 
 ```
-A$ filament send report.pdf --code
-  created your identity  b7f2 3a91 …  (filament id to see it)
+A$ tunlion send report.pdf --code
+  created your identity  b7f2 3a91 …  (tunlion id to see it)
   code: clever-lynx-631
   waiting for the other side …
 ```
@@ -268,18 +268,18 @@ owner), prints the line to stderr through `ui::say`, and prints nothing under
 ticket 1, and until it lands a prose line on a `--json` run is the defect that
 audit exists to remove. `FILAMENT_NO_IMPLICIT_INIT=1` restores the old fail-fast
 bail for scripts that want it. The recovery phrase is not shown here: an
-implicit identity has nothing worth recovering yet, and `filament id` prints the
+implicit identity has nothing worth recovering yet, and `tunlion id` prints the
 phrase on demand. The first verb that creates something worth losing — `add`,
 `certify`, `pass` — prints the "write this down" screen instead.
 
 ### 3.2 `serve <verb>`, and the verb code
 
-`filament serve shell|exec|forward|mount` mints a speakable code scoped to
+`tunlion serve shell|exec|forward|mount` mints a speakable code scoped to
 **one verb and one session**, prints it, and waits. The other side runs the verb
 with the code in the slot where a petname goes. The code burns on first use.
 
 ```
-A$ filament serve shell
+A$ tunlion serve shell
   serving  shell  to whoever speaks this code, once.
   code: gigantic-osprey-4417
   expires in 10 minutes, or when it is used.
@@ -291,10 +291,10 @@ A$ filament serve shell
 ```
 
 ```
-B$ filament shell gigantic-osprey-4417
+B$ tunlion shell gigantic-osprey-4417
   gigantic-osprey-4417 → alex-desktop   verified, direct over wl1
   this is a SESSION: nothing was remembered, and only `shell` was served.
-  to keep it:  filament remember alex-desktop
+  to keep it:  tunlion remember alex-desktop
 
 alex@desktop:~$
 ```
@@ -333,7 +333,7 @@ first. `remember` works during a session (over the open link), or afterwards
 against a peer still in the recent list.
 
 ```
-B$ filament remember alex-desktop
+B$ tunlion remember alex-desktop
   offering to remember alex-desktop, and to be remembered by it.
   waiting for the other side to accept …
 ```
@@ -363,15 +363,15 @@ prompt: running the verb is the consent.
 ### 3.4 `pause` and `resume`
 
 ```
-A$ filament pause laptop --until 18:00
+A$ tunlion pause laptop --until 18:00
   laptop is paused until 18:00 (4h 12m).
   its certificate, its grants and your shared secret are all untouched;
   nothing of yours will answer it until then.
-  resume early with:  filament resume laptop
+  resume early with:  tunlion resume laptop
 ```
 
 ```
-B$ filament shell alex-desktop
+B$ tunlion shell alex-desktop
   refused: paused by alex-desktop until 18:00.
   this is not a revocation. nothing was removed.
 ```
@@ -394,7 +394,7 @@ only way to change a device's ceiling is to walk to the other machine.
 and my `Ceiling` for that device, against the device key already on file.
 
 ```
-A$ filament certify nas --scope transfer,mount --expiry 90d
+A$ tunlion certify nas --scope transfer,mount --expiry 90d
   nas is FLEET, certified by you, expires in 6d.
 
   narrowing:   shell      removed
@@ -407,10 +407,10 @@ A$ filament certify nas --scope transfer,mount --expiry 90d
 ```
 
 ```
-B$ filament requests
+B$ tunlion requests
   IN   waiting on you
     r9   alex-desktop   offers  certificate expiry 90d   sent 1m ago
-         filament requests accept r9
+         tunlion requests accept r9
 ```
 
 The split in that transcript is the whole design. A single command produced one
@@ -421,21 +421,21 @@ which and which one is already true. Widening the ceiling without the subject's
 ### 3.6 `grant … --expires 1h` — elevation that falls back
 
 ```
-A$ filament grant laptop shell --expires 1h
+A$ tunlion grant laptop shell --expires 1h
   offered laptop `shell` for 1h. it expires at 15:40 on its own;
   you do not need to revoke it, and forgetting to will not leave it open.
   waiting for laptop to accept …
 ```
 
 ```
-B$ filament requests accept r4
+B$ tunlion requests accept r4
   accepted: shell from alex-desktop, until 15:40.
 ```
 
 and at 15:40, with nothing run on either side:
 
 ```
-B$ filament shell alex-desktop
+B$ tunlion shell alex-desktop
   refused: the shell grant expired at 15:40.
   it has fallen back to what you had before: transfer, mount.
 ```
@@ -452,14 +452,14 @@ grant id (ledger L13), and a verb that says `approve` invites the reading that
 the *grantor* is approving, which is the one thing it is not.
 
 ```
-A$ filament requests
+A$ tunlion requests
   IN   waiting on you
     r7   jane           wants    shell                    4m ago
   OUT  waiting on them
     o3   laptop         offered  forward:nas:8080         2m ago
     o4   phone          offered  certificate + ceiling    yesterday
 
-  accept:  filament requests accept <id>     deny: filament requests deny <id>
+  accept:  tunlion requests accept <id>     deny: tunlion requests deny <id>
   nothing to do for OUT rows; they accept on their side.
 ```
 
@@ -473,7 +473,7 @@ person key, or a device), **what** (the verb), **where** (device · port · path
 tag · fleet), **which way** (in, out, both), and **how long**.
 
 ```
-A$ filament pass jane \
+A$ tunlion pass jane \
      --allow forward:ws:8080,receive:nas:~/share \
      --expires 7d --devices 3
   a pass for jane, good for 7 days, on at most 3 of her devices.
@@ -491,21 +491,21 @@ A$ filament pass jane \
 ```
 
 ```
-J$ filament join ./jane.pass
+J$ tunlion join ./jane.pass
   alex offers you a pass:
     forward  ws:8080       in     7d
     receive  nas:~/share   in     7d
   this is 1 of 3 devices alex allowed. accept? [y/N] y
-  accepted. `filament guests` on alex's side now shows this device.
+  accepted. `tunlion guests` on alex's side now shows this device.
 ```
 
 ```
-A$ filament guests
+A$ tunlion guests
   jane            2 of 3 devices     5d 4h left
     ├ jane-laptop    forward ws:8080 · receive nas:~/share    last seen 2m ago
     └ jane-phone     forward ws:8080 · receive nas:~/share    last seen 3h ago
-    revoke the person: filament revoke jane --pass
-    revoke one device: filament revoke jane-phone --pass
+    revoke the person: tunlion revoke jane --pass
+    revoke one device: tunlion revoke jane-phone --pass
 ```
 
 Three properties the transcripts are chosen to show:
@@ -563,7 +563,7 @@ Not a relationship verb, but the one thing a waiting party asks that the CLI
 cannot currently answer: *is it direct yet?*
 
 ```
-A$ filament reach nas --until-direct --timeout 30s
+A$ tunlion reach nas --until-direct --timeout 30s
   nas   relay        rtt 148ms   ← 0s
   nas   relay        rtt 151ms   ← 4s
   nas   direct-quic  rtt  11ms   ← 9s   via 192.168.1.40:41221
@@ -595,7 +595,7 @@ a stray newline can never widen a relationship.
 
 **`--yes` is the only bypass.** `confirm` returns `Ok(())` immediately when
 `self.yes` (`main.rs:471`). `--yes` is global (`cli_def.rs:127-130`), so
-`filament remember phone --yes` is the scripted form of accepting an offer.
+`tunlion remember phone --yes` is the scripted form of accepting an offer.
 
 **Non-interactive without `--yes` exits 2 and says which flag.** This matches
 `interact::render_steer`, which prints what the command needs, one example, and
@@ -641,17 +641,17 @@ A waiting party must never be blind. Three mechanisms, in increasing cost.
 
 ### 5.1 The offer inbox, both directions
 
-`filament requests` exists and lists only requests that came *in*
+`tunlion requests` exists and lists only requests that came *in*
 (`cli/src/status_cmd.rs:213-230`, with `approve` / `deny` at `:238-282`). Under
 this model every widening move produces an inbox row on **both** sides, because
 a `Grant` without its `Accept` authorizes nothing and both parties need to know
 which half is missing.
 
 ```
-$ filament requests
+$ tunlion requests
   IN   waiting on you
     r7   jane        wants  shell            asked 4m ago
-         filament requests accept r7   ·   filament requests deny r7
+         tunlion requests accept r7   ·   tunlion requests deny r7
 
   OUT  waiting on them
     o3   laptop      offered  forward:nas:8080      sent 2m ago
@@ -672,10 +672,10 @@ Extend that one line to any verb that prints a banner, so the *next* thing the
 waiting party runs tells them:
 
 ```
-$ filament status
+$ tunlion status
   ● daemon running, 3 devices, 1 exposed port
 
-  ! 1 offer waiting on you (jane · shell) — filament requests
+  ! 1 offer waiting on you (jane · shell) — tunlion requests
 ```
 
 One line, on stderr via `ui::say`, suppressed by `-q` and by `--json` (where it

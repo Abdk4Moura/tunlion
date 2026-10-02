@@ -1,4 +1,4 @@
-# Per-OS capability CI and `filament doctor`
+# Per-OS capability CI and `tunlion doctor`
 
 **Status:** spec. Companion to
 [design-cross-platform-capabilities.md](design-cross-platform-capabilities.md).
@@ -35,7 +35,7 @@ Document this boundary in the suite; never fake a pass for them.
 
 ## The harness (foundation, build first)
 
-Two filament instances on one runner, paired WITHOUT the hosted signaling server:
+Two tunlion instances on one runner, paired WITHOUT the hosted signaling server:
 
 - **Preferred:** a test-only direct pairing path (local loopback handshake) that
   bypasses the hosted signaling server, so CI has no external dependency and no
@@ -68,15 +68,15 @@ Two filament instances on one runner, paired WITHOUT the hosted signaling server
   with admin bypass, so this arms auto-merge and blocks red PRs without blocking
   admin release pushes).
 
-## `filament doctor` and the support matrix
+## `tunlion doctor` and the support matrix
 
 - Each capability declares the adapter methods it needs (ShellHost, MountHost
   {FUSE | WinFsp | ProjFS}, ControlChannel, TUN).
 - The adapter reports supported-or-not on this host.
-- `filament doctor` prints the matrix: capability by supported-here, with an honest
+- `tunlion doctor` prints the matrix: capability by supported-here, with an honest
   "X needs Y here: <link>" for gaps. This is the `--install` honest-fallback
   pattern made systematic.
-- CI snapshots `filament doctor --json` per OS and asserts it, so the matrix itself
+- CI snapshots `tunlion doctor --json` per OS and asserts it, so the matrix itself
   is regression-tested.
 
 ## Sequencing (for opencode)
@@ -86,7 +86,7 @@ Two filament instances on one runner, paired WITHOUT the hosted signaling server
 3. pty interactive + exec (headless ConPTY; the hard one).
 4. forward + expose/proxy.
 5. 3-OS matrix in the workflow; make the jobs required checks.
-6. `filament doctor` + support matrix; snapshot-assert in CI.
+6. `tunlion doctor` + support matrix; snapshot-assert in CI.
 7. mount smoke test once the mesh-native mount is end to end.
 
 ## Process rule (non-code, non-negotiable)

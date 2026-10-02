@@ -2,7 +2,7 @@
 # Certificate revocation against a CERTIFIED fleet device, live. Standalone,
 # hermetic, fixture port 8121 ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament ./fleet-cert-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./fleet-cert-gates.sh
 #
 # WHY THIS EXISTS. Every other shell-class gate in this directory pairs its two
 # daemons by hand-writing a shared secret into both devices.json files. A
@@ -17,18 +17,18 @@
 #
 # So this harness enrols through the REAL product path instead:
 #
-#   owner:  filament init                      mints the user identity + SSH CA
-#   owner:  filament up                        the acceptor
-#   owner:  filament add --for <spoke> --allow shell --out <file>
+#   owner:  tunlion init                      mints the user identity + SSH CA
+#   owner:  tunlion up                        the acceptor
+#   owner:  tunlion add --for <spoke> --allow shell --out <file>
 #                                              a signed, bounded invitation
-#   spoke:  filament join --invite-file <file> claims it; both ends persist certs
-#   spoke:  filament up                        the second daemon
+#   spoke:  tunlion join --invite-file <file> claims it; both ends persist certs
+#   spoke:  tunlion up                        the second daemon
 #
 # Nothing is hand-provisioned: no secret is written by this script, no
 # certificate is fabricated, no cap store is edited. `assert_certified` (in
 # lib/fixture.sh) proves that before any gate runs.
 #
-# THE REVOCATION IS THE CERTIFICATE'S, NOT THE GRANT'S. `filament revoke
+# THE REVOCATION IS THE CERTIFICATE'S, NOT THE GRANT'S. `tunlion revoke
 # <device> --certificate` writes the durable `certRevoked` marker
 # (identity_state.rs `set_device_revoked`) and touches nothing else -- gate B
 # asserts exactly that by diffing the store, so a reader can see that the
@@ -36,7 +36,7 @@
 # gates C/D/E refuse it. The refusal can only be the certificate.
 #
 # NOTE ON `grant`. A certified device's shell authority comes from the ceiling
-# on its fleet certificate, and `filament grant <delegated-device> shell` is
+# on its fleet certificate, and `tunlion grant <delegated-device> shell` is
 # refused on purpose (#226, covered by cap-verbs-gates.sh gate A): a grant
 # cannot widen a signed ceiling. So the positive control here is the ceiling,
 # which IS the product path for a fleet device, and `grant` is deliberately
@@ -44,7 +44,7 @@
 #
 # WAS KNOWN-RED, NOW GREEN: gateAUTH-A. The covered exec after an OWNER RESTART
 # was refused because the possession challenge went to the pid carrying the
-# exec-open -- the ONE-SHOT `filament exec` client's own link -- and that client
+# exec-open -- the ONE-SHOT `tunlion exec` client's own link -- and that client
 # never answered challenges, so the link could never become Proven, the open
 # parked, expired, and every retry minted a fresh equally silent link. Fixed by
 # giving the one-shot client the same shared responder the daemon uses (one
@@ -103,7 +103,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8121
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

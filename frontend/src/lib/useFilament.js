@@ -1,4 +1,4 @@
-// useFilament: the single hook the UI consumes.
+// useTunlion: the single hook the UI consumes.
 //
 // It owns all the networking (config fetch, signaling, a PeerLink per peer) and
 // exposes a flat, render-friendly snapshot plus a handful of actions. The shape
@@ -42,10 +42,10 @@ function cryptoPick(a) {
 
 function randomName() {
   try {
-    const saved = sessionStorage.getItem('filament.name')
+    const saved = sessionStorage.getItem('tunlion.name')
     if (saved) return saved
     const name = `${cryptoPick(ADJ)}-${cryptoPick(ANIMALS)}`
-    sessionStorage.setItem('filament.name', name)
+    sessionStorage.setItem('tunlion.name', name)
     return name
   } catch {
     return `${cryptoPick(ADJ)}-${cryptoPick(ANIMALS)}`
@@ -63,12 +63,12 @@ const colorFor = (seed) => `hsl(${hueFor(seed)} 70% 55%)`
 // Stable per-tab identity (survives reconnects; sids don't). Basis for resume.
 function tabUid() {
   try {
-    let u = sessionStorage.getItem('filament.uid')
+    let u = sessionStorage.getItem('tunlion.uid')
     if (!u) {
       u = (crypto.randomUUID && crypto.randomUUID()) || Math.random().toString(36).slice(2) + Date.now().toString(36)
-      sessionStorage.setItem('filament.uid', u)
+      sessionStorage.setItem('tunlion.uid', u)
     }
-    if (!/^[\x00-\x7F]*$/.test(u)) throw new Error('Filament UID must be ASCII')
+    if (!/^[\x00-\x7F]*$/.test(u)) throw new Error('Tunlion UID must be ASCII')
     return u
   } catch {
     return Math.random().toString(36).slice(2) + Date.now().toString(36)
@@ -80,7 +80,7 @@ function roomFromUrl() {
   return m ? decodeURIComponent(m[1]) : null
 }
 
-export function useFilament() {
+export function useTunlion() {
   const [me, setMe] = useState(null)
   const [peers, setPeers] = useState([]) // [{ id, name, color, status }]
   const [transfers, setTransfers] = useState([]) // see CONTRACT.md
@@ -1223,7 +1223,7 @@ export function useFilament() {
   }, [subscribeKnown])
 
   // ---- Part C: optional native LAN-discovery helper ------------------------
-  // If the Filament Local helper (experiments/localsend-discovery) is running,
+  // If the Tunlion Local helper (experiments/localsend-discovery) is running,
   // it exposes peers it found on the LAN via mDNS/UDP at 127.0.0.1:53317.
   // Browsers may fetch http://localhost from a secure page, so this lights up
   // automatically when present and stays silent (available:false) when not.

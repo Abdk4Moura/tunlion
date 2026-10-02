@@ -1,4 +1,4 @@
-//! B-side SSH certificate signer (`filament shell --ssh` via local CA).
+//! B-side SSH certificate signer (`tunlion shell --ssh` via local CA).
 //!
 //! The daemon holds a permanent CA key (0600 beside the identity key) and
 //! signs initiators' ephemeral ed25519 keys with `ssh-keygen -s`, pinning

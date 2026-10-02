@@ -2,7 +2,7 @@
 
 A length-prefixed framing so a stream/datagram carrier can carry discrete IP
 packets without ambiguity. Shared by the udp carrier (datagram: one packet per
-UDP payload, framing optional) and the filament carrier (STREAM: filament's L2
+UDP payload, framing optional) and the tunlion carrier (STREAM: tunlion's L2
 forward is a byte stream, so packets MUST be length-delimited).
 
 Wire format (stream framing)::
@@ -12,7 +12,7 @@ Wire format (stream framing)::
     +--------+--------+==================+
 
 A 16-bit big-endian length prefix (max 65535 — far above any tunnel MTU). The SID
-concept from filament's L2 lives one layer below us (the L2 stream already
+concept from tunlion's L2 lives one layer below us (the L2 stream already
 demuxes); here a "frame" is exactly one IP packet.
 """
 

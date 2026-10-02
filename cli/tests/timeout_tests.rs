@@ -1,22 +1,22 @@
 //! Tests for connect timeout behavior in shell and reach commands.
 //!
-//! These tests verify that `filament shell` (native PTY) and `filament reach`
+//! These tests verify that `tunlion shell` (native PTY) and `tunlion reach`
 //! exit promptly when connecting to an unreachable peer, instead of hanging
 //! forever. (The old `pty`/`netcat` commands were renamed to `shell`/`reach` in
 //! the 0.7.5 command-surface rework; the underlying connect paths are the same.)
 
 use std::process::Command;
 
-/// Get the path to the filament binary built with test-hooks feature.
+/// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
-    path.push("filament");
+    path.push("tunlion");
     path
 }
 
-/// Test that `filament shell <unreachable-peer> -- echo hi` exits within
+/// Test that `tunlion shell <unreachable-peer> -- echo hi` exits within
 
 /// Seed a device store with one KNOWN peer that cannot be reached.
 ///
@@ -53,7 +53,7 @@ fn pty_unreachable_peer_exits_with_timeout() {
         .arg("echo")
         .arg("hi")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -84,7 +84,7 @@ fn pty_unreachable_peer_exits_with_timeout() {
     );
 }
 
-/// Test that `filament reach <unreachable-peer>:<port>` exits with nonzero code.
+/// Test that `tunlion reach <unreachable-peer>:<port>` exits with nonzero code.
 /// Note: reach may fail with "no known device" before reaching the timeout path,
 /// which is also a valid failure mode (the peer doesn't exist).
 #[test]
@@ -98,7 +98,7 @@ fn netcat_unreachable_peer_exits_with_error() {
         .arg("forward")
         .arg("definitely-unreachable-peer-12345:8080")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -137,7 +137,7 @@ fn pty_timeout_respects_env_var() {
         .arg("echo")
         .arg("hi")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
     let elapsed = start.elapsed();
 
     let stderr = String::from_utf8_lossy(&output.stderr);

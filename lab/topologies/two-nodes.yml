@@ -1,7 +1,7 @@
 # two-nodes — the canonical baseline topology.
 #
 # Two namespace "machines" (a, b) joined by one link. The SAME topology runs over
-# any carrier: `lab up two-nodes --link pipe|udp|wg|filament`. A ping from a's
+# any carrier: `lab up two-nodes --link pipe|udp|wg|tunlion`. A ping from a's
 # overlay address to b's proves the chosen carrier works as an L3 path.
 #
 # overlay subnet  = the tunnel/TUN addresses the probes target (10.50.0.0/24)

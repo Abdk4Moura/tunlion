@@ -11,7 +11,7 @@ private keys and tokens the same way.
 
 Pure `std` (plus `std::process::Command` for the Windows ACL path) — no `windows`
 crate, no async runtime, no app coupling. Extracted from
-[filament](https://github.com/Abdk4Moura/tunlion) so its trust crates share one
+[tunlion](https://github.com/Abdk4Moura/tunlion) so its trust crates share one
 byte-identical secret writer.
 
 ## Usage
@@ -30,7 +30,7 @@ SecretFile::restrict("/path/to/existing")?;
 
 ## Status
 
-Pre-1.0; API may change between minor versions. Part of filament.
+Pre-1.0; API may change between minor versions. Part of tunlion.
 
 ## License
 

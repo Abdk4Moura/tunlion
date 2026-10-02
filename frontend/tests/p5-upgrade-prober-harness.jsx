@@ -12,7 +12,7 @@
 //   3. NO FLAP: a direct path that re-measures back to relay (or whose in-flight
 //      bytes stall) during verify is DISCARDED — the link STAYS on relay,
 //      onRoute never fires 'direct', and the backoff cadence increases.
-//   4. KILL-SWITCH: localStorage.filamentUpgradeProbe==='0' makes a probe a no-op
+//   4. KILL-SWITCH: localStorage.tunlionUpgradeProbe==='0' makes a probe a no-op
 //      (no restartIce, never commits).
 //   5. STALL-GUARD: a probe while a P0 _stallEpisode is open does NOT restartIce
 //      (the stall ladder and the upgrade prober must never both restart ICE).
@@ -145,9 +145,9 @@ async function run() {
     link.close()
   }
 
-  // -- TEST 4: KILL-SWITCH — filamentUpgradeProbe='0' makes a probe a no-op -----
+  // -- TEST 4: KILL-SWITCH — tunlionUpgradeProbe='0' makes a probe a no-op -----
   {
-    localStorage.setItem('filamentUpgradeProbe', '0')
+    localStorage.setItem('tunlionUpgradeProbe', '0')
     const link = makeProbeLink({ polite: false })
     link._routeBox.value = 'relayed'
     await link._detectRoute() // arm
@@ -161,7 +161,7 @@ async function run() {
       `route=${link.route}`)
     rec('kill-switch: prober not re-scheduled', !link._upgradeTimer,
       `timer=${!!link._upgradeTimer}`)
-    localStorage.removeItem('filamentUpgradeProbe')
+    localStorage.removeItem('tunlionUpgradeProbe')
     link.close()
   }
 

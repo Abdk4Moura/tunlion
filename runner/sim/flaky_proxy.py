@@ -2,9 +2,9 @@
 """A deterministic flaky-link TCP proxy — the local stand-in for the unstable
 Colab->do-vm WAN path that breaks the GPU job-runner.
 
-It sits between the filament CLI clients and the LOCAL signaling backend and,
+It sits between the tunlion CLI clients and the LOCAL signaling backend and,
 on command, severs every proxied connection (and refuses new ones) for a window,
-then heals. Because filament's discovery + SDP/ICE exchange ride this socket.io
+then heals. Because tunlion's discovery + SDP/ICE exchange ride this socket.io
 TCP link, cutting it reproduces the real failure signatures WITHOUT a remote box:
 
   * `send` can't find the peer within the timeout         (discovery race / "no peer connected")

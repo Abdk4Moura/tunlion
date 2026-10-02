@@ -1,7 +1,7 @@
 # filament-proto
 
 The file-transfer wire vocabulary and its pure ceremony decisions, carved out of
-the [filament](https://github.com/Abdk4Moura/tunlion) CLI.
+the [tunlion](https://github.com/Abdk4Moura/tunlion) CLI.
 
 Pure by construction: bytes and state in, a decision out. No timers, no retries,
 no transport, no filesystem. The stateful event loops own the I/O and call in

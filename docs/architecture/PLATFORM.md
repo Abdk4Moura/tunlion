@@ -22,14 +22,14 @@ than behind the layer that exists for it.
   had started. Three of those were features shipped that same release.
 - **#215** `detach_up` branches on `cfg(unix)` / `cfg(windows)` inline. The unix
   arm opens `daemon.log` and redirects into it; the Windows arm computes the
-  same path and then discards it. `filament logs`, `up` following a running
+  same path and then discards it. `tunlion logs`, `up` following a running
   daemon, and `up --detach` all dead-end on Windows.
 - **#205** `ctl.rs` is gated to unix with a non-unix stub returning `None`. The
   mint could not tell the daemon an invitation was outstanding, so bounded
   invitations minted on Windows could not be claimed at all.
 - **#202** not a `cfg` at all, but the same shape: six call sites built a
   subcommand string for a verb that had been deleted, because nothing owned the
-  question "what does filament invoke on itself".
+  question "what does tunlion invoke on itself".
 
 The pattern is identical every time. Someone needed a platform fact, wrote it
 where they needed it, tested it on the platform they had, and it was wrong

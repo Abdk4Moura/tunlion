@@ -125,7 +125,7 @@ pub(crate) const PRINCIPAL_STATE_REVOKED: &str = "revoked";
 pub(crate) const FLEET_LINK_NAME: &str = "fleet: unverified";
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
-/// may `filament shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
+/// may `tunlion shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
 /// always enforced separately, this is purely the capability side.
 #[derive(Clone, Debug)]
 pub(crate) enum ShellPolicy {
@@ -159,12 +159,12 @@ pub(crate) const REQUEST_TTL_SECS: u64 = 3600;
 /// daemon is not a managed service (a foreground `up`, no systemd) falls back
 /// to a plain kill.
 /// Which systemd manager owns a daemon pid, if any. Two units can share the
-/// name `filament.service` (a system unit and a per-user unit under Linger),
+/// name `tunlion.service` (a system unit and a per-user unit under Linger),
 /// so the cgroup's SCOPE, not the unit name, decides which manager to ask:
-///   system unit:  /system.slice/filament.service
-///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/filament.service
-/// The unit name is matched as a cgroup segment (`/filament.service`), never as
-/// a substring, so a neighbouring unit (`my-filament.service`) cannot collide.
+///   system unit:  /system.slice/tunlion.service
+///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/tunlion.service
+/// The unit name is matched as a cgroup segment (`/tunlion.service`), never as
+/// a substring, so a neighbouring unit (`my-tunlion.service`) cannot collide.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ServiceManager {
     SystemdSystem,
@@ -207,7 +207,7 @@ pub(crate) struct MountPlan {
     pub(crate) read_only: bool,
 }
 
-pub(crate) const REPO: &str = "Abdk4Moura/filament";
+pub(crate) const REPO: &str = "Abdk4Moura/tunlion";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SendOutcome {

@@ -10,13 +10,13 @@
 #         secret. Together: the server can only DoS, never downgrade auth.
 set -uo pipefail
 # Configurable for any environment (defaults resolve relative to this script):
-#   BIN     path to the release filament binary
+#   BIN     path to the release tunlion binary
 #   SERVER  signaling backend base (port pinned to 8093 below; this gate restarts it)
 #   PY      python that runs the LOCAL fixture backend (a throwaway venv)
 #   MAIN    cli/src/pair_cmd.rs for the structural (source) assertions
 #           (pair_cmd lived in main.rs until the 2026-09-12 decomposition)
 HERE="$(cd "$(dirname "$0")" && pwd)"
-BIN=${BIN:-$HERE/../../target/release/filament}
+BIN=${BIN:-$HERE/../../target/release/tunlion}
 PY=${PY:-${FILAMENT_TEST_VENV:-python3}}
 MAIN=${MAIN:-$HERE/../../src/pair_cmd.rs}
 BACKEND_DIR=${BACKEND_DIR:-$HERE/../../../backend}

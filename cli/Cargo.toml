@@ -12,7 +12,7 @@ keywords = ["p2p", "file-transfer", "webrtc", "cli", "airdrop"]
 categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
-name = "filament"
+name = "tunlion"
 path = "src/main.rs"
 
 [features]
@@ -74,7 +74,7 @@ filament-pair = { path = "../crates/filament-pair", version = "0.1.0" }
 # Standalone atomic owner-only secret-file writer (chmod 0600 / icacls DACL),
 # re-exported as `crate::platform::SecretFile`.
 secret-write = { path = "../crates/secret-write", version = "0.1.0" }
-# Filament-managed authorized_keys block + managed ssh keypair, decoupled from
+# Tunlion-managed authorized_keys block + managed ssh keypair, decoupled from
 # the CLI's config-dir resolution. `crate::sshkeys` is a thin shim over this.
 authkeys-managed = { path = "../crates/authkeys-managed", version = "0.1.0" }
 # Multi-device user identity (user key over device certs, no CA). Aliased as
@@ -147,10 +147,10 @@ fuser = { version = "0.17", optional = true }
 
 
 # Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
-# loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
+# loaded at runtime with libloading. The DLL is bundled beside tunlion.exe by the
 # release packaging; adapter creation needs Administrator.
 # Windows L3 backend: Wintun (WireGuard's userspace TUN driver) via wintun.dll,
-# loaded at runtime with libloading. The DLL is bundled beside filament.exe by the
+# loaded at runtime with libloading. The DLL is bundled beside tunlion.exe by the
 # release packaging; adapter creation needs Administrator.
 [target.'cfg(target_os = "windows")'.dependencies]
 wintun = "0.5"
@@ -186,7 +186,7 @@ incremental = true
 # opt-level "z" costs throughput, so it is applied only where throughput is not
 # the point. These crates run once per connection or once per process: argument
 # parsing, the HTTPS control plane to the signaling server, and WebRTC's
-# session setup. The bulk data path (ring, quinn, tokio, smoltcp, and filament's
+# session setup. The bulk data path (ring, quinn, tokio, smoltcp, and tunlion's
 # own crates) stays at the default so file transfer speed is untouched.
 #
 # Verified by measurement, not assumption: throughput is re-measured against the

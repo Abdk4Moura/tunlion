@@ -1,13 +1,13 @@
 # r/selfhosted post — ready to paste (flair: Release)
 
-**Title:** Filament — self-hostable P2P file drop with visible routing (LAN/P2P/RELAY), resumable transfers, and one-time pairing codes
+**Title:** Tunlion — self-hostable P2P file drop with visible routing (LAN/P2P/RELAY), resumable transfers, and one-time pairing codes
 
 **Body:**
 
 I revived an old project of mine into something I now use daily with my family,
 and it's fully self-hostable, so sharing it here.
 
-Filament is browser-to-browser file transfer (WebRTC). Same-WiFi devices
+Tunlion is browser-to-browser file transfer (WebRTC). Same-WiFi devices
 discover each other automatically; across networks you pair with a one-time
 spoken code ("clever-lynx-63") that burns after a single use. Files are never
 uploaded anywhere — direct peer-to-peer, with your own coturn as the encrypted

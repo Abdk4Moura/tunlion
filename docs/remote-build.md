@@ -1,8 +1,8 @@
 # Remote builds
 
-The dev box is small (2 cores, 5 GB), so filament compiles elsewhere via
+The dev box is small (2 cores, 5 GB), so tunlion compiles elsewhere via
 [rbuild](https://github.com/Abdk4Moura/rbuild). Defaults for this repo live in
-`.rbuild` at the root (musl static release of `cli/`, binary `filament`).
+`.rbuild` at the root (musl static release of `cli/`, binary `tunlion`).
 
     rbuild                          # build the current pushed branch on GitHub's free 4-core runner
     rbuild --ref main --out ~/.local/bin
@@ -10,7 +10,7 @@ The dev box is small (2 cores, 5 GB), so filament compiles elsewhere via
     rbuild --profile dev --test
 
 Builds run in the rbuild repo's Actions, not here, so this repo's Actions view
-stays CI-only. The binary lands in `~/.cache/rbuild/Abdk4Moura-filament/` with
+stays CI-only. The binary lands in `~/.cache/rbuild/Abdk4Moura-tunlion/` with
 a `BUILD_INFO` file. Actions builds what is pushed; dirty or unpushed work
 makes `rbuild` refuse until you push or pass `--force`.
 

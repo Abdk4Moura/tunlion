@@ -101,7 +101,7 @@ empty ceiling and expiry zero"). Rather than paper over that, v1 adopts it as th
 rule: a device admitted by auto-mesh is admitted as a Delegated principal with an
 EMPTY ceiling.
 
-Concretely: the link forms, warm-hold keeps it, `filament ping` works, L3 routes
+Concretely: the link forms, warm-hold keeps it, `tunlion ping` works, L3 routes
 to it and `<peer>.mesh` resolves. Transfer, shell and mount still require their
 own explicit grant, exactly as before.
 
@@ -112,7 +112,7 @@ should not have connected. Capability flow across a fleet needs an owner-signed
 fleet ceiling, which is deliberately deferred.
 
 One consequence worth stating plainly: fleet membership is exactly "holds a
-DeviceCert signed by my owner key", and a device enrolled through `filament mint`
+DeviceCert signed by my owner key", and a device enrolled through `tunlion mint`
 holds one even if you think of it as somebody else's machine. Such a device joins
 the mesh at reachability level. Its capabilities remain bounded by the ceiling
 the mint issued, so this is not an escalation, but the presence is real and the
@@ -161,7 +161,7 @@ are dialed via `maybe_adopt` rather than `start_direct(pid, name, secret)`
 Noted honestly: that existing channel has exactly the metadata property this
 design rejects for `fleet_rv`, since it is derived from `owner_pub`, which
 external peers learn during pairing. It is tolerable there because enrollment is
-short-lived and operator-initiated (`filament mint`), while fleet presence is
+short-lived and operator-initiated (`tunlion mint`), while fleet presence is
 permanent and continuous. A v1 that wanted to ship sooner could reuse
 `enroll_channel` and skip `fleet_rv` entirely, at the cost of letting any device
 you ever paired with watch your fleet come and go. That shortcut is available and
@@ -261,7 +261,7 @@ See also: `docs/design-mesh-network.md` (the decision this amends),
 
 ## Fleet peers are indexed, not addressable
 
-A verified sibling is now written to `devices.json` so `filament devices` can
+A verified sibling is now written to `devices.json` so `tunlion devices` can
 show the fleet, and it renders under FLEET with an empty capability list. The
 record deliberately carries **no pair secret**, which is what keeps it an index
 entry rather than an authorization: `devices_load` filter-maps on `secret`, so
@@ -280,7 +280,7 @@ Two things had to be corrected to make that honest:
 
 And one consequence had to be handled rather than left: a fleet peer is now
 listed but still cannot be a `send --to` target, so the old error ("no known
-device by that name; run `filament devices`") pointed the user at a list
+device by that name; run `tunlion devices`") pointed the user at a list
 containing the very name it claimed not to know. `send --to` now distinguishes
 the two cases and names the real limitation.
 
@@ -372,8 +372,8 @@ pointless cold establish. A refusal should be a reply, not a timeout.
 The claim in 4b is that auto-mesh grants reachability and not capability. Driven
 live, from a fleet peer C against a sibling B that has granted it nothing:
 
-    filament shell laptop   ->  can't reach 'laptop' (no link established in 45s)
-    filament send --to laptop -> no known device by that name
+    tunlion shell laptop   ->  can't reach 'laptop' (no link established in 45s)
+    tunlion send --to laptop -> no known device by that name
 
 Both denied, and both denied EARLIER than the capability gate. `send --to`
 fails in name resolution and `shell` fails at link establishment, because fleet
@@ -585,7 +585,7 @@ exactly the scoped default the capability layer already defined.
 
 ### Sibling transfer works, with a grant
 
-    filament grant <sibling> transfer      (on the receiver)
+    tunlion grant <sibling> transfer      (on the receiver)
     gate: allowed=true legacy_ok=false trusted=false binding=Proven
           own_user=true has_grant=false in_bounds=true
     inboxes: owner[]  laptop[gr.txt]
@@ -650,7 +650,7 @@ standing in for another, all of them reading `devices_load()` (which filter-maps
 on `secret`, so it silently means "devices I can DIAL") as if it meant "devices I
 know":
 
-- **`addr`** refused with "no device named X, see `filament devices`" while
+- **`addr`** refused with "no device named X, see `tunlion devices`" while
   `devices` listed X on the next line. It only needed the secret to print a
   channel id.
 - **`devices revoke` / `restore` / `forget`** did the same, which for revoke is

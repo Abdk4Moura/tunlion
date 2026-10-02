@@ -9,7 +9,7 @@ and the current time; it never phones home. Delegated principals are bounded by 
 ceiling (the intersection of what they were granted and what the delegator holds),
 so a delegate can never exceed its delegator.
 
-This is the authorization core of [filament](https://github.com/Abdk4Moura/tunlion),
+This is the authorization core of [tunlion](https://github.com/Abdk4Moura/tunlion),
 extracted so it can be audited and reused on its own.
 
 ## What's inside
@@ -29,7 +29,7 @@ extracted so it can be audited and reused on its own.
 
 ## Status
 
-Pre-1.0. The API tracks filament's internal needs and may change between minor
+Pre-1.0. The API tracks tunlion's internal needs and may change between minor
 versions. Security-reviewed but not independently audited.
 
 ## License

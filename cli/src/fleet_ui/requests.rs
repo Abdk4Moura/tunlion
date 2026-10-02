@@ -64,21 +64,21 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
             ));
             lines.push(format!(
                 "         [ {} ]   [ {} ]",
-                ui::paint(Tone::Bold, &format!("filament requests approve {} --allow {} --for 1h", r.id, r.capability)),
-                ui::paint(Tone::Dim, &format!("filament requests deny {}", r.id)),
+                ui::paint(Tone::Bold, &format!("tunlion requests approve {} --allow {} --for 1h", r.id, r.capability)),
+                ui::paint(Tone::Dim, &format!("tunlion requests deny {}", r.id)),
             ));
         } else {
             lines.push(format!(
                 "         [ {} ]   [ {} ]",
-                ui::paint(Tone::Bold, &format!("filament requests approve {} --allow {} --for 1h", r.id, r.capability)),
-                ui::paint(Tone::Dim, &format!("filament requests deny {}", r.id)),
+                ui::paint(Tone::Bold, &format!("tunlion requests approve {} --allow {} --for 1h", r.id, r.capability)),
+                ui::paint(Tone::Dim, &format!("tunlion requests deny {}", r.id)),
             ));
         }
         lines.push(String::new());
     }
 
-    lines.push(ui::paint(Tone::Dim, "  Nothing pushes to you yet — check `filament requests`, or wire a hook:"));
-    lines.push(ui::paint(Tone::Dim, "    filament requests --notify 'notify-send %s'   (also: webhook, email)"));
+    lines.push(ui::paint(Tone::Dim, "  Nothing pushes to you yet — check `tunlion requests`, or wire a hook:"));
+    lines.push(ui::paint(Tone::Dim, "    tunlion requests --notify 'notify-send %s'   (also: webhook, email)"));
 
     lines.join("\n")
 }
@@ -117,7 +117,7 @@ pub fn render_approve_guard(request_id: u64, cap: &str) -> String {
     format!(
         "{err} request {request_id} asks for {label} — deliberate access. Name it and bound it:\n  {fix}",
         err = ui::paint(Tone::Err, ui::glyph_err()),
-        fix = format!("filament requests approve {request_id} --allow <capability> --for 1h"),
+        fix = format!("tunlion requests approve {request_id} --allow <capability> --for 1h"),
     )
 }
 

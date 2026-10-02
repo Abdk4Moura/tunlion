@@ -1,4 +1,4 @@
-# Filament documentation map
+# Tunlion documentation map
 
 This directory separates normative references, current planning, designs, and historical working records. Do not treat a dated note or a proposal as a statement about the shipped tree.
 
@@ -31,7 +31,7 @@ Use `Last verified` and `Verified against` for documents that make source-level 
 |---|---|
 | Product use and installation | `../README.md`, `../cli/README.md` |
 | Protocol and browser/CLI interface | `../CONTRACT.md` |
-| Routing reference / `filament man routing` source | `../cli/docs/filament-routing.md` |
+| Routing reference / `tunlion man routing` source | `../cli/docs/filament-routing.md` |
 | Architecture and platform rules | `architecture/`, `adr-*.md` |
 | Reliability evidence | `resilience.md`, `cli-resilience.md`, `testing/`, `test-topology-coverage.md` |
 | Configuration | `env-vars.md` |

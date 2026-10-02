@@ -6,7 +6,7 @@
 //! and made a self-contained build impossible. That was recorded as ledger C16
 //! and treated as unfixable without forking upstream.
 //!
-//! It turned out not to need a fork, because filament uses almost none of that
+//! It turned out not to need a fork, because tunlion uses almost none of that
 //! crate. The client connects with `TransportType::Websocket` and
 //! `reconnect(false)`, its handlers only ever pull the first JSON value out of a
 //! payload and forward it to one channel, and the only methods called on the
@@ -14,9 +14,9 @@
 //! websocket, the Engine.IO framing bytes, and Socket.IO's `42["name",data]`.
 //!
 //! SCOPE, deliberately small. Websocket transport only, no HTTP long-polling
-//! upgrade dance (filament forces websocket anyway, because polling behind
+//! upgrade dance (tunlion forces websocket anyway, because polling behind
 //! Cloudflare produced the reconnect storm documented in `net.rs`). No binary
-//! attachments: every payload here is JSON. No automatic reconnect: filament
+//! attachments: every payload here is JSON. No automatic reconnect: tunlion
 //! keeps `reconnect(false)` on purpose so its own outer loop can re-run
 //! join/subscribe/sync, which a silent library-level reconnect would skip.
 //!
@@ -167,7 +167,7 @@ fn split_packet(s: &str) -> Option<(char, &str)> {
 ///
 /// The ack id is skipped rather than rejected: the server is entitled to ask for
 /// an acknowledgement, and refusing to parse those frames would drop real
-/// events. filament never sends acks, which is the existing behaviour.
+/// events. tunlion never sends acks, which is the existing behaviour.
 pub fn parse_event(body: &str) -> Option<(String, Value)> {
     let json_start = body.find('[')?;
     let arr: Value = serde_json::from_str(&body[json_start..]).ok()?;

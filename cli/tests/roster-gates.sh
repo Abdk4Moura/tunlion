@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mesh roster v1: a spoke can SEE the mesh. Standalone, hermetic, fixture port
-# 8120 ONLY. FILAMENT_BIN=/path/to/filament ./roster-gates.sh
+# 8120 ONLY. FILAMENT_BIN=/path/to/tunlion ./roster-gates.sh
 #
 #   A   each spoke's `devices` lists the sibling (from the owner-signed roster)
 #   A2  `reach <sibling>` no longer says "no device named <sibling>"
@@ -9,7 +9,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8120
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

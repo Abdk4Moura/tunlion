@@ -1,20 +1,20 @@
-//! Tests for `filament man` command behavior.
+//! Tests for `tunlion man` command behavior.
 //!
-//! These tests verify that `filament man` emits readable help on TTY and
+//! These tests verify that `tunlion man` emits readable help on TTY and
 //! roff when piped, and handles unknown pages correctly.
 
 use std::process::Command;
 
-/// Get the path to the filament binary built with test-hooks feature.
+/// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
-    path.push("filament");
+    path.push("tunlion");
     path
 }
 
-/// Test that `filament man` piped emits roff (contains ".TH").
+/// Test that `tunlion man` piped emits roff (contains ".TH").
 #[test]
 fn man_piped_emits_roff() {
     let bin = filament_bin();
@@ -22,7 +22,7 @@ fn man_piped_emits_roff() {
     let output = Command::new(&bin)
         .arg("man")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -34,7 +34,7 @@ fn man_piped_emits_roff() {
     );
 }
 
-/// Test that `filament man` with simulated TTY emits readable help.
+/// Test that `tunlion man` with simulated TTY emits readable help.
 /// Gated to Linux: `script -qec` is util-linux syntax; macOS/Windows lack it.
 #[test]
 #[cfg(target_os = "linux")]
@@ -65,7 +65,7 @@ fn man_tty_emits_readable_help() {
     );
 }
 
-/// Test that `filament man settings` (unknown page) shows error message.
+/// Test that `tunlion man settings` (unknown page) shows error message.
 /// Gated to Linux: `script -qec` is util-linux syntax; macOS/Windows lack it.
 #[test]
 #[cfg(target_os = "linux")]
@@ -97,7 +97,7 @@ fn man_unknown_page_shows_error() {
     );
 }
 
-/// Test that `filament man routing` shows routing documentation.
+/// Test that `tunlion man routing` shows routing documentation.
 #[test]
 fn man_routing_shows_doc() {
     let bin = filament_bin();
@@ -106,7 +106,7 @@ fn man_routing_shows_doc() {
         .arg("man")
         .arg("routing")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 

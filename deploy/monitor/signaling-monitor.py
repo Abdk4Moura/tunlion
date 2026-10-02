@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filament signaling monitor.
+"""Tunlion signaling monitor.
 
 Polls the signaling server's liveness endpoint and emails an alert (via Resend)
 when it transitions DOWN or recovers. Driven every few minutes by
@@ -40,7 +40,7 @@ STATE_FILE = os.environ.get(
     "MONITOR_STATE", os.path.expanduser("~/.cache/filament-signaling-monitor.json")
 )
 ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "pro.kaiserlautern@gmail.com")
-ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Filament Monitor <monitor@send.autumated.com>")
+ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Tunlion Monitor <monitor@send.autumated.com>")
 RESEND_KEY_FILE = os.environ.get("RESEND_KEY_FILE", os.path.expanduser("~/secret_keys/resend_api_key"))
 # Consecutive failed checks before declaring DOWN (debounce transient blips).
 FAIL_THRESHOLD = int(os.environ.get("MONITOR_FAIL_THRESHOLD", "2"))
@@ -125,7 +125,7 @@ def main():
         if prev is False:
             down_for = now - st.get("down_since", now)
             sent, sres = send_alert(
-                "[filament] signaling RECOVERED",
+                "[tunlion] signaling RECOVERED",
                 f"{HEALTH_URL} is healthy again ({detail}).\n"
                 f"Was down for ~{down_for // 60}m{down_for % 60}s.\nRecovered at {utc(now)}.",
             )
@@ -144,7 +144,7 @@ def main():
         st["since"] = now
         st["down_since"] = now
         sent, sres = send_alert(
-            "[filament] signaling DOWN",
+            "[tunlion] signaling DOWN",
             f"{HEALTH_URL} failed {st['fails']} consecutive checks.\n\n"
             f"Last error: {detail}\n\nDetected at {utc(now)}.\n\n"
             "Note: GET / returns 503 by design (SPA fallback); check /api/health "

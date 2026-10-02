@@ -467,7 +467,7 @@ pub trait Transport: Send + Sync {
         None
     }
     /// The literal remote socket address the underlying connection is pinned to
-    /// (the `IP:port` `filament ping` shows for a direct link). `None` for a
+    /// (the `IP:port` `tunlion ping` shows for a direct link). `None` for a
     /// transport with no single socket endpoint (a relay/DataChannel link, whose
     /// path is the ICE-selected candidate pair, not one UDP 5-tuple).
     fn remote_addr(&self) -> Option<std::net::SocketAddr> {
@@ -476,7 +476,7 @@ pub trait Transport: Send + Sync {
     /// The underlying QUIC connection, when this transport has one.
     ///
     /// Exists so a caller can run its own authenticated exchange over the SAME
-    /// connection filament already established, rather than opening a second
+    /// connection tunlion already established, rather than opening a second
     /// path with its own trust story. `None` for a relay/DataChannel transport,
     /// which has no QUIC connection: callers must treat that as "not available
     /// here" and fall back, never as a reason to build an unauthenticated one.
@@ -489,7 +489,7 @@ pub trait Transport: Send + Sync {
     fn rtt_ms(&self) -> Option<u64> {
         None
     }
-    /// Local IP this transport's socket is bound to (so `filament ping` can name
+    /// Local IP this transport's socket is bound to (so `tunlion ping` can name
     /// the network INTERFACE the path uses - tailscale0 / eth0 / docker0). Direct-
     /// QUIC reports quinn's local_ip; `None` for transports that don't expose it
     /// (a relay/DataChannel link's local candidate is read from the ICE pair).
@@ -728,7 +728,7 @@ impl Transport for DataChannelTransport {
 // with both a LAN resolver and Tailscale MagicDNS) the FIRST `getaddrinfo` of
 // the signaling host after the resolver state goes cold stalls ~5 s before it
 // answers, even though each upstream server answers in milliseconds when asked
-// directly. Every `filament ssh`/`send`/`recv` is a fresh process, so its DNS
+// directly. Every `tunlion ssh`/`send`/`recv` is a fresh process, so its DNS
 // cache is cold and that stall lands squarely on the signaling phase (measured
 // 5.6 s vs a ~0.5 s warm connect, blowing the 1.2 s budget).
 //
@@ -1120,7 +1120,7 @@ pub async fn heartbeat(sio: &Client, payload: Value, tx: mpsc::UnboundedSender<E
 /// `_do_subscribe`). It ALSO emits a one-shot async `known-peer` per existing
 /// member, but that single push is lossy: if it dies in a half-open socket the
 /// subscriber waits for a peer that, from its view, never appeared, and stalls
-/// in "presence" forever (the dominant `filament ssh` establishment failure,
+/// in "presence" forever (the dominant `tunlion ssh` establishment failure,
 /// reproduced as ~40% of pop-os->do-vm attempts). The `up` acceptor never hit
 /// this because its `sync` tick re-subscribes on a cadence AND reconciles the
 /// digest roster; the one-shot L2 initiator (`bring_up_to_known`) did neither.
@@ -1253,7 +1253,7 @@ impl Peer {
         generation: u32,
     ) -> Result<Arc<Peer>> {
         crate::hooks::debug(&format!(
-            "filament: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
+            "tunlion: ICE-CONFIG peer={peer_id} servers={} urls={:?}",
             ice_servers.len(),
             ice_servers.iter().flat_map(|s| s.urls.clone()).collect::<Vec<_>>()
         ));
@@ -1518,7 +1518,7 @@ impl Peer {
                 };
                 for c in pending {
                     if let Err(e) = self.pc.add_ice_candidate(c).await {
-                        crate::hooks::trace(&format!("filament: queued candidate failed: {e}"));
+                        crate::hooks::trace(&format!("tunlion: queued candidate failed: {e}"));
                     }
                 }
                 if is_offer {
@@ -1553,7 +1553,7 @@ impl Peer {
                 };
                 if !buffered {
                     if let Err(e) = self.pc.add_ice_candidate(init).await {
-                        crate::hooks::trace(&format!("filament: addIceCandidate failed: {e}"));
+                        crate::hooks::trace(&format!("tunlion: addIceCandidate failed: {e}"));
                     }
                 }
             }
@@ -1619,7 +1619,7 @@ impl Peer {
         Some(format!("direct over {iface}"))
     }
 
-    /// The selected ICE pair's concrete endpoints, for `filament ping`/`doctor`
+    /// The selected ICE pair's concrete endpoints, for `tunlion ping`/`doctor`
     /// to render the exact path (local↔remote address + candidate type + whether
     /// it's relayed). `route()` answers the policy question ("does it leave the
     /// network?"); this hands back the raw 5-tuple so the UI can name the
@@ -1684,8 +1684,8 @@ pub struct PathPair {
     pub relayed: bool,
 }
 
-/// A rendered description of a link's path, shared by `filament ping` (warm) and
-/// `filament doctor` (probe) so both name the path identically: the local
+/// A rendered description of a link's path, shared by `tunlion ping` (warm) and
+/// `tunlion doctor` (probe) so both name the path identically: the local
 /// INTERFACE, the address class, the concrete endpoints, and whether it's
 /// relayed. Fields are `Option` because a relay/webrtc link exposes less than a
 /// direct one.
@@ -1803,7 +1803,7 @@ pub fn is_own_addr(addr: &str) -> bool {
 
 /// The local source IP the kernel would use to reach `remote`. Same no-packets
 /// UDP-connect trick as `is_own_addr`: after `connect()`, `local_addr()` reports
-/// the source the routing table picked. Lets `filament ping` name the outbound
+/// the source the routing table picked. Lets `tunlion ping` name the outbound
 /// interface even when quinn's `local_ip()` is `None` (holepunched / specifically
 /// bound sockets don't carry per-packet dst info). `None` only if the bind fails.
 pub fn source_ip_for(remote: std::net::SocketAddr) -> Option<std::net::IpAddr> {
@@ -1876,7 +1876,7 @@ async fn wire_channel(
             let raw = match dc2.detach().await {
                 Ok(raw) => raw,
                 Err(e) => {
-                    crate::hooks::trace(&format!("filament: data channel detach failed: {e}"));
+                    crate::hooks::trace(&format!("tunlion: data channel detach failed: {e}"));
                     return;
                 }
             };

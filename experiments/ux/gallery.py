@@ -16,7 +16,7 @@ META = {
     "03": ("cli↔cli", "Send with a one-time code", "Sender mints a speakable code; the receiver claims it and the bytes land, sha256-verified end-to-end."),
     "04": ("cli↔cli", "Send --to a known device", "No code: a remembered device, identity proof-verified and auto-accepted; bytes sha256-verified."),
     "05": ("cli↔cli", "Always-on receiver: up / status / down", "Bring up a trusted-only drop target, send into it, check status, stop it; bytes sha256-verified."),
-    "06": ("cli↔cli", "Grant shell + ssh over the tunnel", "Deny-by-default consent; then `filament ssh peer -- echo OK` runs over the data channel."),
+    "06": ("cli↔cli", "Grant shell + ssh over the tunnel", "Deny-by-default consent; then `tunlion ssh peer -- echo OK` runs over the data channel."),
     "07": ("cli↔cli", "Introduce two devices", "A hub that knows both vouches them to each other with a fresh mutual secret."),
     "08": ("cli↔web", "CLI sends → the web app receives", "The browser (local frontend) accepts the offered file and reaches the download affordance."),
     "09": ("cli↔web", "The web app sends → CLI recv", "Browser picks a file and sends it; the CLI receiver writes it, sha256-verified (authoritative no-recorder verify pass). The GIF is a best-effort visual; single-host browser→CLI WebRTC can't complete while the webm recorder runs — see README."),
@@ -67,7 +67,7 @@ def main():
 
     html = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Filament CLI — UX flow gallery</title>
+<title>Tunlion CLI — UX flow gallery</title>
 <style>
   :root {{ color-scheme: dark; }}
   * {{ box-sizing: border-box; }}
@@ -93,7 +93,7 @@ def main():
     .card {{ padding:12px; }}
   }}
 </style></head><body>
-  <h1>Filament CLI — UX flow gallery</h1>
+  <h1>Tunlion CLI — UX flow gallery</h1>
   <p class="sub">Human-watchable recordings of each CLI UX flow (cli↔cli and cli↔web), driven against a local backend.</p>
   <p class="summary"><b style="color:#1f9d55">{npass} PASS</b> &nbsp; <b style="color:#c0392b">{nfail} FAIL</b> &nbsp; <b style="color:#888">{nblock} BLOCKED</b> &nbsp; / 10 scenarios</p>
   <div class="grid">{''.join(cards)}</div>

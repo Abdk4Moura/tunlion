@@ -1,4 +1,4 @@
-# Filament control-plane lab. Install into the fixture venv (or any py3.10+).
+# Tunlion control-plane lab. Install into the fixture venv (or any py3.10+).
 python-socketio>=5.16
 websocket-client>=1.9    # REQUIRED: enables the websocket transport. Without it
                          # socketio.connect(transports=["websocket"]) raises

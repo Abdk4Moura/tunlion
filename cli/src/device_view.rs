@@ -83,7 +83,7 @@ pub(crate) fn device_cert_valid_for(name: &str) -> Option<identity::DeviceCert> 
 
 /// Is `name` a device we hold an INDEX entry for but no pair secret?
 ///
-/// That is exactly a fleet sibling: recorded so `filament devices` can show the
+/// That is exactly a fleet sibling: recorded so `tunlion devices` can show the
 /// fleet, deliberately without a secret so it never becomes a dial target. The
 /// distinction matters for error copy, because such a name is simultaneously
 /// "listed" and "not reachable by this verb".
@@ -92,7 +92,7 @@ pub(crate) fn device_cert_valid_for(name: &str) -> Option<identity::DeviceCert> 
 /// `devices_load()` filter-maps on `secret`, so every check written against it
 /// silently means "devices I can DIAL", not "devices I know". A fleet sibling is
 /// indexed without a secret, so those checks answer "no device named X" while
-/// `filament devices` is listing X on the next line. For `revoke` that is worse
+/// `tunlion devices` is listing X on the next line. For `revoke` that is worse
 /// than confusing: a device you can SEE but cannot revoke.
 pub(crate) fn device_record_exists(name: &str) -> bool {
     let Ok(raw) = std::fs::read_to_string(devices_path()) else {
@@ -166,7 +166,7 @@ pub(crate) fn devices_sweep_lapsed(now: u64) -> usize {
 }
 
 /// Update the `lastSeen` timestamp and overlay addresses for a known device.
-/// Called on each connect so `filament addr <device>` can show recency and addresses.
+/// Called on each connect so `tunlion addr <device>` can show recency and addresses.
 pub(crate) fn devices_touch(
     name: &str,
     v6: Option<std::net::Ipv6Addr>,
@@ -353,7 +353,7 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
             });
             // #240: this tier is reached whenever a device has no stored
             // certificate, which every code-flow pairing does. The row used to
-            // say "promote to continue" and print `filament devices promote
+            // say "promote to continue" and print `tunlion devices promote
             // <name>` underneath. Three things wrong at once: the verb does not
             // exist (#191), nothing is blocked (a transfer to such a device
             // works immediately, verified between two machines), and the tier

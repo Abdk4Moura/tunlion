@@ -50,9 +50,9 @@ thing that must scale — and it's the thing that's centralized.
   `signal`/`candidate`/`description` between them, and emits
   `known-peer`/`known-peer-left`/`peer-joined`/`peer-left`.
 
-## Mapping filament's model onto DOs (clean, because it already shards)
+## Mapping tunlion's model onto DOs (clean, because it already shards)
 
-filament already keys signaling on two kinds of id, both perfect DO names:
+tunlion already keys signaling on two kinds of id, both perfect DO names:
 
 - **Persistent pair channel** (C12): the channel id is a **hash of the pair
   secret** — the server only ever sees "meeting points", never secrets. Map it
@@ -101,7 +101,7 @@ regional, and it's the natural free-vs-paid line.
 
 ## Migration path (incremental, low-risk)
 
-1. Stand up the Workers+DO signaling behind a *new* URL (e.g. `wss://sig.filament…`),
+1. Stand up the Workers+DO signaling behind a *new* URL (e.g. `wss://sig.tunlion…`),
    speaking the same message protocol.
 2. Add a client transport that talks raw WS to it (behind a `server`/flag), keeping
    the socket.io path as fallback. Dogfood on a few devices.

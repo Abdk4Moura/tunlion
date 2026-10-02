@@ -1823,7 +1823,7 @@ pub async fn race_connect_labeled(
     if route == "direct-quic" && test_block() {
         // Fallback gate: pretend the direct path is unreachable. Drop the
         // endpoint and let the budget expire so WebRTC takes over.
-        eprintln!("filament: DIRECT-BLOCKED (test), forcing WebRTC fallback");
+        eprintln!("tunlion: DIRECT-BLOCKED (test), forcing WebRTC fallback");
         tokio::time::sleep(DIRECT_BUDGET).await;
         endpoint.close(0u32.into(), b"test-block");
         return None;
@@ -1893,17 +1893,17 @@ pub async fn race_connect_labeled(
                     if let Ok(s) = std::str::from_utf8(&buf) {
                         if let Ok(ip) = s.trim().parse::<IpAddr>() {
                             record_observed_ip(ip).await;
-                            crate::hooks::trace(&format!("filament: peer observed us from {ip}; supersedes whoami"));
+                            crate::hooks::trace(&format!("tunlion: peer observed us from {ip}; supersedes whoami"));
                         }
                     }
                 }
                 Ok(Err(e)) => {
                     // A malformed frame is not an observation; the connection
                     // still works. Surface it so the operator can see it.
-                    crate::hooks::debug(&format!("filament: observed-address exchange failed ({e}); skipping"));
+                    crate::hooks::debug(&format!("tunlion: observed-address exchange failed ({e}); skipping"));
                 }
                 Err(_) => {
-                    crate::hooks::say("filament: peer agreed to the observed-address exchange but never sent the frame; skipping (inconsistent older build)");
+                    crate::hooks::say("tunlion: peer agreed to the observed-address exchange but never sent the frame; skipping (inconsistent older build)");
                 }
             }
         } else {
@@ -1990,7 +1990,7 @@ pub async fn race_connect_labeled(
                     // greppable. Dial failures (unreachable candidate) are noise.
                     let s = e.to_string();
                     if s.contains("DIRECT-AUTH-FAIL") {
-                        crate::hooks::trace(&format!("filament: {s}"));
+                        crate::hooks::trace(&format!("tunlion: {s}"));
                     }
                     continue;
                 }
@@ -2011,7 +2011,7 @@ pub async fn race_connect_labeled(
     // DEBUG, direct-connect diagnostic (the user-facing route label is the
     // `route:` line emitted in main.rs; this is the internal detail).
     crate::hooks::debug(&format!(
-        "filament: DIRECT-CONNECT ok (route: {}) peer={} remote={}",
+        "tunlion: DIRECT-CONNECT ok (route: {}) peer={} remote={}",
         route,
         peer_id,
         conn.remote_address()

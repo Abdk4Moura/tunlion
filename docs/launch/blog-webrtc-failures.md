@@ -8,7 +8,7 @@
 Last year I dug up an abandoned repo from 2024. It was a peer-to-peer file
 sharing app I had built while teaching myself how Flask and React fit
 together, and it had quietly rotted. I decided to revive it properly. The
-result is [Filament](https://tunlion.autumated.com), which sends files
+result is [Tunlion](https://tunlion.autumated.com), which sends files
 directly between two browsers over WebRTC: no upload, no account, no size
 limit.
 
@@ -19,14 +19,14 @@ WiFi that flickers, and a second tab they forgot about, and you discover that
 the demo was the easy 20 percent.
 
 This post is the other 80 percent. Eleven concrete failure modes I hit while
-making Filament reliable, each with the symptom, the actual cause, and the
+making Tunlion reliable, each with the symptom, the actual cause, and the
 fix. If you are building anything on RTCPeerConnection and DataChannels, I
 suspect you will meet most of these too. The full engineering log lives in
 the repo as [docs/resilience.md](https://github.com/Abdk4Moura/tunlion/blob/main/docs/resilience.md).
 
 ## The shape of the system
 
-Filament is three interacting state machines:
+Tunlion is three interacting state machines:
 
 1. **Room and signaling.** A small Flask-SocketIO server tracks who is in a
    room and relays opaque WebRTC payloads between peers. It never sees file
@@ -224,7 +224,7 @@ will accumulate ghosts.
 
 ## 11. Pairing codes that work forever are a bug, not a feature
 
-This one is a design failure rather than a crash. Filament discovers devices
+This one is a design failure rather than a crash. Tunlion discovers devices
 on the same network automatically, but sometimes the person across the table
 is invisible to you: different carriers, AP isolation, CGNAT splitting what
 looks like one network into many. For that case the original app had short
@@ -250,7 +250,7 @@ nothing. Type-guard your optional string parameters at both ends.
 
 After all eleven fixes, drops re-paired automatically, but a half-sent video
 still restarted from zero. On a flaky mobile path that can mean never
-finishing. So Filament resumes:
+finishing. So Tunlion resumes:
 
 1. **Stable identity.** Each tab mints a session-scoped id carried through
    the signaling protocol, so peers recognize "same device, new connection"
@@ -283,7 +283,7 @@ stream from. That is a platform boundary, not a design choice.
 - **Disconnect handlers are a courtesy.** Build presence on leases, not on
   goodbye messages.
 
-Filament is open source and self-hostable: a React frontend, a small
+Tunlion is open source and self-hostable: a React frontend, a small
 Flask-SocketIO signaling server, Redis, and coturn, all wired together with
 docker compose. Try it at
 [tunlion.autumated.com](https://tunlion.autumated.com), read the code at

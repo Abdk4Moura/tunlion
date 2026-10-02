@@ -1,14 +1,14 @@
-"""provider: filament — native L3 (serve_tun) carrier.
+"""provider: tunlion — native L3 (serve_tun) carrier.
 
-THE INTEGRATION TARGET, now REALIZED. Each node runs ``filament serve-tun``: a
+THE INTEGRATION TARGET, now REALIZED. Each node runs ``tunlion serve-tun``: a
 TUN whose IP packets ride QUIC **datagrams** directly over a point-to-point link
 to the peer's underlay endpoint. No signaling, no pairing, no userspace relay —
 the two ends share a PSK out of band (the WireGuard model) and connect over the
 lab's private underlay veth. This is the collapse the L2-forward approximation
 was a placeholder for:
 
-    node-a ns:  filament serve-tun --listen  <a.underlay>:PORT --tun-addr a/NN ...
-    node-b ns:  filament serve-tun --connect <a.underlay>:PORT --tun-addr b/NN ...
+    node-a ns:  tunlion serve-tun --listen  <a.underlay>:PORT --tun-addr a/NN ...
+    node-b ns:  tunlion serve-tun --connect <a.underlay>:PORT --tun-addr b/NN ...
 
 Each ``serve-tun`` creates its own TUN (``labtun-<node>``) inside its netns and
 adds the connected overlay route itself, so the provider has nothing else to
@@ -16,9 +16,9 @@ wire. Data path (a <-> b):
 
     TUN-a (node-a ns)  <->  QUIC datagrams over the underlay veth  <->  TUN-b
 
-SAFETY: the locally-built ``cli/target/release/filament`` only; the processes run
+SAFETY: the locally-built ``cli/target/release/tunlion`` only; the processes run
 INSIDE the lab netns (serve-tun needs no internet — it dials the peer's underlay
-IP directly), so this never touches host networking, ``~/.config/filament``, or
+IP directly), so this never touches host networking, ``~/.config/tunlion``, or
 the running ``up`` daemon. serve-tun reads no config at all (PSK on the CLI).
 """
 
@@ -37,7 +37,7 @@ PORT = 51820
 def up(ctx: LinkContext) -> None:
     if not FILAMENT_BIN.exists():
         raise RuntimeError(
-            f"locally-built filament not found at {FILAMENT_BIN}; "
+            f"locally-built tunlion not found at {FILAMENT_BIN}; "
             f"build it: (cd cli && cargo build --release).")
     fb = str(FILAMENT_BIN)
 

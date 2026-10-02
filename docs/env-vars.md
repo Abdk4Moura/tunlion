@@ -1,6 +1,6 @@
-# FILAMENT_ environment variables
+# TUNLION_ environment variables
 
-The filament CLI reads a small, deliberate set of `FILAMENT_*` environment
+The tunlion CLI reads a small, deliberate set of `TUNLION_*` environment
 variables. Most are escape hatches on top of sensible defaults: the shipped
 binary already does the right thing for every documented path, and an env
 var is here only when an operator needs to (a) opt into a feature that is
@@ -47,7 +47,7 @@ If you only want to read about a specific subsystem, jump to it directly:
 
 ## The transport ladder
 
-Filament tries three rungs before falling back to relay, in order, and each
+Tunlion tries three rungs before falling back to relay, in order, and each
 rung is independently gated:
 
 1. **Rung 1: direct QUIC** to a known device, only if
@@ -73,23 +73,23 @@ never-flaky model that hangs the whole ladder together is
 
 ## L2 / ssh tunneling
 
-`filament netcat`, `filament ssh`, `filament forward`, and `filament pty`
+`tunlion netcat`, `tunlion ssh`, `tunlion forward`, and `tunlion pty`
 ride the L2 subsystem, which the CLI flips on when any of these conditions
 hold:
 
 - `FILAMENT_L2=1` is set, or
 - the `up --shell` (or `--shell-only <devices,...>`) policy is in effect, or
 - any known device has been granted the `shell` capability (so a plain
-  `up` plus `filament grant <dev> shell` works without restarting the
+  `up` plus `tunlion grant <dev> shell` works without restarting the
   daemon).
 
 The acceptor side of the L2 path is also where the
 [Item 3: direct-first preference for L2](design-l2-direct-ladder.md) lives;
 that document spells out the carve-out from the file-transfer hard rule
 that `FILAMENT_L2` does *not* also imply a direct default for plain
-`filament send`.
+`tunlion send`.
 
-The seamless `filament ssh` flow bootstraps over the trusted channel first
+The seamless `tunlion ssh` flow bootstraps over the trusted channel first
 (pin host keys, install the managed pubkey under `# BEGIN/END
 filament-managed <device>` in the acceptor's `authorized_keys`) and then
 hands off to the user's real `ssh` binary, pointed exclusively at
@@ -101,9 +101,9 @@ host-key prompt. The full design is in
 
 ## Warm-link reuse
 
-A long-lived `filament up` daemon exposes a local unix-domain control
+A long-lived `tunlion up` daemon exposes a local unix-domain control
 socket at `{FILAMENT_CONFIG_DIR}/control.sock`. When a sibling process
-(`filament ssh`, `filament netcat`, `filament forward`) needs to reach a
+(`tunlion ssh`, `tunlion netcat`, `tunlion forward`) needs to reach a
 peer that the daemon already holds a live, trusted link to, the sibling
 sends a one-line JSON request to the daemon and gets back a raw byte pipe
 over a **new L2 stream on the existing link**, skipping signaling,
@@ -121,7 +121,7 @@ a per-process override, not a daemon-only switch.
 
 ## Signaling liveness
 
-Long-lived acceptors (`filament up` and `up --shell`) keep a single
+Long-lived acceptors (`tunlion up` and `up --shell`) keep a single
 socket.io signaling connection open for the daemon's lifetime. A severed
 TCP produces no close callback in `rust_socketio`, so the daemon watches
 the **inbound-event gap** instead: any socket event (welcome, sync ack,
@@ -198,19 +198,19 @@ them. They are still listed in the test-only section.
 
 | Variable | Values (default) | What it does |
 | --- | --- | --- |
-| `FILAMENT_SERVER` | URL string (`https://api.filament.autumated.com`) | Signaling server. Honored by clap as the global `--server` flag (set the env, no flag needed); `--server` on the command line wins. The `--server` flag, the `config server` file key, then the built-in default are the precedence order, in the same shape every other filament command follows. |
-| `FILAMENT_CONFIG_DIR` | Path (`~/.config/filament` on unix) | Root of the filament config tree: `devices.json`, the managed ssh keypair and known_hosts, the warm-reuse control socket, the DNS cache, and the diag log. Honors hermetic tests; the `home` directory is used when unset. |
+| `FILAMENT_SERVER` | URL string (`https://api.filament.autumated.com`) | Signaling server. Honored by clap as the global `--server` flag (set the env, no flag needed); `--server` on the command line wins. The `--server` flag, the `config server` file key, then the built-in default are the precedence order, in the same shape every other tunlion command follows. |
+| `FILAMENT_CONFIG_DIR` | Path (`~/.config/tunlion` on unix) | Root of the tunlion config tree: `devices.json`, the managed ssh keypair and known_hosts, the warm-reuse control socket, the DNS cache, and the diag log. Honors hermetic tests; the `home` directory is used when unset. |
 | `FILAMENT_NAME` | Display name string (config `name`, else `user@host`) | Display name shown to peers. If `--name` is passed, the CLI exports this env var before the runtime spawns any workers; the resolver in `display_name()` then reads it ahead of the config file and the `$USER@hostname` fallback. |
 | `FILAMENT_UID` | String (auto: `cli-<role>-<install_id>-<pid>-<nanos>`) | Pins the per-process signaling `uid` to a fixed value, primarily so the C6 same-uid supersede gate (`main.rs:638`) can exercise the "same device on a new sid" path. The `cli-s-/cli-r-/cli-p-` role prefix is preserved under the override, so the same-role skip (C13) keeps working. Production should leave this unset. |
-| `FILAMENT_NO_IMPLICIT_INIT` | `1` (unset) | Restore the pre-U1 precondition: a verb that needs an identity fails fast with "no identity. Run `filament init` first" instead of minting one. Unset (the default), the identity is created silently on first use and one line says so, once (`docs/design-relationship-ux.md` §3.1). Empty and `0` count as unset. |
+| `FILAMENT_NO_IMPLICIT_INIT` | `1` (unset) | Restore the pre-U1 precondition: a verb that needs an identity fails fast with "no identity. Run `tunlion init` first" instead of minting one. Unset (the default), the identity is created silently on first use and one line says so, once (`docs/design-relationship-ux.md` §3.1). Empty and `0` count as unset. |
 | `FILAMENT_NONINTERACTIVE` | Any value (unset) | Opt out of the guided interactive code entry from the env. Mirrors `--no-interactive`; any value disables the prompt. A non-TTY stdin always disables the prompt regardless. |
 | `FILAMENT_COLOR` | `never` (unset → auto: TTY + not `NO_COLOR` + not `TERM=dumb`) | Force-disable color output when set to `never`. Otherwise the color decision follows the standard `NO_COLOR` + `TERM` checks. |
 | `FILAMENT_LOG` | `critical` / `info` / `debug` / `trace` (`info`) | Global verbosity ceiling. Overrides `-v` / `-q` when set; otherwise the flags decide (`-q` is `critical`, `-v` is `debug`, `-vv` is `trace`). `-v` increments the level; `FILAMENT_LOG=trace` is `vv`. The value-prop lines (route label, relay banner) always print. |
-| `FILAMENT_SSH_PORT` | Integer (22) | Override the port the `filament ssh` ProxyCommand dials on the peer. Mirrors `FILAMENT_L2_DIALHOST` for the host side. Use this when the peer's sshd is on a non-standard port. |
+| `FILAMENT_SSH_PORT` | Integer (22) | Override the port the `tunlion ssh` ProxyCommand dials on the peer. Mirrors `FILAMENT_L2_DIALHOST` for the host side. Use this when the peer's sshd is on a non-standard port. |
 | `FILAMENT_SSH_USER` | String (the acceptor's reported login, else `$USER`, else `root`) | Login account for the ssh destination. The acceptor's report (the bootstrap-ack `user` field) is authoritative over a local `$USER` guess, which is usually wrong cross-machine (`agboola@laptop` vs `root@server`). Set this env only when you want to override that decision. |
 | `FILAMENT_SSH_HOSTKEY` | Path to a pubkey file (prod: `/etc/ssh/ssh_host_*.pub`) | Path to a file holding the acceptor's host public keys, one per line. Production reads the standard `/etc/ssh` directory; the gates point this at a throwaway sshd's pubfile so they never touch the system sshd. |
-| `FILAMENT_NO_WARM_REUSE` | `1` (unset → enabled) | Force every `filament ssh` / `netcat` / `forward` back onto a fresh establish instead of riding the `up` daemon's warm link. Per-process; useful for isolating "is this issue the warm path or the underlying transport?". |
-| `FILAMENT_BUILD_INFO` | Build-stamp string (set by `build.rs`) | The version string baked into the binary at build time and printed by `filament --version`. Not set by users. |
+| `FILAMENT_NO_WARM_REUSE` | `1` (unset → enabled) | Force every `tunlion ssh` / `netcat` / `forward` back onto a fresh establish instead of riding the `up` daemon's warm link. Per-process; useful for isolating "is this issue the warm path or the underlying transport?". |
+| `FILAMENT_BUILD_INFO` | Build-stamp string (set by `build.rs`) | The version string baked into the binary at build time and printed by `tunlion --version`. Not set by users. |
 
 ### Transport / connectivity
 
@@ -218,7 +218,7 @@ them. They are still listed in the test-only section.
 | --- | --- | --- |
 | `FILAMENT_DIRECT` | `1` (unset → disabled) | Opt-in to rung 1 of the transport ladder: the direct authenticated-QUIC dial to a known device, no WebRTC, no ICE, no relay tax. The whole rung-1 path is dead unless this is set, and the shipped WebRTC path is byte-for-byte unchanged when it is not. Set this when both peers are CLIs and you want a known-device transfer over the reachable host candidate. |
 | `FILAMENT_HOLEPUNCH` | `1` (unset → disabled) | Opt-in to rung 2 of the ladder: the STUN-discovered UDP hole-punch that runs after rung 1's host-candidate race fails. Rung 2 binds its own second raw socket, STUNs it to learn the server-reflexive mapping, and runs rung 1's *unchanged* QUIC handshake over the punched socket. Fails gracefully on symmetric NAT (the punch times out and rung 3 takes over). |
-| `FILAMENT_L2` | `1` (unset → disabled) | Turn on the L2/ssh acceptor (`up`/`recv` now serves `l2-open`, `pty-open`, and the seamless `filament ssh` bootstrap). Also implies `FILAMENT_DIRECT` for the L2 path only, per [`design-l2-direct-ladder.md`](design-l2-direct-ladder.md): the L2 use case needs reliable CLI-to-CLI and the file-transfer `FILAMENT_DIRECT` default is deliberately not flipped. |
+| `FILAMENT_L2` | `1` (unset → disabled) | Turn on the L2/ssh acceptor (`up`/`recv` now serves `l2-open`, `pty-open`, and the seamless `tunlion ssh` bootstrap). Also implies `FILAMENT_DIRECT` for the L2 path only, per [`design-l2-direct-ladder.md`](design-l2-direct-ladder.md): the L2 use case needs reliable CLI-to-CLI and the file-transfer `FILAMENT_DIRECT` default is deliberately not flipped. |
 | `FILAMENT_STUN` | `host:port` (first `stun:` URL in the ICE config) | Override the STUN server the rung-2 punch and the `doctor` probe use to learn a server-reflexive candidate. `host:port` is parsed and resolved; no scheme prefix. STUN failure is graceful (no srflx is advertised, rung 2 simply does not fire for that peer). |
 | `FILAMENT_PUBLIC_IP` | IP literal (auto: `{server}/api/whoami`, cached 5 min) | Public IP advertised as a rung-1 direct candidate. Cached for five minutes per server so a stable box does not re-fetch on every connect; the env override always wins and never touches the network. |
 | `FILAMENT_DNS_RACE_MS` | Milliseconds (700) | Bounded wait for a fresh OS DNS resolution before the cached IPs are allowed to win the race outright. Comfortably above a healthy resolver's answer and well below the cold-stall ceiling; a healthy box always uses fresh DNS, only a stalling resolver falls back to the cache. |
@@ -235,8 +235,8 @@ them. They are still listed in the test-only section.
 
 | Variable | Values (default) | What it does |
 | --- | --- | --- |
-| `FILAMENT_L2_CANDIDATE_SECS` | Seconds (7) | Outer wall for the L2 initiator (`filament ssh` / `netcat` / `forward`) from "KnownPeer observed" to "ChannelReady observed". Generous, a slow-but-real ICE lands around 5 s, but the L2 path is not allowed to hang past this on the per-candidate rotation. |
-| `FILAMENT_SEND_TIMEOUT` | Seconds (60) | Establish deadline for `filament send`: how long the spinner is allowed to spin waiting for a peer to connect to the offered room, before failing honestly. `0` disables the bound (a long-lived interactive transfer in a tight loop will not cut you off, but an ICE wedge is no longer capped). Once a live data channel opens the bound is disarmed, so big transfers are never interrupted. |
+| `FILAMENT_L2_CANDIDATE_SECS` | Seconds (7) | Outer wall for the L2 initiator (`tunlion ssh` / `netcat` / `forward`) from "KnownPeer observed" to "ChannelReady observed". Generous, a slow-but-real ICE lands around 5 s, but the L2 path is not allowed to hang past this on the per-candidate rotation. |
+| `FILAMENT_SEND_TIMEOUT` | Seconds (60) | Establish deadline for `tunlion send`: how long the spinner is allowed to spin waiting for a peer to connect to the offered room, before failing honestly. `0` disables the bound (a long-lived interactive transfer in a tight loop will not cut you off, but an ICE wedge is no longer capped). Once a live data channel opens the bound is disarmed, so big transfers are never interrupted. |
 | `FILAMENT_ACK_TIMEOUT` | Seconds (15) | How long the sender waits for the receiver's whole-file `delivery-ack` after every byte has left, before re-probing once (re-sending `file-end` to prompt a possibly-lost ack) and then failing the send honestly if the ack still does not land. The receiver computed a sha256 of every received byte and compared against the sender's offered digest; that ack is the only deterministic "it landed intact" signal. `delivery not confirmed` is the error, never a false "delivered + verified". |
 | `FILAMENT_PAIR_GRACE_SECS` | Seconds (60) | Per-candidate budget for the SPAKE2 pairing / ephemeral-ceremony handshake. The first peer whose ceremony confirms becomes the authenticated counterparty; a per-peer budget lets a decoy / wrong-words candidate drop individually without bailing the whole `recv`. The overall backstop (no peer authenticates at all) is the same value. The same knob also bounds the code-path transfer's PAKE confirmation. |
 | `FILAMENT_REJOIN_SECS` | Seconds (45) | Blind rejoin window for an unannounced peer departure (C21). Holds the line this long waiting for the peer's client to auto-rejoin (C6 supersede completes the recovery). A peer that announced `brb` (mobile file picker suspends the tab) gets its declared ttl plus slack, not this value. |
@@ -244,7 +244,7 @@ them. They are still listed in the test-only section.
 | `FILAMENT_SHUTDOWN_GRACE_MS` | Milliseconds (3,000) | Hard upper bound on shutdown: after SIGINT/SIGTERM, the signal-owned watchdog `std::process::exit`s after this many ms regardless of the event-loop state. `0` is honored (next-tick force-exit). Comfortably under systemd's default `TimeoutStopSec` (90 s) so a wedged `write_data_channel().await` or a `send_frame` parked on backpressure that never drains cannot block exit past the bound. |
 | `FILAMENT_STALL_MS` | Milliseconds (6,000) | Bytes-moved stall threshold for the main loop's watchdog (Phase 0, GAP-1). An in-flight transfer whose link's `idle_ms()` exceeds this while the control channel is still alive is declared stalled, and the correction ladder runs. The threshold is on *time since the last byte*, never on throughput, so a slow-but-MOVING link (which keeps stamping activity) never trips, only a frozen one does. 6 s sits well above a slow mobile uplink's inter-chunk gap and well below human patience. |
 | `FILAMENT_SIGNALING_SILENCE_MS` | Milliseconds (15,000) | Watchdog for the long-lived acceptor's signaling link: if no inbound socket event and no successful `sync` ack lands for this long, the outer reconnect loop fires a forced `sync` heartbeat, and a second threshold with no response declares the link dead and re-dials. Well above the 5 s sync cadence so a single slow ack never false-trips. |
-| `FILAMENT_DOCTOR_PROBE_SECS` | Seconds (30) | Outer wall for `filament doctor` establish-then-drop probes. Generous, a slow-but-real ICE lands around 5 s, but the probe is not allowed to hang past this even when the path is wedged. |
+| `FILAMENT_DOCTOR_PROBE_SECS` | Seconds (30) | Outer wall for `tunlion doctor` establish-then-drop probes. Generous, a slow-but-real ICE lands around 5 s, but the probe is not allowed to hang past this even when the path is wedged. |
 
 ### Test-only hooks (NOT for production)
 

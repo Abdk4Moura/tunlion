@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filament connection-establishment model checker.
+"""Tunlion connection-establishment model checker.
 
 Exhaustively explores the ENTIRE reachable state space of the peer-to-peer
 establishment protocol and verifies, for N peers:
@@ -20,7 +20,7 @@ checker finds EVERY stuck/invalid state, not just one we tripped over.
 Faithfulness: the FSM below is extracted from the deployed code
   - crates/filament-transport/src/net.rs + cli/src/{main,session}.rs
     (Rust client / `up` daemon; net.rs moved out of cli/src on 2026-08-27)
-  - frontend/src/lib/{webrtc,useFilament}.js   (web client)
+  - frontend/src/lib/{webrtc,useTunlion}.js   (web client)
   - signaling.py (the relay), CONTRACT.md, docs/observability-state-machine.md
 See proofs/README.md for the state<->code mapping. Both clients implement the
 SAME protocol (cross-impl parity is pinned by tests), so one canonical FSM
@@ -247,7 +247,7 @@ class Model:
     # level up: that proves a TEST can fail, this proves a PROPERTY can.
     # Related, in prose rather than code: docs/ui/OUTPUT.md, "A true sentence
     # can still be the bug", and #224, where a test asserted
-    # is_filament_process(own_pid) with a binary named filament-<hash>, so the
+    # is_tunlion_process(own_pid) with a binary named tunlion-<hash>, so the
     # input could not fail.
     def invariant_violations(self, st, antecedents_seen=None):
         pairs, fb = st

@@ -24,6 +24,6 @@ TOTAL  226s
 #  - backend_start retries on a fresh port if an eventlet boot is starved
 #  - per-scenario cleanup kills ONLY its own backend; a suite-wide FIL_UX_RIG=1
 #    marker sweep runs once at the very end (never while siblings are live)
-#  - all filament calls are `timeout -k 5`-boxed so a SIGTERM-ignoring recv linger
+#  - all tunlion calls are `timeout -k 5`-boxed so a SIGTERM-ignoring recv linger
 #    gets SIGKILLed and can't hang the suite
 #  - parallel runs clean up fully between runs (no leftover-sshd starvation)

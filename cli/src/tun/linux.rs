@@ -1,6 +1,6 @@
 //! Linux TUN backend for the `tun` module: open `/dev/net/tun`, hand back an async
 //! read/write handle so the overlay pump can move raw IP packets between the kernel
-//! and a filament link's QUIC datagrams.
+//! and a tunlion link's QUIC datagrams.
 //!
 //! Deliberately dependency-light, matching the rest of the CLI: one `TUNSETIFF`
 //! ioctl via `libc`, the device's addr/mtu/up set through `iproute2` (no netlink
@@ -78,7 +78,7 @@ pub fn cap_grant_cmd() -> String {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "filament".into());
+        .unwrap_or_else(|| "tunlion".into());
     format!("sudo setcap cap_net_admin+eip {exe}")
 }
 
@@ -134,7 +134,7 @@ pub fn ensure_hosts_writable() {
 
 /// Make L3 work for a non-root daemon with as few steps as possible: if we lack
 /// CAP_NET_ADMIN and we're at a terminal, run the one-time `setcap` now (a single
-/// sudo prompt) so a later `filament up` just works; otherwise print the exact
+/// sudo prompt) so a later `tunlion up` just works; otherwise print the exact
 /// command. Also grants /etc/hosts write for MagicDNS names. A no-op for each
 /// grant already in place. Returns true if the capability is present or granted.
 pub fn ensure_net_admin_for_l3() -> bool {
@@ -159,7 +159,7 @@ pub fn ensure_net_admin_for_l3() -> bool {
             .map(|s| s.success())
             .unwrap_or(false);
         if granted {
-            eprintln!("  done. restart the daemon (or run `filament up`) to bring up the overlay.");
+            eprintln!("  done. restart the daemon (or run `tunlion up`) to bring up the overlay.");
         } else {
             eprintln!("  could not grant automatically; run it yourself, then restart the daemon:\n    {cmd}");
         }

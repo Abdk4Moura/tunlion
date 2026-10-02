@@ -16,7 +16,7 @@ delimited, per-owner block and leaves everything outside it byte-for-byte untouc
 - **Cross-platform, permission-aware** — writes with the right restrictive
   permissions (shares [`secret-write`](https://crates.io/crates/secret-write)).
 
-Extracted from [filament](https://github.com/Abdk4Moura/tunlion), where it backs
+Extracted from [tunlion](https://github.com/Abdk4Moura/tunlion), where it backs
 the capability layer's SSH-key reconciler (grant shell → key added, revoke → key
 removed).
 

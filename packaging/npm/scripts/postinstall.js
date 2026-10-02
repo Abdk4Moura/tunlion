@@ -1,5 +1,5 @@
 'use strict'
-// Downloads the prebuilt filament binary matching THIS package's version from
+// Downloads the prebuilt tunlion binary matching THIS package's version from
 // the GitHub release, verifies its SHA-256 against the release SHA256SUMS, and
 // unpacks it into ./vendor. Mirrors scripts/install.sh. Zero runtime deps.
 //
@@ -15,7 +15,7 @@ const { execFileSync } = require('child_process')
 const { version } = require('../package.json')
 const { binaryName, binaryPath } = require('./paths')
 
-const REPO = 'Abdk4Moura/filament'
+const REPO = 'Abdk4Moura/tunlion'
 const TAG = `cli-v${version}`
 
 // platform/arch -> { release target triple, archive extension }
@@ -64,13 +64,13 @@ function extract(archive, dest, ext) {
 async function main() {
   const tgt = target()
   if (!tgt) {
-    console.error(`filament: no prebuilt binary for ${process.platform}/${process.arch}.`)
+    console.error(`tunlion: no prebuilt binary for ${process.platform}/${process.arch}.`)
     console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   }
-  const asset = `filament-${tgt.t}.${tgt.ext}`
+  const asset = `tunlion-${tgt.t}.${tgt.ext}`
   const base = `https://github.com/${REPO}/releases/download/${TAG}`
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'filament-'))
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tunlion-'))
   try {
     const [bin, sums] = await Promise.all([get(`${base}/${asset}`), get(`${base}/SHA256SUMS`)])
 
@@ -91,9 +91,9 @@ async function main() {
     fs.mkdirSync(vendor, { recursive: true })
     fs.copyFileSync(path.join(tmp, binaryName()), binaryPath())
     if (process.platform !== 'win32') fs.chmodSync(binaryPath(), 0o755)
-    console.log(`filament: installed ${TAG} for ${tgt.t}`)
+    console.log(`tunlion: installed ${TAG} for ${tgt.t}`)
   } catch (e) {
-    console.error(`filament: install failed — ${e.message}`)
+    console.error(`tunlion: install failed — ${e.message}`)
     console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   } finally {

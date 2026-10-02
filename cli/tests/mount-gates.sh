@@ -12,14 +12,14 @@
 #   5 teardown          fusermount -u is clean; mountpoint empties; no leaked proc
 #   6 refused pre-mount  a bad remote path is refused by the probe, no stale dir
 #
-# Topology (mirrors l2-gates.sh): side B runs `filament up` (the acceptor, serves
-# the mount protocol on a trusted link); side A runs `filament mount`. The two
+# Topology (mirrors l2-gates.sh): side B runs `tunlion up` (the acceptor, serves
+# the mount protocol on a trusted link); side A runs `tunlion mount`. The two
 # share a reciprocal pair secret so B marks A trusted.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="$CLI_DIR/target/release/filament"
+BIN="$CLI_DIR/target/release/tunlion"
 PORT=8098
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-/root/filament-bench/venv/bin/python}"
@@ -204,7 +204,7 @@ fi
 
 # ===================================================================== gate 5 ==
 # teardown: fusermount -u detaches cleanly; the mountpoint empties; the mount
-# process exits (no leaked filament holding the FUSE session).
+# process exits (no leaked tunlion holding the FUSE session).
 say 5
 MPID=$(cat "$WORK/mount.pid" 2>/dev/null)
 if fusermount3 -u "$MNT" 2>"$WORK/umount.err" || fusermount -u "$MNT" 2>>"$WORK/umount.err"; then

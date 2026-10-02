@@ -6,7 +6,7 @@ human-readable code. Two devices that both type the same few words derive the sa
 nothing, and cannot silently substitute their own transport identity.
 
 This is the pairing core (L1) of
-[filament](https://github.com/Abdk4Moura/tunlion) — the same implementation runs
+[tunlion](https://github.com/Abdk4Moura/tunlion) — the same implementation runs
 native and in the browser (wasm32).
 
 ## What's inside
@@ -27,7 +27,7 @@ Production randomness is `OsRng` (getrandom / `crypto.getRandomValues`).
 ## Status
 
 Pre-1.0; API may change between minor versions. Security-reviewed, not independently
-audited. See `docs/L1-pake-protocol.md` in the filament repo for the protocol.
+audited. See `docs/L1-pake-protocol.md` in the tunlion repo for the protocol.
 
 ## License
 

@@ -186,13 +186,13 @@ class _RedisRegistry:
         self.r = redis.Redis.from_url(url, decode_responses=True)
 
     def _rk(self, room):
-        return f"filament:room:{room}"
+        return f"tunlion:room:{room}"
 
     def _sk(self, sid):
-        return f"filament:sid:{sid}"
+        return f"tunlion:sid:{sid}"
 
     def _lk(self, sid):
-        return f"filament:live:{sid}"
+        return f"tunlion:live:{sid}"
 
     def add(self, sid, room, name, uid=None):
         import json
@@ -240,10 +240,10 @@ class _RedisRegistry:
         return {"id": sid, "name": v.get("name"), "uid": v.get("uid")}
 
     def _ck(self, channel):
-        return f"filament:chan:{channel}"
+        return f"tunlion:chan:{channel}"
 
     def _sck(self, sid):
-        return f"filament:sidchan:{sid}"
+        return f"tunlion:sidchan:{sid}"
 
     def subscribe(self, sid, channels):
         out = {}
@@ -289,15 +289,15 @@ class _RedisRegistry:
     # -- one-time pairing codes (#11): SET NX EX to create, GETDEL to consume
     # atomically — a code can be claimed exactly once, ever.
     def pair_create(self, code, sid, ttl=600):
-        return bool(self.r.set(f"filament:pair:{code}", sid, nx=True, ex=ttl))
+        return bool(self.r.set(f"tunlion:pair:{code}", sid, nx=True, ex=ttl))
 
     def peek_pair(self, code):
         """Telemetry only: (exists, creator, creator_alive) without consuming."""
-        creator = self.r.get(f"filament:pair:{code}")
+        creator = self.r.get(f"tunlion:pair:{code}")
         return (creator is not None, creator, bool(creator and self.r.exists(self._lk(creator))))
 
     def pair_claim(self, code):
-        creator = self.r.getdel(f"filament:pair:{code}")
+        creator = self.r.getdel(f"tunlion:pair:{code}")
         # Don't match against a creator whose connection is already dead.
         if creator and not self.r.exists(self._lk(creator)):
             return None

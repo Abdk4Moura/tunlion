@@ -31,7 +31,7 @@ def recv_exact(sock, n):
     return data
 
 def test_json_protocol(data, chunk_size=1024*1024):
-    """JSON protocol (current filament)."""
+    """JSON protocol (current tunlion)."""
     import json
     
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

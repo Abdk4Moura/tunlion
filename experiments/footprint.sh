@@ -17,8 +17,8 @@
 # Reference points are printed alongside, because "25MB" means nothing until you
 # know tmux is 4MB and a shell is 1.4MB.
 set -uo pipefail
-BIN=${1:-$(command -v filament || echo "$HOME/.local/bin/filament")}
-[ -x "$BIN" ] || { echo "no filament binary at $BIN"; exit 2; }
+BIN=${1:-$(command -v tunlion || echo "$HOME/.local/bin/tunlion")}
+[ -x "$BIN" ] || { echo "no tunlion binary at $BIN"; exit 2; }
 CFG=$(mktemp -d /tmp/footprint-XXXX)
 cleanup() {
   for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
@@ -31,7 +31,7 @@ trap cleanup EXIT
 mb() { printf '%.1f MB' "$(echo "$1/1048576" | bc -l)"; }
 
 echo "=== BINARY SIZE"
-printf '  %-14s %s\n' "filament" "$(mb "$(wc -c < "$BIN")")"
+printf '  %-14s %s\n' "tunlion" "$(mb "$(wc -c < "$BIN")")"
 for ref in tmux bash ssh curl; do
   p=$(command -v "$ref" 2>/dev/null) || continue
   printf '  %-14s %s\n' "$ref" "$(mb "$(wc -c < "$(readlink -f "$p")")")"
@@ -41,7 +41,7 @@ echo
 echo "=== ONE-SHOT CLI (peak RSS)"
 for c in "--version" "devices" ""; do
   r=$(FILAMENT_CONFIG_DIR="$CFG" /usr/bin/time -f '%M' "$BIN" $c 2>&1 >/dev/null | tail -1)
-  printf '  %-20s %s KB\n' "filament ${c:-<bare>}" "$r"
+  printf '  %-20s %s KB\n' "tunlion ${c:-<bare>}" "$r"
 done
 printf '  %-20s %s KB\n' "/bin/true (floor)" "$(/usr/bin/time -f '%M' /bin/true 2>&1 >/dev/null | tail -1)"
 

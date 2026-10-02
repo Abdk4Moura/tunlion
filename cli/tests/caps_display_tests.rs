@@ -1,20 +1,20 @@
 //! Tests for caps display labeling.
 //!
-//! These tests verify that `filament devices` and `filament addr` show
+//! These tests verify that `tunlion devices` and `tunlion addr` show
 //! the authoritative local capability-list sentence.
 
 use std::process::Command;
 
-/// Get the path to the filament binary built with test-hooks feature.
+/// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
-    path.push("filament");
+    path.push("tunlion");
     path
 }
 
-/// Test that `filament devices` shows the authoritative capability note.
+/// Test that `tunlion devices` shows the authoritative capability note.
 #[test]
 fn devices_shows_granted_label() {
     let bin = filament_bin();
@@ -22,7 +22,7 @@ fn devices_shows_granted_label() {
     let output = Command::new(&bin)
         .arg("devices")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -33,7 +33,7 @@ fn devices_shows_granted_label() {
     );
 }
 
-/// Test that `filament addr` shows "granted" instead of "caps".
+/// Test that `tunlion addr` shows "granted" instead of "caps".
 #[test]
 fn addr_shows_granted_label() {
     let bin = filament_bin();
@@ -42,7 +42,7 @@ fn addr_shows_granted_label() {
         .arg("addr")
         .arg("--json")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 

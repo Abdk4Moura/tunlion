@@ -3,7 +3,7 @@
 # forward stream. The denial arrives as a stream close (the client's connection
 # breaks), never a hang. Standalone, hermetic, fixture port 8114 ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament ./l2-revoke-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./l2-revoke-gates.sh
 #
 # Gates:
 #   A  the forward streams before the revoke           (positive control)
@@ -12,7 +12,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8114
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

@@ -23,13 +23,13 @@ pub use filament_cap::capability::*;
 /// Shell serving is OFF on the acceptor entirely. Not a capability problem, so a
 /// grant does not help and must never be suggested for it.
 pub const SHELL_OFF_REASON: &str =
-    "shell serving is off there; run `filament up --shell` on that device";
+    "shell serving is off there; run `tunlion up --shell` on that device";
 
 /// The L2 tunnel acceptor is OFF on the peer entirely, so `forward`, `netcat`
 /// and the ssh bootstrap have nothing to open against. Like SHELL_OFF_REASON
 /// this is not a capability problem and a grant does not help.
 pub const TUNNEL_OFF_REASON: &str =
-    "tunnelling is off there; run `filament up --shell` (or set FILAMENT_L2=1) on that device";
+    "tunnelling is off there; run `tunlion up --shell` (or set FILAMENT_L2=1) on that device";
 
 /// The peer's ENROLMENT CEILING excludes this capability. A grant cannot widen a
 /// ceiling, so any hint built on this reason must not prescribe one: the fix is a
@@ -49,7 +49,7 @@ use std::sync::{Mutex, OnceLock};
 /// explicitly via `save_cap_store`; writes by another process are detected only
 /// by the mtime+length comparison below, the cross-process invalidation channel.
 /// If this needs strengthening, prefer explicit notification over a stronger
-/// fingerprint: `filament revoke` should notify a running daemon via ctl. Reopen
+/// fingerprint: `tunlion revoke` should notify a running daemon via ctl. Reopen
 /// this when config sync, restore, or management tools become supported writers.
 /// Hot path: load_cap_store is called on every gated open; without this cache
 /// each open re-reads + re-parses caps.json.
@@ -62,7 +62,7 @@ fn cache_init() -> &'static Mutex<Option<CachedStore>> {
     CAP_CACHE.get_or_init(|| Mutex::new(None))
 }
 
-/// Load the capability store from `caps.json` in the filament config dir.
+/// Load the capability store from `caps.json` in the tunlion config dir.
 /// Cached: subsequent calls with unchanged mtime and file length return the cached store.
 pub fn load_cap_store(config_dir: &std::path::Path) -> Vec<Value> {
     let p = config_dir.join("caps.json");
@@ -120,7 +120,7 @@ pub(crate) fn save_cap_store(config_dir: &std::path::Path, store: &[Value]) -> s
 }
 
 /// Drop the in-process cap-store read cache. Called after the on-disk store is
-/// deleted (e.g. `filament reset`) so a same-process reader can never serve the
+/// deleted (e.g. `tunlion reset`) so a same-process reader can never serve the
 /// now-gone store from memory. Idempotent.
 pub fn invalidate_cap_cache() {
     if let Ok(mut c) = cache_init().lock() {
@@ -814,7 +814,7 @@ pub fn cap_gate_effective(
             (true, CapOutcome::Unprovisioned) => log_once(
                 format!("nh|{resource}"),
                 &format!(
-                    "CAP-SHADOW [unprovisioned]: resource '{resource}' has no capability header; opens rely on legacy authz. Expected until you provision (filament grant/init); not a disagreement."
+                    "CAP-SHADOW [unprovisioned]: resource '{resource}' has no capability header; opens rely on legacy authz. Expected until you provision (tunlion grant/init); not a disagreement."
                 ),
                 true,
             ),
@@ -846,7 +846,7 @@ pub fn cap_gate_effective(
         let reason = match outcome {
             CapOutcome::Denied(r) => r.clone(),
             CapOutcome::Unprovisioned => {
-                "resource unprovisioned (no capability header); run filament grant/init".to_string()
+                "resource unprovisioned (no capability header); run tunlion grant/init".to_string()
             }
             CapOutcome::Authorized => String::new(),
         };
@@ -871,7 +871,7 @@ pub fn cap_gate_effective(
 /// in the revoked set, so the reconciler would NEVER strip its authorized_keys.
 /// Net effect of that bug: grant shell to a fleet device (key installs), revoke
 /// the grant, and the key STAYS — permanent SSH on the one surface that bypasses
-/// every filament gate. That is the exact revocation gap the reconciler exists to
+/// every tunlion gate. That is the exact revocation gap the reconciler exists to
 /// close (#24), reopened for fleet devices. `evaluate_grants_only` removes the
 /// owner shortcut so key presence tracks the explicit shell grant for fleet
 /// devices exactly as it does for external ones. (The live shell OPEN is gated
@@ -1706,7 +1706,7 @@ mod tests {
         let resource = self_resource_id(&pk);
         let target = CapTarget::Device([0xcc; 32]);
 
-        // Build self header (same pattern as filament grant)
+        // Build self header (same pattern as tunlion grant)
         let mut hdr = CapHeader {
             resource: resource.clone(),
             epoch: 0,

@@ -121,8 +121,8 @@ def main():
     {media}
     <p class="detail">{det}</p>
   </section>""")
-    sub = "Live Playwright recordings driving the REAL app against REAL filament peers — real PAKE pairing, real PTYs, real WebRTC. webm→mp4, GPU-aware encode. <a href='./index.html'>← results</a>"
-    html = HEAD.format(title="Filament — e2e reels (real peers)", sub=sub)
+    sub = "Live Playwright recordings driving the REAL app against REAL tunlion peers — real PAKE pairing, real PTYs, real WebRTC. webm→mp4, GPU-aware encode. <a href='./index.html'>← results</a>"
+    html = HEAD.format(title="Tunlion — e2e reels (real peers)", sub=sub)
     html += f'\n<div class="grid">{"".join(cards)}</div>\n</body></html>'
     open(os.path.join(GAL, "reels.html"), "w").write(html)
 
@@ -141,7 +141,7 @@ def main():
     <p class="detail">{r['detail']}</p>
   </section>""")
     sub = f"<b style='color:#7CF6C8'>{npass} PASS</b> &nbsp; <b style='color:#F26D6D'>{nfail} FAIL</b> &nbsp;·&nbsp; real-app + real-peer e2e + live reels. <a href='./reels.html'>reels →</a>"
-    html = HEAD.format(title="Filament — e2e pipeline results", sub=sub)
+    html = HEAD.format(title="Tunlion — e2e pipeline results", sub=sub)
     html += f'\n<div class="grid">{"".join(rows)}</div>\n</body></html>'
     open(os.path.join(GAL, "index.html"), "w").write(html)
 

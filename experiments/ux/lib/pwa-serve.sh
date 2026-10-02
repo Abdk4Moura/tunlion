@@ -31,7 +31,7 @@ while ( exec 3<>"/dev/tcp/127.0.0.1/$port" ) 2>/dev/null; do port=$((port+1)); d
 # "build B" sw.js: same SW with a different BUILD_ID so its cache name differs and
 # the running SW sees a byte-different /sw.js (a real update).
 swapdir="$work/$id-buildB"; mkdir -p "$swapdir"
-sed "s/filament-[A-Za-z0-9_.-]*/filament-buildB-$RANDOM/" "$DIST/sw.js" > "$swapdir/sw.js" 2>/dev/null || cp "$DIST/sw.js" "$swapdir/sw.js"
+sed "s/tunlion-[A-Za-z0-9_.-]*/filament-buildB-$RANDOM/" "$DIST/sw.js" > "$swapdir/sw.js" 2>/dev/null || cp "$DIST/sw.js" "$swapdir/sw.js"
 # ensure it really differs
 echo "// build B $(date +%s%N)" >> "$swapdir/sw.js"
 

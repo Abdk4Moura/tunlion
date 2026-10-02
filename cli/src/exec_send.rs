@@ -1,4 +1,4 @@
-//! `filament exec` initiator: open the stream, pump stdio, surface the exit code.
+//! `tunlion exec` initiator: open the stream, pump stdio, surface the exit code.
 //!
 //! Deliberately one-shot where `pty_cmd` is resumable: an exec invocation has
 //! no session worth reattaching (the receiver holds no persistent state for
@@ -129,10 +129,10 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             {
                 if attempt <= 2 {
                     crate::ui::say(&format!(
-                        "filament: {e} -- re-establishing the link (attempt {attempt})"
+                        "tunlion: {e} -- re-establishing the link (attempt {attempt})"
                     ));
                 } else {
-                    crate::ui::debug(&format!("filament: {e} -- retry {attempt}"));
+                    crate::ui::debug(&format!("tunlion: {e} -- retry {attempt}"));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }

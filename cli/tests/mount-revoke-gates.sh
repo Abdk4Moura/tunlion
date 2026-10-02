@@ -2,7 +2,7 @@
 # #235: a revoked certificate must stop an ALREADY-ESTABLISHED mount.
 # Standalone, hermetic, fixture port 8106 ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament ./mount-revoke-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./mount-revoke-gates.sh
 #
 # The property is bounded staleness, not immediacy. The server re-asks the gate
 # every recheck interval, so the gate allows a grace period and then requires the
@@ -16,7 +16,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8106
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

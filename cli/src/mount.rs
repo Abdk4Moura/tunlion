@@ -187,7 +187,7 @@ impl std::fmt::Display for MountStatus {
 }
 
 /// Removes a mount-point directory we created if the mount never succeeds, so a
-/// failed `filament mount` doesn't litter empty dirs (e.g. the peer has no sshd).
+/// failed `tunlion mount` doesn't litter empty dirs (e.g. the peer has no sshd).
 /// A failed mount leaves the dir empty, so `remove_dir` (empty-only) is safe: a
 /// live/successful mount makes it non-empty and the removal simply no-ops. Only
 /// dirs WE created are tracked, so a pre-existing dir is never touched.
@@ -265,8 +265,8 @@ pub async fn mount_cmd(
         if let Some(_reply) = crate::ctl::try_mount(peer, &remote_path, &local_path, read_only, auto_restore, port).await {
             if let Some(g) = mp_guard.as_mut() { g.disarm(); }
             crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (daemon-managed)"));
-            crate::ui::say(&format!("  check with: filament mount --check {local_path}"));
-            crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
+            crate::ui::say(&format!("  check with: tunlion mount --check {local_path}"));
+            crate::ui::say(&format!("  unmount with: tunlion mount --off {local_path}"));
             return Ok(());
         }
         // Daemon not available or mount failed, fall through to direct spawn.
@@ -281,7 +281,7 @@ pub async fn mount_cmd(
         if let Some(g) = mp_guard.as_mut() { g.cleanup_now(); }
         crate::ui::problem(
             "sshfs not found",
-            "sshfs is required for `filament mount` but is not installed.",
+            "sshfs is required for `tunlion mount` but is not installed.",
             &[
                 "apt install sshfs          # Debian/Ubuntu".to_string(),
                 "brew install sshfs         # macOS (via macFUSE)".to_string(),
@@ -298,9 +298,9 @@ pub async fn mount_cmd(
         Ok(i) => i,
         Err(e) => {
             crate::ui::say(&format!(
-                "  note: `filament mount` currently rides sshfs and needs an sshd on '{peer}'. \
+                "  note: `tunlion mount` currently rides sshfs and needs an sshd on '{peer}'. \
                  A no-sshd mesh-native mount is in progress; for now run an sshd there, set \
-                 FILAMENT_SSH_PORT, or use `filament shell {peer}` for a shell."
+                 FILAMENT_SSH_PORT, or use `tunlion shell {peer}` for a shell."
             ));
             return Err(e);
         }
@@ -358,13 +358,13 @@ pub async fn mount_cmd(
             Ok(s) if s.success() => {
                 if let Some(g) = mp_guard.as_mut() { g.disarm(); }
                 crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path}"));
-                crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
+                crate::ui::say(&format!("  unmount with: tunlion mount --off {local_path}"));
                 Ok(())
             }
             Ok(s) => {
                 let code = s.code().unwrap_or(1);
                 if code == 255 && info.took_fast_path {
-                    crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
+                    crate::ui::say(&format!("tunlion: re-authenticating with '{peer}'..."));
                     let retry = crate::l2::rebootstrap_peer(server, peer, relay, false).await?;
                     let mut cmd = build_sshfs(&retry, true);
                     cmd.arg(&local_path);
@@ -406,8 +406,8 @@ pub async fn mount_cmd(
 
         if let Some(g) = mp_guard.as_mut() { g.disarm(); }
         crate::ui::say(&format!("mounted {peer}:{remote_path} at {local_path} (id: {mount_id})"));
-        crate::ui::say(&format!("  check with: filament mount --check {mount_id}"));
-        crate::ui::say(&format!("  unmount with: filament mount --off {local_path}"));
+        crate::ui::say(&format!("  check with: tunlion mount --check {mount_id}"));
+        crate::ui::say(&format!("  unmount with: tunlion mount --off {local_path}"));
 
         // Spawn monitor thread (not tokio, because we use std::process::Command).
         let monitor_local = local_path.clone();
@@ -444,10 +444,10 @@ fn monitor_mount(local: String, peer: String, remote: String, _server: String, _
                 consecutive_failures += 1;
                 if consecutive_failures >= 3 {
                     crate::ui::say(&format!(
-                        "mount {local} is {status}, run `filament mount --check {local}` for details"
+                        "mount {local} is {status}, run `tunlion mount --check {local}` for details"
                     ));
                     crate::ui::say(&format!(
-                        "  to recover: filament mount --off {local} && filament mount {peer} {remote} {local}"
+                        "  to recover: tunlion mount --off {local} && tunlion mount {peer} {remote} {local}"
                     ));
                     let _ = remove_mount(&local);
                     return;
@@ -465,7 +465,7 @@ fn monitor_mount(local: String, peer: String, remote: String, _server: String, _
 pub fn list_cmd() -> Result<()> {
     let mounts = load_mounts();
     if mounts.is_empty() {
-        crate::ui::say("no active filament mounts");
+        crate::ui::say("no active tunlion mounts");
         return Ok(());
     }
 
@@ -496,7 +496,7 @@ pub fn list_cmd() -> Result<()> {
 
     if is_tty {
         println!("\n{healthy} healthy, {unhealthy} unhealthy, {} total", mounts.len());
-        println!("unmount with: filament mount --off <path>");
+        println!("unmount with: tunlion mount --off <path>");
     }
 
     Ok(())
@@ -534,10 +534,10 @@ pub fn check_cmd(target: &str) -> Result<()> {
         None => {
             // Not tracked, but check if it's a live mount anyway.
             if is_mount_point(target) {
-                crate::ui::say(&format!("{target} is a mount point but not tracked by filament"));
+                crate::ui::say(&format!("{target} is a mount point but not tracked by tunlion"));
                 Ok(())
             } else {
-                bail!("{target} is not a filament mount (use `filament mount --list` to see active mounts)");
+                bail!("{target} is not a tunlion mount (use `tunlion mount --list` to see active mounts)");
             }
         }
         Some(entry) => {
@@ -644,7 +644,7 @@ pub fn unmount_cmd(target: &str) -> Result<()> {
                     }
                 }
             } else {
-                bail!("no mount found for '{target}' (use `filament mount --list` to see active mounts)");
+                bail!("no mount found for '{target}' (use `tunlion mount --list` to see active mounts)");
             }
         }
     }
@@ -729,7 +729,7 @@ pub async fn unmount_cmd_async(target: &str) -> Result<()> {
                     }
                 }
             } else {
-                bail!("no mount found for '{target}' (use `filament mount --list` to see active mounts)");
+                bail!("no mount found for '{target}' (use `tunlion mount --list` to see active mounts)");
             }
         }
     }
@@ -782,15 +782,15 @@ pub fn delete_profile_cmd(name: &str) -> Result<()> {
 }
 
 pub fn print_mount_help() {
-    println!("filament mount - mount remote directories over the mesh");
+    println!("tunlion mount - mount remote directories over the mesh");
     println!();
     println!("USAGE:");
-    println!("  filament mount <peer> <remote-path> [local-path]   Mount a remote directory");
-    println!("  filament mount --list                              List active mounts");
-    println!("  filament mount --check <id|path>                   Check mount health");
-    println!("  filament mount --save <name>                       Save current mounts as profile");
-    println!("  filament mount --apply <name>                      Apply a saved profile");
-    println!("  filament mount --profiles                          List saved profiles");
+    println!("  tunlion mount <peer> <remote-path> [local-path]   Mount a remote directory");
+    println!("  tunlion mount --list                              List active mounts");
+    println!("  tunlion mount --check <id|path>                   Check mount health");
+    println!("  tunlion mount --save <name>                       Save current mounts as profile");
+    println!("  tunlion mount --apply <name>                      Apply a saved profile");
+    println!("  tunlion mount --profiles                          List saved profiles");
     println!();
     println!("OPTIONS:");
     println!("  --read-only                  Mount read-only");
@@ -799,13 +799,13 @@ pub fn print_mount_help() {
     println!("  --options <opts>             Extra sshfs options (comma-separated)");
     println!();
     println!("EXAMPLES:");
-    println!("  filament mount other-do /data /mnt/data");
-    println!("  filament mount other-do /data /mnt/data --read-only");
-    println!("  filament mount other-do /data --save-auto");
-    println!("  filament mount --list");
-    println!("  filament mount --check abc123");
-    println!("  filament mount --save work");
-    println!("  filament mount --apply work");
+    println!("  tunlion mount other-do /data /mnt/data");
+    println!("  tunlion mount other-do /data /mnt/data --read-only");
+    println!("  tunlion mount other-do /data --save-auto");
+    println!("  tunlion mount --list");
+    println!("  tunlion mount --check abc123");
+    println!("  tunlion mount --save work");
+    println!("  tunlion mount --apply work");
 }
 
 // ---- Fancy interactive UI with arrow selection and type-to-filter ----
@@ -915,7 +915,7 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
     if items.is_empty() {
         drop(_guard);
         println!("\x1b[33mNo devices paired and no mounts configured.\x1b[0m");
-        println!("Add a device first: filament add");
+        println!("Add a device first: tunlion add");
         return Ok(());
     }
 
@@ -1015,8 +1015,8 @@ pub async fn interactive_mount_fancy(server: &str, relay: bool) -> Result<()> {
                     if let Some(entry) = mounts.iter().find(|m| name.starts_with(&m.peer)) {
                         println!("  Mount: {}:{} -> {}", entry.peer, entry.remote, entry.local);
                         println!("  \x1b[2mCommands:\x1b[0m");
-                        println!("    filament mount --check {}", entry.local);
-                        println!("    filament mount --off {}", entry.local);
+                        println!("    tunlion mount --check {}", entry.local);
+                        println!("    tunlion mount --off {}", entry.local);
                     }
                     return Ok(());
                 }

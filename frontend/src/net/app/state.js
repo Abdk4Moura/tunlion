@@ -1,6 +1,6 @@
 // APPLICATION layer — the state-REDUCER's pure list operations (Phase 2).
 //
-// useFilament keeps the React state (setPeers/setTransfers) and the side effects
+// useTunlion keeps the React state (setPeers/setTransfers) and the side effects
 // (telemetry, logging, owner/status refs); the pure "merge a snapshot into the
 // list" transforms live here so they are node-testable. Each returns a NEW list
 // (or the same reference when nothing changed, so React can skip a render).

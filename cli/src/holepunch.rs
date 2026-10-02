@@ -41,7 +41,7 @@ pub const PUNCH_BUDGET: Duration = Duration::from_secs(3);
 /// race) and to survive loss.
 const PUNCH_INTERVAL: Duration = Duration::from_millis(75);
 /// Magic bytes so a punch datagram is unmistakably ours (not stray QUIC).
-const PUNCH_MAGIC: &[u8] = b"FILAMENT-PUNCH-v1";
+const PUNCH_MAGIC: &[u8] = b"TUNLION-PUNCH-v1";
 
 // ============================================================== STUN discovery
 
@@ -369,16 +369,16 @@ pub async fn connect(
     .ok()?;
     let (r, punch_sock) = punch_result;
     if let Err(e) = r {
-        crate::ui::trace(&format!("filament: {e}"));
+        crate::ui::trace(&format!("tunlion: {e}"));
         return None; // step down to WebRTC
     }
     // DEBUG, direct/hole-punch internal.
-    crate::ui::debug(&format!("filament: HOLEPUNCH ok, NAT open toward {peer_srflx}, starting QUIC"));
+    crate::ui::debug(&format!("tunlion: HOLEPUNCH ok, NAT open toward {peer_srflx}, starting QUIC"));
 
     let endpoint = match endpoint_from_socket(punch_sock) {
         Ok(ep) => ep,
         Err(e) => {
-            crate::ui::trace(&format!("filament: holepunch endpoint build failed: {e}"));
+            crate::ui::trace(&format!("tunlion: holepunch endpoint build failed: {e}"));
             return None;
         }
     };

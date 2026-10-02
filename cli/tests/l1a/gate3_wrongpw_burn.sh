@@ -5,9 +5,9 @@
 # retry is possible — a failed pairing forces a FRESH code.
 set -uo pipefail
 # Configurable for any environment (defaults match gate9's local fixture):
-#   BIN     path to the release filament binary
+#   BIN     path to the release tunlion binary
 #   SERVER  signaling backend URL (a LOCAL fixture, never prod)
-BIN=${BIN:-../../target/release/filament}
+BIN=${BIN:-../../target/release/tunlion}
 SERVER=${SERVER:-http://127.0.0.1:8093}
 T=${T:-/tmp/l1a-gate3}
 rm -rf "$T/g3"; mkdir -p "$T/g3/cfgA" "$T/g3/cfgB" "$T/g3/cfgC"

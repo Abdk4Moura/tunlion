@@ -96,8 +96,8 @@ const ACK_REPROBE_MS = 5000
 function _testFlags() {
   try {
     const q = new URLSearchParams(window.location.search).get('test')
-    if (q != null) localStorage.setItem('filamentTest', q)
-    return (q ?? localStorage.getItem('filamentTest') ?? '').split(',').filter(Boolean)
+    if (q != null) localStorage.setItem('tunlionTest', q)
+    return (q ?? localStorage.getItem('tunlionTest') ?? '').split(',').filter(Boolean)
   } catch {
     return []
   }
@@ -536,7 +536,7 @@ export class PeerLink {
 
     // The impolite peer owns the data channel; creating it triggers the first
     // negotiationneeded → offer. The polite peer just answers.
-    if (!polite) this._setChannel(this.pc.createDataChannel('filament'))
+    if (!polite) this._setChannel(this.pc.createDataChannel('tunlion'))
 
     // Establishment watchdog (#8): if signaling is lost (offer to a dead sid,
     // peer suspended, swallowed SDP error), the connection would otherwise sit

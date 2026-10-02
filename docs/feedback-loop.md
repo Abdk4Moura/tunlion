@@ -10,7 +10,7 @@ CARGO_TARGET_DIR=/root/.cargo-target-measure/<worktree-id> \
 
 It inherits the release profile, then uses `opt-level=1`, disables LTO and debug
 information, and enables incremental compilation. Every binary includes an
-explicit profile in `filament --version`, including `profile=release`. Timing
+explicit profile in `tunlion --version`, including `profile=release`. Timing
 gates must print the profile beside every figure or fail as unclassified. The
 capability fallback timing gate is deliberately red outside the release profile;
 functional completion without its timing assertion is not latency coverage.

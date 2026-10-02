@@ -1,6 +1,6 @@
-# Homebrew formula for the filament CLI — lives in Abdk4Moura/homebrew-tap.
+# Homebrew formula for the tunlion CLI — lives in Abdk4Moura/homebrew-tap.
 # Regenerated per release by packaging/release-followup.sh.
-class Filament < Formula
+class Tunlion < Formula
   desc "P2P file transfer between terminals and browsers - no upload, no account"
   homepage "https://tunlion.autumated.com"
   version "0.8.5"
@@ -22,11 +22,21 @@ class Filament < Formula
   end
 
   def install
-    bin.install "filament"
-    generate_completions_from_executable(bin/"filament", "completions")
+    # The 0.8.5 tarballs were built before the rename and ship a binary called
+    # `filament`. Install it under the new name, and keep `filament` working as a
+    # symlink so an existing install does not lose the command it already has.
+    # From the first post-rename release the archive ships `tunlion` directly and
+    # packaging/release-followup.sh regenerates this block.
+    if File.exist?("tunlion")
+      bin.install "tunlion"
+    else
+      bin.install "filament" => "tunlion"
+    end
+    bin.install_symlink bin/"tunlion" => "filament"
+    generate_completions_from_executable(bin/"tunlion", "completions")
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/filament --version")
+    assert_match version.to_s, shell_output("#{bin}/tunlion --version")
   end
 end

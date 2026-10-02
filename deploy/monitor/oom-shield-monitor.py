@@ -63,7 +63,7 @@ STATE_FILE = os.environ.get(
     "OOM_MONITOR_STATE", os.path.expanduser("~/.cache/filament-oom-shield-monitor.json")
 )
 ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "pro.kaiserlautern@gmail.com")
-ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Filament Monitor <monitor@send.autumated.com>")
+ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Tunlion Monitor <monitor@send.autumated.com>")
 RESEND_KEY_FILE = os.environ.get("RESEND_KEY_FILE", os.path.expanduser("~/secret_keys/resend_api_key"))
 TIMEOUT = int(os.environ.get("MONITOR_TIMEOUT", "10"))
 # Consecutive UNVERIFIABLE checks before alerting. Deploys and restarts routinely
@@ -143,7 +143,7 @@ def main():
         st["unverifiable"] = 0
         if st.get("shielded") is False:
             sent, sres = send_alert(
-                "[filament] OOM shield RESTORED",
+                "[tunlion] OOM shield RESTORED",
                 f"Production is shielded again at {utc(now)}.\n\n{detail}\n",
             )
             # Print the send result here for the same reason the other two
@@ -160,7 +160,7 @@ def main():
         n = st["unverifiable"]
         if n == UNVERIFIABLE_THRESHOLD:
             sent, sres = send_alert(
-                "[filament] OOM shield UNVERIFIABLE",
+                "[tunlion] OOM shield UNVERIFIABLE",
                 f"assert-oom-shield.sh could not determine the shield state on "
                 f"{n} consecutive checks, ending {utc(now)}.\n\n{detail}\n\n"
                 "This is NOT the same as shielded. Either the production "
@@ -181,7 +181,7 @@ def main():
     remedied = after_code == 0
 
     sent, sres = send_alert(
-        "[filament] OOM shield WAS MISSING" + ("" if remedied else " and could NOT be restored"),
+        "[tunlion] OOM shield WAS MISSING" + ("" if remedied else " and could NOT be restored"),
         f"Detected at {utc(now)}: production was running WITHOUT the OOM shield.\n\n"
         f"--- before ---\n{before}\n\n"
         f"--- fix attempt (exit {fix_code}) ---\n{fix_detail}\n\n"

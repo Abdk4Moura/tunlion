@@ -1,4 +1,4 @@
-// Stamp the binary with commit + date for `filament --version`.
+// Stamp the binary with commit + date for `tunlion --version`.
 // CI can override via FILAMENT_BUILD_SHA / FILAMENT_BUILD_DATE.
 use std::path::Path;
 use std::process::Command;

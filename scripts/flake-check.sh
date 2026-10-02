@@ -60,9 +60,9 @@ declare -A per_test
 for i in $(seq 1 "$ITER"); do
   s=$(date +%s)
   if [ -n "$FILTER" ]; then
-    out=$(cargo test --bin filament "$FILTER" -- --test-threads="$THREADS" 2>&1)
+    out=$(cargo test --bin tunlion "$FILTER" -- --test-threads="$THREADS" 2>&1)
   else
-    out=$(cargo test --bin filament -- --test-threads="$THREADS" 2>&1)
+    out=$(cargo test --bin tunlion -- --test-threads="$THREADS" 2>&1)
   fi
   rc=$?
   e=$(date +%s)

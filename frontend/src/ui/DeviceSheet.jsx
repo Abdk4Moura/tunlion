@@ -23,7 +23,7 @@ function routeMeta(route, T) {
   if (route === 'local') return { label: 'LAN', color: T.ok }
   if (route === 'direct') return { label: 'P2P', color: T.recv }
   // relayed is the only route with a middleman on the wire: loud amber ⚠ + the
-  // honest explainer (still E2E-encrypted). Wording mirrors Filament.jsx §3.5.
+  // honest explainer (still E2E-encrypted). Wording mirrors Tunlion.jsx §3.5.
   if (route === 'relayed') return { label: '⚠ RELAY', color: T.warn, relay: true }
   return null
 }

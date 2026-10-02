@@ -7,17 +7,17 @@ curl -fsSL https://tunlion.autumated.com/install | sh
 
 **Windows:**
 ```
-winget install Abdk4Moura.Filament
+winget install Abdk4Moura.Tunlion
 ```
 
-**Homebrew:** `brew install abdk4moura/tap/filament` · **Cargo:** `cargo install filament-cli`
+**Homebrew:** `brew install abdk4moura/tap/tunlion` · **Cargo:** `cargo install filament-cli`
 
-Already installed? `filament update`
+Already installed? `tunlion update`
 
 ## Quick start
 ```
-filament send video.mp4 --code      # speak the code aloud
-filament receive clever-lynx-63     # …or open tunlion.autumated.com in any browser
+tunlion send video.mp4 --code      # speak the code aloud
+tunlion receive clever-lynx-63     # …or open tunlion.autumated.com in any browser
 ```
 
 All binaries are checksummed (SHA256SUMS) and carry GitHub build

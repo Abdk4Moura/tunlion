@@ -1,6 +1,6 @@
 # Agent-grade output audit
 
-Can a script or an agent drive every filament verb without reading prose? Today,
+Can a script or an agent drive every tunlion verb without reading prose? Today,
 no. This is the evidence, verb by verb, and the two conventions that would fix it.
 
 Read-only audit of `origin/main` (3f51592). Nothing was built or run; every claim
@@ -31,7 +31,7 @@ is a citation. What I could not settle from the source is marked **unverified**.
    checking that `kill` took (`main.rs:1439-1443`). `set --reset` aborted at the prompt
    exits 0 (`settings.rs:1019-1022`).
 
-3. **`shell` throws away the remote exit status, and `exec`'s collides with filament's
+3. **`shell` throws away the remote exit status, and `exec`'s collides with tunlion's
    own.** `PtyOutcome::Exited` is a unit variant carrying no code (`l2.rs:2582-2585`,
    produced at `:2894`), so `dispatch.rs:1253` → `l2.rs:3086` returns `Ok(())` and a
    remote `exit 3` reads as local success; `shell --ssh` is correct (`l2.rs:4769,4772`).
@@ -88,12 +88,12 @@ suppressed by `-q` (`:294-298`), so "ready via `ui::say`" means "invisible under
 
 What the table alone hides:
 
-- **`filament shell` has no help text.** The doc comments at `cli_def.rs:671-685`
+- **`tunlion shell` has no help text.** The doc comments at `cli_def.rs:671-685`
   ("Open a shell on a device…") sit immediately above `Exec {` at `:686`, so clap
-  attaches all of them to `exec`; `Shell {` at `:705` gets nothing. `filament --help`
-  lists `shell` blank and `filament exec --help` describes a shell. Discovery is how an
+  attaches all of them to `exec`; `Shell {` at `:705` gets nothing. `tunlion --help`
+  lists `shell` blank and `tunlion exec --help` describes a shell. Discovery is how an
   agent learns a surface.
-- **`filament get` and `filament unset` do not exist.** `settings::run_get`
+- **`tunlion get` and `tunlion unset` do not exist.** `settings::run_get`
   (`settings.rs:786-830`) has no caller outside its module; the only arm is the hidden
   `Set` (`cli_def.rs:394-434`). `docs/design-command-surface.md:61-63` still promises them.
 - **`forward --socks` silently discards its positional.** `dispatch.rs:1371-1379`
@@ -103,7 +103,7 @@ What the table alone hides:
   otherwise a read-only verb.
 - **`UiCapability::confirm`'s pipe branch is dead.** `interactive` already requires
   `stdin().is_terminal()` (`main.rs:458`), so the line-reading `else` at `:496-505`
-  cannot run and the comment at `:476` ("`echo y | filament ...` is unchanged") is false:
+  cannot run and the comment at `:476` ("`echo y | tunlion ...` is unchanged") is false:
   a piped `y` hits `:514` and fails. Fail-closed is right; the dead branch is not.
 - **Not reproduced:** the reported raw `os error 98` from `forward`. `l2.rs:3475-3477`
   catches `AddrInUse` and emits `port_in_use_msg` (`:3245-3251`) with no io text. Raw io
@@ -115,7 +115,7 @@ What the table alone hides:
 
 | verb | ready | stop | notes |
 |---|---|---|---|
-| `up` | `ui::say` banner (`recv_cmd.rs:371-378` or `:400-407`) fires *before* serving; the real edge is `sdnotify::ready()` at `:939`, systemd-only | Ctrl-C/SIGTERM → 130 (`recv_cmd.rs:477-496`, `shutdown.rs:54-61`); `filament down` | a non-systemd agent must poll `{config}/up.pid` (`file_io.rs:17-30`) and `control.sock` (`ctl.rs:32-34,100`) |
+| `up` | `ui::say` banner (`recv_cmd.rs:371-378` or `:400-407`) fires *before* serving; the real edge is `sdnotify::ready()` at `:939`, systemd-only | Ctrl-C/SIGTERM → 130 (`recv_cmd.rs:477-496`, `shutdown.rs:54-61`); `tunlion down` | a non-systemd agent must poll `{config}/up.pid` (`file_io.rs:17-30`) and `control.sock` (`ctl.rs:32-34,100`) |
 | `forward` | four distinct strings: `"forwarding"` (`l2.rs:3491`), `"ready - "` (`:3517`), `"listening on"` (`:3522`), `"ready, listening on"` (`:3543`) | **no SIGINT handler** (`:3552-3608`); default signal disposition | only `:3491` is guaranteed, and it precedes any link |
 | `forward --socks` | `l2.rs:3635-3637`, plus `:3670-3672` for HTTP CONNECT | no handler | per-connection errors are `ui::debug`, so a failing proxy is silent |
 | `forward --stdio` | none, deliberately | stdin EOF / peer FIN (`l2.rs:2518-2545`) | the one verb with provably clean stdout |
@@ -140,7 +140,7 @@ One enum, mapped onto sites that already distinguish the case in prose.
 
 `1` remains the catch-all for anything not yet classified, so the change is additive and
 no script that only tests `!= 0` breaks. Mechanically: an `enum ExitKind` with
-`fn code(&self) -> u8`, a `FilamentError { kind, source }` wrapper, and
+`fn code(&self) -> u8`, a `TunlionError { kind, source }` wrapper, and
 `main.rs:1671-1682` becoming `fn main() -> ExitCode`. The sites above already know their
 kind; each gains one `.kind(...)` and nothing else.
 
@@ -204,98 +204,98 @@ substrate, which land first. *Accept* is the gate; `jq -e` means the run must al
 
 1. **Envelope + emitter.** `ui::json_ok(verb, data)` / `ui::json_err(verb, kind, msg)`
    writing §4 to stdout; no verb changes yet. *Accept:* unit tests assert both shapes.
-2. **`ExitKind` and `main -> ExitCode`.** §3 enum, `FilamentError`, default arm 1; no call
-   site reclassified yet. *Accept:* `filament nosuchverb; echo $?` still prints 2, and a
+2. **`ExitKind` and `main -> ExitCode`.** §3 enum, `TunlionError`, default arm 1; no call
+   site reclassified yet. *Accept:* `tunlion nosuchverb; echo $?` still prints 2, and a
    classified error in a test binary yields its code.
 3. **`--json` honesty gate.** Under `--json`, route the `dispatch.rs:421` refusal and every
    later `bail!` through `ui::json_err`, so `--json` never emits prose.
-   *Accept:* `filament exec nosuchdev --json -- true | jq -e '.ok == false'`, and all of
+   *Accept:* `tunlion exec nosuchdev --json -- true | jq -e '.ok == false'`, and all of
    stdout parses as JSON.
 4. **`exec`.** `--json` with `data.status`; `dispatch.rs:1284` → 3; `:1287-1294` and
    `exec_send.rs:171-194` → 4; `:100-110,189-193` → 5; `:226-288,339-342` → 6; bare
    pass-through unchanged without `--json`.
-   *Accept:* `filament exec nosuchdev -- true; echo $?` prints 3;
-   `filament exec laptop --json -- sh -c 'exit 7' | jq .data.status` prints 7 with `$?` 0.
+   *Accept:* `tunlion exec nosuchdev -- true; echo $?` prints 3;
+   `tunlion exec laptop --json -- sh -c 'exit 7' | jq .data.status` prints 7 with `$?` 0.
 5. **`shell`.** Carry the remote status on `PtyOutcome::Exited` (`l2.rs:2582-2585,2894`) and
    propagate at `:3086` as `shell --ssh` already does (`:4769`); `:3122,3132` → 4,
    `:3190,3219` → 5; restore the terminal before each `exit` (they skip `Drop`).
    *Accept:* a remote `exit 3` gives local 3; a refused shell exits 4.
 6. **`devices`.** Array becomes `data.devices`; `forget/rename/revoke/restore/vouch` get a
    `--json` result and move their prose from `println!` to `ui::say`; unknown name → 3.
-   *Accept:* `filament devices --json | jq -e .ok`; `filament devices forget nope; echo $?`
+   *Accept:* `tunlion devices --json | jq -e .ok`; `tunlion devices forget nope; echo $?`
    prints 3.
 7. **`status` + `addr` + `id`.** Envelope; human renderings off stdout onto `ui::say`.
-   *Accept:* `filament status --json | jq -e .ok`; human-mode `addr` puts nothing but the
+   *Accept:* `tunlion status --json | jq -e .ok`; human-mode `addr` puts nothing but the
    address on stdout.
 8. **`reach`.** One schema for the warm and cold paths (`ping.rs:189-201`); envelope on the
    error path; exit 5 when unreachable; `ping.rs:30` → `ui::say`.
-   *Accept:* `filament reach nosuchdev; echo $?` prints 3;
-   `filament reach <offline> --json | jq -e '.ok == false'` with `$?` 5.
+   *Accept:* `tunlion reach nosuchdev; echo $?` prints 3;
+   `tunlion reach <offline> --json | jq -e '.ok == false'` with `$?` 5.
 9. **`doctor`.** Emit the envelope instead of propagating at `doctor.rs:62`; exit 5 when the
    probe did not establish; one `kind` per mode, all under `data`.
-   *Accept:* `filament doctor <offline> --json | jq -e .error.code` with valid JSON on
+   *Accept:* `tunlion doctor <offline> --json | jq -e .error.code` with valid JSON on
    stdout and `$?` 5.
 10. **`send`.** `--json`: one JSONL record per file on stdout plus a final envelope; keep the
     CR bar for TTYs (`ui.rs:449`); declined or partial → 7, today 1 (`send_cmd.rs:2060`).
-    *Accept:* `filament send f --to dev --json | jq -s '.[-1].ok'`; a declined transfer exits 7.
+    *Accept:* `tunlion send f --to dev --json | jq -s '.[-1].ok'`; a declined transfer exits 7.
 11. **`receive`.** A ready record on stdout under `--json`; exit 7 when every offer was
     declined (`recv_cmd.rs:5545-5557`) or a file failed verification (`:5854-5865`);
-    unknown `--to` → 3. *Accept:* `filament receive --json` prints
+    unknown `--to` → 3. *Accept:* `tunlion receive --json` prints
     `{"ok":true,"verb":"receive","data":{"state":"listening",…}}` within 2s; a non-TTY run
     that declines everything exits 7.
 12. **`forward`.** Collapse the four ready strings (`l2.rs:3491,3517,3522,3543`) into one
     shape, on stdout under `--json` and via `ui::critical` otherwise so `-q` keeps it; add a
     SIGINT arm to the accept loop (`:3552-3608`) exiting 130; `:3462-3470` → 3,
-    `:3475-3489` and `:3536-3542` → 5. *Accept:* `filament forward dev:5432 --json` emits
+    `:3475-3489` and `:3536-3542` → 5. *Accept:* `tunlion forward dev:5432 --json` emits
     the ready envelope before it blocks; a second one on the same port exits 5 with no
     "os error" in the message.
 13. **`expose`.** Distinguish the three `notify_daemon` outcomes (`expose.rs:147-163`):
     serving → 0, saved-but-not-serving → 7 with the reason; `--list` and the result under
     `--json` (`Binding` at `:24-30` is already `Serialize`); wrap the raw io error at `:231-234`.
-    *Accept:* `filament expose 8080 --json | jq -e .data.live`; exposing with no L3 overlay
-    exits 7; `filament expose --list --json | jq length`.
+    *Accept:* `tunlion expose 8080 --json | jq -e .data.live`; exposing with no L3 overlay
+    exits 7; `tunlion expose --list --json | jq length`.
 14. **`mount`.** Move the help block (`mount.rs:785-808`), `--check` (`:485-499`) and
     `--list` (`:545-558`) off stdout, replacing `--list`'s tty branch with `--json`; keep
     `--check`'s nonzero but reclassify to 6; `mount_cmd.rs:315-324` → 6, `:371-375` → 130.
-    *Accept:* `filament mount --list --json | jq -e .ok`; `filament mount --help` puts
+    *Accept:* `tunlion mount --list --json | jq -e .ok`; `tunlion mount --help` puts
     nothing on stdout.
 15. **`up`.** A ready record on stdout at the same point as `sdnotify::ready()`
     (`recv_cmd.rs:939`) rather than the earlier banner at `:371-378`, so a supervisor
-    without systemd can wait too. *Accept:* `filament up --json` prints one ready envelope
+    without systemd can wait too. *Accept:* `tunlion up --json` prints one ready envelope
     and nothing else on stdout.
 16. **`logs`.** Payload to stdout (`up_logs.rs:391,466`), matching the journalctl path;
     `--json` forces the `diag.jsonl` source so the format is knowable; nonzero when the
     journal fallback fails (`:359-369`); Ctrl-C → 130; drop the network teardown at
-    `:428,434` from a read-only verb. *Accept:* `filament logs --tail 5 | wc -l` prints 5;
-    `filament logs --json` emits one JSON object per line.
+    `:428,434` from a read-only verb. *Accept:* `tunlion logs --tail 5 | wc -l` prints 5;
+    `tunlion logs --json` emits one JSON object per line.
 17. **`requests`.** `--json` for list/approve/deny; unknown id → 3 and no daemon → 5
     (`status_cmd.rs:258-262,278-282`); fill the silent branch at `:240-257`.
-    *Accept:* `filament requests --json | jq -e .ok`; `filament requests deny 999; echo $?`
+    *Accept:* `tunlion requests --json | jq -e .ok`; `tunlion requests deny 999; echo $?`
     prints 3.
 18. **`grant` / `revoke`.** `--json`; prose from `println!` to `ui::say`; ceiling refusal → 4;
     `eprintln!` at `dispatch.rs:1824,1838,1845,1861` → `ui::`.
-    *Accept:* `filament grant dev shell --json | jq -e .ok`; a grant outside the ceiling
+    *Accept:* `tunlion grant dev shell --json | jq -e .ok`; a grant outside the ceiling
     exits 4.
 19. **`set`.** Honour `--json` on the write path (`settings.rs:950-963`) and on `--reset`;
     `eprintln!` → `ui::`; an aborted reset exits 2, not 0 (`:1019-1022`).
-    *Accept:* `filament set relay never --json | jq -e .ok`;
-    `printf 'n\n' | filament set --reset; echo $?` prints 2.
+    *Accept:* `tunlion set relay never --json | jq -e .ok`;
+    `printf 'n\n' | tunlion set --reset; echo $?` prints 2.
 20. **`add` / `join` code transport.** Thread `UiCapability` into `pair_cmd`
     (`pair_cmd.rs:106`) and emit the envelope, or drop them from the allowlist at
     `dispatch.rs:410-411` until it does; dropping is the smaller PR and the honest one.
-    *Accept:* `filament join <code> --json` either emits an envelope or exits 2 saying
+    *Accept:* `tunlion join <code> --json` either emits an envelope or exits 2 saying
     `--json` is not implemented for the code transport. It must not print prose.
 21. **`ephemeral enroll`.** Pass the real flag at `main.rs:1358` instead of `false` and add
     the verb to the `dispatch.rs:407-419` allowlist.
-    *Accept:* `filament ephemeral enroll --auth-key-file k --json | jq -e .ok`.
+    *Accept:* `tunlion ephemeral enroll --auth-key-file k --json | jq -e .ok`.
 22. **`down`.** Confirm the daemon stopped before claiming it (`main.rs:1439-1443` ignores
     `kill`'s status); `--json`; exit 5 if it is still alive after the stop.
-    *Accept:* `filament down --json | jq -e .ok`; stopping a wedged daemon exits 5.
+    *Accept:* `tunlion down --json | jq -e .ok`; stopping a wedged daemon exits 5.
 23. **Docs and ratchet.** Move `shell`'s doc comments off `exec` (`cli_def.rs:671-685`);
     correct the `--json` help (`:123`) and the `logs` help (`:380`); split the ratchet budget
     into `println!` and `eprintln!` columns; add exit-code and JSON sections to
     `docs/ui/OUTPUT.md` and fix its 338; delete the dead `confirm` branch (`main.rs:496-505`).
-    *Accept:* `filament shell --help` describes a shell; `surface_output.rs` reports two
+    *Accept:* `tunlion shell --help` describes a shell; `surface_output.rs` reports two
     numbers per file.
 
 ## 7. Do first
@@ -303,7 +303,7 @@ substrate, which land first. *Accept* is the gate; `jq -e` means the run must al
 The surfaces an agent touches on nearly every task, in payoff order.
 
 1. **Ticket 4, `exec`**. The most-used verb for an agent and the only one whose exit code
-   is already load-bearing; it is where a remote `1` colliding with a filament `1`
+   is already load-bearing; it is where a remote `1` colliding with a tunlion `1`
    actively produces wrong conclusions.
 2. **Tickets 6 and 7, `devices` / `status` / `addr`**. Discovery: everything starts by
    asking what exists and whether the daemon is up. They already emit JSON, so this is

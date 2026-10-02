@@ -23,13 +23,13 @@ nodes:                         # REQUIRED. A mapping of node-name -> params.
     addr: 10.50.0.2
 link:                          # REQUIRED. The carrier between two endpoints.
   provider: pipe               #   DEFAULT carrier; override at runtime with
-                               #   `lab up <topo> --link pipe|udp|wg|filament`.
+                               #   `lab up <topo> --link pipe|udp|wg|tunlion`.
   endpoints: [a, b]            #   Exactly two node names today.
   transport_subnet: 10.77.0.0/24   # UNDERLAY subnet — the carrier's own endpoint
                                #   addresses (veth / UDP / WireGuard endpoints).
                                #   Must NOT overlap `subnet`.
   crypto: none                 #   OPTIONAL. none | wg-noise | dtls. Defaults per
-                               #   provider (pipe/udp/filament -> none; wg ->
+                               #   provider (pipe/udp/tunlion -> none; wg ->
                                #   wg-noise). Validated for coherence with the
                                #   carrier.
 ```
@@ -42,7 +42,7 @@ link:                          # REQUIRED. The carrier between two endpoints.
 | `subnet` | yes | overlay (tunnel) CIDR. Node `addr`s must fall inside it. |
 | `defaults` | no | a map merged under every node's params (per-node keys win). |
 | `nodes` | yes | map of `name -> { addr, ...params }`. `addr` (overlay IP, no prefix) is required per node. A list form `[{name: a, addr: ...}]` is also accepted. |
-| `nodes.<n>.mtu` | no | overlay-iface MTU (default 1380; 1280 recommended for `filament` to leave framing headroom). |
+| `nodes.<n>.mtu` | no | overlay-iface MTU (default 1380; 1280 recommended for `tunlion` to leave framing headroom). |
 | `link.provider` | no | default carrier; `pipe` if omitted. Override with `--link`. |
 | `link.endpoints` | no | the two node names to connect; defaults to the first two nodes. |
 | `link.transport_subnet` | no | underlay CIDR (default `10.77.0.0/24`). Keep distinct per concurrent lab. |
@@ -51,7 +51,7 @@ link:                          # REQUIRED. The carrier between two endpoints.
 ## Addressing planes
 
 - **overlay** (`subnet`) — what you ping. Assigned to the data-path iface (TUN
-  for udp/filament; veth for pipe; wg iface for wg).
+  for udp/tunlion; veth for pipe; wg iface for wg).
 - **underlay** (`transport_subnet`) — the carrier's transport endpoints. The
   engine derives `.1` and `.2` from this subnet for endpoints `a` and `b`.
 
@@ -61,7 +61,7 @@ link:                          # REQUIRED. The carrier between two endpoints.
 | --- | --- | --- |
 | `two-nodes.yml` | `pipe` | the canonical baseline; run with any `--link`. |
 | `wg-pair.yml` | `wg` | ready-made WireGuard example (`crypto: wg-noise`). |
-| `filament-l3.yml` | `filament` | the integration target; `mtu: 1280`, `crypto: none`. |
+| `filament-l3.yml` | `tunlion` | the integration target; `mtu: 1280`, `crypto: none`. |
 
 ## Validation & errors
 

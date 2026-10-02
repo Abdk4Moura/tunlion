@@ -1,4 +1,4 @@
-# Design: seamless `filament ssh <peer>` — zero-setup shell over the trusted channel
+# Design: seamless `tunlion ssh <peer>` — zero-setup shell over the trusted channel
 
 Status: implementing (additive; gated). Owner: transport.
 Companion to: `docs/L1-pake-protocol.md` (caps model), `docs/L2-tunnel-design.md`
@@ -7,12 +7,12 @@ direct QUIC).
 
 ## Goal
 
-Make `filament ssh <peer>` as seamless as `tailscale ssh`: from a client with
-**no ssh keypair and no ssh setup at all**, `filament ssh peer 'hostname'` lands
+Make `tunlion ssh <peer>` as seamless as `tailscale ssh`: from a client with
+**no ssh keypair and no ssh setup at all**, `tunlion ssh peer 'hostname'` lands
 a shell and returns the peer's hostname — **no key copying, no host-key prompt,
 no `~/.ssh` involvement**.
 
-Today `filament ssh` is `ssh -o ProxyCommand="filament netcat <peer> 22"`. The
+Today `tunlion ssh` is `ssh -o ProxyCommand="tunlion netcat <peer> 22"`. The
 data path works, but it inherits OpenSSH's two friction points:
 
 1. **user-key auth** ("who are you") — needs a keypair in `~/.ssh` and its pubkey
@@ -48,14 +48,14 @@ you a file must NOT, by that fact, get a shell.
 
 - New capability string: `"shell"`.
 - Granted only by an explicit, local, consenting action on the ACCEPTOR:
-  `filament grant <device> shell`. (No interactive prompt inside `up`: a
+  `tunlion grant <device> shell`. (No interactive prompt inside `up`: a
   backgrounded daemon cannot prompt; the explicit grant command is the
   deny-by-default consent gate and keeps the path headless/testable.)
-- `filament revoke <device> shell` removes the cap AND strips the managed
+- `tunlion revoke <device> shell` removes the cap AND strips the managed
   `authorized_keys` block.
 - Enforcement is at the **bootstrap**, not at ssh-auth-failure time: a device
   without `shell` that requests the bootstrap is refused with a clear `deny`, and
-  `filament ssh` aborts BEFORE invoking ssh. ("Zero shell, clear denial" — not a
+  `tunlion ssh` aborts BEFORE invoking ssh. ("Zero shell, clear denial" — not a
   muddy auth failure.)
 
 The cap is keyed by the **devices.json petname**. The acceptor verifies a link's
@@ -68,8 +68,8 @@ gate looks the cap up under the exact stored key.
 Two **separate** known-device bring-ups (no threading one link through both the
 bootstrap and the ssh subprocess — simpler and equally correct):
 
-1. `filament ssh <peer>` first runs the bootstrap over its own link, then exits
-   that link and spawns ssh whose ProxyCommand is a fresh `filament netcat` link.
+1. `tunlion ssh <peer>` first runs the bootstrap over its own link, then exits
+   that link and spawns ssh whose ProxyCommand is a fresh `tunlion netcat` link.
 
 Bootstrap, initiator side (`shell_bootstrap`):
 - `bring_up_to_known(server, peer, relay)` → authenticated transport.
@@ -106,14 +106,14 @@ Bootstrap, acceptor side (new `Ev::Control` arm in `up`, next to `l2-open`,
 
 ## filament-managed ssh material (never touches `~/.ssh`)
 
-Under the filament config dir (`FILAMENT_CONFIG_DIR`, default `~/.config/filament`):
+Under the tunlion config dir (`FILAMENT_CONFIG_DIR`, default `~/.config/tunlion`):
 
 - `ssh/id_ed25519` + `ssh/id_ed25519.pub` — managed keypair, generated on demand
   via `ssh-keygen -t ed25519 -N "" -C filament-managed`, `0600`. NEVER the user's
   `~/.ssh`.
 - `ssh/known_hosts` — filament-private pin store.
 
-`filament ssh peer [args]` then invokes:
+`tunlion ssh peer [args]` then invokes:
 
 ```
 ssh -o IdentityFile=<cfg>/ssh/id_ed25519 \
@@ -121,7 +121,7 @@ ssh -o IdentityFile=<cfg>/ssh/id_ed25519 \
     -o UserKnownHostsFile=<cfg>/ssh/known_hosts \
     -o GlobalKnownHostsFile=/dev/null \
     -o StrictHostKeyChecking=accept-new \
-    -o ProxyCommand="filament --server <s> [--relay] netcat <peer> 22" \
+    -o ProxyCommand="tunlion --server <s> [--relay] netcat <peer> 22" \
     <login>@<dest-token> [args]
 ```
 
@@ -131,7 +131,7 @@ ssh -o IdentityFile=<cfg>/ssh/id_ed25519 \
   pre-pin would be worse than none (hard mismatch), so the acceptor pins its
   **real** served host key; `accept-new` only fires if the pin is somehow absent.
 - known_hosts entry is keyed by the **bare host token** ssh matches on
-  (`filament-<peer>`), NOT `user@host` — ssh looks host-only entries up, so a
+  (`tunlion-<peer>`), NOT `user@host` — ssh looks host-only entries up, so a
   `user@host` key would be silently inert. We write the plain host token. Proven
   by GATE D (a `StrictHostKeyChecking=yes` connection against the pre-pinned file,
   no `accept-new` backstop).
@@ -164,10 +164,10 @@ preference is a transport optimization, not a correctness requirement.)
 
 ## Surfaces / CLI additions
 
-- `filament grant <device> shell` — acceptor-side consent; adds `"shell"` to the
+- `tunlion grant <device> shell` — acceptor-side consent; adds `"shell"` to the
   device's caps (deny-by-default; only a known device).
-- `filament revoke <device> shell` — removes the cap + strips the managed block.
-- `filament ssh <peer> [args]` — now runs the bootstrap first (gated: only when
+- `tunlion revoke <device> shell` — removes the cap + strips the managed block.
+- `tunlion ssh <peer> [args]` — now runs the bootstrap first (gated: only when
   the peer is expected to accept; if bootstrap is denied, abort cleanly).
 - `CMDS` array + dispatch extended (must stay in lockstep or the bare-code
   heuristic / clap break).
@@ -178,10 +178,10 @@ New `cli/tests/ssh-gates.sh`, hermetic, fixture backend, sandboxed `HOME`:
 
 - **GATE A (positive, no-keys bootstrap):** client config dir has NO ssh keypair
   and NO `~/.ssh`. `grant boxA shell` on the acceptor, then
-  `filament ssh boxB 'hostname'` returns the acceptor's hostname. Proves the full
+  `tunlion ssh boxB 'hostname'` returns the acceptor's hostname. Proves the full
   zero-setup bootstrap (key gen + authorized_keys install + host-key pin + ssh).
 - **GATE B (negative, no cap):** a paired device WITHOUT `shell` is REFUSED the
-  bootstrap (`shell-bootstrap-deny`), `filament ssh` aborts before invoking ssh,
+  bootstrap (`shell-bootstrap-deny`), `tunlion ssh` aborts before invoking ssh,
   zero shell. Clear denial in output.
 - **Marked + removable:** assert the `# BEGIN/END filament-managed <device>` block
   is present after grant and gone after `revoke`.

@@ -1,14 +1,14 @@
 //! Per-OS capability CI harmer (docs/design-per-os-ci.md steps 1-2).
 //!
-//! Integration test that starts a local filament backend + two filament
-//! daemons, pairs them, and runs smoke tests. Needs the filament binary
+//! Integration test that starts a local tunlion backend + two tunlion
+//! daemons, pairs them, and runs smoke tests. Needs the tunlion binary
 //! pre-built with `cargo build --features test-hooks`.
 //!
 //! COMPILE GATE: this entire file is `#[cfg(feature = "test-hooks")]`.
 //! The compiler strips it from default/release builds, so the signaling-bypass
 //! path can NEVER end up in a published binary (security gate per Claude).
 //!
-//! CAP MODE: every filament process spawned here runs with
+//! CAP MODE: every tunlion process spawned here runs with
 //! `FILAMENT_CAP_AUTHORITATIVE=0` (shadow). These are TRANSPORT / mechanics
 //! smoke tests (byte-transparency, PTY exec, pairing, warm-hold latency) run
 //! between two FRESH, UNPROVISIONED daemons with NO cap grant. Since the 0.7
@@ -200,7 +200,7 @@ impl LiveChild {
 fn binary() -> PathBuf {
     // Cargo supplies the exact executable for this test invocation, including
     // custom target directories, target triples, profile, and .exe suffix.
-    let cand = PathBuf::from(env!("CARGO_BIN_EXE_filament"));
+    let cand = PathBuf::from(env!("CARGO_BIN_EXE_tunlion"));
     let profile = BUILD_PROFILE;
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(&cand)
@@ -1222,13 +1222,13 @@ fn two_nodes_pair_each_other() {
         .expect("help");
     assert!(out.status.success(), "binary help failed");
 
-    eprintln!("two_nodes_pair_each_other: filament binary and backend OK");
+    eprintln!("two_nodes_pair_each_other: tunlion binary and backend OK");
 }
 
 #[test]
 fn pty_one_shot_exec_smoke() {
     // PTY one-shot exec smoke: starts daemons, pairs them, then runs
-    // `filament pty <peer> -- echo NONCE` and verifies the echo output.
+    // `tunlion pty <peer> -- echo NONCE` and verifies the echo output.
     //
     // On Linux/Windows: uses live-pairing (daemon discovers newly paired
     // device via 2s scan, no restart needed — proven by #41).
@@ -1393,7 +1393,7 @@ fn pty_one_shot_exec_smoke() {
 fn shell_owner_gate_refuses_real_spawn() {
     let root = std::env::temp_dir().join(format!("filament-shell-gate-{}", std::process::id()));
     let drops = root.join("drops");
-    let out = Command::new(env!("CARGO_BIN_EXE_filament"))
+    let out = Command::new(env!("CARGO_BIN_EXE_tunlion"))
         .env("FILAMENT_CONFIG_DIR", &root)
         .args([
             "up", "--userspace", "--shell", "--server", "http://127.0.0.1:1", "--dir",
@@ -1580,7 +1580,7 @@ fn shell_daemon_live_pairing_no_restart() {
 // ------------------------------------------------- warm-all integration test ---
 
 /// Proves: "no cold establish when a peer is online and the daemon is up".
-/// Uses `filament ping --json` which returns `"warm": true` from the daemon's
+/// Uses `tunlion ping --json` which returns `"warm": true` from the daemon's
 /// own warm-link resolver — a trace-grade proof independent of timing.
 ///
 /// Gated off macOS: the hyperkit CI runner can't reliably complete a QUIC
@@ -1723,7 +1723,7 @@ fn warm_all_makes_first_contact_warm() {
     std::thread::sleep(Duration::from_secs(10));
 
     // Assertion 2: FIRST CONTACT TAKES THE WARM PATH
-    eprintln!("warm_all: running filament ping --json...");
+    eprintln!("warm_all: running tunlion ping --json...");
     let mut ping_proc = Command::new(&bin)
         .env("FILAMENT_CAP_AUTHORITATIVE", "0")
         .env("FILAMENT_DIRECT", &direct_flag)

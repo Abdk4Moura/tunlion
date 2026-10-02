@@ -110,13 +110,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
-      - name: Build filament
+      - name: Build tunlion
         working-directory: cli
         run: cargo build --release
 
       - name: Run gates
         env:
-          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/filament
+          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/tunlion
         run: |
           set -uo pipefail
           declare -A EXPECT=(

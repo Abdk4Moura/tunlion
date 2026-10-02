@@ -105,7 +105,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
         ));
         for d in &review {
             lines.push(render_device_row(d));
-            // #240: was `↳ filament devices promote <name>`, a verb that does
+            // #240: was `↳ tunlion devices promote <name>`, a verb that does
             // not exist, rendered as the prescribed next step.
             lines.push(ui::paint(Tone::Dim, "       ↳ its identity was never certified; re-pair to scope it"));
         }
@@ -115,7 +115,7 @@ pub fn render_devices(devices: &[DeviceEntry], pending_requests: usize, roster_h
     // Pending requests
     if pending_requests > 0 {
         lines.push(format!(
-            "  {} {} · filament requests",
+            "  {} {} · tunlion requests",
             ui::paint(Tone::Bold, &format!("{pending_requests}")),
             ui::paint(Tone::Dim, "requests waiting")
         ));
@@ -160,8 +160,8 @@ fn render_device_row(d: &DeviceEntry) -> String {
 pub fn render_empty() -> String {
     format!(
         "No devices yet.\n\
-         Add in person:        filament add\n\
-         Invite securely:      filament add --for person"
+         Add in person:        tunlion add\n\
+         Invite securely:      tunlion add --for person"
     )
 }
 
@@ -233,8 +233,8 @@ mod tests {
     fn empty_devices() {
         let s = render_empty();
         assert!(s.contains("No devices yet"), "must show empty message");
-        assert!(s.contains("filament add"), "must suggest add");
-        assert!(s.contains("filament add --for person"), "must suggest the bounded invite");
+        assert!(s.contains("tunlion add"), "must suggest add");
+        assert!(s.contains("tunlion add --for person"), "must suggest the bounded invite");
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
         assert!(s.contains("NEEDS REVIEW"), "must show review section");
         assert!(s.contains("old-laptop"), "must show review device");
         // #240: this used to assert the row said "promote to continue" and
-        // printed `filament devices promote <name>`. The verb does not exist,
+        // printed `tunlion devices promote <name>`. The verb does not exist,
         // clap rejects it, and the owner hit exactly that on his own machines.
         // The test pinned the defect, so it is inverted: the row must state the
         // condition and prescribe no action it cannot deliver.
@@ -293,7 +293,7 @@ mod tests {
     fn pending_requests_count() {
         let s = render_devices(&[], 2, None);
         assert!(s.contains("2"), "must show request count");
-        assert!(s.contains("filament requests"), "must suggest filament requests");
+        assert!(s.contains("tunlion requests"), "must suggest tunlion requests");
     }
 
     #[test]

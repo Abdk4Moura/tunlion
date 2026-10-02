@@ -8,7 +8,7 @@
 //
 // Drives the REAL PeerLink in real Chromium (the P0/P1 harness pattern; the
 // chrome-devtools MCP multi-tab path wedges headless, so we use the
-// esbuild→http→Playwright harness instead). ALSO asserts useFilament.js +
+// esbuild→http→Playwright harness instead). ALSO asserts useTunlion.js +
 // webrtc.js source contain the load-bearing P5 wiring, to catch source drift.
 //
 //   node frontend/tests/p5-upgrade-prober.spec.cjs
@@ -44,7 +44,7 @@ function buildHarness() {
       // loader for, and iife has no `import.meta`, so the bundle failed and
       // then the component threw reading import.meta.env. Same-origin is
       // what a harness wants: an empty base keeps requests local.
-      '--loader:.wasm=file', '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
+      '--loader:.wasm=file', '--define:import.meta.env={"VITE_TUNLION_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;
@@ -62,7 +62,7 @@ function startServer(bundlePath) {
 
 // ---- source-level invariants (guard against harness/source drift) ----------
 function assertSource() {
-  const hook = fs.readFileSync(path.join(FRONT, 'src', 'lib', 'useFilament.js'), 'utf8');
+  const hook = fs.readFileSync(path.join(FRONT, 'src', 'lib', 'useTunlion.js'), 'utf8');
   const rtc = fs.readFileSync(path.join(FRONT, 'src', 'lib', 'webrtc.js'), 'utf8');
   const checks = [
     ['rtc has _armUpgradeProber', /_armUpgradeProber\s*\(\)\s*\{/.test(rtc)],
@@ -72,7 +72,7 @@ function assertSource() {
     ['rtc has _commitUpgrade with value-prop line', /_commitUpgrade\s*\(/.test(rtc) && /upgraded to direct — relay released/.test(rtc)],
     ['rtc arms on relayed / disarms on direct in _detectRoute',
       /route\s*===\s*'relayed'\)\s*this\._armUpgradeProber\(\)/.test(rtc) && /this\._disarmUpgradeProber\(\)/.test(rtc)],
-    ['rtc kill-switch reads filamentUpgradeProbe', /localStorage\.getItem\('filamentUpgradeProbe'\)\s*===\s*'0'/.test(rtc)],
+    ['rtc kill-switch reads tunlionUpgradeProbe', /localStorage\.getItem\('tunlionUpgradeProbe'\)\s*===\s*'0'/.test(rtc)],
     ['rtc shared-ICE-restart guard (stallEpisode || !connected)',
       /connectionState\s*!==\s*'connected'\s*\|\|\s*this\._stallEpisode/.test(rtc)],
     ['rtc only impolite drives restartIce in probe', /if\s*\(!this\.polite\)\s*\{[\s\S]*?restartIce/.test(rtc)],

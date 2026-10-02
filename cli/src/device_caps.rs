@@ -102,7 +102,7 @@ pub(crate) fn device_allows(name: &str, capability: &str) -> bool {
 /// Grant or revoke a capability on an EXISTING known device, preserving its
 /// secret and any other caps. Promotes a v1 record (no `caps`) to v2 with the
 /// back-compat baseline `["transfer"]` first, so granting `shell` never silently
-/// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
+/// drops `transfer`. Deny-by-default consent for `tunlion grant`/`revoke`.
 /// Returns Err if the device is unknown (you can't grant a stranger a shell).
 /// Has the owner explicitly revoked this capability from this device?
 ///
@@ -210,7 +210,7 @@ pub(crate) fn device_set_cap(
         }
         if !found {
             return Err(anyhow::anyhow!(
-                "no known device named '{name}', run `filament devices` to see who you've paired"
+                "no known device named '{name}', run `tunlion devices` to see who you've paired"
             ));
         }
         Ok(())

@@ -1,15 +1,15 @@
 // Focused render harness for the relay-honesty UX (transport-resilience P1).
-// Driving a REAL relayed peer here would need two filament CLI peers paired in
+// Driving a REAL relayed peer here would need two tunlion CLI peers paired in
 // over `--relay` plus live signaling, and the relay state we assert is PURELY
-// presentation — Filament derives every relay affordance from `peer.route ===
+// presentation — Tunlion derives every relay affordance from `peer.route ===
 // 'relayed'` (set browser-side by webrtc.js `_detectRoute`). So, exactly as the
-// PakeKeep harness does, we mount Filament directly with an injected roster:
+// PakeKeep harness does, we mount Tunlion directly with an injected roster:
 // two relayed peers (loud ⚠ expected) + one direct peer (no warning expected),
 // and assert the tile chip, the status line, the device-sheet explainer, and
 // the global "N on relay" indicator. ?theme=light|dark drives both palettes.
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import Filament from '../src/ui/Filament.jsx'
+import Tunlion from '../src/ui/Tunlion.jsx'
 
 const params = new URLSearchParams(window.location.search)
 const theme = params.get('theme') === 'light' ? 'light' : 'dark'
@@ -47,7 +47,7 @@ if (allDirect) baseState.peers = baseState.peers.map((p) => ({ ...p, route: 'dir
 const noop = () => {}
 
 function Harness() {
-  return React.createElement(Filament, {
+  return React.createElement(Tunlion, {
     state: baseState,
     ui: { theme, accent: 'green', density: 'airy', columns: 'auto', font: 'jetbrains', onToggleTheme: noop },
     onSendFiles: noop, onAccept: noop, onDecline: noop, onSave: noop, onClear: noop,

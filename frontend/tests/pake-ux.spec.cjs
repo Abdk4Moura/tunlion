@@ -20,7 +20,7 @@
 //      asserts the exact resulting string. A naive reformat (caret -> end)
 //      produces a DIFFERENT string here and fails.
 //   3. pastes "GRAND-HAWK-RUBY-8045" -> asserts value.
-//   4. consent: serves a focused Filament render harness with an injected
+//   4. consent: serves a focused Tunlion render harness with an injected
 //      pendingPakeKeep and asserts the PakeKeepBanner shows, the name is
 //      editable, and remember/not-now fire with the edited name.
 
@@ -112,7 +112,7 @@ function buildHarness() {
       // loader for, and iife has no `import.meta`, so the bundle failed and
       // then the component threw reading import.meta.env. Same-origin is
       // what a harness wants: an empty base keeps requests local.
-      '--loader:.wasm=file', '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
+      '--loader:.wasm=file', '--define:import.meta.env={"VITE_TUNLION_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;
@@ -129,12 +129,12 @@ function startHarnessServer(bundlePath) {
 }
 
 (async () => {
-  if (!fs.existsSync(path.join(DIST, 'index.html'))) fail('frontend/dist not built — run `VITE_FILAMENT_API= npm run build` in frontend/');
+  if (!fs.existsSync(path.join(DIST, 'index.html'))) fail('frontend/dist not built — run `VITE_TUNLION_API= npm run build` in frontend/');
   // Guard the documented red herring: a prod-pointing dist times out every nav.
   const bundleJs = fs.readdirSync(path.join(DIST, 'assets')).filter((f) => f.endsWith('.js'));
   for (const f of bundleJs) {
     if (fs.readFileSync(path.join(DIST, 'assets', f), 'utf8').includes('api.filament.autumated.com'))
-      fail('dist is prod-pointing — rebuild SAME-ORIGIN: `VITE_FILAMENT_API= npm run build`');
+      fail('dist is prod-pointing — rebuild SAME-ORIGIN: `VITE_TUNLION_API= npm run build`');
   }
   ok('dist present and same-origin');
 
@@ -201,7 +201,7 @@ function startHarnessServer(bundlePath) {
   if (val !== 'GRAND-HAWK-RUBY-8045') fail(`paste value was "${val}", expected "GRAND-HAWK-RUBY-8045"`);
   ok('paste GRAND-HAWK-RUBY-8045 -> value correct');
 
-  // ---- Change 2: consent banner (focused Filament render) -------------------
+  // ---- Change 2: consent banner (focused Tunlion render) -------------------
   const bundle = buildHarness();
   await startHarnessServer(bundle);
   const hpage = await browser.newPage();

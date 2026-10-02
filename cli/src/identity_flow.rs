@@ -177,13 +177,13 @@ pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
 
 /// Restores the pre-U1 precondition for scripts that want to fail fast: with
 /// this set (any value but empty or `0`), a verb that needs an identity bails
-/// with the old "run `filament init` first" instead of minting one.
+/// with the old "run `tunlion init` first" instead of minting one.
 pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "FILAMENT_NO_IMPLICIT_INIT";
 
 /// Whether the opt-out above is set (any value except empty and `0`).
 ///
 /// The INSPECT surfaces read this instead of calling the accessor and letting
-/// it fail. `filament id` and the bare tour screen answered pre-U1 without an
+/// it fail. `tunlion id` and the bare tour screen answered pre-U1 without an
 /// identity and exited 0; if the opt-out turned either into an error, U1 would
 /// have taken a working read-only answer away from exactly the scripts that
 /// asked for the old behaviour, which is the opposite of what an opt-out is
@@ -193,7 +193,7 @@ pub(crate) fn implicit_init_disabled() -> bool {
 }
 
 /// The identity, minted on first use (U1). A keypair is not a ceremony: the
-/// bails that read "no identity. Run `filament init` first" route through here
+/// bails that read "no identity. Run `tunlion init` first" route through here
 /// and proceed instead. Prints one past-tense line the ONE time the key is
 /// created, to stderr via `ui::say`, and nothing under `--json` (the envelope
 /// that could carry it as a data field is audit ticket 1; until then a prose
@@ -204,12 +204,12 @@ pub(crate) fn implicit_init_disabled() -> bool {
 /// paths sign with it; `id` is the verb whose entire subject is the identity.
 /// The bare tour screen (`status_cmd::tour_cmd`) does NOT call this and must
 /// not: it is an inspect screen that renders whatever state it finds, so
-/// minting there would make `filament` with no arguments write a private key
+/// minting there would make `tunlion` with no arguments write a private key
 /// as a side effect of being looked at, and would make the screen FAIL on the
 /// two devices that cannot mint (a joined one, and one with the opt-out set).
 ///
 /// What it deliberately does NOT do, because those ARE ceremonies and
-/// `filament init` still owns them: name the device, choose the inbox, write
+/// `tunlion init` still owns them: name the device, choose the inbox, write
 /// a stored device cert, install the service, or touch anything outside the
 /// config dir. `local_device_cert()` mints the self-cert on demand, so an
 /// implicit identity pairs the same as an `init`ed one.
@@ -217,7 +217,7 @@ pub(crate) fn ensure_user_key(json: bool) -> Result<identity::UserKey> {
     let (key, created) = ensure_user_key_inner()?;
     if created && !json {
         ui::say(&format!(
-            "  created your identity at {}  (filament id to see it)",
+            "  created your identity at {}  (tunlion id to see it)",
             settings::config_dir().display()
         ));
     }
@@ -246,7 +246,7 @@ pub(crate) fn ensure_user_key_inner() -> Result<(identity::UserKey, bool)> {
         );
     }
     if implicit_init_disabled() {
-        bail!("no identity. Run `filament init` first");
+        bail!("no identity. Run `tunlion init` first");
     }
     let dir = settings::config_dir();
     if !dir.exists() {
@@ -276,11 +276,11 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
     let result = (|| -> Result<()> {
         eprintln!(
             "{}",
-            ui::paint(ui::Tone::Brand, "  FILAMENT / YOUR WAY BACK")
+            ui::paint(ui::Tone::Brand, "  TUNLION / YOUR WAY BACK")
         );
         eprintln!();
         eprintln!("  Anyone with these words can become you.");
-        eprintln!("  Write them somewhere offline. Filament cannot reset them.");
+        eprintln!("  Write them somewhere offline. Tunlion cannot reset them.");
         eprintln!();
         for (row, chunk) in words.chunks(4).enumerate() {
             let cells = chunk
@@ -330,12 +330,12 @@ pub(crate) async fn init_experience(
     let store = crate::platform::PlatformKeyStore;
     if caps.json && background {
         bail!(
-            "init --json cannot install a service without mixing service output; run `filament up --install` separately"
+            "init --json cannot install a service without mixing service output; run `tunlion up --install` separately"
         );
     }
     if let Some(existing) = identity::UserKey::load(&store)? {
         bail!(
-            "this device already has identity {}; see `filament id`",
+            "this device already has identity {}; see `tunlion id`",
             existing.fingerprint()
         );
     }
@@ -396,7 +396,7 @@ pub(crate) async fn init_experience(
         true
     } else if caps.interactive {
         // `-y` means "answer this prompt with its default", and the default is Y.
-        // Without it `filament init --yes` BLOCKED on a real terminal: the
+        // Without it `tunlion init --yes` BLOCKED on a real terminal: the
         // identity was written, then it sat on "Stay available in the
         // background? [Y/n]:" forever, because this arm never consulted
         // `caps.yes`. Every other confirmation goes through
@@ -495,7 +495,7 @@ pub(crate) async fn init_experience(
     } else {
         ui::say(&ui::paint(
             ui::Tone::Dim,
-            "  Stay available: filament up --install",
+            "  Stay available: tunlion up --install",
         ));
     }
     Ok(())
@@ -511,7 +511,7 @@ pub(crate) async fn join_cmd(
     to: Option<String>,
 ) -> Result<()> {
     if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
-        bail!("this device already has an identity; join starts from a clean Filament identity");
+        bail!("this device already has an identity; join starts from a clean Tunlion identity");
     }
     if local_device_cert_path().exists() {
         bail!("this device has already joined an identity; reset it before joining another");

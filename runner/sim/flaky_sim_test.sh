@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DETERMINISTIC FLAKY-LINK SIMULATION for the file-driven filament job-runner.
+# DETERMINISTIC FLAKY-LINK SIMULATION for the file-driven tunlion job-runner.
 #
 # Reproduces — LOCALLY, with NO real remote box — the three failure modes that
 # break the runner over the real Colab->do-vm WAN link, and proves the resilience
@@ -16,14 +16,14 @@
 #                         is never permanently lost.
 #
 # HOW INSTABILITY IS INDUCED: a stdlib TCP proxy (flaky_proxy.py) sits between every
-# filament CLI client and the LOCAL signaling backend. filament's discovery + SDP/ICE
+# tunlion CLI client and the LOCAL signaling backend. tunlion's discovery + SDP/ICE
 # ride that socket.io link, so cutting it (toggle a control file) severs live
 # connections and refuses new ones — the local equivalent of the WAN path dropping.
 # A background "flapper" then keeps randomly dropping the link for the whole run, so
 # the eventual success is "despite induced drops", not just one scripted outage.
 #
 # LOCAL ONLY: isolated FILAMENT_CONFIG_DIRs + the locally-built binary + a local
-# backend on its own port. Never touches the user's daemon or ~/.local/bin/filament.
+# backend on its own port. Never touches the user's daemon or ~/.local/bin/tunlion.
 #
 # Usage:  runner/sim/flaky_sim_test.sh            # full flaky run
 #         FILJOB_KEEP=1 runner/sim/flaky_sim_test.sh   # keep work dir for inspection
@@ -40,7 +40,7 @@ PORT="${FILJOB_SIM_PORT:-$_BASE}"
 PROXY_PORT="${FILJOB_SIM_PROXY_PORT:-$(( _BASE + 1 ))}"
 BACKEND="http://127.0.0.1:$PORT"          # clients NEVER hit this directly
 SERVER="http://127.0.0.1:$PROXY_PORT"     # every client goes through the flaky proxy
-BIN="${FILJOB_BIN:-$ROOT/cli/target/release/filament}"
+BIN="${FILJOB_BIN:-$ROOT/cli/target/release/tunlion}"
 SEED="${FILJOB_SIM_SEED:-1}"
 
 # pick the python with signaling deps (reuse run_local_test's venv if present)
@@ -61,7 +61,7 @@ mkdir -p "$HOST_CFG" "$HOST_DOUT_CFG" "$BOX_DIN_CFG" "$BOX_DOUT_CFG" "$BOX_INBOX
 
 PIDS=()
 cleanup() {
-  # kill tracked PIDs AND their groups (the up-supervisor + filament children),
+  # kill tracked PIDs AND their groups (the up-supervisor + tunlion children),
   # so a timeout-kill of the wrapper never leaks a backend/proxy/acceptor that
   # would hold a port and corrupt the next run.
   for p in "${PIDS[@]:-}"; do
@@ -91,7 +91,7 @@ say() { printf '\033[35m[sim]\033[0m %s\n' "$*"; }
 link_down() { : > "$DOWN_FLAG"; }
 link_up()   { rm -f "$DOWN_FLAG"; }
 
-[ -x "$BIN" ] || { echo "ERROR: filament binary not found at $BIN"; exit 1; }
+[ -x "$BIN" ] || { echo "ERROR: tunlion binary not found at $BIN"; exit 1; }
 say "binary: $BIN"
 say "work:   $WORK"
 
@@ -135,7 +135,7 @@ sleep 1
 cp "$RUNNER/box_executor.py" "$BOX_JOBS/box_executor.py"
 cp "$RUNNER/watcher.py"      "$BOX_JOBS/watcher.py"
 
-# SUPERVISED box-din acceptor: filament's socket.io is reconnect(false), so a
+# SUPERVISED box-din acceptor: tunlion's socket.io is reconnect(false), so a
 # severed `up` zombies out and the host can't rediscover it. up_supervisor.sh
 # recycles it on a cadence so a fresh, re-announcing acceptor is always present.
 FILAMENT_CONFIG_DIR="$BOX_DIN_CFG" HOME="$BOX_DIN_CFG" PATH="$(dirname "$BIN"):$PATH" \

@@ -21,8 +21,8 @@ Every script is parameterized by env with sane defaults (resolved relative to
 the script), so no edit is needed for a fresh checkout:
 
 ```sh
-# defaults: BIN=../../target/release/filament, SERVER=http://127.0.0.1:8093
-BIN=path/to/filament SERVER=http://127.0.0.1:8093 bash gate1_mutual_key.sh
+# defaults: BIN=../../target/release/tunlion, SERVER=http://127.0.0.1:8093
+BIN=path/to/tunlion SERVER=http://127.0.0.1:8093 bash gate1_mutual_key.sh
 # gate6 also takes PY (the backend venv python) and BACKEND_DIR
 PY=/path/to/venv/bin/python bash gate6_downgrade.sh
 # the mjs gates resolve frontend/pake artifacts relative to the repo root
@@ -36,7 +36,7 @@ OWN numeric nameplate, so a claimer uses the FULL minted code, not the phrase).
 
 | # | script | property |
 |---|--------|----------|
-| 1 mutual-key        | `gate1_mutual_key.sh`    | two real `filament pair` procs, same code → identical pinned secret; confirmation passes |
+| 1 mutual-key        | `gate1_mutual_key.sh`    | two real `tunlion pair` procs, same code → identical pinned secret; confirmation passes |
 | 2 adversarial (NEG) | `cargo run --bin adversary` (in `pake/`) | element-MITM / a=fingerprint-rewrite / caps-rewrite all DETECTED → abort, zero secret (A/B numbers) |
 | 3 wrongpw-burns     | `gate3_wrongpw_burn.sh`  | wrong password REFUSED, nothing stored, nameplate BURNED, no silent retry |
 | 4 browser↔cli       | `node gate4_interop.mjs` | committed browser WASM and native CLI derive the SAME secret + mutually confirm |

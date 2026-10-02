@@ -1,4 +1,4 @@
-// Filament service worker — offline app shell + runtime asset cache.
+// Tunlion service worker — offline app shell + runtime asset cache.
 // Deliberately hands off anything dynamic: signaling (/socket.io), the API
 // (/api), and cross-origin requests are never intercepted, so the P2P/WebRTC
 // path is untouched.
@@ -18,7 +18,7 @@
 //     caching them long is safe and fast.
 //   - /api + /socket.io (+ cross-origin: TURN/signaling): NEVER intercepted.
 const BUILD_ID = '__BUILD_ID__'
-const CACHE = 'filament-' + BUILD_ID
+const CACHE = 'tunlion-' + BUILD_ID
 const SHELL = ['/', '/index.html']
 
 self.addEventListener('install', (e) => {

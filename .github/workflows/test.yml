@@ -201,10 +201,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: filament-${{ matrix.target }}
+          name: tunlion-${{ matrix.target }}
           path: |
-            cli/target/${{ matrix.target }}/release/filament
-            cli/target/${{ matrix.target }}/release/filament.exe
+            cli/target/${{ matrix.target }}/release/tunlion
+            cli/target/${{ matrix.target }}/release/tunlion.exe
           if-no-files-found: error
           retention-days: 7
 

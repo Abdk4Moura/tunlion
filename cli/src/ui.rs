@@ -38,7 +38,7 @@ static VERBOSITY: AtomicU8 = AtomicU8::new(Level::Info as u8);
 ///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
 ///   2. otherwise the clap flags: `-q/--quiet` -> critical; repeated `-v` raises
 ///      info -> debug -> trace (count saturates at trace).
-///   3. persistent `verbosity` setting (e.g. `filament set verbosity debug`).
+///   3. persistent `verbosity` setting (e.g. `tunlion set verbosity debug`).
 /// Call this from `main` right after parsing, before any worker spawns.
 pub fn init_verbosity(verbose: u8, quiet: bool) {
     let level = if let Ok(s) = std::env::var("FILAMENT_LOG") {
@@ -125,7 +125,7 @@ pub fn caps() -> &'static Caps {
 
 #[derive(Clone, Copy)]
 pub enum Tone {
-    /// the brand: filament green (#7CF6C8)
+    /// the brand: tunlion green (#7CF6C8)
     Brand,
     Ok,
     Err,
@@ -312,7 +312,7 @@ pub fn critical(line: &str) {
 /// easier to scan than a wall of prose. Each line rides the CRITICAL channel
 /// (always shown, even under `-q`) and `paint()` (color only on a tty, clean in a
 /// pipe). Steps are pre-formatted by the caller, so a step may embed a command in
-/// the brand accent, e.g. `paint(Tone::Brand, "filament pty box")`.
+/// the brand accent, e.g. `paint(Tone::Brand, "tunlion pty box")`.
 pub fn problem(headline: &str, detail: &str, steps: &[String]) {
     critical(&format!("{} {}", paint(Tone::Err, "✗"), paint(Tone::Bold, headline)));
     if !detail.is_empty() {

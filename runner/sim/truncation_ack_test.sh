@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Filament — P4 WHOLE-FILE-INTEGRITY + DELIVERY-ACK gate (deterministic).
+# Tunlion — P4 WHOLE-FILE-INTEGRITY + DELIVERY-ACK gate (deterministic).
 #
 # SLO-measurement gate for transport-resilience §P4 (GAP-5): lift whole-file
-# sha256 verification + a delivery-ACK INTO THE CORE send/recv, so EVERY filament
+# sha256 verification + a delivery-ACK INTO THE CORE send/recv, so EVERY tunlion
 # transfer (not just runner jobs) is verified-and-acknowledged. The gap P4 closes:
 # core send/recv kept partials + a head-hash (C7 resume) but had NO whole-file
 # integrity check and was fire-and-forget — a transfer could "complete" while
@@ -48,7 +48,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CLI_DIR="$ROOT/cli"
-BIN="${FILJOB_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`

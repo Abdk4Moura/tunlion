@@ -2,7 +2,7 @@
 // (Phase 2). Plain Node ESM:
 // node frontend/src/net/app/__tests__/recovery.test.mjs
 // Pins the onStall escalation, onStuck retry/second-wind, and link-rebuild
-// predicate extracted 1:1 from useFilament.js, so the rewire is behavior-faithful.
+// predicate extracted 1:1 from useTunlion.js, so the rewire is behavior-faithful.
 import { decideStallEscalation, decideStuckRecovery, shouldRebuildLink, REBUILD_STATES } from '../recovery.js'
 
 let ok = true
