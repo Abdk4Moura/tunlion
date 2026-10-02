@@ -1,11 +1,11 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
-PackageIdentifier: Abdk4Moura.Tunlion
+PackageIdentifier: Abdk4Moura.Filament
 PackageVersion: "0.2.1-beta.27"
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
-  - RelativeFilePath: tunlion.exe
-    PortableCommandAlias: tunlion
+  - RelativeFilePath: filament.exe
+    PortableCommandAlias: filament
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/Abdk4Moura/tunlion/releases/download/cli-v0.2.1-beta.27/filament-x86_64-pc-windows-msvc.zip
