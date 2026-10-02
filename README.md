@@ -1,8 +1,18 @@
-# Filament
+# Tunlion
 
-**Live: [filament.autumated.com](https://filament.autumated.com)** — send files and reach your devices, peer to peer. No upload, no size cap, no account.
+> **Filament is now Tunlion.** Same project, same people, new name. The old name
+> collided with [Filament](https://filamentphp.com) the Laravel admin panel, which
+> owns the search results, so this one is ours alone.
+>
+> `filament.autumated.com` redirects here and old GitHub links redirect to this repo,
+> so nothing you have bookmarked breaks. The published `filament-cli` crate and the
+> `cli-v0.8.5` release assets keep working unchanged; new releases ship under the new
+> name. **`api.filament.autumated.com` is deliberately unchanged** and stays up: every
+> binary already installed points at it.
 
-Filament started as the file transfer nothing else does: the **receiving end needs nothing installed** — it can be any browser, on any phone or laptop. That still holds. But the same crypto-addressed link that carries a file also lets you **shell into your machines, forward a port, or mount a folder** across the internet. One tool, one identity, your devices meshed.
+**Live: [tunlion.autumated.com](https://tunlion.autumated.com)** — send files and reach your devices, peer to peer. No upload, no size cap, no account.
+
+Tunlion started as the file transfer nothing else does: the **receiving end needs nothing installed** — it can be any browser, on any phone or laptop. That still holds. But the same crypto-addressed link that carries a file also lets you **shell into your machines, forward a port, or mount a folder** across the internet. One tool, one identity, your devices meshed.
 
 Files and streams travel **peer to peer** (WebRTC data channel in the browser, direct QUIC between terminals). The server only helps the two ends find each other — it never sees a byte.
 
