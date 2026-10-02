@@ -34,7 +34,7 @@ This is the field-testing hardening release. Every change here came out of live 
 filament update
 
 # Linux / macOS installer
-curl -fsSL https://filament.autumated.com/install | sh
+curl -fsSL https://tunlion.autumated.com/install | sh
 
 # Homebrew
 brew tap Abdk4Moura/tap

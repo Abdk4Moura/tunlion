@@ -113,7 +113,7 @@ direct-quic stall to verify fallback (future test, not part of this design).
 - Relay fallback for file transfer (send/recv) — this is a separate transport
   decision
 - Relay fallback for daemon-to-daemon links (those are already warm-held)
-- TURN relay server provisioning (production already has `turn:filament.autumated.com:3478`)
+- TURN relay server provisioning (production already has `turn:tunlion.autumated.com:3478`)
 - Any change to `FILAMENT_DIRECT` semantics for file-transfer paths
 
 ## CI caveat: macOS hyperkit runner

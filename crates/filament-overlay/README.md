@@ -3,7 +3,7 @@
 Self-certifying overlay addresses: an IPv6 address derived from an Ed25519 public
 key, plus signed claims to that address that are **bound to a specific link**.
 
-Carved out of the [filament](https://github.com/Abdk4Moura/filament) CLI.
+Carved out of the [filament](https://github.com/Abdk4Moura/tunlion) CLI.
 
 ```rust
 use filament_overlay::{addr_from_pubkey, Identity};

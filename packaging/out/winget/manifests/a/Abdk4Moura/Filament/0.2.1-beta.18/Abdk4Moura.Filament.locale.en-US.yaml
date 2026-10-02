@@ -4,15 +4,15 @@ PackageVersion: "0.2.1-beta.18"
 PackageLocale: en-US
 Publisher: Abdulkabir Agboola
 PublisherUrl: https://github.com/Abdk4Moura
-PublisherSupportUrl: https://github.com/Abdk4Moura/filament/issues
+PublisherSupportUrl: https://github.com/Abdk4Moura/tunlion/issues
 PackageName: Filament
-PackageUrl: https://filament.autumated.com
+PackageUrl: https://tunlion.autumated.com
 License: MIT
-LicenseUrl: https://github.com/Abdk4Moura/filament/blob/main/LICENSE
+LicenseUrl: https://github.com/Abdk4Moura/tunlion/blob/main/LICENSE
 ShortDescription: P2P file transfer between terminals and browsers - no upload, no account
 Description: |-
   Filament sends files directly between devices over WebRTC. The other end
-  can be another terminal or any browser at filament.autumated.com - nothing
+  can be another terminal or any browser at tunlion.autumated.com - nothing
   to install on the receiving phone or laptop. One-time speakable pairing
   codes, resumable transfers that survive restarts, and visible routing
   (local / direct / relayed). Self-hostable.

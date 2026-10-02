@@ -2,7 +2,7 @@
 
 **Linux / macOS** (verifies checksums, installs to `~/.local/bin`, no sudo):
 ```
-curl -fsSL https://filament.autumated.com/install | sh
+curl -fsSL https://tunlion.autumated.com/install | sh
 ```
 
 **Windows:**
@@ -17,7 +17,7 @@ Already installed? `filament update`
 ## Quick start
 ```
 filament send video.mp4 --code      # speak the code aloud
-filament receive clever-lynx-63     # …or open filament.autumated.com in any browser
+filament receive clever-lynx-63     # …or open tunlion.autumated.com in any browser
 ```
 
 All binaries are checksummed (SHA256SUMS) and carry GitHub build

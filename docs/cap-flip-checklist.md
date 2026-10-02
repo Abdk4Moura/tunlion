@@ -66,7 +66,7 @@ the counters are process-global and a fresh CLI invocation reads zeros.
 ## FLIP BLOCKER: fleet devices cannot re-prove identity after an owner restart
 
 Measured on `cli/tests/fleet-cert-gates.sh` gate AUTH-A (currently KNOWN-RED,
-https://github.com/Abdk4Moura/filament/issues/312): after the owner daemon
+https://github.com/Abdk4Moura/tunlion/issues/312): after the owner daemon
 restarts, the possession challenge does not reach the peer on the link that is
 carrying its traffic, so a covered shell-class open is refused under
 authoritative mode until the peer reconnects cleanly. The defect is in the link,

@@ -63,7 +63,7 @@ EXAMPLES
   filament reach laptop              check if a device is reachable
   filament forward laptop:5432       tunnel to a peer's localhost port
 
-  The other end never needs anything installed: https://filament.autumated.com
+  The other end never needs anything installed: https://tunlion.autumated.com
   Run `filament <command> --help` for details.";
 
 #[derive(Parser)]

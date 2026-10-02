@@ -8,7 +8,7 @@
 Last year I dug up an abandoned repo from 2024. It was a peer-to-peer file
 sharing app I had built while teaching myself how Flask and React fit
 together, and it had quietly rotted. I decided to revive it properly. The
-result is [Filament](https://filament.autumated.com), which sends files
+result is [Filament](https://tunlion.autumated.com), which sends files
 directly between two browsers over WebRTC: no upload, no account, no size
 limit.
 
@@ -22,7 +22,7 @@ This post is the other 80 percent. Eleven concrete failure modes I hit while
 making Filament reliable, each with the symptom, the actual cause, and the
 fix. If you are building anything on RTCPeerConnection and DataChannels, I
 suspect you will meet most of these too. The full engineering log lives in
-the repo as [docs/resilience.md](https://github.com/Abdk4Moura/filament/blob/main/docs/resilience.md).
+the repo as [docs/resilience.md](https://github.com/Abdk4Moura/tunlion/blob/main/docs/resilience.md).
 
 ## The shape of the system
 
@@ -286,8 +286,8 @@ stream from. That is a platform boundary, not a design choice.
 Filament is open source and self-hostable: a React frontend, a small
 Flask-SocketIO signaling server, Redis, and coturn, all wired together with
 docker compose. Try it at
-[filament.autumated.com](https://filament.autumated.com), read the code at
-[github.com/Abdk4Moura/filament](https://github.com/Abdk4Moura/filament),
+[tunlion.autumated.com](https://tunlion.autumated.com), read the code at
+[github.com/Abdk4Moura/tunlion](https://github.com/Abdk4Moura/tunlion),
 and if you find failure mode number twelve, the issue tracker is open.
 
 ---

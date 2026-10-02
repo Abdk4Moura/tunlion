@@ -1,7 +1,7 @@
 # Filament Showcase (R2-backed, isolated from the app)
 
 A public "dev-effort + reels" showcase served at
-**https://filament.autumated.com/showcase/** — a dark/mono build-log page with
+**https://tunlion.autumated.com/showcase/** — a dark/mono build-log page with
 the session's reels (web-shell, native shell, tile-interaction v2, annotator,
 mobile keys + ⌘K, live pairing) embedded as real evidence, plus the GPU
 job-runner contact sheet.
@@ -9,9 +9,9 @@ job-runner contact sheet.
 ## Why this is safe (the whole point)
 
 The main app (`filament` Worker, the SPA) is bound to the **entire hostname**
-`filament.autumated.com` via a Worker **Custom Domain**. This showcase is a
+`tunlion.autumated.com` via a Worker **Custom Domain**. This showcase is a
 **separate** Worker (`filament-showcase`) attached to a more-specific **zone
-route** `filament.autumated.com/showcase/*`. Cloudflare resolves the
+route** `tunlion.autumated.com/showcase/*`. Cloudflare resolves the
 more-specific path route ahead of the catch-all Custom Domain, so:
 
 - `GET /` and everything else → main `filament` app (untouched).
@@ -27,7 +27,7 @@ cost, no big mp4s in git or in the app build.
 | --- | --- |
 | Showcase Worker | `showcase/` (`src/index.ts`, `wrangler.jsonc`) |
 | R2 bucket | `filament-showcase` (account R2) |
-| Route | `filament.autumated.com/showcase/*` (zone `autumated.com`) |
+| Route | `tunlion.autumated.com/showcase/*` (zone `autumated.com`) |
 | Publish script | `scripts/publish-showcase.sh` |
 
 The Worker maps `GET /showcase/<path>` → R2 object `<path>`, serves
@@ -83,7 +83,7 @@ cd showcase && CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=… npx wrangler d
 ## Verify
 
 ```bash
-curl -sI https://filament.autumated.com/showcase/                 # 200 text/html
-curl -sI https://filament.autumated.com/showcase/reel1-webshell.mp4   # 200 video/mp4
-curl -sI https://filament.autumated.com/                          # 200 — app SPA, untouched
+curl -sI https://tunlion.autumated.com/showcase/                 # 200 text/html
+curl -sI https://tunlion.autumated.com/showcase/reel1-webshell.mp4   # 200 video/mp4
+curl -sI https://tunlion.autumated.com/                          # 200 — app SPA, untouched
 ```

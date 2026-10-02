@@ -7,8 +7,8 @@
 
 ```yaml
 name: "Filament"
-website_url: "https://filament.autumated.com"
-source_code_url: "https://github.com/Abdk4Moura/filament"
+website_url: "https://tunlion.autumated.com"
+source_code_url: "https://github.com/Abdk4Moura/tunlion"
 description: "Browser-to-browser P2P file transfer (WebRTC) with automatic same-network discovery, one-time pairing codes, resumable transfers, and visible routing (LAN/P2P/relay)."
 licenses:
   - MIT

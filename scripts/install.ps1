@@ -1,12 +1,12 @@
-# filament installer (Windows) — https://filament.autumated.com/install.ps1
+# filament installer (Windows) — https://tunlion.autumated.com/install.ps1
 #
-#   irm https://filament.autumated.com/install.ps1 | iex
+#   irm https://tunlion.autumated.com/install.ps1 | iex
 #
 # Detects your platform, downloads the latest release .zip from GitHub, verifies
 # its SHA-256 against the release's SHA256SUMS, and installs filament.exe (with
 # the bundled wintun.dll) to %LOCALAPPDATA%\Programs\filament, adding it to your
 # user PATH. Override the location with $env:FILAMENT_INSTALL_DIR. No admin, no
-# telemetry. Source: scripts/install.ps1 in https://github.com/Abdk4Moura/filament
+# telemetry. Source: scripts/install.ps1 in https://github.com/Abdk4Moura/tunlion
 #
 # Prefer a package manager? `winget install Abdk4Moura.Filament` works too.
 
@@ -111,4 +111,4 @@ if (($userPath -split ';') -notcontains $InstallDir) {
 
 Say ''
 Say 'try it:   filament send <file> --code'
-Say '          (the other end can be a terminal — or any browser at https://filament.autumated.com)'
+Say '          (the other end can be a terminal — or any browser at https://tunlion.autumated.com)'

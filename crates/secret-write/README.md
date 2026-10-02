@@ -11,7 +11,7 @@ private keys and tokens the same way.
 
 Pure `std` (plus `std::process::Command` for the Windows ACL path) — no `windows`
 crate, no async runtime, no app coupling. Extracted from
-[filament](https://github.com/Abdk4Moura/filament) so its trust crates share one
+[filament](https://github.com/Abdk4Moura/tunlion) so its trust crates share one
 byte-identical secret writer.
 
 ## Usage

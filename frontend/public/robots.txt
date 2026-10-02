@@ -1,3 +1,3 @@
 User-agent: *
 Allow: /
-Sitemap: https://filament.autumated.com/sitemap.xml
+Sitemap: https://tunlion.autumated.com/sitemap.xml

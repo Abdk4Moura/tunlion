@@ -2,8 +2,8 @@
 
 Everything below is final and meant to be pasted as-is. The HN and Reddit
 sections contain no em dashes on purpose. CLI is at v0.2.0 stable with a
-v0.2.1-beta available. Product: https://filament.autumated.com ·
-Source: https://github.com/Abdk4Moura/filament
+v0.2.1-beta available. Product: https://tunlion.autumated.com ·
+Source: https://github.com/Abdk4Moura/tunlion
 
 ---
 
@@ -18,7 +18,7 @@ Show HN: Filament - P2P file sharing that shows the route your bytes take
 **URL field:**
 
 ```
-https://filament.autumated.com
+https://tunlion.autumated.com
 ```
 
 **Text field (paste as-is):**
@@ -59,7 +59,7 @@ stored (that is the point, but it means no async drop). Resume needs the
 sender's tab to stay alive, since browsers revoke file handles on reload. And
 iOS Safari backgrounding is still the hardest environment.
 
-Code: https://github.com/Abdk4Moura/filament
+Code: https://github.com/Abdk4Moura/tunlion
 
 **First comment (post this yourself right after submitting):**
 
@@ -132,8 +132,8 @@ Honest limits: both ends must be online (nothing is stored, by design), and
 resume needs the sender's tab alive, since a page reload revokes browser file
 handles.
 
-Live instance: https://filament.autumated.com
-Code plus deploy guide: https://github.com/Abdk4Moura/filament
+Live instance: https://tunlion.autumated.com
+Code plus deploy guide: https://github.com/Abdk4Moura/tunlion
 
 Happy to answer anything about the WebRTC failure modes. That turned out to be
 the real project.
@@ -151,12 +151,12 @@ Filament
 **URL:**
 
 ```
-https://filament.autumated.com
+https://tunlion.autumated.com
 ```
 
 **Category:** File Sharing / File Transfer
 
-**License:** Open Source (MIT) · https://github.com/Abdk4Moura/filament
+**License:** Open Source (MIT) · https://github.com/Abdk4Moura/tunlion
 
 **Platforms:** Web (any browser: Android, iPhone, Mac, Windows, Linux). Native
 CLI on Linux, macOS, and Windows.
@@ -208,18 +208,18 @@ No registration · No file size limit · Peer-to-peer · End-to-end encrypted tr
 
 ## 4. Google Search Console checklist
 
-Property is for **filament.autumated.com** (the product site). Note the blog
+Property is for **tunlion.autumated.com** (the product site). Note the blog
 lives on a **different domain**, abdk4moura.github.io, so it needs its own
 property if you want the blog post indexed there.
 
-- [ ] Add the property for `filament.autumated.com`. Easiest path: Domain
+- [ ] Add the property for `tunlion.autumated.com`. Easiest path: Domain
       property via a DNS TXT record in Cloudflare (covers all subdomains). The
       HTML-file method also works since the site is served by the CF Worker/Pages,
       but DNS is cleaner here.
 - [ ] Submit the sitemap. It already exists and is referenced by robots.txt:
-      `https://filament.autumated.com/sitemap.xml` (lists `/`, `/about`, `/faq`).
+      `https://tunlion.autumated.com/sitemap.xml` (lists `/`, `/about`, `/faq`).
       No action needed beyond submitting it in Search Console.
-- [ ] Request indexing for `https://filament.autumated.com/` (URL Inspection
+- [ ] Request indexing for `https://tunlion.autumated.com/` (URL Inspection
       tool, then "Request indexing").
 - [ ] For the blog deep-dive
       (`https://abdk4moura.github.io/post.html?post=webrtc-file-transfer-failures.md`),

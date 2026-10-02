@@ -6,7 +6,7 @@ human-readable code. Two devices that both type the same few words derive the sa
 nothing, and cannot silently substitute their own transport identity.
 
 This is the pairing core (L1) of
-[filament](https://github.com/Abdk4Moura/filament) — the same implementation runs
+[filament](https://github.com/Abdk4Moura/tunlion) — the same implementation runs
 native and in the browser (wasm32).
 
 ## What's inside

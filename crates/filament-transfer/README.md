@@ -3,7 +3,7 @@
 Out-of-order chunk reassembly and short-write-safe positional writes, with no
 opinion about how a peer was found, authenticated, or displayed.
 
-Carved out of the [filament](https://github.com/Abdk4Moura/filament) CLI so the
+Carved out of the [filament](https://github.com/Abdk4Moura/tunlion) CLI so the
 mechanics are usable on their own. Zero dependencies beyond `std`.
 
 ```rust

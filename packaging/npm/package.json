@@ -1,7 +1,7 @@
 {
   "name": "@abdk4moura/filament-cli",
   "version": "0.0.0",
-  "description": "Send files and reach your devices, peer to peer — no upload, no account. The CLI for filament.autumated.com.",
+  "description": "Send files and reach your devices, peer to peer — no upload, no account. The CLI for tunlion.autumated.com.",
   "bin": {
     "filament": "bin/filament.js"
   },
@@ -25,10 +25,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Abdk4Moura/filament.git"
+    "url": "git+https://github.com/Abdk4Moura/tunlion.git"
   },
-  "homepage": "https://filament.autumated.com",
-  "bugs": "https://github.com/Abdk4Moura/filament/issues",
+  "homepage": "https://tunlion.autumated.com",
+  "bugs": "https://github.com/Abdk4Moura/tunlion/issues",
   "license": "MIT",
   "engines": {
     "node": ">=16"

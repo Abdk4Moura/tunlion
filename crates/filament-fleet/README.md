@@ -4,7 +4,7 @@ Same-owner device auto-mesh: devices certified by **one owner key** find each
 other on a rendezvous channel and admit each other on that **certificate**,
 never on presence.
 
-Carved out of the [filament](https://github.com/Abdk4Moura/filament) CLI.
+Carved out of the [filament](https://github.com/Abdk4Moura/tunlion) CLI.
 
 The channel is a meeting point and nothing more. Anyone who learns its id can see
 that devices are there, and none of them can be admitted, because admission

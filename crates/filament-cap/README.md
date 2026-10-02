@@ -9,7 +9,7 @@ and the current time; it never phones home. Delegated principals are bounded by 
 ceiling (the intersection of what they were granted and what the delegator holds),
 so a delegate can never exceed its delegator.
 
-This is the authorization core of [filament](https://github.com/Abdk4Moura/filament),
+This is the authorization core of [filament](https://github.com/Abdk4Moura/tunlion),
 extracted so it can be audited and reused on its own.
 
 ## What's inside
