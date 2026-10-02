@@ -24,6 +24,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// How long the event loop will wait for one `establish_as` before abandoning it.
+/// Generous against a slow signalling server and a slow ICE setup, and still far
+/// below any human's patience: the point is that the ceiling EXISTS, not its value.
+/// See #350 -- an unbounded await here is reachable by any peer that can start an
+/// enrolment, which makes it a denial of service rather than a slow path.
+const ESTABLISH_BUDGET: Duration = Duration::from_secs(45);
+
+
 /// Store the certificates a join acknowledgement carried, and return the name.
 ///
 /// ONE of these. There were two, `persist_join_ack` and `persist_join_ack_v2`,
@@ -305,7 +313,35 @@ pub(crate) async fn enroll_cmd(
                         && !conn.direct_pending.contains_key(&pid)
                     {
                         conn.roster.insert(pid.clone(), v.clone());
-                        conn.establish_as(v.clone(), Some(false)).await?;
+                        // BOUNDED, because this is the event loop. `establish_as`
+                        // is awaited by the only handler for Signal, DirectReady,
+                        // ChannelReady and Control, so while it runs no signalling
+                        // reaches anyone. It returns promptly today -- its last act
+                        // is the ESTABLISH trace, after the link is inserted -- but
+                        // "promptly" is a property of what it happens to await
+                        // (`fetch_config`, an HTTP round trip, and `Peer::connect`,
+                        // which ends in a socket.io emit), not something this code
+                        // enforces. A peer that can start an enrolment must not be
+                        // able to hold the loop, so bound it and say so when the
+                        // bound fires (#350): a timeout that reports beats silence.
+                        match tokio::time::timeout(
+                            ESTABLISH_BUDGET,
+                            conn.establish_as(v.clone(), Some(false)),
+                        )
+                        .await
+                        {
+                            // Propagate a real establish error exactly as `?` did
+                            // before the bound was added. Only the TIMEOUT arm is
+                            // new behaviour.
+                            Ok(result) => result?,
+                            Err(_) => {
+                                ui::say(&format!(
+                                    "filament: establish for '{pid}' exceeded {}s and was abandoned; the event loop was released (#350)",
+                                    ESTABLISH_BUDGET.as_secs()
+                                ));
+                                continue;
+                            }
+                        }
                         if conn.active.is_none() {
                             conn.active = Some(pid);
                         }
@@ -542,7 +578,35 @@ pub(crate) async fn enroll_and_send_cmd(
                         && !conn.direct_pending.contains_key(&pid)
                     {
                         conn.roster.insert(pid.clone(), v.clone());
-                        conn.establish_as(v.clone(), Some(false)).await?;
+                        // BOUNDED, because this is the event loop. `establish_as`
+                        // is awaited by the only handler for Signal, DirectReady,
+                        // ChannelReady and Control, so while it runs no signalling
+                        // reaches anyone. It returns promptly today -- its last act
+                        // is the ESTABLISH trace, after the link is inserted -- but
+                        // "promptly" is a property of what it happens to await
+                        // (`fetch_config`, an HTTP round trip, and `Peer::connect`,
+                        // which ends in a socket.io emit), not something this code
+                        // enforces. A peer that can start an enrolment must not be
+                        // able to hold the loop, so bound it and say so when the
+                        // bound fires (#350): a timeout that reports beats silence.
+                        match tokio::time::timeout(
+                            ESTABLISH_BUDGET,
+                            conn.establish_as(v.clone(), Some(false)),
+                        )
+                        .await
+                        {
+                            // Propagate a real establish error exactly as `?` did
+                            // before the bound was added. Only the TIMEOUT arm is
+                            // new behaviour.
+                            Ok(result) => result?,
+                            Err(_) => {
+                                ui::say(&format!(
+                                    "filament: establish for '{pid}' exceeded {}s and was abandoned; the event loop was released (#350)",
+                                    ESTABLISH_BUDGET.as_secs()
+                                ));
+                                continue;
+                            }
+                        }
                         if conn.active.is_none() {
                             conn.active = Some(pid);
                         }
