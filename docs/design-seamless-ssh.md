@@ -106,7 +106,7 @@ Bootstrap, acceptor side (new `Ev::Control` arm in `up`, next to `l2-open`,
 
 ## filament-managed ssh material (never touches `~/.ssh`)
 
-Under the tunlion config dir (`FILAMENT_CONFIG_DIR`, default `~/.config/tunlion`):
+Under the tunlion config dir (`FILAMENT_CONFIG_DIR`, default `~/.config/filament`):
 
 - `ssh/id_ed25519` + `ssh/id_ed25519.pub` — managed keypair, generated on demand
   via `ssh-keygen -t ed25519 -N "" -C filament-managed`, `0600`. NEVER the user's

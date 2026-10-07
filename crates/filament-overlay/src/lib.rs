@@ -36,8 +36,8 @@ const PREFIX_LEN: u8 = 48;
 
 /// Domain-separation tags so a hash/signature here can never be mistaken for one
 /// from another tunlion protocol (or a future overlay version).
-const ADDR_DOMAIN: &[u8] = b"tunlion/overlay-addr/v1\0";
-const BIND_DOMAIN: &[u8] = b"tunlion/overlay-bind/v1\0";
+const ADDR_DOMAIN: &[u8] = b"filament/overlay-addr/v1\0";
+const BIND_DOMAIN: &[u8] = b"filament/overlay-bind/v1\0";
 
 /// The overlay prefix as a `<addr>/48` string for route installation.
 pub fn prefix_cidr() -> String {
@@ -79,7 +79,7 @@ const V4_PREFIX_LEN: u8 = 15;
 /// Low 17 bits = the host part of a `/15`.
 const V4_HOST_MASK: u32 = 0x0001_FFFF;
 /// Domain tag for the v4 host derivation, distinct from the v6 addr tag.
-const ADDR_V4_DOMAIN: &[u8] = b"tunlion/overlay-v4-addr/v1\0";
+const ADDR_V4_DOMAIN: &[u8] = b"filament/overlay-v4-addr/v1\0";
 
 /// The v4 overlay prefix as a CIDR string for route installation.
 pub fn prefix_v4_cidr() -> String {

@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 
 /// `{config_dir}/control.sock`, honoring FILAMENT_CONFIG_DIR (hermetic tests),
-/// else `~/.config/tunlion`. Mirrors `devices_path()` / `pidfile()`. Portable
+/// else `~/.config/filament`. Mirrors `devices_path()` / `pidfile()`. Portable
 /// (just path math); only used on unix where the socket is actually bound.
 pub fn control_sock_path() -> PathBuf {
     crate::platform::Paths::config_path("control.sock")

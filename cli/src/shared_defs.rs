@@ -159,12 +159,12 @@ pub(crate) const REQUEST_TTL_SECS: u64 = 3600;
 /// daemon is not a managed service (a foreground `up`, no systemd) falls back
 /// to a plain kill.
 /// Which systemd manager owns a daemon pid, if any. Two units can share the
-/// name `tunlion.service` (a system unit and a per-user unit under Linger),
+/// name `filament.service` (a system unit and a per-user unit under Linger),
 /// so the cgroup's SCOPE, not the unit name, decides which manager to ask:
-///   system unit:  /system.slice/tunlion.service
-///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/tunlion.service
-/// The unit name is matched as a cgroup segment (`/tunlion.service`), never as
-/// a substring, so a neighbouring unit (`my-tunlion.service`) cannot collide.
+///   system unit:  /system.slice/filament.service
+///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/filament.service
+/// The unit name is matched as a cgroup segment (`/filament.service`), never as
+/// a substring, so a neighbouring unit (`my-filament.service`) cannot collide.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ServiceManager {
     SystemdSystem,

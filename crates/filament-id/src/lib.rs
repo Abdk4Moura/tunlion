@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 use std::path::{Path, PathBuf};
 
 pub const CERT_TTL_SECS: u64 = 90 * 24 * 3600;
-const CERT_SIGN_DOMAIN: &[u8] = b"tunlion/identity-device-cert/v1";
+const CERT_SIGN_DOMAIN: &[u8] = b"filament/identity-device-cert/v1";
 const RECOVERY_KEY_DOMAIN: &[u8] = b"tunlion/user-identity/recovery/v1";
 const RECOVERY_SEED_PREFIX: &[u8] = b"filament-id-seed-v1\0";
 
@@ -276,7 +276,7 @@ pub struct RosterDevice {
     pub petname: String,
 }
 
-pub const ROSTER_SIGN_DOMAIN: &[u8] = b"tunlion/mesh-roster/v1";
+pub const ROSTER_SIGN_DOMAIN: &[u8] = b"filament/mesh-roster/v1";
 
 impl MeshRoster {
     /// Deterministic signing bytes: domain, owner_pub, epoch, valid_until, then
@@ -903,7 +903,7 @@ mod tests {
         let canonical = cert.canonical_for_signing();
         let flipped_scope_cert_canonical_user = {
             let mut v = Vec::new();
-            v.extend_from_slice(b"tunlion/identity-device-cert/v1");
+            v.extend_from_slice(b"filament/identity-device-cert/v1");
             v.extend_from_slice(&cert.device_pub);
             v.extend_from_slice(&cert.user_pub);
             v.extend_from_slice(&cert.expires.to_le_bytes());
@@ -913,7 +913,7 @@ mod tests {
         };
         let flipped_scope_cert_canonical_device = {
             let mut v = Vec::new();
-            v.extend_from_slice(b"tunlion/identity-device-cert/v1");
+            v.extend_from_slice(b"filament/identity-device-cert/v1");
             v.extend_from_slice(&cert.device_pub);
             v.extend_from_slice(&cert.user_pub);
             v.extend_from_slice(&cert.expires.to_le_bytes());

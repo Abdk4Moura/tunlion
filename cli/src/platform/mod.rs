@@ -5,9 +5,9 @@ use anyhow::Result;
 /// Platform-specific paths for the tunlion CLI.
 ///
 /// Uses the `directories` crate for proper OS placement:
-/// - Linux:   `$XDG_CONFIG_HOME/tunlion` (falls back to `$HOME/.config/tunlion`)
-/// - macOS:   `$HOME/Library/Application Support/tunlion`
-/// - Windows: `%APPDATA%/tunlion`
+/// - Linux:   `$XDG_CONFIG_HOME/filament` (falls back to `$HOME/.config/filament`)
+/// - macOS:   `$HOME/Library/Application Support/filament`
+/// - Windows: `%APPDATA%/filament`
 ///
 /// All paths honor `FILAMENT_CONFIG_DIR` as an override (hermetic tests,
 /// custom deployments).
@@ -16,7 +16,7 @@ pub struct Paths;
 impl Paths {
     /// Config directory root.
     ///
-    /// On first access, checks for legacy `./.config/tunlion` (cwd-relative,
+    /// On first access, checks for legacy `./.config/filament` (cwd-relative,
     /// the broken Windows fallback when HOME was unset) and migrates contents
     /// to the platform-correct path.
     pub fn config_dir() -> PathBuf {
@@ -27,12 +27,29 @@ impl Paths {
     }
 
     fn platform_config_dir() -> PathBuf {
+        // THE DIRECTORY NAME STAYS `filament` ACROSS THE RENAME, and that is
+        // deliberate rather than an oversight. This path holds the user key, the
+        // device certificate, devices.json and the capability store: everything
+        // that makes an install *this* install. Renaming it would present every
+        // existing user with a machine that has forgotten its identity, every
+        // pairing, and every grant, with no error message -- it would simply look
+        // like a fresh install. A brand is not worth that, and a migration that
+        // moves live secrets is a worse risk than a directory with the old name.
+        //
+        // The new name is honoured when it is ALREADY the one in use, so anyone
+        // who starts fresh after the rename lands on `tunlion` and keeps it.
         if let Some(proj) = directories::ProjectDirs::from("", "", "tunlion") {
+            let new_dir = proj.config_dir().to_path_buf();
+            if new_dir.exists() {
+                return new_dir;
+            }
+        }
+        if let Some(proj) = directories::ProjectDirs::from("", "", "filament") {
             return proj.config_dir().to_path_buf();
         }
         // #184: route through home_dir() (USERPROFILE on Windows) instead of a
         // bare HOME read that falls back to "." on Windows.
-        Self::home_dir().join(".config").join("tunlion")
+        Self::home_dir().join(".config").join("filament")
     }
 
     /// Resolve a config-relative path (file or subdirectory).
@@ -70,18 +87,18 @@ impl Paths {
         Ok(repaired)
     }
 
-    /// Migrate state from a legacy `$HOME/.config/tunlion` directory (the
+    /// Migrate state from a legacy `$HOME/.config/filament` directory (the
     /// broken Windows fallback when HOME was unset, which resolved relative to
     /// the process cwd). Best-effort, safe to call repeatedly.
     ///
     /// Two guards, both earned:
     /// 1. An explicit FILAMENT_CONFIG_DIR override means the caller knows where
     ///    their config lives; migrating INTO it would copy whatever a
-    ///    cwd-relative ".config/tunlion" resolves to — the production identity
+    ///    cwd-relative ".config/filament" resolves to — the production identity
     ///    when the shell's cwd is $HOME (issue #149, a key clone). Never
     ///    migrate under an override.
     /// 2. The legacy location is pinned to home_dir(), not the process cwd.
-    ///    "./.config/tunlion" names a different directory in every process;
+    ///    "./.config/filament" names a different directory in every process;
     ///    with the default shell cwd of $HOME it was indistinguishable from the
     ///    live production config, which is exactly what let the override case
     ///    clone keys. When HOME is unset, home_dir() falls back to ".", which
@@ -90,7 +107,7 @@ impl Paths {
         if std::env::var_os("FILAMENT_CONFIG_DIR").is_some() {
             return;
         }
-        let legacy = Self::home_dir().join(".config").join("tunlion");
+        let legacy = Self::home_dir().join(".config").join("filament");
         if !legacy.is_dir() {
             return;
         }
@@ -522,7 +539,7 @@ impl ServiceHost {
         match self {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
-                let unit = std::path::Path::new("/etc/systemd/system/tunlion.service");
+                let unit = std::path::Path::new("/etc/systemd/system/filament.service");
                 std::fs::write(unit, format!(
                     "[Unit]\nDescription=Tunlion drop target\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=multi-user.target\n",
                     exe.display(), shell_args
@@ -547,7 +564,7 @@ impl ServiceHost {
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
-                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.tunlion.plist");
+                let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.filament.plist");
                 std::fs::write(plist, format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -778,7 +795,7 @@ fn install_systemd_user(exe: &Path, shell_args: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
-    let unit = unit_dir.join("tunlion.service");
+    let unit = unit_dir.join("filament.service");
     std::fs::write(&unit, format!(
         "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
         exe.display(), shell_args
@@ -844,7 +861,7 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = PathBuf::from(&home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir)?;
-    let plist = dir.join("autumated.tunlion.plist");
+    let plist = dir.join("autumated.filament.plist");
     std::fs::write(&plist, format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1270,8 +1287,8 @@ mod tests {
 
     /// Regression for #149: setting FILAMENT_CONFIG_DIR to a fresh path from a
     /// shell whose cwd is $HOME must NOT migrate the production identity into
-    /// it. Before the fix, `.config/tunlion` (cwd-relative) resolved to
-    /// $HOME/.config/tunlion, the live production config, and the migration
+    /// it. Before the fix, `.config/filament` (cwd-relative) resolved to
+    /// $HOME/.config/filament, the live production config, and the migration
     /// copied it wholesale into the override: a key clone.
     #[cfg(unix)]
     #[test]
@@ -1279,7 +1296,7 @@ mod tests {
         let uid = format!("{}-cfgdir-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         let work = std::env::temp_dir().join(format!("fil-cfg-{uid}"));
         let home = work.join("home");
-        let legacy = home.join(".config").join("tunlion");
+        let legacy = home.join(".config").join("filament");
         let target = work.join("target");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("identity.ed25519"), b"production key").unwrap();

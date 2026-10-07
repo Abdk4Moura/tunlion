@@ -347,7 +347,7 @@ fn phase_from_label(s: &str) -> Option<Phase> {
 }
 
 /// Read the local diag JSONL and digest the most recent `limit` terminal spans.
-/// Reads from `{FILAMENT_CONFIG_DIR else ~/.config/tunlion}/diag.jsonl`. A
+/// Reads from `{FILAMENT_CONFIG_DIR else ~/.config/filament}/diag.jsonl`. A
 /// missing/empty file yields an all-zero `Summary` (a fresh install with no
 /// history, not an error).
 pub fn summarize(limit: usize) -> Summary {

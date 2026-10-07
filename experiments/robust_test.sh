@@ -18,7 +18,7 @@ for c in glob.glob('/proc/[0-9]*/cmdline'):
         try: os.kill(pid, 9)
         except Exception: pass
 PY
-  rm -f /root/.config/tunlion/*.lock /root/.config/tunlion/daemon.* /root/.config/tunlion/up.pid 2>/dev/null
+  rm -f /root/.config/filament/*.lock /root/.config/filament/daemon.* /root/.config/filament/up.pid 2>/dev/null
 }
 
 rebuild() {
@@ -68,7 +68,7 @@ POP="tailscale ssh agboola@pop-os"
 # -x: match the process NAME only. A -f pattern would match the tailscale ssh
 # wrapper's own embedded command line and kill the session mid-flight (255).
 pop_up_restart() {
-  $POP "bash -c 'pkill -9 -x tunlion; sleep 1; rm -f /tmp/fil-up.log \$HOME/.config/tunlion/*.lock; setsid nohup env FILAMENT_L2=1 \$HOME/.local/bin/tunlion up >/tmp/fil-up.log 2>&1 </dev/null & sleep 5; pgrep -x tunlion | wc -l'" 2>/dev/null | tail -1
+  $POP "bash -c 'pkill -9 -x tunlion; sleep 1; rm -f /tmp/fil-up.log \$HOME/.config/filament/*.lock; setsid nohup env FILAMENT_L2=1 \$HOME/.local/bin/tunlion up >/tmp/fil-up.log 2>&1 </dev/null & sleep 5; pgrep -x tunlion | wc -l'" 2>/dev/null | tail -1
 }
 
 pop_up_kill() {

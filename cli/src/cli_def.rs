@@ -455,7 +455,7 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: Option<IdAction>,
     },
-    /// Raw config escape hatch (key value lines in ~/.config/tunlion/config).
+    /// Raw config escape hatch (key value lines in ~/.config/filament/config).
     /// Prefer `tunlion set`; this is kept for scripts that wrote it directly.
     #[command(hide = true)]
     Config {

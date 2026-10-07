@@ -105,7 +105,7 @@ sealed delivery**, and (c) **claim-link keys** for non-users.
 
 ### 1.2 Deny-by-default capabilities (the ACL substrate)
 
-- `cli/src/main.rs` — device records in `~/.config/tunlion/devices.json` carry
+- `cli/src/main.rs` — device records in `~/.config/filament/devices.json` carry
   `{name, secret, v:2, caps:[...], addedAt}` (`devices_store_v2()`). First pairing
   grants **only** `["transfer"]` (`pair_v2_caps()`, mirrored in
   `frontend/src/lib/pairing.js` as `PAIR_V2_CAPS`). `device_allows(name, cap)` is

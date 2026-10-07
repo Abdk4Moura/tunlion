@@ -211,7 +211,7 @@ def cbor_decode(buf: bytes) -> tuple[object, int]:
 # fdf1 overlay address derivation (crates/filament-overlay/src/lib.rs)
 # --------------------------------------------------------------------------
 
-ADDR_DOMAIN = b"tunlion/overlay-addr/v1\0"
+ADDR_DOMAIN = b"filament/overlay-addr/v1\0"
 ADDR_PREFIX = bytes([0xFD, 0xF1, 0x1A, 0xF7, 0xC3, 0x0D])
 
 

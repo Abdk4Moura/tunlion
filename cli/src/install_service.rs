@@ -22,7 +22,7 @@ use anyhow::bail;
 /// the binary. That is what kills the recurring sudo: a file cap is lost when
 /// `tunlion update` replaces the binary, but an ambient cap is granted afresh by
 /// systemd on every (re)start, so updates never need `setcap` (hence never a
-/// password). Writes `/etc/systemd/system/tunlion.service`, drops any stale file
+/// password). Writes `/etc/systemd/system/filament.service`, drops any stale file
 /// cap, retires a pre-existing --user service, and enables it, using ONE `sudo` for
 /// the privileged steps (a single interactive prompt, NOT a per-update one). If it
 /// cannot elevate, it prints the exact unit + commands to run by hand.
@@ -72,7 +72,7 @@ pub(crate) fn install_system_service(
          [Install]\n\
          WantedBy=multi-user.target\n"
     );
-    let unit_path = "/etc/systemd/system/tunlion.service";
+    let unit_path = "/etc/systemd/system/filament.service";
     let am_root = unsafe { libc::geteuid() } == 0;
     // Run a privileged command, using sudo only when not already root.
     let run_priv = |args: &[&str]| -> bool {
@@ -97,7 +97,7 @@ pub(crate) fn install_system_service(
     }
     // Write the unit as root by PIPING it to `tee` under the privileged runner.
     // Deliberately NO on-disk staging: a predictable, world-writable temp file
-    // (e.g. /tmp/tunlion.service.tmp) is a TOCTOU - another local user could
+    // (e.g. /tmp/filament.service.tmp) is a TOCTOU - another local user could
     // swap or symlink it between our write and the privileged copy, yielding an
     // attacker-controlled ROOT-owned systemd unit (root code execution). Piping to
     // `tee` has no intermediary to race; sudo still reads its password from the tty,

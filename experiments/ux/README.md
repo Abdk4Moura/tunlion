@@ -22,7 +22,7 @@ The harness is **self-safe**: every `tunlion` call points at a throwaway
 (base 8071+, skipping ports other tenants own) and carries the marker
 `FIL_UX_RIG=1`, and teardown kills **only** processes this harness started
 (tracked children + backends bearing that marker). The user's real
-`~/.config/tunlion`, their running `tunlion up` daemon, the Vite dev servers on
+`~/.config/filament`, their running `tunlion up` daemon, the Vite dev servers on
 5180/5181, and a gallery server on 8095 are never touched.
 
 ## Run it

@@ -68,28 +68,40 @@ async function main() {
     console.error('Install another way: https://tunlion.autumated.com  or  cargo install filament-cli')
     process.exit(1)
   }
+  // Pre-rename releases ship `filament-<target>`; everything from the first
+  // post-rename release ships `tunlion-<target>`. Try the new name first and
+  // fall back, so `npm i -g` works against both and there is no window where
+  // the published package cannot install.
   const asset = `tunlion-${tgt.t}.${tgt.ext}`
+  const legacyAsset = `filament-${tgt.t}.${tgt.ext}`
   const base = `https://github.com/${REPO}/releases/download/${TAG}`
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tunlion-'))
   try {
-    const [bin, sums] = await Promise.all([get(`${base}/${asset}`), get(`${base}/SHA256SUMS`)])
+    const sums = await get(`${base}/SHA256SUMS`)
+    // Pick whichever asset this release actually published.
+    let name = sums.toString('utf8').includes(asset) ? asset : legacyAsset
+    const bin = await get(`${base}/${name}`)
 
     const got = crypto.createHash('sha256').update(bin).digest('hex').toLowerCase()
     const line = sums
       .toString('utf8')
       .split('\n')
-      .find((l) => l.includes(asset))
-    if (!line) throw new Error(`no checksum for ${asset} in SHA256SUMS`)
+      .find((l) => l.includes(name))
+    if (!line) throw new Error(`no checksum for ${name} in SHA256SUMS`)
     const want = line.trim().split(/\s+/)[0].toLowerCase()
     if (got !== want) throw new Error(`checksum mismatch (got ${got}, want ${want})`)
 
-    const archive = path.join(tmp, asset)
+    const archive = path.join(tmp, name)
     fs.writeFileSync(archive, bin)
     extract(archive, tmp, tgt.ext)
 
     const vendor = path.join(__dirname, '..', 'vendor')
     fs.mkdirSync(vendor, { recursive: true })
-    fs.copyFileSync(path.join(tmp, binaryName()), binaryPath())
+    const legacyBin = process.platform === 'win32' ? 'filament.exe' : 'filament'
+    const inner = fs.existsSync(path.join(tmp, binaryName()))
+      ? binaryName()
+      : legacyBin
+    fs.copyFileSync(path.join(tmp, inner), binaryPath())
     if (process.platform !== 'win32') fs.chmodSync(binaryPath(), 0o755)
     console.log(`tunlion: installed ${TAG} for ${tgt.t}`)
   } catch (e) {

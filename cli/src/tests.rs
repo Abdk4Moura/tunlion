@@ -2917,22 +2917,22 @@ fn descriptions_of_a_verb_do_not_contradict_each_other() {
 
 #[test]
 fn down_picks_the_right_systemd_manager_for_the_daemon_cgroup() {
-    // Two units can share the name tunlion.service (system + user under
+    // Two units can share the name filament.service (system + user under
     // Linger). down must ask the manager whose cgroup actually owns the
     // daemon, or it stops someone else's unit.
-    let system = "0::/system.slice/tunlion.service";
+    let system = "0::/system.slice/filament.service";
     assert_eq!(
         service_manager_for_cgroup(system),
         Some(ServiceManager::SystemdSystem)
     );
-    let user = "0::/user.slice/user-0.slice/user@0.service/app.slice/tunlion.service";
+    let user = "0::/user.slice/user-0.slice/user@0.service/app.slice/filament.service";
     assert_eq!(
         service_manager_for_cgroup(user),
         Some(ServiceManager::SystemdUser)
     );
     // A neighbouring unit name must not collide (the name is matched as a
     // cgroup segment, not a substring).
-    let neighbour = "0::/system.slice/my-tunlion.service";
+    let neighbour = "0::/system.slice/my-filament.service";
     assert_eq!(service_manager_for_cgroup(neighbour), None);
     // A detached foreground daemon is not a managed service at all.
     let detached = "0::/user.slice/user-0.slice/session-3.scope";

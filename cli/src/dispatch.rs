@@ -119,7 +119,7 @@ pub(crate) async fn async_main() -> Result<()> {
     // ordering-window probe fires here (and in the harness) but not in unit
     // tests that construct the window state deliberately.
     crate::capability::set_gate_live();
-    // Migrate state from legacy cwd-relative .config/tunlion (the broken
+    // Migrate state from legacy cwd-relative .config/filament (the broken
     // Windows fallback when HOME was unset) to the platform-correct path.
     platform::Paths::migrate_legacy();
     match platform::Paths::repair_sensitive_permissions() {
