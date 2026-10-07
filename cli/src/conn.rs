@@ -3863,17 +3863,24 @@ impl Conn {
                 return Ok(());
             }
             // A direct link that is STILL ALIVE is serving them; a peer offering
-            // WebRTC on top of it is belt-and-braces, not a stall, so leave the
-            // working transport alone. Only a dead or absent one is worth
-            // replacing -- that is the case where both ends are waiting.
-            let direct_alive = l
-                .transport
-                .as_ref()
-                .map(|t| t.is_alive())
-                .unwrap_or(false);
-            if direct_alive {
+            // WebRTC on top of it is belt-and-braces, not a stall, so the working
+            // transport is left alone.
+            //
+            // `transport: None` means STILL ESTABLISHING, not dead. The direct
+            // link is born with no transport and adopts one when the race is won
+            // (adopt_direct), so classifying None as dead tore down links that
+            // were mid-enrolment. That is what wedged `join --name bravo` in
+            // devices-write-race on the first version of this change, a gate that
+            // passes on main -- caught by running the control rather than by
+            // reasoning. Only a transport that EXISTS and reports not-alive is a
+            // corpse worth replacing.
+            let keep_direct = match l.transport.as_ref() {
+                Some(t) => t.is_alive(),
+                None => true,
+            };
+            if keep_direct {
                 ui::debug(&format!(
-                    "responder: {from} offered WebRTC but its direct link is alive; keeping the direct transport"
+                    "responder: keeping {from}'s direct link (alive, or still establishing); not rebuilding to answer its offer"
                 ));
                 return Ok(());
             }
