@@ -47,9 +47,7 @@ fn save(bindings: &[Binding]) -> Result<()> {
         std::fs::create_dir_all(d)?;
     }
     // Atomic replace so a concurrent daemon read never sees a half-written file.
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(bindings)?)?;
-    std::fs::rename(&tmp, &p)?;
+    crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(bindings)?)?;
     Ok(())
 }
 

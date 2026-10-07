@@ -76,9 +76,37 @@ impl SecretFile {
             f.write_all(data)?;
             f.sync_all()?;
         }
-        // Atomic rename over original
-        std::fs::rename(&temp, path)?;
-        // Best-effort: fsync parent dir for crash durability
+        // Atomic rename over original.
+        //
+        // WINDOWS NEEDS A RETRY and POSIX does not. On POSIX rename(2) onto an
+        // existing path is atomic and succeeds even while other processes hold
+        // the old inode open. On Windows the call fails outright if ANY handle
+        // is open on the destination, and a handle appears there routinely and
+        // briefly: the indexer, a virus scanner, or a reader that has not yet
+        // been dropped. The result is a write that looks like it landed and did
+        // not, which is how #349 presented -- a value not visible to the very
+        // next read, on Windows only, on the second write of a file rather than
+        // the first, because the first has no destination to replace.
+        //
+        // Bounded and short: five attempts over ~100ms, then surface the real
+        // error. This never loops on POSIX because the first attempt succeeds.
+        let mut last = match std::fs::rename(&temp, path) {
+            Ok(()) => return Self::fsync_parent(path),
+            Err(e) => e,
+        };
+        for backoff_ms in [5u64, 10, 25, 50] {
+            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+            match std::fs::rename(&temp, path) {
+                Ok(()) => return Self::fsync_parent(path),
+                Err(e) => last = e,
+            }
+        }
+        let _ = std::fs::remove_file(&temp);
+        return Err(last);
+    }
+
+    /// Best-effort parent-directory fsync, for crash durability of the rename.
+    fn fsync_parent(path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             if let Ok(dir) = std::fs::OpenOptions::new().read(true).open(parent) {
                 let _ = dir.sync_all();
