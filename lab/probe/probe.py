@@ -1,11 +1,11 @@
 """primitive 7 — probe: drive + measure across the tunnel.
 
 Runs traffic from one node to another's OVERLAY address and emits machine-readable
-(JSON) results, so the same probe is comparable across `pipe`/`wg`/`filament`.
+(JSON) results, so the same probe is comparable across `pipe`/`wg`/`tunlion`.
 
 Probes:
   ping  — reachability + RTT (parses ping summary). Retries, because the
-          filament carrier's data channel can take a few seconds to come up.
+          tunlion carrier's data channel can take a few seconds to come up.
   iperf3 — throughput: starts an iperf3 -s in the destination netns, runs the
           client in the source netns, returns the parsed JSON.
   curl  — application reachability: starts a tiny HTTP server in the dest netns,
@@ -41,7 +41,7 @@ def ping(ledger: Ledger, count: int = 5, retries: int = 8) -> Dict[str, Any]:
     ns = na["netns"]
     out = ""
     ok = False
-    # Retry: the filament data channel may need a few seconds post-up.
+    # Retry: the tunlion data channel may need a few seconds post-up.
     for attempt in range(retries):
         ok, out = netns.ping(ns, target, count=count)
         if ok:

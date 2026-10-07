@@ -30,7 +30,7 @@ STATE_FILE = os.environ.get(
     "MEMORY_MONITOR_STATE", os.path.expanduser("~/.cache/filament-memory-pressure.json")
 )
 ALERT_TO = os.environ.get("MONITOR_ALERT_TO", "pro.kaiserlautern@gmail.com")
-ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Filament Monitor <monitor@send.autumated.com>")
+ALERT_FROM = os.environ.get("MONITOR_ALERT_FROM", "Tunlion Monitor <monitor@send.autumated.com>")
 RESEND_KEY_FILE = os.environ.get("RESEND_KEY_FILE", os.path.expanduser("~/secret_keys/resend_api_key"))
 TIMEOUT = int(os.environ.get("MONITOR_TIMEOUT", "10"))
 AVAILABLE_LIMIT_MB = int(os.environ.get("MEMORY_AVAILABLE_LIMIT_MB", "1024"))
@@ -148,7 +148,7 @@ def main(snapshot_fn=None):
         state["since"] = now
         if was_pressured:
             sent, result = send_alert(
-                "[filament] memory pressure RECOVERED",
+                "[tunlion] memory pressure RECOVERED",
                 f"Memory pressure recovered at {utc(now)}.\n\n{snapshot}\n",
             )
             print(f"RESTORED alert sent={sent} {result}", file=sys.stderr)
@@ -167,7 +167,7 @@ def main(snapshot_fn=None):
     state["since"] = state.get("since", now) or now
     build = "cargo/rustc detected" if snapshot["build_running"] else "no cargo/rustc detected"
     sent, result = send_alert(
-        "[filament] sustained memory pressure",
+        "[tunlion] sustained memory pressure",
         f"Host memory pressure detected at {utc(now)} after {state['breaches']} consecutive checks.\n"
         f"MemAvailable={snapshot['available_mb']} MiB (limit {AVAILABLE_LIMIT_MB}), "
         f"SwapFree={snapshot['swap_free_mb']} MiB (limit {SWAP_FREE_LIMIT_MB}).\n"

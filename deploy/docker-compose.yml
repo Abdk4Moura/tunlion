@@ -1,4 +1,4 @@
-# Filament backend stack for the DigitalOcean droplet (shared box — stays small).
+# Tunlion backend stack for the DigitalOcean droplet (shared box — stays small).
 #   api        — Flask signaling (gunicorn+eventlet). NOT exposed to the host;
 #                only reachable inside this compose network.
 #   cloudflared— Cloudflare Tunnel: dials OUT to Cloudflare and routes

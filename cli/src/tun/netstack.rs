@@ -870,7 +870,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn build_echo_request(src: Ipv6Addr, dst: Ipv6Addr) -> Vec<u8> {
-        let echo = Icmpv6Repr::EchoRequest { ident: 0x1234, seq_no: 1, data: b"filament" };
+        let echo = Icmpv6Repr::EchoRequest { ident: 0x1234, seq_no: 1, data: b"tunlion" };
         let ipr = Ipv6Repr {
             src_addr: src,
             dst_addr: dst,
@@ -1188,7 +1188,7 @@ mod tests {
     }
 
     fn build_icmpv4_echo_request(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
-        let echo = Icmpv4Repr::EchoRequest { ident: 0x5678, seq_no: 1, data: b"filament" };
+        let echo = Icmpv4Repr::EchoRequest { ident: 0x5678, seq_no: 1, data: b"tunlion" };
         let ipr = Ipv4Repr {
             src_addr: src.into(),
             dst_addr: dst.into(),

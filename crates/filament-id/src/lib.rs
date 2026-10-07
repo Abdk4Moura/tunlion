@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const CERT_TTL_SECS: u64 = 90 * 24 * 3600;
 const CERT_SIGN_DOMAIN: &[u8] = b"filament/identity-device-cert/v1";
-const RECOVERY_KEY_DOMAIN: &[u8] = b"filament/user-identity/recovery/v1";
+const RECOVERY_KEY_DOMAIN: &[u8] = b"tunlion/user-identity/recovery/v1";
 const RECOVERY_SEED_PREFIX: &[u8] = b"filament-id-seed-v1\0";
 
 /// Host-provided key persistence, injected so this crate stays decoupled from

@@ -1,9 +1,9 @@
-// sshkeys, filament-managed ssh auth material for the seamless `filament ssh`
+// sshkeys, filament-managed ssh auth material for the seamless `tunlion ssh`
 // path (docs/design-seamless-ssh.md). NEVER touches the user's ~/.ssh.
 //
 // Two roles:
 //   * INITIATOR keeps an ephemeral managed keypair + a private known_hosts under
-//     the filament config dir. `filament ssh` points ssh at exactly these via
+//     the tunlion config dir. `tunlion ssh` points ssh at exactly these via
 //     -o IdentityFile / -o UserKnownHostsFile / -o IdentitiesOnly=yes, so a user
 //     with ZERO ssh setup connects with no prompts and no key copying.
 //   * ACCEPTOR installs an initiator's managed pubkey into its OWN
@@ -19,7 +19,7 @@ use secret_write::SecretFile;
 
 /// Directory holding the managed keypair + private known_hosts.
 ///
-/// `config_dir` is the filament config root, injected by the caller (the CLI
+/// `config_dir` is the tunlion config root, injected by the caller (the CLI
 /// passes `crate::settings::config_dir()`) so this crate has no coupling to the
 /// CLI's path resolution.
 fn ssh_dir(config_dir: &Path) -> PathBuf {
@@ -31,7 +31,7 @@ pub fn managed_key_path(config_dir: &Path) -> PathBuf {
     ssh_dir(config_dir).join("id_ed25519")
 }
 
-/// Filament-private known_hosts (pin store), never the user's.
+/// Tunlion-private known_hosts (pin store), never the user's.
 pub fn known_hosts_path(config_dir: &Path) -> PathBuf {
     ssh_dir(config_dir).join("known_hosts")
 }
@@ -61,7 +61,7 @@ pub fn ensure_managed_key(config_dir: &Path) -> Result<String> {
 
     if created_this_call {
         if let Some(dir) = key.parent() {
-            std::fs::create_dir_all(dir).context("create filament ssh dir")?;
+            std::fs::create_dir_all(dir).context("create tunlion ssh dir")?;
             chmod(dir, 0o700);
         }
         let st = std::process::Command::new("ssh-keygen")
@@ -171,7 +171,7 @@ pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
 }
 
 /// Remove `device`'s marked block from authorized_keys (the "removable" half of
-/// the audit story; used by `filament revoke`). No-op if absent.
+/// the audit story; used by `tunlion revoke`). No-op if absent.
 pub fn remove_authorized_key(device: &str) -> Result<()> {
     let path = authorized_keys_path();
     let Ok(existing) = std::fs::read_to_string(&path) else { return Ok(()) };
@@ -254,7 +254,7 @@ pub fn host_pubkeys() -> Vec<String> {
 pub fn pin_host_keys(config_dir: &Path, dest_token: &str, hostkeys: &[String]) -> Result<()> {
     let path = known_hosts_path(config_dir);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).context("create filament ssh dir")?;
+        std::fs::create_dir_all(dir).context("create tunlion ssh dir")?;
         chmod(dir, 0o700);
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -277,7 +277,7 @@ pub fn pin_host_keys(config_dir: &Path, dest_token: &str, hostkeys: &[String]) -
 }
 
 // ---- shell-bootstrap fast-path cache ---------------------------------------
-// A repeat `filament ssh <dev>` re-ran the full key/host-key/cap bootstrap every
+// A repeat `tunlion ssh <dev>` re-ran the full key/host-key/cap bootstrap every
 // time (a second establish before the data link). Once a device has been
 // bootstrapped its host keys are pinned, our key is installed, and the shell cap
 // was granted, so the next ssh can skip straight to the data link. The skip
@@ -288,7 +288,7 @@ fn bootstrap_cache_path(config_dir: &Path) -> PathBuf {
     ssh_dir(config_dir).join("bootstrap-cache.json")
 }
 
-/// How long a recorded bootstrap lets `filament ssh` skip the pre-flight (s).
+/// How long a recorded bootstrap lets `tunlion ssh` skip the pre-flight (s).
 /// 24h: repeat ssh stays instant across a working day. A stale skip self-heals,
 /// the ssh-layer 255 retry re-runs a fresh bootstrap, and a cache miss now rides
 /// the daemon's warm link anyway, so a longer window costs nothing.
@@ -328,7 +328,7 @@ pub fn bootstrap_cache_get(config_dir: &Path, device: &str) -> Option<Option<Str
     )
 }
 
-/// Record a successful bootstrap so the next `filament ssh` to `device` skips it.
+/// Record a successful bootstrap so the next `tunlion ssh` to `device` skips it.
 pub fn bootstrap_cache_put(config_dir: &Path, device: &str, user: Option<&str>) {
     let path = bootstrap_cache_path(config_dir);
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
@@ -358,7 +358,7 @@ mod tests {
     fn strip_block_removes_only_the_named_device() {
         let c = "ssh-rsa AAAAother user@host\n\
                  # BEGIN filament-managed boxA\n\
-                 ssh-ed25519 AAAAfilament filament-managed\n\
+                 ssh-ed25519 AAAAtunlion filament-managed\n\
                  # END filament-managed boxA\n\
                  ssh-ed25519 AAAAkeep keep@host\n";
         let out = strip_block(c, "boxA");

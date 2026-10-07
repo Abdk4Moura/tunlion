@@ -66,7 +66,7 @@ S2 is conditioned on rev_known, not on the global revoked flag, because a real
 device gates admission on its LOCAL record. So between `revoke` and
 `propagate_revoke` reaching a peer, that peer will still admit the revoked
 device. The model asserts that window closes (liveness) but does not pretend it
-does not exist. That window is revocation-propagation latency, which filament
+does not exist. That window is revocation-propagation latency, which tunlion
 already has; the fleet channel neither widens nor narrows it.
 """
 

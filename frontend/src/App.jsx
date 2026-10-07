@@ -1,29 +1,29 @@
-// App: wires the real useFilament() networking to the Filament UI.
-// The presentation lives in ui/Filament.jsx (ported from the Claude Design
+// App: wires the real useTunlion() networking to the Tunlion UI.
+// The presentation lives in ui/Tunlion.jsx (ported from the Claude Design
 // handoff); here we map its callback props to the hook's actions and carry a
 // small, persisted `ui` preference set (theme/accent/density/columns/font).
 
 import { useCallback, useEffect, useState } from 'react'
-import Filament from './ui/Filament.jsx'
-import { useFilament } from './lib/useFilament.js'
+import Tunlion from './ui/Tunlion.jsx'
+import { useTunlion } from './lib/useTunlion.js'
 
 const UI_DEFAULTS = { theme: 'dark', accent: 'green', density: 'airy', columns: 'auto', font: 'jetbrains' }
 
 function loadUiPrefs() {
   try {
-    return { ...UI_DEFAULTS, ...JSON.parse(localStorage.getItem('filament.ui') || '{}') }
+    return { ...UI_DEFAULTS, ...JSON.parse(localStorage.getItem('tunlion.ui') || '{}') }
   } catch {
     return { ...UI_DEFAULTS }
   }
 }
 
 export default function App() {
-  const qs = useFilament()
+  const qs = useTunlion()
   const [prefs, setPrefs] = useState(loadUiPrefs)
 
   useEffect(() => {
     try {
-      localStorage.setItem('filament.ui', JSON.stringify(prefs))
+      localStorage.setItem('tunlion.ui', JSON.stringify(prefs))
     } catch {}
   }, [prefs])
 
@@ -37,7 +37,7 @@ export default function App() {
   }, [qs.roomUrl])
 
   return (
-    <Filament
+    <Tunlion
       state={qs}
       ui={ui}
       onSendFiles={qs.sendFiles}

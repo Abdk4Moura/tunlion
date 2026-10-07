@@ -10,7 +10,7 @@
 //     at-most-once (no rebuild loop), partials/outgoing preserved (resume).
 //
 // To defend against the harness's faithful-copy of the hook handler drifting
-// from source, this spec ALSO asserts useFilament.js itself contains the
+// from source, this spec ALSO asserts useTunlion.js itself contains the
 // load-bearing onStall wiring (relayOnly guard, relayedRef at-most-once,
 // makeLinkRef({relayOnly:true})) and that webrtc.js threads iceTransportPolicy.
 //
@@ -47,7 +47,7 @@ function buildHarness() {
       // loader for, and iife has no `import.meta`, so the bundle failed and
       // then the component threw reading import.meta.env. Same-origin is
       // what a harness wants: an empty base keeps requests local.
-      '--loader:.wasm=file', '--define:import.meta.env={"VITE_FILAMENT_API":""}'],
+      '--loader:.wasm=file', '--define:import.meta.env={"VITE_TUNLION_API":""}'],
     { cwd: FRONT, encoding: 'utf8' });
   if (r.status !== 0) fail('esbuild harness bundle failed: ' + (r.stderr || r.stdout));
   return out;
@@ -65,7 +65,7 @@ function startServer(bundlePath) {
 
 // ---- source-level invariants (guard against harness/source drift) ----------
 function assertSource() {
-  const hook = fs.readFileSync(path.join(FRONT, 'src', 'lib', 'useFilament.js'), 'utf8');
+  const hook = fs.readFileSync(path.join(FRONT, 'src', 'lib', 'useTunlion.js'), 'utf8');
   const rtc = fs.readFileSync(path.join(FRONT, 'src', 'lib', 'webrtc.js'), 'utf8');
   const checks = [
     ['hook declares relayedRef', /relayedRef\s*=\s*useRef\(new Map\(\)\)/.test(hook)],

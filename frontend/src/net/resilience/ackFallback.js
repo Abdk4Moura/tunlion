@@ -71,14 +71,14 @@ export class AckFallbackController {
   markPeerAcks() {
     this._peerAckedThisLink = true
     try {
-      if (this.h.peerUid) localStorage.setItem('filamentPeerAcks:' + this.h.peerUid, '1')
+      if (this.h.peerUid) localStorage.setItem('tunlionPeerAcks:' + this.h.peerUid, '1')
     } catch {}
   }
 
   peerAcks() {
     if (this._peerAckedThisLink) return true
     try {
-      if (this.h.peerUid) return localStorage.getItem('filamentPeerAcks:' + this.h.peerUid) === '1'
+      if (this.h.peerUid) return localStorage.getItem('tunlionPeerAcks:' + this.h.peerUid) === '1'
     } catch {}
     return false
   }

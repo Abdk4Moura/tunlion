@@ -244,7 +244,7 @@ import json,sys
 d=json.load(sys.stdin)
 sys.exit(0 if d.get('role')=='owner' and any(x['name']==sys.argv[1] and x.get('devicePub') for x in d.get('devices',[])) else 1)
 " "$name" 2>/dev/null; then
-    ok "enrolment: owner certified '$name' (filament id lists its device key)"
+    ok "enrolment: owner certified '$name' (tunlion id lists its device key)"
   else
     echo "-- owner id --json --"; printf '%s\n' "$ojson"
     bad "enrolment: owner holds no certificate for '$name'"

@@ -20,7 +20,7 @@ pub async fn backup_cmd(
     {
         crate::ui::problem(
             "rsync not found",
-            "rsync is required for `filament backup` but is not installed.",
+            "rsync is required for `tunlion backup` but is not installed.",
             &[
                 "apt install rsync          # Debian/Ubuntu".to_string(),
                 "brew install rsync         # macOS".to_string(),
@@ -106,7 +106,7 @@ pub async fn backup_cmd(
             let code = s.code().unwrap_or(1);
             if code == 255 && info.took_fast_path {
                 // Retry with fresh bootstrap.
-                crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
+                crate::ui::say(&format!("tunlion: re-authenticating with '{peer}'..."));
                 let retry = crate::l2::rebootstrap_peer(server, peer, relay, false).await?;
                 let mut cmd = std::process::Command::new("rsync");
                 cmd.arg("-avz");

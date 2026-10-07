@@ -1,6 +1,6 @@
-# filament CLI
+# tunlion CLI
 
-The terminal end of [Filament](https://tunlion.autumated.com): P2P file
+The terminal end of [Tunlion](https://tunlion.autumated.com): P2P file
 transfer that works anywhere, where **a browser is a first-class peer**. Send from a headless
 server straight to a phone with nothing installed on it, or between two
 terminals, or terminal → browser → terminal. Same signaling, same WebRTC
@@ -8,22 +8,22 @@ wire protocol, same one-time codes as the web app.
 
 ```
 # the croc-style flow, except the other end can be a browser
-filament send video.mp4 --code
+tunlion send video.mp4 --code
 #   code: clever-lynx-63
 # other machine:
-filament receive clever-lynx-63
+tunlion receive clever-lynx-63
 # or: open tunlion.autumated.com on any phone and claim the code there
 
 # same network? no code needed: auto-discovery
-filament receive -y --dir ~/Drops       # this terminal
-filament send report.pdf                # any device on the same network
+tunlion receive -y --dir ~/Drops       # this terminal
+tunlion send report.pdf                # any device on the same network
 
 # directories tar on the fly; stdin works
-filament send ./photos --code
-tar c logs | filament send - --name logs.tar --code
+tunlion send ./photos --code
+tar c logs | tunlion send - --name logs.tar --code
 
 # self-hosters
-filament send x.bin --server https://your-instance.example
+tunlion send x.bin --server https://your-instance.example
 ```
 
 ## What it does that the web app can't
@@ -32,7 +32,7 @@ filament send x.bin --server https://your-instance.example
   `<name>.part.meta`; a re-offer of the same file (name + size) continues
   from the bytes on disk. Browsers lose the file handle on reload: the CLI
   has a real filesystem, so it doesn't.
-- **Headless.** `filament receive -y --dir` on a server is a drop target for
+- **Headless.** `tunlion receive -y --dir` on a server is a drop target for
   any browser or CLI that can reach the signaling server.
 
 ## What it shares with the web app
@@ -49,16 +49,16 @@ filament send x.bin --server https://your-instance.example
 curl -fsSL https://tunlion.autumated.com/install | sh
 
 # Windows
-winget install Abdk4Moura.Filament
+winget install Abdk4Moura.Tunlion
 
 # Homebrew / Cargo
-brew tap abdk4moura/filament https://github.com/Abdk4Moura/tunlion
-brew install abdk4moura/filament/filament
+brew tap abdk4moura/tunlion https://github.com/Abdk4Moura/tunlion
+brew install abdk4moura/tunlion/tunlion
 cargo install filament-cli
 ```
 
-Already installed? `filament update` fetches and checksum-verifies the latest
-release and swaps itself atomically. Shell completions: `filament completions
+Already installed? `tunlion update` fetches and checksum-verifies the latest
+release and swaps itself atomically. Shell completions: `tunlion completions
 <bash|zsh|fish>` (the installer wires them up automatically). Releases carry
 SHA256SUMS + GitHub build provenance attestations; the Linux binary is fully
 static. No telemetry: the binary talks to the signaling server you point it
@@ -67,7 +67,7 @@ at and to your peer, nothing else.
 ## Build from source
 
 ```
-cargo build --release                                          # -> target/release/filament
+cargo build --release                                          # -> target/release/tunlion
 cargo build --release --target x86_64-unknown-linux-musl   # fully static (rustls-only tree)
 ```
 
@@ -92,7 +92,7 @@ optimization-sensitive claims from the `measure` profile.** It uses
 on functional and causal behavior, then repeat every performance or timing
 claim with the release profile.
 
-Every binary identifies its profile in `filament --version`, including
+Every binary identifies its profile in `tunlion --version`, including
 `profile=release`. Timing gates must carry that profile beside a number or fail
 as unclassified. The profile removes warm compile waiting; it does not make cold
 builds cheap or make a weak experiment trustworthy. The rule is: qualify the

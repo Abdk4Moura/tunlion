@@ -1,7 +1,7 @@
 """Driver — scriptable scenarios + an interactive REPL over a Peer.
 
 Scenarios are plain functions that drive a Peer (and optionally a real
-`filament` subprocess) through a deterministic sequence, then report what was
+`tunlion` subprocess) through a deterministic sequence, then report what was
 observed. The REPL lets you step in by hand: peers, offer, sig, raw, faults.
 
 Run:
@@ -53,7 +53,7 @@ def scenario_discover(peer: Peer, seconds: int) -> dict:
 def scenario_late_join(peer: Peer, seconds: int) -> dict:
     """The late-join experiment, from the PYTHON side: we are the LATE subscriber.
 
-    Precondition (script externally): a real `filament up` is already subscribed
+    Precondition (script externally): a real `tunlion up` is already subscribed
     to the shared channel BEFORE we run this. We subscribe second and observe:
 
       (a) Do WE receive a known-peer for the already-present Rust peer?
@@ -167,7 +167,7 @@ def _set_fault(peer: Peer, knob: str, val: str) -> None:
 # ------------------------------------------------------------------- main ----
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Filament control-plane lab driver")
+    ap = argparse.ArgumentParser(description="Tunlion control-plane lab driver")
     ap.add_argument("--server", default="http://127.0.0.1:8099")
     ap.add_argument("--secret", action="append", default=[],
                     help="device secret (hex); repeatable. channel = channel_of(secret)")

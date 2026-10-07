@@ -1,6 +1,6 @@
 // APPLICATION layer — the resilience-MANAGER's pure decisions (Phase 2).
 //
-// useFilament owns the retry budgets, the relay-escalation counter, and the
+// useTunlion owns the retry budgets, the relay-escalation counter, and the
 // network-change recovery EFFECTS (rebuilding PeerLinks, reconnecting signaling).
 // The timer-free POLICY of those — "escalate to relay? retry? give a second
 // wind? rebuild this link?" — is split out here so it is node-testable, the same

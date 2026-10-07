@@ -5,7 +5,7 @@
 import React, { useState, useEffect } from 'react'
 import WebTerminal from './WebTerminal.jsx'
 
-// Mirror the real app's visual-viewport tracking (Filament.jsx) so the preview
+// Mirror the real app's visual-viewport tracking (Tunlion.jsx) so the preview
 // wrapper sizes itself to what is actually visible, matching production.
 function useVisualViewport() {
   const read = () => {
@@ -52,7 +52,7 @@ const NO_ECHO = Q.get('noecho') === '1'
 // A mock PeerLink: a tiny line-discipline shell so typing, Enter, Backspace,
 // Ctrl-C and the accessory keys all visibly do something.
 function makeMockLink() {
-  const prompt = '\x1b[1m\x1b[38;2;124;246;200mguest@filament\x1b[0m:\x1b[38;2;91;157;255m~\x1b[0m$ '
+  const prompt = '\x1b[1m\x1b[38;2;124;246;200mguest@tunlion\x1b[0m:\x1b[38;2;91;157;255m~\x1b[0m$ '
   let line = ''
   const link = {
     channel: { readyState: 'open', send: () => {} },
@@ -107,7 +107,7 @@ function makeMockLink() {
   function run(cmd, l, emit) {
     const c = cmd.trim()
     if (c === 'help') emit('commands: help, ls, whoami, echo <text>, date, seq [n], tui\r\n')
-    else if (c === 'ls') emit('\x1b[38;2;91;157;255mFilament\x1b[0m  docs  src  README.md\r\n')
+    else if (c === 'ls') emit('\x1b[38;2;91;157;255mTunlion\x1b[0m  docs  src  README.md\r\n')
     else if (c === 'whoami') emit('guest\r\n')
     else if (c.startsWith('echo ')) emit(c.slice(5) + '\r\n')
     else if (c === 'date') emit('Wed Jun 10 14:22:07 UTC 2026\r\n')
@@ -161,7 +161,7 @@ export default function WebTermPreview() {
   if (closed) return <div style={{ position: 'fixed', inset: 0, background: T.bg, color: T.dim, display: 'grid', placeItems: 'center', fontFamily: font }}>closed, reload to reopen</div>
   return (
     // Pin the harness wrapper to the VISUAL viewport, exactly like the real app's
-    // terminal overlay (Filament.jsx), so the mobile-fit behavior under test here
+    // terminal overlay (Tunlion.jsx), so the mobile-fit behavior under test here
     // matches production rather than the layout-viewport fixed:inset:0 box.
     <div data-testid="terminal-overlay" style={{
       position: 'fixed', left: vp.left, top: vp.top, width: vp.width, height: vp.height,

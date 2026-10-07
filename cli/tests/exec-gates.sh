@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# `filament exec` end-to-end gates. Standalone, hermetic, fixture port 8104 ONLY.
+# `tunlion exec` end-to-end gates. Standalone, hermetic, fixture port 8104 ONLY.
 # Proves argv[] crosses EXACTLY (spaces/quotes/globs intact on both platforms by
 # construction -- the vector is never joined, split, or re-parsed), stdout and
 # stderr stay separate, exit codes surface, and real byte traffic works.
 #
-#   FILAMENT_BIN=/path/to/filament ./exec-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./exec-gates.sh
 #
 # Gates:
 #   A  NEGATIVE no-grant -- acceptor serving, initiator NOT granted: refused,
@@ -19,7 +19,7 @@
 #      Windows equivalent exists; the 128+signal MAPPING is unit-tested).
 #   H  BULK BYTES -- 1 MiB through `cat` matches local sha256 (binary-safe bulk).
 #   I  RSYNC-OVER-EXEC -- real rsync across the link (skipped cleanly when rsync
-#      is absent on PATH). `rsync -e '<filament> exec'` appends
+#      is absent on PATH). `rsync -e '<tunlion> exec'` appends
 #      `boxB rsync --server ...`, which our trailing-argv shape takes directly --
 #      itself an argv-exactness proof under a real workload.
 #   J  NEGATIVE revoked -- grant revoked, same command refused again.
@@ -36,7 +36,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8104
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

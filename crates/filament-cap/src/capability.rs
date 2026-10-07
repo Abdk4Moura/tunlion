@@ -14,14 +14,14 @@
 //!
 //! ## LIMIT — WireGuard / serve-tun mesh (accepted posture)
 //!
-//! The WG mesh is a COARSER trust tier. Mesh-join (filament serve-tun) grants
+//! The WG mesh is a COARSER trust tier. Mesh-join (tunlion serve-tun) grants
 //! L3 IP reach to raw TCP services bound on the overlay address (SSH, exposed
 //! ports). These services are NOT constrained by L2 capability gates (l2-open,
 //! mount-open, pty-open) because the WG data path is L3 IP, not L2 control-plane
 //! streams over QUIC/WebRTC.
 //!
 //! Everything reachable by WG peers with ONLY L3 IP: SSH daemon on overlay
-//! address, any port exposed via `filament expose`. Everything else (forward,
+//! address, any port exposed via `tunlion expose`. Everything else (forward,
 //! netcat, proxy, file transfer, mount, PTY) requires an L2 control channel
 //! that a WG-only peer lacks.
 //!

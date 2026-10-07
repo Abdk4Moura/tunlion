@@ -73,7 +73,7 @@ pipe_transcode() {
     -crf 26 -pix_fmt yuv420p -movflags +faststart -an "$out" >/dev/null 2>&1 && _pipe_mp4_ok "$out"
 }
 
-# Offload the final encode to a filament GPU node by SUBMITTING an NVENC ffmpeg
+# Offload the final encode to a tunlion GPU node by SUBMITTING an NVENC ffmpeg
 # job to the box via runner/runner_cli.py (the worked example from the runner
 # docs), then fetching out.mp4.
 #

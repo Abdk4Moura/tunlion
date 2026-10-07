@@ -530,7 +530,7 @@ def build_vectors() -> dict:
     )
 
     return {
-        "format": "filament bootstrap card (fc1) test vectors",
+        "format": "tunlion bootstrap card (fc1) test vectors",
         "contract": "CONTRACT.md, section 'Bootstrap card (fc1)'",
         "generator": "proofs/card_vectors.py",
         "signature_backend": SIGNATURE_BACKEND,

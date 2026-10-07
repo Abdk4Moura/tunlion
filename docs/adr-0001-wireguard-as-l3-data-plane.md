@@ -7,9 +7,9 @@
 
 ## Context
 
-### What filament's L3 (VPN) data plane is today
+### What tunlion's L3 (VPN) data plane is today
 
-`filament up` attaches an IP plane to the mesh. The current implementation
+`tunlion up` attaches an IP plane to the mesh. The current implementation
 (`l3.rs`, `tun/linux.rs`, `direct.rs`) is:
 
 - A kernel TUN device `filament0` (`IFF_TUN | IFF_NO_PI`), configured via iproute2.
@@ -37,9 +37,9 @@ optimization wireguard-go added. Confirmed structural ceilings:
 
 ### Why it was built this way (the real reason, not a strawman)
 
-filament's L3 datagrams ride the **same authenticated QUIC connection** that
+tunlion's L3 datagrams ride the **same authenticated QUIC connection** that
 already punched through NAT and completed the PAKE. The overlay thus inherits all
-of filament's connectivity and identity for free, over one connection. WireGuard
+of tunlion's connectivity and identity for free, over one connection. WireGuard
 would need a *second, separate UDP flow* with its own hole-punching and its own
 static-key trust model. That code-reuse and simplicity is genuine. The cost is an
 order-of-magnitude throughput hit and a data plane we must optimize and secure
@@ -59,12 +59,12 @@ converged on the same conclusion.
 
 The "order of magnitude" above was an inference from architecture. It has now been
 measured head-to-head. Rig: one host, two network namespaces joined by a veth pair
-(the underlay), same overlay IPs (10.9.0.0/24), same `iperf3` tests. filament's L3
+(the underlay), same overlay IPs (10.9.0.0/24), same `iperf3` tests. tunlion's L3
 via `serve-tun` (the QUIC-datagram pump) vs a kernel-WireGuard tunnel, both at the
 default 1280 TUN MTU. The veth underlay itself sustained ~14,960 Mbps, so neither
 overlay was link-bound.
 
-| Test (MTU 1280) | filament L3 (QUIC datagram) | kernel WireGuard |
+| Test (MTU 1280) | tunlion L3 (QUIC datagram) | kernel WireGuard |
 |---|---|---|
 | Single-stream TCP | 479 Mbps, 382 retransmits | 1218 Mbps, 0 retransmits |
 | 4 parallel TCP | 543 Mbps | 1122 Mbps |
@@ -77,24 +77,24 @@ Reading:
 - Raw same-rig ratio is ~2.5x (1218 vs 479 Mbps), but that **understates** the win.
   The rig is conservative *for WireGuard*: WireGuard is CPU-bound here (both
   endpoints' crypto plus iperf competing for 4 cores), so 1.2 Gbps is a floor, not
-  its ceiling. filament is NOT CPU-bound (half a core), it is architecture-bound, so
+  its ceiling. tunlion is NOT CPU-bound (half a core), it is architecture-bound, so
   its 0.5 Gbps is near its true ceiling. On dedicated hardware per end, kernel
-  WireGuard reaches the 5-13 Gbps range; filament would barely move. The real gap is
+  WireGuard reaches the 5-13 Gbps range; tunlion would barely move. The real gap is
   multiples of 2.5x.
 - The qualitative difference matters as much as the ratio: WireGuard delivered with
-  **zero retransmits**; filament threw 382 and lost 61% of the UDP flood. filament's
+  **zero retransmits**; tunlion threw 382 and lost 61% of the UDP flood. tunlion's
   unreliable-datagram plane drops under load (quinn discards datagrams past the
   congestion window), so the inner TCP keeps backing off. That is *why* it sits at
   0.5 Gbps on a 15 Gbps underlay with spare CPU. One plane fights the traffic inside
   it; the other carries it.
-- WireGuard also gets a packet-size edge filament structurally cannot match (1420 vs
+- WireGuard also gets a packet-size edge tunlion structurally cannot match (1420 vs
   ~1280), because QUIC datagrams do not do jumbo.
 
 Bench scripts: `l3bench.sh` (before) and `wgbench.sh` (after) in the working notes.
 
 ## Decision
 
-**Adopt WireGuard as filament's default L3 data plane. Keep filament as the network
+**Adopt WireGuard as tunlion's default L3 data plane. Keep tunlion as the network
 (control plane + connectivity) around it.** Concretely:
 
 1. **WireGuard is the primary L3 data plane.**
@@ -110,8 +110,8 @@ Bench scripts: `l3bench.sh` (before) and `wgbench.sh` (after) in the working not
    - **WireGuard rides on top of whichever underlay path won.** The direct-TCP arm
      stops being a competing L3 plane and becomes a path option *under* WireGuard.
 3. **Preserve unified identity via the control channel.** Do PAKE / key exchange
-   over filament's existing authenticated control channel, then *install the
-   resulting keys* into WireGuard. filament keeps owning identity, discovery, NAT
+   over tunlion's existing authenticated control channel, then *install the
+   resulting keys* into WireGuard. tunlion keeps owning identity, discovery, NAT
    traversal, hole-punching, and relay selection.
 4. **Keep the QUIC/WebRTC plane only as a bridge**, not a destination: for the
    browser/WebRTC case (browsers cannot run WireGuard), the no-admin case while a
@@ -121,7 +121,7 @@ Bench scripts: `l3bench.sh` (before) and `wgbench.sh` (after) in the working not
    Layered model (the decision in one picture):
 
    +-----------------------------------------------------------+
-   |  filament control plane (STAYS ours):                     |
+   |  tunlion control plane (STAYS ours):                     |
    |  identity, PAKE codes, discovery, NAT traversal/holepunch,|
    |  relay selection, transport portfolio (PATH selection)    |
    +-----------------------------------------------------------+
@@ -151,13 +151,13 @@ Bench scripts: `l3bench.sh` (before) and `wgbench.sh` (after) in the working not
 - Correct semantics: WireGuard is a best-effort packet tunnel, which is what an L3
   VPN should be (the inner protocol owns reliability; avoids TCP-over-TCP).
 - The connectivity moat (PAKE, discovery, NAT traversal, relay, path portfolio)
-  stays filament's and is untouched.
+  stays tunlion's and is untouched.
 
 ### Negative / costs
 
 - A WireGuard dependency: kernel WG where present, plus a userspace WG for no-admin.
-  Cuts against filament's dependency-light ethos.
-- Identity bridge work: map filament's Ed25519 + PAKE + channel-binding identity to
+  Cuts against tunlion's dependency-light ethos.
+- Identity bridge work: map tunlion's Ed25519 + PAKE + channel-binding identity to
   WireGuard's static Curve25519 keypair model (exchange over the control channel,
   install keys).
 - Two crypto stacks during migration (WireGuard Noise + the retained QUIC/WebRTC
@@ -184,7 +184,7 @@ WireGuard is still the admin-mode default for non-browser users.
 
 ## Migration / phasing (sketch, non-binding)
 
-1. Prototype the smallest end-to-end slice: filament brokers a WireGuard tunnel
+1. Prototype the smallest end-to-end slice: tunlion brokers a WireGuard tunnel
    between two peers (PAKE over control channel -> install WG keys -> kernel WG over
    the punched UDP path). Measure vs the current QUIC-datagram plane on loopback
    (CPU ceiling) and cross-machine (policer-bound).
@@ -197,20 +197,20 @@ WireGuard is still the admin-mode default for non-browser users.
 ## 2026-09-07: the relay is deleted, and boringtun is NOT the answer here
 
 The loopback relay is gone. It was dominated, as recorded below. But the
-replacement it was supposed to make way for, boringtun over filament's transport,
-should NOT be built, and the reason is specific to filament rather than a
+replacement it was supposed to make way for, boringtun over tunlion's transport,
+should NOT be built, and the reason is specific to tunlion rather than a
 judgement about boringtun.
 
-**filament's transport is already an authenticated encrypted channel.** A direct
+**tunlion's transport is already an authenticated encrypted channel.** A direct
 link is QUIC with rustls/TLS 1.3; a relayed link is a WebRTC DataChannel over
 DTLS. Running WireGuard inside either encrypts the same bytes twice and
 authenticates a peer that the transport has already authenticated. It costs CPU
 and buys nothing.
 
-**That is exactly where filament differs from Tailscale.** Tailscale needs
+**That is exactly where tunlion differs from Tailscale.** Tailscale needs
 wireguard-go because DERP is a dumb packet forwarder with no per-peer crypto of
 its own: WireGuard IS its security layer, so it must run somewhere, and userspace
-is the only place they can own the socket. filament's relay is not DERP. It is a
+is the only place they can own the socket. tunlion's relay is not DERP. It is a
 mutually authenticated tunnel in its own right, so the security layer already
 exists and the QUIC-datagram plane already carries a NATed peer over the same
 punched path.
@@ -228,7 +228,7 @@ entry REMOVED rather than re-pointed at a tunnel-inside-a-tunnel, so it stays on
 the plane it was already using and no route is left pointing into something that
 carries nothing.
 
-What would change this: if filament ever gains a transport that forwards
+What would change this: if tunlion ever gains a transport that forwards
 ciphertext without authenticating peers (a true DERP equivalent), WireGuard would
 become the security layer for that path and boringtun would earn its place.
 
@@ -262,15 +262,15 @@ for, and the opt-in default is now the only thing between it and being on.
 ### The finding that is not about WireGuard
 
 The peer had **IPv6 disabled system-wide** (`net.ipv6.conf.all.disable_ipv6=1`),
-which is a common hardening default. filament's overlay IS an IPv6 ULA, so
+which is a common hardening default. tunlion's overlay IS an IPv6 ULA, so
 `ip addr add` failed, the node fell back to the userspace overlay, and the only
 evidence was a log line quoting the failed command. A host with IPv6 disabled
-silently loses the kernel data plane. filament should DETECT this and say so by
+silently loses the kernel data plane. tunlion should DETECT this and say so by
 name; that is worth a separate fix and is not done.
 
 ## 2026-09-07, correction: kernel-direct works, and my rig said otherwise
 
-Plain kernel WireGuard between do-vm and the KVM VPS, no filament involved:
+Plain kernel WireGuard between do-vm and the KVM VPS, no tunlion involved:
 
     endpoint: 162.35.114.254:51999
     latest handshake: 11 seconds ago
@@ -295,7 +295,7 @@ servers, which is where throughput matters most.
 **Reachability, not privilege, is the only thing that can force a fallback.**
 Privilege decides whether kernel WireGuard is available; NAT decides whether its
 socket can be reached. They are independent, and the second is the harder one:
-filament punches holes with its OWN socket, and kernel WireGuard cannot share it.
+tunlion punches holes with its OWN socket, and kernel WireGuard cannot share it.
 
 ### On the fallback, and what Tailscale actually does
 
@@ -313,7 +313,7 @@ So the shape should be:
 
 1. **Kernel WireGuard, direct** when the peer's endpoint is reachable. Default.
    No userspace in the path. Proven above.
-2. **boringtun** (an audited Rust WireGuard) over filament's transport when it is
+2. **boringtun** (an audited Rust WireGuard) over tunlion's transport when it is
    not. This is Tailscale's model and strictly cheaper than the loopback relay.
 3. **Delete the loopback relay** once 2 exists; it is dominated by it.
 
@@ -322,9 +322,9 @@ is the valuable part and it is already implemented well; a rewrite would inherit
 the risk of hand-rolled crypto for none of the benefit. Using boringtun is the
 same idea done with a library.
 
-## Status 2026-09-07: WORKING. Kernel WireGuard over filament's transport.
+## Status 2026-09-07: WORKING. Kernel WireGuard over tunlion's transport.
 
-A kernel WireGuard tunnel between two machines, keyed over filament's own
+A kernel WireGuard tunnel between two machines, keyed over tunlion's own
 authenticated connection, with a completed handshake, verified by
 `experiments/wireguard-2machine.sh`:
 
@@ -342,11 +342,11 @@ mapping, and every handshake was dropped. The answer is not to teach WireGuard
 about NAT. It is to stop WireGuard touching the network at all.
 
 Each side points its peer's endpoint at a filament-owned UDP socket on LOOPBACK,
-and filament carries the frames over the path it has already punched:
+and tunlion carries the frames over the path it has already punched:
 
-    kernel WG --UDP--> 127.0.0.1:relay --filament transport--> peer's relay --> its WG
+    kernel WG --UDP--> 127.0.0.1:relay --tunlion transport--> peer's relay --> its WG
 
-That is exactly "WireGuard rides on top of whichever underlay path won": filament
+That is exactly "WireGuard rides on top of whichever underlay path won": tunlion
 keeps identity, discovery, NAT traversal and relay fallback; WireGuard gets the
 data plane. The `endpoint: 127.0.0.1` in the output above is the whole point.
 
@@ -365,7 +365,7 @@ ADR was written to replace.
 
 ### Still to do before it is the default
 
-- It is opt-in (`filament set wireguard on`) and stays that way until the
+- It is opt-in (`tunlion set wireguard on`) and stays that way until the
   throughput case is measured against the QUIC plane on the two-machine rig.
 - The relay socket binds `127.0.0.1:0` per peer. Anything that could reach it
   could inject frames the peer never sent, which is why it is loopback-only;
@@ -381,13 +381,13 @@ the reason is architectural rather than a bug.
 
 ### What works
 
-`filament set wireguard on` (off by default: this changes the DATA PLANE).
+`tunlion set wireguard on` (off by default: this changes the DATA PLANE).
 Reconciliation runs on a 10s TICK, not an event, because a link that starts
 relayed upgrades to direct AFTER the announce and an event hook missed it.
 
 The key exchange rides the CONTROL CHANNEL, the same path certificate renewal
 uses. The first version opened a raw QUIC bi-stream and both ends hung forever
-after creating their interface: filament multiplexes its own protocol over that
+after creating their interface: tunlion multiplexes its own protocol over that
 connection and runs its own stream acceptor, so an out-of-band stream races with
 it. The exchange is now symmetric with no initiator: each side announces its key,
 each configures the other on receipt, and two messages converge.
@@ -401,26 +401,26 @@ endpoint and allowed-ips, and 148 B was sent.
 **0 B received, no handshake.** The endpoint each side announces is its own
 WireGuard listen port, and both daemons sit behind NAT. The announced port is the
 INTERNAL one; the NAT has no inbound mapping for it, so handshake packets are
-dropped. WireGuard opened its own UDP socket instead of using the path filament
+dropped. WireGuard opened its own UDP socket instead of using the path tunlion
 had already punched.
 
 That is exactly what decision point 2 of this ADR says must not happen:
 "WireGuard rides on top of whichever underlay path won... The direct-TCP arm
 stops being a competing L3 plane and becomes a path option *under* WireGuard."
 A WireGuard peer with its own socket is a SECOND connectivity story, and it
-inherits none of filament's NAT traversal.
+inherits none of tunlion's NAT traversal.
 
 ### The next step, concretely
 
 Two options, and they are not equivalent:
 
-1. **Userspace WireGuard over filament's transport** (boringtun-style): WG frames
-   ride filament's existing punched path as datagrams. Keeps every property
-   filament already has, is the ADR's stated design, and is the larger job.
+1. **Userspace WireGuard over tunlion's transport** (boringtun-style): WG frames
+   ride tunlion's existing punched path as datagrams. Keeps every property
+   tunlion already has, is the ADR's stated design, and is the larger job.
 2. **Kernel WireGuard with a punched endpoint**: teach the exchange to announce
-   the EXTERNAL mapped address, which means either reusing filament's ICE result
+   the EXTERNAL mapped address, which means either reusing tunlion's ICE result
    for the WG socket or port-forwarding. Cheaper, but it re-implements NAT
-   traversal that filament already owns, which is what the ADR warns against.
+   traversal that tunlion already owns, which is what the ADR warns against.
 
 Option 1 is the right one. `experiments/wireguard-2machine.sh` reproduces the
 current state end to end and fails on the handshake assertion, which is the

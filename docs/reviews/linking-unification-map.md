@@ -69,8 +69,8 @@ would leak the secret to the server).
   5034). Differ only in `relay_only`/`to_filter`/`warm_standby`.
 - **D3 — code-shape validators in 2 languages.** `regex_lite_code`/
   `looks_like_pake_code` (main.rs:466/482) vs the inline checks in
-  `pairWithCode` (useFilament.js:891-901).
-- **D4 — wordlists in 4 places** (signaling.py:36, useFilament.js:26, words.js:10,
+  `pairWithCode` (useTunlion.js:891-901).
+- **D4 — wordlists in 4 places** (signaling.py:36, useTunlion.js:26, words.js:10,
   words.rs:19), kept in sync by comment convention only.
 - **D5 — `channel_of`/`channelOf` and `proof_for`/`proofFor`** reimplemented in
   Rust (main.rs:881/914) and JS (devices.js:101/108); must be byte-identical, no
@@ -88,7 +88,7 @@ wire protocol, the registry abstraction, the claim rate-limiter, burn semantics.
 ## The one big gap: the browser has no receive path
 
 `pairWithCode` drives PAKE pairing; there is **no `receiveWithCode`** that claims
-a code and downloads a file (useFilament.js / pairing.js — confirmed, and called
+a code and downloads a file (useTunlion.js / pairing.js — confirmed, and called
 out in the Jun 13 note line 62/100). True unification requires building the
 browser receive flow: claim → PAKE → open DataChannel → accept `file-offer` →
 write download. Non-trivial, security-reviewed scope on its own.
@@ -105,7 +105,7 @@ a security *upgrade*; never go the other way to "save a word".
 1. **Extract `Conn::for_command(...)`** — collapse the 3 struct literals. Zero
    wire change. (main.rs:1421/4120/5034)
 2. **Frontend wordlist consolidation** — import from `words.js`, drop the copy in
-   useFilament.js:26-45. Zero wire change.
+   useTunlion.js:26-45. Zero wire change.
 3. **Byte-identity tests** for `channel_of`/`proof_for` across Rust↔JS. Safe.
 4. **Frontend validator → shared WASM** `splitCode`/`normCode` in `pairWithCode`.
    Safe.

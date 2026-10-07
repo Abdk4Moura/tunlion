@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""End-to-end test for the FILE-DRIVEN filament job runner — LOCAL loopback only.
+"""End-to-end test for the FILE-DRIVEN tunlion job runner — LOCAL loopback only.
 
 Drives the file-driven control plane (FileRunnerBox + watcher.py) against an
 isolated box on this host (isolated config dirs + the locally-built binary, NEVER
-the user's live daemon or the installed ~/.local/bin/filament). The box-side
+the user's live daemon or the installed ~/.local/bin/tunlion). The box-side
 watcher + din acceptor are started by run_local_test.sh; this script is the HOST.
 
 Flow per job:  host.submit(spec+inputs over din)  ->  watcher runs the job  ->

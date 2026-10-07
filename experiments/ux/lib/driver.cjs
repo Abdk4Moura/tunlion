@@ -1,6 +1,6 @@
 // driver.cjs — shared Playwright harness for the REAL-app e2e drivers.
 //
-// Every driver below opens the REAL built filament app (served same-origin by
+// Every driver below opens the REAL built tunlion app (served same-origin by
 // our local backend), drives it with human-like gestures, ASSERTS real DOM /
 // localStorage state, and records the tab to a VP8/webm. No ?preview= mock seam
 // is used for these e2e flows (preview stays only for the pure-visual reels).

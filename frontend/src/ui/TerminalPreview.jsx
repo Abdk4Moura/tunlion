@@ -1,6 +1,6 @@
 // TerminalPreview: a pure-visual, no-backend comparison of three "web-ssh"
 // terminal looks (Step 0 of the web-shell feature). Gated behind ?preview=terminal
-// in main.jsx; it never touches the real app. Reuses the Filament design tokens so
+// in main.jsx; it never touches the real app. Reuses the Tunlion design tokens so
 // what you see here is what the shipped terminal will feel like.
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from '@xterm/xterm'
@@ -8,7 +8,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import AnnotationOverlay from './AnnotationOverlay.jsx'
 
-// ---- design tokens (mirrored from Filament.jsx so the preview is self-contained) ----
+// ---- design tokens (mirrored from Tunlion.jsx so the preview is self-contained) ----
 const MONOS = {
   jetbrains: "'JetBrains Mono',ui-monospace,monospace",
   plex: "'IBM Plex Mono',ui-monospace,monospace",
@@ -75,15 +75,15 @@ async function runSession(term, T, accent, alive, host = 'do-vm') {
   const line = async (s, d = 16) => { if (!alive.current) return; term.write(s + '\r\n'); await sleep(d) }
 
   term.write('\x1b[2J\x1b[H')
-  await line(`${fg(accent)}●${RST} ${fg(T.text)}filament shell${RST} ${fg(T.dim)}· connected to ${RST}${fg(T.text)}${host}${RST} ${fg(T.dim)}· direct · 12ms${RST}`)
+  await line(`${fg(accent)}●${RST} ${fg(T.text)}tunlion shell${RST} ${fg(T.dim)}· connected to ${RST}${fg(T.text)}${host}${RST} ${fg(T.dim)}· direct · 12ms${RST}`)
   await line(`${fg(T.faint)}  trusted device · end-to-end encrypted · no sshd${RST}`)
   await line('')
   await sleep(260)
 
   const steps = [
-    { cmd: 'ls', out: [`${fg(T.recv)}Filament${RST}  ${fg(T.recv)}docs${RST}  ${fg(T.recv)}experiments${RST}  ${fg(T.recv)}src${RST}  README.md`] },
+    { cmd: 'ls', out: [`${fg(T.recv)}Tunlion${RST}  ${fg(T.recv)}docs${RST}  ${fg(T.recv)}experiments${RST}  ${fg(T.recv)}src${RST}  README.md`] },
     { cmd: 'uptime', out: [` 14:22:07 up 6 days,  2:14,  1 user,  load average: ${fg(T.ok)}0.04${RST}, 0.08, 0.02`] },
-    { cmd: 'filament devices', out: [
+    { cmd: 'tunlion devices', out: [
       `  pixel-6a   ${fg(T.dim)}(channel 14c4ee23)${RST}`,
       `  popos      ${fg(T.dim)}(channel aab6b53d)${RST}  ${fg(accent)}[transfer, shell]${RST}`,
     ] },
@@ -220,7 +220,7 @@ function NativePane({ T, accent, font }) {
     <div style={{ position: 'absolute', inset: 0, background: T.bg, color: T.text, fontFamily: font, display: 'flex', flexDirection: 'column' }}>
       <div style={{ height: 54, borderBottom: `1px solid ${T.line}`, display: 'flex', alignItems: 'center', gap: 12, padding: '0 18px' }}>
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 15, fontWeight: 600 }}>
-          <span style={{ width: 3, height: 16, background: accent, display: 'inline-block', boxShadow: `0 0 8px ${accent}99` }} />filament
+          <span style={{ width: 3, height: 16, background: accent, display: 'inline-block', boxShadow: `0 0 8px ${accent}99` }} />tunlion
         </span>
         <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 8, alignItems: 'center', fontSize: 11.5, color: T.sub }}>
           <Dot c={T.ok} glow />connected
@@ -242,7 +242,7 @@ function NativePane({ T, accent, font }) {
             </div>
           ))}
           <div style={{ marginTop: 'auto', fontSize: 10.5, color: T.faint, lineHeight: 1.5 }}>
-            devices running <span style={{ color: T.dim }}>filament up --shell</span> show a terminal.
+            devices running <span style={{ color: T.dim }}>tunlion up --shell</span> show a terminal.
           </div>
         </div>
         {/* right: transfers + on-demand terminal tabs */}

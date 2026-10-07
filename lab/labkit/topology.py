@@ -3,7 +3,7 @@
 A topology is a small YAML (or JSON) file describing NODES + LINKS + per-node
 params, with DEFAULTS and per-node OVERRIDES. It is PROVIDER-AGNOSTIC: the link
 says "connect node a and node b on subnet X"; HOW that carriage happens (pipe /
-udp / wg / filament) is chosen at ``up`` time via ``--link`` (or the link's own
+udp / wg / tunlion) is chosen at ``up`` time via ``--link`` (or the link's own
 ``provider:`` field), exactly the netlab provider split.
 
 To stay dependency-light we parse YAML with a tiny built-in subset parser (no

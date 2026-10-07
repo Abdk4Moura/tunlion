@@ -1,39 +1,39 @@
-# Feasibility: a GPU-compute product riding on filament
+# Feasibility: a GPU-compute product riding on tunlion
 
 > Status: assessment (2026-07-25). Not a commitment to build. This memo answers
-> "can a Salad/Vast-class GPU-compute product be built ON filament, and what is
-> the honest wedge," grounded in filament's own decisions and two research passes
+> "can a Salad/Vast-class GPU-compute product be built ON tunlion, and what is
+> the honest wedge," grounded in tunlion's own decisions and two research passes
 > (GPU-linking, and Sybil-vs-anonymity) run this session.
 
 ## The framing that makes it coherent
 
-The product **rides on** filament; it is not filament. This matters because
-filament already decided (`docs/design-mesh-network.md`, 2026-07-16) to stay
+The product **rides on** tunlion; it is not tunlion. This matters because
+tunlion already decided (`docs/design-mesh-network.md`, 2026-07-16) to stay
 **strictly pairwise**: no mesh, no DHT, no gossip, no coordinator, no transitive
 trust. It declines multi-hop reach and says "use a mesh product instead of
-filament for that."
+tunlion for that."
 
-That decision is not a blocker; it is the architecture. filament separates two
+That decision is not a blocker; it is the architecture. tunlion separates two
 things the product must keep separate too:
 
 - **Authorization** (who I open a secure channel with): pairwise, explicit,
-  introduce-assisted. Absolute in filament, and the product must not violate it.
-- **Reachability** (who can route bytes to me): the layer filament keeps and
+  introduce-assisted. Absolute in tunlion, and the product must not violate it.
+- **Reachability** (who can route bytes to me): the layer tunlion keeps and
   hardens (holepunch, relay, self-hostable rendezvous).
 
 The product builds its discovery / pool / routing in the **reachability** layer,
-on top of filament's pairwise authorized channels, and it keeps **authorization
-pairwise and introduce-gated**. It never asks filament to authorize transitively
+on top of tunlion's pairwise authorized channels, and it keeps **authorization
+pairwise and introduce-gated**. It never asks tunlion to authorize transitively
 or hold group state. The pool/registry is a product-layer concern.
 
 This is exactly what the Sybil research independently recommended: closed-by-
 default, PAKE-introduce as the Sybil defense (not a bolt-on), and a DHT used only
 as a reachability/rendezvous aid between already-introduced peers, never as a
 stranger-discovery mechanism (RetroShare's "admission and discovery are
-orthogonal dials"). filament's mesh decision and the Sybil posture converge on the
+orthogonal dials"). tunlion's mesh decision and the Sybil posture converge on the
 same shape: **introduce-gated trust, reachability-only discovery.**
 
-## What filament already provides (the primitives)
+## What tunlion already provides (the primitives)
 
 | Primitive | State |
 |---|---|
@@ -59,7 +59,7 @@ open-marketplace ambition):
 The shape:
 
 - **Hosts**: one-click (Windows-native is the liquidity wedge; 80% of consumer
-  4090s are on Windows gaming rigs, and filament already leans Windows), lending an
+  4090s are on Windows gaming rigs, and tunlion already leans Windows), lending an
   idle GPU inside the lend-gpu sandbox.
 - **Borrowers**: an OpenAI-compatible endpoint that routes to the nearest
   *introduced* lender over a pairwise WireGuard tunnel.
@@ -67,7 +67,7 @@ The shape:
   addressed instead of re-pulling from S3. This is the "data plane, not control
   plane" gap nobody else fills.
 - **Pool/registry**: a product-layer roster built from pairwise introductions; a
-  stable peer doubles as relay + rendezvous (filament's sanctioned pattern). No
+  stable peer doubles as relay + rendezvous (tunlion's sanctioned pattern). No
   transitive trust; every borrower-lender channel is separately authorized.
 
 ## The two walls that gate the OPEN version (and why we start closed)
@@ -101,7 +101,7 @@ host identity and accrued standing. This is both:
 
 - **No-account is not zero-trusted-parties.** A small bootstrap/rendezvous seed is
   unavoidable; the honest goal is small, diverse, replaceable, non-load-bearing
-  once a peer has one introduced contact. filament's signaling server is already
+  once a peer has one introduced contact. tunlion's signaling server is already
   this (rendezvous, not coordinator) and is on a self-hostable trajectory.
 - **Vouching-chain abuse is not covered by Sybil defense.** A malicious introduced
   host, or one that introduces bad actors into the pool, needs a revocation layer
@@ -111,9 +111,9 @@ host identity and accrued standing. This is both:
 
 ## Verdict
 
-A **no-account, trusted-group, edge-inference** product is feasible on filament's
+A **no-account, trusted-group, edge-inference** product is feasible on tunlion's
 existing primitives plus the WireGuard data plane built this session. It is
-"Tailscale-for-GPUs for a trusted fleet/community," and it respects filament's
+"Tailscale-for-GPUs for a trusted fleet/community," and it respects tunlion's
 pairwise core by keeping authorization pairwise and building pool/discovery in the
 reachability layer. The open marketplace is gated on verifiable-compute and open-
 DHT Sybil resistance, both unsolved. The one net-new design the feasible version
@@ -125,7 +125,7 @@ owes is identity continuity.
 |---|---|
 | Secure data plane (WireGuard) | done, measured |
 | Trust / Sybil posture | done, researched: closed-by-default, introduce-gated |
-| filament mesh boundary | decided: filament stays pairwise; product rides on top |
+| tunlion mesh boundary | decided: tunlion stays pairwise; product rides on top |
 | Discovery / routing (reachability layer) | product-layer; reuse rendezvous/relay pattern |
 | Identity continuity | net-new gap, must design |
 | Model distribution (mount + CID) | wedge exists; streaming layer TBD |
@@ -134,7 +134,7 @@ owes is identity continuity.
 
 ## Sources in-repo
 
-- `docs/design-mesh-network.md` (filament stays pairwise)
+- `docs/design-mesh-network.md` (tunlion stays pairwise)
 - `docs/adr-0001-wireguard-as-l3-data-plane.md` (data plane, measured)
 - lend-gpu MVP notes (`LEND_GPU.md`, `LEND_GPU_RUST_SPEC.md`, worktree)
 - session research: GPU-linking (RDMA vs kernel vs userspace), Sybil-vs-anonymity

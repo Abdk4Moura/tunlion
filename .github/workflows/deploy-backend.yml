@@ -6,7 +6,7 @@
 #   Repo secrets: DROPLET_HOST, DROPLET_USER, DROPLET_SSH_KEY, DEPLOY_PATH
 #                 (optional DROPLET_PORT, default 22)
 #   Make the GHCR package `filament-api` public (so the droplet pulls w/o auth).
-#   On the droplet: /opt/filament cloned + deploy/.env filled + stack up once.
+#   On the droplet: /opt/tunlion cloned + deploy/.env filled + stack up once.
 
 name: Deploy backend
 

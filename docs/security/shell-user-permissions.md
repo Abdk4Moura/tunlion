@@ -16,8 +16,8 @@ it can traverse the config directory.
 (`cli/src/platform/mod.rs:29-35`):
 
 - Linux: `$XDG_CONFIG_HOME/filament`, falling back to `$HOME/.config/filament`.
-- macOS: `$HOME/Library/Application Support/filament`.
-- Windows: `%APPDATA%/filament`.
+- macOS: `$HOME/Library/Application Support/tunlion`.
+- Windows: `%APPDATA%/tunlion`.
 - `FILAMENT_CONFIG_DIR` overrides all three.
 
 The daemon creates parent directories with ordinary `create_dir_all`, for
@@ -62,7 +62,7 @@ case created `devices.json` as `daemon:daemon` with `0600`; `nobody` again got
 runuser -u nobody -- /bin/cat <scratch>/config/devices.json
 ```
 
-The result was nonzero in both owner cases. No real Filament config or running
+The result was nonzero in both owner cases. No real Tunlion config or running
 daemon was touched.
 
 ## Existing Installs

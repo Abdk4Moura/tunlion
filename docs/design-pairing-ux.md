@@ -27,7 +27,7 @@ default. 0.7.1 reverted the flip to opt-in pending this design.
 
 ## Two relationships (the wizard's first job)
 
-`filament pair` establishes one of two fundamentally different things, and every
+`tunlion pair` establishes one of two fundamentally different things, and every
 default flips between them. The wizard's first job is not "what permissions" — it is
 **"is this me, or someone else?"**, answered by whether the peer's device cert chains
 to *my* user key.
@@ -59,7 +59,7 @@ Never a default. Never grantable by a flag alone. Requires an **interactive conf
 the granting device**:
 
 - `shell` — arbitrary code execution on the target
-- `write-mount` — rewrites arbitrary files, **including `~/.filament/caps.json`**: a
+- `write-mount` — rewrites arbitrary files, **including `~/.tunlion/caps.json`**: a
   capability that edits its own leash (authority-equivalent)
 - `mount` of a broader root (home, `/`)
 - `reach` of a non-exposed or privileged local port
@@ -135,13 +135,13 @@ Shrinking mount to read-only does **not** fix this; only scoping does.
 
 ## The interactive wizard
 
-`filament pair` is **interactive by default** (it routes same-vs-inter-user and sets
+`tunlion pair` is **interactive by default** (it routes same-vs-inter-user and sets
 caps/expiry/direction/name); flags are the scriptable escape hatch — same pattern as
 the existing interactive-code-entry / `--no-interactive`.
 
 **Same-user (fleet add):**
 ```
-$ filament pair 7f3k-otter
+$ tunlion pair 7f3k-otter
   connecting… "work-laptop" — identity 7b7e03e8 ✓ this is YOU  (binding: Proven)
   add to your fleet? [Y/n]
     default (scoped):  [x] transfer→inbox   [x] reach→exposed ports   [x] mount→share (ro)
@@ -152,7 +152,7 @@ $ filament pair 7f3k-otter
 
 **Inter-user (external share):**
 ```
-$ filament pair 7f3k-otter
+$ tunlion pair 7f3k-otter
   connecting… "alice-mbp" — identity 3f9c… ⚠ NOT you (alice)
   [speak/verify the pairing words]  otter · cobalt · ninth
   this is a SHARE, not a fleet add. grant nothing by default:
@@ -167,7 +167,7 @@ $ filament pair 7f3k-otter
 
 - Under `--yes`, capabilities must be **named explicitly on the command line**, so a
   pasted command's blast radius is visible in the text the victim can read. `--yes`
-  never carries implicit defaults. (Defuses the "just run `filament pair X --yes`"
+  never carries implicit defaults. (Defuses the "just run `tunlion pair X --yes`"
   curl-pipe-bash vector.)
 - The **deliberate tier stays deliberate under `--yes`**: no flag combination grants
   `shell` or `write-mount` without an interactive confirmation on the *granting* device.
@@ -187,12 +187,12 @@ capability that can name an arbitrary resource is not a capability, it is an acc
 
 A device must be fully functional with **no user identity at all**. Identity is an
 opt-in layer that *adds* fleet auto-trust; it is never a precondition for using
-filament. (0.7.0 violated this — authoritative-by-default made "create a user first"
+tunlion. (0.7.0 violated this — authoritative-by-default made "create a user first"
 feel mandatory. It isn't.)
 
 Three tiers:
-1. **No identity — "no account" mode (the original pitch).** `filament video.mp4` →
-   speak a code → the other side claims it; `filament pair phone` remembers a specific
+1. **No identity — "no account" mode (the original pitch).** `tunlion video.mp4` →
+   speak a code → the other side claims it; `tunlion pair phone` remembers a specific
    device. **Consent-gated, not capability-gated**: you approve each incoming action.
    The capability layer never gates this path. Works forever with zero identity.
 2. **User identity (opt-in) — the fleet.** Add an identity and your own devices
@@ -208,14 +208,14 @@ feature, not a gap.
 Every approval in this design — a fleet join, a deliberate-tier grant, an inter-user
 share — is **asynchronous and often cross-device** (the action starts on one device,
 the approval happens on a primary). Unlike `sudo` or a git credential helper, which
-prompt synchronously in the context you're already in, filament cannot assume the human
+prompt synchronously in the context you're already in, tunlion cannot assume the human
 is watching the granting device. And it has **no persistent notification channel yet**
 (the tray/companion app is a future feature).
 
 So the rule: **approvals are pull-safe now, push-better later.**
-- **The substrate is the consent queue** (`filament requests` — list/approve/deny).
+- **The substrate is the consent queue** (`tunlion requests` — list/approve/deny).
   Every approval lands there durably. With zero notification channel you can
-  `filament requests` on a primary and act. This is the sudo-equivalent: it waits for
+  `tunlion requests` on a primary and act. This is the sudo-equivalent: it waits for
   the human, in a queue instead of a blocked terminal.
 - **Notify hooks fire OS-native notifications now** as the stopgap (`notify-send` /
   Windows toast / `osascript`) — the consent-notify hooks already exist; wiring them to
@@ -231,14 +231,14 @@ self-enrollment) is the primitive. Same shape as `tailscale up --authkey`.
 
 ```
 # on his primary, once — the ONE deliberate act:
-$ filament mint --fleet --shell --fleet-open --ttl 1h
+$ tunlion mint --fleet --shell --fleet-open --ttl 1h
   ⚠ devices with this key can SHELL your fleet and reach ALL fleet ports.
     confirm on this device: [y/N] y
   fk_7b7e03e8_9d2a…   (valid 1h)
 
 # one line in cloud-init / Ansible / Dockerfile for every VM:
   curl -fsSL https://tunlion.autumated.com/install | sh && \
-    filament identity join --key fk_7b7e03e8_9d2a… && filament up --shell
+    tunlion identity join --key fk_7b7e03e8_9d2a… && tunlion up --shell
 ```
 
 The security model holds: `shell` + `fleet-open` (reach-all-ports) are the deliberate
@@ -332,7 +332,7 @@ Detection, not prevention; defense-in-depth. Cheap enough to ship before guardia
   read-only share root? Per-device override? First-run setup vs sane built-in?
 - **Primary designation UX.** How does a user mark a device primary, see which are, and
   recover if all primaries are lost (the encrypted backup phrase flow)?
-- **The needs-review queue.** What does `filament devices` show for review-pending
+- **The needs-review queue.** What does `tunlion devices` show for review-pending
   legacy devices, and what's the one-command promote?
 - **Renewal visibility.** How does the UI show "this device renews every N days / falls
   out if offline > N" without being noise?

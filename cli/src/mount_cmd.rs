@@ -1,8 +1,8 @@
-//! Mount planning, the mount implementation, and `filament reset`.
+//! Mount planning, the mount implementation, and `tunlion reset`.
 //!
 //! `resolve_mount_plan` turns `mount <device> <dir>` into a plan, `mount_fuse_cmd`
 //! carries it out through the platform mount adapter, and `reset_cmd` wipes this
-//! machine's filament state.
+//! machine's tunlion state.
 //!
 //! CFG, handled explicitly because anyhow::{ Result, anyhow, bail };
 use crate::MountPlan;
@@ -20,7 +20,17 @@ use crate::principal_ceiling_for;
 use crate::prompt_line;
 use crate::reset_remove;
 use crate::ui;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
+// The cfg here must match the DEFINITION gate in runtime_support.rs and the
+// re-export gate in main.rs. It was missing the windows arm, so on
+// `--features mount-windows` the function existed and was re-exported while the
+// import was compiled out, and both call sites below failed with E0425. Nothing
+// caught it because mount-ci.yml is path-triggered and no change had touched its
+// trigger paths since the arm was added.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "mount-macos"),
+    all(target_os = "windows", feature = "mount-windows")
+))]
 use crate::unmount_fuse;
 use anyhow::{Context, Result, anyhow, bail};
 use std::time::Duration;
@@ -30,21 +40,21 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
     //    from under a live acceptor. Make the user stop it explicitly.
     if let Some(pid) = daemon_alive() {
         bail!(
-            "the filament daemon is running (pid {pid}); run `filament down` first, then `filament reset`"
+            "the tunlion daemon is running (pid {pid}); run `tunlion down` first, then `tunlion reset`"
         );
     }
 
     // 2. Confirm (destructive). ui_caps.confirm honors the global -y/--yes and
     //    REFUSES from a non-TTY without it, exactly the required behavior.
     ui_caps.confirm(
-        "wipe ALL local filament state (identity, devices, caps, managed ssh keys) on this machine",
+        "wipe ALL local tunlion state (identity, devices, caps, managed ssh keys) on this machine",
     )?;
 
     let cfg = crate::settings::config_dir();
     let mut wiped: Vec<String> = Vec::new();
 
     // 3. Strip the managed authorized_keys blocks BEFORE devices.json is gone,
-    //    so we know every petname whose block filament may have installed. Only
+    //    so we know every petname whose block tunlion may have installed. Only
     //    the delimited `# BEGIN/END filament-managed <device>` blocks are removed;
     //    everything else in authorized_keys is preserved verbatim.
     let ak_path = crate::sshkeys::authorized_keys_path();
@@ -77,7 +87,7 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
         }
     }
 
-    // 4. Remove filament's own state files. Each is filament-authored; a missing
+    // 4. Remove tunlion's own state files. Each is filament-authored; a missing
     //    file is a silent no-op. Explicit list (NOT a blanket rmdir of the config
     //    dir) so a mis-set FILAMENT_CONFIG_DIR can never take out unrelated files.
     reset_remove(
@@ -139,16 +149,16 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
     crate::capability::invalidate_cap_cache();
 
     if wiped.is_empty() {
-        ui::say("  nothing to wipe / no local filament state found");
+        ui::say("  nothing to wipe / no local tunlion state found");
     } else {
         ui::say(&format!(
-            "  {} wiped local filament state:",
+            "  {} wiped local tunlion state:",
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
         ));
         for line in &wiped {
             ui::say(&format!("    - {line}"));
         }
-        ui::say("  this machine is now a clean slate (`filament init` to start over)");
+        ui::say("  this machine is now a clean slate (`tunlion init` to start over)");
     }
     Ok(())
 }
@@ -177,12 +187,12 @@ pub(crate) fn resolve_mount_plan(
     if peer.is_none() {
         if !caps.interactive {
             bail!(
-                "mount needs a device in non-interactive mode: filament mount <device> <remote> [local]"
+                "mount needs a device in non-interactive mode: tunlion mount <device> <remote> [local]"
             );
         }
         let devices = devices_load();
         if devices.is_empty() {
-            bail!("no devices are connected; start with `filament add`");
+            bail!("no devices are connected; start with `tunlion add`");
         }
         let labels = devices
             .iter()
@@ -265,7 +275,7 @@ pub(crate) fn resolve_mount_plan(
         eprintln!();
         eprintln!("  The remote device still enforces its configured share root and grant.");
         eprintln!(
-            "  command  filament mount {} {} {}{}",
+            "  command  tunlion mount {} {} {}{}",
             command_arg(&plan.peer),
             command_arg(&plan.remote),
             command_arg(&plan.local),
@@ -345,7 +355,7 @@ pub(crate) async fn mount_fuse_cmd(
         }
     ));
     ui::say(&format!(
-        "  {} mounted. unmount with `filament mount --off {local}` or ctrl-c",
+        "  {} mounted. unmount with `tunlion mount --off {local}` or ctrl-c",
         ui::paint(ui::Tone::Ok, ui::glyph_ok())
     ));
 

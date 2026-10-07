@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Filament — P3 PRIMARY-STALL-FAILOVER gate (warm redundant transport, deterministic).
+# Tunlion — P3 PRIMARY-STALL-FAILOVER gate (warm redundant transport, deterministic).
 #
 # SLO-measurement gate for transport-resilience §P3 (GAP-3): a long-lived /
 # interactive session keeps ONE alternate transport WARM (the relay path, kept
@@ -46,7 +46,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CLI_DIR="$ROOT/cli"
-BIN="${FILJOB_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILJOB_BIN:-$CLI_DIR/target/release/tunlion}"
 # Verbosity: the resilience PROOF lines this gate greps for (stall detected,
 # repairing in place, warm cutover, signaling reconnected, falling back to the
 # TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
@@ -109,7 +109,7 @@ say "setup: local coturn (static-auth-secret) on 127.0.0.1:$TURN_PORT"
 turnserver -n --no-tls --no-dtls --no-cli \
   --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
   --listening-port="$TURN_PORT" --min-port="$TURN_MINP" --max-port="$TURN_MAXP" \
-  --realm=filament.sim --lt-cred-mech --fingerprint \
+  --realm=tunlion.sim --lt-cred-mech --fingerprint \
   --allow-loopback-peers \
   --static-auth-secret="$TURN_SECRET" \
   >"$WORK/turn.log" 2>&1 &

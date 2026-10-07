@@ -1,16 +1,16 @@
-// filament, anywhere-to-anywhere P2P file transfer, CLI end.
+// tunlion, anywhere-to-anywhere P2P file transfer, CLI end.
 //
 // Speaks the exact same wire protocol as the browser app at
 // https://tunlion.autumated.com: Socket.IO signaling, perfect-negotiation
 // WebRTC, one-time pairing codes, and sid-framed chunk transfer with
-// offset-based resume. A browser is a first-class peer: `filament send` can
+// offset-based resume. A browser is a first-class peer: `tunlion send` can
 // deliver straight to a phone with nothing installed on it.
 //
-//   filament send video.mp4 --code          mint a speakable one-time code
-//   filament receive clever-lynx-63          claim it on the other machine
-//   filament send ./dir --room demo         directories are tarred on the fly
-//   tar c logs | filament send - --name logs.tar --code
-//   filament receive -y --dir ~/Drops       auto-accept into a directory
+//   tunlion send video.mp4 --code          mint a speakable one-time code
+//   tunlion receive clever-lynx-63          claim it on the other machine
+//   tunlion send ./dir --room demo         directories are tarred on the fly
+//   tar c logs | tunlion send - --name logs.tar --code
+//   tunlion receive -y --dir ~/Drops       auto-accept into a directory
 //
 // Failure-mode ledger: ../docs/cli-resilience.md, every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
@@ -22,7 +22,7 @@ mod subnet_forward;
 mod diag;
 use filament_transport::direct;
 mod doctor;
-/// `filament ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
+/// `tunlion ephemeral`: auth-key delegation for ephemeral devices, pre-authorized
 /// self-enrollment, and delegated principal ceiling enforcement.
 mod ephemeral;
 mod fleet;
@@ -41,7 +41,7 @@ mod exec_recv;
 mod exec_send;
 mod sync_cmd;
 mod ssh_ca;
-/// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
+/// `tunlion expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;
 mod holepunch;
@@ -83,22 +83,22 @@ mod daemon_ctl;
 mod renewal_lifecycle;
 /// Peer-identity proof/expose lifecycle handlers.
 mod identity_lifecycle;
-/// `filament enroll` and its shared helpers.
+/// `tunlion enroll` and its shared helpers.
 mod enrollment;
-/// `filament introduce` / `filament depart`.
+/// `tunlion introduce` / `tunlion depart`.
 mod membership;
-/// `filament pair` and its pair-specific helpers.
+/// `tunlion pair` and its pair-specific helpers.
 mod pair_cmd;
 #[cfg(test)]
 use pair_cmd::invitation_not_a_code_msg;
-/// `filament up` / `filament logs`.
+/// `tunlion up` / `tunlion logs`.
 mod up_logs;
-/// `filament add --for`.
+/// `tunlion add --for`.
 mod add_for;
-/// `filament recv`, the receive-side event loop.
+/// `tunlion recv`, the receive-side event loop.
 mod recv_cmd;
 use recv_cmd::recv_cmd;
-/// `filament send`.
+/// `tunlion send`.
 mod send_cmd;
 /// The CLI dispatch table.
 mod dispatch;
@@ -106,7 +106,7 @@ use dispatch::async_main;
 /// Bare-argument routing and the first-screen actions.
 mod first_screen;
 pub(crate) use first_screen::{classify_bare_token, first_screen_actions};
-/// `filament update`.
+/// `tunlion update`.
 mod update_cmd;
 pub(crate) use update_cmd::update_cmd;
 /// Device lookups and views.
@@ -172,7 +172,7 @@ pub(crate) use shell_support::shell_grant_names_at;
 #[cfg(test)]
 pub(crate) use shell_support::any_shell_grant_at;
 use enrollment::{enroll_cmd};
-/// `filament up --install`: the managed-service unit, per platform.
+/// `tunlion up --install`: the managed-service unit, per platform.
 mod install_service;
 use install_service::install_system_service;
 /// The devices.json substrate: load, atomic upsert, locked mutation.
@@ -475,7 +475,7 @@ impl UiCapability {
             // #208: a confirmation should cost ONE keypress, not a key and an
             // Enter. On a TTY read a single key with crossterm (raw mode); bare
             // Enter takes the capitalised default (N). Scripts/pipes keep the
-            // line-reading path below, so `echo y | filament ...` is unchanged.
+            // line-reading path below, so `echo y | tunlion ...` is unchanged.
             if std::io::stdin().is_terminal() {
                 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
                 use std::io::Write as _;
@@ -593,7 +593,7 @@ fn trailing_num_width(s: &str) -> usize {
 
 /// ADVISORY hint that a typed code is a PAIRING code (vs a one-time transfer
 /// code). Both are now `word-word-DIGITS`; the only structural difference is the
-/// trailing-number WIDTH, a 4-digit nameplate is what `filament pair` / the
+/// trailing-number WIDTH, a 4-digit nameplate is what `tunlion pair` / the
 /// browser "create code" mints, whereas a transfer code ends in 3 digits. This
 /// is UX-only, it NEVER authenticates (PAKE/SPAKE2 does), so it's safe to be
 /// approximate; a mismatch still fails LOUDLY with the right next command.
@@ -774,7 +774,7 @@ impl PartMeta {
 /// True when the env gate is set (`direct_enabled`), OR this is the L2/ssh
 /// acceptor (`l2_enabled`), OR this is the long-lived `up` daemon (`daemon`).
 ///
-/// The daemon case is the anti-glare fix for a PLAIN `filament up` (no `--shell`,
+/// The daemon case is the anti-glare fix for a PLAIN `tunlion up` (no `--shell`,
 /// no `FILAMENT_L2`): two such daemons that are known devices to each other each
 /// fire a KnownPeer for the other and each tries to be the WebRTC initiator. The
 /// two offers collide (GLARE); the polite side drops and rebuilds as a responder,
@@ -890,7 +890,7 @@ fn enrollment_refusal(prior: &Value) -> Option<String> {
     let revoked = prior["certRevoked"].as_bool() == Some(true)
         || prior["principalState"].as_str() == Some(PRINCIPAL_STATE_REVOKED);
     if revoked {
-        Some("this device was revoked; the owner must run 'filament devices restore <name>' to allow it back".to_string())
+        Some("this device was revoked; the owner must run 'tunlion devices restore <name>' to allow it back".to_string())
     } else {
         None
     }
@@ -984,10 +984,10 @@ fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
     flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(default_drop_dir)
 }
 
-/// The built-in drop directory when nothing is configured (~/Filament). Shared
+/// The built-in drop directory when nothing is configured (~/Tunlion). Shared
 /// with the settings readout so it shows the true default.
 pub(crate) fn default_drop_dir() -> PathBuf {
-    platform::Paths::home_dir().join("Filament")
+    platform::Paths::home_dir().join("Tunlion")
 }
 
 
@@ -1459,8 +1459,8 @@ fn down_cmd() -> Result<()> {
 
 
 // ---------------------------------------------------------------- reset -----
-// `filament reset`: a conservative clean-slate for the LOCAL machine. It removes
-// only filament's OWN state under the config dir (identity/overlay keys, the
+// `tunlion reset`: a conservative clean-slate for the LOCAL machine. It removes
+// only tunlion's OWN state under the config dir (identity/overlay keys, the
 // paired-device store, the capability store, pending consent requests, the
 // managed ssh material) and strips the delimited `# BEGIN/END filament-managed
 // <device>` blocks it installed in ~/.ssh/authorized_keys. It NEVER touches the
@@ -1589,7 +1589,7 @@ fn peer_authz(conn: &mut Conn, pid: &str) -> PeerAuthz {
 ///
 /// The old rule was "contains a dash and any digit", which was fine while the
 /// name only arrived through --for and became wrong the moment it went
-/// positional: `add my-laptop-2` was answered with "run filament join
+/// positional: `add my-laptop-2` was answered with "run tunlion join
 /// my-laptop-2".
 fn token_is_pairing_code(token: &str) -> bool {
     let segs: Vec<&str> = token.split('-').collect();
@@ -1692,7 +1692,7 @@ fn default_mount_point(peer: &str, remote: &str) -> String {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "files".to_string());
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join("Filament Mounts").join(peer).join(leaf).display().to_string()
+    home.join("Tunlion Mounts").join(peer).join(leaf).display().to_string()
 }
 
 

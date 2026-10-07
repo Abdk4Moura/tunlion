@@ -11,7 +11,7 @@
 # Two network namespaces on one host, because each daemon needs its own kernel
 # filament0 (l3::ifname() is a const) and its own WireGuard device.
 set -uo pipefail
-BIN=${FILAMENT_BIN:-/tmp/wg-bin/filament}
+BIN=${FILAMENT_BIN:-/tmp/wg-bin/tunlion}
 W=/tmp/wg-e2e
 FAIL=0
 say() { printf '\n=== %s\n' "$*"; }

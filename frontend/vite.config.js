@@ -73,7 +73,7 @@ const swVersion = {
       src = src.replace(/__BUILD_ID__/g, buildId)
       fs.writeFileSync(swPath, src)
       // eslint-disable-next-line no-console
-      console.log(`[sw-version] stamped dist/sw.js cache -> filament-${buildId}`)
+      console.log(`[sw-version] stamped dist/sw.js cache -> tunlion-${buildId}`)
     } catch (e) {
       // eslint-disable-next-line no-console
       console.warn('[sw-version] could not stamp dist/sw.js:', String(e))

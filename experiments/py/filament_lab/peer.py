@@ -1,4 +1,4 @@
-"""Peer — a known-device Filament peer (control plane only).
+"""Peer — a known-device Tunlion peer (control plane only).
 
 Wraps a Signaling connection with the device-pairing presence flow:
   * subscribe to channel_of(secret) for one or more known devices,
@@ -57,7 +57,7 @@ class Peer:
     """A controllable known-device peer.
 
     secrets: name -> 64-hex device secret (as in devices.json). We subscribe to
-    channel_of(secret) for each, so the real `filament up` holding the same
+    channel_of(secret) for each, so the real `tunlion up` holding the same
     secret discovers us (and we discover it) via the symmetric known-peer emit.
     """
 

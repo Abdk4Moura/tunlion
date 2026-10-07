@@ -52,7 +52,7 @@ jobs:
     name: deterministic core ratchet
     runs-on: ubuntu-latest
     # The suite genuinely takes this long: the CI attempt at 45 was cut off
-    # mid-run with a filament still resident, and a local release run measured
+    # mid-run with a tunlion still resident, and a local release run measured
     # roughly the same. This is slow feedback and that is a real cost, accepted
     # because the job only triggers on cli/** and backend/** changes. If it
     # becomes the bottleneck, the answer is to make gates faster or narrow the
@@ -81,7 +81,7 @@ jobs:
       # misreading that cost 90 minutes a run.
       - name: Build the gate binary
         working-directory: cli
-        run: cargo build --bin filament --features test-hooks
+        run: cargo build --bin tunlion --features test-hooks
 
       # `|| true`: the suite is expected to exit nonzero while known-red gates
       # remain. The ratchet, not the suite's exit code, is what gates this job.

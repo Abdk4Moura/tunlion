@@ -10,7 +10,7 @@
 //!
 //! NO member is definition-gated. Three statement-level cfg attributes travel with
 //! their bodies (one in shell_root_note, two in service_manager_for_pid). The
-//! pre-check confirmed no member holds a `filament <command>` instruction line, so
+//! pre-check confirmed no member holds a `tunlion <command>` instruction line, so
 //! the two hardcoded-file-list tests are unaffected by this move.
 use crate::devices_store::devices_path;
 use crate::file_io::pidfile;
@@ -21,10 +21,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// True if ANY known device has been granted the `shell` capability. The daemon
-/// uses this to switch L2/shell ON even for a plain `filament up`: otherwise
-/// `filament grant <dev> shell` writes a grant the running daemon never consults
+/// uses this to switch L2/shell ON even for a plain `tunlion up`: otherwise
+/// `tunlion grant <dev> shell` writes a grant the running daemon never consults
 /// (l2_enabled was set only by --shell/--shell-only at startup), so the grant
-/// silently did nothing and `filament shell --ssh` timed out. With this, a grant alone is
+/// silently did nothing and `tunlion shell --ssh` timed out. With this, a grant alone is
 /// enough; the per-device cap gate (auto_allows || device_allows) still denies
 /// every non-granted device, so this does NOT broaden access, it only honors the
 /// grants that already exist.

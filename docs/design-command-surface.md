@@ -1,11 +1,11 @@
-# filament — command-surface simplification spec
+# tunlion — command-surface simplification spec
 
 Status: design (UX pass). Companion to `design-pairing-ux.md` (the model) and
 `ux-spec-pairing.md` (the surface UX). Goal: a new user meets ~6–8 verbs, not 32.
 
 ## The one-sentence spec
 
-**The noun is the command** (`filament <file|code|device|device:port>` covers send /
+**The noun is the command** (`tunlion <file|code|device|device:port>` covers send /
 receive / shell / forward), **six named everyday verbs** carry the rest (`pair`,
 `devices`, `up`, `mint`, `requests`, `doctor`), the **reach cluster collapses 8→4** and
 **config 5→1** via `--off`/param folding, identity-admin hides behind one `identity`
@@ -28,44 +28,44 @@ and config is 5 verbs for read/write/reset. Everything else just needs grouping.
 
 ## Reduced surface — before → after
 
-Legend: **keep** · **positional** (`filament <thing>`) · **merge→X** · **flag**
+Legend: **keep** · **positional** (`tunlion <thing>`) · **merge→X** · **flag**
 (`--off`/param) · **ns:X** (namespaced) · **alias** (hidden, deprecated, still works).
 
 | current | disposition | after |
 |---|---|---|
-| `send FILE` | positional + keep | `filament <file>`; `send` stays explicit |
-| `recv CODE` | positional + keep | `filament <code>`; `recv` stays explicit |
-| `ssh DEV` | merge→shell | `filament shell <dev>` / bare `filament <dev>`; `ssh`=alias (arg passthrough preserved) |
+| `send FILE` | positional + keep | `tunlion <file>`; `send` stays explicit |
+| `recv CODE` | positional + keep | `tunlion <code>`; `recv` stays explicit |
+| `ssh DEV` | merge→shell | `tunlion shell <dev>` / bare `tunlion <dev>`; `ssh`=alias (arg passthrough preserved) |
 | `pty DEV` (hidden) | merge→shell | folded into `shell`; `pty`=alias |
-| `netcat DEV RPORT` | merge→reach | `filament reach <dev>:<rport>`; `netcat`=alias |
-| `dial DEV PORT` | merge→reach | `filament reach <dev>:<port>`; `dial`=alias |
-| `forward LP DEV RP` | keep + positional | `filament <dev>:<rport>` (persistent listener); verb stays |
-| `proxy` | flag→reach | `filament reach --socks [--port]`; `proxy`=alias |
-| `expose PORT` | keep | `filament expose <port>` (`--list`, `--peer`) |
-| `unexpose PORT` | flag | `filament expose <port> --off`; `unexpose`=alias |
-| `mount …` | keep | `filament mount <dev>:<dir> <mnt>` |
-| `unmount MNT` | flag | `filament mount --off <mnt>`; `unmount`=alias |
-| `serve-tun` | ns:net (advanced) | `filament net serve-tun`; alias kept |
-| `pair` | keep (everyday) | `filament pair` |
-| `devices` | keep (everyday) | `filament devices` (+ `forget`/`rename`/`promote`) |
-| `introduce A B` | ns:devices | `filament devices vouch <a> <b>`; alias kept |
-| `grant DEV CAP` | keep | `filament grant <dev> <cap>` |
-| `revoke DEV CAP` | keep (do NOT merge) | `filament revoke <dev> <cap>` — see below |
-| `up` | keep (everyday) | `filament up` |
-| `down` | keep | `filament down` |
+| `netcat DEV RPORT` | merge→reach | `tunlion reach <dev>:<rport>`; `netcat`=alias |
+| `dial DEV PORT` | merge→reach | `tunlion reach <dev>:<port>`; `dial`=alias |
+| `forward LP DEV RP` | keep + positional | `tunlion <dev>:<rport>` (persistent listener); verb stays |
+| `proxy` | flag→reach | `tunlion reach --socks [--port]`; `proxy`=alias |
+| `expose PORT` | keep | `tunlion expose <port>` (`--list`, `--peer`) |
+| `unexpose PORT` | flag | `tunlion expose <port> --off`; `unexpose`=alias |
+| `mount …` | keep | `tunlion mount <dev>:<dir> <mnt>` |
+| `unmount MNT` | flag | `tunlion mount --off <mnt>`; `unmount`=alias |
+| `serve-tun` | ns:net (advanced) | `tunlion net serve-tun`; alias kept |
+| `pair` | keep (everyday) | `tunlion pair` |
+| `devices` | keep (everyday) | `tunlion devices` (+ `forget`/`rename`/`promote`) |
+| `introduce A B` | ns:devices | `tunlion devices vouch <a> <b>`; alias kept |
+| `grant DEV CAP` | keep | `tunlion grant <dev> <cap>` |
+| `revoke DEV CAP` | keep (do NOT merge) | `tunlion revoke <dev> <cap>` — see below |
+| `up` | keep (everyday) | `tunlion up` |
+| `down` | keep | `tunlion down` |
 | `status` | keep + absorb | absorbs `ping`, `cap-status`, `addr --json` |
-| `ping DEV` (hidden) | merge→status/doctor | `filament status <dev>` / `doctor <dev>`; alias kept |
-| `doctor` | keep | `filament doctor [dev]` |
-| `addr` | keep (thin) | `filament addr`; device-info → `devices <name>` |
+| `ping DEV` (hidden) | merge→status/doctor | `tunlion status <dev>` / `doctor <dev>`; alias kept |
+| `doctor` | keep | `tunlion doctor [dev]` |
+| `addr` | keep (thin) | `tunlion addr`; device-info → `devices <name>` |
 | `set K V` | keep + absorb | `set K V` write · `set K` read · `set K --unset` reset |
-| `get K` | merge→set | `filament set <k>`; `get`=alias (bare stdout preserved) |
-| `unset K` | flag→set | `filament set <k> --unset`; `unset`=alias |
+| `get K` | merge→set | `tunlion set <k>`; `get`=alias (bare stdout preserved) |
+| `unset K` | flag→set | `tunlion set <k> --unset`; `unset`=alias |
 | `config …` | alias | hidden raw escape hatch stays |
-| `backup` | keep (tail) | `filament backup` (rsync) |
-| `update` | keep (tail) | `filament update` |
+| `backup` | keep (tail) | `tunlion backup` (rsync) |
+| `update` | keep (tail) | `tunlion update` |
 | `completions`/`man` | keep hidden | plumbing |
-| *(new)* `mint` | new, everyday | `filament mint` |
-| *(new)* `requests` | new, everyday | `filament requests` |
+| *(new)* `mint` | new, everyday | `tunlion mint` |
+| *(new)* `requests` | new, everyday | `tunlion requests` |
 | *(new)* identity-admin | ns:identity | `identity init\|restore\|rotate\|revoke\|certify\|promote` |
 | *(new)* `restore` | top-level alias of `identity restore` | emergency discoverability |
 
@@ -73,7 +73,7 @@ Legend: **keep** · **positional** (`filament <thing>`) · **merge→X** · **fl
 
 ## Positional rules — target shape → action
 
-`filament <thing>` resolves by the **shape of the token**, deny-by-default on ambiguity.
+`tunlion <thing>` resolves by the **shape of the token**, deny-by-default on ambiguity.
 
 | token shape | example | resolves to |
 |---|---|---|
@@ -82,7 +82,7 @@ Legend: **keep** · **positional** (`filament <thing>`) · **merge→X** · **fl
 | bare word = known device petname | `laptop` | **shell** |
 | `device:port` | `laptop:5432` | **forward** (local listener → peer port) |
 | `device.mesh` / `.mesh:port` | `gpu.mesh:8080` | **reach** over the mesh |
-| nothing, at a TTY | `filament` | guided picker |
+| nothing, at a TTY | `tunlion` | guided picker |
 | nothing, non-TTY | (piped) | print help, non-zero exit (never block) |
 
 **Tie-breaks (explicit — guessing wrong is a security event):**
@@ -90,21 +90,21 @@ Legend: **keep** · **positional** (`filament <thing>`) · **merge→X** · **fl
 - Path form always wins for files; device petnames never contain `/` or `.`, so the
   namespaces are structurally disjoint except the bare-word overlap.
 - Code-vs-device collision is near-impossible (distinct grammar); if ever, the device
-  wins (you named something you already trust); force with `filament recv <code>`.
-- **Positional never escalates:** `filament laptop` opens a shell ONLY if `laptop`
+  wins (you named something you already trust); force with `tunlion recv <code>`.
+- **Positional never escalates:** `tunlion laptop` opens a shell ONLY if `laptop`
   already holds the `shell` cap. No cap → it connects and says so. The positional
   shortcut is a **router, never an authorizer**.
 
-## `filament --help` after
+## `tunlion --help` after
 
 ```
-filament — send files and reach machines, peer to peer. no account.
+tunlion — send files and reach machines, peer to peer. no account.
 
 USAGE
-  filament <file>              send it            (mints a one-time code + QR)
-  filament <code>              claim a code and receive
-  filament <device>            open a shell on a device you know
-  filament <device>:<port>     forward a local port to that device
+  tunlion <file>              send it            (mints a one-time code + QR)
+  tunlion <code>              claim a code and receive
+  tunlion <device>            open a shell on a device you know
+  tunlion <device>:<port>     forward a local port to that device
 
 EVERYDAY
   pair        add your own device, or let someone in
@@ -114,7 +114,7 @@ EVERYDAY
   requests    approvals waiting for you
   doctor      diagnose a link that won't connect
 
-MORE  (run `filament <cmd> --help`)
+MORE  (run `tunlion <cmd> --help`)
   reach · forward · expose · mount     reach a service on a peer
   shell · backup                       remote shell · rsync sync
   grant · revoke                       change what a device may do
@@ -132,8 +132,8 @@ still runs, prints one dim stderr line teaching the new form (reusing the `↳` 
 and exits with the same status it always did:
 
 ```
-note: `filament netcat` is now `filament reach`. Same behavior.
-↳ filament reach laptop:5432
+note: `tunlion netcat` is now `tunlion reach`. Same behavior.
+↳ tunlion reach laptop:5432
 ```
 
 Rules: **stderr only** (stdout stays script-clean), **once per invocation**,

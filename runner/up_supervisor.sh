@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DEPRECATED — superseded by core reconnect in filament v0.2.1-beta.5 (P2/GAP-2).
+# DEPRECATED — superseded by core reconnect in tunlion v0.2.1-beta.5 (P2/GAP-2).
 # Kept for belt-and-suspenders only; bringup_t4.sh no longer wraps the acceptor.
 #
 # As of P2 (docs/design/transport-resilience.md §2.5), the long-lived `up`/`up --dir`
@@ -11,24 +11,24 @@
 # with the loop reverted ZOMBIES). Use this script only if you must run an OLDER
 # binary that predates the core fix.
 #
-# WHY IT EXISTED: the filament socket.io client is built with reconnect(false)
+# WHY IT EXISTED: the tunlion socket.io client is built with reconnect(false)
 # (cli/src/net.rs), and `up`/`up --dir` USED TO run ONE signaling connection with no
 # outer reconnect loop. On a flaky WAN link, when the signaling TCP was severed the
 # acceptor's socket died and it never re-announced — a zombie the sender could no
 # longer discover (reproduced deterministically by runner/sim/flaky_sim_test.sh).
-# Short discrete `filament send`s recovered (each reconnects fresh); a long-lived
+# Short discrete `tunlion send`s recovered (each reconnects fresh); a long-lived
 # acceptor did not. P2 fixes that IN-CORE, retiring this crutch.
 #
 # This supervisor made the acceptor self-healing WITHOUT a core CLI change: it runs
 # the acceptor and PROACTIVELY RESTARTS it on a cadence (and immediately if it exits),
 # so a fresh acceptor — which re-announces and is rediscoverable — is always present
 # within `--cadence` seconds. Restarting `up --dir` is safe/idempotent: it just
-# receives files into the inbox, and filament keeps partials + resumes, so an
+# receives files into the inbox, and tunlion keeps partials + resumes, so an
 # interrupted transfer continues on the next send.
 #
 # Usage:
 #   up_supervisor.sh --cadence 25 --log /path/up.log -- \
-#       filament up --server "$SRV" --name-as box-din --dir "$INBOX" --relay
+#       tunlion up --server "$SRV" --name-as box-din --dir "$INBOX" --relay
 #
 # Env: FILAMENT_CONFIG_DIR / HOME / FILAMENT_L2 are inherited by the child as set.
 set -u

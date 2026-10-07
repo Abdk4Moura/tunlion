@@ -2,7 +2,7 @@
 # grant / revoke / devices honesty for delegated (ceiling-bounded) devices.
 # Standalone, hermetic, fixture port 8104 ONLY.
 #
-#   FILAMENT_BIN=/path/to/filament ./cap-verbs-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./cap-verbs-gates.sh
 #
 # A delegated device's authority comes from the enrollment ceiling on its fleet
 # certificate, never from the grant store, so `grant`/`revoke` cannot bind for it.
@@ -20,7 +20,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8104
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

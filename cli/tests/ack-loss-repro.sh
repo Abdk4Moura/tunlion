@@ -40,7 +40,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$(cd "$CLI_DIR" && cargo metadata --format-versi
 # assertion is compiled out in release, so a `--release --features test-hooks`
 # build has the injection hooks AND no panic, which is the only way to get a
 # verdict out of this script until the ordering question is settled.
-BIN="${FILAMENT_BIN:-${TARGET_DIR:-$CLI_DIR/target}/debug/filament}"
+BIN="${FILAMENT_BIN:-${TARGET_DIR:-$CLI_DIR/target}/debug/tunlion}"
 SERVER="${FILAMENT_TEST_SERVER:-http://127.0.0.1:8077}"
 WORK="$(mktemp -d /tmp/filament-ackloss.XXXXXX)"
 PYV="${FILAMENT_TEST_VENV:-/root/filament-bench/venv}/bin/python"

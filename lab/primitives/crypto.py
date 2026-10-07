@@ -5,13 +5,13 @@ provides confidentiality for a given link, so a topology states its security
 model explicitly and the engine can validate the choice against the carrier:
 
   none     — rely on the carrier's own encryption (or none at all). Correct for
-             the `filament` link: filament's data channel is already DTLS-SRTP
+             the `tunlion` link: tunlion's data channel is already DTLS-SRTP
              and pair-proof authenticated, so layering WG on top is redundant.
              Also the honest label for the bare `pipe`/`udp` baselines.
   wg-noise — WireGuard's Noise_IKpsk2 handshake + ChaCha20-Poly1305. This is what
              the `wg` carrier supplies natively; selecting it on a non-wg carrier
              is an error (we don't have a standalone Noise implementation).
-  dtls     — DTLS (e.g. the filament channel). A label for "the carrier already
+  dtls     — DTLS (e.g. the tunlion channel). A label for "the carrier already
              gives us DTLS"; not independently established by the lab.
 
 Interface:
@@ -28,7 +28,7 @@ _COHERENT = {
     "pipe":     {"none"},
     "udp":      {"none"},
     "wg":       {"wg-noise"},
-    "filament": {"none", "dtls"},  # the channel is DTLS; `none` = lean on it
+    "tunlion": {"none", "dtls"},  # the channel is DTLS; `none` = lean on it
 }
 
 
@@ -48,5 +48,5 @@ def describe(crypto: str) -> str:
     return {
         "none": "no lab-added crypto (lean on the carrier or run in the clear)",
         "wg-noise": "WireGuard Noise_IKpsk2 + ChaCha20-Poly1305 (carrier-native)",
-        "dtls": "DTLS provided by the carrier (e.g. filament's data channel)",
+        "dtls": "DTLS provided by the carrier (e.g. tunlion's data channel)",
     }.get(crypto, crypto)

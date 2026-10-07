@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# filament job-runner — HOST pairing helper.
+# tunlion job-runner — HOST pairing helper.
 #
 # Generates the three pair secrets (ctl/din/dout) and plants them in the host's
 # job-runner config dirs, then prints the exact env block to paste into the T4

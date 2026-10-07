@@ -1,19 +1,19 @@
-# Async send + enterprise for filament: opt-in layers on a zero-knowledge core
+# Async send + enterprise for tunlion: opt-in layers on a zero-knowledge core
 
 **Status:** design (doc-only). **Audience:** decision-grade — does this earn the
-two markets filament cedes today, without spending the P2P user's simplicity or
+two markets tunlion cedes today, without spending the P2P user's simplicity or
 the project's security posture?
 
 ---
 
 ## TL;DR — the thesis, and how the three hard constraints are met
 
-Filament is pure peer-to-peer: account-free, end-to-end encrypted, pairing-based.
+Tunlion is pure peer-to-peer: account-free, end-to-end encrypted, pairing-based.
 Both ends must be online at once. That is the source of its two biggest
 "won't-use-it" gaps:
 
 - **Async / send-to-anyone.** It cannot send a file to someone who is offline,
-  on another of your own devices that is asleep, or who is not a filament user at
+  on another of your own devices that is asleep, or who is not a tunlion user at
   all. That cedes the WeTransfer / email-a-link / Drive market.
 - **Enterprise IT.** Ungoverned P2P + arbitrary pairing + a remote shell is the
   exact shape corporate IT *blocks*: no SSO, no ACLs, no audit, no perimeter
@@ -22,7 +22,7 @@ Both ends must be online at once. That is the source of its two biggest
 Both gaps reduce to the same move: **add a controlled, server-side component on
 top of P2P.** The danger is that the obvious version of that move — "just run a
 server that holds the files / brokers the trust" — destroys the two things that
-make filament filament (a default with no middleman, and a server that never
+make tunlion tunlion (a default with no middleman, and a server that never
 sees plaintext).
 
 **The thesis: build exactly one new server-side primitive — a *zero-knowledge
@@ -52,7 +52,7 @@ How the three constraints are satisfied — stated up front, defended in §3, §
 3. **Ideally makes security BETTER.** It does, on three axes (§3.4): (a) the async
    path *replaces* the insecure thing real users do today — emailing the file,
    dropping it in Drive, using WeTransfer — all of which expose plaintext to a
-   provider; filament's store cannot read it. (b) Enterprise enrollment turns
+   provider; tunlion's store cannot read it. (b) Enterprise enrollment turns
    ad-hoc spoken pairing codes into **SSO-bound device identity**, raising the
    trust root from "whoever typed the code" to "this device belongs to this
    authenticated employee." (c) Self-hosting the store + signaling + `--no-relay`
@@ -162,7 +162,7 @@ sealed delivery**, and (c) **claim-link keys** for non-users.
 
 One server-side primitive — a **sealed mailbox** — unlocks all three gaps:
 async-to-self, send-to-anyone, and the enterprise data plane. It is *additive*:
-when both peers are online, filament still does direct P2P first (§6). The store
+when both peers are online, tunlion still does direct P2P first (§6). The store
 is the fallback the user opts into per-send, or that an always-on node provides
 transparently.
 
@@ -194,7 +194,7 @@ key material live inside an envelope the server cannot open
 a new device's public key
 ([Keybase key model](https://keybase.io/blog/keybase-new-key-model)).
 
-**(b) Sealed-to-link (recipient is not a filament user / not yet paired).**
+**(b) Sealed-to-link (recipient is not a tunlion user / not yet paired).**
 The sender generates `Kc`, encrypts the file, and **embeds `Kc` in the URL
 fragment** of a claim link:
 `https://<host>/claim/<blobid>#<base64url(Kc)>`. The fragment after `#` is
@@ -217,7 +217,7 @@ no code path where the store receives a key or a plaintext byte. (The phased pla
 
 1. **Async-to-self (Syncthing-shaped).** Your laptop sends to your phone; the
    phone is asleep. Two sub-options, both opt-in: (i) **mesh park** — if you run an
-   always-on filament node (a home server, a `up` acceptor), it holds the sealed
+   always-on tunlion node (a home server, a `up` acceptor), it holds the sealed
    blob and forwards when the phone wakes; (ii) **hosted mailbox** — our store (or
    the org's) parks it. The recipient device is already paired, so this is
    sealed-to-pubkey (3.1a); the phone pulls + decrypts on wake. No new trust:
@@ -225,7 +225,7 @@ no code path where the store receives a key or a plaintext byte. (The phased pla
 
 2. **Send-to-anyone (the WeTransfer killer).** A claim link (3.1b) a non-user
    opens in any browser, zero-install. This is the single feature that opens the
-   email-a-link market filament cedes today — and it opens it *more securely than
+   email-a-link market tunlion cedes today — and it opens it *more securely than
    the incumbent* (§3.4).
 
 3. **Enterprise data plane.** The org **self-hosts the same store inside its
@@ -260,7 +260,7 @@ no code path where the store receives a key or a plaintext byte. (The phased pla
 
 **Why this is strictly better than what users do today.** The async path competes
 with email attachments, Google Drive links, and WeTransfer — **all of which hand
-the provider your plaintext.** Filament's store is zero-knowledge: it competes by
+the provider your plaintext.** Tunlion's store is zero-knowledge: it competes by
 being the option where *the server literally cannot read the file*. That is the
 "makes security better" claim made concrete — we are not adding a risky new
 surface, we are giving users a sealed alternative to the unsealed thing they
@@ -328,7 +328,7 @@ are streamed E2E-encrypted to a recorder node the org runs — Tailscale never s
 them** ([Tailscale session recording](https://tailscale.com/kb/1246/tailscale-ssh-session-recording),
 [auditable access](https://tailscale.com/blog/auditable-infrastructure-access)).
 
-Filament's audit events:
+Tunlion's audit events:
 - **Transfers:** `{actor SSO sub, recipient routing token, file SHA-256, size,
   timestamp, route (direct/relay/store)}` — enough to prove *what hash went where,
   when*, for chain-of-custody, with no plaintext.
@@ -385,7 +385,7 @@ escape hatch — never a silent backdoor:**
   on keeps full E2E; we never weaken the default to court the DLP buyer.
 
 This is the same line Tailscale draws — E2E by default, org-run recorders/inspection
-as an opt-in the customer operates — and it keeps filament's promise honest for the
+as an opt-in the customer operates — and it keeps tunlion's promise honest for the
 99% who never enable it.
 
 ---
@@ -399,8 +399,8 @@ casual, no-account, pair-and-go path is provably untouched. Per feature:
 |---|---|---|
 | **Direct P2P send (today)** | Identical. Pair once, send. No account, no login, no config. Direct path is still *preferred* (the ladder `direct > holepunch > relay`, transport-resilience §2.1); the store is never tried when both ends are online. | Naive: route everything through the store "for consistency." Avoided: store is strictly fallback/opt-in; online peers never touch it. |
 | **Async-to-self** | Additive. When the target device is asleep, the UI offers *"park it — your phone will get it when it wakes."* One tap. No new concept; the user already understands "send to my phone." | Naive: make the user configure a mailbox/account first. Avoided: if they run an always-on node it's automatic; the hosted mailbox needs no account (sealed-to-pubkey uses the existing pairing). |
-| **Send-to-anyone (claim link)** | Additive. When the recipient isn't a paired peer, the UI offers *"get a link to share."* The sender gets a URL; the recipient opens it in any browser, zero install. | Naive: require the recipient to install filament or sign up. Avoided: link mode is browser-only, account-free; the WASM decryptor is already in the frontend. |
-| **SSO enrollment** | An enrolled employee sees *"join via <company>"* once, through their normal company login. Thereafter it is the same pair-and-go filament. They never see ACLs, audit config, or store settings. | Naive: surface org policy/ACLs to the end user. Avoided: all governance is in the admin plane; the device just consults policy silently at connect time. |
+| **Send-to-anyone (claim link)** | Additive. When the recipient isn't a paired peer, the UI offers *"get a link to share."* The sender gets a URL; the recipient opens it in any browser, zero install. | Naive: require the recipient to install tunlion or sign up. Avoided: link mode is browser-only, account-free; the WASM decryptor is already in the frontend. |
+| **SSO enrollment** | An enrolled employee sees *"join via <company>"* once, through their normal company login. Thereafter it is the same pair-and-go tunlion. They never see ACLs, audit config, or store settings. | Naive: surface org policy/ACLs to the end user. Avoided: all governance is in the admin plane; the device just consults policy silently at connect time. |
 | **Enterprise audit / ACL / DLP** | Invisible to the end user unless an admin enabled the inspection escape hatch (§5.6), in which case the *honest UX* tells them — which is a feature, not friction. | Naive: per-send consent dialogs. Avoided: ACLs enforce silently (deny-by-default already does); only the rare content-inspection case surfaces, and it *should*. |
 | **`--no-relay` / self-host** | A personal user never sets these. They are admin/power-user flags with safe defaults (relay allowed for reliability, hosted server default). | Naive: ask every user to choose a server. Avoided: `FILAMENT_SERVER` has a working default; orgs override it via MDM, not the user. |
 
@@ -414,7 +414,7 @@ doesn't.
 
 ## 7. How six real systems handle this (and what we borrow)
 
-| System | What it solves | What filament borrows |
+| System | What it solves | What tunlion borrows |
 |---|---|---|
 | **Magic Wormhole** ([docs](https://magic-wormhole.readthedocs.io/en/latest/welcome.html)) | PAKE (SPAKE2) over a low-entropy code; numeric nameplate routes to a mailbox, words are the PAKE secret; one-time code → 1-in-65536 MITM. | Already our pairing model (`pake/src/lib.rs`); the **mailbox shape** is the template for the store's rendezvous (§3). |
 | **Bitwarden Send / Firefox Send** ([Bitwarden](https://bitwarden.com/help/send-encryption/), [how-it-works](https://bitwarden.com/blog/bitwarden-send-how-it-works/)) | Zero-knowledge ephemeral send: client-side AEAD, **key in the URL `#fragment`** (never sent to server), TTL + download-burn. | The **claim-link / sealed-to-link** design (§3.1b), fragment-key handling, TTL/expiry/burn semantics. |
@@ -422,7 +422,7 @@ doesn't.
 | **Keybase** ([key model](https://keybase.io/blog/keybase-new-key-model), [sigchain](https://keybase.io/docs/sigchain)) | Per-device keys; an existing device provisions a new one by signing/encrypting to its pubkey; per-user sigchain as the identity record. | The **device-to-device sealing** pattern for async-to-self (§3.2.1) and the model for SSO-bound device identity as an append-only org record (§5.1). |
 | **Tailscale / Headscale** ([Headscale](https://github.com/juanfont/headscale), [ACLs](https://headscale.net/stable/ref/acls/), [session recording](https://tailscale.com/kb/1246/tailscale-ssh-session-recording), [auditable access](https://tailscale.com/blog/auditable-infrastructure-access)) | OIDC SSO node enrollment, Git-versionable HuJSON ACLs, config audit logs, **E2E SSH session recording to a customer-run recorder**, fully **self-hostable control plane**. | The **entire enterprise layer's shape** (§5): SSO enrollment extending the trust root, HuJSON ACLs over our caps, audit-without-content, self-host = Headscale, session recording E2E to org recorder, the E2E-vs-DLP line. |
 
-The synthesis filament is uniquely positioned for: Wormhole-grade PAKE pairing +
+The synthesis tunlion is uniquely positioned for: Wormhole-grade PAKE pairing +
 Bitwarden-grade sealed ephemeral send + Tailscale-grade governance + Signal-grade
 metadata hygiene, all on **one** zero-knowledge store, with the P2P default
 untouched.
@@ -495,7 +495,7 @@ default change.
 
 Ship the **zero-knowledge store-and-forward node** as the one new server-side
 primitive, and expose async + enterprise as **opt-in layers** on it and the
-existing P2P core. It is the rare move that closes filament's two biggest market
+existing P2P core. It is the rare move that closes tunlion's two biggest market
 gaps while making the *default user's* experience no harder and the *overall*
 security posture **better** — because the async path it adds is a sealed
 replacement for the plaintext habits (email, Drive, WeTransfer) users have today,

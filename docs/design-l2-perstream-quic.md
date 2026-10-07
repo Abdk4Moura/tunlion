@@ -11,7 +11,7 @@ Status: PROPOSED (supersedes the app-level credit approach on branch
 single QUIC stream is an ordered byte stream, so if one logical stream's data is
 not drained by the peer application, it blocks the shared stream and every other
 logical stream stalls behind it. This is head-of-line (HoL) blocking across
-filament's logical streams.
+tunlion's logical streams.
 
 App-level credit (the `feat/l2-credit` attempt) cannot fix this: it throttles how
 much each sid SENDS, but the bytes still serialize through one QUIC stream, and

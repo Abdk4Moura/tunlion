@@ -1,8 +1,8 @@
 // Refusal microcopy for capabilities a key may not carry.
 //
-// This module used to render a guided `filament mint` form with three key types
+// This module used to render a guided `tunlion mint` form with three key types
 // (Fleet / External / CI) and its own capability toggles. That verb is gone:
-// minting collapsed into `filament ephemeral mint`, and the guided flow lives in
+// minting collapsed into `tunlion ephemeral mint`, and the guided flow lives in
 // `interactive_mint_options` in main.rs, next to the code that actually mints.
 //
 // The form was never wired into the Commands enum, so when the verb went away

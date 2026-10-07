@@ -1,6 +1,6 @@
 """tun_io — open a TUN iface fd and read/write raw IP packets (userspace path).
 
-Used by the udp and filament carriers, whose relay process runs INSIDE a node's
+Used by the udp and tunlion carriers, whose relay process runs INSIDE a node's
 netns (spawned via ``ip netns exec``) and attaches to the pre-created TUN iface
 by name. Pure stdlib + ioctl; no external deps.
 

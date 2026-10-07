@@ -19,7 +19,7 @@ const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 pub(crate) const EXAMPLES: &str = "\
 COMMANDS
   Start
-    init                   create your Filament identity and first device
+    init                   create your Tunlion identity and first device
     add                    offer: a code, or an invitation file with --out
     add --for device       ...and enrol them into your mesh (--for person to not)
     join                   accept: join <code>, or join --invite-file <path>
@@ -53,28 +53,28 @@ COMMANDS
     doctor                 diagnose a link
 
 EXAMPLES
-  filament video.mp4                 send it; mints a speakable one-time code + QR
-  filament receive clever-lynx-63    claim a code and receive
-  filament send big.iso --to laptop  send to a remembered device, no code
-  filament add                       offer a code; the other device runs `filament join <code>`
-  filament add --for person          bounded invitation; the other device runs `filament join`
-  filament up --install              always-on receiver (the daemon, autostart)
-  filament shell laptop              open a shell on a known device
-  filament reach laptop              check if a device is reachable
-  filament forward laptop:5432       tunnel to a peer's localhost port
+  tunlion video.mp4                 send it; mints a speakable one-time code + QR
+  tunlion receive clever-lynx-63    claim a code and receive
+  tunlion send big.iso --to laptop  send to a remembered device, no code
+  tunlion add                       offer a code; the other device runs `tunlion join <code>`
+  tunlion add --for person          bounded invitation; the other device runs `tunlion join`
+  tunlion up --install              always-on receiver (the daemon, autostart)
+  tunlion shell laptop              open a shell on a known device
+  tunlion reach laptop              check if a device is reachable
+  tunlion forward laptop:5432       tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://tunlion.autumated.com
-  Run `filament <command> --help` for details.";
+  Run `tunlion <command> --help` for details.";
 
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
 // (next_help_heading groups args, not subcommands), so we omit the auto
 // {subcommands} list entirely and present a curated, GROUPED command reference in
 // the after-help (EXAMPLES). Every subcommand still exists, still works, and still
-// has its own `filament <cmd> --help`; the top-level help just stops being a flat
+// has its own `tunlion <cmd> --help`; the top-level help just stops being a flat
 // 27-item dump with deprecated + canonical names side by side.
 #[command(
-    name = "filament",
+    name = "tunlion",
     version = VERSION,
     about = "One thread across your devices, end-to-end encrypted: send, receive, mount files, and open an authorized shell without an account or cloud upload.",
     after_help = EXAMPLES,
@@ -136,12 +136,12 @@ pub(crate) struct Cli {
 #[derive(Subcommand)]
 pub(crate) enum Cmd {
     // ── Start ───────────────────────────────────────────────────────
-    /// Create your Filament identity and configure this first device.
+    /// Create your Tunlion identity and configure this first device.
     Init {
         /// Name this device (default: hostname).
         #[arg(long)]
         name: Option<String>,
-        /// Directory where received files land (default: ~/Filament).
+        /// Directory where received files land (default: ~/Tunlion).
         #[arg(long)]
         inbox: Option<PathBuf>,
         /// Write the recovery phrase to a new owner-only file for automation.
@@ -223,7 +223,7 @@ pub(crate) enum Cmd {
     /// Add a device or person with consent on both ends.
     #[command(next_help_heading = "Connect")]
     Add {
-        /// Who you are adding: a name for the device or person. `filament add
+        /// Who you are adding: a name for the device or person. `tunlion add
         /// laptop` is the short way to say `--for laptop`, which means a device
         /// of yours called laptop.
         ///
@@ -326,21 +326,21 @@ pub(crate) enum Cmd {
         detach: bool,
         /// With --install: install a SYSTEM service (root, one-time sudo) that gets
         /// CAP_NET_ADMIN from systemd via AmbientCapabilities. The overlay's kernel
-        /// TUN then needs NO setcap on the binary, so `filament update` never prompts
+        /// TUN then needs NO setcap on the binary, so `tunlion update` never prompts
         /// for a password again. Recommended for the kernelspace (kernel-TUN) path.
         #[arg(long)]
         system: bool,
         /// Force the ZERO-PRIVILEGE userspace overlay (an in-process smoltcp netstack
         /// instead of a kernel TUN): no CAP_NET_ADMIN, no /dev/net/tun, works in a
         /// container. Note: host firewall rules do not apply and native tools reach
-        /// <peer>.mesh only via `filament forward <peer>:<port> --socks`. Default is auto (kernel TUN
+        /// <peer>.mesh only via `tunlion forward <peer>:<port> --socks`. Default is auto (kernel TUN
         /// when available, userspace otherwise).
         #[arg(long)]
         userspace: bool,
-        /// Drop directory (default: `filament config dir`, else ~/Filament)
+        /// Drop directory (default: `tunlion config dir`, else ~/Tunlion)
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept seamless `filament shell --ssh` from ANY paired (proof-verified) device,
+        /// Accept seamless `tunlion shell --ssh` from ANY paired (proof-verified) device,
         /// no per-device `grant` needed. Enables the tunnel acceptor too, so you
         /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
         /// required). Prints a security banner.
@@ -352,7 +352,7 @@ pub(crate) enum Cmd {
         shell_only: Option<String>,
         /// The shell program to spawn for PTY sessions (overrides platform default).
         /// Can carry args: `--shell-program "bash -l"`, `"pwsh -NoLogo"`.
-        /// Persistent: use `filament set shell-program "<program>"` for the daemon.
+        /// Persistent: use `tunlion set shell-program "<program>"` for the daemon.
         /// Env: `FILAMENT_SHELL`.
         #[arg(long, value_name = "PROGRAM")]
         shell_program: Option<String>,
@@ -370,7 +370,7 @@ pub(crate) enum Cmd {
         install_system: bool,
         /// When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port
         /// 1080 so native tools (curl, ssh) can reach <peer>.mesh. Opt out
-        /// with --no-proxy-fallback or `filament set auto-proxy off`.
+        /// with --no-proxy-fallback or `tunlion set auto-proxy off`.
         #[arg(long)]
         no_proxy_fallback: bool,
     },
@@ -400,17 +400,17 @@ pub(crate) enum Cmd {
     #[command(
         hide = true,
         after_help = "\x1b[1mExamples:\x1b[0m\n  \
-        filament set                          show every setting + where it came from\n  \
-        filament set auto-extract on          change one setting (partial, never resets others)\n  \
-        filament set shell on --peer laptop   per-device override\n  \
-        filament set drop-dir                 read one value (bare value on stdout)\n  \
-        filament set relay --reset            revert settings to their defaults\n\n\
+        tunlion set                          show every setting + where it came from\n  \
+        tunlion set auto-extract on          change one setting (partial, never resets others)\n  \
+        tunlion set shell on --peer laptop   per-device override\n  \
+        tunlion set drop-dir                 read one value (bare value on stdout)\n  \
+        tunlion set relay --reset            revert settings to their defaults\n\n\
         Keys: name, server, drop-dir, relay, auto-extract, shell, shell-user"
     )]
     Set {
-        /// Setting name (run `filament set` to list them all)
+        /// Setting name (run `tunlion set` to list them all)
         key: Option<String>,
-        /// New value. `filament set` with no arguments lists every setting.
+        /// New value. `tunlion set` with no arguments lists every setting.
         value: Option<String>,
         /// Scope this change to one or more known devices (per-peer settings
         /// only). Comma-separated or repeatable: --peer a,b  or  --peer a --peer b
@@ -456,13 +456,13 @@ pub(crate) enum Cmd {
         action: Option<IdAction>,
     },
     /// Raw config escape hatch (key value lines in ~/.config/filament/config).
-    /// Prefer `filament set`; this is kept for scripts that wrote it directly.
+    /// Prefer `tunlion set`; this is kept for scripts that wrote it directly.
     #[command(hide = true)]
     Config {
         key: Option<String>,
         value: Option<String>,
     },
-    /// Update filament to the latest release
+    /// Update tunlion to the latest release
     #[command(hide = true)]
     Update {
         /// Check only; don't install
@@ -476,7 +476,7 @@ pub(crate) enum Cmd {
     #[command(hide = true)]
     Completions { shell: clap_complete::Shell },
     /// Print the manual. On a TTY, shows readable help; piped, emits roff
-    /// (for `filament man > filament.1`). `filament man routing` shows the
+    /// (for `tunlion man > tunlion.1`). `tunlion man routing` shows the
     /// connection & interface selection model.
     #[command(hide = true)]
     Man {
@@ -525,9 +525,9 @@ pub(crate) enum Cmd {
     ///
     /// The daemon binds the overlay address (a private ULA, reachable only over
     /// the mesh) and forwards each connection to a local target. Needs L3 up
-    /// (`filament set tun-addr auto`). Persists across restarts.
+    /// (`tunlion set tun-addr auto`). Persists across restarts.
     ///
-    /// Use `filament expose <port> --off` to stop exposing a port.
+    /// Use `tunlion expose <port> --off` to stop exposing a port.
     Expose {
         /// Port to publish on the overlay. Omit together with --list or --off.
         port: Option<u16>,
@@ -540,13 +540,13 @@ pub(crate) enum Cmd {
         /// List exposed ports and exit.
         #[arg(long)]
         list: bool,
-        /// Stop exposing the given port (replaces `filament unexpose`).
+        /// Stop exposing the given port (replaces `tunlion unexpose`).
         #[arg(long)]
         off: bool,
     },
     /// Reach a peer: check whether it is reachable, and how (direct/relay + rtt).
     ///
-    /// To TUNNEL to a peer's port, use `filament forward <device>:<port>`.
+    /// To TUNNEL to a peer's port, use `tunlion forward <device>:<port>`.
     #[command(next_help_heading = "Mesh")]
     Reach {
         /// Device to probe (omit for the environment preflight).
@@ -582,7 +582,7 @@ pub(crate) enum Cmd {
         json: bool,
     },
     /// Grant a known device a capability (deny-by-default). `shell` permits
-    /// seamless `filament shell --ssh` into THIS machine, a separate consent from
+    /// seamless `tunlion shell --ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
     Grant {
         /// Known device (petname), or omit with --tag
@@ -603,14 +603,14 @@ pub(crate) enum Cmd {
         #[arg(long)]
         certificate: bool,
     },
-    /// Mount a remote directory over Filament's native filesystem protocol.
+    /// Mount a remote directory over Tunlion's native filesystem protocol.
     /// Read-only is the default; the remote share root and grant remain authoritative.
     Mount {
         /// Known device (petname) to mount from
         peer: Option<String>,
         /// Remote directory path
         remote: Option<String>,
-        /// Local mount point (default: ~/Filament Mounts/<device>/<remote>)
+        /// Local mount point (default: ~/Tunlion Mounts/<device>/<remote>)
         local: Option<String>,
         /// Permit writes when the remote grant also allows them. Read-only is the default.
         #[arg(long)]
@@ -624,7 +624,7 @@ pub(crate) enum Cmd {
         /// Auto-restore this mount on daemon start (off by default)
         #[arg(long, hide = true)]
         save_auto: bool,
-        /// List all filament mounts and their status
+        /// List all tunlion mounts and their status
         #[arg(long)]
         list: bool,
         /// Check if a mount is healthy
@@ -652,13 +652,13 @@ pub(crate) enum Cmd {
         /// Delete a saved mount profile
         #[arg(long, value_name = "NAME", hide = true)]
         delete_profile: Option<String>,
-        /// Unmount a filament mount point (replaces `filament unmount`).
+        /// Unmount a tunlion mount point (replaces `tunlion unmount`).
         #[arg(long, value_name = "PATH")]
         off: Option<String>,
     },
     /// Sync files to/from a peer via rsync over the mesh.
     ///
-    /// Requires rsync on both ends. Uses `filament shell --ssh` as the remote shell,
+    /// Requires rsync on both ends. Uses `tunlion shell --ssh` as the remote shell,
     /// so the same transport and bootstrap logic applies.
     #[command(hide = true)]
     Backup {
@@ -704,7 +704,7 @@ pub(crate) enum Cmd {
     },
     /// Mirror a local directory onto a paired device; only changed chunks move.
     ///
-    /// The receiver's `filament up` writes under its drop directory, so
+    /// The receiver's `tunlion up` writes under its drop directory, so
     /// <remote-dir> is relative to (or absolute within) that directory. The
     /// receiver's consent is the existing pairing and transfer grant: there is
     /// no prompt on either end. Re-running after an interruption moves only
@@ -729,7 +729,7 @@ pub(crate) enum Cmd {
     // deliberate (see ShellPolicy::All); the sentence describing it was not.
     // Rationale lives here, in a comment. The doc line below is what a user
     // reads, so it states the two ways in and nothing else.
-    /// Default: Filament's native PTY. The peer must authorize shell, either
+    /// Default: Tunlion's native PTY. The peer must authorize shell, either
     /// per-device with `grant <device> shell`, or for every paired device at
     /// once by serving `up --shell` (use `up --shell-only a,b` to scope it).
     /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
@@ -737,7 +737,7 @@ pub(crate) enum Cmd {
     Shell {
         /// Known device (petname) to open a shell on
         peer: Option<String>,
-        /// Use real ssh (ProxyCommand over filament) instead of the native PTY
+        /// Use real ssh (ProxyCommand over tunlion) instead of the native PTY
         #[arg(long, hide = true)]
         ssh: bool,
         /// Extra args passed through to ssh (only with --ssh)
@@ -759,14 +759,14 @@ pub(crate) enum Cmd {
         #[command(subcommand)]
         action: EphemeralAction,
     },
-    /// Wipe this machine's filament state (clean slate). DESTRUCTIVE.
+    /// Wipe this machine's tunlion state (clean slate). DESTRUCTIVE.
     ///
     /// Removes the local identity + overlay keys, the paired-device store, the
     /// capability store, pending consent requests, and the managed ssh material
     /// (private key, known_hosts, bootstrap cache), and strips the
     /// filament-managed blocks it installed in ~/.ssh/authorized_keys. Your own
-    /// ssh keys and any non-filament lines in authorized_keys are left untouched.
-    /// Stop the daemon first (`filament down`); reset refuses while it runs.
+    /// ssh keys and any non-tunlion lines in authorized_keys are left untouched.
+    /// Stop the daemon first (`tunlion down`); reset refuses while it runs.
     ///
     /// Pass the global `-y`/`--yes` to skip the confirmation prompt (required
     /// from a non-TTY / scripts).

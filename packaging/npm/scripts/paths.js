@@ -3,7 +3,7 @@
 const path = require('path')
 
 function binaryName() {
-  return process.platform === 'win32' ? 'filament.exe' : 'filament'
+  return process.platform === 'win32' ? 'tunlion.exe' : 'tunlion'
 }
 
 // The postinstall downloads the platform binary here; the bin/ launcher execs it.

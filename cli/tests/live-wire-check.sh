@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # LIVE verification of the JS wire layer (frontend/src/net/protocol/wire.js):
-# a real headless Chromium running the PRODUCTION frontend <-> a real `filament`
+# a real headless Chromium running the PRODUCTION frontend <-> a real `tunlion`
 # CLI peer, both directions, over a real WebRTC data channel — REAL framing.
 #
 # This is the check the web-shell mock harness (?preview=webterm) canNOT give
@@ -27,7 +27,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
 REPO="$(dirname "$CLI_DIR")"
-BIN="$CLI_DIR/target/release/filament"
+BIN="$CLI_DIR/target/release/tunlion"
 PORT="${PORT:-8077}"
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"
@@ -66,9 +66,9 @@ curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; cat
 [ -x "$BIN" ] || { echo "build first: (cd $CLI_DIR && cargo build --release)"; exit 2; }
 
 # dist must be SAME-ORIGIN (a prod-pointing bundle signals via prod and times out)
-if grep -qs "api\.filament\.autumated\.com" "$REPO/frontend"/dist/assets/*.js 2>/dev/null; then
+if grep -qs "api\.tunlion\.autumated\.com" "$REPO/frontend"/dist/assets/*.js 2>/dev/null; then
   echo "dist is prod-pointing — rebuilding same-origin…"
-  ( cd "$REPO/frontend" && VITE_FILAMENT_API= npm run build >/dev/null 2>&1 ) || { echo "frontend rebuild failed"; exit 2; }
+  ( cd "$REPO/frontend" && VITE_TUNLION_API= npm run build >/dev/null 2>&1 ) || { echo "frontend rebuild failed"; exit 2; }
 fi
 
 # ============================================================ 5: CLI -> browser

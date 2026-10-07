@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# `filament sync` end-to-end gates. Standalone, hermetic, fixture port 8107 ONLY.
+# `tunlion sync` end-to-end gates. Standalone, hermetic, fixture port 8107 ONLY.
 # Two daemons' worth of identity (acceptor `up` + one-shot initiator), a
 # reciprocal pair secret so B trusts A, real bytes over the real link.
 #
-#   FILAMENT_BIN=/path/to/filament ./sync-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./sync-gates.sh
 #
 
 # --- BITE-CHECK CONVENTION (four rules, each earned by a specific failure) ---
@@ -85,7 +85,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8107
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

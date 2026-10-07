@@ -1,4 +1,4 @@
-// PROTOCOL layer — the filament FILE-TRANSFER ceremony.
+// PROTOCOL layer — the tunlion FILE-TRANSFER ceremony.
 //
 // This module owns the *vocabulary* and the *pure decisions* of the
 // offer/accept/end/delivery-ack state machine, extracted from webrtc.js

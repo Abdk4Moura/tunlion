@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # `reach --until-direct`. Two daemons on one box are direct by nature, so this
 # is the arm where the loop must stop at once and exit 0. Hermetic, fixture
-# port 8122 ONLY. FILAMENT_BIN=/path/to/filament ./reach-until-direct-gates.sh
+# port 8122 ONLY. FILAMENT_BIN=/path/to/tunlion ./reach-until-direct-gates.sh
 #
 #   1  `reach <dev>` prints the one-line shape once ("pong via ...")
 #   2  `reach <dev> --until-direct` names a direct route and exits 0
@@ -9,7 +9,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8122
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"

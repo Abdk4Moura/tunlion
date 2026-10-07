@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""filament job runner — box-side WATCHER (file-driven control plane).
+"""tunlion job runner — box-side WATCHER (file-driven control plane).
 
 This REPLACES the interactive-PTY control plane (v1's `ctl` channel). The v1
-runner drove the box-side executor over a long-lived `filament pty` session; on
+runner drove the box-side executor over a long-lived `tunlion pty` session; on
 the unstable Colab->do-vm WAN link that PTY dropped every few seconds and the
 host hung forever in `open_session()` (see docs/runner/jobrunner-challenges.md).
 
@@ -11,9 +11,9 @@ box. Its only network I/O is discrete, retry-tolerant FILE TRANSFERS — exactly
 the primitive the diagnosis proved survives the link drops:
 
     inbound (din) : the host pushes job<id>.json + the declared inputs into the
-                    box inbox via `filament send` -> the box `up --dir .inbox`
+                    box inbox via `tunlion send` -> the box `up --dir .inbox`
                     daemon drops them in. The watcher just watches that dir.
-    outbound (dout): the watcher runs the job, then `filament send --relay`s the
+    outbound (dout): the watcher runs the job, then `tunlion send --relay`s the
                     manifest + outputs back to the host's transient `up` sink on
                     the dout channel (peer `host-out`). The MANIFEST IS SENT LAST
                     so its host-side arrival signals job completion.
@@ -33,7 +33,7 @@ Stdlib-only. Targets the T4 stack (glibc 2.35 / python3). Logs plainly to stdout
 P4 RETIREMENT NOTE (transport-resilience §P4 / GAP-5) — the app-level integrity
 + ACK loop below is now REDUNDANT with a CORE guarantee.
 
-  This watcher carries its OWN whole-file reliability layer on top of filament:
+  This watcher carries its OWN whole-file reliability layer on top of tunlion:
     - per-output sha256 verification (box_executor manifest + the host re-hashes
       every declared output against the manifest before accepting), and
     - the `ack-<job_id>` ACK loop (_ack_seen / _consume_acks below + the host's
@@ -47,7 +47,7 @@ P4 RETIREMENT NOTE (transport-resilience §P4 / GAP-5) — the app-level integri
   the file's whole-file sha256 in the offer (`full`), the receiver verifies its
   received bytes on completion and resumes/re-fetches on a mismatch (never accepts
   a corrupt/truncated file), and on a match returns a `delivery-ack` control frame
-  that gates the sender's success. So a single `filament send` of the outputs is
+  that gates the sender's success. So a single `tunlion send` of the outputs is
   now itself verified-and-acknowledged at the transport layer.
 
   TODO(runner-retirement): once the core P4 path has soaked on the real T4 WAN
@@ -159,7 +159,7 @@ class Watcher:
         self.reship_attempts = reship_attempts
         self.reship_gap_s = reship_gap_s
         self.reship_deadline_s = reship_deadline_s
-        # each individual `filament send` is BOUNDED (FILAMENT_SEND_TIMEOUT) so a
+        # each individual `tunlion send` is BOUNDED (FILAMENT_SEND_TIMEOUT) so a
         # wedged establishment is abandoned and re-invoked (a fresh connect clears
         # a stuck candidate pair); the retry loop + reship deadline are what wait
         # "until the peer appears". 0 would disable the bound (wait forever) —
@@ -297,7 +297,7 @@ class Watcher:
         return scratch
 
     def _ship(self, job, scratch):
-        """Copy manifest + declared outputs into the outbox, then `filament send`
+        """Copy manifest + declared outputs into the outbox, then `tunlion send`
         them to the host on the dout channel. Manifest LAST so its arrival
         host-side signals completion."""
         job_id = job["id"]
@@ -461,11 +461,11 @@ class Watcher:
 
 def main(argv):
     import argparse
-    ap = argparse.ArgumentParser(description="filament box-side file-driven job watcher")
+    ap = argparse.ArgumentParser(description="tunlion box-side file-driven job watcher")
     ap.add_argument("--jobs-root", default=os.environ.get("FILJOB_ROOT", "~/filament-jobs"))
     ap.add_argument("--server", default=os.environ.get("FILJOB_SERVER",
                     "https://api.filament.autumated.com"))
-    ap.add_argument("--bin", default=os.environ.get("FILAMENT_BIN", "filament"))
+    ap.add_argument("--bin", default=os.environ.get("FILAMENT_BIN", "tunlion"))
     ap.add_argument("--dout-cfg", default=os.environ.get("FILJOB_BOX_DOUT_CFG",
                     "~/filament-jobs/cfg-dout"))
     ap.add_argument("--host-dout-peer", default=os.environ.get("FILJOB_HOST_DOUT_PEER", "host-out"))

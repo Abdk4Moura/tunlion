@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filament transport-UPGRADE model checker.
+"""Tunlion transport-UPGRADE model checker.
 
 The third proof. `establishment_model.py` proves signaling reaches CONNECTED.
 `transport_lifecycle_model.py` proves a CONNECTED pair can carry a file and tear

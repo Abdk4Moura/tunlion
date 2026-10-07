@@ -1,7 +1,7 @@
-"""Filament identity + pairing crypto — a faithful Python port of the Rust.
+"""Tunlion identity + pairing crypto — a faithful Python port of the Rust.
 
 Every function here is a byte-for-byte mirror of a Rust counterpart so a Python
-peer can sit on the same wire as the real `filament` binary:
+peer can sit on the same wire as the real `tunlion` binary:
 
   channel_of(secret)          <- cli/src/main.rs:622   (presence rendezvous)
   proof_for(...)              <- cli/src/main.rs:655   (the trust-gate MAC)

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable, user-facing changes to filament are recorded here. This file was
+All notable, user-facing changes to tunlion are recorded here. This file was
 started at the 0.7 capability cutover; earlier history lives in the git log and
 the GitHub release notes.
 
@@ -71,14 +71,14 @@ the GitHub release notes.
 
   **Invitations minted before 0.8.4 cannot be claimed.** They are refused with
   a message saying so rather than failing to parse. Mint a new one with
-  `filament add --for`.
+  `tunlion add --for`.
 
 ### Fixed
 
 - **Windows: setting up background receive now actually starts receiving.**
-  `filament receive --background` installed the autostart entry and reported
+  `tunlion receive --background` installed the autostart entry and reported
   success, but started nothing. The entry only fires at logon, so the receiver
-  stayed down, `filament status` correctly said "not running", and an
+  stayed down, `tunlion status` correctly said "not running", and an
   invitation minted on that machine could never be claimed: the joining device
   waited and then failed with `enrollment timed out after 60s`. Three commands
   each behaved correctly on their own and the product could not pair.
@@ -88,8 +88,8 @@ the GitHub release notes.
   already did on the other platforms. The message says "receiving now, and at
   every logon" rather than describing only the part that happens later.
 
-- **Your inbox is no longer relative to the directory you ran filament from.**
-  On Windows the inbox resolved to `.\Filament` and the fleet share root to
+- **Your inbox is no longer relative to the directory you ran tunlion from.**
+  On Windows the inbox resolved to `.\Tunlion` and the fleet share root to
   `.\filament-share`, because four call sites read the `HOME` environment
   variable directly. Windows does not set `HOME`, so each fell back to the
   current directory. Received files landed wherever the command happened to be
@@ -116,7 +116,7 @@ the GitHub release notes.
   and prompts for a name, as `init` does.
 
 - **A failed install no longer suggests a command that cannot work.** After a
-  successful per-user install, a note recommended `filament up --install-system`
+  successful per-user install, a note recommended `tunlion up --install-system`
   for a machine-wide service. That path registers a plain executable as a
   Windows service, which can never start, so following the advice turned a
   working install into a failure. The note is gone until a real service entry
@@ -153,7 +153,7 @@ the GitHub release notes.
 
   The surface now has TWO roles, not three:
 
-  - **MINT** is `filament add`. It prints a code (the other device claims it
+  - **MINT** is `tunlion add`. It prints a code (the other device claims it
     with `add <code>`) or, with `add --for <device|person>`, a bounded
     invitation (the other device claims it with `join`).
   - **CLAIM** is `add <code>` (a pairing code) or `join` (a bounded
@@ -170,7 +170,7 @@ the GitHub release notes.
 
 - **Windows: no more "repaired permissions" on every command.** Every
   invocation, including `--version` and `--help`, began with
-  `filament: repaired permissions on 4 sensitive config path(s)`. Nothing was
+  `tunlion: repaired permissions on 4 sensitive config path(s)`. Nothing was
   being repaired. The Windows arm of the check reasserted the owner-only ACL
   and reported a repair unconditionally, so the number was simply how many
   sensitive files existed.
@@ -268,7 +268,7 @@ the GitHub release notes.
   permanently: it goes quiet only when the ordering is fixed.
 
 
-- **Revoking a device now actually denies it.** `filament revoke <name>
+- **Revoking a device now actually denies it.** `tunlion revoke <name>
   --certificate` cut fleet auto-trust and nothing else. Two separate paths kept
   authorizing a revoked device:
 
@@ -305,14 +305,14 @@ the GitHub release notes.
 
 ### Added
 
-- **Recoverable identity.** `filament init` creates your identity from a
+- **Recoverable identity.** `tunlion init` creates your identity from a
   random 12-word BIP39 recovery phrase. The identity is committed only after
   you prove you wrote the phrase down (a word transcription check); `id
   recover` restores the same identity from the phrase on another device.
   Recovery phrases and invitation secrets are written only to owner-only
   files or a terminal, never to argv, logs, or stdout.
-- **Bounded invitations.** `filament invite` mints a key with a capability
-  ceiling and a lifetime; `filament join` claims it and becomes a delegated
+- **Bounded invitations.** `tunlion invite` mints a key with a capability
+  ceiling and a lifetime; `tunlion join` claims it and becomes a delegated
   device whose ceiling is persisted in one record and restored on reconnect.
   A re-joining device gets the NEW key's bounds, never a wider inherited set;
   a lapsed device revives, a revoked one does not.
@@ -322,12 +322,12 @@ the GitHub release notes.
   (liveness is observed, not traffic-driven). Past-deadline devices are
   marked `lapsed` and kept as evidence. `devices revoke`/`restore` durably
   revokes: the marker survives cert renewal and overrides any standing grant.
-  `filament depart` signs and announces a goodbye; it is advisory, never
+  `tunlion depart` signs and announces a goodbye; it is advisory, never
   load-bearing.
 - **Ephemeral enrollment.** An ephemeral auth key admits a device in memory
   only, gone at restart; a persistent key writes the durable record. The
   device validates the ack against the key's persistence choice.
-- **Guided flows.** Bare `filament` on a terminal opens a picker; every
+- **Guided flows.** Bare `tunlion` on a terminal opens a picker; every
   file, mount, and identity flow shows a review screen naming the exact
   replay command. Mounts default to read-only with an explicit
   `--read-write`; the remote side still enforces its share root and grant.
@@ -352,7 +352,7 @@ the GitHub release notes.
 
 - **Releases no longer publish stray repository files as assets.** The release
   job began checking out the repository in 0.7.7 so notes could be generated from
-  this changelog, which put the working tree where two `filament-*` globs could
+  this changelog, which put the working tree where two `tunlion-*` globs could
   match it. `cli-v0.7.7` consequently shipped three unrelated repository
   documents (`filament-status-2026-06-14.md`,
   `filament-update-2026-06-14b.md` and
@@ -384,7 +384,7 @@ the GitHub release notes.
 - **`.part` files are no longer opened through a symlink or directory junction.**
   A junction or symlink planted at the `.part` path was followed when the receiver
   opened it, redirecting the write outside the download directory with the
-  authority of the user running filament.
+  authority of the user running tunlion.
 
   **The affected platforms differ by version. Read the row that applies to you.**
 
@@ -490,8 +490,8 @@ perfectly good files.
 
 ### Changed
 
-- **`filament shell <device>` now opens filament's own native PTY by default**
-  (the peer must run `up --shell`). Use `filament shell <device> --ssh` to run
+- **`tunlion shell <device>` now opens tunlion's own native PTY by default**
+  (the peer must run `up --shell`). Use `tunlion shell <device> --ssh` to run
   your real ssh over the data channel via ProxyCommand as before. The refined PTY
   engine (warm-link reuse, resumable reconnect, single shared stdin reader) is
   unchanged; only which command drives it changed.
@@ -538,7 +538,7 @@ The command surface, finished: a clean ~15-verb CLI with no legacy names.
   `shell`; `netcat`/`dial` → `reach` (`--socks` for a proxy); `unexpose` → `expose --off`;
   `unmount` → `mount --off`; `cap-status`/`ping` → `status`/`doctor`; `get`/`unset` → `set`
   (`set <key>` shows, `set <key> <val>` sets, `set <key> --unset` clears); `introduce` →
-  `devices vouch`; `serve-tun`/`tag-bind` removed. `filament --help` now lists exactly the
+  `devices vouch`; `serve-tun`/`tag-bind` removed. `tunlion --help` now lists exactly the
   real verbs, grouped (Connect / Share / Devices / Identity / Mesh). ~360 lines removed.
 
 ## [0.7.4] - 2026-07-31
@@ -548,11 +548,11 @@ same-owner-devices "auto-detect" half of fleet trust.
 
 ### Changed
 
-- **`filament --help` is now a grouped, curated command reference** (Connect / Share /
+- **`tunlion --help` is now a grouped, curated command reference** (Connect / Share /
   Devices / Identity / Mesh) instead of a flat dump of every subcommand with deprecated
-  and canonical names side by side. Each command still has its own `filament <cmd> --help`.
-- **Simpler verbs:** `filament shell <device>` (folds `ssh`/`pty`), `filament reach
-  <device>:<port>` (folds `netcat`/`dial`; `--socks` for a local proxy), `filament devices
+  and canonical names side by side. Each command still has its own `tunlion <cmd> --help`.
+- **Simpler verbs:** `tunlion shell <device>` (folds `ssh`/`pty`), `tunlion reach
+  <device>:<port>` (folds `netcat`/`dial`; `--socks` for a local proxy), `tunlion devices
   vouch <a> <b>` (folds `introduce`). All 13 old names keep working as deprecation aliases
   with a one-line note to stderr (suppress with `FILAMENT_NO_DEPRECATION=1`), so no
   existing script or muscle memory breaks.
@@ -614,7 +614,7 @@ the same features and actually builds and publishes.
   reconciler used the owner shortcut, so a same-owner (fleet) device was never listed
   as revoked and its managed `authorized_keys` block survived forever after you
   revoked its shell grant — permanent SSH on the one surface that bypasses every
-  filament gate. It now tracks the grant exactly like an external device: revoke
+  tunlion gate. It now tracks the grant exactly like an external device: revoke
   shell → key removed. Proven live via a fixed-vs-buggy binary differential.
 - **Transfer scope is enforced against the real write target, not asserted.** The
   fleet transfer scope check was a dead binding; it now verifies the landing path is
@@ -668,20 +668,20 @@ the same features and actually builds and publishes.
 
 ### Added
 
-- **`filament reset`** — a conservative clean slate for the local machine.
-  Wipes only filament's own state (identity + overlay keys, the paired-device
+- **`tunlion reset`** — a conservative clean slate for the local machine.
+  Wipes only tunlion's own state (identity + overlay keys, the paired-device
   store, the capability store, pending consent requests, exposed-service and
   mount records, per-peer + global settings, the managed ssh material) and
   strips the delimited `# BEGIN/END filament-managed <device>` blocks it
   installed in `~/.ssh/authorized_keys`. Your own ssh keys and any lines
   outside those blocks are never touched. Destructive: prompts for
   confirmation (required `-y`/`--yes` from a non-TTY) and refuses while the
-  daemon is running (`filament down` first). Prints exactly what it removed.
+  daemon is running (`tunlion down` first). Prints exactly what it removed.
 
 ### Fixed
 
-- CLI ergonomics: `filament init` now hints `filament identity init`;
-  `filament help` works as an alias for `--help`; `filament devices remove <x>`
+- CLI ergonomics: `tunlion init` now hints `tunlion identity init`;
+  `tunlion help` works as an alias for `--help`; `tunlion devices remove <x>`
   now suggests `forget` (the semantic match) instead of clap's `rename`; and
   the Windows managed-key install no longer leaks `icacls`' "Successfully
   processed 1 files" banner to stdout (captured, surfaced only on error).

@@ -6,7 +6,7 @@ Multi-device identity with no certificate authority: one **user key** signs a
 possession of that device's private key — no directory, no online check.
 
 This is the identity layer of
-[filament](https://github.com/Abdk4Moura/tunlion), extracted for reuse.
+[tunlion](https://github.com/Abdk4Moura/tunlion), extracted for reuse.
 
 ## What's inside
 
@@ -23,7 +23,7 @@ devices share, not an account issued by a third party.
 
 ## Status
 
-Pre-1.0; API may change between minor versions. Part of filament; security-reviewed,
+Pre-1.0; API may change between minor versions. Part of tunlion; security-reviewed,
 not independently audited.
 
 ## License

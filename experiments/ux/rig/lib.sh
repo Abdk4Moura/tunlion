@@ -2,12 +2,12 @@
 # Self-safe rig primitives shared by the UX scenarios.
 #
 # HARD SAFETY RULES (see harness README):
-#  - Never touch the user's real config (/root/.config/filament). Every filament
+#  - Never touch the user's real config (/root/.config/tunlion). Every tunlion
 #    invocation in a scenario MUST set FILAMENT_CONFIG_DIR under $UX_ROOT/tmp.
 #  - Never kill processes we did not start. We track our own PIDs in $UX_PIDS
 #    and our own backend on $UX_PORT (a non-default port). We only kill a port
 #    listener on $UX_PORT if WE are the ones who started it (recorded in
-#    $UX_BACKEND_PID). The user's `filament up` daemon is a CLIENT (no listener),
+#    $UX_BACKEND_PID). The user's `tunlion up` daemon is a CLIENT (no listener),
 #    so it is never matched.
 set -uo pipefail
 : "${ZSH_VERSION:=}"  # some interactive snapshots probe this under set -u
@@ -15,7 +15,7 @@ set -uo pipefail
 UX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UX_BIN="$UX_DIR/bin"
 REPO="$(cd "$UX_DIR/../.." && pwd)"
-FILAMENT="${FILAMENT_BIN:-/root/.local/bin/filament}"
+TUNLION="${FILAMENT_BIN:-/root/.local/bin/tunlion}"
 PYV="${UX_PYV:-/root/filament-bench/venv/bin/python}"
 
 # Unique env marker stamped on EVERY backend this harness starts. Cleanup matches
@@ -180,12 +180,12 @@ pair_two() {
   # bare `add --name` drops into the guided "type two words" prompt, which
   # refuses from a non-TTY (found 2026-08-12 while converting the rig).
   local W; W=$(ux_words)
-  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 45 "$FILAMENT" add --word "$W" --name "$NB" -y \
+  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 45 "$TUNLION" add --word "$W" --name "$NB" -y \
       --server "$UX_SERVER" </dev/null >"$log.a" 2>&1 &
   local PA=$!; track $PA
   local C
   C=$(wait_code "$log.a") || { echo "pair_two: $DA never minted a code" >&2; kill $PA 2>/dev/null; return 1; }
-  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 45 "$FILAMENT" add "$C" --name "$NA" -y \
+  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 45 "$TUNLION" add "$C" --name "$NA" -y \
       --server "$UX_SERVER" </dev/null >"$log.b" 2>&1
   local rcB=$?
   wait $PA 2>/dev/null; local rcA=$?
@@ -193,8 +193,8 @@ pair_two() {
   # side can now name the other. Poll, because under parallel load the store
   # write or the `devices` read can lag a moment; a single shot is flaky.
   local okA okB
-  okA=$(wait_for 15 0.3 bash -c "FILAMENT_CONFIG_DIR='$DA' '$FILAMENT' devices 2>/dev/null | grep -q '$NB'" && echo 1 || echo 0)
-  okB=$(wait_for 15 0.3 bash -c "FILAMENT_CONFIG_DIR='$DB' '$FILAMENT' devices 2>/dev/null | grep -q '$NA'" && echo 1 || echo 0)
+  okA=$(wait_for 15 0.3 bash -c "FILAMENT_CONFIG_DIR='$DA' '$TUNLION' devices 2>/dev/null | grep -q '$NB'" && echo 1 || echo 0)
+  okB=$(wait_for 15 0.3 bash -c "FILAMENT_CONFIG_DIR='$DB' '$TUNLION' devices 2>/dev/null | grep -q '$NA'" && echo 1 || echo 0)
   if [ "$okA" = 1 ] && [ "$okB" = 1 ]; then
     return 0
   fi

@@ -15,7 +15,7 @@ tun.create(ledger, ns, iface, addr_cidr=None, mtu=1380)
   overlay on its real data-path iface, so a carrier-less TUN never wins a
   competing on-link route.
 - `tun_io.open_tun(iface)` / `read_packet(fd)` / `write_packet(fd, pkt)` give raw
-  IP-packet access from Python (used by the udp + filament userspace relays). The
+  IP-packet access from Python (used by the udp + tunlion userspace relays). The
   TUN is `IFF_TUN | IFF_NO_PI` → bare IP packets, no Ethernet header.
 
 ## 2. link — `providers/`
@@ -29,7 +29,7 @@ teardown (the ledger sweep is the backstop). Providers:
 | `pipe`/`veth` | veth pair joins the two netns directly | none | topology engine + tun + route + probe |
 | `udp` | userspace UDP relay over the veth underlay | none | frame primitive + a real socket hop |
 | `wg` | **real WireGuard** (kernel, or wireguard-go/boringtun) | wg-noise | the provider abstraction vs production crypto |
-| `filament` | filament data channel via an L2 forward stream | none (channel is DTLS) | **filament as an L3 carrier** (integration target) |
+| `tunlion` | tunlion data channel via an L2 forward stream | none (channel is DTLS) | **tunlion as an L3 carrier** (integration target) |
 
 `LinkContext` (`labkit/context.py`) gives a provider: the two `Endpoint`s (node,
 ns, overlay_ip, underlay_ip), consistent iface-name helpers
@@ -40,7 +40,7 @@ dir.
 
 IP packet ⇄ length-prefixed link frame for **stream** carriers. `encode(pkt)`
 prepends a 2-byte big-endian length; `Decoder().feed(chunk)` reassembles whole
-packets across arbitrary chunk boundaries. Used by `filament` (the L2 stream is a
+packets across arbitrary chunk boundaries. Used by `tunlion` (the L2 stream is a
 byte stream). `udp` doesn't need it (one packet per datagram).
 
 ## 4. route — `primitives/route.py`
@@ -58,9 +58,9 @@ rejects incoherent combinations; the carrier supplies the actual encryption:
 
 | value | meaning | coherent with |
 | --- | --- | --- |
-| `none` | no lab-added crypto (lean on the carrier or run clear) | pipe, udp, filament |
+| `none` | no lab-added crypto (lean on the carrier or run clear) | pipe, udp, tunlion |
 | `wg-noise` | WireGuard Noise_IKpsk2 + ChaCha20-Poly1305 (carrier-native) | wg |
-| `dtls` | DTLS provided by the carrier (filament's data channel) | filament |
+| `dtls` | DTLS provided by the carrier (tunlion's data channel) | tunlion |
 
 ## 6. fault — `primitives/fault.py`
 

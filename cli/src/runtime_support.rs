@@ -213,7 +213,7 @@ pub(crate) fn resolve_for_kind(
     // `--for` with no value arrives as Some("") (clap's default_missing_value),
     // and it MEANS "ask me". Normalised here rather than in the callers because
     // it was normalised in exactly one of them: add_for_cmd filtered the empty
-    // string, the spoken-code path did not, so `filament add --for` fell through
+    // string, the spoken-code path did not, so `tunlion add --for` fell through
     // to the device-NAME arm below, silently resolved to kind=device with an
     // empty invitee name, and never asked the question. The menu entry "Invite a
     // device or person" is that argv, which is why it looked identical to
@@ -254,12 +254,12 @@ pub(crate) fn resolve_for_kind(
                     [
                         "--for needs to know who is joining:",
                         "",
-                        "  a device you own   filament add laptop --out laptop.invite",
-                        "  someone else       filament add --for person --out alice.invite",
-                        "  a CI runner        filament add --for runner --out ci.key",
+                        "  a device you own   tunlion add laptop --out laptop.invite",
+                        "  someone else       tunlion add --for person --out alice.invite",
+                        "  a CI runner        tunlion add --for runner --out ci.key",
                         "",
                         "  A bare name means a device, so `add laptop` is `--for laptop`.",
-                        "  They claim it with:  filament join <file>",
+                        "  They claim it with:  tunlion join <file>",
                     ]
                     .join("\n")
                 )
@@ -272,19 +272,19 @@ pub(crate) fn resolve_for_kind(
 
 pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // Only stop through the manager when THIS daemon is actually the managed
-    // unit's process, AND the right manager. `systemctl stop filament` stops
+    // unit's process, AND the right manager. `systemctl stop tunlion` stops
     // the named unit even when down targets a DIFFERENT daemon (a detached
     // foreground `up` on another config), which killed another machine's
     // service during development. Two units share the name here, so the cgroup
     // scope decides which manager.
     match service_manager_for_pid(pid) {
         Some(ServiceManager::SystemdSystem) => std::process::Command::new("systemctl")
-            .args(["stop", "filament"])
+            .args(["stop", "tunlion"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
         Some(ServiceManager::SystemdUser) => std::process::Command::new("systemctl")
-            .args(["--user", "stop", "filament"])
+            .args(["--user", "stop", "tunlion"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
@@ -356,7 +356,7 @@ pub(crate) async fn next_ev(
 /// API that would panic is `block_in_place`, and the tree contains none.
 pub(crate) fn is_light_command(first_arg: Option<&str>) -> bool {
     match first_arg {
-        // Bare `filament` is the tour: three file reads and a printout.
+        // Bare `tunlion` is the tour: three file reads and a printout.
         None => true,
         Some(a) => matches!(
             a,

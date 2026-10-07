@@ -83,7 +83,7 @@ def up(topo_name: str, link: Optional[str] = None,
 
         # 3) TUN per node — created BARE (no overlay address). Each provider
         #    addresses the overlay on its OWN data-path iface (tun for udp/
-        #    filament; veth for pipe; wg iface for wg), so a carrier-less TUN
+        #    tunlion; veth for pipe; wg iface for wg), so a carrier-less TUN
         #    never wins a competing on-link route to the real path.
         for ep in ctx.endpoints:
             tun_prim.create(ledger, ep.ns, ctx.tun_iface(ep), mtu=ctx.mtu)
@@ -93,7 +93,7 @@ def up(topo_name: str, link: Optional[str] = None,
         provider.up(ctx)
 
         # record each node's DATA-PATH iface (where a fault must be applied to
-        # actually degrade traffic): tun for udp/filament, veth for pipe, wg
+        # actually degrade traffic): tun for udp/tunlion, veth for pipe, wg
         # iface for wg. fault() targets this, not the (maybe-unused) tun.
         for ep in ctx.endpoints:
             ledger.set_node(ep.node, datapath_iface=_datapath_iface(ctx, ep))
@@ -117,12 +117,12 @@ def _datapath_iface(ctx: LinkContext, ep) -> str:
         return ctx.underlay_iface(ep)     # the veth
     if p == "wg":
         return ctx.wg_iface(ep)           # the wg iface
-    return ctx.tun_iface(ep)              # udp / filament use the tun
+    return ctx.tun_iface(ep)              # udp / tunlion use the tun
 
 
 def _default_crypto(provider: str) -> str:
     return {"pipe": "none", "udp": "none", "wg": "wg-noise",
-            "filament": "none"}.get(provider, "none")
+            "tunlion": "none"}.get(provider, "none")
 
 
 def down(lab: str, purge_logs: bool = False) -> bool:

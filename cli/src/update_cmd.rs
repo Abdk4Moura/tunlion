@@ -1,4 +1,4 @@
-//! The `filament update` command.
+//! The `tunlion update` command.
 //!
 //! Checks the release API for a newer `cli-v*` tag (skipping prereleases unless
 //! `--beta` or already on one), verifies the download, swaps the binary atomically
@@ -26,7 +26,7 @@ use std::time::Duration;
 pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
-        .user_agent(format!("filament/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("tunlion/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     // Latest cli-v* release via the API (releases/latest may point at a web
@@ -89,7 +89,7 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     let latest_ver = tag.trim_start_matches("cli-v").to_string();
     let current = env!("CARGO_PKG_VERSION");
     if key(&latest_ver) <= key(current) {
-        println!("filament {current} is already the latest (released: {latest_ver})");
+        println!("tunlion {current} is already the latest (released: {latest_ver})");
         return Ok(());
     }
     println!("update available: {current} -> {latest_ver}");
@@ -102,16 +102,16 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     let source = platform::InstallSource::detect();
     if source != platform::InstallSource::SelfInstalled {
         let hint = source.upgrade_hint();
-        println!("filament was installed via a package manager, update with: {hint}");
+        println!("tunlion was installed via a package manager, update with: {hint}");
         return Ok(());
     }
 
     let target = release_target()
         .ok_or_else(|| anyhow!("no prebuilt binary for this platform; build from source"))?;
     let (asset, inner) = if cfg!(windows) {
-        (format!("filament-{target}.zip"), "filament.exe")
+        (format!("tunlion-{target}.zip"), "tunlion.exe")
     } else {
-        (format!("filament-{target}.tar.gz"), "filament")
+        (format!("tunlion-{target}.tar.gz"), "tunlion")
     };
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
 
@@ -238,7 +238,7 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
             );
         }
         // A non-root L3 node also needs write on /etc/hosts to publish MagicDNS
-        // names; grant the narrow per-file ACL here too so a plain `filament
+        // names; grant the narrow per-file ACL here too so a plain `tunlion
         // update` is all it takes (no separate `set tun-addr` step). No-op for
         // root or if already granted.
         crate::tun::ensure_hosts_writable();
@@ -255,7 +255,7 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
             println!("reloading the daemon onto the new binary (graceful restart, no sudo)");
         } else if daemon_alive().is_some() {
             println!(
-                "restart the daemon to run the new binary: `systemctl restart filament` (or `filament down` then `filament up ...`)"
+                "restart the daemon to run the new binary: `systemctl restart tunlion` (or `tunlion down` then `tunlion up ...`)"
             );
         }
     }

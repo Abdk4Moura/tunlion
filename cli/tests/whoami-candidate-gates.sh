@@ -18,7 +18,7 @@
 # connection lands on a lower rung - and inference is a weaker claim than
 # measurement. It is labelled as such here and must stay labelled in the
 # write-up. An earlier version of this gate tried to demonstrate the downgrade by
-# emptying the local candidate set with `filament set only <nonexistent-iface>`;
+# emptying the local candidate set with `tunlion set only <nonexistent-iface>`;
 # that lever starves the link of everything rather than isolating the public
 # candidate, and its CONTROL arm did not link even with a truthful whoami, so
 # nothing downstream of it was attributable. The namespace-with-a-NAT version is
@@ -120,7 +120,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8709
 SERVER="http://127.0.0.1:$PORT"
 PROXY_PORT=8710
@@ -137,11 +137,11 @@ trap 'fixture_cleanup' EXIT
 echo "## bin:  $BIN"
 echo "## work: $WORK"
 
-# The binary must be named so `is_filament_process` recognises the daemon, or no
+# The binary must be named so `is_tunlion_process` recognises the daemon, or no
 # control.sock is created and every warm-link lookup silently reads as "no link".
 case "$(basename "$BIN")" in
-  *filament*) ;;
-  *) echo "FILAMENT_BIN basename must contain 'filament' (see lib/fixture.sh); got '$(basename "$BIN")'"; exit 2 ;;
+  *tunlion*) ;;
+  *) echo "FILAMENT_BIN basename must contain 'tunlion' (see lib/fixture.sh); got '$(basename "$BIN")'"; exit 2 ;;
 esac
 command -v tcpdump >/dev/null || { echo "tcpdump is required for the wire observable"; exit 2; }
 # (No `claim_port` helper exists in lib/fixture.sh - the original call here was a
@@ -197,7 +197,7 @@ async def handle(cr, cw):
             body = json.dumps({"ip": ip}).encode()
             cw.write(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                + b"X-Filament-Gate-Injector: whoami-237\r\n"
+                + b"X-Tunlion-Gate-Injector: whoami-237\r\n"
                 + b"Content-Length: " + str(len(body)).encode()
                 + b"\r\nConnection: close\r\n\r\n" + body
             )
@@ -228,7 +228,7 @@ SEEN=$(curl -fsS -D "$WORK/whoami.hdr" "$PROXY/api/whoami")
 echo "## injector says: $SEEN"
 # Verify by HEADER: a real backend also answers /api/whoami with an ip, so the
 # body cannot distinguish our injector from somebody else's server.
-grep -qi "^X-Filament-Gate-Injector: whoami-237" "$WORK/whoami.hdr" || {
+grep -qi "^X-Tunlion-Gate-Injector: whoami-237" "$WORK/whoami.hdr" || {
   echo "the process answering $PROXY is NOT this gate's injector"; cat "$WORK/proxy.log"; exit 2; }
 
 # ------------------------------------------------------------- the two peers --

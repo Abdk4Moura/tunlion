@@ -1,4 +1,4 @@
-//! The pairing command (`filament pair`), lifted out of `main.rs`.
+//! The pairing command (`tunlion pair`), lifted out of `main.rs`.
 //!
 //! Drives the L1-a PAKE ceremony at the terminal: mint a spoken code or claim
 //! one, show the join screen, and hand the agreed secret to the device store.
@@ -93,8 +93,8 @@ fn malformed_entry_banner(arg: &str) {
 
 pub(crate) fn invitation_not_a_code_msg() -> String {
     "that is an invitation, not a pairing code.\n  \
-     Run `filament join` and paste it at the prompt; it is cleared from the terminal after reading.\n  \
-     If you saved it to a file: `filament join --invite-file <path>`.\n  \
+     Run `tunlion join` and paste it at the prompt; it is cleared from the terminal after reading.\n  \
+     If you saved it to a file: `tunlion join --invite-file <path>`.\n  \
      Invitation material is deliberately never read from the command line, where it would land in `ps` output and shell history."
         .to_string()
 }
@@ -216,8 +216,8 @@ pub(crate) async fn pair_cmd(
     if let Some(c) = &code {
         if regex_lite_code(c) && !looks_like_pake_code(c) {
             bail!(
-                "'{c}' looks like a one-time TRANSFER code (from `filament send --code`), not a pairing code.\n  \
-                 To receive that transfer: run `filament receive {c}`\n  \
+                "'{c}' looks like a one-time TRANSFER code (from `tunlion send --code`), not a pairing code.\n  \
+                 To receive that transfer: run `tunlion receive {c}`\n  \
                  An add code ends in a 4-digit number, e.g. `brave-otter-3141`."
             );
         }
@@ -235,7 +235,7 @@ pub(crate) async fn pair_cmd(
             // just produced it. Without this the token is sent as a nameplate,
             // the server rejects it, and the user is told "codes burn after one
             // use" about a token that was never claimed, with a remedy
-            // (`re-run filament add`) that mints a code and cannot help.
+            // (`re-run tunlion add`) that mints a code and cannot help.
             if c.starts_with("filament-invite:") {
                 bail!("{}", invitation_not_a_code_msg());
             }
@@ -587,7 +587,7 @@ pub(crate) async fn pair_cmd(
                             ));
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!("  try: filament send <file> --to {n}   ·   filament up"),
+                                &format!("  try: tunlion send <file> --to {n}   ·   tunlion up"),
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
@@ -605,7 +605,7 @@ pub(crate) async fn pair_cmd(
         if let Some(dl) = ceremony_deadline {
             if Instant::now() > dl {
                 bail!(
-                    "the other device disconnected before setup finished; make sure both run `filament add` at the same time, then try again"
+                    "the other device disconnected before setup finished; make sure both run `tunlion add` at the same time, then try again"
                 );
             }
         }
@@ -760,13 +760,13 @@ pub(crate) async fn pair_cmd(
                 if interactive_allowed() {
                     ui::say(&ui::paint(
                         ui::Tone::Dim,
-                        "  scan this in Filament, or enter the code below it",
+                        "  scan this in Tunlion, or enter the code below it",
                     ));
                     ui::say(&ui::qr_or_text(&full, 6));
                 }
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  on the other device: type it into the web app, or `filament join <code>`",
+                    "  on the other device: type it into the web app, or `tunlion join <code>`",
                 ));
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
@@ -827,7 +827,7 @@ pub(crate) async fn pair_cmd(
                         "that code's creator already left, ask them for a fresh one".to_string()
                     }
                     _ => format!(
-                        "{}, codes burn after one use; a failed setup needs a FRESH code (re-run `filament add`)",
+                        "{}, codes burn after one use; a failed setup needs a FRESH code (re-run `tunlion add`)",
                         v["error"].as_str().unwrap_or("?")
                     ),
                 };

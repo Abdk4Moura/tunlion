@@ -69,8 +69,8 @@ export class UpgradeProber {
     if (h._closed || h.route !== 'relayed') return this.disarm()
     // Kill-switch (browser analog of FILAMENT_UPGRADE_PROBE=0).
     try {
-      if (localStorage.getItem('filamentUpgradeProbe') === '0') {
-        rlog.debug('upgrade prober disabled (filamentUpgradeProbe=0), staying on relay', h.id.slice(-6))
+      if (localStorage.getItem('tunlionUpgradeProbe') === '0') {
+        rlog.debug('upgrade prober disabled (tunlionUpgradeProbe=0), staying on relay', h.id.slice(-6))
         return
       }
     } catch {}

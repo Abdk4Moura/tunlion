@@ -52,8 +52,8 @@ def test_route_dst_ip_v4():
 def test_crypto_coherence():
     crypto.validate("none", "pipe")
     crypto.validate("wg-noise", "wg")
-    crypto.validate("none", "filament")
-    crypto.validate("dtls", "filament")
+    crypto.validate("none", "tunlion")
+    crypto.validate("dtls", "tunlion")
     for bad in [("wg-noise", "pipe"), ("dtls", "wg"), ("bogus", "pipe")]:
         try:
             crypto.validate(*bad)

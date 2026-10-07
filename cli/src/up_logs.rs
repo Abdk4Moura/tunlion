@@ -1,4 +1,4 @@
-//! `filament up` / `filament logs`, lifted out of `main.rs`.
+//! `tunlion up` / `tunlion logs`, lifted out of `main.rs`.
 //!
 //! `up_cmd` installs and starts the receiver (including the service-manager and
 //! shell-policy paths, and the already-running case that follows the daemon's
@@ -90,7 +90,7 @@ pub(crate) async fn up_cmd(
              password), which is a security risk if stored or passed via CLI.\n\
              \n\
              The PTY will run as the current user. To run as a different user,\n\
-             start filament from that user's session, or use 'runas /user:<name> filament'.",
+             start tunlion from that user's session, or use 'runas /user:<name> tunlion'.",
             ui::paint(ui::Tone::Warn, "WARNING:")
         ));
     }
@@ -102,7 +102,7 @@ pub(crate) async fn up_cmd(
         let host = platform::ServiceHost::detect();
         if !host.supports_install() {
             let hint = host.install_instructions();
-            eprintln!("filament: --install is not supported on this platform. {hint}");
+            eprintln!("tunlion: --install is not supported on this platform. {hint}");
             return Ok(());
         }
         let exe = std::env::current_exe()?;
@@ -155,7 +155,7 @@ pub(crate) async fn up_cmd(
                 ));
             } else {
                 ui::say(&format!(
-                    "  {} autostart installed; starting the receiver now failed, run `filament up`",
+                    "  {} autostart installed; starting the receiver now failed, run `tunlion up`",
                     ui::paint(ui::Tone::Warn, "!")
                 ));
             }
@@ -175,7 +175,7 @@ pub(crate) async fn up_cmd(
                         ui::paint(ui::Tone::Ok, ui::glyph_ok())
                     ));
                     ui::say(&format!(
-                        "  {} run `filament up --install` again to grant admin for kernel overlay",
+                        "  {} run `tunlion up --install` again to grant admin for kernel overlay",
                         ui::paint(ui::Tone::Dim, "note:")
                     ));
                 }
@@ -213,7 +213,7 @@ pub(crate) async fn up_cmd(
         // (current AND any introduced later via pair-intro). This is a broad,
         // deliberate over-grant; --shell-only is the scoped, safer alternative.
         ShellPolicy::All => ui::say(&format!(
-            "  {} seamless shell ON, ANY paired device (now or paired later) can `filament shell --ssh` into this machine",
+            "  {} seamless shell ON, ANY paired device (now or paired later) can `tunlion shell --ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
         )),
         ShellPolicy::Only(set) => {
@@ -225,12 +225,12 @@ pub(crate) async fn up_cmd(
                 .collect::<Vec<_>>()
                 .join(", ");
             ui::say(&format!(
-                "  {} seamless shell ON for: {list}, they can `filament shell --ssh` into this machine",
+                "  {} seamless shell ON for: {list}, they can `tunlion shell --ssh` into this machine",
                 ui::paint(ui::Tone::Warn, "!"),
             ));
         }
         ShellPolicy::Granted if !granted_names.is_empty() => ui::say(&format!(
-            "  {} seamless shell ON for: {}, they can `filament shell --ssh` into this machine",
+            "  {} seamless shell ON for: {}, they can `tunlion shell --ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
             granted_names.join(", "),
         )),
@@ -332,7 +332,7 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     // A daemon under a service manager writes to the journal, not to a file we
     // own, so there is nothing here to read and there never will be. That is
     // the DEFAULT path: first-run offers "Stay available in the background?"
-    // and installs a service, after which `filament logs` said "no log yet (the
+    // and installs a service, after which `tunlion logs` said "no log yet (the
     // daemon writes it while it runs)" forever, on a daemon that was running
     // and was writing plenty. The sentence blamed timing for a condition that
     // does not change. Hand the user the journal instead.
@@ -345,14 +345,14 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 };
                 let n = tail.max(1);
                 let follow_flag = if follow { "-f " } else { "" };
-                let cmd = format!("journalctl {scope}-u filament {follow_flag}-n {n} --no-pager");
+                let cmd = format!("journalctl {scope}-u tunlion {follow_flag}-n {n} --no-pager");
                 ui::say(&format!(
                     "  this daemon runs as a service (pid {pid}); its output goes to the journal"
                 ));
                 ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
                 let status = std::process::Command::new("journalctl")
                     .args(scope.split_whitespace())
-                    .args(["-u", "filament"])
+                    .args(["-u", "tunlion"])
                     .args(if follow { vec!["-f"] } else { vec![] })
                     .args(["-n", &n.to_string(), "--no-pager"])
                     .status();

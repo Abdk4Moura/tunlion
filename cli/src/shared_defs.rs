@@ -125,7 +125,7 @@ pub(crate) const PRINCIPAL_STATE_REVOKED: &str = "revoked";
 pub(crate) const FLEET_LINK_NAME: &str = "fleet: unverified";
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
-/// may `filament shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
+/// may `tunlion shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
 /// always enforced separately, this is purely the capability side.
 #[derive(Clone, Debug)]
 pub(crate) enum ShellPolicy {
@@ -207,7 +207,7 @@ pub(crate) struct MountPlan {
     pub(crate) read_only: bool,
 }
 
-pub(crate) const REPO: &str = "Abdk4Moura/filament";
+pub(crate) const REPO: &str = "Abdk4Moura/tunlion";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SendOutcome {

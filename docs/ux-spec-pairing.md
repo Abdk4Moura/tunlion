@@ -1,4 +1,4 @@
-# filament — pairing / auth-key / fleet-trust UX spec
+# tunlion — pairing / auth-key / fleet-trust UX spec
 
 Status: design (UX pass). Companion to `design-pairing-ux.md` (the model) and
 `design-command-surface.md` (the verbs). Built on the real `ui.rs` tokens so these
@@ -75,9 +75,9 @@ degraded "no primary" state is calm + dated. F11 danger encoded three ways (a11y
 
 ## Mocks
 
-### `filament mint` (guided, TTY)
+### `tunlion mint` (guided, TTY)
 ```
-  filament mint — a key that lets a machine join, scoped and expiring
+  tunlion mint — a key that lets a machine join, scoped and expiring
   What is this key for?
    ● (o) A device in my fleet     ( ) An external share   ( ) A CI / automation runner
   ── Access ─────────────────────────────────────────
@@ -94,26 +94,26 @@ degraded "no primary" state is calm + dated. F11 danger encoded three ways (a11y
         [ Mint key ]   [ Cancel ]
 ```
 Enabling a deliberate item requires an intent keystroke (`type SHELL to confirm`). On
-mint, prints the join code + `↳ filament mint --fleet --ttl 1h --reuse once --allow shell`.
+mint, prints the join code + `↳ tunlion mint --fleet --ttl 1h --reuse once --allow shell`.
 
-### `filament mint` (headless)
+### `tunlion mint` (headless)
 ```
-$ filament mint --fleet --ttl 1h --reuse once
-filament join clever-lynx-63-brave-otter    # ● fleet · once · expires in 1h
+$ tunlion mint --fleet --ttl 1h --reuse once
+tunlion join clever-lynx-63-brave-otter    # ● fleet · once · expires in 1h
 
-$ filament mint --fleet --ttl 1h --shell
+$ tunlion mint --fleet --ttl 1h --shell
 ✗ --shell is not a flag. Shell is deliberate access.
-  To grant it on purpose:  filament mint --fleet --ttl 1h --allow shell
+  To grant it on purpose:  tunlion mint --fleet --ttl 1h --allow shell
 
-$ filament mint --fleet --ttl 1h --yes --reusable
+$ tunlion mint --fleet --ttl 1h --yes --reusable
 ✗ --yes will not enable a deliberate option you didn't name.
-  Say it explicitly:  filament mint --fleet --ttl 1h --allow reuse --yes
+  Say it explicitly:  tunlion mint --fleet --ttl 1h --allow reuse --yes
 
-$ filament mint --external bob --ttl 30d --allow reach
+$ tunlion mint --external bob --ttl 30d --allow reach
 ✗ external keys expire within 24h (this key type's ceiling). Pick a shorter --ttl.
 ```
 
-### `filament pair` (the unmissable branch)
+### `tunlion pair` (the unmissable branch)
 SAME PERSON: a Brand banner "● SAME PERSON · this is you", one "Add to my fleet" confirm,
 scoped defaults, no per-cap ceremony. SOMEONE ELSE: an amber banner "○ SOMEONE ELSE · not
 your identity", the spoken-words PAKE ("say these three words: amber · lantern · ferry —
@@ -121,7 +121,7 @@ do they match?"), fingerprint behind `[compare]` (informational), THEN deny-by-d
 directional time-boxed caps. The two share only the frame — different color, glyph, word,
 ceremony.
 
-### `filament devices` (three tiers)
+### `tunlion devices` (three tiers)
 ```
   ● FLEET — your devices, permissive within scope, self-renewing
      ● pixel-7    online   shell reach:8080 inbox   renews in 9m
@@ -130,25 +130,25 @@ ceremony.
      ○ carol      online   send→you                 expires in 4m
   ◐ NEEDS REVIEW — paired before scoped trust; promote to sort into a tier
      ◐ old-laptop offline  (full legacy trust)       promote to continue
-       ↳ filament devices promote old-laptop
-  2 requests waiting · filament requests
+       ↳ tunlion devices promote old-laptop
+  2 requests waiting · tunlion requests
   This is a local index; each device's own capability list is authoritative.
 ```
 
-### `filament requests` (pull queue, no tray)
+### `tunlion requests` (pull queue, no tray)
 ```
   2 waiting
   1  ○ carol wants to send you files       [ approve 1 ] [ deny 1 ]
-  2  ○ dave  wants to open a shell ⚠        [ filament requests approve 2 ] [ deny 2 ]
-  Nothing pushes to you yet — check `filament requests`, or wire a hook:
-    filament requests --notify 'notify-send %s'
+  2  ○ dave  wants to open a shell ⚠        [ tunlion requests approve 2 ] [ deny 2 ]
+  Nothing pushes to you yet — check `tunlion requests`, or wire a hook:
+    tunlion requests --notify 'notify-send %s'
 ```
 A deliberate request can't be approved by a bare `approve` (must name + bound it).
 
 ### Recovery
-`filament init` force-saves a 12-word phrase ("Write these down. This is the only way
+`tunlion init` force-saves a 12-word phrase ("Write these down. This is the only way
 back if every device is lost. We will not show them again.") + nudges ≥2 primaries.
-`filament restore` recovers on a new device with a 7-day pending-activation anti-theft
+`tunlion restore` recovers on a new device with a 7-day pending-activation anti-theft
 freeze. `revoke`/`rotate` are self-lockout-guarded ("pixel-7 is your only online
 primary — rotating now could lock you out"). Degraded state changes the clock's shape:
 `renews in 6m` → `renews until Aug 3 (in 5 days) — bring a primary online before then`.

@@ -1,7 +1,7 @@
 """cli.py — the argparse front-end behind the `lab` command.
 
 Subcommands:
-  up <topology> [--link pipe|udp|wg|filament] [--crypto ...] [--no-doctor]
+  up <topology> [--link pipe|udp|wg|tunlion] [--crypto ...] [--no-doctor]
   down [<lab>] [--all] [--purge-logs]
   status [<lab>]
   probe <ping|iperf|curl|counters> [<lab>]
@@ -179,7 +179,7 @@ def cmd_fault(args) -> int:
     led = load_ledger(lab)
     if led is None:
         raise SystemExit(f"no such lab '{lab}'")
-    # Apply the fault to the FIRST node's carrier-side iface. For wg/udp/filament
+    # Apply the fault to the FIRST node's carrier-side iface. For wg/udp/tunlion
     # the overlay-bearing iface differs; we degrade the underlay where possible,
     # else the tun. We target node-a's tun by default (works for all carriers).
     nodes = led.nodes()
@@ -261,14 +261,14 @@ def cmd_compose(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="lab", description="filament networking dev-lab (lab as code).")
+        prog="lab", description="tunlion networking dev-lab (lab as code).")
     p.add_argument("--json", action="store_true",
                    help="machine-readable JSON output")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     up = sub.add_parser("up", help="realize a topology")
     up.add_argument("topology")
-    up.add_argument("--link", choices=["pipe", "veth", "udp", "wg", "filament"],
+    up.add_argument("--link", choices=["pipe", "veth", "udp", "wg", "tunlion"],
                     help="override the link provider")
     up.add_argument("--crypto", choices=["none", "wg-noise", "dtls"])
     up.add_argument("--no-doctor", action="store_true",
@@ -303,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dc = sub.add_parser("doctor", help="preflight checks")
     dc.add_argument("--link", default="pipe",
-                    choices=["pipe", "veth", "udp", "wg", "filament"])
+                    choices=["pipe", "veth", "udp", "wg", "tunlion"])
     dc.set_defaults(func=cmd_doctor)
 
     sub.add_parser("list", help="list topologies + running labs").set_defaults(
@@ -311,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     co = sub.add_parser("compose", help="preview the primitive wiring for a topology")
     co.add_argument("topology")
-    co.add_argument("--link", choices=["pipe", "veth", "udp", "wg", "filament"])
+    co.add_argument("--link", choices=["pipe", "veth", "udp", "wg", "tunlion"])
     co.set_defaults(func=cmd_compose)
 
     return p

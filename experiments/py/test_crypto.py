@@ -9,7 +9,7 @@ from filament_lab import crypto as c
 
 def test_channel_of_vector():
     # Cross-checked against the release binary: a device with this secret prints
-    # `channel d6b6e37400ac` in `filament devices`.
+    # `channel d6b6e37400ac` in `tunlion devices`.
     full = c.channel_of("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
     assert full[:12] == "d6b6e37400ac", full
     assert len(full) == 64

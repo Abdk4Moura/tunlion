@@ -3,7 +3,7 @@
 > Status: historical implementation record. Verify the current L2 transport path and gates before extending it.
 
 ## Problem (diagnosed live, do not re-derive)
-Seamless `filament ssh` is unreliable cross-machine because the L2 link rides WebRTC,
+Seamless `tunlion ssh` is unreliable cross-machine because the L2 link rides WebRTC,
 which gets `connection stuck while connecting → dropping peer` cross-machine **even over
 `--relay`** (verified do-vm↔pop-os). Meanwhile a plain file transfer over direct-QUIC to
 do-vm's PUBLIC IP is rock-solid (`route: direct-quic`, byte-exact).
@@ -33,8 +33,8 @@ direct-for-L2 to the L2 use-case only.
 
 ### 1. Acceptor enablement — make `FILAMENT_L2` imply direct (small, safe)
 In `direct::direct_enabled()` (direct.rs:43): return true if `FILAMENT_DIRECT==1` **OR
-`FILAMENT_L2==1`**. Rationale: the L2 acceptor (`FILAMENT_L2=1 filament up`) wants reliable
-CLI↔CLI; a plain `filament up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
+`FILAMENT_L2==1`**. Rationale: the L2 acceptor (`FILAMENT_L2=1 tunlion up`) wants reliable
+CLI↔CLI; a plain `tunlion up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
 untouched (hard rule preserved). The acceptor already sends offers + races once enabled.
 
 ### 2. Initiator — give `bring_up_to_known` a direct dial that races WebRTC
@@ -68,9 +68,9 @@ arm already does and should be replicated).
 - **Gates, no regression:** `cli/tests/ssh-gates.sh` (4), `l2-gates.sh` (5),
   `transport-gates.sh` rung-1 (4), and `gates.sh` send/recv (file transfer untouched).
 - **Live (human runs — agent can't reach pop-os):**
-  - do-vm: `FILAMENT_L2=1 filament up`   (no FILAMENT_DIRECT needed now)
-  - do-vm: `filament grant popos shell`  (already granted)
-  - pop-os: `filament ssh root@dovm 'hostname'`  → returns do-vm's hostname, route
+  - do-vm: `FILAMENT_L2=1 tunlion up`   (no FILAMENT_DIRECT needed now)
+  - do-vm: `tunlion grant popos shell`  (already granted)
+  - pop-os: `tunlion ssh root@dovm 'hostname'`  → returns do-vm's hostname, route
     direct-quic, no keys, no prompts.
 
 ## Durability / safety

@@ -1,6 +1,6 @@
 // journey-phone-shell.cjs — Sam journey (dev, home server): shell from anywhere.
 //
-// Sam's home server runs `filament up --shell` (a REAL peer). From his PHONE
+// Sam's home server runs `tunlion up --shell` (a REAL peer). From his PHONE
 // (mobile viewport) he pairs it once, opens its terminal, and runs a real
 // command (`uname -a`) — output streams back over the WebRTC data channel. No
 // SSH server, no port-forward, no VPN: the shell-from-anywhere story.

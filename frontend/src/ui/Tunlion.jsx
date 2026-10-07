@@ -1,6 +1,6 @@
-/* Filament: polished "Terminal" presentation component.
+/* Tunlion: polished "Terminal" presentation component.
    Ported from the Claude Design handoff (Variant A · Terminal). Presentation
-   only: driven by `state` + callbacks whose names match useFilament(). An
+   only: driven by `state` + callbacks whose names match useTunlion(). An
    optional `ui` prop carries display options (theme/accent/density/columns/font);
    omit it for sensible defaults (dark / green / airy). */
 
@@ -813,7 +813,7 @@ function useLockZoomWhile(active) {
   }, [active])
 }
 
-export default function Filament(props) {
+export default function Tunlion(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
     onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, ui = {} } = props
@@ -1166,7 +1166,7 @@ export default function Filament(props) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <span style={{ fontSize: 16, letterSpacing: '.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
               <span className="fil-caret" style={{ width: 9, height: 15, background: accent, display: 'inline-block', boxShadow: '0 0 10px ' + accent + '88' }} />
-              filament
+              tunlion
             </span>
             <Pill T={T}>{state.roomId}</Pill>
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -1222,7 +1222,7 @@ export default function Filament(props) {
         borderBottom: '1px solid ' + T.line, background: T.bg }}>
         <span style={{ fontSize: 16, letterSpacing: '.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
           <span className="fil-caret" style={{ width: 10, height: 16, background: accent, display: 'inline-block', boxShadow: '0 0 10px ' + accent + '88' }} />
-          filament
+          tunlion
         </span>
         <Pill T={T}>room {state.roomId}</Pill>
         <span style={{ fontSize: 11, color: state.connected ? T.ok : T.bad, display: 'flex', alignItems: 'center', gap: 6 }}>

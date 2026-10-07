@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""filament signaling probe — a controllable peer for EXPERIMENTS, not assertions.
+"""tunlion signaling probe — a controllable peer for EXPERIMENTS, not assertions.
 
-The real `filament` binary is the "test object"; this is the other side, fully
-under our control. Pair it with a real `filament up`/`send`/`netcat` and you can
+The real `tunlion` binary is the "test object"; this is the other side, fully
+under our control. Pair it with a real `tunlion up`/`send`/`netcat` and you can
 construct exact adversarial timing (late join, withheld/duplicated/reordered
 offers, malformed payloads) and watch how the real code reacts — deterministic,
 and you can STEP IN interactively to inject anything.
@@ -15,7 +15,7 @@ The pair channel is sha256("filament-pair:"+secret) (= the CLI's channel_of).
 
 USAGE
   # passive watch: does a LATE subscriber see an already-present peer?
-  #   (run `FILAMENT_L2=1 filament up` first, then:)
+  #   (run `FILAMENT_L2=1 tunlion up` first, then:)
   probe.py --secret <hex> watch --seconds 15
 
   # interactive step-in REPL:

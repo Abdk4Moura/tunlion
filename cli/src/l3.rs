@@ -132,7 +132,7 @@ const IFNAME: &str = "filament0";
 /// Is IPv6 switched off for new interfaces on this host?
 ///
 /// Read from the two knobs that actually govern a freshly created device. A TUN
-/// filament just made inherits `default`, and `all` overrides everything, so
+/// tunlion just made inherits `default`, and `all` overrides everything, so
 /// either being set is enough to make the overlay address unassignable.
 pub fn ipv6_disabled() -> bool {
     let read = |p: &str| std::fs::read_to_string(p).ok().map(|v| v.trim() == "1").unwrap_or(false);
@@ -155,7 +155,7 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
     let e = err.to_ascii_lowercase();
     if ipv6_off || e.contains("ipv6 is disabled") {
         return format!(
-            "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), and filament's \
+            "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), and tunlion's \
              overlay address is an IPv6 ULA, so the kernel plane cannot hold it. Re-enable it \
              with `sysctl -w net.ipv6.conf.all.disable_ipv6=0 \
              net.ipv6.conf.default.disable_ipv6=0` (persist it in /etc/sysctl.d). Original error: {err}"
@@ -163,7 +163,7 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
     }
     if e.contains("operation not permitted") || e.contains("permission denied") {
         return format!(
-            "no permission to create a network device: filament needs CAP_NET_ADMIN (run as root, \
+            "no permission to create a network device: tunlion needs CAP_NET_ADMIN (run as root, \
              or grant the capability on the binary). Original error: {err}"
         );
     }
@@ -175,7 +175,7 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
     }
     if e.contains("busy") {
         return format!(
-            "another process already holds {IFNAME}: only one filament per host can own the kernel \
+            "another process already holds {IFNAME}: only one tunlion per host can own the kernel \
              device. Original error: {err}"
         );
     }
@@ -214,7 +214,7 @@ pub struct L3 {
     identity: Option<Identity>,
     /// Subnet prefixes THIS node has installed into the kernel routing table, so
     /// reconciliation can withdraw one that is no longer advertised. Tracked
-    /// rather than re-read from the kernel so filament only ever deletes routes
+    /// rather than re-read from the kernel so tunlion only ever deletes routes
     /// it created, and never a route the operator put there.
     kernel_subnets: Mutex<std::collections::HashSet<String>>,
     /// Whether the policy-routing exit route is currently in force, so it is
@@ -780,7 +780,7 @@ impl L3 {
     ///
     /// Without this the whole path is invisible to the operating system: the
     /// advertisement verifies, authorization passes, the prefix lands in the
-    /// in-process table, `filament` prints "routes via <peer>", and `ip route`
+    /// in-process table, `tunlion` prints "routes via <peer>", and `ip route`
     /// still shows nothing, so the kernel never hands those packets to the TUN
     /// and every ping fails. The in-process table decides which TRANSPORT a
     /// packet rides once it reaches us; it cannot make the kernel deliver the
@@ -937,7 +937,7 @@ fn open_kernel(
     Ok(tun)
 }
 
-const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
+const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by tunlion; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
 
 /// Get this machine's hostname for MagicDNS.
@@ -992,7 +992,7 @@ fn rewrite_hosts_block(entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> std:
     // only has a per-file ACL on the hosts file: a single-shot in-place truncating
     // write, which needs write on the file alone. The in-place path writes the whole
     // buffer in one std::fs::write so the corruption window is one syscall.
-    let tmp = path.with_extension("filament.tmp");
+    let tmp = path.with_extension("tunlion.tmp");
     match std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, &path)) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -1003,7 +1003,7 @@ fn rewrite_hosts_block(entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> std:
 }
 
 /// Pure transform: strip any prior filament-mesh block from `current`, then append
-/// a fresh one for `entries` (none => block removed). Non-filament lines are kept
+/// a fresh one for `entries` (none => block removed). Non-tunlion lines are kept
 /// verbatim, so we never clobber the user's /etc/hosts.
 fn render_hosts(current: &str, entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)]) -> String {
     let mut out = String::with_capacity(current.len() + 256);
@@ -1067,7 +1067,7 @@ fn is_safe_mesh_name(name: &str) -> bool {
 
 /// Standalone point-to-point serve_tun (no signaling): open `dev` with `tun_addr`
 /// and pump IP packets both ways over an already-authenticated QUIC connection's
-/// datagrams. Runs until the link or TUN closes. Backs `filament serve-tun` and
+/// datagrams. Runs until the link or TUN closes. Backs `tunlion serve-tun` and
 /// the lab's filament-l3 carrier (WireGuard-style known-endpoint overlay).
 pub async fn run_point_to_point(
     conn: quinn::Connection,

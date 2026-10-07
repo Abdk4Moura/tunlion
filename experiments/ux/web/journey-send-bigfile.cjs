@@ -1,6 +1,6 @@
 // journey-send-bigfile.cjs — HERO JOURNEY (Maya, café→home), browser leg.
 //
-// Maya's "home desktop" is a REAL filament `up` peer (paired/remembered). The
+// Maya's "home desktop" is a REAL tunlion `up` peer (paired/remembered). The
 // browser (her laptop) DRAGS a multi-MB file onto its tile and it transfers
 // byte-correct over real WebRTC. This driver is the user-visible half: it pairs
 // for real (CLI mints a PAKE code), waits for the tile to go LIVE/ready, then

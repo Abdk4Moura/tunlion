@@ -15,7 +15,7 @@ machine is. That reaches **machines you control**.
 
 The things people actually want to reach are usually not nodes: the NAS, the
 printer, a Postgres box on `10.0.0.5` nobody will install anything on, an office
-LAN. Those will never run filament, and some cannot run anything.
+LAN. Those will never run tunlion, and some cannot run anything.
 
 A **subnet router** closes that gap: one node on the LAN announces "I can reach
 `10.0.0.0/24`", peers route that prefix to it, and it forwards. One install
@@ -124,7 +124,7 @@ were individually correct.
 2. **No kernel route was installed.** An accepted prefix updated only the
    in-process `RouteTable`, which decides which transport a packet rides *after*
    it reaches us. It cannot make the kernel deliver the packet in the first
-   place. `filament` printed "routes via <peer>" while `ip route` showed nothing.
+   place. `tunlion` printed "routes via <peer>" while `ip route` showed nothing.
 
 3. **`route` was missing from the invitation bitmask**, and the encoder ended in
    `.unwrap_or(0)`, so an unencodable capability silently collapsed the WHOLE

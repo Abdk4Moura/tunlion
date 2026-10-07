@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Local loopback e2e for the FILE-DRIVEN filament job runner.
+# Local loopback e2e for the FILE-DRIVEN tunlion job runner.
 #
-# Boots an ISOLATED filament topology on THIS host (separate built binary +
+# Boots an ISOLATED tunlion topology on THIS host (separate built binary +
 # separate FILAMENT_CONFIG_DIRs + a local signaling backend) and runs the full
 # file-driven submit -> watcher-runs-job -> await(results) loop against it. Never
-# touches the user's live `up --shell` daemon or the installed ~/.local/bin/filament.
+# touches the user's live `up --shell` daemon or the installed ~/.local/bin/tunlion.
 #
 # Topology (file-driven — see filament_runner.FileRunnerBox + watcher.py):
 #   din  : box `up --dir <inbox>`  <- host `send`   (push job spec + inputs)
@@ -22,7 +22,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PORT="${FILJOB_TEST_PORT:-8077}"
 SERVER="http://127.0.0.1:$PORT"
-BIN="${FILJOB_BIN:-$ROOT/cli/target/release/filament}"
+BIN="${FILJOB_BIN:-$ROOT/cli/target/release/tunlion}"
 
 # A python with the backend's signaling deps (flask-socketio + eventlet) is
 # needed to run the LOCAL signaling backend. Prefer an explicit FILJOB_VENV;
@@ -76,7 +76,7 @@ echo "[test] work:    $WORK"
 if [ -z "${FILJOB_BIN:-}" ]; then
   ( cd "$ROOT/cli" && cargo build --release --features test-hooks ) || { echo "ERROR: build failed"; exit 1; }
 fi
-[ -x "$BIN" ] || { echo "ERROR: filament binary not found at $BIN (build: cd cli && cargo build --release --features test-hooks)"; exit 1; }
+[ -x "$BIN" ] || { echo "ERROR: tunlion binary not found at $BIN (build: cd cli && cargo build --release --features test-hooks)"; exit 1; }
 
 # --- devices.json on each side -------------------------------------------------
 # host: din->"box-in" (send target). host-dout: dout->"box-out" (sink peer).

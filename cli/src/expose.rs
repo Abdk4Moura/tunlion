@@ -1,10 +1,10 @@
-//! `filament expose <port>`: publish a local service on this device's L3 overlay
+//! `tunlion expose <port>`: publish a local service on this device's L3 overlay
 //! address so paired peers reach it at `<this-device>.mesh:<port>`, like a
 //! Tailscale-served port. The daemon binds the overlay address (a ULA reachable
 //! only over filament0) and splices each connection to a local target; nothing is
 //! exposed on any public or LAN interface. Config lives in `expose.json` next to
 //! the other settings and is applied to the running daemon over the control
-//! socket (no restart), mirroring `filament set`.
+//! socket (no restart), mirroring `tunlion set`.
 //!
 //! Access control: a connection can only arrive over filament0 from a paired,
 //! verified peer, so mesh membership is the primary boundary; `--peer` narrows it
@@ -78,7 +78,7 @@ fn scope_str(peers: &Option<Vec<String>>) -> String {
     }
 }
 
-/// `filament expose [<port>] [--to <host:port>] [--peer a,b] [--list]`.
+/// `tunlion expose [<port>] [--to <host:port>] [--peer a,b] [--list]`.
 pub async fn expose_cmd(
     port: Option<u16>,
     to: Option<String>,
@@ -109,7 +109,7 @@ pub async fn expose_cmd(
     Ok(())
 }
 
-/// `filament unexpose <port>`.
+/// `tunlion unexpose <port>`.
 pub async fn unexpose_cmd(port: u16) -> Result<()> {
     let mut cfg = load();
     let before = cfg.len();
@@ -127,7 +127,7 @@ pub async fn unexpose_cmd(port: u16) -> Result<()> {
 fn print_list() -> Result<()> {
     let cfg = load();
     if cfg.is_empty() {
-        ui::say(&ui::paint(ui::Tone::Dim, "  no ports exposed. try: filament expose 8080"));
+        ui::say(&ui::paint(ui::Tone::Dim, "  no ports exposed. try: tunlion expose 8080"));
         return Ok(());
     }
     ui::say("  exposed on this device's .mesh address:");
@@ -153,14 +153,14 @@ async fn notify_daemon() {
             Some(_) => {
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
-                    "  saved; the daemon has no L3 overlay up (run: filament set tun-addr auto, then filament up)",
+                    "  saved; the daemon has no L3 overlay up (run: tunlion set tun-addr auto, then tunlion up)",
                 ));
                 return;
             }
             None => {}
         }
     }
-    ui::say(&ui::paint(ui::Tone::Dim, "  saved; takes effect on next `filament up`"));
+    ui::say(&ui::paint(ui::Tone::Dim, "  saved; takes effect on next `tunlion up`"));
 }
 
 // -------------------------------------------------------------- daemon side --

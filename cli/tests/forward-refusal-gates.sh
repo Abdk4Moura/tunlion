@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # #232/#268: what `forward` tells the user when the peer says no.
 #
-#   FILAMENT_BIN=/path/to/filament ./forward-refusal-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./forward-refusal-gates.sh
 #
 # This gate exists because there was none. Every other gate in this directory is
 # a same-host fixture, and a same-host fixture cannot produce the state that
@@ -28,8 +28,8 @@ CLI_DIR="$(dirname "$HERE")"
 # to do with the code under test. Prefer the shared dir when it holds a newer
 # build, and say which one was chosen.
 _default_bin() {
-    local a="$CLI_DIR/target/release/filament"
-    local b="/root/.cargo-target/release/filament"
+    local a="$CLI_DIR/target/release/tunlion"
+    local b="/root/.cargo-target/release/tunlion"
     if [ -x "$b" ] && { [ ! -x "$a" ] || [ "$b" -nt "$a" ]; }; then echo "$b"; else echo "$a"; fi
 }
 BIN="${FILAMENT_BIN:-$(_default_bin)}"
@@ -45,7 +45,7 @@ FAST=12
 source "$HERE/lib/fixture.sh"
 trap 'fixture_cleanup; pkill -f "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 
-[ -x "$BIN" ] || { echo "no filament binary at $BIN; build first"; exit 2; }
+[ -x "$BIN" ] || { echo "no tunlion binary at $BIN; build first"; exit 2; }
 echo "## binary under test: $BIN"
 "$BIN" --version | sed 's/^/##   /'
 
@@ -59,7 +59,7 @@ BDIR="$WORK/bravo"
 # sends its errors to /dev/null, so setup failed silently and every later gate
 # measured a forward that never started.
 # Alpha must be SERVING for a join to complete: `add --for` says so itself
-# ("the always-on receiver is not running; start `filament up` before anyone
+# ("the always-on receiver is not running; start `tunlion up` before anyone
 # claims this invitation"). Omitting it is why the first run of this gate could
 # not enrol bravo at all.
 start_acceptor "$DA"
@@ -112,7 +112,7 @@ start_acceptor_l2() {
   sleep 6
   # "daemon already running ... following its log" is NOT serving, so match the
   # banner a real acceptor prints and reject the follow-mode message explicitly.
-  if grep -qs 'already running' "$WORK/up-$1.log" || ! grep -qs 'filament up,' "$WORK/up-$1.log"; then
+  if grep -qs 'already running' "$WORK/up-$1.log" || ! grep -qs 'tunlion up,' "$WORK/up-$1.log"; then
     echo "acceptor ($1) did not start:"; sed 's/^/    /' "$WORK/up-$1.log" | tail -5; exit 2
   fi
 }

@@ -4,11 +4,11 @@
 
 ## The bug that started this
 
-`filament add` in a script said:
+`tunlion add` in a script said:
 
     ✗ add is interactive (it needs consent on both ends). For automation,
       create a bounded invitation instead:
-          filament add --for device
+          tunlion add --for device
 
 That suggested command fails with the same message. `--out` is required too, so
 the error told you to run the thing that produced it. It was a hardcoded string
@@ -30,7 +30,7 @@ Three properties, in order of how much they cost when missing:
    `add laptop` already said who; do not re-explain `--for`, name the one piece
    they missed. Someone who typed bare `add` has not chosen yet, so enumerate.
 3. **Name the other end.** An invitation whose reader does not know that
-   `filament join <file>` claims it is not a working instruction. Half a
+   `tunlion join <file>` claims it is not a working instruction. Half a
    ceremony is not guidance.
 
 The third matters most for AGENTS, which cannot infer the claim side from

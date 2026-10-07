@@ -17,7 +17,7 @@ from labkit.state import Ledger
 from labkit.topology import Topology
 
 
-# Where the locally-built filament binary lives (filament provider uses it).
+# Where the locally-built tunlion binary lives (tunlion provider uses it).
 from labkit.doctor import FILAMENT_BIN  # noqa: F401  (re-export for providers)
 
 

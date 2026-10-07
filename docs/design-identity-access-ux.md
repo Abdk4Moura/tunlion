@@ -1,6 +1,6 @@
 # Identity and access UX
 
-> Status: design (2026-07-25). Builds on `docs/design-mesh-network.md` (filament
+> Status: design (2026-07-25). Builds on `docs/design-mesh-network.md` (tunlion
 > stays pairwise) and `docs/design-introduce-user-identity.md` (user-key over
 > device-certs). Every load-bearing decision here was stress-tested adversarially
 > before it landed. This note freezes the product-layer identity and access design
@@ -19,7 +19,7 @@
 4. **The human confirms every cross-boundary action.** The same confirm dialog
    gates introduce (accept a peer), grant (accept an access change), recovery
    (threshold + out-of-band), and the GPU consent screen. That one recurring gate is
-   where filament's pairwise-authorization guarantee lives in the product.
+   where tunlion's pairwise-authorization guarantee lives in the product.
 
 ## 1. Onboarding
 
@@ -125,7 +125,7 @@ confidence, not the combination.**
 
 ## 5. Access control: capabilities, not an ACL file
 
-filament does **not** use a Tailscale-style central ACL file (that is the pain and
+tunlion does **not** use a Tailscale-style central ACL file (that is the pain and
 the coordinator we reject). Access is an **object-capability** model.
 
 - **Edge-local, owner-signed.** Each device/service carries its own signed grant
@@ -159,8 +159,8 @@ both **LLM-legible and foot-gun-resistant**.
 
 ### AI is external; safety lives in the apply path
 
-filament embeds no AI. Users bring their own (ChatGPT/Claude) to draft the typed
-ops from natural-language intent. filament never trusts the author. Its safety is a
+tunlion embeds no AI. Users bring their own (ChatGPT/Claude) to draft the typed
+ops from natural-language intent. tunlion never trusts the author. Its safety is a
 single apply path, identical no matter who or what wrote the grant:
 
 - **Preview the effective bidirectional access, and show the negative space** (what
@@ -221,7 +221,7 @@ The gate is one concept but reaches the human two ways, and a CLI is natively go
 at only the first:
 
 - **Deliberate grant (pull).** The owner decides and issues the grant themselves,
-  ahead of the access: `filament grant <peer> shell --for 1h`. No interruption, no
+  ahead of the access: `tunlion grant <peer> shell --for 1h`. No interruption, no
   surface needed, because the owner is already the party acting. This is the
   CLI-native mode and the correct default. Helping a friend lands entirely here: the
   friend is already at his keyboard, so *he* runs the grant; it is directional and
@@ -231,8 +231,8 @@ at only the first:
 - **Live approval (push).** Someone asks while the owner is not looking and wants a
   yes in the moment. This REQUIRES a persistent notification surface, which a CLI
   structurally is not. Degrade honestly: the daemon holds a **pending-requests
-  queue** surfaced in-band on next CLI use (`filament requests`, plus a line in
-  `filament devices`), and optional owner-configured **notify hooks** (notify-send /
+  queue** surfaced in-band on next CLI use (`tunlion requests`, plus a line in
+  `tunlion devices`), and optional owner-configured **notify hooks** (notify-send /
   webhook / email). The instant tap-allow experience is the first-class job of the
   daemon + tray/companion app (see `docs/design-product-interface.md`), not
   something to fake in the terminal.
@@ -260,7 +260,7 @@ SSO-bound identity (the org authority is just another CA binding user keys to Id
 identities; deprovision = revoke the org cert), admin-authorized membership +
 device approval (delegated trust *within the org boundary*, which enterprises want
 and consumers reject), central policy authored once and pushed to devices as the
-typed signed ops, and the audit log + global policy view. It squares with "filament
+typed signed ops, and the audit log + global policy view. It squares with "tunlion
 stays pairwise" the same way the GPU discovery layer and the recovery witness do:
 it is a **product-layer coordinator** that orchestrates pairwise primitives for an
 org that opts in, never a mandatory global one. Cross-org stays pairwise;
@@ -269,7 +269,7 @@ anonymity is traded for control *inside* the org, which is the desired trade the
 ### The positioning this implies (stress-tested)
 
 - **The fabric is the foundation we must OWN, standalone, not merely "table
-  stakes."** filament must remain a standalone mesh; Tailscale is a
+  stakes."** tunlion must remain a standalone mesh; Tailscale is a
   migration/compatibility bridge only, never the primary fabric. If we build on
   someone else's network we become a feature on their platform.
 - **But fabric parity does not WIN enterprise.** You do not dislodge Tailscale with

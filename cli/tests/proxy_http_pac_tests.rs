@@ -1,21 +1,21 @@
 //! Tests for HTTP CONNECT proxy and PAC file serving.
 //!
-//! These tests verify that `filament reach --socks --http-port` serves HTTP
+//! These tests verify that `tunlion reach --socks --http-port` serves HTTP
 //! CONNECT tunneling and PAC file for browser config. (The old `proxy` command
 //! was folded into `reach --socks` in the 0.7.5 command-surface rework.)
 
 use std::process::Command;
 
-/// Get the path to the filament binary built with test-hooks feature.
+/// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
-    path.push("filament");
+    path.push("tunlion");
     path
 }
 
-/// Test that `filament reach --help` shows the --http-port flag.
+/// Test that `tunlion reach --help` shows the --http-port flag.
 #[test]
 fn proxy_help_shows_http_port_flag() {
     let bin = filament_bin();
@@ -24,7 +24,7 @@ fn proxy_help_shows_http_port_flag() {
         .arg("forward")
         .arg("--help")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -35,7 +35,7 @@ fn proxy_help_shows_http_port_flag() {
     );
 }
 
-/// Test that `filament reach --socks --http-port 0` disables HTTP proxy.
+/// Test that `tunlion reach --socks --http-port 0` disables HTTP proxy.
 #[test]
 fn proxy_http_port_zero_disables() {
     let bin = filament_bin();
@@ -52,7 +52,7 @@ fn proxy_http_port_zero_disables() {
         .arg("19999")
         .stdin(std::process::Stdio::null())
         .spawn()
-        .expect("failed to start filament proxy");
+        .expect("failed to start tunlion proxy");
 
     // Wait a moment for startup
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -92,7 +92,7 @@ fn pac_file_returns_correct_socks_port() {
         .arg(http_port.to_string())
         .stdin(std::process::Stdio::null())
         .spawn()
-        .expect("failed to start filament proxy");
+        .expect("failed to start tunlion proxy");
 
     // Wait for proxy to start
     std::thread::sleep(std::time::Duration::from_millis(500));

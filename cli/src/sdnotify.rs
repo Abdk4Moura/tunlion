@@ -10,7 +10,7 @@
 //! once the loop is actually serving, and `STATUS=` surfaces signaling health in
 //! `systemctl status` (the visibility that was missing when a node fell off).
 //!
-//! Every call is a NO-OP when `NOTIFY_SOCKET` is unset (a manual `filament up`,
+//! Every call is a NO-OP when `NOTIFY_SOCKET` is unset (a manual `tunlion up`,
 //! non-systemd, or non-unix), so it is always safe to call.
 
 #[cfg(unix)]
@@ -53,7 +53,7 @@ pub fn watchdog() {
     notify("WATCHDOG=1");
 }
 
-/// One-line human status shown by `systemctl --user status filament`.
+/// One-line human status shown by `systemctl --user status tunlion`.
 pub fn status(s: &str) {
     notify(&format!("STATUS={s}"));
 }

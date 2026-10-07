@@ -10,10 +10,10 @@
 #         persists the ephemeral secret on a plain transfer.
 #
 # Configurable for any environment (defaults match the l1a fixture on 8093):
-#   BIN     path to the release filament binary
+#   BIN     path to the release tunlion binary
 #   SERVER  signaling backend URL (a LOCAL fixture, never prod)
 set -uo pipefail
-BIN=${BIN:-../../target/release/filament}
+BIN=${BIN:-../../target/release/tunlion}
 SERVER=${SERVER:-http://127.0.0.1:8093}
 T=${T:-/tmp/l1a-gate9}
 rm -rf "$T"; mkdir -p "$T/cfgS" "$T/cfgR" "$T/out"

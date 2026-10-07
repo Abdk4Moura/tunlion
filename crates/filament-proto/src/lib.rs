@@ -1,4 +1,4 @@
-//! PROTOCOL: the filament file-transfer ceremony decisions (the Rust mirror of
+//! PROTOCOL: the tunlion file-transfer ceremony decisions (the Rust mirror of
 //! the JS `net/protocol` layer). Pure: bytes/state in, a decision out, NO timers,
 //! NO retries, NO transport. The stateful event loops (`send_cmd`/`recv_cmd` in
 //! `main.rs`) own the I/O and call in here. Mirrors

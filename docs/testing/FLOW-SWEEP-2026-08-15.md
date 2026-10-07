@@ -20,7 +20,7 @@ Every claim below is something a command actually did.
 | `join --invite-file` | enrolled in under 1s, ceiling persisted |
 | single-use enforcement | second claim refused, `this invitation has already been used`, exit 1. #222 closed |
 | `send --to <device>` | 2.9 MB at 245 MB/s, sha256 matched, both directions |
-| bare `filament <file>` | speakable code, clipboard, browser fallback, 10 min expiry |
+| bare `tunlion <file>` | speakable code, clipboard, browser fallback, 10 min expiry |
 | `receive <code>` | stranger with no pairing, authenticated, sha256 matched |
 | `reach` | 1 ms on a warm link, cold path reports an estimate |
 | `mount` | FUSE read-only, listing and reads correct |
@@ -44,7 +44,7 @@ is the mitigation. The message also reports removing the managed
 `authorized_keys` block, which it really does, and which only governs `--ssh`.
 
 **#226, grant is inert for the same devices.** `grant <device> shell`, then
-`requests approve --allow shell`, then `filament devices` all report the
+`requests approve --allow shell`, then `tunlion devices` all report the
 capability held; the acceptor refuses it. `grant` targets `peer_cert.user_pub`,
 which for a delegated device is the issuer's own owner key, and enforcement reads
 the enrollment ceiling instead. The enforcement is right. Three surfaces
@@ -52,7 +52,7 @@ asserting owner-equivalent access that does not exist is the bug.
 
 **#223, a refused stream reports success.** Acceptor logs `pty refused: … not in
 auth key caps` or `device revoked`; the initiator gets an empty screen and exit 0,
-so `filament shell host -- deploy.sh && echo done` prints `done` after a refusal.
+so `tunlion shell host -- deploy.sh && echo done` prints `done` after a refusal.
 Full four-cell matrix is on the issue, including the positive control.
 
 **#232, `forward` announces success at the moment of refusal.** Prints `the link
@@ -61,16 +61,16 @@ caps`, and the tunnel returns nothing. Third stream type in the #223 family afte
 mount and pty, which is the argument for one per-stream outcome channel rather
 than a fix per verb.
 
-**#224, `daemon_alive()` greps the command line for "filament".** The same binary
+**#224, `daemon_alive()` greps the command line for "tunlion".** The same binary
 renamed to `fil` reports not running while running; `down` and `up` follow. The
-existing test cannot fail, because the test binary is named `filament-<hash>`.
+existing test cannot fail, because the test binary is named `tunlion-<hash>`.
 
-**#230, `filament send <file>` does not mint a code** although the banner says it
-does, while bare `filament <file>` does. The verb form is the one people type.
+**#230, `tunlion send <file>` does not mint a code** although the banner says it
+does, while bare `tunlion <file>` does. The verb form is the one people type.
 
-**#229 and #227, printed commands that do not exist.** `filament unmount`, after
-every successful mount. `filament requests approve <id>`, missing two required
-flags. `filament forward <lport> <device> <rport>`, wrong arity. Three
+**#229 and #227, printed commands that do not exist.** `tunlion unmount`, after
+every successful mount. `tunlion requests approve <id>`, missing two required
+flags. `tunlion forward <lport> <device> <rport>`, wrong arity. Three
 subsystems, three authors, one shape. #229 carries a design for the guard.
 
 **#231, `CAP-SHADOW` telemetry prints during a normal receive** at default

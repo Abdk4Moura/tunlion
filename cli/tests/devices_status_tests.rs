@@ -1,20 +1,20 @@
-//! Tests for `filament devices` status table display.
+//! Tests for `tunlion devices` status table display.
 //!
-//! These tests verify that `filament devices` shows aligned, colored output
+//! These tests verify that `tunlion devices` shows aligned, colored output
 //! with address and last-seen information.
 
 use std::process::Command;
 
-/// Get the path to the filament binary built with test-hooks feature.
+/// Get the path to the tunlion binary built with test-hooks feature.
 fn filament_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // remove test binary name
     path.pop(); // remove deps/
-    path.push("filament");
+    path.push("tunlion");
     path
 }
 
-/// Test that `filament devices` shows the final empty-state copy.
+/// Test that `tunlion devices` shows the final empty-state copy.
 #[test]
 fn devices_empty_shows_message() {
     let bin = filament_bin();
@@ -23,7 +23,7 @@ fn devices_empty_shows_message() {
         .env("FILAMENT_CONFIG_DIR", std::env::temp_dir().join("filament-devices-test-empty"))
         .arg("devices")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -34,7 +34,7 @@ fn devices_empty_shows_message() {
     );
 }
 
-/// Test that `filament devices` shows the tiered listing for legacy records.
+/// Test that `tunlion devices` shows the tiered listing for legacy records.
 #[test]
 fn devices_shows_table_headers() {
     let bin = filament_bin();
@@ -56,12 +56,12 @@ fn devices_shows_table_headers() {
         .env("FILAMENT_CONFIG_DIR", &config_dir)
         .arg("devices")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // #240: this test used to require "promote to continue" and the hint
-    // "filament devices promote test-device". Both were removed because the
+    // "tunlion devices promote test-device". Both were removed because the
     // verb does not exist (#191), nothing was actually blocked (a transfer to
     // such a device works immediately, verified between two machines), and the
     // tier heading blamed "paired before scoped trust" for pairings made
@@ -112,7 +112,7 @@ fn devices_shows_table_headers() {
     std::fs::remove_dir_all(&config_dir).ok();
 }
 
-/// Test that `filament devices --json` includes new fields.
+/// Test that `tunlion devices --json` includes new fields.
 #[test]
 fn devices_json_includes_new_fields() {
     let bin = filament_bin();
@@ -136,7 +136,7 @@ fn devices_json_includes_new_fields() {
         .arg("devices")
         .arg("--json")
         .output()
-        .expect("failed to execute filament");
+        .expect("failed to execute tunlion");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 

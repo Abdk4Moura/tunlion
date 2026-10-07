@@ -18,7 +18,7 @@ use spake2::{Ed25519Group, Identity, Password, Spake2};
 
 type HmacSha256 = Hmac<Sha256>;
 
-// ---- Filament code-split model (item 4) -------------------------------------
+// ---- Tunlion code-split model (item 4) -------------------------------------
 // A spoken code today is `adj-animal-NNN`. We split it wormhole-style:
 //   nameplate = the NNN suffix (or a dedicated routing token) -> goes to server
 //   password  = the adj-animal words -> NEVER sent to server, feeds SPAKE2

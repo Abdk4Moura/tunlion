@@ -36,7 +36,7 @@ Three specific traps, all of which caught the first draft:
 - **Do not state a quantity no single device can compute.** With two primaries,
   no one device knows the longest certificate another has issued.
 
-## `filament devices`
+## `tunlion devices`
 
 Fresh:
 
@@ -72,7 +72,7 @@ banner is not a security boundary, so past a threshold the deliberate tier is
 
 ## Adding a device
 
-`filament add` on one machine, `filament join <code>` on the other, from any
+`tunlion add` on one machine, `tunlion join <code>` on the other, from any
 device holding an enrolment delegation, which is the point of the split.
 
 The verbs split by ROLE, not transport: `add` offers, `join` accepts, and
@@ -112,7 +112,7 @@ direction that produced #226 and #228.
 ## Removing a device
 
 ```
-$ filament revoke laptop
+$ tunlion revoke laptop
   ✓ laptop removed from your mesh
 
     phone       told
@@ -120,7 +120,7 @@ $ filament revoke laptop
 
   Any device that has not been told still honours laptop's certificate.
   Each stops within 10 minutes of hearing, or when its own roster expires.
-    filament revoke laptop --now    contacts every device this device knows
+    tunlion revoke laptop --now    contacts every device this device knows
                                     about, and fails loudly if any is unreachable
 ```
 
@@ -139,7 +139,7 @@ defect: two adjacent screens stating opposite rules for the most
 security-relevant verb in the model.
 
 ```
-$ filament devices promote desktop
+$ tunlion devices promote desktop
   Promoting needs your recovery phrase, because a primary that could promote
   could also promote a device you never approved, and removing the primary
   afterwards would not remove that device.
@@ -152,7 +152,7 @@ $ filament devices promote desktop
 ```
 
 ```
-$ filament devices demote desktop
+$ tunlion devices demote desktop
   Demoting needs your recovery phrase, because nothing a primary could sign
   is enough to remove a primary.
 
@@ -213,7 +213,7 @@ draft, which the review confirmed is correct.
 
 ## Vocabulary
 
-Keep `filament devices`. The mesh model lives in the heading. #198 shipped
+Keep `tunlion devices`. The mesh model lives in the heading. #198 shipped
 because a surface removal was audited for the new thing working rather than the
 old thing still existing, and a second verb for a list that already has one
 invites the same mistake.

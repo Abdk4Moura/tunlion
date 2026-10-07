@@ -1,7 +1,7 @@
 //! The enrolment command surface, lifted out of `main.rs`.
 //!
-//! `filament enroll` (join an owner's mesh with an invitation) and
-//! `filament enroll --send` (enrol a device and then hand it a file), plus the
+//! `tunlion enroll` (join an owner's mesh with an invitation) and
+//! `tunlion enroll --send` (enrol a device and then hand it a file), plus the
 //! two helpers they share: `persist_join_ack`, which writes the join
 //! acknowledgement into the local device store, and `enrollment_timeout`, the
 //! shared long-op budget. Both helpers are called only from inside this module,
@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<String> {
     if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
         bail!(
-            "this device already holds an identity key; join only from a clean Filament identity"
+            "this device already holds an identity key; join only from a clean Tunlion identity"
         );
     }
     if local_device_cert_path().exists() {
@@ -717,7 +717,7 @@ pub(crate) async fn enroll_and_send_cmd(
         // needs a join invitation, which mints a persistent key.
         if ak.ephemeral {
             ui::say(&format!(
-                "  {} --remember cannot persist this enrollment: the key is signed ephemeral. For a remembered device, the owner mints `filament add --for device` and it joins (`filament join`).",
+                "  {} --remember cannot persist this enrollment: the key is signed ephemeral. For a remembered device, the owner mints `tunlion add --for device` and it joins (`tunlion join`).",
                 ui::paint(ui::Tone::Warn, "·"),
             ));
         } else {

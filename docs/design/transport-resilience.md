@@ -27,7 +27,7 @@ Two promises, made precise:
    > direct rungs are exhausted.**
 
    The correction ladder, in order of *least* disruption (each rung preserves the
-   filament partials/resume already on disk):
+   tunlion partials/resume already on disk):
    **(a)** resume/retry on the *same* transport →
    **(b)** switch to an already-warm *redundant* transport →
    **(c)** repair the transport in place (ICE-restart / re-dial / fresh QUIC) under
@@ -50,7 +50,7 @@ internet-down on either side. Measured by the flaky-link sim harness
 
 ## 1. Audit — what already exists vs the real gaps
 
-This design does **not** start from zero. Filament already has a large, gated,
+This design does **not** start from zero. Tunlion already has a large, gated,
 tested resilience surface. The honest summary: **establishment and recovery are
 strong; in-flight stall detection is the hole.**
 
@@ -121,7 +121,7 @@ The C-series ledger is genuinely deep. The load-bearing pieces:
 ### 1.3 The runner's hard-won patterns (PROVEN — to be lifted into the core)
 
 The runner (`runner/`, owned separately — we do not modify it here) re-derived
-the never-flaky model *on top of* filament because the core lacked it. These are
+the never-flaky model *on top of* tunlion because the core lacked it. These are
 proven patterns to pull *down* into the transport layer so **every** client gets
 them, not just the runner (`jobrunner-challenges.md` "Layer B"):
 
@@ -133,7 +133,7 @@ them, not just the runner (`jobrunner-challenges.md` "Layer B"):
 - **Integrity + resume-to-completion.** A result set is accepted **only** when
   every declared output's sha256 matches the manifest — a truncated/partial
   output fails verification and the receiver keeps awaiting. This is full-file
-  integrity, beyond filament's head-hash resume seam (C7).
+  integrity, beyond tunlion's head-hash resume seam (C7).
 - **Result-ACK loop.** The receiver pushes a tiny `ack-<job_id>` back; the
   sender re-ships each round and **stops the instant it sees the ack**. A
   lost completion signal costs one extra round, never a hang.
@@ -191,8 +191,8 @@ Stated honestly, smallest-to-largest:
 
 - **Frontend route surfacing is thin.** `_detectRoute` (`webrtc.js:243`)
   classifies `local`/`direct`/`relayed` and the tile shows a `RouteBadge`
-  (`Filament.jsx:103`) — but relay renders as a quiet amber `RELAY` chip with the
-  tooltip "via a relay" (`routeMeta`, `Filament.jsx:99`). It is *legible* but not
+  (`Tunlion.jsx:103`) — but relay renders as a quiet amber `RELAY` chip with the
+  tooltip "via a relay" (`routeMeta`, `Tunlion.jsx:99`). It is *legible* but not
   *loud*, and there is no global session indicator, no explainer, and no
   prefer-direct / allow-relay control.
 
@@ -286,7 +286,7 @@ exists, `webrtc.js` ctor).
 ### 2.3 Least-disruptive correction ladder
 
 On `Ev::TransferStalled`, escalate in order of **least disruption**, **preserving
-the on-disk partial at every rung** (filament already parks `<name>.part` +
+the on-disk partial at every rung** (tunlion already parks `<name>.part` +
 `.part.meta` and re-offers with `resume: true`):
 
 > **(a) Resume/retry on the SAME transport.**
@@ -366,7 +366,7 @@ keep the fast/honest path when it works and fail over instantly when it doesn't.
 
 The hard part. Re-establishing a path under a *live* session (transfers, PTY,
 tunnels) without the app or user noticing requires three things, two of which
-filament already has:
+tunlion already has:
 
 - **Idempotent resume offsets (HAVE).** Every transfer is resumable from its
   `.part` offset; re-offering is idempotent (C23 enforces one stream per `.part`).
@@ -440,7 +440,7 @@ still encrypted end to end).
 - **Persistent, not transient.** A relay session shows its state for the *whole*
   session, not a flash on connect. Today's `RouteBadge` is persistent on the tile
   (good) but visually quiet for relay (`routeMeta` amber `RELAY`, tooltip "via a
-  relay", `Filament.jsx:99`). Make relay **loud**: a ⚠ chip, not a calm one.
+  relay", `Tunlion.jsx:99`). Make relay **loud**: a ⚠ chip, not a calm one.
 - **Legible route everywhere.** Keep the four honest labels — **LAN** (local),
   **P2P** (direct), **HOLEPUNCHED** (NAT-traversed direct, still no middleman),
   **RELAY** (TURN). LAN/P2P/holepunched are all "no middleman"; relay is the only
@@ -451,7 +451,7 @@ still encrypted end to end).
   reliability" — and an honest consequence note (3.4).
 - **Dark/mono aesthetic preserved.** Reuse the existing theme tokens
   (`T.warn = #FFC857` dark / `#9A6B00` light; `T.bad`, `T.line`, `T.sub`,
-  `Filament.jsx:60`/`69`). The relay chip is amber-on-mono with a ⚠, matching the
+  `Tunlion.jsx:60`/`69`). The relay chip is amber-on-mono with a ⚠, matching the
   existing `away`/warn vocabulary — no new color language.
 
 ### 3.2 The tile chip (per-peer, persistent)
@@ -490,16 +490,16 @@ Relay (loud, persistent, with the honest explainer on hover/tap):
 ### 3.3 Global session indicator
 
 When *any* active link is on relay, a persistent status strip (the app's existing
-top bar, alongside `LanChip`, `Filament.jsx:249`) shows it so the user is never
+top bar, alongside `LanChip`, `Tunlion.jsx:249`) shows it so the user is never
 unaware even if the tile is scrolled off:
 
 ```
- filament                          ⚠ 1 peer on relay · routed via TURN  [ details ]
+ tunlion                          ⚠ 1 peer on relay · routed via TURN  [ details ]
  ───────────────────────────────────────────────────────────────────────────────
 ```
 
 `[ details ]` opens the same explainer + the prefer-direct/allow-relay control.
-CLI parity: `filament send`/`recv`/`pty` already print `route: relayed`
+CLI parity: `tunlion send`/`recv`/`pty` already print `route: relayed`
 (`direct.rs:684`, WebRTC `route()`); make the relay line **stand out** in the CLI
 too — a one-line honest banner on first reaching relay, e.g.:
 
@@ -520,7 +520,7 @@ A per-session (and persistable) toggle:
 - **Prefer direct (don't use relay).** Honors users who require the no-middleman
   property (privacy, policy). **Honest consequence, shown inline:** *"Some peers
   behind strict firewalls may not connect, and a session can drop instead of
-  falling back. Filament will keep trying direct paths and tell you if it can't
+  falling back. Tunlion will keep trying direct paths and tell you if it can't
   reach a peer."* This is the one place the SLO is *intentionally* capped by user
   choice — and the UI says so rather than silently breaking the promise. Maps to
   forcing the ladder to stop at rung (c) and never escalate to `--relay`.

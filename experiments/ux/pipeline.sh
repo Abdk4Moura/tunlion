@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pipeline.sh — flag-controlled, async, GPU-aware TEST + live-record pipeline that
-# drives the REAL filament app against REAL local filament peers (no mock seams).
+# drives the REAL tunlion app against REAL local tunlion peers (no mock seams).
 #
 # It stands up genuine peers (locally-built binary, isolated FILAMENT_CONFIG_DIRs,
 # a local signaling backend), PAIRS FOR REAL in the browser (a CLI peer mints a
@@ -32,11 +32,11 @@ QUALITY="auto"    # auto | high | min
 ASYNC=1           # async by default: heavy encode/gallery runs in the background
 OUT="$HERE/gallery"
 UPDATE_GALLERY=1
-GPU_NODE=""       # optional filament GPU node for encode offload (opt-in, guarded)
+GPU_NODE=""       # optional tunlion GPU node for encode offload (opt-in, guarded)
 
 usage() {
   cat <<'EOF'
-pipeline.sh — REAL-app + REAL-peer e2e TEST + live-record pipeline for filament.
+pipeline.sh — REAL-app + REAL-peer e2e TEST + live-record pipeline for tunlion.
 
 USAGE
   experiments/ux/pipeline.sh [flags]
@@ -49,7 +49,7 @@ FLAGS
   --speed <x>                playback/gesture speed hint    (default: 1)
   --parallel <n>             max concurrent web cases       (default: 1 — single-host ICE-safe)
   --quality <auto|high|min>  encode tier (default: auto — GPU→high/NVENC, else CPU/min)
-  --gpu-node <name>          OPT-IN: offload the final encode to a filament GPU node
+  --gpu-node <name>          OPT-IN: offload the final encode to a tunlion GPU node
                              (guarded; never contends with the live single-flight batch)
   --async / --sync           kick recording/encoding to the background (default) / wait
   --out <dir>                output dir for reels (default: experiments/ux/gallery)
@@ -66,7 +66,7 @@ CASES (ids)
             recorded + an ergonomics step-counter burned into each reel)
 
 MODEL
-  * Peers are REAL: locally-built cli/target/release/filament, isolated configs,
+  * Peers are REAL: locally-built cli/target/release/tunlion, isolated configs,
     a local signaling backend. No ?preview= mock seam is used for e2e (preview is
     reserved for the pure-visual reels only).
   * Pairing is REAL: a CLI peer mints a PAKE code; Playwright types it into the
@@ -329,7 +329,7 @@ case_runner_local() {
 source "$HERE/lib/journeys.sh"
 
 # ---------------------------------------------------------------- run ----------
-echo "================= filament e2e pipeline ================="
+echo "================= tunlion e2e pipeline ================="
 echo "binary  : $FILAMENT_BIN"
 echo "suite   : $SUITE   record:$RECORD  quality:$QUALITY  async:$ASYNC  parallel:$PARALLEL"
 echo "cases   : ${SELECTED[*]:-<none>}"

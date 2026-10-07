@@ -49,7 +49,7 @@ pub(crate) fn fleet_certificate_warning_for(
         return None;
     }
     Some(format!(
-        "{} {} still has fleet access via its certificate.\n  Revoke it: filament revoke {} --certificate",
+        "{} {} still has fleet access via its certificate.\n  Revoke it: tunlion revoke {} --certificate",
         ui::paint(ui::Tone::Warn, ui::glyph_warn()),
         name,
         name,
@@ -191,12 +191,12 @@ pub(crate) fn sweep_lapsed(records: &mut Vec<Value>, now: u64) -> usize {
 /// is out of scope (the deliberate tier) and needs an explicit grant.
 ///
 /// COMPOSITION INVARIANT (load-bearing — do not break in a refactor): the
-/// transfer INBOX (`drop_dir`, default `~/Filament`) must NOT be inside this
+/// transfer INBOX (`drop_dir`, default `~/Tunlion`) must NOT be inside this
 /// share root. Two scoped defaults compose dangerously if it is: `transfer`
 /// (write, auto-trusted) could place a file — or, absent plain-file-only write
 /// hardening, a symlink — that the read-only `mount` default then serves,
 /// turning two individually-correct defaults into arbitrary filesystem read.
-/// The defaults (`~/Filament` vs `~/filament-share`) are disjoint by
+/// The defaults (`~/Tunlion` vs `~/filament-share`) are disjoint by
 /// construction; a user who points `dir` and `share` at overlapping paths
 /// re-opens this, so the mount server must additionally refuse to traverse
 /// out of the share root at open time (see the beneath-root hardening).
@@ -206,10 +206,10 @@ pub(crate) fn fleet_share_root() -> PathBuf {
         .unwrap_or_else(|| platform::Paths::home_dir().join("filament-share"))
 }
 
-/// Apply a `filament set <key>` change to the LIVE daemon state, the heart of
+/// Apply a `tunlion set <key>` change to the LIVE daemon state, the heart of
 /// live-reconfigure. Returns whether the change took effect without a restart.
 /// Keys woven into startup (relay/server force, or arming the L2 acceptor from
-/// cold) return `false`, so the client tells the user to run `filament up`.
+/// cold) return `false`, so the client tells the user to run `tunlion up`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_reconfigure(
     key: &str,
@@ -259,7 +259,7 @@ pub(crate) async fn apply_reconfigure(
             true
         }
         // relay/server are bound into the establishment + signaling setup at
-        // startup; changing them safely needs a fresh `filament up`.
+        // startup; changing them safely needs a fresh `tunlion up`.
         _ => false,
     }
 }

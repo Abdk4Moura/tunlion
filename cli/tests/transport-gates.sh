@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Filament — rung-1 DIRECT CLI<->CLI transport gates (FILAMENT_DIRECT=1).
+# Tunlion — rung-1 DIRECT CLI<->CLI transport gates (FILAMENT_DIRECT=1).
 #
 # OPT-IN. These exercise the additive QUIC transport (docs/design-direct-cli-
 # transport.md realized over quinn). They are SEPARATE from gates.sh and never
@@ -19,7 +19,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="$CLI_DIR/target/release/filament"
+BIN="$CLI_DIR/target/release/tunlion"
 PORT="${FILAMENT_TEST_PORT:-8098}"          # 8098 ONLY (task constraint)
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d /tmp/wt-transport-gates.XXXXXX)"
@@ -60,14 +60,14 @@ BIG="$WORK/big.bin";     head -c 5000000 /dev/urandom >"$BIG";  H_BIG=$(hashof "
 # for the known-device direct path. WebRTC (flag OFF) for the pairing itself.
 DA="$WORK/devA"; DB="$WORK/devB"; DDROP="$WORK/drop"; mkdir -p "$DA" "$DB" "$DDROP"
 pair() {
-  # `filament add` without --for is INTERACTIVE and refuses automation outright:
+  # `tunlion add` without --for is INTERACTIVE and refuses automation outright:
   #   "add is interactive (it needs consent on both ends). For automation,
-  #    create a bounded invitation instead: filament add --for device"
+  #    create a bounded invitation instead: tunlion add --for device"
   # and `send/receive --remember` silently stores nothing (#256), which is why
   # this gate's original setup produced two unpaired stores while reporting a
   # successful transfer. The invitation flow is the supported non-interactive
   # ceremony; the owner's daemon must be UP or `join` only times out.
-  # `add --for` needs an owner identity ("no identity. Run `filament init` first").
+  # `add --for` needs an owner identity ("no identity. Run `tunlion init` first").
   env FILAMENT_CONFIG_DIR="$DA" "$BIN" init --name boxA --recovery-file "$DA/rec.txt" --yes \
       >"$WORK/pair-a-init.log" 2>&1 || { echo "init failed"; cat "$WORK/pair-a-init.log"; return 1; }
   env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" up --dir "$DDROP" \

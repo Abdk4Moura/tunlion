@@ -1,12 +1,12 @@
 # Introduce, user identity, and reaching one device (not a person's mesh)
 
 > Status: design (2026-07-25). Extends the introduce model in
-> `docs/design-mesh-network.md` (which keeps filament strictly pairwise). Reviewed
+> `docs/design-mesh-network.md` (which keeps tunlion strictly pairwise). Reviewed
 > adversarially (internal skeptic pass). Not yet built.
 
 ## The gap
 
-filament is device-level: a device is an Ed25519 key = an overlay address, and
+tunlion is device-level: a device is an Ed25519 key = an overlay address, and
 `introduce` wires two *devices* together (pairwise, rendezvous-brokered, the user
 confirms). But humans reach *people*, and a person is a set of devices. That
 mismatch leaves three things unaddressed:
@@ -20,7 +20,7 @@ mismatch leaves three things unaddressed:
 Add one layer, no more. It is deliberately **SSH certificate-authority shaped**,
 which is the framing to steal:
 
-| filament | SSH-CA analogue |
+| tunlion | SSH-CA analogue |
 |---|---|
 | **User key** (long-term, cold, rarely used) | the CA key |
 | **Device key** (never leaves the device) | a host key |
@@ -29,7 +29,7 @@ which is the framing to steal:
 
 This is a strict simplification of Matrix cross-signing (master + self-signing +
 user-signing keys), and that is correct: Matrix's extra machinery exists to do
-federated cross-user trust without an authoritative server, which filament does
+federated cross-user trust without an authoritative server, which tunlion does
 not need. One user key signing device certs is sufficient. (Keybase sigchains,
 Signal's server-mediated device linkage, DIDs/verifiable-credentials,
 WebAuthn/passkeys, age/minisign: understood and deliberately not adopted, wrong
@@ -50,7 +50,7 @@ roster. When you are introduced to Bob:
    user is Bob. You learn nothing about his other devices. The set is never
    enumerated.
 
-Authorization stays exactly where filament requires it: device-to-device, pairwise
+Authorization stays exactly where tunlion requires it: device-to-device, pairwise
 (your device to bob-laptop). Only the *addressing and consent* are user-mediated.
 
 ### Scope is a knob on the out-of-band token, and it is not downgradable
@@ -95,7 +95,7 @@ why this note comes before the recovery design: recovery = re-establishing the
 user key's authority over a new device, vouched through peers who already hold a
 link bound to that user key.
 
-## Consistency with filament's pairwise core
+## Consistency with tunlion's pairwise core
 
 - **Within Bob**: his devices are pairwise-paired with each other (a small private
   mesh) and share the user key, so they can coordinate which device fronts an
@@ -147,7 +147,7 @@ link bound to that user key.
 Add a thin **user-key-over-device-certs** layer (SSH-CA shaped), and redefine
 introduction as a **per-device capability grant bound to the user key**. This lets
 you address a person, land on exactly one device, keep the device set private, and
-get identity continuity for free, all without breaking filament's pairwise
+get identity continuity for free, all without breaking tunlion's pairwise
 authorization or introducing a coordinator. Do not adopt Matrix cross-signing; this
 model is simpler and sufficient. The residual risks are cert linkability (accepted
 tradeoff), user-key compromise (mitigated by cold storage + short-lived certs), and

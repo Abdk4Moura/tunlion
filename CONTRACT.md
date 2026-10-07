@@ -1,4 +1,4 @@
-# Filament contract
+# Tunlion contract
 
 The one document that pins how the pieces talk. The backend, the frontend
 networking layer, the CLI, and any UI all depend on this and nothing else.
@@ -89,7 +89,7 @@ Firebase mode mirrors these exact events client-side via Firestore.
   id at `frontend/src/lib/signaling.js:161`; there is no supported welcome
   variant without it. Rust's `as_str().map(...)` handling in
   `cli/src/l2.rs:1247` and the browser's destructuring in
-  `frontend/src/lib/useFilament.js:586` are defensive tolerance for malformed
+  `frontend/src/lib/useTunlion.js:586` are defensive tolerance for malformed
   input, not protocol permission to omit the field. Implementations must send
   the id and clients may treat a welcome without one as malformed.
 - `peer-joined` `{ id, name }`
@@ -109,9 +109,9 @@ Convention: the **newer** peer always initiates the WebRTC offer.
 - `GET /api/room/code` → `{ code, room, scope: "code" }` — a short human code to
   pair **across** networks (different WiFi / mobile data).
 
-## UI contract — `useFilament()`
+## UI contract — `useTunlion()`
 
-The UI imports `useFilament()` and renders from its return value. It must not
+The UI imports `useTunlion()` and renders from its return value. It must not
 touch the socket, Firestore, or RTCPeerConnection directly.
 
 ```ts
@@ -226,8 +226,8 @@ Control messages over the DataChannel; the browser implements both sides
   that link and tells the user to re-pair, instead of forever claiming an
   acquaintance the other side has no memory of.
 
-#### The `filament pair` ceremony
-A dedicated pairing-only flow (`filament pair [code] [--name X]`) that runs the
+#### The `tunlion pair` ceremony
+A dedicated pairing-only flow (`tunlion pair [code] [--name X]`) that runs the
 `pair-keep`/`pair-keep-ack` exchange and exits — no file moves. One side mints a
 one-time code (the **creator**); the other **claims** it. On connect exactly one
 fresh 64-hex secret crosses the link, by a single rule layered on the line-50
@@ -238,7 +238,7 @@ WebRTC convention:
   fallback, because browsers (and legacy peers) never initiate the keep. So a
   CLI↔CLI pair settles on the creator's secret; a browser-creator pair settles
   on the claimer's after the 3 s window.
-Consent is mutual per C27: the browser asks (banner); a running `filament pair`
+Consent is mutual per C27: the browser asks (banner); a running `tunlion pair`
 IS consent and acks `{type:"pair-keep-ack", ok:true}` automatically. On `ok`
 both sides store `{name, secret}` (CLI: `devices.json`; browser: localStorage
 `filament-known-devices`) and subscribe the derived channel — "mutually
@@ -364,7 +364,7 @@ messages keep their present behaviour exactly.
   ignored. A v:1 ack (no `offer_id`) answers the single most recent outstanding
   offer, which is the legacy behaviour.
 - Either side may send `pair-keep` at any point in a session, and either side
-  may send it first. The 3-second creator/claimer tie-break in the `filament
+  may send it first. The 3-second creator/claimer tie-break in the `tunlion
   pair` ceremony applies to that ceremony only, not here.
 
 Invariants:
@@ -501,7 +501,7 @@ Invariants:
 - Unknown actions and unknown target forms are REFUSED at ingest. A capability
   string the boundary cannot parse is not a capability it may store and skip.
 
-## Exec streams (`filament exec`)
+## Exec streams (`tunlion exec`)
 
 Remote command execution over an established link, as a session-stream kind
 beside `mount-open` / `pty-open`: same sid-keyed streams table, same
@@ -784,11 +784,11 @@ a required gate in `.github/workflows/proof.yml`.
 
 A bootstrap card is a short self-describing string that says "this key,
 reachable maybe at these addresses, until this instant", signed by the
-key it names. It is what `filament addr --card` prints, what an
+key it names. It is what `tunlion addr --card` prints, what an
 invitation carries, what a pair QR encodes, and what a DNS TXT record
 publishes. It exists so a peer can be reached when the signaling server
 is unreachable, untrusted, or unwanted. It is also the ONLY artifact in
-filament a stranger may hand you before any link exists, which is why
+tunlion a stranger may hand you before any link exists, which is why
 every rule below is about what it is not allowed to do.
 
 - WIRE FORMAT: `fc1` followed immediately by base64url (RFC 4648 §5,
@@ -832,7 +832,7 @@ every rule below is about what it is not allowed to do.
      caller-visible fact;
   4. DERIVE the overlay address from `device_pub`
      (`fdf1:1af7:c30d::/48` prefix ||
-     `SHA256(b"filament/overlay-addr/v1\0" || device_pub)[..10]`, the
+     `SHA256(b"tunlion/overlay-addr/v1\0" || device_pub)[..10]`, the
      same function the L3 overlay uses) and REFUSE on mismatch with the
      record the card claims to be about;
   5. verify `sig` over the canonical re-encoding from step 1;
@@ -906,12 +906,12 @@ every rule below is about what it is not allowed to do.
   expired card, and refuses one whose expiry is implausibly far in the
   future for its class rather than trusting the number.
 - UNKNOWN VERSION REFUSED: a `v` other than 1 is refused with a clear
-  "newer card, upgrade filament" error. No field-by-field best effort,
+  "newer card, upgrade tunlion" error. No field-by-field best effort,
   no ignoring unknown keys: a card the verifier does not fully
   understand is one it cannot safely dial.
 - SHORT FORM IS A REFERENCE, NEVER A CARRIER. The speakable short form
   is `version + 64-bit device_pub fingerprint + checksum`, 8 to 10
-  words from filament's pairing wordlists (8 bits per word, so 64 to 80
+  words from tunlion's pairing wordlists (8 bits per word, so 64 to 80
   bits of payload). It is a RENDEZVOUS / FINGERPRINT REFERENCE: it
   names which key to expect, it does not carry the card. The floor is
   arithmetic, not taste -- `device_pub` (32 B) plus `sig` (64 B) alone
@@ -925,11 +925,11 @@ every rule below is about what it is not allowed to do.
   equal the one in the short form, else REFUSE. The short form is
   therefore an out-of-band integrity check on a card obtained some
   other way, exactly like a pairing SAS.
-- DNS PUBLICATION: one TXT record at `_filament.<name>`, whose value is
+- DNS PUBLICATION: one TXT record at `_tunlion.<name>`, whose value is
   `fc1:<base64url>` (the `fc1:` here is the record's own tag; the
   card's own prefix form is `fc1` with no colon, and a publisher emits
   exactly one of the two shapes per channel). ONE record: a name with
-  two `_filament` TXT values is ambiguous and is refused rather than
+  two `_tunlion` TXT values is ambiguous and is refused rather than
   merged or raced. The published card is always PUBLIC class, always
   `expires <= 30 days`, and rotation is the publisher's job -- an
   expired record is a refusal, not a fallback.
@@ -941,14 +941,14 @@ every rule below is about what it is not allowed to do.
   surfaced as a conflict, not accepted as a rotation. DNS never
   confers trust by itself; it is a faster way to learn a key you then
   verify exactly as you would verify a key from anywhere else.
-- CLI SURFACE (shape, not implementation): `filament addr --card`
+- CLI SURFACE (shape, not implementation): `tunlion addr --card`
   prints this machine's PUBLIC card; `--private` adds the psk and
   prints the PRIVATE form with a "do not publish this" banner.
-  `filament addr --parse <card>` is fully OFFLINE: it decodes, runs
+  `tunlion addr --parse <card>` is fully OFFLINE: it decodes, runs
   steps 1 to 5, and prints the field summary the dial path logs
   (version, derived address, expiry with remaining time, endpoint list
   with the guard verdict per endpoint, relay, class, signature
-  verdict). It never dials. `filament reach --until-direct` uses a
+  verdict). It never dials. `tunlion reach --until-direct` uses a
   card's hints to keep trying for a direct path instead of settling for
   the first relayed one.
 
@@ -965,9 +965,9 @@ Stated so nobody implements a guess and calls it the contract:
 - ENDPOINT `ip` TYPE: text ("192.0.2.1", "2001:db8::1") versus a 4/16
   byte bstr. The reference codec in `proofs/card_vectors.py` uses text
   PROVISIONALLY so the vectors exist; this is not yet a decision.
-- NO DOMAIN-SEPARATION PREFIX. Every other signed filament struct tags
+- NO DOMAIN-SEPARATION PREFIX. Every other signed tunlion struct tags
   its signed bytes (`filament-auth-key-v2`, `INV_FORMAT`,
-  `filament/overlay-addr/v1\0`). The card as designed signs bare
+  `tunlion/overlay-addr/v1\0`). The card as designed signs bare
   canonical CBOR, so the same key signing a card and signing some other
   bare-CBOR structure has overlapping domains. Whether to add a prefix
   before v1 ships is open.
@@ -985,7 +985,7 @@ Stated so nobody implements a guess and calls it the contract:
   signal inside the card, so a compromised device key is reachable
   until every published card expires.
 
-## SSH certificates (`filament shell --ssh` via local CA)
+## SSH certificates (`tunlion shell --ssh` via local CA)
 
 Passwordless ssh between fleet devices without installed keys: the
 initiator A mints a fresh ephemeral ed25519 key per invocation, asks the
@@ -1035,7 +1035,7 @@ bulk -- the Bootstrap precedent); all lifetimes are seconds on the wire.
   `AuthorizedPrincipalsFile`/`AuthorizedPrincipalsCommand` restricted to
   the daemon user. When those lines are unwritable the daemon prints
   both lines plus the reload step instead of silently serving plaintext
-  auth; `filament doctor` checks their presence. sshd integration (config
+  auth; `tunlion doctor` checks their presence. sshd integration (config
   lines, `sshd -t` validation, reload) targets unix OpenSSH: a bad config
   rolls back before any reload, and on Windows the writer prints the lines
   for manual application (no system sshd to drive there).
@@ -1234,7 +1234,7 @@ for a hold to bind to.
 - FUTURE WORK, not built: the cleaner shape is client-side (the client
   waits for a "proven" acknowledgement before sending the open), which
   would remove the server-side hold entirely.
-## Certify (`filament certify <device>` -- NeedsReview exit)
+## Certify (`tunlion certify <device>` -- NeedsReview exit)
 
 A NeedsReview device has a record but no stored certificate and is trusted
 in full. `certify` ends that state atomically: it re-proves identity AND

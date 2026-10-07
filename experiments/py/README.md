@@ -1,8 +1,8 @@
-# filament_lab — a controllable Python peer for the Filament control plane
+# filament_lab — a controllable Python peer for the Tunlion control plane
 
-A reusable library + interactive driver that makes the Filament
+A reusable library + interactive driver that makes the Tunlion
 signaling / pairing / discovery / transport-offer flow **scriptable, inspectable,
-and step-into-able**, and that **interoperates with the real Rust `filament`
+and step-into-able**, and that **interoperates with the real Rust `tunlion`
 binary on the same wire**.
 
 The Rust transport keeps failing on cross-machine signaling races (late-join
@@ -23,7 +23,7 @@ oracle to diff against the Rust.
 | `filament_lab/peer.py` | `Peer`: a known-device peer that subscribes to `channel_of(secret)`, tracks known-peers, does the transport-offer exchange, and carries the fault knobs |
 | `filament_lab/driver.py` | scriptable scenarios (`watch` / `discover` / `late-join`) **and** an interactive REPL |
 | `test_crypto.py` | 7 crypto-fidelity tests (no pytest dep) |
-| `run_interop.sh` | one command: boots the fixture backend, plants a device, starts real `filament up`, runs a Python scenario |
+| `run_interop.sh` | one command: boots the fixture backend, plants a device, starts real `tunlion up`, runs a Python scenario |
 
 ## Setup
 
@@ -55,7 +55,7 @@ cd backend && PORT=8099 FIL_ASYNC_MODE=eventlet FIL_SELF_MONKEYPATCH=1 \
 ```
 
 This plants `devices.json` with a shared secret, starts the **real release
-binary** `filament up` (with `FILAMENT_L2=1` so it emits transport-offers),
+binary** `tunlion up` (with `FILAMENT_L2=1` so it emits transport-offers),
 then runs the Python peer as the late subscriber.
 
 ## The REPL (step in by hand)
@@ -77,7 +77,7 @@ $VENV/bin/python -m filament_lab.driver --secret <hex> repl
 ## Interop demonstrations (verified)
 
 All against the local fixture backend + the release binary
-`cli/target/release/filament`.
+`cli/target/release/tunlion`.
 
 **1. Python connects + receives `welcome`**
 
@@ -91,7 +91,7 @@ All against the local fixture backend + the release binary
 **2. Python ↔ Rust discovery + transport-offer round-trip** (`discover`)
 
 `channel_of(secret)` is **byte-identical** to the binary: a planted secret yields
-`channel d6b6e37400ac` in both `filament devices` and `crypto.channel_of(...)`.
+`channel d6b6e37400ac` in both `tunlion devices` and `crypto.channel_of(...)`.
 On the shared channel:
 
 ```

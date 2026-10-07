@@ -1,6 +1,6 @@
 # filament-native job runner
 
-A thin **compute-job orchestration layer** on top of filament's existing P2P
+A thin **compute-job orchestration layer** on top of tunlion's existing P2P
 transport (file channel). It offloads a *declared* compute job — e.g. an NVENC
 transcode or a headless render — to a remote filament-reachable box (an ephemeral
 Tesla T4 we cannot SSH into), runs it, pulls the artifacts back, and records a
@@ -38,7 +38,7 @@ structural reframing argued in
 | file | what |
 |------|------|
 | `box_executor.py` | the **FIXED** box-side job-execution core. `run_job(job_dir)` reads `job.json`, runs the declared `cmd` in the scratch dir under a watchdog timeout, captures exit code + per-output sha256/size + wall-clock + **all** GPU names (`nvidia-smi -L`), writes `manifest.json`, and optionally `rclone`-copies outputs to R2 before the box dies. Shared by both the watcher and the legacy PTY path. Stdlib only. |
-| `watcher.py` | **box-side file-driven control plane.** A local poll loop: watches `.inbox/` for a job spec + its inputs (dedups `.N` resends by basename, guards on input-presence + size-stability), runs the job via `box_executor.run_job`, writes an `.outbox/<id>/`, then **`filament send --relay`**s the manifest + outputs back on the dout channel (manifest LAST). Idempotent/crash-safe (retires the spec to `.inbox/done/`); ships results in a background thread so jobs pipeline. Stdlib only. |
+| `watcher.py` | **box-side file-driven control plane.** A local poll loop: watches `.inbox/` for a job spec + its inputs (dedups `.N` resends by basename, guards on input-presence + size-stability), runs the job via `box_executor.run_job`, writes an `.outbox/<id>/`, then **`tunlion send --relay`**s the manifest + outputs back on the dout channel (manifest LAST). Idempotent/crash-safe (retires the spec to `.inbox/done/`); ships results in a background thread so jobs pipeline. Stdlib only. |
 | `filament_runner.py` | host-side library. **`FileRunnerBox`** (DEFAULT): `submit` (`send --relay` job+inputs on din) / `await_results` (stand up a `up --dir --relay` sink on dout, poll for the manifest + verify each output's sha256) / `run()`. **`RunnerBox`** (DEPRECATED): the legacy PTY `submit`/`stream`/`fetch`. Stdlib only. |
 | `runner_cli.py` | host CLI to submit one job and fetch its artifacts (routes through `FileRunnerBox`; `--relay` default, `--no-relay` to opt out). |
 | `bringup_t4.sh` | **SSH-FREE** T4 bring-up: install ffmpeg(NVENC)/python3/(rclone), drop the static musl binary + `watcher.py`/`box_executor.py`, plant pairing secrets, start the **din acceptor + the watcher** (no PTY, no sshd), and tail their logs to keep the cell alive. |
@@ -65,7 +65,7 @@ A job is JSON:
 }
 ```
 
-- `inputs` — files pushed to the box (over the filament file channel) before the run.
+- `inputs` — files pushed to the box (over the tunlion file channel) before the run.
 - `cmd` — argv executed **in the scratch dir** by the fixed executor (not by a shell the host pipes into).
 - `outputs` — declared artifacts; hashed (sha256), sized, and pulled back.
 - `timeout_s` — wall-clock kill (whole process group; enforced by a watchdog even for jobs that emit no output).
@@ -99,7 +99,7 @@ rb = FileRunnerBox(
     server="https://api.filament.autumated.com",
     host_config_dir="~/.filament-jobrunner/host",   # knows box-in (the `send` target)
     host_dout_config_dir="~/.filament-jobrunner/host-dout",  # the results sink (box-out)
-    filament_bin="filament",
+    filament_bin="tunlion",
     relay=True,                                     # force TURN relay (WAN default)
 )
 
@@ -140,9 +140,9 @@ runner/runner_cli.py \
 
 ---
 
-## How it maps onto filament (transport model)
+## How it maps onto tunlion (transport model)
 
-A filament "device" is a pair secret; a petname is a local alias. The file-driven
+A tunlion "device" is a pair secret; a petname is a local alias. The file-driven
 runner uses **two file channels** (the `ctl` PTY is dropped):
 
 | channel | box side | host side | carries |
@@ -170,7 +170,7 @@ binary on the host:
 
 ```bash
 cargo build --release --target x86_64-unknown-linux-musl
-# -> cli/target/x86_64-unknown-linux-musl/release/filament   (static-pie; runs on the T4)
+# -> cli/target/x86_64-unknown-linux-musl/release/tunlion   (static-pie; runs on the T4)
 ```
 
 On the **host**, pair and get the secrets:
@@ -181,7 +181,7 @@ runner/pair_host.sh            # plants ~/.filament-jobrunner/{host,host-dout}, 
 
 On the **T4**, paste the printed `export SEC_CTL=… SEC_DIN=… SEC_DOUT=…` block,
 make the static binary reachable (host it somewhere and set `FILAMENT_URL`, or
-copy it next to the script as `./filament`), then:
+copy it next to the script as `./tunlion`), then:
 
 ```bash
 # the binary + bringup_t4.sh on the box, secrets exported, then:
@@ -214,7 +214,7 @@ config` / `~/secret_keys` piped in — never on the command line). Then pass
 runner/run_local_test.sh
 ```
 
-Boots a SEPARATE filament topology on this host (locally-built binary + isolated
+Boots a SEPARATE tunlion topology on this host (locally-built binary + isolated
 `FILAMENT_CONFIG_DIR`s + a local signaling backend — never the live daemon or the
 installed binary): a box **din acceptor + watcher**, paired over din/dout, and
 runs a **real** ffmpeg job through the file-driven `submit` → watcher → `await`
@@ -234,7 +234,7 @@ runner/sim/flaky_sim_test.sh        # FILJOB_KEEP=1 to keep the work dir + logs
 
 Reproduces the three failure modes that broke the runner over the real Colab→do-vm
 WAN link and proves the resilience fixes recover from each — **all locally**. A
-stdlib TCP proxy (`runner/sim/flaky_proxy.py`) sits between every filament client
+stdlib TCP proxy (`runner/sim/flaky_proxy.py`) sits between every tunlion client
 and the local backend and severs the signaling link on command (plus a background
 randomised flapper); `flaky_e2e.py` drives a real job through it while inducing
 outages and asserts:
@@ -257,7 +257,7 @@ no WebRTC timing) — used as the regression gate:
 runner/sim/test_resilience_unit.py
 ```
 
-It drives `FileRunnerBox` + the watcher against a scriptable fake `filament` and
+It drives `FileRunnerBox` + the watcher against a scriptable fake `tunlion` and
 asserts: submit survives 3 forced `no peer connected` failures; a 7 KB truncated
 output is rejected by the sha256 gate; the box stops re-shipping the instant the
 host's `ack-<id>` lands.
@@ -277,5 +277,5 @@ callers:
 - **SkyPilot** — a `sky.yaml` with `file_mounts` for `inputs`, a `run:` block
   calling `cmd`, `--use-spot`, and an autostop hook that pushes artifacts to R2.
 
-The filament runner is the right tool for the *no-SSH gift box we have today*;
+The tunlion runner is the right tool for the *no-SSH gift box we have today*;
 Modal/SkyPilot are the right tools the moment we'd rather rent.

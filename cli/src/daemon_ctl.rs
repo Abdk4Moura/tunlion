@@ -349,7 +349,7 @@ pub(crate) async fn handle_mount_health(req: ctl::Req, daemon_mounts: &DaemonMou
 }
 
 /// Is something listening on this host's own loopback `port` - i.e. an sshd a
-/// `filament shell --ssh` initiator could actually reach? A fast connect probe: a
+/// `tunlion shell --ssh` initiator could actually reach? A fast connect probe: a
 /// successful connect means a listener (we close it at once); refused/timeout
 /// means nothing is there. Reported in the shell-bootstrap ack so the initiator
 /// fails fast with a clear message instead of ssh hanging on a dead port.
@@ -377,7 +377,7 @@ pub(crate) async fn sshd_listening(port: u16) -> bool {
     false
 }
 
-/// Answer a `filament reach`: report the daemon's warm link to `peer` (route,
+/// Answer a `tunlion reach`: report the daemon's warm link to `peer` (route,
 /// remote address, RTT, verified name). Synchronous - every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
 /// nothing is awaited from the peer and the F8 event-loop rule is not in play. A
@@ -572,7 +572,7 @@ async fn handle_warm_open(
             }
             Err(e) => {
                 ui::debug(&format!(
-                    "filament: warm link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
+                    "tunlion: warm link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
                 ));
                 let _ = tx.send(Ev::DropLink(pid));
                 req.reject("warm link unresponsive; establishing fresh")
@@ -583,7 +583,7 @@ async fn handle_warm_open(
 }
 
 /// Warm-reuse: open a PTY on `peer` over its existing link and bridge it to the
-/// client's stdio socket (the `filament shell` fast path). Records the session->sid
+/// client's stdio socket (the `tunlion shell` fast path). Records the session->sid
 /// so a later `pty-resize` can find it; the entry is dropped when the bridge ends.
 #[cfg(unix)]
 async fn handle_warm_pty(
@@ -649,13 +649,13 @@ async fn handle_warm_pty(
             }
             l2::WarmPtyVerdict::Refused(reason) => {
                 ui::debug(&format!(
-                    "filament: warm pty to '{peer}' refused by the peer ({reason})"
+                    "tunlion: warm pty to '{peer}' refused by the peer ({reason})"
                 ));
                 req.reject(&format!("refused: {reason}")).await;
             }
             l2::WarmPtyVerdict::LinkDead => {
                 ui::debug(&format!(
-                    "filament: warm pty link to '{peer}' died; dropping + establishing fresh"
+                    "tunlion: warm pty link to '{peer}' died; dropping + establishing fresh"
                 ));
                 let _ = tx.send(Ev::DropLink(pid));
                 req.reject("warm link unresponsive; establishing fresh")
@@ -666,7 +666,7 @@ async fn handle_warm_pty(
                 // client reads EOF as exit 0 (the cold path's Exited).
                 // Nothing is recorded (no live session exists to reattach).
                 ui::debug(&format!(
-                    "filament: warm pty to '{peer}' exited cleanly with no output"
+                    "tunlion: warm pty to '{peer}' exited cleanly with no output"
                 ));
                 let _sock = req.accept().await;
             }
@@ -717,7 +717,7 @@ pub(crate) type PendingBootstraps =
 
 /// Warm-reuse the ssh `shell-bootstrap`: install the client's managed `pubkey` on
 /// `peer` over the daemon's EXISTING link instead of a fresh cold establish, the
-/// big win for `filament shell --ssh` (pty already rode the warm link; the bootstrap was
+/// big win for `tunlion shell --ssh` (pty already rode the warm link; the bootstrap was
 /// the last cold-establish left). Sends `shell-bootstrap` and STASHES the reply
 /// socket; the ack/deny handler completes it. A miss falls the client back to the
 /// cold `shell_bootstrap`.

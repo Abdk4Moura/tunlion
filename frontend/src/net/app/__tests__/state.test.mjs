@@ -1,7 +1,7 @@
 // Characterization tests for the state-reducer's pure list transforms (Phase 2).
 // node frontend/src/net/app/__tests__/state.test.mjs
 // Pins addPeer/updatePeer/removePeer/upsertTransfer list logic extracted 1:1 from
-// useFilament.js (incl. the same-reference-on-no-change contract React relies on).
+// useTunlion.js (incl. the same-reference-on-no-change contract React relies on).
 import { addPeerToList, patchPeerInList, removePeerFromList, upsertTransferInList } from '../state.js'
 
 let ok = true

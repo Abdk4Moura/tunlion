@@ -1,7 +1,7 @@
 # Token carrier: Biscuit for delegable tokens
 
 > Status: decided, pending verification. Records the read-only spike into
-> `biscuit-auth` (Biscuit tokens, biscuitsec.org) as the carrier for filament's
+> `biscuit-auth` (Biscuit tokens, biscuitsec.org) as the carrier for tunlion's
 > delegable capability/pass tokens, and the acceptance list for the Rust
 > adoption PR. No code yet. This doc does not modify the enrollment flow.
 
@@ -110,7 +110,7 @@ What each condition checks, for the implementing PR:
 ## UCAN note
 
 UCAN's audience binding (the `aud` field must match the recipient's DID and an
-invocation must be signed by the invoker) is the same property filament already
+invocation must be signed by the invoker) is the same property tunlion already
 gets from its nonce-bound possession proof, so UCAN's headline advantage over
 Biscuit is already covered by our enrollment layer, while UCAN adds per-hop
 signed CBOR-with-CID chains that are heavier than a Biscuit token.

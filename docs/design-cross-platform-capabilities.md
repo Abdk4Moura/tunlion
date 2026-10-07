@@ -1,6 +1,6 @@
 # Cross-platform capabilities: one mesh, one adapter layer
 
-**Status:** design. This is the framing document for making every filament
+**Status:** design. This is the framing document for making every tunlion
 capability (send/recv, pty/shell, forward, expose, netcat, ssh, mount) work the
 same on Linux, macOS, and Windows. The phased task list lives in
 [design-windows-first-class.md](design-windows-first-class.md); this document is
@@ -76,16 +76,16 @@ That is correct and stays. But running a *command* in a shell is not uniform, so
 
 1. **`interactive()`** spawns the login shell as a PTY. Resolution order, first
    match wins:
-   1. `filament up --shell-program "<cmd>"` (explicit, one-off)
+   1. `tunlion up --shell-program "<cmd>"` (explicit, one-off)
    2. `FILAMENT_SHELL` env var
-   3. `filament set shell "<cmd>"` config value (persists; fits the daemon)
+   3. `tunlion set shell "<cmd>"` config value (persists; fits the daemon)
    4. `$SHELL` on Unix, `%ComSpec%` / powershell on Windows (platform default)
    5. hardcoded fallback (`/bin/bash`→`/bin/sh`, `cmd.exe`)
 
    The value is argv-split, so it can carry args: `FILAMENT_SHELL="pwsh -NoLogo"`,
    `bash -l`, `nu`, `fish`.
 
-2. **`exec(cmd)`** runs a one-shot command string (for `filament <peer> '<cmd>'`)
+2. **`exec(cmd)`** runs a one-shot command string (for `tunlion <peer> '<cmd>'`)
    via the resolved shell's own command flag: `-c` for sh/bash/zsh/fish,
    `-Command` for PowerShell, `/c` for `cmd.exe`. The command runs in whatever
    shell that box actually uses (fish included), using the right invocation,
@@ -96,7 +96,7 @@ That is correct and stays. But running a *command* in a shell is not uniform, so
 
 The data path for forward/expose is already portable TCP. Only the warm-reuse
 IPC (sibling process to the daemon) is a unix-domain socket. `ControlChannel`
-abstracts it: unix socket on Unix, named pipe (`\\.\pipe\filament-<user>`) on
+abstracts it: unix socket on Unix, named pipe (`\\.\pipe\tunlion-<user>`) on
 Windows. Until then, Windows forward/ssh/pty/netcat still work, just always
 cold-establish (no warm speedup).
 
@@ -116,7 +116,7 @@ mount does not exist on Windows at all. Instead:
   local mount: FUSE on Linux/macOS, WinFsp or Projected File System on Windows.
   The adapter is the only platform-specific piece, and where none is available it
   fails with an honest "mount needs WinFsp on Windows: <link>", or offers a
-  plain `filament pull`/`sync` fallback.
+  plain `tunlion pull`/`sync` fallback.
 
 This makes mount self-contained and uniform like pty, and it means one wire
 protocol to test rather than N sshfs integrations. WinFsp remains an option for
@@ -212,29 +212,29 @@ and where a mesh-native protocol can be genuinely better.
 
 ## Reachability: two tiers, elevated and not
 
-filament reaches peers two ways. The choice is about privilege, not features.
+tunlion reaches peers two ways. The choice is about privilege, not features.
 
 ### Elevated: the always-on service owns the kernel TUN
 
-`filament up --install` registers filament as a system service that runs
+`tunlion up --install` registers tunlion as a system service that runs
 privileged: systemd with CAP_NET_ADMIN on Linux, a LaunchDaemon as root on macOS,
 a Windows Service as LocalSystem. Because the service is privileged it creates the
 kernel TUN itself (wintun / utun / `/dev/net/tun`), at boot, once. The result is
 Tailscale parity: every native app (ssh, curl, the browser, anything) reaches
 `<peer>.mesh` transparently through the kernel route, MagicDNS resolves via the
-hosts file, and the user's own `filament` commands are unprivileged clients of the
+hosts file, and the user's own `tunlion` commands are unprivileged clients of the
 service. One UAC or pkexec prompt at install, never again.
 
 This is the whole answer to "kernelspace on Windows without much ado": the user
 never touches wintun or Administrator; the LocalSystem service creates the adapter
 for them. Requirements:
 
-- **Elevate with a GUI prompt, and fall back on decline.** `filament up --install`
+- **Elevate with a GUI prompt, and fall back on decline.** `tunlion up --install`
   triggers the OS elevation dialog (UAC on Windows via ShellExecute "runas",
   polkit/pkexec on Linux) so the user grants admin from a popup, not by opening an
   admin shell. If they approve, the privileged service installs (kernel TUN,
   autostart at boot). If they decline, do not fail: fall back to a user-level
-  autostart that runs `filament up` in userspace (a per-user Scheduled Task at
+  autostart that runs `tunlion up` in userspace (a per-user Scheduled Task at
   logon on Windows, a `systemd --user` unit on Linux, a LaunchAgent on macOS), so
   the user still gets always-on, just in the userspace tier with no admin. So
   `--install` has two outcomes by consent: privileged-and-kernel, or
@@ -253,22 +253,22 @@ for them. Requirements:
 ### Non-elevated: userspace overlay plus a proxy, zero install
 
 Where the user cannot or will not elevate (a container, a locked-down box, a
-laptop just trying it out), filament uses the in-process userspace netstack at
-zero privilege. This is **not** a degraded mode for filament's own features:
+laptop just trying it out), tunlion uses the in-process userspace netstack at
+zero privilege. This is **not** a degraded mode for tunlion's own features:
 send/recv, pty/shell, forward, expose, dial, and mount all tunnel over the
 authenticated data channel and need no kernel route, so a non-elevated user has
 the full capability set.
 
 The one thing kernel TUN gives that userspace cannot is transparent access from
-*arbitrary native apps* to *arbitrary* overlay addresses. filament already closes
-that with `filament proxy`, a local SOCKS5 proxy (Tailscale's userspace-networking
+*arbitrary native apps* to *arbitrary* overlay addresses. tunlion already closes
+that with `tunlion proxy`, a local SOCKS5 proxy (Tailscale's userspace-networking
 model): point a browser, curl, git, or ssh's ProxyCommand at it and
 `<peer>.mesh:<port>` rides the mesh, while non-mesh hosts go direct. To make that
 comfortable rather than a manual chore:
 
-- **Run the proxy as part of `filament up`** when kernel TUN is unavailable, on a
+- **Run the proxy as part of `tunlion up`** when kernel TUN is unavailable, on a
   known port, so presence and the proxy arrive together (no separate
-  `filament proxy` step to remember).
+  `tunlion proxy` step to remember).
 - **Add an HTTP CONNECT proxy alongside SOCKS5** (some tools only speak HTTP
   proxy), matching Tailscale.
 - **Print copy-paste config** for the common tools (`ALL_PROXY`, `git http.proxy`,
@@ -276,7 +276,7 @@ comfortable rather than a manual chore:
   `*.mesh` through the proxy and everything else direct.
 
 The mental model: elevated is transparent and native, non-elevated is zero-install
-and proxy-mediated, and both deliver the full filament feature set. The user picks
+and proxy-mediated, and both deliver the full tunlion feature set. The user picks
 their comfort level, and the honest fallback tells them which tier they are on and
 how to reach the other.
 
@@ -287,7 +287,7 @@ Two mechanisms, so we stop finding gaps by accident:
 1. **Capability-support matrix.** Each capability declares which adapter methods
    it needs. The adapter reports supported-or-not per platform, so an unsupported
    combination prints "X needs Y here" instead of failing. This is the honest
-   fallback we already ship for `--install`, made systematic. `filament doctor`
+   fallback we already ship for `--install`, made systematic. `tunlion doctor`
    can print the matrix for the current host.
 2. **Per-OS CI.** Run capability smoke tests (pair, send, pty interactive + exec,
    forward) on Linux, macOS, and Windows, not only build + unit tests. A platform

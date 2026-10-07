@@ -3,7 +3,7 @@
 # handing that device a shell. The operator ran the security verb, saw a success
 # line, and lost nothing.
 #
-#   FILAMENT_BIN=/path/to/filament ./shell-posture-gates.sh
+#   FILAMENT_BIN=/path/to/tunlion ./shell-posture-gates.sh
 #
 # The subject is a VOUCH-SHAPED record: a petname holding a secret with no
 # certificate and no enrollment ceiling. That shape matters, and is why the test
@@ -28,7 +28,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
-BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/filament}"
+BIN="${FILAMENT_BIN:-$CLI_DIR/target/release/tunlion}"
 PORT=8114
 SERVER="http://127.0.0.1:$PORT"
 PYV="${FILAMENT_TEST_VENV:-python3}"
@@ -78,7 +78,7 @@ start_daemon() {
   # `up --shell` as root REFUSES without --shell-user/--i-know (the PTY would run
   # as the owner). A silently dead daemon is indistinguishable from a daemon that
   # simply never warns, so assert it is actually serving before testing it.
-  if ! grep -qs 'filament up' "$WORK/up-$label.log"; then
+  if ! grep -qs 'tunlion up' "$WORK/up-$label.log"; then
     echo "daemon ($label) did not start:"; sed 's/^/    /' "$WORK/up-$label.log"; exit 2
   fi
 }

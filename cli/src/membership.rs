@@ -1,7 +1,7 @@
 //! Signalling-room membership commands, lifted out of `main.rs`.
 //!
-//! `filament introduce A B` puts two devices into each other's room so they can
-//! find one another, and `filament depart` leaves the mesh. Both are membership
+//! `tunlion introduce A B` puts two devices into each other's room so they can
+//! find one another, and `tunlion depart` leaves the mesh. Both are membership
 //! operations on the signalling room and share the room's channel derivation
 //! (`channel_of`) and the join-record lookup (`joined_owner_record`).
 //!
@@ -190,7 +190,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             .cloned()
     };
     let (a_name, a_sec) =
-        find(a).ok_or_else(|| anyhow!("'{a}' is not a known device (see: filament devices)"))?;
+        find(a).ok_or_else(|| anyhow!("'{a}' is not a known device (see: tunlion devices)"))?;
     let (b_name, b_sec) = find(b).ok_or_else(|| anyhow!("'{b}' is not a known device"))?;
 
     let my_uid = mk_uid("s");
@@ -269,7 +269,7 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
 
     loop {
         if Instant::now() > deadline {
-            bail!("timed out, both devices must be online (e.g. running `filament up`)");
+            bail!("timed out, both devices must be online (e.g. running `tunlion up`)");
         }
         let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => ev,

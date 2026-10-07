@@ -8,10 +8,10 @@ Interface:
 
 A TUN device is the L3 endpoint: anything written to its fd appears as an inbound
 IP packet on ``iface``, and any packet routed to ``iface`` is readable from the
-fd. The carrier (udp/filament providers) owns that fd via tun_io.py; the pipe and
+fd. The carrier (udp/tunlion providers) owns that fd via tun_io.py; the pipe and
 wg carriers instead route real kernel traffic and never touch the fd.
 
-For reading/writing raw packets from Python (the udp + filament userspace
+For reading/writing raw packets from Python (the udp + tunlion userspace
 carriers) see ``tun_io.py``.
 """
 
@@ -25,7 +25,7 @@ def create(ledger, ns: str, iface: str, addr_cidr: str = None,
     """Create + bring up a TUN iface; optionally address it on the overlay.
 
     ``addr_cidr`` is OPTIONAL: only carriers that use the TUN as the actual data
-    path (udp, filament) address the overlay here. Carriers whose data path is a
+    path (udp, tunlion) address the overlay here. Carriers whose data path is a
     different iface (pipe -> veth, wg -> wg iface) create the TUN bare so its
     (carrier-less, DOWN) presence never wins a competing on-link route to the
     real path. Idempotent.

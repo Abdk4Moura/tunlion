@@ -7,11 +7,11 @@
 ## 1. L3 is on by default
 
 `tun-addr` defaulted to empty, which meant L3 off, so a fresh install had no IP
-plane until someone ran `filament set tun-addr auto`. It now defaults to `auto`,
+plane until someone ran `tunlion set tun-addr auto`. It now defaults to `auto`,
 deriving the address from the overlay key.
 
 The privilege question is the reason this was not already the default: a non-root
-daemon needs `CAP_NET_ADMIN` to open the tunnel device. `filament init` now asks
+daemon needs `CAP_NET_ADMIN` to open the tunnel device. `tunlion init` now asks
 for that one-time grant, because init is the moment there is a terminal to answer
 a sudo prompt and the daemon has none. Declining is not fatal: the overlay falls
 back to the userspace netstack, which needs no privilege but has no kernel route,
@@ -108,5 +108,5 @@ other over loopback QUIC. Like every hook in `test_hooks`, it compiles only unde
 Worth recording why the earlier signal was misleading: with `--relay` the two
 daemons DID install L3 routes and DID pass a ping, which looks like success. It
 was not. `--relay` constrains ICE candidate selection; it does not stop the
-direct-QUIC ladder, and `filament reach` showed the link was `direct-quic` over
+direct-QUIC ladder, and `tunlion reach` showed the link was `direct-quic` over
 loopback. The route and the ping were real, and they were the OLD path.

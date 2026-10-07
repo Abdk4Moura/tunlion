@@ -1,7 +1,7 @@
 # Design: Adaptive Transport Portfolio (provably link-maximizing throughput)
 
 Status: DRAFT for review. Goal: a single, principled mechanism that provably
-drives any filament transfer toward the maximum throughput the link can give,
+drives any tunlion transfer toward the maximum throughput the link can give,
 generalizing every ad-hoc transport decision in the codebase.
 
 ## 1. Why (the empirical motivation)
@@ -12,8 +12,8 @@ Measured on a real DO sister-pair (do-vm <-> other-do, 2026-07-24):
 |---|---|---|
 | Raw TCP (single or 8 streams) | 2.0 Gbps | policer caps here; parallel does NOT aggregate |
 | Raw UDP (paced 1.8-2.5 Gbps offered) | 1.0-1.3 Gbps, 3-8% loss | UDP deprioritized ~1.7x vs TCP |
-| filament direct-quic (QUIC = UDP) | 1.3 Gbps (162 MB/s) | already at the UDP ceiling |
-| filament DataChannel (old default) | 5-9 MB/s | SCTP flow-control bound |
+| tunlion direct-quic (QUIC = UDP) | 1.3 Gbps (162 MB/s) | already at the UDP ceiling |
+| tunlion DataChannel (old default) | 5-9 MB/s | SCTP flow-control bound |
 | Same host (LocalTransport / channel-writer) | 1.2 GB/s | different regime entirely |
 
 Conclusions that force a general solution:
@@ -74,7 +74,7 @@ online-learning** selector:
   E[ sum_t g_{a_t} ]  >=  max_i sum_t g_i(t)  -  O( sqrt( T K log K ) )
   ```
   i.e. average-throughput regret is `O( sqrt( K log K / T ) )` per round, which
-  **-> 0 as T grows**. For any transfer long enough to matter, filament converges
+  **-> 0 as T grows**. For any transfer long enough to matter, tunlion converges
   to the throughput of the **best available arm**, with a bounded, shrinking gap.
 - **Slowly-varying rewards** (typical): **sliding-window UCB** gives the same
   asymptotic optimality with better constants, by trusting recent measurements.
@@ -84,7 +84,7 @@ online-learning** selector:
   a machine with genuinely independent links the guarantee targets the **sum**,
   not any single path.
 
-**Statement.** Under a no-regret selector, filament's realized average throughput
+**Statement.** Under a no-regret selector, tunlion's realized average throughput
 is within a vanishing additive gap of the best achievable by any single arm (or
 any independent-path stripe-subset). That is the precise sense in which we
 "maximize any link": *bounded regret => asymptotically optimal transport
@@ -105,7 +105,7 @@ exploration needed to discover the optimum.
 
 ## 4. The concrete missing arm: a direct-TCP transport
 
-Today filament's direct mesh path is QUIC-over-UDP only. On UDP-throttled links
+Today tunlion's direct mesh path is QUIC-over-UDP only. On UDP-throttled links
 (common: cloud DDoS policies) that caps us ~1.7x below TCP. The portfolio needs a
 **direct-TCP arm**:
 
@@ -114,7 +114,7 @@ Today filament's direct mesh path is QUIC-over-UDP only. On UDP-throttled links
 - Establish a direct TCP connection to the peer via **TCP hole-punching**
   (simultaneous-open) using the same candidate exchange the QUIC direct path
   already does; fall back to relay-TCP if hole-punch fails.
-- Run filament's existing frame/auth layer over the `TcpStream` (the framing is
+- Run tunlion's existing frame/auth layer over the `TcpStream` (the framing is
   already transport-generic - `serve_stream<S: AsyncRead+AsyncWrite>`).
 - It enters the portfolio as just another arm; the selector uses it when (and
   only when) it measures faster than QUIC on that link.
@@ -122,7 +122,7 @@ Today filament's direct mesh path is QUIC-over-UDP only. On UDP-throttled links
 This is the single highest-value addition, because it is the arm that beats the
 UDP policer we hit.
 
-## 5. How it composes with existing filament
+## 5. How it composes with existing tunlion
 
 - **Establishment**: extend the current direct-vs-WebRTC race (Option A,
   `start_direct` post-PAKE) into an N-arm race. The `worker-ports` /
@@ -169,7 +169,7 @@ generalization.
 
 One mechanism - **a portfolio of transports selected by a no-regret online
 learner, with a direct-TCP arm added and independence-aware striping** - gives a
-provable guarantee: filament converges to the throughput of the best available
+provable guarantee: tunlion converges to the throughput of the best available
 transport (or the best independent-path combination) on any link, within a
 bounded and vanishing gap. It turns "which transport?" from a pile of heuristics
 into one adaptive, measured, mathematically-grounded decision.

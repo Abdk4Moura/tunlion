@@ -1,23 +1,23 @@
-# filament installer (Windows) — https://tunlion.autumated.com/install.ps1
+# tunlion installer (Windows) — https://tunlion.autumated.com/install.ps1
 #
 #   irm https://tunlion.autumated.com/install.ps1 | iex
 #
 # Detects your platform, downloads the latest release .zip from GitHub, verifies
-# its SHA-256 against the release's SHA256SUMS, and installs filament.exe (with
-# the bundled wintun.dll) to %LOCALAPPDATA%\Programs\filament, adding it to your
+# its SHA-256 against the release's SHA256SUMS, and installs tunlion.exe (with
+# the bundled wintun.dll) to %LOCALAPPDATA%\Programs\tunlion, adding it to your
 # user PATH. Override the location with $env:FILAMENT_INSTALL_DIR. No admin, no
 # telemetry. Source: scripts/install.ps1 in https://github.com/Abdk4Moura/tunlion
 #
-# Prefer a package manager? `winget install Abdk4Moura.Filament` works too.
+# Prefer a package manager? `winget install Abdk4Moura.Tunlion` works too.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$Repo = 'Abdk4Moura/filament'
-$InstallDir = if ($env:FILAMENT_INSTALL_DIR) { $env:FILAMENT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\filament' }
+$Repo = 'Abdk4Moura/tunlion'
+$InstallDir = if ($env:FILAMENT_INSTALL_DIR) { $env:FILAMENT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\tunlion' }
 
-function Say([string]$m) { Write-Host "filament: $m" -ForegroundColor Cyan }
-function Die([string]$m) { Write-Host "filament: $m" -ForegroundColor Red; exit 1 }
+function Say([string]$m) { Write-Host "tunlion: $m" -ForegroundColor Cyan }
+function Die([string]$m) { Write-Host "tunlion: $m" -ForegroundColor Red; exit 1 }
 
 # ----------------------------------------------------------- platform detect
 # We ship an x64 build (x86_64-pc-windows-msvc); it runs natively on x64 and via
@@ -26,7 +26,7 @@ $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -notin @('AMD64', 'ARM64', 'x86')) { Die "unsupported architecture: $arch" }
 if ($arch -eq 'ARM64') { Say 'ARM64 detected — installing the x64 build (runs via emulation)' }
 $Target = 'x86_64-pc-windows-msvc'
-$Asset = "filament-$Target.zip"
+$Asset = "tunlion-$Target.zip"
 
 # ------------------------------------------------------- resolve latest tag
 # CLI releases are tagged cli-vX.Y.Z. Pick the HIGHEST stable version (the API's
@@ -63,10 +63,10 @@ if (-not $Tag) { Die 'could not find a CLI release' }
 $Base = "https://github.com/$Repo/releases/download/$Tag"
 
 # ------------------------------------------------------------------ download
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("filament-" + [System.IO.Path]::GetRandomFileName())
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("tunlion-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
-    Say "downloading filament $Tag for $Target ..."
+    Say "downloading tunlion $Tag for $Target ..."
     Invoke-WebRequest -Headers $headers -Uri "$Base/$Asset" -OutFile "$tmp\$Asset"
     Invoke-WebRequest -Headers $headers -Uri "$Base/SHA256SUMS" -OutFile "$tmp\SHA256SUMS"
 
@@ -82,7 +82,7 @@ try {
     $extract = Join-Path $tmp 'x'
     Expand-Archive -Path "$tmp\$Asset" -DestinationPath $extract -Force
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    foreach ($f in @('filament.exe', 'wintun.dll')) {
+    foreach ($f in @('tunlion.exe', 'wintun.dll')) {
         $src = Join-Path $extract $f
         if (Test-Path $src) {
             # Strip the mark-of-the-web so the extracted binary doesn't trip an
@@ -91,8 +91,8 @@ try {
             Copy-Item -Path $src -Destination (Join-Path $InstallDir $f) -Force
         }
     }
-    $exe = Join-Path $InstallDir 'filament.exe'
-    if (-not (Test-Path $exe)) { Die 'install failed: filament.exe not found in the archive' }
+    $exe = Join-Path $InstallDir 'tunlion.exe'
+    if (-not (Test-Path $exe)) { Die 'install failed: tunlion.exe not found in the archive' }
     $ver = (& $exe --version 2>$null) -join ' '
     Say "installed $exe ($(if ($ver) { $ver } else { $Tag }))"
 } finally {
@@ -107,8 +107,8 @@ if (($userPath -split ';') -notcontains $InstallDir) {
     Say "added $InstallDir to your PATH — open a new terminal for it to take effect"
 }
 
-# Note: Windows has no man page — use `filament --help` or `filament man` for docs.
+# Note: Windows has no man page — use `tunlion --help` or `tunlion man` for docs.
 
 Say ''
-Say 'try it:   filament send <file> --code'
+Say 'try it:   tunlion send <file> --code'
 Say '          (the other end can be a terminal — or any browser at https://tunlion.autumated.com)'

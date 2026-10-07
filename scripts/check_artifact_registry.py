@@ -23,7 +23,7 @@ TOPOLOGIES = {
     "model-checker",
     "unit",
 }
-ISSUE_RE = re.compile(r"https://github\.com/Abdk4Moura/filament/issues/[1-9][0-9]*$")
+ISSUE_RE = re.compile(r"https://github\.com/Abdk4Moura/tunlion/issues/[1-9][0-9]*$")
 # A `required` artifact whose path appears in no workflow is not required by
 # anything: the entrypoint check below proves only that the command is spelled
 # correctly, never that CI invokes it (#249). These 14 predate that check. The

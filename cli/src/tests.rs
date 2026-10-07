@@ -2082,7 +2082,7 @@ fn revoked_record_is_not_revivable_by_enrollment() {
 
 #[test]
 fn bare_for_flag_asks_rather_than_defaulting_to_device() {
-    // `filament add --for` (which is what the menu entry "Invite a device or
+    // `tunlion add --for` (which is what the menu entry "Invite a device or
     // person" runs) arrives as Some("") from clap's default_missing_value and
     // MEANS "ask me". It used to fall through resolve_for_kind's device-NAME
     // arm to kind=device with an empty invitee name, silently, so the menu
@@ -2246,7 +2246,7 @@ fn a_device_with_no_identity_is_offered_both_ways_in() {
 
 #[test]
 fn printed_hints_carry_every_required_flag() {
-    // #227: `filament requests` printed `[ filament requests approve 1 ]`.
+    // #227: `tunlion requests` printed `[ tunlion requests approve 1 ]`.
     // Both `--allow` and `--for` are REQUIRED, so typing the hint exactly as
     // shown fails with a usage error. The hint was corrected, but the test
     // defending it asserted only `contains("requests approve 2")`, which is
@@ -2306,7 +2306,7 @@ fn printed_hints_carry_every_required_flag() {
                 continue; // prose and history, not instructions
             }
             for (path, flags) in &required {
-                let needle = format!("filament {}", path.join(" "));
+                let needle = format!("tunlion {}", path.join(" "));
                 let Some(i) = line.find(&needle) else {
                     continue;
                 };
@@ -2320,7 +2320,7 @@ fn printed_hints_carry_every_required_flag() {
                     .collect();
                 if !missing.is_empty() {
                     bad.push(format!(
-                        "{rel}:{}: hint `filament {}` omits required {:?}",
+                        "{rel}:{}: hint `tunlion {}` omits required {:?}",
                         n + 1,
                         path.join(" "),
                         missing
@@ -2511,7 +2511,7 @@ fn help_banner_names_commands_that_exist() {
     //
     // `printed_hints_name_verbs_that_exist` exists to stop exactly this and
     // could not see it, for two reasons worth keeping written down:
-    //   1. it anchors on the literal "filament ", and the COMMANDS column
+    //   1. it anchors on the literal "tunlion ", and the COMMANDS column
     //      lists bare verbs with no such prefix, so the banner was never
     //      scanned at all;
     //   2. it reads ONE word, so `ephemeral mint` would have passed on
@@ -2529,9 +2529,9 @@ fn help_banner_names_commands_that_exist() {
     let mut checked = 0usize;
     for raw in EXAMPLES.lines() {
         // Two shapes carry commands: the COMMANDS column (4-space indent,
-        // command, 2+ spaces, prose) and the EXAMPLES lines (`filament ...`).
+        // command, 2+ spaces, prose) and the EXAMPLES lines (`tunlion ...`).
         let line = raw.trim_end();
-        let cmdtext = if let Some(rest) = line.trim_start().strip_prefix("filament ") {
+        let cmdtext = if let Some(rest) = line.trim_start().strip_prefix("tunlion ") {
             rest.split("  ").next().unwrap_or("").trim().to_string()
         } else if line.starts_with("    ") && !line.starts_with("     ") {
             let body = &line[4..];
@@ -2624,22 +2624,22 @@ fn help_banner_names_commands_that_exist() {
     );
     assert!(
         bad.is_empty(),
-        "filament --help prints commands that clap will reject:\n{}",
+        "tunlion --help prints commands that clap will reject:\n{}",
         bad.join("\n")
     );
 }
 
 fn printed_hints_name_verbs_that_exist() {
     // #229, and the reason this test exists rather than a fifth point fix:
-    // `filament unmount` was printed after every successful mount and has
+    // `tunlion unmount` was printed after every successful mount and has
     // never been a verb. It was corrected in three places and survived in
     // FIVE more, including the one users actually hit, and the miss was
     // found by reading a real mount on a real machine rather than by any
     // test. Change one copy of a sentence, leave the others, and the wrong
     // one is the one someone reads next.
     //
-    // `internal_subcommand_invocations_name_real_verbs` covers what filament
-    // types AT ITSELF. This covers what filament tells the USER to type,
+    // `internal_subcommand_invocations_name_real_verbs` covers what tunlion
+    // types AT ITSELF. This covers what tunlion tells the USER to type,
     // which is the larger surface and the one with a person on the end of it.
     use clap::CommandFactory;
     let cmd = Cli::command();
@@ -2651,10 +2651,10 @@ fn printed_hints_name_verbs_that_exist() {
             v
         })
         .collect();
-    // `filament <file>` is the bare-send form, and `filament --help` etc.
+    // `tunlion <file>` is the bare-send form, and `tunlion --help` etc.
     valid.insert("--help".into());
-    // "filament" is also an ordinary noun in our own prose: "the filament
-    // daemon", "local filament state", "no active filament mounts". These
+    // "tunlion" is also an ordinary noun in our own prose: "the tunlion
+    // daemon", "local tunlion state", "no active tunlion mounts". These
     // are the words that legitimately follow it there. A NEW one trips this
     // test once and gets added deliberately, which is the point: the cost of
     // adding a word is a moment's thought about whether it is prose or an
@@ -2683,13 +2683,13 @@ fn printed_hints_name_verbs_that_exist() {
         };
         for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
-            // Comments explain history ("replaces `filament unmount`") and
+            // Comments explain history ("replaces `tunlion unmount`") and
             // are not instructions to anyone.
             if t.starts_with("//") {
                 continue;
             }
-            for (i, _) in line.match_indices("filament ") {
-                let rest = &line[i + "filament ".len()..];
+            for (i, _) in line.match_indices("tunlion ") {
+                let rest = &line[i + "tunlion ".len()..];
                 let word: String = rest
                     .chars()
                     .take_while(|c| c.is_ascii_lowercase() || *c == '-')
@@ -2701,7 +2701,7 @@ fn printed_hints_name_verbs_that_exist() {
                 }
                 if !valid.contains(&word) {
                     bad.push(format!(
-                        "  {rel}:{}: prints `filament {word}`, which clap does not accept\n    {}",
+                        "  {rel}:{}: prints `tunlion {word}`, which clap does not accept\n    {}",
                         n + 1,
                         line.trim()
                     ));
@@ -2719,13 +2719,13 @@ fn printed_hints_name_verbs_that_exist() {
 /// An invitation pasted into `add` must be named for what it is, and the
 /// remedy must be a command that exists. The old path sent the token as a
 /// nameplate and the server answered "codes burn after one use" about a
-/// token that was never claimed, prescribing `re-run filament add`, which
+/// token that was never claimed, prescribing `re-run tunlion add`, which
 /// mints a code and cannot help. The owner hit exactly this.
 ///
 /// The remedy is asserted against `join`'s real interface: it takes the
 /// invitation interactively or via --invite-file, and NEVER from argv, so
 /// this must not tell anyone to pass it on the command line.
-/// #194: the bare screen prints "FILAMENT / N DEVICES / ..." and then a
+/// #194: the bare screen prints "TUNLION / N DEVICES / ..." and then a
 /// menu. Those two must not contradict each other. The owner saw
 /// "2 DEVICES" above "Set up this first device" on a machine paired by
 /// code, which has peers and no identity of its own.
@@ -2771,7 +2771,7 @@ fn an_invitation_pasted_into_add_is_named_and_the_remedy_exists() {
         "must say what it is not: {msg}"
     );
     assert!(
-        msg.contains("filament join"),
+        msg.contains("tunlion join"),
         "must name the verb that consumes it: {msg}"
     );
     assert!(
@@ -2780,12 +2780,12 @@ fn an_invitation_pasted_into_add_is_named_and_the_remedy_exists() {
     );
     assert!(!msg.contains("burn"), "must not blame a burned code: {msg}");
     assert!(
-        !msg.contains("re-run `filament add`"),
+        !msg.contains("re-run `tunlion add`"),
         "must not prescribe minting a code: {msg}"
     );
-    // `filament join` accepts no positional argument, by design.
+    // `tunlion join` accepts no positional argument, by design.
     assert!(
-        !msg.contains("filament join filament-invite:"),
+        !msg.contains("tunlion join filament-invite:"),
         "must not tell anyone to put invitation material in argv: {msg}"
     );
 }
@@ -2847,7 +2847,7 @@ fn descriptions_of_a_verb_do_not_contradict_each_other() {
         described.push(("help banner", subject.to_string(), desc.to_string()));
     }
 
-    // tour_cmd's `act("filament <verb> ...", "<desc>")` lines, read from the
+    // tour_cmd's `act("tunlion <verb> ...", "<desc>")` lines, read from the
     // source: the tour is printed, not returned, so there is nothing to call.
     let manifest = env!("CARGO_MANIFEST_DIR");
     // The tour used to live in main.rs; it now lives in status_cmd.rs. Locate it by
@@ -2863,7 +2863,7 @@ fn descriptions_of_a_verb_do_not_contradict_each_other() {
         .expect("tour_cmd must exist for this test to mean anything");
     for line in tour.lines() {
         let t = line.trim();
-        let Some(rest) = t.strip_prefix("act(\"filament ") else {
+        let Some(rest) = t.strip_prefix("act(\"tunlion ") else {
             continue;
         };
         let Some((lhs, rest)) = rest.split_once("\", \"") else {
@@ -2942,7 +2942,7 @@ fn down_picks_the_right_systemd_manager_for_the_daemon_cgroup() {
 #[test]
 fn internal_subcommand_invocations_name_real_verbs() {
     // #202 inward audit: the banner-vs-clap test asks what a PERSON can
-    // type. Nothing asked what filament types AT ITSELF, which is how a
+    // type. Nothing asked what tunlion types AT ITSELF, which is how a
     // dead verb (netcat) survived in six internal ProxyCommand call sites
     // and one printed hint. Scan the source for format!-built subcommand
     // invocations (a quoted verb, a space, then an interpolation brace) and
@@ -3656,16 +3656,16 @@ fn device_colon_port_is_forward() {
 }
 
 /// The forward rewrite produces the exact argv shape the `Forward` subcommand
-/// expects: `filament forward <lport> <peer> <rport>`.
+/// expects: `tunlion forward <lport> <peer> <rport>`.
 #[test]
 fn forward_rewrite_argv_shape() {
-    let mut argv: Vec<String> = vec!["filament".into(), "laptop:5432".into()];
+    let mut argv: Vec<String> = vec!["tunlion".into(), "laptop:5432".into()];
     argv.remove(1);
     argv.insert(1, "forward".into());
     argv.insert(2, "5432".into());
     argv.insert(3, "laptop".into());
     argv.insert(4, "5432".into());
-    assert_eq!(argv, vec!["filament", "forward", "5432", "laptop", "5432"]);
+    assert_eq!(argv, vec!["tunlion", "forward", "5432", "laptop", "5432"]);
 }
 
 /// A malformed port after the colon must NOT be treated as a forward.
@@ -3728,7 +3728,7 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
     .unwrap();
     let warning = fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 150).unwrap();
     assert!(warning.contains("laptop still has fleet access via its certificate"));
-    assert!(warning.contains("filament revoke laptop --certificate"));
+    assert!(warning.contains("tunlion revoke laptop --certificate"));
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
 }
@@ -3871,13 +3871,13 @@ fn implicit_identity_is_minted_once_even_under_contention() {
     unsafe { std::env::set_var(NO_IMPLICIT_INIT_ENV, "1") };
     let err = ensure_user_key_inner().err().expect("the opt-out must refuse to mint").to_string();
     unsafe { std::env::remove_var(NO_IMPLICIT_INIT_ENV) };
-    assert!(err.contains("filament init"), "{err}");
+    assert!(err.contains("tunlion init"), "{err}");
     assert!(!dir.join("identity.ed25519").exists());
     unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
 }
 
 /// U1: the bare tour screen is an INSPECT surface. It renders whatever
-/// identity it finds and never mints one, so `filament` with no arguments
+/// identity it finds and never mints one, so `tunlion` with no arguments
 /// writes no private key as a side effect of being looked at, and cannot fail
 /// on a device that is unable to mint (a joined one, or one with
 /// FILAMENT_NO_IMPLICIT_INIT set). The screen is printed rather than returned,

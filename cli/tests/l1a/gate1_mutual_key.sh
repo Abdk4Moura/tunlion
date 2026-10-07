@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# GATE 1 (mutual-key): two honest `filament pair` processes with the SAME spoken
+# GATE 1 (mutual-key): two honest `tunlion pair` processes with the SAME spoken
 # code derive the SAME pinned secret over the real wire (8093). Key confirmation
 # passes; both write byte-identical devices.json secrets.
 set -uo pipefail
 # Configurable for any environment (defaults match gate9's local fixture):
-#   BIN     path to the release filament binary
+#   BIN     path to the release tunlion binary
 #   SERVER  signaling backend URL (a LOCAL fixture, never prod)
-BIN=${BIN:-../../target/release/filament}
+BIN=${BIN:-../../target/release/tunlion}
 SERVER=${SERVER:-http://127.0.0.1:8093}
 T=${T:-/tmp/l1a-gate1}
 CFG_A=$T/g1-cfgA; CFG_B=$T/g1-cfgB

@@ -1,4 +1,4 @@
-# What filament is allowed to print, and how
+# What tunlion is allowed to print, and how
 
 Rules for anything a person reads. Written down because the UI layer is the
 part most often finished last, by whoever is closest to the feature, and it is
@@ -78,8 +78,8 @@ a number and cannot act on a condition they do not control.
 
 ### It is the same defect as an unfalsifiable test
 
-`cli/src/main.rs` once asserted `is_filament_process(std::process::id())` where
-the test binary is named `filament-<hash>`, so the input could not fail and the
+`cli/src/main.rs` once asserted `is_tunlion_process(std::process::id())` where
+the test binary is named `tunlion-<hash>`, so the input could not fail and the
 check was never exercised (#224). **A test that cannot fail and a sentence that
 cannot be false are the same defect in different materials.**
 
@@ -135,11 +135,11 @@ Plain sentences that stop when they are done. No em dashes. Do not tell the user
 what to feel about an outcome, and do not congratulate them.
 
 Name the thing that has to happen next, in the words of the command that does
-it. "start `filament up`" beats "ensure a receiver is available".
+it. "start `tunlion up`" beats "ensure a receiver is available".
 
 Never print an instruction naming a command that does not exist. Three did:
-`filament netcat` from six internal call sites, and `filament proxy` and
-`filament dial` from a printed hint (#202).
+`tunlion netcat` from six internal call sites, and `tunlion proxy` and
+`tunlion dial` from a printed hint (#202).
 
 ## Do not offer what cannot work
 

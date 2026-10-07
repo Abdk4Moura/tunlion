@@ -1,4 +1,4 @@
-// Characterization tests for the filament file-transfer protocol layer. Plain
+// Characterization tests for the tunlion file-transfer protocol layer. Plain
 // Node ESM (no deps): node frontend/src/net/protocol/__tests__/transfer.test.mjs
 // These pin the control-message shapes (incl. key ORDER, which encodeControl/
 // JSON.stringify emit verbatim — CONTRACT.md is byte-frozen) and the pure

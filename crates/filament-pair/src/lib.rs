@@ -1,4 +1,4 @@
-//! Filament PAKE core — the single SPAKE2 implementation shared by the CLI
+//! Tunlion PAKE core — the single SPAKE2 implementation shared by the CLI
 //! (native) and the browser (wasm32). See docs/L1-pake-protocol.md.
 //!
 //! Design (L1-a):

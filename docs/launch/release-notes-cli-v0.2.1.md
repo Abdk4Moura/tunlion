@@ -1,12 +1,12 @@
-# Filament CLI v0.2.1
+# Tunlion CLI v0.2.1
 
 This is the field-testing hardening release. Every change here came out of live multi-device testing across Android, iPad, and the CLI, with each diagnosis confirmed by telemetry rather than guesswork. The result is a calmer, more honest CLI that holds connections through real-world hiccups and tells you what is actually happening.
 
 ## New
 
-- `filament pair`: a first-class pairing ceremony, so you can add and remember a device without pretending to send a file.
-- `filament up` is now an interactive session: type a code to pair, or run `pair`, `devices`, and `forget` right in the prompt.
-- New `filament devices rename` and `filament devices forget` subcommands to fix or remove your device names.
+- `tunlion pair`: a first-class pairing ceremony, so you can add and remember a device without pretending to send a file.
+- `tunlion up` is now an interactive session: type a code to pair, or run `pair`, `devices`, and `forget` right in the prompt.
+- New `tunlion devices rename` and `tunlion devices forget` subcommands to fix or remove your device names.
 - Colored peer-status roster lines show every peer side by side, with the one that just changed carrying the note.
 
 ## Fixed
@@ -31,12 +31,12 @@ This is the field-testing hardening release. Every change here came out of live 
 
 ```
 # Already installed
-filament update
+tunlion update
 
 # Linux / macOS installer
 curl -fsSL https://tunlion.autumated.com/install | sh
 
 # Homebrew
 brew tap Abdk4Moura/tap
-brew install abdk4moura/tap/filament
+brew install abdk4moura/tap/tunlion
 ```

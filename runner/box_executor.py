@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""filament job runner — box-side executor (the FIXED, single-invocation node program).
+"""tunlion job runner — box-side executor (the FIXED, single-invocation node program).
 
 This is the ONLY thing the host ever runs on the remote box. It is a *fixed*
 program: the host does not pipe arbitrary shell commands across the PTY. Instead
@@ -21,7 +21,7 @@ parse them out of an interactive PTY stream that also carries shell echo/prompts
     FILJOB v1 <job_id> done exit=<code>
 
 The sentinel prefix (FILJOB) lets the host recover structure even though a login
-shell, not a clean pipe, is on the other end of `filament pty`.
+shell, not a clean pipe, is on the other end of `tunlion pty`.
 
 Job spec (job.json):
     {

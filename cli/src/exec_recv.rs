@@ -1,4 +1,4 @@
-//! `filament exec` receiver: parse the open frame, enforce the shell gate,
+//! `tunlion exec` receiver: parse the open frame, enforce the shell gate,
 //! direct-spawn the command, and serve its stdio until it exits.
 //!
 //! This is the `exec-open` counterpart to the `pty-open` acceptor in recv_cmd.rs:
@@ -450,7 +450,7 @@ pub(crate) async fn serve_exec(
                     // acceptor believed it had reported the exit while the initiator never heard
                     // it and the only artifact was silence. Say so instead.
                     crate::ui::say(&format!(
-                        "filament: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
+                        "tunlion: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
                     ));
                 }
                 // THE END OF THE STREAM IS SIGNALLED UNCONDITIONALLY, and that is the correction
@@ -471,12 +471,12 @@ pub(crate) async fn serve_exec(
                 // instead of leaving "emitted but unseen" and "never emitted" indistinguishable.
                 if let Err(e) = t.send_frame(sid, 0, &[]).await {
                     crate::ui::say(&format!(
-                        "filament: could not signal the end of exec stream sid {sid}: {e}"
+                        "tunlion: could not signal the end of exec stream sid {sid}: {e}"
                     ));
                 }
                 if let Err(e) = t.send_frame(err_sid, 0, &[]).await {
                     crate::ui::say(&format!(
-                        "filament: could not signal the end of exec stream sid {err_sid}: {e}"
+                        "tunlion: could not signal the end of exec stream sid {err_sid}: {e}"
                     ));
                 }
                 // THE CONTROL CHANNEL CARRIES THE END TOO, because the data-frame sentinel does

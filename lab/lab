@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# lab — the filament networking dev-lab CLI.
+# lab — the tunlion networking dev-lab CLI.
 #
 # A thin launcher around the `labkit` Python engine (stdlib-only). Works without
 # the Claude skill; the skill drives this same binary.
 #
-#   lab up <topology> [--link pipe|udp|wg|filament] [--crypto ...]
+#   lab up <topology> [--link pipe|udp|wg|tunlion] [--crypto ...]
 #   lab down [<lab>] [--all] [--purge-logs]
 #   lab status [<lab>]
 #   lab probe <ping|iperf|curl|counters> [<lab>]
@@ -16,7 +16,7 @@
 # Add --json to any command for machine-readable output.
 #
 # SAFETY: everything is sandboxed in network namespaces; the lab NEVER modifies
-# host networking, the running filament daemon, or the installed binary. Root is
+# host networking, the running tunlion daemon, or the installed binary. Root is
 # required for netns/tun/wg (the CLI checks and fails clearly otherwise).
 set -euo pipefail
 

@@ -1,6 +1,6 @@
 //! The bare-argument comfort router and the first-screen action list.
 //!
-//! `classify_bare_token` decides what a bare `filament <word>` means (help, a
+//! `classify_bare_token` decides what a bare `tunlion <word>` means (help, a
 //! path to send, a nameplate, `device:port`, `device.mesh`, a known device name,
 //! or nothing it recognises), and `first_screen_actions` is the list the no-args
 //! screen offers. They travel together because anyhow::{Context, Result, anyhow, bail};
@@ -10,7 +10,7 @@ use crate::regex_lite_code;
 
 /// `add` was handed an invitation instead of a pairing code. One source for the
 /// sentence so the test and the error cannot drift apart.
-/// What the bare `filament` screen offers, given what this machine actually has.
+/// What the bare `tunlion` screen offers, given what this machine actually has.
 ///
 /// Extracted so #194 can be pinned without driving a terminal: the bug was a
 /// menu that contradicted the header printed directly above it.

@@ -37,7 +37,7 @@ pub fn render_same_person_success(device_name: &str) -> String {
         "{ok} {name} joined your fleet.\n{echo}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),
         name = device_name,
-        echo = echo_cmd("filament add"),
+        echo = echo_cmd("tunlion add"),
     )
 }
 
@@ -119,7 +119,7 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
 pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> String {
     let echo = match cap {
         "shell" | "transfer" | "mount" => {
-            echo_cmd(&format!("filament grant {peer_name} {cap} --for {expiry}"))
+            echo_cmd(&format!("tunlion grant {peer_name} {cap} --for {expiry}"))
         }
         _ => String::new(),
     };
@@ -144,16 +144,16 @@ pub fn err_pair_interactive() -> (String, i32) {
         ),
         "  someone to type. In a script, write an invitation they claim later instead:".to_string(),
         String::new(),
-        // EVERY ONE OF THESE RUNS. This used to suggest `filament add --for
+        // EVERY ONE OF THESE RUNS. This used to suggest `tunlion add --for
         // device`, which fails with this very message because --out is required
         // too, so the error told you to run the thing that produced it.
-        format!("  {}      a device you own", ui::paint(Tone::Brand, "filament add laptop --out laptop.invite")),
-        format!("  {}  someone else", ui::paint(Tone::Brand, "filament add --for person --out alice.invite")),
-        format!("  {}        a CI runner", ui::paint(Tone::Brand, "filament add --for runner --out ci.key")),
+        format!("  {}      a device you own", ui::paint(Tone::Brand, "tunlion add laptop --out laptop.invite")),
+        format!("  {}  someone else", ui::paint(Tone::Brand, "tunlion add --for person --out alice.invite")),
+        format!("  {}        a CI runner", ui::paint(Tone::Brand, "tunlion add --for runner --out ci.key")),
         String::new(),
         format!(
             "  A bare name means a device you own. They claim it with:  {}",
-            ui::paint(Tone::Brand, "filament join <file>")
+            ui::paint(Tone::Brand, "tunlion join <file>")
         ),
     ];
     (lines.join("\n"), super::EXIT_BAD_ARG)
@@ -226,7 +226,7 @@ mod tests {
 
     /// EVERY SUGGESTED COMMAND MUST RUN.
     ///
-    /// This message used to suggest `filament add --for device`, which fails
+    /// This message used to suggest `tunlion add --for device`, which fails
     /// with this very message because --out is required too: the error told you
     /// to run the thing that produced it. Nothing caught it, because no test
     /// read error text.
@@ -240,7 +240,7 @@ mod tests {
         let plain = strip_ansi(&msg);
         let mut checked = 0;
         for line in plain.lines() {
-            let Some(start) = line.find("filament ") else { continue };
+            let Some(start) = line.find("tunlion ") else { continue };
             // the command runs to the double-space that starts its description
             let rest = &line[start..];
             let cmd = rest.split("  ").next().unwrap_or(rest).trim();

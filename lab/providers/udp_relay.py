@@ -2,7 +2,7 @@
 
 One process per node, run INSIDE the node's netns (so both the TUN and the UDP
 socket live in the same netns, reachable over the veth underlay — no setns needed
-here, unlike the filament relay). Reads IP packets from the TUN and sends each as
+here, unlike the tunlion relay). Reads IP packets from the TUN and sends each as
 one UDP datagram to the peer's underlay address; receives UDP datagrams and
 writes them to the TUN. One packet per datagram, so no length framing is required
 (the datagram boundary IS the frame) — but we still cap at the MTU.

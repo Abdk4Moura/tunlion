@@ -1,13 +1,13 @@
-//! #224: the daemon's identity is its executable path, not a "filament"
+//! #224: the daemon's identity is its executable path, not a "tunlion"
 //! substring in its command line.
 //!
 //! The old `daemon_alive` read `/proc/<pid>/cmdline` and asked "does this
-//! string contain the word filament". A renamed binary (or a recycled pid
+//! string contain the word tunlion". A renamed binary (or a recycled pid
 //! running some other program) defeats that, so `status` lied, `down` did
 //! nothing and `up` started a second daemon. The fix records the daemon's
 //! executable when the pidfile is written and confirms it against the live
 //! process on read. This test spawns a REAL daemon under a name with no
-//! "filament" in it, which the old check could never recognise, and asserts an
+//! "tunlion" in it, which the old check could never recognise, and asserts an
 //! unrelated live pid is rejected.
 
 use std::io::Read;
@@ -16,14 +16,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn real_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_filament")
+    env!("CARGO_BIN_EXE_tunlion")
 }
 
 /// A copy of the real binary under a path that deliberately contains no
-/// "filament" substring anywhere (scratch dir AND file name). The old check
+/// "tunlion" substring anywhere (scratch dir AND file name). The old check
 /// matched on the name, so this path is exactly the input it could not fail.
 fn scratch_root() -> std::path::PathBuf {
-    // No "filament" in any component of this path: the cmdline substring check
+    // No "tunlion" in any component of this path: the cmdline substring check
     // must not be able to match it by accident.
     std::env::temp_dir().join(format!("bg-{}", std::process::id()))
 }
@@ -33,7 +33,7 @@ fn status_json(cfg: &std::path::Path) -> serde_json::Value {
         .env("FILAMENT_CONFIG_DIR", cfg)
         .args(["status", "--json"])
         .output()
-        .expect("run filament status");
+        .expect("run tunlion status");
     serde_json::from_slice(&out.stdout).unwrap_or_else(|_| serde_json::Value::Null)
 }
 
@@ -43,7 +43,7 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
 
-    // Copy the binary under a name with no "filament" substring.
+    // Copy the binary under a name with no "tunlion" substring.
     let renamed = scratch.join("bg-224");
     std::fs::copy(real_bin(), &renamed).unwrap();
     #[cfg(unix)]
@@ -97,7 +97,7 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     assert_eq!(
         found,
         Some(child.id() as u64),
-        "a daemon running under a name with no 'filament' must still be found by status"
+        "a daemon running under a name with no 'tunlion' must still be found by status"
     );
 
     // An unrelated live pid must be REJECTED: point the pidfile at a live

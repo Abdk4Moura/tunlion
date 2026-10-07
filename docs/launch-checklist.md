@@ -1,4 +1,4 @@
-# Filament launch checklist
+# Tunlion launch checklist
 
 Owners: **C** = Claude (drafts/ships directly) · **A** = Abdul (account actions).
 Drafts land in `docs/launch/` ready to paste.
@@ -6,7 +6,7 @@ Drafts land in `docs/launch/` ready to paste.
 **Strategy / why:** `docs/launch/CASE-STUDY-takeoff.md` — how the analogues
 (LocalSend, Snapdrop/PairDrop, magic-wormhole/croc, Syncthing/Tailscale/ngrok)
 actually took off, the 2026 channel reality, the Quick-Share↔AirDrop pivot, and
-Filament's positioning + sequenced plan + leading indicators. Read it before
+Tunlion's positioning + sequenced plan + leading indicators. Read it before
 executing the phases below.
 
 ## Phase 0 — Foundation ✅
@@ -33,8 +33,8 @@ executing the phases below.
 - [ ] r/selfhosted post (different week than HN)
 - [ ] AlternativeTo listing (alternative to Snapdrop / PairDrop / AirDrop / WeTransfer)
 - [ ] awesome-selfhosted PR — **scheduled**: a remote routine ("Open awesome-selfhosted
-      PR for Filament") fires 2026-10-07 09:00 UTC and opens the PR from the staged
-      branch `Abdk4Moura/awesome-selfhosted-data@add-filament` (Oct 7, not Oct 6,
+      PR for Tunlion") fires 2026-10-07 09:00 UTC and opens the PR from the staged
+      branch `Abdk4Moura/awesome-selfhosted-data@add-tunlion` (Oct 7, not Oct 6,
       for one day of buffer past the exactly-4-months mark; v1.0.0 released 2026-06-06).
       Manage at https://claude.ai/code/routines
 - [ ] GSC: Request Indexing for `/`, `/about`, `/faq` (after OG image ships)
@@ -46,4 +46,4 @@ executing the phases below.
 
 **Positioning per channel:** consumer = "AirDrop between Android and iPhone, in the browser";
 technical = "self-hosted, route-transparent P2P file drop with resumable transfers".
-**Naming rule:** always "Filament file sharing" — never bare "filament" (3D-printing collision).
+**Naming rule:** always "Tunlion file sharing" — never bare "tunlion" (3D-printing collision).

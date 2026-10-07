@@ -1,19 +1,19 @@
-/* Filament: global shell styles (ported from the design handoff host).
-   The UI itself is inline-styled in ui/Filament.jsx; this file only carries the
+/* Tunlion: global shell styles (ported from the design handoff host).
+   The UI itself is inline-styled in ui/Tunlion.jsx; this file only carries the
    page reset, the keyframes the component references, and scrollbars. */
 
 /* App shell: lock the page so a touch never pans or rubber-bands the document.
    overscroll-behavior:none kills the bounce/pull-to-refresh that, on mobile,
    reads as "panning an oversized image". height:100% + overflow:hidden keep the
    document exactly one viewport tall; the terminal overlay then sizes itself to
-   the VISUAL viewport in JS (see Filament.jsx) so nothing taller than what is
+   the VISUAL viewport in JS (see Tunlion.jsx) so nothing taller than what is
    actually visible can be panned into view. This is the app shell, not the
    marketing/content pages, so locking page scroll here does not affect reading. */
 html, body { margin: 0; height: 100%; background: #0A0B0C; overflow: hidden; overscroll-behavior: none; }
 * { box-sizing: border-box; }
 #root { position: fixed; inset: 0; }
 
-/* progress-bar shimmer + the blinking "filament tip" caret */
+/* progress-bar shimmer + the blinking "tunlion tip" caret */
 @keyframes filShimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 @keyframes filBlink { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0.15; } }
 .fil-caret { animation: filBlink 1.1s steps(1) infinite; }
