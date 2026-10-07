@@ -63,7 +63,7 @@ filament-signal = { path = "../filament-signal", version = "0.1.0" }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
-rustls = { version = "0.23.40", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha2 = "0.11.0"
 quinn-proto = "0.11"
 socket2 = { version = "0.5", features = ["all"] }
