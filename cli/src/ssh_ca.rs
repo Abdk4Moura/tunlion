@@ -311,7 +311,7 @@ pub(crate) fn record_issuance(
     let text =
         serde_json::to_string(&v).map_err(|e| anyhow::anyhow!("issuance record unserializable: {e}"))?;
     let path = issued_path(config_dir);
-    crate::platform::SecretFile::write_str(&path, text)?;
+    crate::platform::SecretFile::write_str(&path, &text)?;
     Ok(())
 }
 
