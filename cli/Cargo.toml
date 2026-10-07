@@ -51,7 +51,7 @@ mount-macos = ["dep:fuser"]
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.89"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.11.1"
 chrono = "0.4"
 clap = { version = "4.6.1", features = ["derive", "env"] }
@@ -66,8 +66,8 @@ sha2 = "0.11.0"
 # pake-internal: sha2 0.10 (for hkdf/hmac 0.12 trait compat). Renamed to
 # avoid the 0.10/0.11 name clash; the pake module aliases it as `sha2`.
 sha2_pake = { package = "sha2", version = "0.10" }
-hkdf = "0.12"
-hmac = "0.12"
+hkdf = "0.13"
+hmac = "0.13"
 spake2 = "=0.4.0"
 # PAKE first-pairing core, carved into its own crate (zero app coupling).
 filament-pair = { path = "../crates/filament-pair", version = "0.1.0" }
@@ -90,10 +90,10 @@ filament-overlay = { path = "../crates/filament-overlay", version = "0.1.0" }
 filament-fleet = { path = "../crates/filament-fleet", version = "0.1.0" }
 filament-transport = { path = "../crates/filament-transport", version = "0.1.0" }
 hex = "0.4"
-rand_core = "0.6"
-getrandom = "0.2"
+rand_core = "0.9"
+getrandom = "0.4"
 tar = "0.4.46"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
 clap_complete = "4.6.5"
@@ -101,26 +101,26 @@ clap_mangen = "0.3.0"
 flate2 = "1.1.9"
 qrcode = { version = "0.14.1", default-features = false }
 # web-shell: spawn a login shell in a PTY and bridge it to the browser terminal.
-portable-pty = "0.8"
+portable-pty = "0.9"
 # rung-1 direct CLI<->CLI transport (FILAMENT_DIRECT=1). ring crypto to match
 # the rest of the rustls tree; we hand quinn an explicit ring-based config so
 # no process-default crypto provider is required.
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 quinn-proto = "0.11"
-rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
 # L3 overlay crypto: a per-device Ed25519 identity whose public key IS the overlay
 # address (self-certifying, Yggdrasil-style). ring is already in the tree via
 # rustls/quinn/rcgen; this is a direct handle for Ed25519 sign/verify + CSPRNG, so
 # we never hand-roll the crypto.
 ring = "0.17"
 zeroize = "1.8"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 # Userspace L3 netstack: an in-process TCP/IP stack so a zero-privilege node (no
 # CAP_NET_ADMIN, no /dev/net/tun, e.g. a container) is a first-class overlay member.
 # Pure Rust, no OS device (more portable than the kernel-TUN/Wintun backends); it
 # feeds/drains bare IPv6 packets to/from the same direct-QUIC datagram carrier. IPv6
 # is mandatory (the overlay is an IPv6 ULA); TCP only for now.
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 # Interactive guided code entry (raw mode + key events + styled output;
 # cross-platform incl. Windows). Used ONLY behind the interactivity gate; a
 # non-TTY / scripted run never enters its event loop.
@@ -137,7 +137,7 @@ libc = "0.2"
 # This stays default-on: it builds on stock Linux runners and is fully exercised
 # by mount-gates.sh.
 [target.'cfg(target_os = "linux")'.dependencies]
-fuser = "0.17"
+fuser = "0.18"
 
 # macOS needs the macFUSE SDK, so the adapter is opt-in via `mount-macos`; the
 # dependency is optional so a default macOS build neither needs nor builds it.
@@ -157,11 +157,11 @@ wintun = "0.5"
 # Pinned to 0.12: 0.13 is a significant API refactor (FileSystemHost::new
 # takes 2 args, DirInfo is now generic DirInfo<N>, VolumeParams is a builder).
 # Upgrade tracked as follow-up item.
-winfsp = { version = "=0.12.0", features = ["full", "windows-61"], optional = true }
-winfsp-sys = { version = "=0.3.0", optional = true }
+winfsp = { version = "=0.13.1", features = ["full", "windows-61"], optional = true }
+winfsp-sys = { version = "=0.12.1", optional = true }
 # Used for reparse-point (symlink/junction) refusal in safe_create_part /
 # safe_resume_part — closes the Windows half deferred in 0.7.2/0.7.3.
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
