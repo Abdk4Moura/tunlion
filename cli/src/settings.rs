@@ -454,10 +454,17 @@ fn global_put(store: &str, value: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{store} {value}"));
-    // Atomic write: temp file + rename (same as devices.json fix)
-    let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, lines.join("\n") + "\n")?;
-    std::fs::rename(&tmp, &p)?;
+    // Route through SecretFile rather than hand-rolling the temp-and-rename.
+    // The comment this replaces claimed parity with the devices.json fix and did
+    // not have it: this used a FIXED temp name (`config.tmp`, no pid) and never
+    // fsynced, where SecretFile::write_raw suffixes the pid, fsyncs the file and
+    // then the parent directory. The fixed name is what made
+    // `ssh_cert_ttl_resolves_then_clamps` fail on Windows and only on Windows,
+    // at its SECOND `set` -- the first rename has no destination to replace, the
+    // second does, and on Windows a rename onto an existing path fails outright
+    // if anything still holds a handle to it (#349). Same write, one
+    // implementation, and the hardened one.
+    crate::platform::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))?;
     Ok(())
 }
 
@@ -1429,6 +1436,28 @@ mod tests {
         assert_eq!(canonicalize(s, "YES").unwrap(), "on");
         assert_eq!(canonicalize(s, "0").unwrap(), "off");
         assert!(canonicalize(s, "maybe").is_err());
+    }
+
+    /// BITE for #349: the defect was a value not visible to the very next read,
+    /// so assert overwrite specifically, several times, with a read between each.
+    /// This fails if `global_put` ever goes back to a fixed temp name or stops
+    /// replacing the destination. It is deliberately not a Windows-only test:
+    /// the bug only SHOWED on Windows, and a test that only runs there would not
+    /// have caught the fixed-temp-name defect that caused it.
+    #[test]
+    fn repeated_set_is_visible_to_the_next_read() {
+        with_tmp_cfg(|| {
+            let s = find("ssh.cert_ttl").expect("registered");
+            for want in ["30m", "2h", "45m", "1h", "90m"] {
+                set("ssh.cert_ttl", want, None).unwrap();
+                let (got, _) = resolve(s, None);
+                assert_eq!(
+                    got, want,
+                    "a set must be visible to the very next read (#349); \
+                     wrote {want}, read back {got}"
+                );
+            }
+        });
     }
 
     #[test]

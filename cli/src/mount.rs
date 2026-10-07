@@ -38,9 +38,7 @@ fn save_profile(profile: &MountProfile) -> Result<()> {
     let path = profiles_dir().join(format!("{}.json", profile.name));
     let data = serde_json::to_string_pretty(profile)?;
     // Atomic write: temp file + rename (prevents truncation on ENOSPC/crash)
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::platform::SecretFile::write_str(&path, &data)?;
     Ok(())
 }
 

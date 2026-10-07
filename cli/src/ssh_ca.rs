@@ -253,9 +253,7 @@ pub(crate) fn read_serial(config_dir: &std::path::Path, records: &[IssuedCert]) 
 /// interleave the read-increment-write.
 pub(crate) fn write_serial(config_dir: &std::path::Path, next: u64) -> Result<()> {
     let path = serial_path(config_dir);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, next.to_string())?;
-    std::fs::rename(&tmp, &path)?;
+    crate::platform::SecretFile::write_str(&path, &next.to_string())?;
     Ok(())
 }
 
@@ -313,9 +311,7 @@ pub(crate) fn record_issuance(
     let text =
         serde_json::to_string(&v).map_err(|e| anyhow::anyhow!("issuance record unserializable: {e}"))?;
     let path = issued_path(config_dir);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &path)?;
+    crate::platform::SecretFile::write_str(&path, &text)?;
     Ok(())
 }
 
