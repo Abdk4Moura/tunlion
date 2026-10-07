@@ -20,7 +20,17 @@ use crate::principal_ceiling_for;
 use crate::prompt_line;
 use crate::reset_remove;
 use crate::ui;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
+// The cfg here must match the DEFINITION gate in runtime_support.rs and the
+// re-export gate in main.rs. It was missing the windows arm, so on
+// `--features mount-windows` the function existed and was re-exported while the
+// import was compiled out, and both call sites below failed with E0425. Nothing
+// caught it because mount-ci.yml is path-triggered and no change had touched its
+// trigger paths since the arm was added.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", feature = "mount-macos"),
+    all(target_os = "windows", feature = "mount-windows")
+))]
 use crate::unmount_fuse;
 use anyhow::{Context, Result, anyhow, bail};
 use std::time::Duration;
