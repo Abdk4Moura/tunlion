@@ -3780,7 +3780,49 @@ impl Conn {
     pub(crate) async fn apply_signal(&mut self, from: &str, data: Value) {
         let peer = match self.link(from).and_then(|l| l.peer.clone()) {
             Some(p) => p,
-            None => return,
+            // NO USABLE PEER FOR THIS SIGNAL. There are two ways to get here and
+            // both used to end in a bare `return`, which is how an establish
+            // becomes permanent silence instead of a failure: the initiator waits
+            // for an answer that nobody will ever send, and no line is logged on
+            // either side.
+            //
+            //  - no link at all, because a teardown raced the signal; or
+            //  - a link with `peer: None`, which is what the DIRECT-QUIC path
+            //    creates (conn.rs:2408, :3479). A direct link cannot answer
+            //    WebRTC signalling at all, so holding one made us drop every
+            //    offer for that peer.
+            //
+            // An OFFER is recoverable from both: build a responder and answer it.
+            // Anything else (an answer or a candidate for a link we no longer
+            // have) is genuinely stale, so say so and drop it.
+            None => {
+                let is_offer = data["type"].as_str() == Some("description")
+                    && data["description"]["type"].as_str() == Some("offer");
+                if !is_offer {
+                    ui::debug(&format!(
+                        "signal: dropped {} from {from}: no link with a signalling peer",
+                        data["type"].as_str().unwrap_or("?")
+                    ));
+                    return;
+                }
+                ui::debug(&format!(
+                    "signal: offer from {from} arrived with no signalling peer (link={}); building a responder",
+                    if self.link(from).is_some() { "direct-only" } else { "absent" }
+                ));
+                if let Err(e) = self.ensure_responder(from, &data).await {
+                    ui::debug(&format!("signal: could not answer offer from {from}: {e}"));
+                    return;
+                }
+                match self.link(from).and_then(|l| l.peer.clone()) {
+                    Some(p) => p,
+                    None => {
+                        ui::debug(&format!(
+                            "signal: still no signalling peer for {from} after building a responder; offer abandoned"
+                        ));
+                        return;
+                    }
+                }
+            }
         };
         match peer.handle_signal(data).await {
             Ok(net::SignalOutcome::Handled) => {}
@@ -3810,8 +3852,34 @@ impl Conn {
                     .insert(from.to_string(), json!({ "id": from, "uid": uid }));
             }
         }
-        if self.links.contains_key(from) {
-            return Ok(());
+        // A link we ALREADY HAVE is only a reason to skip if it can actually carry
+        // the signalling. A `peer: None` link is the direct-QUIC kind
+        // (conn.rs:2408, :3479): it has no RTCPeerConnection, so it can neither
+        // answer an offer nor apply a candidate. Treating it as "already handled"
+        // meant every offer for that peer was swallowed, which is one half of the
+        // establish stall -- the other half was apply_signal's bare return.
+        if let Some(l) = self.links.get(from) {
+            if l.peer.is_some() {
+                return Ok(());
+            }
+            // A direct link that is STILL ALIVE is serving them; a peer offering
+            // WebRTC on top of it is belt-and-braces, not a stall, so leave the
+            // working transport alone. Only a dead or absent one is worth
+            // replacing -- that is the case where both ends are waiting.
+            let direct_alive = l
+                .transport
+                .as_ref()
+                .map(|t| t.is_alive())
+                .unwrap_or(false);
+            if direct_alive {
+                ui::debug(&format!(
+                    "responder: {from} offered WebRTC but its direct link is alive; keeping the direct transport"
+                ));
+                return Ok(());
+            }
+            ui::debug(&format!(
+                "responder: link to {from} is direct-only and not alive; answering their offer instead of treating it as already handled"
+            ));
         }
         if data["type"].as_str() == Some("description")
             && data["description"]["type"].as_str() == Some("offer")
@@ -3834,6 +3902,14 @@ impl Conn {
             if self.links.len() < MAX_LINKS {
                 // Forced responder: this link exists to answer THEIR offer.
                 self.establish_as(info, Some(true)).await?;
+            } else {
+                // AT CAPACITY, AND THE INITIATOR CANNOT TELL. It waits for an
+                // answer that will never come. Refusing is the right call, but
+                // refusing in silence is not: this is the only place that says so.
+                ui::say(&format!(
+                    "filament: refusing {from}'s offer: {} links already held (MAX_LINKS). The peer will see a timeout, not a refusal.",
+                    self.links.len()
+                ));
             }
         }
         Ok(())
