@@ -1195,7 +1195,7 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Man { page } => {
             if let Some(p) = page {
                 if p == "routing" {
-                    println!("{}", include_str!("../docs/filament-routing.md"));
+                    println!("{}", include_str!("../docs/tunlion-routing.md"));
                     return Ok(());
                 }
                 // Unknown page: print clear message instead of falling through to roff

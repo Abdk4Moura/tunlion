@@ -31,7 +31,7 @@ Use `Last verified` and `Verified against` for documents that make source-level 
 |---|---|
 | Product use and installation | `../README.md`, `../cli/README.md` |
 | Protocol and browser/CLI interface | `../CONTRACT.md` |
-| Routing reference / `tunlion man routing` source | `../cli/docs/filament-routing.md` |
+| Routing reference / `tunlion man routing` source | `../cli/docs/tunlion-routing.md` |
 | Architecture and platform rules | `architecture/`, `adr-*.md` |
 | Reliability evidence | `resilience.md`, `cli-resilience.md`, `testing/`, `test-topology-coverage.md` |
 | Configuration | `env-vars.md` |

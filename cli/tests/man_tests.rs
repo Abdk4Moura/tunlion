@@ -112,7 +112,7 @@ fn man_routing_shows_doc() {
 
     // Should contain routing documentation
     assert!(
-        stdout.contains("filament-routing") || stdout.contains("THE ROUTE"),
+        stdout.contains("tunlion-routing") || stdout.contains("THE ROUTE"),
         "Expected routing documentation, got: {}",
         &stdout[..stdout.len().min(500)]
     );

@@ -1,4 +1,4 @@
-# filament-routing(7) — how tunlion chooses a network path
+# tunlion-routing(7) — how tunlion chooses a network path
 
 > Source for the `tunlion man routing` entry / the routing man page. This
 > documents the TARGET model; ship each section as the matching feature lands
