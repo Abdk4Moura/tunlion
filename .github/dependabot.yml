@@ -1,0 +1,56 @@
+# Automated dependency PRs.
+#
+# WHY THIS EXISTS. Alerts were already on, but with no config Dependabot never
+# opened a pull request, so four advisories sat on the default branch unnoticed
+# until a push happened to print the banner: three MEDIUM on `rustls` (TLS 1.3
+# handshake messages accepted in the wrong state, in the TLS stack this product
+# actually ships) and one HIGH on `source-map-js`.
+#
+# Fixing them by hand also showed why the PRs are worth having: bumping rustls
+# to 0.23.45 broke resolution, because it raises its floor on `rustls-webpki`
+# past the 0.103.13 the lock held via rustls-platform-verifier <- reqwest.
+# Dependabot computes that transitive consequence for free; doing it by hand
+# meant a failed CI round first.
+#
+# Grouped on purpose: a security advisory usually implicates a small family of
+# crates that must move together, and one PR per crate guarantees a resolution
+# conflict in each.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/cli"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rustls-family:
+        patterns: ["rustls", "rustls-*", "webpki*", "quinn*", "ring"]
+      everything-else:
+        patterns: ["*"]
+        exclude-patterns: ["rustls", "rustls-*", "webpki*", "quinn*", "ring"]
+
+  - package-ecosystem: cargo
+    directory: "/crates/filament-transport"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: cargo
+    directory: "/crates/filament-signal"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+
+  # The workflows pin actions by tag; keep them current so a deprecated runner
+  # image does not become the reason a release cannot be cut.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
