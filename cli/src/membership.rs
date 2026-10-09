@@ -259,6 +259,9 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
         warm_hold: WarmHold::default(),
         worker_port_tx: HashMap::new(),
         roster_pushed: None,
+        stuck_retry: HashMap::new(),
+        ice_cache: crate::conn::SharedIceCache::default(),
+        roster_absent: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -489,6 +492,9 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             }
             Ev::GraceExpired(pid, g) => {
                 conn.on_stuck(&pid, g, "lost").await?;
+            }
+            Ev::RetryLink(pid, g) => {
+                conn.on_retry_due(&pid, g).await?;
             }
             Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
             Ev::PeerLeft(v) => {

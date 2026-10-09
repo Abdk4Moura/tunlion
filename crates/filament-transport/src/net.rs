@@ -330,6 +330,13 @@ pub enum Ev {
     TransferStalled(String, u64),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
+    /// The retry ladder's backoff for (peer sid, generation of the stuck
+    /// attempt) has elapsed. `on_stuck` used to SLEEP the backoff (1,2,4,8s)
+    /// inline, which froze the whole event loop: control requests waited up to
+    /// 4s and peer exec stalled. It now schedules this event from a timer task
+    /// and returns at once; the handler re-validates the generation, so a
+    /// retry for a link that was replaced or recovered meanwhile is ignored.
+    RetryLink(String, u32),
     /// P2 (GAP-2): the signaling socket reported a clean close/error (the
     /// socket.io `close`/`error` callbacks). A FAST-PATH hint that the link is
     /// gone, the long-lived acceptor's outer reconnect loop re-dials signaling

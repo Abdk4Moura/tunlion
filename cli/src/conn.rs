@@ -116,6 +116,52 @@ pub(crate) fn link_has_live_for(peer_live: bool, primary_ok: bool, workers_ok: b
     peer_live || primary_ok || workers_ok
 }
 
+/// Which existing link an establish may replace. Two values, not a bool, so a
+/// call site says what it means.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Replace {
+    /// Every caller but one: an existing live link satisfies the request and
+    /// is kept (the establish is refused and logged).
+    NeverLive,
+    /// The retry ladder rebuilding the stuck attempt it was scheduled for.
+    StuckAttempt,
+}
+
+/// `ice_config` reuses a config younger than this without asking again.
+const ICE_CONFIG_FRESH: Duration = Duration::from_secs(60);
+/// Ceiling on the config GET when the cache is not fresh.
+const ICE_CONFIG_BUDGET: Duration = Duration::from_secs(3);
+/// A failed GET falls back to a cached config younger than this.
+const ICE_CONFIG_STALE_OK: Duration = Duration::from_secs(20 * 60);
+/// Ceiling on building a WebRTC peer connection inside an establish.
+const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
+
+/// Backoff before retry `attempts` of the stuck-link ladder: 1, 2, 4, 8s,
+/// capped at 10s.
+pub(crate) fn stuck_backoff(attempts: u32) -> Duration {
+    std::cmp::min(
+        Duration::from_secs(2u64.pow(attempts.saturating_sub(1).min(16))),
+        Duration::from_secs(10),
+    )
+}
+
+/// Arm the retry-ladder timer: after `backoff`, post `Ev::RetryLink(pid,
+/// generation)` to the event loop. Returns immediately; the wait happens on
+/// a spawned task, never on the loop.
+pub(crate) fn schedule_retry(
+    tx: &mpsc::UnboundedSender<Ev>,
+    pid: &str,
+    generation: u32,
+    backoff: Duration,
+) {
+    let tx = tx.clone();
+    let pid = pid.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(backoff).await;
+        let _ = tx.send(Ev::RetryLink(pid, generation));
+    });
+}
+
 pub(crate) struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
     /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
@@ -151,9 +197,9 @@ pub(crate) struct Link {
     /// (`FILAMENT_DIRECT_STREAMS` > 1). Empty when striping is disabled
     /// or when the link uses a non-QUIC transport.
     pub(crate) workers: Vec<Arc<dyn Transport>>,
-    /// When this link was established (for the warm-hold pair-proof grace).
-    /// `warm_hold_tick` skips re-establish for a live link within this window,
-    /// preventing churn while pair-proof verification completes.
+    /// When this link was established. Reported when an establish is refused
+    /// over it (warm-hold no longer needs a pair-proof grace: it never asks to
+    /// replace a live link at all).
     pub(crate) established_at: Option<Instant>,
     /// Identity cert device_pub (set when identity-expose is verified).
     pub(crate) identity_device_pub: Option<[u8; 32]>,
@@ -347,6 +393,95 @@ fn warm_max() -> usize {
         .min(MAX_LINKS - 2)
 }
 
+/// The device petname a link belongs to: the one it proved as, else the one
+/// whose pair secret it carries. `None` for an unproven, secretless link.
+pub(crate) fn link_petname(l: &Link) -> Option<&str> {
+    l.verified_name
+        .as_deref()
+        .or(l.expected_secret.as_ref().map(|(n, _)| n.as_str()))
+}
+
+/// One link as warm-hold sees it.
+pub(crate) struct WarmLinkView<'a> {
+    pub(crate) pid: &'a str,
+    /// `link_petname`: the device it is bound to, when known.
+    pub(crate) petname: Option<&'a str>,
+    /// The name the link was born with (a display name for a WebRTC link,
+    /// the petname for a direct one).
+    pub(crate) name: &'a str,
+    /// `Conn::has_live_transport`: serving, or still making progress.
+    pub(crate) live: bool,
+}
+
+/// One roster entry (a sid we saw on signaling) as warm-hold sees it.
+pub(crate) struct WarmRosterView<'a> {
+    pub(crate) pid: &'a str,
+    /// The DISPLAY name the sid announced.
+    pub(crate) name: Option<&'a str>,
+    /// The pair channel it was met on, for a channel-introduced entry.
+    pub(crate) channel: Option<&'a str>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WarmDecision {
+    /// A live link to the device exists: leave it alone.
+    Skip { pid: String },
+    /// No live link: dial this present sid.
+    Establish { pid: String },
+    /// No live link and no present sid to dial.
+    Absent,
+}
+
+/// What warm-hold should do for `peer` this tick. Pure, so the rule is
+/// testable without a network.
+///
+/// `peer` is a warm-tier key. For a paired device (`channel` is its pair
+/// channel) the device is identified by that channel and by the petname
+/// links carry, never by the display name a sid announces: two devices may
+/// share a display name and one device changes sids. Only a key that is not a
+/// paired device falls back to matching display name or sid.
+///
+/// Skip if ANY link to the device is live, whatever its kind (direct,
+/// WebRTC, relay) or the name it was born with. Otherwise dial one of the
+/// sids actually present for it; `rotation` (the peer's consecutive failure
+/// count) walks through them when there are several, so one stale sid cannot
+/// absorb every attempt.
+pub(crate) fn warm_decide(
+    peer: &str,
+    channel: Option<&str>,
+    links: &[WarmLinkView<'_>],
+    roster: &[WarmRosterView<'_>],
+    rotation: usize,
+) -> WarmDecision {
+    let is_peer = |s: &str| s.eq_ignore_ascii_case(peer);
+    let mut sids: Vec<&str> = roster
+        .iter()
+        .filter(|r| match channel {
+            Some(ch) => r.channel == Some(ch),
+            None => r.name.is_some_and(is_peer) || is_peer(r.pid),
+        })
+        .map(|r| r.pid)
+        .collect();
+    sids.sort_unstable();
+    sids.dedup();
+    let belongs = |l: &WarmLinkView<'_>| {
+        l.petname.is_some_and(is_peer)
+            || sids.contains(&l.pid)
+            || (channel.is_none() && (is_peer(l.name) || is_peer(l.pid)))
+    };
+    if let Some(l) = links.iter().filter(|l| l.live && belongs(*l)).min_by_key(|l| l.pid) {
+        return WarmDecision::Skip {
+            pid: l.pid.to_string(),
+        };
+    }
+    if sids.is_empty() {
+        return WarmDecision::Absent;
+    }
+    WarmDecision::Establish {
+        pid: sids[rotation % sids.len()].to_string(),
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct WarmHold {
     /// Explicitly configured peers (from `warm-peers` setting)
@@ -469,6 +604,11 @@ impl WarmHold {
             }
         }
         peers
+    }
+
+    /// Consecutive failed attempts for this peer (0 when none recorded).
+    pub(crate) fn failures(&self, peer: &str) -> u32 {
+        self.backoff.get(peer).map(|b| b.failures).unwrap_or(0)
     }
 
     /// Check if a peer is dormant (too many failures)
@@ -955,6 +1095,38 @@ pub(crate) struct Conn {
     /// and the live links it reached, so a re-push fires only on a membership
     /// change (new epoch), a validity refresh (new valid_until), or a new link.
     pub(crate) roster_pushed: Option<(u64, u64, HashSet<String>)>,
+    /// Retry ladder: the stuck attempt per peer sid whose backoff timer is
+    /// running. `on_stuck` records it and returns; `Ev::RetryLink` resumes it.
+    pub(crate) stuck_retry: HashMap<String, StuckRetry>,
+    /// Last good ICE config and when it was fetched, so an establish does not
+    /// block the event loop on the config GET (see `ice_config`). Shared with
+    /// the off-loop refresh task.
+    pub(crate) ice_cache: SharedIceCache,
+    /// Roster sids absent from consecutive channel/room digests, for the
+    /// two-tick hysteresis in `prune_roster_absent`.
+    pub(crate) roster_absent: HashMap<String, u8>,
+}
+
+/// The cached ICE config (see `Conn::ice_config`).
+#[derive(Default)]
+pub(crate) struct IceCache {
+    pub(crate) cfg: Option<(Instant, net::ServerConfig)>,
+    refreshing: bool,
+}
+pub(crate) type SharedIceCache = Arc<std::sync::Mutex<IceCache>>;
+
+/// Poison-tolerant: a panicked refresh task must not wedge every establish.
+fn lock_ice(cache: &SharedIceCache) -> std::sync::MutexGuard<'_, IceCache> {
+    cache.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A stuck link whose retry is scheduled (see `Conn::on_stuck`).
+pub(crate) struct StuckRetry {
+    /// Generation of the stuck attempt. The retry fires only if the link still
+    /// carries it: a link replaced or recovered meanwhile makes it stale.
+    pub(crate) generation: u32,
+    /// Attempt number the retry will be (already counted against MAX_ATTEMPTS).
+    pub(crate) attempts: u32,
 }
 
 /// What principal a relay->direct upgrade's rebuilt Link should carry.
@@ -1052,6 +1224,9 @@ impl Conn {
             warm_hold: WarmHold::default(),
             worker_port_tx: HashMap::new(),
             roster_pushed: None,
+            stuck_retry: HashMap::new(),
+            ice_cache: SharedIceCache::default(),
+            roster_absent: HashMap::new(),
         }
     }
 
@@ -1361,6 +1536,24 @@ impl Conn {
             .unwrap_or(false)
     }
 
+    /// What link `pid` holds and how long it has been up, for log lines.
+    fn link_kind(&self, pid: &str) -> String {
+        let Some(l) = self.links.get(pid) else {
+            return "absent".to_string();
+        };
+        let kind = if l.direct {
+            "direct"
+        } else if l.peer.is_some() {
+            "WebRTC"
+        } else {
+            "transport"
+        };
+        match l.established_at {
+            Some(at) => format!("{kind}, up {}s", at.elapsed().as_secs()),
+            None => kind.to_string(),
+        }
+    }
+
     /// Re-emit `ChannelReady` for a link that ALREADY holds a live transport.
     ///
     /// The `--code` path DEFERS every offer until the PAKE confirms. The offer
@@ -1426,13 +1619,28 @@ impl Conn {
         // holds sids that are still live links.
         self.deferred_left.remove(pid);
         self.buffered_offers.remove(pid);
+        self.stuck_retry.remove(pid);
         if let Some(old) = self.links.remove(pid) {
-            // Never await close in the event loop (F8): mark + spawn. A direct
-            // link has no WebRTC peer; dropping the Link drops its QUIC transport
-            // (the keepalive task observes conn.closed() and tears down).
+            // Never await close in the event loop (F8): mark + spawn.
             if let Some(p) = old.peer.clone() {
                 p.mark_closed();
                 tokio::spawn(async move { p.close().await });
+            }
+            // CLOSE the direct transports explicitly. Dropping the Link only
+            // drops OUR Arc: the L3 overlay pump, the mesh accept loop and any
+            // warm stream hold their own clones, so the QUIC connection stayed
+            // up and the peer never learned the link was gone. It kept its own
+            // direct link for this pid and ignored our WebRTC offers (no
+            // `peer` on its link to apply them to), our ladder exhausted, and
+            // the cycle repeated forever: split-brain. Closing sends
+            // ApplicationClose, the peer sees ConnectionLost, drops its side and
+            // both ends re-converge. No-op for transports without a connection
+            // to close (DataChannel, local).
+            if let Some(t) = old.transport.as_ref() {
+                t.force_close();
+            }
+            for w in &old.workers {
+                w.force_close();
             }
         }
         if self.is_active(pid) {
@@ -1466,18 +1674,37 @@ impl Conn {
     /// Called periodically from the daemon event loop. Returns the list of
     /// peers we attempted to connect to.
     ///
-    /// `auto_warm`: sync the auto tier (ALL online paired peers) from the roster.
-    /// Default ON (`auto-warm` setting); forced on while L3 is up. When off, the
-    /// auto tier is cleared and only configured + recent peers stay warm.
+    /// `auto_warm`: sync the auto tier (ALL online paired devices). Default ON
+    /// (`auto-warm` setting); forced on while L3 is up. When off, the auto tier
+    /// is cleared and only configured + recent peers stay warm.
+    ///
+    /// KEYED BY DEVICE, not by display name. Every tier is a devices.json
+    /// PETNAME (the known-peer arrival, `note_warm_use` and `warm-peers` all
+    /// use it), and a device counts as connected when ANY link to it is live:
+    /// one that proved as it, one bound to its pair secret, or one to a sid
+    /// on its channel. This used to build the auto tier from roster DISPLAY
+    /// names and look for a link with that name, while a direct link is named
+    /// by petname. Whenever the two differ, which is the normal case (petname
+    /// `x`, display `user@x`), a healthy direct link was never recognised, a
+    /// fresh establish replaced it every tick, and the peer, still holding its
+    /// end, ignored the new offers: a ~95s re-dial cycle that never settled.
     pub(crate) async fn warm_hold_tick(&mut self, auto_warm: bool) -> Vec<String> {
         // Reload configured peers from settings to stay in sync
         self.load_warm_peers_config();
+        let devices = devices_load();
         if auto_warm {
-            let mut online: Vec<(String, Option<Instant>)> = self
-                .roster
-                .values()
-                .filter_map(|v| v["name"].as_str())
-                .map(|s| (s.to_string(), self.warm_hold.last_use.get(s).copied()))
+            let mut online: Vec<(String, Option<Instant>)> = devices
+                .iter()
+                .filter(|(name, secret)| {
+                    let channel = crate::channel_of(secret);
+                    self.roster
+                        .values()
+                        .any(|v| v["channel"].as_str() == Some(channel.as_str()))
+                        || self.links.values().any(|l| {
+                            link_petname(l).is_some_and(|p| p.eq_ignore_ascii_case(name))
+                        })
+                })
+                .map(|(n, _)| (n.clone(), self.warm_hold.last_use.get(n).copied()))
                 .collect();
             // Change 4 size guard: over warm-max, keep the most recently USED peers
             // warm (never-used peers rank last; name tie-break keeps it deterministic).
@@ -1505,69 +1732,152 @@ impl Conn {
         let mut connected = Vec::new();
         let peers = self.warm_hold.peers_to_connect();
         for peer in peers {
-            // Skip re-establish if a link to this pid exists AND is alive AND
-            // (verified OR within the pair-proof grace window).  Dead links and
-            // alive-but-unverified-past-grace (stuck) links still re-establish.
-            // The grace prevents churn during the normal pair-proof verification
-            // window while ensuring stuck links are eventually replaced.
-            const WARM_PAIR_PROOF_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-            let skip = self.links.iter().any(|(_, l)| {
-                // Match by name (peers_to_connect returns names, not IDs)
-                l.name.eq_ignore_ascii_case(&peer)
-                    // Link is alive: transport alive, OR WebRTC peer exists, OR direct link exists
-                    && (l.transport.as_ref().map(|t| t.is_alive()).unwrap_or(false)
-                        || l.peer.is_some()
-                        || l.direct)
-                    && (
-                        l.verified_name.is_some()                    // verified: warm-usable, skip
-                        || l.established_at                          // within grace: pair-proof expected
-                            .map(|t| t.elapsed() < WARM_PAIR_PROOF_GRACE)
-                            .unwrap_or(false)
-                    )
-            });
-            if skip {
-                ui::debug(&format!(
-                    "warm-hold: skip '{peer}' (link alive, within grace)"
-                ));
-                continue;
-            } else {
-                ui::debug(&format!(
-                    "warm-hold: will establish '{peer}' (no alive link found)"
-                ));
-            }
+            let device = devices
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&peer))
+                .cloned();
+            let channel = device.as_ref().map(|(_, s)| crate::channel_of(s));
+            let decision = {
+                let links: Vec<WarmLinkView<'_>> = self
+                    .links
+                    .iter()
+                    .map(|(pid, l)| WarmLinkView {
+                        pid: pid.as_str(),
+                        petname: link_petname(l),
+                        name: &l.name,
+                        live: self.has_live_transport(pid),
+                    })
+                    .collect();
+                let roster: Vec<WarmRosterView<'_>> = self
+                    .roster
+                    .iter()
+                    .map(|(pid, v)| WarmRosterView {
+                        pid: pid.as_str(),
+                        name: v["name"].as_str(),
+                        channel: v["channel"].as_str(),
+                    })
+                    .collect();
+                warm_decide(
+                    &peer,
+                    channel.as_deref(),
+                    &links,
+                    &roster,
+                    self.warm_hold.failures(&peer) as usize,
+                )
+            };
+            let pid = match decision {
+                WarmDecision::Skip { pid } => {
+                    ui::debug(&format!(
+                        "warm-hold: skip '{peer}' (link {pid} to it is live)"
+                    ));
+                    continue;
+                }
+                WarmDecision::Absent => {
+                    ui::trace(&format!("warm-hold: '{peer}' is not present, nothing to dial"));
+                    continue;
+                }
+                WarmDecision::Establish { pid } => pid,
+            };
+            ui::debug(&format!(
+                "warm-hold: will establish '{peer}' via {pid} (no live link to it)"
+            ));
             // Honor per-peer backoff; a dormant peer still gets one probe per
             // WARM_DORMANT_RETRY so an online-but-unlucky peer cannot stay cold forever.
             if !self.warm_hold.due(&peer) {
                 continue;
             }
-            // Find peer info from roster
-            if let Some(info) = self.roster.values().find(|v| {
-                v["name"]
-                    .as_str()
-                    .map(|n| n.eq_ignore_ascii_case(&peer))
-                    .unwrap_or(false)
-                    || v["id"]
-                        .as_str()
-                        .map(|id| id.eq_ignore_ascii_case(&peer))
-                        .unwrap_or(false)
-            }) {
-                let info = info.clone();
-                let _peer_id = info["id"].as_str().unwrap_or_default().to_string();
-                // Try to establish connection
-                match self.establish_as(info, None).await {
-                    Ok(()) => {
-                        self.warm_hold.note_success(&peer);
-                        ui::debug(&format!("warm-hold: established connection to '{peer}'"));
-                        connected.push(peer);
-                    }
-                    Err(e) => {
-                        self.warm_hold.note_failure(&peer);
-                        ui::debug(&format!("warm-hold: failed to connect to '{peer}': {e}"));
-                    }
+            let Some(info) = self.roster.get(&pid).cloned() else {
+                continue;
+            };
+            // A paired device is re-dialled the way its known-peer arrival dials
+            // it: direct first (establish below then yields to the pending
+            // attempt), and the link bound to its pair secret. A secretless link
+            // proves nothing and is exactly what the room digest reconcile reaps
+            // as a room peer that left.
+            if let Some((petname, secret)) = &device {
+                self.start_direct(&pid, petname, secret).await;
+            }
+            let result = self.establish_as(info, None).await;
+            if let (Some((petname, secret)), Some(l)) = (&device, self.links.get_mut(&pid)) {
+                if l.expected_secret.is_none() {
+                    l.expected_secret = Some((petname.clone(), secret.clone()));
+                }
+            }
+            match result {
+                Ok(()) => {
+                    self.warm_hold.note_success(&peer);
+                    ui::debug(&format!("warm-hold: established connection to '{peer}'"));
+                    connected.push(peer);
+                }
+                Err(e) => {
+                    self.warm_hold.note_failure(&peer);
+                    ui::debug(&format!("warm-hold: failed to connect to '{peer}': {e}"));
                 }
             }
         }
         connected
+    }
+
+    /// `known-peer-left`: a sid left one of the channels we watch. Forget it
+    /// from the roster, unless a live link still runs to it (the link carries
+    /// its own copy of the info, and worker role election reads the roster).
+    ///
+    /// Without this the roster only ever shrank on a ROOM peer-left, so every
+    /// past one-shot CLI and old daemon instance of a paired device stayed in
+    /// it forever under the same display name, and warm-hold dialled those
+    /// ghosts, each with its own retry ladder. Returns true if an entry went.
+    pub(crate) fn on_known_peer_left(&mut self, v: &Value) -> bool {
+        let Some(pid) = v["id"].as_str() else {
+            return false;
+        };
+        self.roster_absent.remove(pid);
+        if self.has_live_transport(pid) {
+            return false;
+        }
+        let removed = self.roster.remove(pid).is_some();
+        if removed {
+            ui::debug(&format!("roster: forgot {pid} (known-peer-left)"));
+        }
+        removed
+    }
+
+    /// Digest reconcile for the ROSTER (links have their own reapers): a sid
+    /// absent from two consecutive digests, with no live link, is forgotten.
+    /// A channel-introduced entry (it carries `channel`) is judged against the
+    /// channel digest, anything else against the room digest. The backstop for
+    /// a `known-peer-left` that never arrived. Returns the sids forgotten.
+    pub(crate) fn prune_roster_absent(
+        &mut self,
+        channel_present: &HashSet<String>,
+        room_present: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut gone = Vec::new();
+        let pids: Vec<String> = self.roster.keys().cloned().collect();
+        for pid in pids {
+            let via_channel = self.roster[&pid]["channel"].as_str().is_some();
+            let present = if via_channel {
+                channel_present.contains(&pid)
+            } else {
+                room_present.contains(&pid)
+            };
+            if present || self.has_live_transport(&pid) {
+                self.roster_absent.remove(&pid);
+                continue;
+            }
+            let count = self.roster_absent.entry(pid.clone()).or_insert(0);
+            *count += 1;
+            if *count >= 2 {
+                gone.push(pid);
+            }
+        }
+        for pid in &gone {
+            self.roster.remove(pid);
+            self.roster_absent.remove(pid);
+            ui::debug(&format!("roster: forgot {pid} (absent from two digests)"));
+        }
+        let roster = &self.roster;
+        self.roster_absent.retain(|pid, _| roster.contains_key(pid));
+        gone
     }
 
     /// Resume a dormant warm peer (e.g., when it reappears in signaling presence)
@@ -1587,7 +1897,84 @@ impl Conn {
         force_polite: Option<bool>,
     ) -> impl std::future::Future<Output = Result<()>> + '_ {
         let caller = std::panic::Location::caller();
-        async move { self.establish_as_inner(info, force_polite, caller).await }
+        async move {
+            self.establish_as_inner(info, force_polite, caller, Replace::NeverLive)
+                .await
+        }
+    }
+
+    /// The retry ladder's rebuild of a STUCK link (`on_retry_due`): the only
+    /// establish allowed to replace a link `has_live_transport` still counts as
+    /// live. A stuck WebRTC attempt is exactly that shape (its peer is still
+    /// New/Connecting, which #246 counts as progress), and replacing it is the
+    /// whole point of the ladder. `on_retry_due` has already checked that the
+    /// link is the stuck generation and not connected.
+    #[track_caller]
+    fn reestablish_stuck(
+        &mut self,
+        info: Value,
+    ) -> impl std::future::Future<Output = Result<()>> + '_ {
+        let caller = std::panic::Location::caller();
+        async move {
+            self.establish_as_inner(info, None, caller, Replace::StuckAttempt)
+                .await
+        }
+    }
+
+    /// ICE config for an establish without letting the config GET hold the
+    /// event loop. `fetch_config` retries 3x with a 10s timeout each, and it
+    /// was awaited inline on every establish, so one slow API answer could
+    /// freeze the daemon for ~30s.
+    ///
+    /// A config younger than ICE_CONFIG_FRESH is reused outright. One younger
+    /// than ICE_CONFIG_STALE_OK is reused while a background task refreshes it
+    /// OFF the loop. Only with nothing usable cached (the first establish, or
+    /// after a long idle) does an establish wait, and then for at most
+    /// ICE_CONFIG_BUDGET. TURN credentials are expiry-stamped (backend
+    /// FIL_TURN_TTL, 1h default), so every reused config is still valid (C5:
+    /// fresh credentials, just not a round trip per attempt).
+    async fn ice_config(&mut self) -> Result<net::ServerConfig> {
+        let cached = lock_ice(&self.ice_cache).cfg.clone();
+        if let Some((at, cfg)) = cached {
+            if at.elapsed() < ICE_CONFIG_FRESH {
+                return Ok(cfg);
+            }
+            if at.elapsed() < ICE_CONFIG_STALE_OK {
+                self.refresh_ice_config_off_loop();
+                return Ok(cfg);
+            }
+        }
+        match tokio::time::timeout(ICE_CONFIG_BUDGET, net::fetch_config(&self.server)).await {
+            Ok(Ok(cfg)) => {
+                lock_ice(&self.ice_cache).cfg = Some((Instant::now(), cfg.clone()));
+                Ok(cfg)
+            }
+            Ok(Err(e)) => Err(e.context("ICE config")),
+            Err(_) => Err(anyhow::anyhow!(
+                "ICE config: no answer within {ICE_CONFIG_BUDGET:?}"
+            )),
+        }
+    }
+
+    /// Refresh the cached ICE config on a spawned task (at most one in flight).
+    fn refresh_ice_config_off_loop(&self) {
+        {
+            let mut cache = lock_ice(&self.ice_cache);
+            if cache.refreshing {
+                return;
+            }
+            cache.refreshing = true;
+        }
+        let cache = self.ice_cache.clone();
+        let server = self.server.clone();
+        tokio::spawn(async move {
+            let got = net::fetch_config(&server).await;
+            let mut cache = lock_ice(&cache);
+            cache.refreshing = false;
+            if let Ok(cfg) = got {
+                cache.cfg = Some((Instant::now(), cfg));
+            }
+        });
     }
 
     async fn establish_as_inner(
@@ -1595,6 +1982,7 @@ impl Conn {
         info: Value,
         force_polite: Option<bool>,
         caller: &'static std::panic::Location<'static>,
+        replace: Replace,
     ) -> Result<()> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
         // rung-1: a direct-QUIC attempt owns this peer until its budget expires.
@@ -1612,6 +2000,20 @@ impl Conn {
         // removed by the normal drop path (on_pc_state/GraceExpired) FIRST, so when
         // no link is present here we DO proceed to (re)build the relay link.
         if self.resil.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
+            return Ok(());
+        }
+        // NEVER replace a live link. A healthy direct-QUIC link was being torn
+        // down here by warm-hold, which looked the device up under its display
+        // name, did not recognise the link (named by petname), and asked for a
+        // fresh one. The caller wanted a link to this peer; there is one, so the
+        // request is already satisfied. Only the stuck-attempt rebuild may
+        // replace a link that still counts as live (see `reestablish_stuck`).
+        if replace == Replace::NeverLive && self.has_live_transport(&peer_id) {
+            ui::debug(&format!(
+                "tunlion: ESTABLISH-REFUSED peer={peer_id} caller={caller}: \
+                 keeping its live link ({})",
+                self.link_kind(&peer_id)
+            ));
             return Ok(());
         }
         // Build the replacement BEFORE destroying what we have. The drop used to
@@ -1640,7 +2042,7 @@ impl Conn {
         let name = info["name"].as_str().unwrap_or("peer").to_string();
         // C5: fresh ICE config (TURN creds are expiry-stamped HMACs) for
         // every attempt, not just the first.
-        let mut cfg = net::fetch_config(&self.server).await?;
+        let mut cfg = self.ice_config().await?;
         self.chunk_size = cfg.chunk_size;
         let polite = match force_polite {
             Some(value) => value,
@@ -1682,19 +2084,46 @@ impl Conn {
         if relay_forbidden() {
             cfg.ice_servers.retain(|s| net::is_stun_only(s));
         }
-        let peer = Peer::connect(
-            peer_id.clone(),
-            self.my_uid.clone(),
-            polite,
-            cfg.ice_servers,
-            relay_ice,
-            self.sio.clone(),
-            self.tx.clone(),
-            generation,
+        // Bounded: building the peer connection is local work, but it is
+        // awaited on the event loop, so it gets a ceiling like the config GET.
+        let peer = match tokio::time::timeout(
+            PEER_BUILD_BUDGET,
+            Peer::connect(
+                peer_id.clone(),
+                self.my_uid.clone(),
+                polite,
+                cfg.ice_servers,
+                relay_ice,
+                self.sio.clone(),
+                self.tx.clone(),
+                generation,
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(built) => built?,
+            Err(_) => anyhow::bail!("building the peer connection took over {PEER_BUILD_BUDGET:?}"),
+        };
         // Everything fallible is done: NOW replace. Until this point the old link
         // was still serving, so an early return above leaves it untouched.
+        //
+        // Re-check liveness: the awaits above yielded, and a link that was
+        // merely Disconnected can come back to Connected meanwhile. Same rule
+        // as the guard at the top, applied at the moment of the drop.
+        if replace == Replace::NeverLive && self.has_live_transport(&peer_id) {
+            ui::debug(&format!(
+                "tunlion: ESTABLISH-REFUSED peer={peer_id} caller={caller}: \
+                 its link came back while building, keeping it ({})",
+                self.link_kind(&peer_id)
+            ));
+            peer.mark_closed();
+            tokio::spawn(async move { peer.close().await });
+            return Ok(());
+        }
+        debug_assert!(
+            replace == Replace::StuckAttempt || !self.has_live_transport(&peer_id),
+            "establish_as must never drop a link with a live transport (peer={peer_id}, caller={caller})"
+        );
         self.drop_link(&peer_id);
         self.links.insert(
             peer_id.clone(),
@@ -2655,6 +3084,16 @@ impl Conn {
         if l.generation != generation || l.peer.as_ref().map(|p| p.is_connected()).unwrap_or(true) {
             return Ok(false); // stale timer from a superseded attempt
         }
+        // Stuck and GraceExpired can both fire for one attempt; a retry already
+        // scheduled for it owns the ladder step, so a second one must not
+        // count another attempt or arm a second timer.
+        if self
+            .stuck_retry
+            .get(pid)
+            .is_some_and(|r| r.generation == generation)
+        {
+            return Ok(false);
+        }
         // Gate-18 Mode B: the transfer is COMPLETE (recv_done; recomputed per
         // tick by the recv loop, so this can only be true with by_sid empty and
         // !keep_open) and this link just went stuck/lost. Reconnecting would
@@ -2697,6 +3136,50 @@ impl Conn {
             attempts + 1,
             MAX_ATTEMPTS
         ));
+        // Exponential backoff between retries so the attempts are not burned
+        // instantly. SCHEDULED, never slept: this runs on the event loop, and
+        // sleeping here froze every control request, peer exec and signaling
+        // event for the whole ladder (measured: ctl latency up to 4008ms against
+        // 7-10ms normal, the loop frozen ~30% of the time with 2-3 ladders).
+        let backoff = stuck_backoff(attempts);
+        self.stuck_retry.insert(
+            pid.to_string(),
+            StuckRetry {
+                generation,
+                attempts,
+            },
+        );
+        schedule_retry(&self.tx, pid, generation, backoff);
+        Ok(false)
+    }
+
+    /// `Ev::RetryLink`: the backoff `on_stuck` scheduled has elapsed. Re-check
+    /// that the stuck attempt is still the link's CURRENT one (nothing
+    /// replaced, dropped or recovered it meanwhile), then rebuild it. Returns
+    /// what `on_stuck` returns: true when the ladder is exhausted and the
+    /// dropped link was the active transfer target.
+    ///
+    /// A rebuild failure is not propagated (it used to escape through `?` and
+    /// end the caller's loop): it counts as another stuck attempt instead, so
+    /// the ladder stays bounded by MAX_ATTEMPTS either way.
+    pub(crate) async fn on_retry_due(&mut self, pid: &str, generation: u32) -> Result<bool> {
+        let Some(pending) = self.stuck_retry.get(pid) else {
+            return Ok(false);
+        };
+        if pending.generation != generation {
+            return Ok(false); // a later on_stuck superseded this timer
+        }
+        let attempts = pending.attempts;
+        self.stuck_retry.remove(pid);
+        let Some(l) = self.links.get(pid) else {
+            return Ok(false); // dropped meanwhile (peer-left, reap): nothing to retry
+        };
+        if l.generation != generation {
+            return Ok(false); // replaced meanwhile (direct adopt, supersede)
+        }
+        if l.peer.as_ref().map(|p| p.is_connected()).unwrap_or(true) {
+            return Ok(false); // recovered on its own during the backoff
+        }
         let info = l.info.clone();
         let secret = l.expected_secret.clone();
         // C26: a link that was ever up is *re*connecting; one that never
@@ -2706,13 +3189,15 @@ impl Conn {
             _ => Presence::Reconnecting,
         };
         let was_active = self.is_active(pid);
-        // Add exponential backoff between retries to avoid burning through attempts instantly.
-        let backoff = std::cmp::min(
-            Duration::from_secs(2u64.pow(attempts - 1)),
-            Duration::from_secs(10),
-        );
-        tokio::time::sleep(backoff).await;
-        self.establish_as(info, None).await?;
+        if let Err(e) = self.reestablish_stuck(info).await {
+            ui::debug(&format!(
+                "connection retry for {pid} failed to build: {e}; counting it as an attempt"
+            ));
+            if let Some(l) = self.links.get_mut(pid) {
+                l.attempts = attempts;
+            }
+            return self.on_stuck(pid, generation, "retry failed").await;
+        }
         if let Some(nl) = self.links.get_mut(pid) {
             nl.attempts = attempts;
             nl.expected_secret = secret;
@@ -3903,5 +4388,459 @@ mod tests {
             "unrelated-paired-sid",
             Some("unrelated-install")
         ));
+    }
+}
+
+/// Warm-hold identity, live-link replacement, the non-blocking retry ladder
+/// and roster pruning: the defects behind the ~95s re-dial cycle and the
+/// frozen event loop. Everything here runs without a network; `Conn` is built
+/// on a loopback signaling client.
+#[cfg(test)]
+mod warm_identity_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A direct-QUIC-shaped transport whose liveness and close are observable.
+    struct FakeQuic {
+        alive: AtomicBool,
+        closes: AtomicUsize,
+    }
+    impl FakeQuic {
+        fn live() -> Arc<Self> {
+            Arc::new(FakeQuic {
+                alive: AtomicBool::new(true),
+                closes: AtomicUsize::new(0),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Transport for FakeQuic {
+        async fn send_control(&self, _msg: &Value) -> Result<()> {
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _offset: u64, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+        fn is_alive(&self) -> bool {
+            self.alive.load(Ordering::Relaxed)
+        }
+        fn is_dead(&self) -> bool {
+            !self.alive.load(Ordering::Relaxed)
+        }
+        fn force_close(&self) {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            self.alive.store(false, Ordering::Relaxed);
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The link `adopt_direct` builds on the dialer: named by PETNAME, while
+    /// the roster entry for the same sid carries the DISPLAY name.
+    fn direct_link(pid: &str, petname: &str, display: &str, t: Arc<dyn Transport>) -> Link {
+        Link {
+            peer: None,
+            info: json!({ "id": pid, "name": display }),
+            name: petname.to_string(),
+            uid: None,
+            transport: Some(t),
+            workers: vec![],
+            generation: 7,
+            attempts: 0,
+            trusted: true,
+            expected_secret: Some((petname.to_string(), "s3cret".to_string())),
+            verified_name: Some(petname.to_string()),
+            presence: Presence::Ready,
+            direct: true,
+            direct_route: "direct-quic",
+            established_at: Some(Instant::now()),
+            identity_device_pub: None,
+            identity_user_pub: None,
+            identity_binding: crate::capability::BindingStrength::None,
+            identity_cert_expires: None,
+            principal_kind: crate::capability::PrincipalKind::OwnerDevice,
+        }
+    }
+
+    /// A `Conn` on a loopback signaling client, with a fresh ICE config cached
+    /// so no establish ever reaches for the network. Keep the returned socket
+    /// alive for the duration of the test.
+    async fn test_conn() -> (Conn, tokio::net::TcpStream, mpsc::UnboundedReceiver<Ev>) {
+        let (sio, far) = filament_signal::Client::loopback()
+            .await
+            .expect("loopback client");
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Port 9 (discard) on loopback: a config GET that does escape the cache
+        // fails fast instead of hanging.
+        let conn = Conn::for_command(
+            "http://127.0.0.1:9",
+            sio,
+            tx,
+            "zz-me".to_string(),
+            false,
+            None,
+            false,
+            false,
+        );
+        lock_ice(&conn.ice_cache).cfg = Some((
+            Instant::now(),
+            net::ServerConfig {
+                ice_servers: vec![],
+                chunk_size: 16 * 1024,
+            },
+        ));
+        (conn, far, rx)
+    }
+
+    // --- the pure decision ------------------------------------------------
+
+    const CH: &str = "chan-of-x";
+
+    #[test]
+    fn display_name_roster_and_petname_direct_link_is_a_skip() {
+        // THE defect: roster says `user@x`, the live direct link is named `x`.
+        let roster = [WarmRosterView {
+            pid: "sid-1",
+            name: Some("user@x"),
+            channel: Some(CH),
+        }];
+        let links = [WarmLinkView {
+            pid: "sid-1",
+            petname: Some("x"),
+            name: "x",
+            live: true,
+        }];
+        assert_eq!(
+            warm_decide("x", Some(CH), &links, &roster, 0),
+            WarmDecision::Skip {
+                pid: "sid-1".into()
+            }
+        );
+        // The pre-fix key (the display name) must not establish either: it is
+        // not a paired-device key, but the sid is the live link's sid.
+        assert_eq!(
+            warm_decide("user@x", None, &links, &roster, 0),
+            WarmDecision::Skip {
+                pid: "sid-1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_link_to_the_device_under_any_sid_or_name_is_a_skip() {
+        // The device reconnected signaling (new sid) and an old daemon instance
+        // left a ghost entry; the live link still runs on the original sid,
+        // which is no longer in the roster at all. Petname identity carries it.
+        let roster = [
+            WarmRosterView {
+                pid: "sid-ghost",
+                name: Some("user@x"),
+                channel: Some(CH),
+            },
+            WarmRosterView {
+                pid: "sid-new",
+                name: Some("user@x"),
+                channel: Some(CH),
+            },
+        ];
+        let links = [WarmLinkView {
+            pid: "sid-old",
+            petname: Some("x"),
+            name: "x",
+            live: true,
+        }];
+        for rotation in 0..4 {
+            assert_eq!(
+                warm_decide("x", Some(CH), &links, &roster, rotation),
+                WarmDecision::Skip {
+                    pid: "sid-old".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn no_live_link_dials_only_present_sids_of_the_device_and_rotates() {
+        let roster = [
+            WarmRosterView {
+                pid: "sid-b",
+                name: Some("user@x"),
+                channel: Some(CH),
+            },
+            WarmRosterView {
+                pid: "sid-a",
+                name: Some("user@x"),
+                channel: Some(CH),
+            },
+            // Same display name, different device: never this device's sid.
+            WarmRosterView {
+                pid: "sid-stranger",
+                name: Some("user@x"),
+                channel: Some("someone-elses-channel"),
+            },
+        ];
+        // A dead link to the device does not count.
+        let links = [WarmLinkView {
+            pid: "sid-a",
+            petname: Some("x"),
+            name: "x",
+            live: false,
+        }];
+        let pick = |r| match warm_decide("x", Some(CH), &links, &roster, r) {
+            WarmDecision::Establish { pid } => pid,
+            other => panic!("expected an establish, got {other:?}"),
+        };
+        assert_eq!(pick(0), "sid-a");
+        assert_eq!(pick(1), "sid-b");
+        assert_eq!(pick(2), "sid-a");
+    }
+
+    #[test]
+    fn an_absent_device_is_not_dialled() {
+        let roster = [WarmRosterView {
+            pid: "sid-other",
+            name: Some("user@y"),
+            channel: Some("chan-of-y"),
+        }];
+        assert_eq!(
+            warm_decide("x", Some(CH), &[], &roster, 0),
+            WarmDecision::Absent
+        );
+    }
+
+    // --- the Conn paths ---------------------------------------------------
+
+    /// The required unit gate: warm_hold_tick with the roster entry `user@x`
+    /// and a live direct link named by petname `x` neither establishes nor
+    /// drops anything.
+    #[tokio::test]
+    async fn warm_hold_tick_keeps_a_live_direct_link_named_by_petname() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-warm-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        std::fs::write(
+            dir.join("devices.json"),
+            r#"[{"name":"x","secret":"s3cret"}]"#,
+        )
+        .unwrap();
+        let channel = crate::channel_of("s3cret");
+
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live();
+        conn.links
+            .insert("sid-1".into(), direct_link("sid-1", "x", "user@x", t.clone()));
+        conn.roster.insert(
+            "sid-1".into(),
+            json!({ "id": "sid-1", "name": "user@x", "uid": "uid-x", "channel": channel }),
+        );
+        // A ghost from an earlier instance of the same device.
+        conn.roster.insert(
+            "sid-ghost".into(),
+            json!({ "id": "sid-ghost", "name": "user@x", "uid": "uid-x", "channel": channel }),
+        );
+
+        for _ in 0..3 {
+            let dialled = conn.warm_hold_tick(true).await;
+            assert!(dialled.is_empty(), "warm-hold dialled {dialled:?} over a live link");
+        }
+        let l = conn.links.get("sid-1").expect("the live direct link must survive");
+        assert_eq!(l.generation, 7, "the live direct link was replaced");
+        assert!(l.direct);
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "the live transport was closed");
+        assert!(conn.direct_pending.is_empty(), "a re-dial was armed");
+        assert!(!conn.links.contains_key("sid-ghost"), "a ghost sid was dialled");
+        assert!(conn.warm_hold.auto.contains("x"), "the device is warm-held by petname");
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn establish_refuses_to_replace_a_live_link() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live();
+        conn.links
+            .insert("sid-1".into(), direct_link("sid-1", "x", "user@x", t.clone()));
+        conn.establish_as(json!({ "id": "sid-1", "name": "user@x", "uid": "uid-x" }), None)
+            .await
+            .expect("a refusal is not an error: the caller's link exists");
+        let l = conn.links.get("sid-1").expect("the live link must survive");
+        assert_eq!(l.generation, 7);
+        assert!(l.direct && l.peer.is_none(), "replaced by a WebRTC link");
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
+
+        // Once its transport is dead the same call does replace it, closing it.
+        t.alive.store(false, Ordering::Relaxed);
+        conn.establish_as(json!({ "id": "sid-1", "name": "user@x", "uid": "uid-x" }), Some(true))
+            .await
+            .expect("rebuild a dead link");
+        let l = conn.links.get("sid-1").expect("rebuilt");
+        assert!(!l.direct && l.peer.is_some());
+        assert_eq!(
+            l.expected_secret.as_ref().map(|(n, _)| n.as_str()),
+            Some("x"),
+            "the pair binding must carry over"
+        );
+        assert_eq!(t.closes.load(Ordering::Relaxed), 1, "the dropped transport was not closed");
+    }
+
+    #[tokio::test]
+    async fn drop_link_closes_the_direct_connection() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let t = FakeQuic::live();
+        let w = FakeQuic::live();
+        let mut l = direct_link("sid-1", "x", "user@x", t.clone());
+        l.workers = vec![w.clone()];
+        conn.links.insert("sid-1".into(), l);
+        conn.drop_link("sid-1");
+        assert!(!conn.links.contains_key("sid-1"));
+        assert_eq!(t.closes.load(Ordering::Relaxed), 1, "primary QUIC left open: split-brain");
+        assert_eq!(w.closes.load(Ordering::Relaxed), 1, "worker QUIC left open");
+    }
+
+    #[tokio::test]
+    async fn known_peer_left_drops_the_sid_from_the_roster() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert(
+            "sid-gone".into(),
+            json!({ "id": "sid-gone", "name": "user@x", "channel": CH }),
+        );
+        conn.roster.insert(
+            "sid-linked".into(),
+            json!({ "id": "sid-linked", "name": "user@x", "channel": CH }),
+        );
+        conn.links.insert(
+            "sid-linked".into(),
+            direct_link("sid-linked", "x", "user@x", FakeQuic::live()),
+        );
+        assert!(conn.on_known_peer_left(&json!({ "id": "sid-gone", "channel": CH })));
+        assert!(!conn.roster.contains_key("sid-gone"));
+        // A sid still carrying a live link keeps its entry (role election and
+        // adoption read it); the link reapers own that link's fate.
+        assert!(!conn.on_known_peer_left(&json!({ "id": "sid-linked", "channel": CH })));
+        assert!(conn.roster.contains_key("sid-linked"));
+    }
+
+    #[tokio::test]
+    async fn digest_absence_prunes_the_roster_after_two_digests() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        conn.roster.insert(
+            "sid-ch".into(),
+            json!({ "id": "sid-ch", "name": "user@x", "channel": CH }),
+        );
+        conn.roster
+            .insert("sid-room".into(), json!({ "id": "sid-room", "name": "guest" }));
+        conn.roster.insert(
+            "sid-here".into(),
+            json!({ "id": "sid-here", "name": "user@y", "channel": "c2" }),
+        );
+        let channel_present: HashSet<String> = ["sid-here".to_string()].into();
+        let room_present: HashSet<String> = HashSet::new();
+        assert!(conn.prune_roster_absent(&channel_present, &room_present).is_empty());
+        assert_eq!(conn.roster.len(), 3, "one absent digest is not enough (hysteresis)");
+        let mut gone = conn.prune_roster_absent(&channel_present, &room_present);
+        gone.sort();
+        assert_eq!(gone, vec!["sid-ch".to_string(), "sid-room".to_string()]);
+        assert!(conn.roster.contains_key("sid-here"));
+        assert!(conn.roster_absent.is_empty());
+    }
+
+    /// The event-loop gate: a mini loop that dispatches Stuck/RetryLink to
+    /// the REAL `on_stuck`/`on_retry_due` and answers a control request in
+    /// between, the way the daemon loop does. Stuck is re-injected for the
+    /// current attempt on every request. Before the fix `on_stuck` slept the
+    /// backoff (1,2,4,8s) inline and a request waited up to 4s behind it.
+    #[tokio::test]
+    async fn the_retry_ladder_never_blocks_a_control_request() {
+        let (mut conn, _far, mut rx) = test_conn().await;
+        let pid = "sid-stuck".to_string();
+        conn.establish_as(
+            json!({ "id": pid, "name": "user@x", "uid": "uid-x" }),
+            Some(true),
+        )
+        .await
+        .expect("build a WebRTC link that will never connect");
+        let first_gen = conn.links[&pid].generation;
+
+        type Probe = (Instant, oneshot::Sender<Duration>);
+        let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<Probe>();
+        let driver = tokio::spawn(async move {
+            let mut worst = Duration::ZERO;
+            // ~5s: long enough for the 1s and 2s backoffs to fire.
+            for _ in 0..100 {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                ctl_tx.send((Instant::now(), reply_tx)).unwrap();
+                worst = worst.max(reply_rx.await.unwrap());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            worst
+        });
+
+        let mut retries = 0;
+        let worst = loop {
+            tokio::select! {
+                Some(ev) = rx.recv() => match ev {
+                    Ev::Stuck(p, g) => {
+                        conn.on_stuck(&p, g, "stuck").await.unwrap();
+                    }
+                    Ev::RetryLink(p, g) => {
+                        retries += 1;
+                        conn.on_retry_due(&p, g).await.unwrap();
+                    }
+                    _ => {}
+                },
+                Some((sent, reply)) = ctl_rx.recv() => {
+                    let _ = reply.send(sent.elapsed());
+                    if let Some(l) = conn.links.get(&pid) {
+                        let _ = conn.tx.send(Ev::Stuck(pid.clone(), l.generation));
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            if driver.is_finished() {
+                break driver.await.unwrap();
+            }
+        };
+        assert!(
+            worst < Duration::from_millis(200),
+            "a control request waited {worst:?} behind the retry ladder"
+        );
+        assert!(retries >= 2, "the ladder did not run ({retries} retries)");
+        let l = conn.links.get(&pid).expect("the link is still being retried");
+        assert!(l.generation > first_gen, "no retry rebuilt the stuck link");
+        assert!(l.attempts >= 2, "attempts were not counted ({})", l.attempts);
+    }
+
+    #[tokio::test]
+    async fn a_stale_retry_is_ignored() {
+        let (mut conn, _far, _rx) = test_conn().await;
+        let pid = "sid-stuck";
+        conn.establish_as(
+            json!({ "id": pid, "name": "user@x", "uid": "uid-x" }),
+            Some(true),
+        )
+        .await
+        .unwrap();
+        let g = conn.links[pid].generation;
+        assert!(!conn.on_stuck(pid, g, "stuck").await.unwrap());
+        assert!(conn.stuck_retry.contains_key(pid));
+        // A second watchdog for the same attempt does not count again.
+        assert!(!conn.on_stuck(pid, g, "lost").await.unwrap());
+        assert_eq!(conn.stuck_retry[pid].attempts, 1);
+        // The link is replaced meanwhile: the retry must not touch it.
+        let t = FakeQuic::live();
+        conn.links
+            .insert(pid.into(), direct_link(pid, "x", "user@x", t.clone()));
+        assert!(!conn.on_retry_due(pid, g).await.unwrap());
+        assert!(conn.links[pid].direct, "a stale retry replaced the new link");
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0);
     }
 }
