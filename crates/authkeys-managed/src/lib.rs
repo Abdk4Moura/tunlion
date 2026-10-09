@@ -170,6 +170,97 @@ pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
     Ok(())
 }
 
+/// Markers for tunlion's OWN CA-trust line. Deliberately a different prefix from
+/// the per-device blocks (`# BEGIN filament-managed <device>`): blocks are keyed
+/// by device NAME, and a device could be named anything, so sharing that scheme
+/// would let a device called e.g. "tunlion-ssh-ca" overwrite the trust line on a
+/// shell grant, or delete it when revoked. With its own markers no device block
+/// can ever equal it, and the shell-key reconciler, which strips only
+/// `filament-managed <device>` blocks, never touches it.
+const CA_BEGIN: &str = "# BEGIN tunlion-ca-trust";
+const CA_END: &str = "# END tunlion-ca-trust";
+
+/// Validate that `line` is EXACTLY `cert-authority,principals="<user>" <pubkey>`
+/// with a plain username and a single, well-formed public key. Nothing else is
+/// accepted, so this can never become a generic "write any authorized_keys
+/// line" primitive for a future caller to misuse.
+pub fn validate_ca_trust_line(line: &str) -> Result<String> {
+    let line = line.trim();
+    if line.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("CA trust line contains a control character"));
+    }
+    let rest = line
+        .strip_prefix("cert-authority,principals=\"")
+        .ok_or_else(|| anyhow!("CA trust line must start with cert-authority,principals=\""))?;
+    let (user, key) = rest
+        .split_once("\" ")
+        .ok_or_else(|| anyhow!("CA trust line is missing the closing quote"))?;
+    if user.is_empty()
+        || user.len() > 64
+        || !user.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(anyhow!("CA trust principal is not a plain username"));
+    }
+    let key = validate_pubkey(key)?;
+    Ok(format!("cert-authority,principals=\"{user}\" {key}"))
+}
+
+/// Install (or replace) tunlion's CA-trust line. Idempotent: one block, replaced
+/// in place. Creates ~/.ssh (0700) and the file (0600) if absent.
+pub fn install_ca_trust_line(line: &str) -> Result<()> {
+    let line = validate_ca_trust_line(line)?;
+    let path = authorized_keys_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).context("create ~/.ssh")?;
+        chmod(dir, 0o700);
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let want = format!("{CA_BEGIN}\n{line}\n{CA_END}\n");
+    if existing.contains(&want) {
+        return Ok(()); // already exactly right; do not rewrite the file
+    }
+    let mut kept = strip_between(&existing, CA_BEGIN, CA_END);
+    if !kept.is_empty() && !kept.ends_with('\n') {
+        kept.push('\n');
+    }
+    kept.push_str(&want);
+    SecretFile::write_str(&path, &kept).context("write authorized_keys")?;
+    Ok(())
+}
+
+/// Remove tunlion's CA-trust block. No-op if absent.
+pub fn remove_ca_trust_line() -> Result<()> {
+    let path = authorized_keys_path();
+    let Ok(existing) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let kept = strip_between(&existing, CA_BEGIN, CA_END);
+    if kept != existing {
+        SecretFile::write_str(&path, &kept).context("write authorized_keys")?;
+    }
+    Ok(())
+}
+
+/// Lines between (and including) the exact `begin`/`end` marker lines removed;
+/// everything else preserved verbatim.
+fn strip_between(content: &str, begin: &str, end: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        if line.trim() == begin {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            if line.trim() == end {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Remove `device`'s marked block from authorized_keys (the "removable" half of
 /// the audit story; used by `tunlion revoke`). No-op if absent.
 pub fn remove_authorized_key(device: &str) -> Result<()> {
@@ -348,6 +439,52 @@ pub fn bootstrap_cache_clear(config_dir: &Path, device: &str) {
         obj.remove(device);
     }
     let _ = SecretFile::write_str(&path, &v.to_string());
+}
+
+#[cfg(test)]
+mod ca_trust_tests {
+    use super::*;
+
+    const CA: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH2u7c8bP1RkQ0n1i3f5l0x9c4m2rWq6v8T7a3YkZpQ1 tunlion-ca";
+
+    #[test]
+    fn the_exact_trust_line_is_accepted() {
+        let line = format!("cert-authority,principals=\"kabir\" {CA}");
+        assert_eq!(validate_ca_trust_line(&line).unwrap(), line);
+    }
+
+    #[test]
+    fn the_principal_cannot_break_out_of_its_quotes() {
+        // The principal sits inside a quoted option, so a quote in it would let
+        // the rest of the "username" become extra authorized_keys options.
+        for bad in [
+            format!("cert-authority,principals=\"root\",command=\"/bin/sh\" {CA}"),
+            format!("cert-authority,principals=\"a b\" {CA}"),
+            format!("cert-authority,principals=\"\" {CA}"),
+            format!("cert-authority,principals=\"root\nssh-ed25519 AAAA\" {CA}"),
+        ] {
+            assert!(validate_ca_trust_line(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_but_the_trust_shape_is_writable_through_it() {
+        // It must never become a generic "write any line" primitive.
+        assert!(validate_ca_trust_line(CA).is_err(), "a bare key is not a trust line");
+        assert!(validate_ca_trust_line(&format!("command=\"x\" {CA}")).is_err());
+        assert!(validate_ca_trust_line("cert-authority,principals=\"kabir\" not-a-key").is_err());
+    }
+
+    #[test]
+    fn the_trust_block_cannot_collide_with_a_device_block() {
+        // Its markers use a different prefix from every per-device block, so a
+        // device named anything at all can neither overwrite nor strip it.
+        let content = format!("{CA_BEGIN}\nx\n{CA_END}\n{BEGIN} tunlion-ca-trust\ny\n{END} tunlion-ca-trust\n");
+        let after_device_strip = strip_block(&content, "tunlion-ca-trust");
+        assert!(after_device_strip.contains(CA_BEGIN), "device strip must not touch the CA block");
+        let after_ca_strip = strip_between(&content, CA_BEGIN, CA_END);
+        assert!(has_block(&after_ca_strip, "tunlion-ca-trust"), "CA strip must not touch a device block");
+    }
 }
 
 #[cfg(test)]
