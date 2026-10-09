@@ -3362,7 +3362,7 @@ fn consent_enqueue_skips_unidentified() {
 fn consent_enqueue_dedup_same_peer_cap_pending() {
     // add_pending_request has no dedup itself; dedup lives in enqueue_if_requestable.
     // Test the dedup logic directly: check-before-insert on in-flight requests.
-    let mut reqs = vec![PendingRequest {
+    let reqs = vec![PendingRequest {
         id: 1,
         peer: "alice".into(),
         capability: "shell".into(),

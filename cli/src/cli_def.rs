@@ -996,12 +996,12 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
         assert!(names.len() >= 5, "parsed {names:?} from {help:?}");
-        let sample = |name: &str| -> Vec<&str> {
+        fn sample<'a>(name: &'a str) -> Vec<&'a str> {
             match name {
                 "sync" => vec!["sync", ".", "laptop:dir"],
                 other => vec![other],
             }
-        };
+        }
         for name in &names {
             let cli = parse(&sample(name))
                 .unwrap_or_else(|e| panic!("--json help names `{name}`, which does not parse: {e}"));
