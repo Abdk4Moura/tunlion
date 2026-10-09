@@ -920,7 +920,13 @@ pub(crate) async fn async_main() -> Result<()> {
                 // Same question, spoken-code transport. Resolving here (rather
                 // than inside the ceremony) means a script that omits the answer
                 // is refused before anything is minted.
+                // WHO can be said two ways, a name (`add laptop`) or a kind
+                // (`add --for device`). Either one is enough to skip straight to
+                // the code; a first-time-user test typed `--for device`, the
+                // form --help leads with, and still met both prompts.
+                let for_given = for_.is_some();
                 let (kind, named) = resolve_for_kind(&ui_caps, for_)?;
+                let who_given = named.is_some() || for_given;
                 // ASK "how", not only "who". The comment above names three
                 // orthogonal axes and the guided flow asked exactly one of them,
                 // so from the first screen the ONLY reachable delivery was a
@@ -959,7 +965,7 @@ pub(crate) async fn async_main() -> Result<()> {
                     // option is printed on the code screen (pair_cmd `quick`).
                     // Measured: this and the words entry were two Enter presses
                     // standing between the command and a code to read out.
-                    None if ui_caps.interactive && named.is_some() => Some("code".to_string()),
+                    None if ui_caps.interactive && who_given => Some("code".to_string()),
                     None if ui_caps.interactive => {
                         let who = if kind == "device" {
                             "that device"
@@ -1010,7 +1016,7 @@ pub(crate) async fn async_main() -> Result<()> {
                          `--for person` to pair without enrolling."
                     );
                 }
-                let quick = ui_caps.interactive && named.is_some() && via_defaulted;
+                let quick = ui_caps.interactive && who_given && via_defaulted;
                 pair_cmd(&server, code, name.or(named), word, relay, internal, allow, quick).await
             } else {
                 // No answer given and none required: an ordinary pair, which

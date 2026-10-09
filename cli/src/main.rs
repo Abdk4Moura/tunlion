@@ -1527,7 +1527,11 @@ fn invite_path_for(named: Option<&str>, kind: &str) -> std::path::PathBuf {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
-    std::path::PathBuf::from(format!("filament-invite-{safe}.txt"))
+    // The FILE NAME is prose, unlike the `filament-invite:` token prefix inside
+    // it, which is wire format and must not change. A first-time user reading
+    // `filament-invite-device.txt` from a tool called tunlion wondered whether
+    // they had the right tool.
+    std::path::PathBuf::from(format!("tunlion-invite-{safe}.txt"))
 }
 
 
