@@ -243,9 +243,11 @@ pub(crate) enum Cmd {
         /// borrowed box; a temporary key, not a member). A device name is
         /// accepted and means `device`.
         ///
-        /// With `--out` this is delivered as a bounded invitation file; without
-        /// it you get a pairing code. Either way the other side accepts with
-        /// `join`. The transport differs; the question does not.
+        /// With `--out` this is delivered as a bounded invitation file. Without
+        /// it, at a terminal you get a pairing code to read out; from a script
+        /// there is nobody to read it to, so it is written to a file instead.
+        /// Either way the other side accepts with `join`. The transport
+        /// differs; the question does not.
         ///
         /// Omit the value on a terminal to be asked. Omit the flag entirely for
         /// an ordinary pair, which confers no membership.

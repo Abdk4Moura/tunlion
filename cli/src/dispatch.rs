@@ -920,7 +920,13 @@ pub(crate) async fn async_main() -> Result<()> {
                 // Same question, spoken-code transport. Resolving here (rather
                 // than inside the ceremony) means a script that omits the answer
                 // is refused before anything is minted.
+                // WHO can be said two ways, a name (`add laptop`) or a kind
+                // (`add --for device`). Either one is enough to skip straight to
+                // the code; a first-time-user test typed `--for device`, the
+                // form --help leads with, and still met both prompts.
+                let for_given = for_.is_some();
                 let (kind, named) = resolve_for_kind(&ui_caps, for_)?;
+                let who_given = named.is_some() || for_given;
                 // ASK "how", not only "who". The comment above names three
                 // orthogonal axes and the guided flow asked exactly one of them,
                 // so from the first screen the ONLY reachable delivery was a
@@ -940,6 +946,10 @@ pub(crate) async fn async_main() -> Result<()> {
                 // happened to be present, and the guided flow never asked at
                 // all, so the file path was reachable only by knowing to type a
                 // flag nobody was told about.
+                // Nothing about HOW was said: no --via, no --out, no --word. Only then
+                // is skipping the questions safe, because only then were they going
+                // to be asked. Captured before `via` is shadowed below.
+                let via_defaulted = via.is_none() && out.is_none() && word.is_none();
                 let via = match via.as_deref() {
                     Some("code") => Some("code".to_string()),
                     Some("file") => Some("file".to_string()),
@@ -949,6 +959,13 @@ pub(crate) async fn async_main() -> Result<()> {
                     // An unattended runner is never present to hear a code read
                     // out, so the question does not arise: it is always a file.
                     None if kind == "runner" => Some("file".to_string()),
+                    // `add <name>` on a terminal: they are almost always both
+                    // present, the code is the fast path, and the question only
+                    // confirmed its default. Straight to the code; the file
+                    // option is printed on the code screen (pair_cmd `quick`).
+                    // Measured: this and the words entry were two Enter presses
+                    // standing between the command and a code to read out.
+                    None if ui_caps.interactive && who_given => Some("code".to_string()),
                     None if ui_caps.interactive => {
                         let who = if kind == "device" {
                             "that device"
@@ -999,12 +1016,13 @@ pub(crate) async fn async_main() -> Result<()> {
                          `--for person` to pair without enrolling."
                     );
                 }
-                pair_cmd(&server, code, name.or(named), word, relay, internal, allow).await
+                let quick = ui_caps.interactive && who_given && via_defaulted;
+                pair_cmd(&server, code, name.or(named), word, relay, internal, allow, quick).await
             } else {
                 // No answer given and none required: an ordinary pair, which
                 // confers no membership. This is the safe default and the
                 // pre-existing behaviour.
-                pair_cmd(&server, code, name, word, relay, false, allow).await
+                pair_cmd(&server, code, name, word, relay, false, allow, false).await
             }
         }
         Cmd::Join {
@@ -1040,7 +1058,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 // Same ceremony `add <code>` runs: accepting a code confers no
                 // membership by itself, the offering side decides that.
-                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new()).await
+                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), false).await
             } else {
                 join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
             }

@@ -1674,6 +1674,12 @@ pub(crate) async fn recv_cmd(
                                 l2_enabled, &mut sess, &sio, &my_uid,
                             ).await;
                             req.reply(&json!({ "ok": true, "live": live })).await;
+                        } else if matches!(&req.kind, ctl::ReqKind::Wake) {
+                            // Nothing to do here: receiving this event IS the point.
+                            // The loop now runs its top-level arm gate this same
+                            // iteration, so a just-minted invitation's enrollment
+                            // channel is subscribed before the joiner can arrive.
+                            req.reply(&json!({ "ok": true })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ReloadExpose) {
                             // `tunlion expose`/`unexpose`: reconcile overlay
                             // listeners from expose.json. live:true only if L3 is up.

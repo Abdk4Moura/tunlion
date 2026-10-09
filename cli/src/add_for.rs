@@ -179,7 +179,7 @@ pub(crate) async fn add_for_cmd(
         // piece, with a filename derived from what they actually typed so the
         // suggestion is copy-pasteable rather than a template.
         // Defensive: both call sites now supply a path (a bare `add laptop`
-        // defaults to filament-invite-laptop.txt and says so), so this cannot
+        // defaults to tunlion-invite-laptop.txt and says so), so this cannot
         // fire today. Kept because add_for_cmd is a function and a future caller
         // could pass None, and written as lines because the continued literal it
         // replaced dragged its source indentation into the output.
@@ -251,6 +251,11 @@ pub(crate) async fn add_for_cmd(
     // mint cannot guarantee is that a RECEIVER is actually running to pick the
     // key up - check that, and offer to start one.
     crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
+    // Make the daemon subscribe the enrollment channel NOW rather than on its next
+    // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
+    // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs
+    // ~0.2 s once subscribed. No daemon, or no control socket (#205): harmless.
+    let _ = crate::ctl::try_wake().await;
     // #207: a minted code that nothing can claim is not an invitation, it is a
     // lie with a QR on it. The receiver is what claims; if none is running,
     // say so before printing and offer to start one.
@@ -355,6 +360,15 @@ pub(crate) async fn add_for_cmd(
         ui::say(&ui::paint(
             ui::Tone::Warn,
             "  Anyone who reads that file can join until it is used or expires.",
+        ));
+        // The step a first-time user could not find: they had a file and two
+        // machines that share nothing. `join` takes the path positionally.
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        ui::say(&format!(
+            "  next: copy it to the other device, then run there:  tunlion join {file_name}"
         ));
     }
     // Non-interactive (--out or a pipe): no offer was printed above. Warn that a
