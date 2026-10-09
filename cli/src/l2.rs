@@ -4557,6 +4557,18 @@ async fn run_ssh(
     }
     let code = spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)?;
     sigwatch.abort();
+    if code == 255 {
+        // 255 is ssh's own failure (connect or auth), never the remote command's.
+        // Without password fallback the commonest cause is now a crisp
+        // "Permission denied (publickey)", so say what it means and what to do.
+        crate::ui::say(&format!(
+            "tunlion: ssh to '{peer}' was refused before a session started. If ssh said \
+             \"Permission denied (publickey)\", that device's sshd does not trust \
+             tunlion's certificates for this user yet: restart `tunlion up` there \
+             (it installs the trust for its own user, no root needed), or drop \
+             --ssh to use the built-in shell, which needs no sshd at all."
+        ));
+    }
     Ok(code)
 }
 
@@ -4579,6 +4591,18 @@ fn spawn_ssh_direct(
         .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
+        // NEVER A PASSWORD. Auth is the certificate this daemon just signed, so
+        // there is no legitimate password path; when the cert is not accepted,
+        // ssh's default is to fall through to a password prompt, which is how
+        // a missing CA trust on the device used to look -- a baffling prompt
+        // nobody could answer. With these, the same failure is an immediate,
+        // explainable "Permission denied (publickey)".
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o")
@@ -4637,6 +4661,18 @@ fn spawn_ssh(
         .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
+        // NEVER A PASSWORD. Auth is the certificate this daemon just signed, so
+        // there is no legitimate password path; when the cert is not accepted,
+        // ssh's default is to fall through to a password prompt, which is how
+        // a missing CA trust on the device used to look -- a baffling prompt
+        // nobody could answer. With these, the same failure is an immediate,
+        // explainable "Permission denied (publickey)".
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o")
