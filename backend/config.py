@@ -16,8 +16,64 @@ def _bool(name: str, default: bool = False) -> bool:
 # this Flask app) or "firebase" (serverless, talks straight to Firestore).
 SIGNALING = os.environ.get("FIL_SIGNALING", "socketio").lower()
 
+# Explicit development mode. The ONLY thing it unlocks today is the built-in
+# FIL_SECRET fallback below; production must never run with that value.
+DEV = _bool("FIL_DEV", False)
+
 # Secret used to derive a stable, non-reversible default room name per network.
-SECRET = os.environ.get("FIL_SECRET", "filament-dev-secret")
+# There is deliberately no silent default: a server that falls back to a
+# public, committed secret makes every network's auto room predictable to
+# anyone who reads this file. `ensure_secret()` resolves it at startup.
+DEV_SECRET = "filament-dev-secret"
+SECRET = os.environ.get("FIL_SECRET") or ""
+
+
+def ensure_secret(dev_entrypoint: bool = False) -> str:
+    """Resolve SECRET or refuse to start.
+
+    Unset FIL_SECRET is allowed only in development: FIL_DEV=1, or the direct
+    `python app.py` Werkzeug dev server (``dev_entrypoint``), which is what
+    the local gate fixtures launch and which production never runs (it runs
+    gunicorn, see deploy/api.Dockerfile). Anything else fails startup.
+    """
+    global SECRET
+    if SECRET:
+        return SECRET
+    if DEV or dev_entrypoint:
+        import sys
+
+        sys.stderr.write("tunlion backend: FIL_SECRET unset, using the DEV secret (development only)\n")
+        SECRET = DEV_SECRET
+        return SECRET
+    raise RuntimeError(
+        "FIL_SECRET is not set. Set it to a long random string (see deploy/.env.example); "
+        "FIL_DEV=1 enables the development default."
+    )
+
+
+def _trusted_proxies(raw):
+    """FIL_TRUSTED_PROXIES: comma-separated IPs/CIDRs of the reverse proxies in
+    front of this server (e.g. the cloudflared container's network), or "*"
+    when the server is reachable ONLY through a proxy. Proxy headers such as
+    CF-Connecting-IP are honoured only from these peers. Unset = trust none."""
+    import ipaddress
+
+    raw = (raw or "").strip()
+    if raw == "*":
+        return "*"
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            pass
+    return nets
+
+
+TRUSTED_PROXIES = _trusted_proxies(os.environ.get("FIL_TRUSTED_PROXIES"))
 
 PORT = int(os.environ.get("PORT", 5000))
 

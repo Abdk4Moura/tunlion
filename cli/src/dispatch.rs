@@ -129,6 +129,7 @@ pub(crate) async fn async_main() -> Result<()> {
         Ok(_) => {}
         Err(e) => eprintln!("tunlion: sensitive config permission repair failed: {e}"),
     }
+    platform::tighten_config_dir(&platform::Paths::config_dir());
     // Bare-arg comfort dispatch: `tunlion <path>` sends it with a code;
     // `tunlion <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
@@ -1448,6 +1449,7 @@ pub(crate) async fn async_main() -> Result<()> {
             port,
             bind,
             http_port,
+            allow_remote,
         } => {
             let (peer, rport) = match target.split_once(':') {
                 Some((p, r)) => (
@@ -1465,7 +1467,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 require_known_device(&peer)?;
                 l2::netcat_cmd(&server, &peer, rport, relay).await
             } else if socks {
-                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+                l2::proxy_cmd(&server, &bind, port, http_port, relay, allow_remote).await
             } else {
                 require_known_device(&peer)?;
                 let lport = lport.unwrap_or(rport);

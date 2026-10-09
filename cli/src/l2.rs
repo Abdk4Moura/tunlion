@@ -3697,6 +3697,83 @@ pub async fn forward_cmd(
     }
 }
 
+/// File (in the config dir, owner-only) holding the local proxy's password.
+pub(crate) fn proxy_token_path() -> std::path::PathBuf {
+    crate::platform::Paths::config_path("proxy.token")
+}
+
+/// The local proxy's password: a random 256-bit token, created on first use
+/// and stored owner-only (0600 / owner ACL) so only this user can read it.
+/// The proxy opens mesh streams AS THE OWNER, so a listener on 127.0.0.1 with
+/// no auth handed that authority to every local account on the machine.
+pub(crate) fn proxy_token() -> Result<String> {
+    let path = proxy_token_path();
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim();
+        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(t.to_string());
+        }
+    }
+    let mut buf = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buf)
+        .map_err(|_| anyhow!("no system randomness for the proxy token"))?;
+    let token = hex::encode(buf);
+    if let Some(dir) = path.parent() {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            crate::platform::tighten_new_dir(dir);
+        }
+    }
+    crate::platform::SecretFile::write_str(&path, &token)?;
+    // Two proxies starting at once could both mint; whichever landed on disk
+    // is the one a user will `cat`, so serve that.
+    Ok(std::fs::read_to_string(&path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| t.len() == 64)
+        .unwrap_or(token))
+}
+
+/// Username the proxy prints. Only the password is checked; the name is there
+/// because SOCKS5 user/pass and HTTP Basic both carry one.
+pub(crate) const PROXY_USER: &str = "tunlion";
+
+/// Length-checked, constant-time comparison of a presented password.
+fn proxy_password_ok(presented: &[u8], token: &str) -> bool {
+    let want = token.as_bytes();
+    if presented.len() != want.len() {
+        return false;
+    }
+    presented.iter().zip(want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// How to use the proxy, with the password read from its file at use time
+/// (never printed: `up` output lands in log files).
+pub(crate) fn proxy_usage_lines(bind: &str, port: u16) -> Vec<String> {
+    let tok = proxy_token_path();
+    vec![
+        format!(
+            "  auth: username/password required (user `{PROXY_USER}`, password in {}, owner-only)",
+            tok.display()
+        ),
+        format!(
+            "  e.g.  curl -x \"socks5h://{PROXY_USER}:$(cat '{}')@{bind}:{port}\" http://<peer>.mesh:8080/",
+            tok.display()
+        ),
+    ]
+}
+
+/// True for an address that only this machine can reach.
+fn bind_is_loopback(bind: &str) -> bool {
+    bind.eq_ignore_ascii_case("localhost")
+        || bind
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// `tunlion proxy`: a local SOCKS5 proxy that reaches mesh peers by name with NO
 /// TUN and NO privilege (Tailscale's userspace-networking model). A SOCKS5 CONNECT
 /// to `<peer>.mesh:<port>` opens an L2 stream to that peer's `localhost:<port>` over
@@ -3712,7 +3789,26 @@ pub async fn proxy_cmd(
     port: u16,
     http_port: u16,
     relay: bool,
+    allow_remote: bool,
 ) -> Result<()> {
+    // A non-loopback bind exposes "open a stream as the owner" (and a plain
+    // open relay to anywhere) to the network, guarded only by the token. Make
+    // that a deliberate choice, and say so loudly when it is made.
+    if !bind_is_loopback(bind) {
+        if !allow_remote {
+            bail!(
+                "tunlion: refusing to bind the proxy to {bind}: anyone who can reach it and learns the token can open mesh streams as you and relay traffic through this machine. Use the default 127.0.0.1, or pass --allow-remote if you really mean it."
+            );
+        }
+        crate::ui::critical(&crate::ui::paint(
+            crate::ui::Tone::Warn,
+            &format!(
+                "WARNING: proxy bound to {bind} (--allow-remote): reachable from the network; the token in {} is the only thing between it and your mesh",
+                proxy_token_path().display()
+            ),
+        ));
+    }
+    let token: Arc<str> = proxy_token()?.into();
     let listener = match TcpListener::bind((bind, port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -3731,9 +3827,9 @@ pub async fn proxy_cmd(
         "  point apps here; {}.mesh rides the mesh, everything else connects directly",
         "<peer>"
     ));
-    crate::ui::say(&format!(
-        "  e.g.  curl --socks5-hostname {bind}:{port} http://<peer>.mesh:8080/"
-    ));
+    for line in proxy_usage_lines(bind, port) {
+        crate::ui::say(&line);
+    }
     #[cfg(unix)]
     if !crate::ctl::daemon_present().await {
         crate::ui::say(&crate::ui::paint(
@@ -3763,13 +3859,15 @@ pub async fn proxy_cmd(
             "tunlion: HTTP CONNECT proxy on {bind}:{http_port}"
         ));
         crate::ui::say(&format!(
-            "  PAC file: http://127.0.0.1:{http_port}/proxy.pac"
+            "  PAC file: http://127.0.0.1:{http_port}/proxy.pac (browsers ask for the same user/password)"
         ));
         crate::ui::say(&format!(
-            "  e.g.  curl -x http://127.0.0.1:{http_port} https://<peer>.mesh"
+            "  e.g.  curl -x \"http://{PROXY_USER}:$(cat '{}')@127.0.0.1:{http_port}\" https://<peer>.mesh",
+            proxy_token_path().display()
         ));
         let cold_http = cold.clone();
         let server_http = server.to_string();
+        let token_http = token.clone();
         tokio::spawn(async move {
             loop {
                 let sock = match http_listener.accept().await {
@@ -3783,9 +3881,9 @@ pub async fn proxy_cmd(
                     }
                 };
                 let _ = sock.set_nodelay(true);
-                let (server, cold) = (server_http.clone(), cold_http.clone());
+                let (server, cold, token) = (server_http.clone(), cold_http.clone(), token_http.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle_http(sock, &server, port, relay, cold).await {
+                    if let Err(e) = handle_http(sock, &server, port, http_port, relay, cold, &token).await {
                         crate::ui::debug(&format!("tunlion: HTTP proxy connection ended: {e}"));
                     }
                 });
@@ -3802,9 +3900,9 @@ pub async fn proxy_cmd(
             }
         };
         let _ = sock.set_nodelay(true);
-        let (server, cold) = (server.to_string(), cold.clone());
+        let (server, cold, token) = (server.to_string(), cold.clone(), token.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_socks(sock, &server, relay, cold).await {
+            if let Err(e) = handle_socks(sock, &server, relay, cold, &token).await {
                 crate::ui::debug(&format!("tunlion: proxy connection ended: {e}"));
             }
         });
@@ -3817,16 +3915,11 @@ async fn socks_reply(sock: &mut TcpStream, code: u8) -> std::io::Result<()> {
         .await
 }
 
-/// Handle one SOCKS5 client: no-auth handshake, parse the CONNECT target, then
-/// route `<peer>.mesh:<port>` over tunlion (warm-first, cold fallback) or dial any
-/// other host directly. Errors here only affect this one connection.
-async fn handle_socks(
-    mut sock: TcpStream,
-    server: &str,
-    relay: bool,
-    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
-) -> Result<()> {
-    // Greeting: VER, NMETHODS, METHODS...; we only offer no-auth (0x00).
+/// SOCKS5 greeting + RFC 1929 username/password sub-negotiation. Only method
+/// 0x02 is accepted: a client offering no-auth alone gets 0xFF (no acceptable
+/// method) and is closed. Returns Ok(()) only for the right password.
+async fn socks_authenticate<S: AsyncRead + AsyncWrite + Unpin>(sock: &mut S, token: &str) -> Result<()> {
+    // Greeting: VER, NMETHODS, METHODS...
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await?;
     if greet[0] != 0x05 {
@@ -3834,7 +3927,43 @@ async fn handle_socks(
     }
     let mut methods = vec![0u8; greet[1] as usize];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[0x05, 0x00]).await?;
+    if !methods.contains(&0x02) {
+        sock.write_all(&[0x05, 0xFF]).await?;
+        bail!("SOCKS5 client offered no username/password auth; the tunlion proxy requires it");
+    }
+    sock.write_all(&[0x05, 0x02]).await?;
+    // RFC 1929: VER(1)=0x01, ULEN, UNAME, PLEN, PASSWD.
+    let mut hdr = [0u8; 2];
+    sock.read_exact(&mut hdr).await?;
+    if hdr[0] != 0x01 {
+        bail!("bad SOCKS5 auth version");
+    }
+    let mut user = vec![0u8; hdr[1] as usize];
+    sock.read_exact(&mut user).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut pass).await?;
+    if !proxy_password_ok(&pass, token) {
+        sock.write_all(&[0x01, 0x01]).await?;
+        bail!("SOCKS5 auth failed");
+    }
+    sock.write_all(&[0x01, 0x00]).await?;
+    Ok(())
+}
+
+/// Handle one SOCKS5 client: username/password handshake, parse the CONNECT
+/// target, then route `<peer>.mesh:<port>` over tunlion (warm-first, cold
+/// fallback) or dial any other host directly. Errors here only affect this one
+/// connection.
+async fn handle_socks(
+    mut sock: TcpStream,
+    server: &str,
+    relay: bool,
+    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+    token: &str,
+) -> Result<()> {
+    socks_authenticate(&mut sock, token).await?;
 
     // Request: VER, CMD, RSV, ATYP, ADDR, PORT.
     let mut req = [0u8; 4];
@@ -3938,8 +4067,10 @@ async fn handle_http(
     mut sock: TcpStream,
     server: &str,
     socks_port: u16,
+    http_port: u16,
     relay: bool,
     cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+    token: &str,
 ) -> Result<()> {
     // Read the HTTP request line + headers until empty line.
     let mut buf = Vec::new();
@@ -3964,6 +4095,20 @@ async fn handle_http(
     let path = parts.next().unwrap_or("");
 
     if method.eq_ignore_ascii_case("CONNECT") {
+        // Same authority as the SOCKS side, so the same password: HTTP Basic
+        // in Proxy-Authorization. A browser answers the 407 with a prompt.
+        if !http_proxy_auth_ok(&request, token) {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Basic realm=\"tunlion\"\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .await;
+            return Ok(());
+        }
         // HTTP CONNECT proxy: CONNECT host:port HTTP/1.1
         let host_port = path;
         let (host, dport) = if let Some(colon) = host_port.rfind(':') {
@@ -4031,11 +4176,13 @@ async fn handle_http(
             }
         }
     } else if path == "/proxy.pac" || path == "/wpad.dat" {
-        // Serve PAC file for browser/OS proxy config.
+        // Serve PAC file for browser/OS proxy config. The PAC itself holds no
+        // secret. Browsers cannot authenticate to SOCKS5, so the HTTP CONNECT
+        // proxy (which they can, via the Basic prompt) comes first.
         let pac = format!(
             r#"function FindProxyForURL(url, host) {{
     if (dnsDomainIs(host, ".mesh") || shExpMatch(host, "*.mesh")) {{
-        return "SOCKS5 127.0.0.1:{socks_port}; DIRECT";
+        return "PROXY 127.0.0.1:{http_port}; SOCKS5 127.0.0.1:{socks_port}; DIRECT";
     }}
     return "DIRECT";
 }}
@@ -4062,6 +4209,32 @@ async fn handle_http(
         let _ = sock.write_all(response.as_bytes()).await;
         Ok(())
     }
+}
+
+/// Whether the raw request head carries `Proxy-Authorization: Basic` with the
+/// proxy password (any username).
+fn http_proxy_auth_ok(request: &str, token: &str) -> bool {
+    use base64::Engine;
+    for line in request.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        let mut parts = value.trim().splitn(2, ' ');
+        let (Some(scheme), Some(cred)) = (parts.next(), parts.next()) else { continue };
+        if !scheme.eq_ignore_ascii_case("basic") {
+            continue;
+        }
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(cred.trim()) else { continue };
+        let pass = match raw.iter().position(|&b| b == b':') {
+            Some(i) => &raw[i + 1..],
+            None => continue,
+        };
+        if proxy_password_ok(pass, token) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Serve one accepted forward connection over the managed cold link, tolerant of
@@ -4934,6 +5107,78 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
         Ok(Ok(_)) => Some(true),   // a listener answered (sshd banner)
         Ok(Err(_)) => Some(false), // stream error: treat as unreachable
         Err(_) => None,            // no banner in time: inconclusive, don't block
+    }
+}
+
+#[cfg(test)]
+mod proxy_auth_tests {
+    use super::*;
+
+    const TOKEN: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    async fn run_handshake(client_bytes: Vec<u8>) -> (Result<()>, Vec<u8>) {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(&client_bytes).await.unwrap();
+        let res = socks_authenticate(&mut server, TOKEN).await;
+        drop(server);
+        let mut out = Vec::new();
+        let _ = client.read_to_end(&mut out).await;
+        (res, out)
+    }
+
+    fn userpass(user: &[u8], pass: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x05, 0x01, 0x02, 0x01, user.len() as u8];
+        v.extend_from_slice(user);
+        v.push(pass.len() as u8);
+        v.extend_from_slice(pass);
+        v
+    }
+
+    #[tokio::test]
+    async fn socks_no_auth_client_is_refused() {
+        let (res, out) = run_handshake(vec![0x05, 0x01, 0x00]).await;
+        assert!(res.is_err(), "a no-auth-only client must not get through");
+        assert_eq!(out, [0x05, 0xFF], "answered with no acceptable method");
+    }
+
+    #[tokio::test]
+    async fn socks_wrong_password_is_refused() {
+        let (res, out) = run_handshake(userpass(b"tunlion", b"not-the-token")).await;
+        assert!(res.is_err());
+        assert_eq!(out, [0x05, 0x02, 0x01, 0x01]);
+        let mut near = TOKEN.as_bytes().to_vec();
+        near[63] = b'0';
+        let (res, _) = run_handshake(userpass(b"tunlion", &near)).await;
+        assert!(res.is_err(), "one byte off is still wrong");
+    }
+
+    #[tokio::test]
+    async fn socks_right_password_is_accepted() {
+        let (res, out) = run_handshake(userpass(b"tunlion", TOKEN.as_bytes())).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(out, [0x05, 0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn http_basic_auth_is_checked() {
+        use base64::Engine;
+        let good = base64::engine::general_purpose::STANDARD.encode(format!("tunlion:{TOKEN}"));
+        let bad = base64::engine::general_purpose::STANDARD.encode("tunlion:nope");
+        let req = |h: &str| format!("CONNECT a.mesh:80 HTTP/1.1\r\nHost: a.mesh:80\r\n{h}\r\n");
+        assert!(http_proxy_auth_ok(&req(&format!("Proxy-Authorization: Basic {good}\r\n")), TOKEN));
+        assert!(http_proxy_auth_ok(&req(&format!("proxy-authorization: basic {good}\r\n")), TOKEN));
+        assert!(!http_proxy_auth_ok(&req(&format!("Proxy-Authorization: Basic {bad}\r\n")), TOKEN));
+        assert!(!http_proxy_auth_ok(&req(""), TOKEN), "no header, no entry");
+    }
+
+    #[test]
+    fn only_loopback_binds_are_local() {
+        for b in ["127.0.0.1", "::1", "[::1]", "localhost", "127.0.0.2"] {
+            assert!(bind_is_loopback(b), "{b}");
+        }
+        for b in ["0.0.0.0", "::", "192.168.1.5", "example.com"] {
+            assert!(!bind_is_loopback(b), "{b}");
+        }
     }
 }
 

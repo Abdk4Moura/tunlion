@@ -272,14 +272,8 @@ fn write_jsonl(v: &Value) {
     // Rotate by TRUNCATION: a doctor wants the latest span, not unbounded
     // history. Cheap stat, then start fresh if we are over the cap.
     let over = std::fs::metadata(&path).map(|m| m.len() > MAX_JSONL_BYTES).unwrap_or(false);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true);
-    if over {
-        opts.truncate(true);
-    } else {
-        opts.append(true);
-    }
-    if let Ok(mut f) = opts.open(&path) {
+    // Owner-only: the diag stream names peers, addresses and activity.
+    if let Ok(mut f) = crate::platform::open_private_log(&path, over) {
         // Compact one-liner + newline; ignore a partial-write failure.
         let mut line = v.to_string();
         line.push('\n');

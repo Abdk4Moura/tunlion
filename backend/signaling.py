@@ -17,10 +17,11 @@ Event contract (kept in sync with CONTRACT.md):
 import os
 import re
 import time as _time
-from collections import defaultdict, deque
 
 from flask import request
 from flask_socketio import emit, join_room, leave_room
+
+import ratelimit
 
 # One-time pairing nameplate allocation. v2 ONLY: the client CSPRNG-mints the
 # WORDS locally (spec S2.0), the server allocates/matches only the numeric
@@ -124,6 +125,11 @@ class _MemRegistry:
             out[ch] = [s for s in members if s != sid]
             members.add(sid)
         return out  # channel -> other live sids already present
+
+    def share_channel(self, a, b):
+        """Whether sids `a` and `b` are subscribed to at least one common channel."""
+        bysid = getattr(self, "_sidchan", {})
+        return bool(bysid.get(a, set()) & bysid.get(b, set()))
 
     def unsubscribe_all(self, sid):
         affected = {}
@@ -275,6 +281,10 @@ class _RedisRegistry:
             if others:
                 affected[ch] = others
         return affected
+
+    def share_channel(self, a, b):
+        """Whether sids `a` and `b` are subscribed to at least one common channel."""
+        return bool(self.r.sinter(self._sck(a), self._sck(b)))
 
     def unsubscribe_all(self, sid):
         affected = {}
@@ -430,6 +440,36 @@ def register(socketio, registry):
     # -- one-time pairing (#11): say the code aloud; it works exactly once. --
     PAIR_TTL = 600  # unclaimed codes evaporate after 10 minutes
 
+    # Claim rate limit: 21.8 bits of code entropy only holds if nobody can
+    # sweep the space. 5 attempts/min per connection (and per client IP, so
+    # reconnecting doesn't reset it) makes an exhaustive sweep of 3.7M codes
+    # take years instead of the minutes the unthrottled 9,000-code space took.
+    # FIL_CLAIM_LIMIT overrides it: the gate fixture sets it sky-high so the
+    # suite's many rapid claims never collide (the limit is a prod security
+    # control, irrelevant to a local single-tester fixture — pinning it makes
+    # the claim path DETERMINISTIC instead of timing-window-dependent).
+    #
+    # The client IP is the TCP peer unless a configured trusted proxy vouches
+    # for a header (FIL_TRUSTED_PROXIES); IPv6 counts per /64. With Redis the
+    # budget is shared across replicas, else it is a bounded in-process map.
+    CLAIM_LIMIT = int(os.environ.get("FIL_CLAIM_LIMIT", "5"))
+    CLAIM_WINDOW = 60.0
+    # pair-create had no limit at all: every call parks a nameplate for 10
+    # minutes, so one client could fill the 3-5 digit nameplate space and deny
+    # pairing to everyone. Default 4x the claim budget (a creator retries on
+    # `taken`); FIL_PAIR_CREATE_LIMIT overrides, and a fixture that lifts the
+    # claim limit lifts this one with it.
+    PAIR_CREATE_LIMIT = int(os.environ.get("FIL_PAIR_CREATE_LIMIT", str(CLAIM_LIMIT * 4)))
+    _redis = getattr(registry, "r", None)
+    _claim_limiter = ratelimit.make_limiter("pair-claim", CLAIM_LIMIT, CLAIM_WINDOW, _redis)
+    _create_limiter = ratelimit.make_limiter("pair-create", PAIR_CREATE_LIMIT, CLAIM_WINDOW, _redis)
+
+    def _limit_keys(sid):
+        return (f"sid:{sid}", "ip:" + ratelimit.ip_bucket(ratelimit.client_ip(request)))
+
+    def _claim_allowed(sid):
+        return _claim_limiter.allow(_limit_keys(sid))
+
     # L1-a (PAKE v2): a v:2 client mints the WORDS locally and asks the server
     # to allocate only the NAMEPLATE (the numeric routing suffix). The server
     # NEVER sees or generates the words — the entire MITM-resistance claim rests
@@ -441,6 +481,9 @@ def register(socketio, registry):
     @socketio.on("pair-create")
     def on_pair_create(data=None):
         sid = request.sid
+        if not _create_limiter.allow(_limit_keys(sid)):
+            emit("pair-error", {"error": "slow-down"})
+            return
         # C24: refresh liveness lease so the nameplate is never minted by a
         # creator the claim-side lease check would call dead (zombie-tab bug).
         if hasattr(registry, "refresh"):
@@ -472,31 +515,6 @@ def register(socketio, registry):
             return
         # Collision: the client re-mints a fresh nameplate and retries.
         emit("pair-error", {"error": "taken"})
-
-    # Claim rate limit: 21.8 bits of code entropy only holds if nobody can
-    # sweep the space. 5 attempts/min per connection (and per client IP, so
-    # reconnecting doesn't reset it) makes an exhaustive sweep of 3.7M codes
-    # take years instead of the minutes the unthrottled 9,000-code space took.
-    # FIL_CLAIM_LIMIT overrides it: the gate fixture sets it sky-high so the
-    # suite's many rapid claims never collide (the limit is a prod security
-    # control, irrelevant to a local single-tester fixture — pinning it makes
-    # the claim path DETERMINISTIC instead of timing-window-dependent).
-    CLAIM_LIMIT = int(os.environ.get("FIL_CLAIM_LIMIT", "5"))
-    CLAIM_WINDOW = 60.0
-    _claim_log = defaultdict(deque)  # key -> recent claim timestamps
-
-    def _claim_allowed(sid):
-        ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "?"
-        now = _time.monotonic()
-        for key in (f"sid:{sid}", f"ip:{ip}"):
-            q = _claim_log[key]
-            while q and now - q[0] > CLAIM_WINDOW:
-                q.popleft()
-            if len(q) >= CLAIM_LIMIT:
-                return False
-        for key in (f"sid:{sid}", f"ip:{ip}"):
-            _claim_log[key].append(now)
-        return True
 
     @socketio.on("pair-claim")
     def on_pair_claim(data=None):
@@ -645,7 +663,15 @@ def register(socketio, registry):
         sid = request.sid
         to = (data or {}).get("to")
         payload = (data or {}).get("data")
-        if not to or not registry.room_of(sid):
+        my_room = registry.room_of(sid)
+        if not to or not isinstance(to, str) or not my_room:
+            return
+        # Only deliver to a peer the sender could legitimately have learned
+        # about: same room (welcome/peer-joined/sync) or a shared pair channel
+        # (known-peer). Forwarding to ANY sid let a client inject offers into
+        # strangers' sessions by guessing or harvesting socket ids.
+        if registry.room_of(to) != my_room and not registry.share_channel(sid, to):
+            _tel("signal-refused", sid=sid, to=to)
             return
         emit("signal", {"from": sid, "data": payload}, to=to)  # routes cross-instance
 

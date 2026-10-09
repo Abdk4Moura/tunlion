@@ -20,7 +20,6 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc;
 use crate::net::Transport;
 
@@ -555,7 +554,7 @@ impl MountClient {
 
 fn mount_op_writes(op: &MountOp) -> bool {
     match op {
-        MountOp::Open { flags, .. } => flags & 0b11 != 0,
+        MountOp::Open { flags, .. } => open_mutates(*flags),
         MountOp::Write { .. }
         | MountOp::Create { .. }
         | MountOp::Unlink { .. }
@@ -585,6 +584,29 @@ const O_RDWR: i32 = 2;
 // set bit: O_RDONLY is 0, so `flags & O_RDONLY` is always 0 and can never be
 // tested for. Mask with O_ACCMODE and compare the result to the three modes.
 const O_ACCMODE: i32 = 3;
+const EMFILE: i32 = 24;
+
+/// Open handles one mount stream may hold. Each is a real fd in the serving
+/// daemon, so an unbounded table lets one peer exhaust the daemon's fd limit
+/// (and with it every other link). FUSE releases handles as files close, so a
+/// well-behaved client sits far below this.
+const MAX_OPEN_FILES_PER_STREAM: usize = 256;
+
+/// Largest JSON header line the server will buffer. A header carries at most
+/// two base64 paths (rename) bounded by max_path_len, plus a few numbers.
+const MAX_HEADER_LEN: usize = 64 * 1024;
+
+/// Largest binary payload a frame may declare. The server advertises
+/// DEFAULT_MOUNT_MAX_SIZE for reads and writes, so anything larger is a
+/// protocol violation; refusing it stops a peer from making the server wait
+/// on (and buffer toward) a 4 GiB frame.
+const MAX_FRAME_DATA_LEN: usize = DEFAULT_MOUNT_MAX_SIZE as usize;
+
+/// True when an Open with these flags would create or modify data: a writable
+/// access mode, or O_CREAT/O_TRUNC/O_APPEND/O_TMPFILE even with O_RDONLY.
+fn open_mutates(flags: i32) -> bool {
+    (flags & O_ACCMODE) != 0 || crate::platform::fs_at::open_flags_modify(flags)
+}
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -657,8 +679,19 @@ pub fn spawn_mount_server(
             // suffix. Drain the complete frame atomically so a raw `\n` byte inside
             // payload data never triggers a false header boundary.
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                if nl > MAX_HEADER_LEN {
+                    crate::ui::debug(&format!("mount: header over {MAX_HEADER_LEN} bytes, closing (sid {sid})"));
+                    return;
+                }
                 let frame_end = if v2 && buf.len() >= nl + 1 + 4 {
                     let len = u32::from_le_bytes([buf[nl + 1], buf[nl + 2], buf[nl + 3], buf[nl + 4]]) as usize;
+                    if len > MAX_FRAME_DATA_LEN {
+                        // A declared length past anything the server advertised:
+                        // the stream is out of sync or hostile. Close rather than
+                        // buffer toward it.
+                        crate::ui::debug(&format!("mount: frame declares {len} bytes (max {MAX_FRAME_DATA_LEN}), closing (sid {sid})"));
+                        return;
+                    }
                     if buf.len() >= nl + 1 + 4 + len {
                         nl + 1 + 4 + len
                     } else {
@@ -736,6 +769,12 @@ pub fn spawn_mount_server(
                 if transport.send_frame(sid, 0, &payload).await.is_err() { return; }
             }
 
+            // No complete frame buffered. A header that never ends is the same
+            // unbounded wait as an oversized frame, so bound the buffer too.
+            if buf.len() > MAX_HEADER_LEN + 1 + 4 + MAX_FRAME_DATA_LEN {
+                crate::ui::debug(&format!("mount: unterminated frame over the limit, closing (sid {sid})"));
+                return;
+            }
             // Read next frame
             match rx.recv().await {
                 Some(Some(data)) => buf.extend_from_slice(&data),
@@ -776,7 +815,9 @@ async fn handle_mount_request(
             | MountOp::RmDir { .. }
             | MountOp::Rename { .. }
             | MountOp::Truncate { .. } => true,
-            MountOp::Open { flags, .. } => (flags & O_ACCMODE) != 0, // O_RDONLY == 0
+            // O_RDONLY == 0, so the access mode alone misses O_RDONLY|O_TRUNC
+            // (which truncates) and O_CREAT/O_APPEND/O_TMPFILE.
+            MountOp::Open { flags, .. } => open_mutates(*flags),
             _ => false,
         };
         if mutating {
@@ -854,12 +895,33 @@ fn resolve(root: &PathBuf, encoded_path: &str) -> Result<PathBuf, MountError> {
 
 fn do_getattr(root: &PathBuf, path: &str) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    let meta = std::fs::symlink_metadata(&resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
-    let st = file_stat(&resolved, &meta);
-    Ok(serde_json::to_value(&st).unwrap_or_default())
+    let rel = resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "path not beneath root".into() })?;
+    // resolve() is lexical, so stat-by-path followed a symlinked DIRECTORY in
+    // the share out of it (`sub -> /etc` made `sub/shadow` stat-able). Stat the
+    // final name relative to a parent dirfd the kernel keeps beneath root, not
+    // following the final component (lstat semantics, as before).
+    let looked_up = if rel.as_os_str().is_empty() {
+        crate::platform::fs_at::stat_root(root)
+    } else {
+        resolve_parent_beneath(root, rel)
+            .and_then(|(parent, name)| crate::platform::fs_at::lstat_at(&parent, &name))
+    };
+    let meta = looked_up
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    Ok(serde_json::to_value(file_stat(&meta)).unwrap_or_default())
+}
+
+fn too_many_open(open_files: &HashMap<u64, (std::fs::File, PathBuf)>) -> Result<(), MountError> {
+    if open_files.len() >= MAX_OPEN_FILES_PER_STREAM {
+        return Err(MountError { code: EMFILE, msg: format!("too many open files on this mount (max {MAX_OPEN_FILES_PER_STREAM})") });
+    }
+    Ok(())
 }
 
 fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64, (std::fs::File, PathBuf)>, next_fh: &mut u64) -> Result<Value, MountError> {
+    too_many_open(open_files)?;
     let resolved = resolve(root, path)?;
     // Use safe_open_beneath to prevent symlink traversal out of the share root
     let rel = match resolved.strip_prefix(root) {
@@ -875,28 +937,23 @@ fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64,
 }
 
 fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut HashMap<u64, (std::fs::File, PathBuf)>, next_fh: &mut u64) -> Result<Value, MountError> {
+    too_many_open(open_files)?;
     let resolved = resolve(root, path)?;
     // Use safe_open_beneath with O_CREAT to prevent symlink traversal
     let rel = match resolved.strip_prefix(root) {
         Ok(r) => r.to_path_buf(),
         Err(_) => return Err(MountError { code: EACCES, msg: "path not beneath root".into() }),
     };
-    // O_CREAT|O_EXCL are POSIX (libc) flags. #40 added this libc use in do_create
-    // WITHOUT a cfg gate, which broke the Windows (msvc) release build — libc has no
-    // such module in scope there. Gate the constants; on non-Unix, safe_open_beneath's
-    // fallback does not consume POSIX creation flags (Windows mounts go through WinFsp,
-    // where this FUSE do_create path is not the create surface).
-    #[cfg(unix)]
-    let create_flags = flags | libc::O_CREAT | libc::O_EXCL;
-    #[cfg(not(unix))]
-    let create_flags = flags;
+    // O_CREAT|O_EXCL are POSIX (libc) flags; the platform adapter supplies them
+    // (on non-Unix, safe_open_beneath's fallback does not consume POSIX creation
+    // flags: Windows mounts go through WinFsp, where this is not the create surface).
+    let create_flags = crate::platform::fs_at::create_excl_flags(flags);
     let file = safe_open_beneath(root, &rel, create_flags, false)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(mode));
-    }
+    // The mode is applied through the handle we just created (a path could
+    // have been swapped for a symlink since), and only its permission bits:
+    // a peer never gets to create a setuid/setgid/sticky file on this host.
+    let _ = crate::platform::fs_at::set_mode_via_handle(&file, mode);
     let fh = *next_fh;
     *next_fh += 1;
     open_files.insert(fh, (file, resolved));
@@ -908,7 +965,9 @@ fn do_read(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset:
     let (file, _) = open_files.get(&fh).ok_or_else(|| MountError { code: EBADF, msg: "bad fh".into() })?;
     let mut file = file.try_clone().map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
     file.seek(SeekFrom::Start(offset)).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
-    let mut buf = vec![0u8; size as usize];
+    // The peer picks `size`; allocating it verbatim was a 4 GiB allocation per
+    // request. Clamp to the read size this server advertises.
+    let mut buf = vec![0u8; size.min(DEFAULT_MOUNT_MAX_SIZE) as usize];
     let n = file.read(&mut buf).map_err(|e| MountError { code: EIO, msg: e.to_string() })?;
     buf.truncate(n);
     Ok((serde_json::json!({ "n": n }), buf))
@@ -924,27 +983,23 @@ fn do_write(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, offset
 }
 
 fn do_readdir(_root: &PathBuf, open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64, _offset: i64) -> Result<Value, MountError> {
-    let (_, dir_path) = open_files.get(&fh).ok_or_else(|| MountError { code: EBADF, msg: "bad fh".into() })?;
-    // For directories, the "file" handle is the dir itself; we open with read_dir
-    let entries: Vec<DirEntry> = match std::fs::read_dir(dir_path) {
-        Ok(iter) => {
-            iter.filter_map(|e| e.ok())
-                .map(|e| {
-                    let name_os = e.file_name();
-                    let name = path_encode(std::path::Path::new(&name_os));
-                    let meta = e.metadata().ok();
-                    let stat = match (&e.path(), meta) {
-                        (p, Some(m)) => file_stat(p, &m),
-                        (_, None) => FileStat { ino: 0, size: 0, mode: 0, uid: 0, gid: 0, mtime: 0, nlink: 0, blocks: 0, blksize: 4096, kind: None },
-                    };
-                    DirEntry { name, stat }
-                })
-                .collect()
-        }
-        Err(e) => {
-            return Err(MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() });
-        }
-    };
+    let (dir, dir_path) = open_files.get(&fh).ok_or_else(|| MountError { code: EBADF, msg: "bad fh".into() })?;
+    // List through the HANDLE, which was opened beneath the root. Listing by
+    // the stored path re-resolved it, so a directory swapped for a symlink
+    // after the open (or reached through one) listed whatever it pointed at.
+    let listed = crate::platform::fs_at::read_dir_handle(dir, dir_path)
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    let entries: Vec<DirEntry> = listed
+        .into_iter()
+        .map(|(name_os, meta)| {
+            let name = path_encode(std::path::Path::new(&name_os));
+            let stat = match meta {
+                Some(m) => file_stat(&m),
+                None => FileStat { ino: 0, size: 0, mode: 0, uid: 0, gid: 0, mtime: 0, nlink: 0, blocks: 0, blksize: 4096, kind: None },
+            };
+            DirEntry { name, stat }
+        })
+        .collect();
     Ok(serde_json::to_value(entries).unwrap_or_default())
 }
 
@@ -1037,24 +1092,30 @@ fn do_fsync(open_files: &HashMap<u64, (std::fs::File, PathBuf)>, fh: u64) -> Res
 
 fn do_readlink(root: &PathBuf, path: &str) -> Result<Value, MountError> {
     let resolved = resolve(root, path)?;
-    let target = std::fs::read_link(&resolved).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
+    let rel = resolved
+        .strip_prefix(root)
+        .map_err(|_| MountError { code: EACCES, msg: "path not beneath root".into() })?;
+    // Same containment as getattr: read the link named relative to a parent
+    // dirfd beneath root, so a symlinked directory cannot redirect it.
+    let target = resolve_parent_beneath(root, rel)
+        .and_then(|(parent, name)| crate::platform::fs_at::readlink_at(&parent, &name))
+        .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(serde_json::Value::String(path_encode(&target)))
 }
 
 // ---- helpers ----
 
-fn file_stat(path: &std::path::Path, meta: &std::fs::Metadata) -> FileStat {
-    let kind = if meta.is_dir() { FileKind::Dir } else if meta.file_type().is_symlink() { FileKind::Symlink } else { FileKind::File };
-    let mtime = meta.modified().unwrap_or(UNIX_EPOCH).duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+fn file_stat(meta: &crate::platform::fs_at::AtMeta) -> FileStat {
+    let kind = if meta.is_dir { FileKind::Dir } else if meta.is_symlink { FileKind::Symlink } else { FileKind::File };
     FileStat {
-        ino: file_ino(path),
-        size: meta.len(),
-        mode: mode_from_meta(meta),
-        uid: cfg_unix_uid(),
-        gid: cfg_unix_gid(),
-        mtime,
+        ino: meta.ino,
+        size: meta.size,
+        mode: meta.mode,
+        uid: crate::platform::fs_at::current_uid(),
+        gid: crate::platform::fs_at::current_gid(),
+        mtime: meta.mtime,
         nlink: 1,
-        blocks: meta.len() / 512,
+        blocks: meta.size / 512,
         blksize: 4096,
         kind: Some(kind),
     }
@@ -1513,43 +1574,6 @@ fn beneath_rename(
     std::fs::rename(from_parent.join(from_name), to_parent.join(to_name))
 }
 
-fn file_ino(path: &std::path::Path) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::symlink_metadata(path).map(|m| m.ino()).unwrap_or(0)
-    }
-    #[cfg(not(unix))]
-    {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf()).hash(&mut h);
-        h.finish()
-    }
-}
-
-fn mode_from_meta(meta: &std::fs::Metadata) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode()
-    }
-    #[cfg(not(unix))]
-    {
-        if meta.is_dir() { 0o40755 } else { 0o100644 }
-    }
-}
-
-fn cfg_unix_uid() -> u32 {
-    #[cfg(unix)] { unsafe { libc::getuid() } }
-    #[cfg(not(unix))] { 0 }
-}
-
-fn cfg_unix_gid() -> u32 {
-    #[cfg(unix)] { unsafe { libc::getgid() } }
-    #[cfg(not(unix))] { 0 }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,6 +1691,92 @@ mod tests {
         let (resp, _) =
             handle_mount_request(root, &mut open_files, &mut next_fh, &req, None, true, false).await;
         resp.result
+    }
+
+    /// M4/M5: the METADATA ops had the same lexical-resolve hole the five
+    /// mutations had (#148). getattr and readlink through `evil -> outside`
+    /// must be refused, the link itself still stats as a link, the root still
+    /// stats, and a created file never keeps setuid/setgid/sticky.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_ops_refuse_escape_and_create_masks_mode() {
+        let f = EscapeFixture::new("meta");
+        std::fs::write(f.outside.join("secret"), b"top secret").unwrap();
+        std::os::unix::fs::symlink("/somewhere", f.outside.join("lnk")).unwrap();
+        let res = call_mount(&f.share, MountOp::GetAttr { path: f.enc("evil/secret") }).await;
+        assert!(matches!(res, MountResult::Err(_)), "getattr through escaping symlink must be refused: {res:?}");
+        let res = call_mount(&f.share, MountOp::ReadLink { path: f.enc("evil/lnk") }).await;
+        assert!(matches!(res, MountResult::Err(_)), "readlink through escaping symlink must be refused: {res:?}");
+        match call_mount(&f.share, MountOp::GetAttr { path: f.enc("evil") }).await {
+            MountResult::Ok(v) => {
+                let st: FileStat = serde_json::from_value(v).unwrap();
+                assert!(matches!(st.kind, Some(FileKind::Symlink)), "the in-share link stats as a link (lstat)");
+            }
+            other => panic!("getattr of the link itself must succeed: {other:?}"),
+        }
+        assert!(matches!(call_mount(&f.share, MountOp::GetAttr { path: f.enc("") }).await, MountResult::Ok(_)), "the root stats");
+
+        let res = call_mount(&f.share, MountOp::Create { path: f.enc("made"), mode: 0o6755, flags: O_WRONLY }).await;
+        assert!(matches!(res, MountResult::Ok(_)), "create: {res:?}");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(f.share.join("made")).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "setuid/setgid stripped, permission bits kept");
+        f.cleanup();
+    }
+
+    /// A read-only share must refuse every Open that modifies data, not only a
+    /// writable access mode: O_RDONLY|O_TRUNC truncates on Linux.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_share_refuses_modifying_open_flags() {
+        let f = EscapeFixture::new("ro");
+        std::fs::write(f.share.join("keep"), b"data").unwrap();
+        for flags in [libc::O_RDONLY | libc::O_TRUNC, libc::O_RDONLY | libc::O_CREAT, libc::O_RDONLY | libc::O_APPEND, libc::O_WRONLY] {
+            let mut open_files = HashMap::new();
+            let mut next_fh = 1u64;
+            let req = MountRequest { id: 1, bin: None, op: MountOp::Open { path: f.enc("keep"), flags } };
+            let (resp, _) = handle_mount_request(&f.share, &mut open_files, &mut next_fh, &req, None, true, true).await;
+            assert!(matches!(&resp.result, MountResult::Err(e) if e.code == EROFS), "flags {flags:#o} must be EROFS: {:?}", resp.result);
+            assert!(mount_op_writes(&MountOp::Open { path: String::new(), flags }), "client side agrees for {flags:#o}");
+        }
+        assert_eq!(std::fs::read(f.share.join("keep")).unwrap(), b"data", "nothing was truncated");
+        f.cleanup();
+    }
+
+    /// M3: a read allocates what the server advertises, not what the peer asks.
+    #[test]
+    fn read_size_is_clamped_to_the_advertised_max() {
+        let dir = std::env::temp_dir().join(format!("fil-mount-clamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("big");
+        std::fs::write(&p, vec![1u8; DEFAULT_MOUNT_MAX_SIZE as usize * 3]).unwrap();
+        let mut open_files = HashMap::new();
+        open_files.insert(1u64, (std::fs::File::open(&p).unwrap(), p.clone()));
+        let (_, bytes) = do_read(&open_files, 1, 0, u32::MAX).unwrap();
+        assert_eq!(bytes.len(), DEFAULT_MOUNT_MAX_SIZE as usize);
+        drop(open_files);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M3: one stream cannot hold an unbounded number of daemon fds.
+    #[test]
+    fn open_handles_are_capped_per_stream() {
+        let dir = std::env::temp_dir().join(format!("fil-mount-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        let root = dir.clone();
+        let enc = path_encode(std::path::Path::new("f"));
+        let mut open_files = HashMap::new();
+        let mut next_fh = 1u64;
+        for _ in 0..MAX_OPEN_FILES_PER_STREAM {
+            do_open(&root, &enc, O_RDONLY, &mut open_files, &mut next_fh).expect("under the cap");
+        }
+        let err = do_open(&root, &enc, O_RDONLY, &mut open_files, &mut next_fh).unwrap_err();
+        assert_eq!(err.code, EMFILE);
+        open_files.remove(&1);
+        assert!(do_open(&root, &enc, O_RDONLY, &mut open_files, &mut next_fh).is_ok(), "a release frees a slot");
+        drop(open_files);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

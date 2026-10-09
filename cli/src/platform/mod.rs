@@ -1,3 +1,5 @@
+pub mod fs_at;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -252,6 +254,58 @@ pub fn tighten_new_dir(dir: &Path) {
     {
         let _ = dir;
     }
+}
+
+/// Keep the config dir owner-only on EVERY start, not just at the one-time
+/// migration: it holds keys, grants and the proxy token, and a dir someone
+/// loosened (or a tool created 0755) would expose new files' NAMES and any file
+/// a writer forgot to restrict. Only a directory this user owns, that is not a
+/// symlink, and that is not a shared sticky dir (a FILAMENT_CONFIG_DIR pointed
+/// at /tmp must never be chmodded) is touched. Windows: the profile ACL is
+/// already owner-only.
+pub fn tighten_config_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(md) = std::fs::symlink_metadata(dir) else { return };
+        let mode = md.permissions().mode();
+        let mine = md.uid() == unsafe { libc::getuid() };
+        if md.is_dir() && mine && mode & 0o1000 == 0 && mode & 0o077 != 0 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+/// Open an owner-only (0600 on unix) log-style file, creating it if needed,
+/// for appending, or truncating when `truncate`. An existing file with a
+/// looser mode is tightened through the handle. Used for diag.jsonl and the
+/// daemon logs, which carry peer names, addresses and activity.
+pub fn open_private_log(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if truncate {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata().map(|m| m.permissions().mode() & 0o077 != 0).unwrap_or(false) {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(file)
 }
 
 fn repair_sensitive_dir(dir: &Path) -> std::io::Result<usize> {
@@ -905,10 +959,7 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)?;
+    let log_file = open_private_log(log, false)?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null());

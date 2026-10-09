@@ -32,6 +32,13 @@ services:
       # 120/25 for exactly this reason.
       FIL_PING_TIMEOUT: "60"
       FIL_PING_INTERVAL: "25"
+      # The api is reachable ONLY through cloudflared (expose, not ports), so
+      # every TCP peer is the tunnel and CF-Connecting-IP is the real client.
+      # The backend honours that header only from trusted proxies; without
+      # this every caller would share the tunnel's address (one rate-limit
+      # bucket, one "nearby" room). Narrow it to a CIDR if the api is ever
+      # published on a host port.
+      FIL_TRUSTED_PROXIES: "*"
     expose:
       - "8000" # internal only — cloudflared reaches it as http://api:8000
     depends_on:

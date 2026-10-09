@@ -344,7 +344,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOnly,
             env: Some("FILAMENT_AUTO_PROXY"),
             daemon: true,
-            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `tunlion set auto-proxy off`.",
+            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on 127.0.0.1:1080 so native tools reach <peer>.mesh. It requires a username/password (the password is in proxy.token in the config dir, owner-only). Turn off with `tunlion set auto-proxy off`.",
         },
         Setting {
             key: "verbosity",

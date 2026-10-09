@@ -513,6 +513,10 @@ pub(crate) enum Cmd {
         /// HTTP CONNECT proxy port (0 = disabled)
         #[arg(long, default_value_t = 0)]
         http_port: u16,
+        /// Allow --bind to a non-loopback address (the proxy is then reachable
+        /// from the network, guarded only by its password). Refused without it.
+        #[arg(long)]
+        allow_remote: bool,
     },
     /// (hidden for one release) The netcat shape moved into `forward --stdio`.
     #[command(hide = true)]
