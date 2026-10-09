@@ -172,6 +172,7 @@ fs_bounded() {  # $1 = seconds, rest = command
   local out="$WORK/fs.out" done="$WORK/fs.done"
   rm -f "$out" "$done"
   ( "$@" >"$out" 2>&1; echo $? >"$done" ) &
+  local fs_pid=$!
   for _ in $(seq 1 $((secs * 2))); do [ -f "$done" ] && break; sleep 0.5; done
   if [ -f "$done" ]; then
     cat "$done" > "$WORK/fs.rc"
@@ -179,8 +180,31 @@ fs_bounded() {  # $1 = seconds, rest = command
   else
     : > "$WORK/fs.rc"
     echo wedged >"$WORK/fs.state"
+    fs_forensics "$fs_pid" "$out" "$*" >&2
   fi
   cat "$out" 2>/dev/null
+}
+# A wedge used to leave nothing behind but its own name, and a rare one cannot
+# be reproduced on demand. The establishment stall was found by looking at the
+# HUNG process (which socket it held, what it waited on), not by reading code,
+# so capture exactly that at the moment of the wedge, then kill the tree so the
+# gates after this one start clean. Goes to stderr: callers capture stdout.
+fs_forensics() {  # $1 = subshell pid, $2 = output file, $3 = command
+  local root="$1" pids p
+  pids="$root $(pgrep -P "$root" 2>/dev/null) $(for c in $(pgrep -P "$root" 2>/dev/null); do pgrep -P "$c" 2>/dev/null; done)"
+  echo "===== WEDGE FORENSICS: $3"
+  echo "--- its own output so far:"; sed 's/^/    /' "$2" 2>/dev/null | tail -40
+  echo "--- process tree:"; ps -o pid,ppid,stat,etimes,wchan:24,args -p "$(echo $pids | tr ' ' ',')" 2>/dev/null
+  for p in $pids; do
+    [ -d "/proc/$p" ] || continue
+    echo "--- pid $p sockets:"; ss -tunxp 2>/dev/null | grep -E "pid=$p[,)]" | sed 's/^/    /' | head -20
+    echo "--- pid $p threads/wchan:"; for t in /proc/$p/task/*; do printf '    %s %s\n' "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"; done | sort -k2 | uniq -c -f1 | head -10
+    sudo -n cat "/proc/$p/stack" 2>/dev/null | sed 's/^/    stack: /' | head -12
+  done
+  echo "--- every daemon/server log in \$WORK (tail):"
+  for f in "$WORK"/*.log; do [ -f "$f" ] || continue; echo "  [${f##*/}]"; tail -25 "$f" | sed 's/^/    /'; done
+  echo "===== END WEDGE FORENSICS"
+  for p in $pids; do kill "$p" 2>/dev/null; done
 }
 fs_state() { cat "$WORK/fs.state" 2>/dev/null; }
 # The child's exit code, empty when it wedged. Bounded callers still need it: the gates assert
