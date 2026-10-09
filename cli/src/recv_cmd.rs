@@ -837,7 +837,13 @@ pub(crate) async fn recv_cmd(
     // swap in a freshly-dialed signaling client after a drop (see below). The
     // short-lived `recv`/`send` paths never reconnect, they re-invoke fresh,
     // so this is only exercised by the daemon (`up`/`up --dir`).
-    let mut sio = net::connect_signaling(server, tx.clone()).await?;
+    // The daemon waits for the network instead of exiting (see
+    // `connect_signaling_patiently`); a one-shot receive still fails fast.
+    let mut sio = if daemon {
+        crate::up_logs::connect_signaling_patiently(server, tx.clone()).await?
+    } else {
+        net::connect_signaling(server, tx.clone()).await?
+    };
 
     let mut paired = code.is_some();
     // C24: at most one typed claim in flight, a second typed code while one
@@ -1629,6 +1635,8 @@ pub(crate) async fn recv_cmd(
     if daemon {
         sdnotify::ready();
         sdnotify::status("up - serving");
+        // The same edge for `up --detach`, which has no systemd to tell it.
+        crate::file_io::mark_daemon_ready();
     }
 
     // Restore mounts that were marked with auto_restore.

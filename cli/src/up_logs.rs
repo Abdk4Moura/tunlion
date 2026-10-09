@@ -101,9 +101,13 @@ pub(crate) async fn up_cmd(
         // Gate --install on a detected service manager.
         let host = platform::ServiceHost::detect();
         if !host.supports_install() {
-            let hint = host.install_instructions();
-            eprintln!("tunlion: --install is not supported on this platform. {hint}");
-            return Ok(());
+            // An error, not a printed note and exit 0: a script that asked for
+            // autostart did not get it, and must be able to tell.
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Other,
+                "--install is not supported here: no service manager was found to start tunlion at boot. \
+                 To keep receiving in the background now: tunlion up --detach",
+            ));
         }
         let exe = std::env::current_exe()?;
         let mut up_args = String::new();
@@ -186,6 +190,15 @@ pub(crate) async fn up_cmd(
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
+        if detach {
+            // `--detach` asks for a daemon in the background and the prompt
+            // back; following the log instead would block a script forever.
+            ui::say(&format!(
+                "  {} daemon already running (pid {pid})",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            ));
+            return Ok(());
+        }
         dlog!(
             "[up] already-up: pidfile={:?} pid={pid} cmdline={:?}",
             pidfile(),
@@ -315,7 +328,7 @@ pub(crate) async fn up_cmd(
         no_proxy_fallback,
     )
     .await;
-    let _ = std::fs::remove_file(pidfile());
+    crate::file_io::remove_pidfile();
     res
 }
 
@@ -473,5 +486,80 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 continue;
             }
         }
+    }
+}
+
+/// Backoff between `up`'s attempts to reach signaling while the network is
+/// down: 1, 2, 4, 8, 16, then every 30 seconds. Pure, so it is unit-tested.
+pub(crate) fn signaling_backoff(attempt: u32) -> Duration {
+    Duration::from_secs((1u64 << attempt.min(5)).min(30))
+}
+
+/// The daemon's FIRST connect to signaling, made patient.
+///
+/// `up` used to make one attempt and exit on failure, so a daemon started at
+/// boot before the network (or on a laptop waking without wifi) died at once,
+/// and `up --detach` reported it as running. A daemon's job is to be there
+/// when the network comes back: retry with backoff, say once that it is
+/// waiting, and carry on. Only the daemon does this; a one-shot verb still
+/// fails fast with the one-line network message.
+///
+/// A server URL that cannot be valid is refused at once rather than retried,
+/// so a typo in `--server` is not reported as a network outage forever.
+pub(crate) async fn connect_signaling_patiently(
+    server: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+) -> Result<filament_signal::Client> {
+    if !(server.starts_with("http://") || server.starts_with("https://")) {
+        anyhow::bail!("--server must be an http:// or https:// URL, got '{server}'");
+    }
+    let mut attempt: u32 = 0;
+    loop {
+        match crate::net::connect_signaling(server, tx.clone()).await {
+            Ok(client) => {
+                if attempt > 0 {
+                    ui::say(&format!(
+                        "  {} network is back; connected to {server}",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                    ));
+                }
+                return Ok(client);
+            }
+            Err(e) => {
+                let wait = signaling_backoff(attempt);
+                if attempt == 0 {
+                    ui::say(&format!(
+                        "  {} waiting for network: can't reach the tunlion server yet; retrying (ctrl-c to stop)",
+                        ui::paint(ui::Tone::Warn, "!")
+                    ));
+                }
+                ui::debug(&format!(
+                    "  signaling connect failed ({e:#}); retry in {}s",
+                    wait.as_secs()
+                ));
+                crate::sdnotify::status("waiting for network");
+                attempt = attempt.saturating_add(1);
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        crate::file_io::remove_pidfile();
+                        std::process::exit(130);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod patient_connect_tests {
+    use super::signaling_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_doubles_then_holds_at_thirty_seconds() {
+        let secs: Vec<u64> = (0..9).map(|a| signaling_backoff(a).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 16, 30, 30, 30, 30]);
+        assert_eq!(signaling_backoff(u32::MAX), Duration::from_secs(30), "never overflows");
     }
 }

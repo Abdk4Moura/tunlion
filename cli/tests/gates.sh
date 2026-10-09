@@ -903,39 +903,92 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
 # ============================================================================
 
-say "20: U1 implicit identity: minted once on first use, never twice, inspect screens mint nothing"
+say "20: U1 implicit identity: minted once by a verb that signs, never by one that only looks"
 # The config dir is NOT pre-created: the accessor makes it (0700) and the key
-# (0600). Run 1 creates and says so once on stderr; run 2 says nothing and
-# prints the same identity; `init` afterwards still refuses; `--json` never
-# gets the prose line. Then the three that must NOT mint: the bare tour screen
-# (an inspect surface, which must also not FAIL on a device that cannot mint),
-# `id` under the opt-out (the pre-U1 answer, exit 0, nothing written), and a
-# verb that must sign under the opt-out (still fails fast).
+# (0600). `id` used to be the minting verb here; it no longer mints (a fresh
+# machine that ran `tunlion id` was then refused by `tunlion join` for already
+# having an identity). So: `id` on a fresh dir answers "no identity yet" with
+# exit 9 (ExitKind::NoIdentity) and writes nothing, `id --json` answers
+# `"identity": null` with exit 9 and writes nothing, and the minting is proven
+# on `grant`, a verb that SIGNS: run 1 creates and says so once on stderr, run 2
+# says nothing, `id` then prints the same identity twice, and `init`
+# afterwards still refuses. Then the two that must NOT mint: the bare tour
+# screen, and a signing verb under the opt-out (still fails fast).
+#
+# Changed with the exit-code taxonomy: the opt-out `id` used to exit 0 with
+# "no identity yet"; it now exits 9 like every keyless `id` (documented in
+# `tunlion --help`, EXIT CODES).
 D20="$WORK/g20-cfg"; rm -rf "$D20"
-FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"; R20A=$?
-FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"; R20B=$?
-N20A=$(grep -c "created your identity" "$WORK/g20-1.err"); N20B=$(grep -c "created your identity" "$WORK/g20-2.err")
-M20K=$(stat -c %a "$D20/identity.ed25519" 2>/dev/null); M20D=$(stat -c %a "$D20" 2>/dev/null)
-FILAMENT_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
+D20Z="$WORK/g20-fresh"; rm -rf "$D20Z"
+FILAMENT_CONFIG_DIR="$D20Z" "$BIN" id >"$WORK/g20-0.out" 2>"$WORK/g20-0.err"; R20Z=$?
 D20J="$WORK/g20-json"; rm -rf "$D20J"
 FILAMENT_CONFIG_DIR="$D20J" "$BIN" id --json >"$WORK/g20-j.out" 2>"$WORK/g20-j.err"; R20J=$?
+J20=$(python3 -c "
+import json,sys
+v=json.load(open('$WORK/g20-j.out'))
+print('ok' if v.get('identity',1) is None and v.get('ok') is False and v['error']['exit']==9 else 'bad')
+" 2>/dev/null)
+FILAMENT_CONFIG_DIR="$D20" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"
+FILAMENT_CONFIG_DIR="$D20" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"
+N20A=$(grep -c "created your identity" "$WORK/g20-1.err"); N20B=$(grep -c "created your identity" "$WORK/g20-2.err")
+M20K=$(stat -c %a "$D20/identity.ed25519" 2>/dev/null); M20D=$(stat -c %a "$D20" 2>/dev/null)
+FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-id1.out" 2>&1; R20A=$?
+FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-id2.out" 2>&1; R20B=$?
+FILAMENT_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
 D20T="$WORK/g20-tour"; rm -rf "$D20T"
 FILAMENT_CONFIG_DIR="$D20T" "$BIN" >"$WORK/g20-t.log" 2>&1; R20T=$?
 D20N="$WORK/g20-noimplicit"; rm -rf "$D20N"
 FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" id >"$WORK/g20-n.log" 2>&1; R20N=$?
 FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-g.log" 2>&1; R20G=$?
-if [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] \
-   && cmp -s "$WORK/g20-1.out" "$WORK/g20-2.out" && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+if [ $R20Z -eq 9 ] && grep -q "no identity yet" "$WORK/g20-0.err" && [ ! -e "$D20Z/identity.ed25519" ] \
+   && [ $R20J -eq 9 ] && [ "$J20" = ok ] && [ ! -e "$D20J/identity.ed25519" ] \
+   && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+   && [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && cmp -s "$WORK/g20-id1.out" "$WORK/g20-id2.out" \
    && [ $R20I -ne 0 ] && grep -q "already has identity" "$WORK/g20-init.log" \
-   && [ $R20J -eq 0 ] && ! grep -q "created your identity" "$WORK/g20-j.err" && [ -f "$D20J/identity.ed25519" ] \
    && [ $R20T -eq 0 ] && grep -q "do this:" "$WORK/g20-t.log" && [ ! -e "$D20T/identity.ed25519" ] \
-   && [ $R20N -eq 0 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
+   && [ $R20N -eq 9 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
    && [ $R20G -ne 0 ] && grep -q "tunlion init" "$WORK/g20-g.log" && [ ! -e "$D20N/identity.ed25519" ]; then
-  ok "U1: created once ($N20A line, key $M20K, dir $M20D), second run silent, init refuses, --json silent, tour and opt-out mint nothing"
+  ok "U1: created once ($N20A line, key $M20K, dir $M20D) by a signing verb, second run silent, init refuses; id and id --json mint nothing (exit 9), tour and opt-out mint nothing"
 else
   bad "u1-implicit-init"
-  echo "  rc: id=$R20A/$R20B lines=$N20A/$N20B key=$M20K dir=$M20D init=$R20I json=$R20J tour=$R20T optout-id=$R20N optout-grant=$R20G"
-  tail -n 3 "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-j.err" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+  echo "  rc: id-fresh=$R20Z id-json=$R20J/$J20 lines=$N20A/$N20B key=$M20K dir=$M20D id=$R20A/$R20B init=$R20I tour=$R20T optout-id=$R20N optout-grant=$R20G"
+  tail -n 3 "$WORK/g20-0.err" "$WORK/g20-j.out" "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+fi
+
+say "21: up waits for the network instead of exiting; up --detach reports a dead daemon"
+# Item 7: a daemon whose server is unreachable (127.0.0.1:9, nothing listens)
+# must stay up, say it is waiting, and keep retrying; it used to exit at once.
+# Item 6: `up --detach` used to print "daemon detached" and exit 0 for a
+# daemon that died a moment later. Here the daemon dies at startup (its --dir
+# is a regular FILE, so creating it fails): --detach must exit nonzero and
+# quote the daemon's own last output. And for the waiting daemon, --detach
+# must not claim it is serving.
+D21="$WORK/g21-cfg"; rm -rf "$D21"; mkdir -p "$D21"
+FILAMENT_CONFIG_DIR="$D21" "$BIN" --server http://127.0.0.1:9 up --dir "$WORK/g21-drop" >"$WORK/g21-up.log" 2>&1 &
+P21=$!; pids+=($P21)
+sleep 6
+A21=0; kill -0 $P21 2>/dev/null && A21=1
+W21=$(grep -c "waiting for network" "$WORK/g21-up.log")
+PIDLINES=$(wc -l < "$D21/up.pid" 2>/dev/null | tr -d ' ')
+PIDVAL=$(cat "$D21/up.pid" 2>/dev/null)
+kill "$P21" 2>/dev/null; wait "$P21" 2>/dev/null
+D21B="$WORK/g21-cfg-b"; rm -rf "$D21B"; mkdir -p "$D21B"
+: > "$WORK/g21-notadir"
+FILAMENT_CONFIG_DIR="$D21B" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/g21-notadir" >"$WORK/g21-detach.log" 2>&1; R21D=$?
+D21C="$WORK/g21-cfg-c"; rm -rf "$D21C"; mkdir -p "$D21C"
+FILAMENT_CONFIG_DIR="$D21C" timeout 30 "$BIN" --server http://127.0.0.1:9 up --detach --dir "$WORK/g21-drop-c" >"$WORK/g21-detach-wait.log" 2>&1; R21W=$?
+P21C=$(cat "$D21C/up.pid" 2>/dev/null)
+[ -n "$P21C" ] && kill "$P21C" 2>/dev/null
+if [ "$A21" = 1 ] && [ "$W21" -ge 1 ] && [ "$PIDLINES" = 1 ] && [ "$PIDVAL" = "$P21" ] \
+   && [ $R21D -ne 0 ] && [ $R21D -ne 124 ] && grep -q "exited during startup" "$WORK/g21-detach.log" \
+   && ! grep -q "detached and serving" "$WORK/g21-detach.log" \
+   && [ $R21W -eq 0 ] && grep -q "not connected yet" "$WORK/g21-detach-wait.log" \
+   && ! grep -q "detached and serving" "$WORK/g21-detach-wait.log"; then
+  ok "daemon waits for the network (alive after 6s, says so), up.pid is the pid alone, --detach exits $R21D on a dead daemon and does not claim a waiting one is serving"
+else
+  bad "daemon-network-wait"
+  echo "  alive=$A21 waiting-lines=$W21 pidlines=$PIDLINES pid=$PIDVAL/$P21 detach-dead=$R21D detach-wait=$R21W"
+  tail -n 5 "$WORK/g21-up.log" "$WORK/g21-detach.log" "$WORK/g21-detach-wait.log"
 fi
 
 # --------------------------------------------------------- L2 tunnel gates ---

@@ -260,7 +260,8 @@ pub(crate) struct SyncOpts {
 }
 
 /// Exit codes per docs/agent-output-audit.md: 3 unknown device, 4 denied,
-/// 5 unreachable, 7 partial, 1 anything else.
+/// 6 unreachable, 8 partial, 1 anything else (the taxonomy in exit_codes.rs;
+/// 5 belongs to `reach --until-direct`, so unreachable and partial moved).
 struct Fail(i32, &'static str, String);
 impl std::fmt::Display for Fail {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -318,7 +319,7 @@ pub(crate) async fn run(
     match sync_inner(server, local, peer, remote_dir, relay, &opts, &mut rep).await {
         Ok(total) => {
             let partial = rep.counts.get("failed").copied().unwrap_or(0) > 0;
-            let exit = if partial { 7 } else { 0 };
+            let exit = if partial { 8 } else { 0 };
             if opts.json {
                 let mut d = json!({ "moved": rep.moved, "total": total, "dry_run": opts.dry_run, "exit": exit });
                 for (k, v) in &rep.counts {
@@ -395,8 +396,8 @@ async fn sync_inner(
         Ok(Err(e)) if e.to_string().contains("no known device") => {
             return Err(fail(3, "unknown_device", e.to_string()));
         }
-        Ok(Err(e)) => return Err(fail(5, "unreachable", e.to_string())),
-        Err(_) => return Err(fail(5, "unreachable", format!("couldn't reach '{peer}' in 45s"))),
+        Ok(Err(e)) => return Err(fail(6, "unreachable", e.to_string())),
+        Err(_) => return Err(fail(6, "unreachable", format!("couldn't reach '{peer}' in 45s"))),
     };
     guard.forget();
     let mux = l2::Mux::new(t.clone());
@@ -431,7 +432,7 @@ async fn sync_inner(
         }
     })
     .await
-    .map_err(|_| fail(5, "unreachable", format!("no answer from '{peer}' (is `tunlion up` running there?)")))?;
+    .map_err(|_| fail(6, "unreachable", format!("no answer from '{peer}' (is `tunlion up` running there?)")))?;
     if let Err(reason) = ack {
         return Err(fail(4, "denied", format!("'{peer}' refused sync: {reason}")));
     }

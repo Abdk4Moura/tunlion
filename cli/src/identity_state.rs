@@ -204,15 +204,24 @@ pub(crate) fn require_known_device(name: &str) -> Result<()> {
     if known.iter().any(|n| n == name) {
         return Ok(());
     }
+    // Classified, not left to the text: an unknown device is exit 3 for every
+    // verb that asks (exit_codes::ExitKind::UnknownDevice).
+    use crate::exit_codes::{ExitKind, err};
     if known.is_empty() {
-        bail!(
-            "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
-        );
+        return Err(err(
+            ExitKind::UnknownDevice,
+            format!(
+                "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
+            ),
+        ));
     }
-    bail!(
-        "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
-        known.join(", ")
-    )
+    Err(err(
+        ExitKind::UnknownDevice,
+        format!(
+            "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
+            known.join(", ")
+        ),
+    ))
 }
 
 /// #157 call-site derivation for the gate's `cert_revoked` input. A peer with

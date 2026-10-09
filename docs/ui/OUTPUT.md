@@ -178,7 +178,73 @@ who has seen the line once can read the loop.
 Under `--json` the same probe is one envelope per line on stdout,
 `{"ok","verb":"reach","data":{route,direct,rtt_ms,addr}}` — per verb, not a
 global wrapper, and the exit code is what a script branches on (0 direct,
-5 still on a relay at the timeout).
+5 still on a relay at the timeout, 6 no link at all: the peer is offline).
+A plain `reach --json` carries the same `ok`, `verb` and `data` keys next to
+the flat fields older scripts read (`warm`, `route`, `established`,
+`total_ms`, `failed_phase`), and `ok` is true only when the peer answered.
+
+## Exit codes
+
+Every verb ends in one of these. They are printed in `tunlion --help` (EXIT
+CODES) and defined once, in `cli/src/exit_codes.rs` (`ExitKind`), which a unit
+test holds to the help text.
+
+| code | token (`error.code`) | means |
+|---|---|---|
+| 0 | | success |
+| 1 | `error` | anything not classified below |
+| 2 | `usage` | bad arguments or flags |
+| 3 | `unknown_device` | no such device, or not paired with this one |
+| 4 | `denied` | refused by the peer, a capability or ceiling, or the system |
+| 5 | `still_relayed` | `reach --until-direct`: the link is up but still on a relay |
+| 6 | `unreachable` | the peer is offline, unreachable, or did not answer in time |
+| 7 | `network` | the tunlion server cannot be reached (no internet, DNS) |
+| 8 | `partial` | some files moved and some did not (`send`, `sync`) |
+| 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>` |
+| 130 | | interrupted |
+
+Rules that go with them:
+
+- **Codes 3, 4 and 5 kept the meanings they already had** (`sync`,
+  `devices --caps`, `reach --until-direct`), because gates assert them. `sync`
+  moved its unreachable from 5 to 6 and its partial from 7 to 8, so one number
+  means one thing across every verb.
+- **`exec` passes the remote command's own status through.** A remote `exit 3`
+  is a local 3; tunlion's own failures use the table, so for `exec` alone a
+  low code is ambiguous. `1` is still the catch-all for anything unclassified,
+  so a script that only tests `!= 0` is unaffected by any of this.
+- **A command that only looks never creates an identity.** On a keyless
+  device `id` answers `no identity yet; run ...` and exits 9 (`--json`:
+  `"identity": null`). `status --json` and `doctor --json` report
+  `"identity": null` and keep their own exit rules; `status` and `devices`
+  print the same one-line hint.
+- **`ok` describes the outcome, not the invocation.** `reach` and `doctor` on
+  an offline peer are `"ok": false` with exit 6; `doctor` with the tunlion
+  server unreachable is `"ok": false` with exit 7.
+- **Under `--json`, a failure is one JSON object on stdout**:
+  `{"ok":false,"verb":"<verb>","error":{"code":"<token>","exit":<n>,"message":"<text>"}}`,
+  plus `detail` with the raw error chain when it differs from the message.
+  stderr still carries the human line, for a log.
+- **A network failure is one plain line**, `Can't reach the tunlion server (no
+  internet or DNS?). Run tunlion doctor for details.`; the raw error chain is
+  shown under `-v`.
+- **`send --json`** prints one result object: `ok`, `verb`, `peer`, `bytes`
+  (total), `files` (each with `file`, `bytes`, `sha256`, `delivered`,
+  `declined`), `file` and `sha256` at the top when exactly one file was sent,
+  and `error` on failure. There is no `stored_name`: no receiver reports the
+  name it stored under. A send whose files were all declined exits 4; some
+  delivered and some declined exits 8.
+- **`up --detach` waits up to 10 s** for the daemon to report it is serving
+  (the ready marker it writes beside systemd's READY=1, or its control
+  socket). A daemon that exits during startup is reported with its last lines
+  of output and a nonzero exit (7 when it said the network was the cause). A
+  daemon still waiting for the network is reported as started but not
+  connected yet, exit 0: it keeps retrying, by design.
+- **`up` does not exit when the tunlion server is unreachable.** The daemon
+  retries with backoff (1, 2, 4, 8, 16, then every 30 s) and says once that it
+  is waiting for the network.
+- **`up.pid` holds the pid alone**, so `kill $(cat up.pid)` works. The
+  executable the daemon started from is in `up.exe` beside it.
 
 ## Enforcing this
 
