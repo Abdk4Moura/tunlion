@@ -1305,6 +1305,10 @@ mod tests {
         // Snapshot the real process state so it can be restored even if the
         // assertion below fails (the failure must not leak into parallel tests).
         let old_cwd = std::env::current_dir().unwrap();
+        // Mutates HOME, FILAMENT_CONFIG_DIR and the process cwd, all process-wide.
+        // Without the shared lock it could swap the config dir out from under any
+        // concurrently running test that reads it.
+        let _guard = crate::tests::lock_test_config();
         let old_home = std::env::var_os("HOME");
         let old_override = std::env::var_os("FILAMENT_CONFIG_DIR");
 

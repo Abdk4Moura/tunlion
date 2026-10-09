@@ -1402,12 +1402,19 @@ mod tests {
     }
     use super::*;
 
-    // FILAMENT_CONFIG_DIR is process-global, so config-dir tests must not run
-    // concurrently (cargo tests are multithreaded by default). Serialize them.
-    static CFG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // FILAMENT_CONFIG_DIR is process-global, so EVERY test that points it at a
+    // temp dir must serialize on ONE lock. This used to be a lock private to
+    // this module, which excluded only other settings tests: the twelve tests in
+    // tests.rs that set the same variable hold the shared lock_test_config()
+    // instead, so a settings test and one of those could interleave. One wrote
+    // to its temp dir, the other swapped the variable, and the read resolved a
+    // DIFFERENT directory and returned the default. That is #349 -- "a write is
+    // not visible to the very next read", Windows-only only because Windows CI
+    // happened to schedule the interleaving. Two disjoint locks over one global
+    // are no lock. The earlier fix (#355) changed the WRITE path, which was not
+    // the cause.
     fn with_tmp_cfg<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = CFG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::tests::lock_test_config();
         let dir = std::env::temp_dir().join(format!("fil-set-test-{}-{:x}", std::process::id(), rand_tag()));
         std::fs::create_dir_all(&dir).unwrap();
         // SAFETY: the lock above makes this the only thread touching the env/dir.
