@@ -53,7 +53,7 @@ mod interact;
 mod l2;
 mod mount;
 mod mount_proto;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 mod mount_fuse;
 #[cfg(all(target_os = "windows", feature = "mount-windows"))]
 mod mount_winfsp;

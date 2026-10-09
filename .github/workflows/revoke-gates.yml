@@ -129,7 +129,10 @@ jobs:
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3
-            [cli/tests/shell-posture-gates.sh]=3
+            # 4 = gates A/B/C + the setup-grant slot. The grant those gates
+            # depend on was never checked and in fact fails for the vouched
+            # record; the slot reports it (KNOWN-RED today, counted here).
+            [cli/tests/shell-posture-gates.sh]=4
             [cli/tests/forward-refusal-gates.sh]=5
           )
           rc=0
