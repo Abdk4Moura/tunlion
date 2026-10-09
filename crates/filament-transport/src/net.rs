@@ -1270,6 +1270,19 @@ impl Peer {
         #[cfg(feature = "test-hooks")]
         if std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false) {
             se.set_ip_filter(Box::new(|ip: std::net::IpAddr| ip.is_loopback()));
+            // THE FILTER ALONE YIELDS ZERO HOST CANDIDATES. webrtc-rs excludes
+            // loopback from host gathering unless told otherwise (default off,
+            // per RFC 8445 5.1.1.1; see SettingEngine::set_include_loopback_candidate).
+            // So "admit only loopback" composed with "never gather loopback"
+            // left nothing but the srflx candidate STUN returns -- the runner's
+            // own public address -- and two processes on one machine cannot
+            // reach each other through that, because the cloud NAT does not
+            // hairpin. ICE went checking -> failed, and every establishment that
+            // rides WebRTC failed with it. Before enrolment that is all of them,
+            // which is why Capability CI's join and pairing cells timed out while
+            // the gate suite (a plain release build, no test-hooks, so no filter)
+            // passed the same joins. Test-hooks only: production never runs this.
+            se.set_include_loopback_candidate(true);
             se.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
         }
         se.detach_data_channels(); // C1: we run our own read loop (see READ_BUF)
