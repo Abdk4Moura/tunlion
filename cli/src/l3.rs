@@ -1668,6 +1668,36 @@ mod tests {
     #[tokio::test]
     async fn l3_start_with_ipv4() {
         use super::*;
+        // ISOLATED CONFIG DIR, under the shared lock (#339). load_identity reads
+        // and writes the process-global config dir. Unguarded, this test raced
+        // the settings tests, which point FILAMENT_CONFIG_DIR at a temp dir and
+        // then remove_dir_all it: on Windows it failed with "write overlay key:
+        // The system cannot find the path specified". And with no override set
+        // at all, it wrote an overlay key into the developer's REAL config dir.
+        // Found by auditing every test that DEPENDS on the config dir, not just
+        // the ones that set it -- this was the only one of eight candidates that
+        // used the global rather than a path of its own.
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-l3-v4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("FILAMENT_CONFIG_DIR");
+        // SAFETY: the shared lock makes this the only test touching the env.
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        struct Restore(Option<std::ffi::OsString>, std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: still under the lock, which outlives this guard.
+                unsafe {
+                    match self.0.take() {
+                        Some(v) => std::env::set_var("FILAMENT_CONFIG_DIR", v),
+                        None => std::env::remove_var("FILAMENT_CONFIG_DIR"),
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _restore = Restore(previous, dir.clone());
         let identity = crate::overlay::load_identity().unwrap();
         let expected_v4 = identity.addr_v4();
         let cidr = format!("{}/128", identity.addr());
