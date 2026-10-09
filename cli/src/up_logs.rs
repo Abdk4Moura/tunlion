@@ -14,7 +14,7 @@
 //! descendant module like this one.
 use crate::{
     ServiceManager, ShellPolicy, daemon_alive, detach_up, direct, dlog, drop_dir,
-    install_system_service, pidfile, platform, recv_cmd, require_shell_owner_ack,
+    install_system_service, platform, recv_cmd, require_shell_owner_ack,
     service_manager_for_pid, settings, shell_grant_names, shell_root_note, sshkeys, subnet_forward,
     ui, write_pidfile,
 };
@@ -201,7 +201,7 @@ pub(crate) async fn up_cmd(
         }
         dlog!(
             "[up] already-up: pidfile={:?} pid={pid} cmdline={:?}",
-            pidfile(),
+            crate::pidfile(),
             std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default()
         );
         // #192: `up` twice should not dead-end. The daemon is already serving;

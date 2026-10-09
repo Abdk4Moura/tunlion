@@ -214,7 +214,7 @@ pub async fn reach_until_direct(
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             _ = tokio::signal::ctrl_c() => std::process::exit(130),
         }
-    }
+    };
     let kind = until_direct_verdict(&last);
     if !json_out {
         let verdict = match kind {
