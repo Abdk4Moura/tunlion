@@ -3585,14 +3585,24 @@ fn invitation_v2_roundtrips_without_argv_parsing() {
         Vec::new(),
     )
     .unwrap();
-    let token = format!(
-        "filament-invite:{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
-    );
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token());
+    let token = format!("filament-invite:v2:{b64}");
     let parsed = parse_invitation(&token).expect("a well-formed v2 token must parse");
     assert_eq!(parsed.caps, inv.caps, "caps round-trip");
     assert_eq!(parsed.enroll_pub, inv.enroll_pub, "derived pub round-trips");
     assert!(parse_invitation("secret-as-a-positional-argument").is_err());
+
+    // CROSS-RELEASE COMPATIBILITY, pinned. 0.8.4/0.8.5 mint the `v2:` form
+    // above; unreleased builds between #291 and its fix minted the same bytes
+    // with no `v2:`; 0.8.0-0.8.3 minted `v1:`. A mixed fleet mid-upgrade hands
+    // the next release all three.
+    let unprefixed = parse_invitation(&format!("filament-invite:{b64}"))
+        .expect("the unprefixed form carries the same v2 payload and must parse");
+    assert_eq!(unprefixed.enroll_pub, inv.enroll_pub);
+    let v1 = parse_invitation("filament-invite:v1:AAAA").err().expect("v1 is refused");
+    let v1 = v1.to_string();
+    assert!(v1.contains("pre-0.8.4"), "v1 must be named as stale, got: {v1}");
+    assert!(!v1.contains("base64"), "v1 must not read as a parse error, got: {v1}");
 }
 
 #[test]

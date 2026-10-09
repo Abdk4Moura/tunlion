@@ -2452,13 +2452,13 @@ fn add_for_device_and_person_carry_different_caps() {
     let parse = |file: &Path| -> Invitation {
         let raw = std::fs::read_to_string(file).expect("read invitation file");
         let token = raw.trim();
-        // The prefix is `filament-invite:` with no version segment: the payload
-        // carries its own version byte, which is what `from_token` checks. It
-        // was `filament-invite:v2:` when this test was written in August.
-        // Anchored to what add_for.rs emits today (`cli/src/add_for.rs:240`) and
-        // what file_io::parse_invitation consumes.
+        // The minted prefix is `filament-invite:v2:` and must stay that way: it
+        // is what the released 0.8.4/0.8.5 parsers require. An earlier edit to
+        // this very line relaxed it to match a mint that had dropped `v2:`, and
+        // in doing so hid a cross-release enrolment break. Asserting the exact
+        // prefix is the point: if the mint changes, this should fail.
         let encoded = token
-            .strip_prefix("filament-invite:")
+            .strip_prefix("filament-invite:v2:")
             .unwrap_or_else(|| panic!("token has the invitation prefix: {token}"));
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded)
