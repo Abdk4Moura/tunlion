@@ -2174,7 +2174,6 @@ pub(crate) fn warm_verify_window() -> std::time::Duration {
 /// than handing the client a dead connection (which would stall until ITS own
 /// timeout - the 25s ssh ConnectTimeout we measured). Verifying first means the
 /// fallback is immediate and the client never sends bytes into a black hole.
-#[cfg(unix)]
 async fn verify_first_frame(
     mux: &Arc<Mux>,
     sid: u32,
@@ -2222,14 +2221,12 @@ pub(crate) async fn open_stream_verified(
 /// a peer's `l2-close{err}` to the same error as a zombie link, so the daemon
 /// dropped a healthy warm link every time a forward was refused, and the client
 /// fell to a cold path that refused again with nothing on its terminal.
-#[cfg(unix)]
 pub(crate) enum WarmOpen {
     Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
     Refused(String),
     Dead(anyhow::Error),
 }
 
-#[cfg(unix)]
 pub(crate) async fn open_stream_verified_reason(
     mux: &Arc<Mux>,
     rport: u16,
