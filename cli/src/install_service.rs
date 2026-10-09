@@ -74,7 +74,7 @@ pub(crate) fn install_system_service(
     );
     // PROTOCOL LITERAL: frozen, do not rename. The unit file, and every
     // systemctl/journalctl/sudoers reference below, name the unit that
-    // released builds installed: platform::SYSTEMD_UNIT (`filament`).
+    // released builds installed: crate::platform::SYSTEMD_UNIT (`filament`).
     let unit_path = "/etc/systemd/system/filament.service";
     let am_root = unsafe { libc::geteuid() } == 0;
     // Run a privileged command, using sudo only when not already root.
@@ -148,10 +148,10 @@ pub(crate) fn install_system_service(
     // pre-existing --user service so the two don't fight over the mesh. Best-effort.
     let _ = run_priv(&["setcap", "-r", &exe]);
     let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", platform::SYSTEMD_UNIT])
+        .args(["--user", "disable", "--now", crate::platform::SYSTEMD_UNIT])
         .status();
     let enabled = run_priv(&["systemctl", "daemon-reload"])
-        && run_priv(&["systemctl", "enable", "--now", platform::SYSTEMD_UNIT]);
+        && run_priv(&["systemctl", "enable", "--now", crate::platform::SYSTEMD_UNIT]);
     if enabled {
         ui::say(&format!(
             "  {} system service enabled; CAP_NET_ADMIN comes from systemd, so no setcap on update",
@@ -178,7 +178,7 @@ pub(crate) fn install_system_service(
     let sudoers_path = "/etc/sudoers.d/filament";
     let sudoers = format!(
         "{user} ALL=(root) NOPASSWD: {systemctl} restart {unit}, {systemctl} daemon-reload\n",
-        unit = platform::SYSTEMD_UNIT,
+        unit = crate::platform::SYSTEMD_UNIT,
     );
     let wrote_sudoers = {
         use std::io::Write;
