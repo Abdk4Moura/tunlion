@@ -106,7 +106,7 @@ pub fn registry() -> &'static [Setting] {
             aliases: &["dir"],
             store: "dir",
             kind: Kind::Path,
-            default: "~/Tunlion",
+            default: "~/Filament if it exists, else ~/Tunlion",
             scope: ScopeKind::GlobalOnly,
             env: None,
             daemon: true,

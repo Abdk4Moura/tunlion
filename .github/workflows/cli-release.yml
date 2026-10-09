@@ -9,6 +9,15 @@
 # tap, and the winget manifests all consume these exact artifact names:
 #     tunlion-<target>.tar.gz   (unix)   /  tunlion-<target>.zip (windows)
 #     SHA256SUMS
+#
+# PROTOCOL LITERAL: frozen, do not rename. Every release ALSO publishes the
+# same build under the pre-rename names, with the binary inside named the old
+# way:
+#     filament-<target>.tar.gz  (contains `filament`)
+#     filament-<target>.zip     (contains `filament.exe` + wintun.dll)
+# because released 0.8.x `filament update` asks for exactly those asset names
+# and that inner file name, and verifies them against SHA256SUMS. Without the
+# aliases every installed 0.8.x can never self-update past the rename.
 # Ledger C16 / gap G-e: docs/cli-resilience.md.
 
 name: cli-release
@@ -88,6 +97,11 @@ jobs:
           mkdir -p out
           cp "cli/target/${{ matrix.target }}/release/tunlion" out/
           tar -C out -czf "tunlion-${{ matrix.target }}.tar.gz" tunlion
+          # Pre-rename alias (see the header): same build, old asset name,
+          # inner binary named `filament`, which is what 0.8.x `update` unpacks.
+          mkdir -p out-legacy
+          cp "cli/target/${{ matrix.target }}/release/tunlion" out-legacy/filament
+          tar -C out-legacy -czf "filament-${{ matrix.target }}.tar.gz" filament
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -112,12 +126,20 @@ jobs:
           if ($sig.SignerCertificate.Subject -notmatch "WireGuard LLC") { throw "wintun.dll not signed by WireGuard LLC: $($sig.SignerCertificate.Subject)" }
           Copy-Item $dll out/
           Compress-Archive -Path "out/*" -DestinationPath "tunlion-${{ matrix.target }}.zip"
+          # Pre-rename alias (see the header): same build and DLL, old asset
+          # name, exe named `filament.exe`, which is what 0.8.x `update` unpacks.
+          New-Item -ItemType Directory -Force -Path out-legacy | Out-Null
+          Copy-Item "out/tunlion.exe" "out-legacy/filament.exe"
+          Copy-Item "out/wintun.dll" "out-legacy/wintun.dll"
+          Compress-Archive -Path "out-legacy/*" -DestinationPath "filament-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: pkg-${{ matrix.target }}
           path: |
             tunlion-*.tar.gz
             tunlion-*.zip
+            filament-*.tar.gz
+            filament-*.zip
           if-no-files-found: error
 
   release:
@@ -140,10 +162,11 @@ jobs:
           path: dist
       - name: Checksums
         run: |
-          (cd dist && sha256sum tunlion-*.tar.gz tunlion-*.zip > SHA256SUMS)
+          (cd dist && sha256sum tunlion-*.tar.gz tunlion-*.zip filament-*.tar.gz filament-*.zip > SHA256SUMS)
           cat dist/SHA256SUMS
       # #151: pin the release asset set to EXACTLY the four platform artifacts
-      # plus SHA256SUMS. cli-v0.7.7 published three repo-root docs under
+      # (each under its tunlion name and its pre-rename filament alias) plus
+      # SHA256SUMS. cli-v0.7.7 published three repo-root docs under
       # tunlion-*.md because the release job gained a checkout (for
       # changelog-driven notes) and the bare globs widened. This check fails
       # the release on any extra or missing asset.
@@ -155,6 +178,8 @@ jobs:
           subject-path: |
             dist/tunlion-*.tar.gz
             dist/tunlion-*.zip
+            dist/filament-*.tar.gz
+            dist/filament-*.zip
             dist/SHA256SUMS
       # WHY THIS EXISTS
       #
@@ -226,4 +251,6 @@ jobs:
           files: |
             dist/tunlion-*.tar.gz
             dist/tunlion-*.zip
+            dist/filament-*.tar.gz
+            dist/filament-*.zip
             dist/SHA256SUMS

@@ -41,7 +41,9 @@ pub const PUNCH_BUDGET: Duration = Duration::from_secs(3);
 /// race) and to survive loss.
 const PUNCH_INTERVAL: Duration = Duration::from_millis(75);
 /// Magic bytes so a punch datagram is unmistakably ours (not stray QUIC).
-const PUNCH_MAGIC: &[u8] = b"TUNLION-PUNCH-v1";
+/// PROTOCOL LITERAL: frozen, do not rename. Released peers send and match
+/// exactly these bytes; a renamed magic makes every punch to them fail.
+const PUNCH_MAGIC: &[u8] = b"FILAMENT-PUNCH-v1";
 
 // ============================================================== STUN discovery
 
@@ -507,5 +509,27 @@ mod tests {
         assert!(srflx.ip().is_loopback(), "srflx ip {} not loopback", srflx.ip());
         assert_eq!(srflx.port(), client.local_addr().unwrap().port());
         handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn punch_magic_is_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("PUNCH_MAGIC", super::PUNCH_MAGIC,
+             "e94cd67f5a3f4b181aaf614005aaf6785b60b1775bed3907314036be20497888"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }

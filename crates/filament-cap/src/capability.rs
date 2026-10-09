@@ -158,6 +158,7 @@ pub const MAX_SKEW_SECS: u64 = 300;
 
 /// Domain constant for the deterministic "self" resource nonce.
 /// Survives cold-key restore: the key survives, so the resource id does too.
+// PROTOCOL LITERAL: frozen, do not rename.
 pub const SELF_RESOURCE_DOMAIN: &[u8] = b"filament-self-resource-v1";
 
 pub fn self_resource_nonce() -> [u8; 32] {
@@ -176,6 +177,7 @@ pub fn self_resource_id(owner_pub: &[u8; 32]) -> String {
 /// Domain constant for route-resource nonces. Separate from SELF so a route id
 /// can never collide with the self id, and so the two namespaces can evolve
 /// independently.
+// PROTOCOL LITERAL: frozen, do not rename.
 pub const ROUTE_RESOURCE_DOMAIN: &[u8] = b"filament-route-resource-v1";
 
 /// Deterministic nonce for a CIDR, so the same prefix always names the same
@@ -343,6 +345,7 @@ pub fn hash_header(header: &CapHeader) -> [u8; 32] {
 // CapOp  (domain b"filament/capability-op/v1")
 // ---------------------------------------------------------------------------
 
+// PROTOCOL LITERAL: frozen, do not rename.
 const CAPOP_SIGN_DOMAIN: &[u8] = b"filament/capability-op/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -874,7 +877,7 @@ impl TagBindingObj {
             buf.extend_from_slice(f);
         }
         let mut v = Vec::new();
-        v.extend_from_slice(b"filament/tag-binding/v1");
+        v.extend_from_slice(TAG_BINDING_DOMAIN);
         lp(&mut v, &self.tag_ref);
         lp(&mut v, &[self.subject_kind]);
         lp(&mut v, &self.subject);
@@ -1006,7 +1009,10 @@ impl TagBindingObj {
 // CapHeader  (domain b"filament/capability-header/v1")
 // ---------------------------------------------------------------------------
 
+// PROTOCOL LITERAL: frozen, do not rename.
 const CAPHEADER_SIGN_DOMAIN: &[u8] = b"filament/capability-header/v1";
+// PROTOCOL LITERAL: frozen, do not rename (tag-binding signature domain).
+const TAG_BINDING_DOMAIN: &[u8] = b"filament/tag-binding/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapFloor {
@@ -3986,5 +3992,34 @@ mod route_scope_tests {
         assert!(!cidr_within_any("not-a-cidr", &allow(&["10.0.0.0/8"])));
         assert!(!cidr_within_any("10.0.0.0/33", &allow(&["10.0.0.0/8"])));
         assert!(!cidr_within_any("10.0.0.0/24", &allow(&["garbage"])));
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+/// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+///
+/// Each digest was computed from the ORIGINAL (pre-rename) literal with
+/// `printf '%s' '<literal>' | sha256sum`. A digest cannot be satisfied by a
+/// find-and-replace: if a rename touches one of these literals this test
+/// fails, and the literal is what must be put back.
+    #[test]
+    fn capability_domains_are_frozen() {
+        use sha2_pake::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("SELF_RESOURCE_DOMAIN", super::SELF_RESOURCE_DOMAIN,
+             "ed9f1a70d0c32a43ba6f7ed81056a32e77ef8d64c89f043124a1057c03b7ee9e"),
+            ("ROUTE_RESOURCE_DOMAIN", super::ROUTE_RESOURCE_DOMAIN,
+             "10e31fada2b653fd92673b580cfda79e1d36923a36c99828565a177f7f2d5943"),
+            ("CAPOP_SIGN_DOMAIN", super::CAPOP_SIGN_DOMAIN,
+             "dfd49712783337b1722d3501628a32868a7ba175b274ba3708f341244498b7dd"),
+            ("CAPHEADER_SIGN_DOMAIN", super::CAPHEADER_SIGN_DOMAIN,
+             "cb0a517f9714d9ff71f314c8163b74652c09c00f04e89e1a66064d79b8420b66"),
+            ("TAG_BINDING_DOMAIN", super::TAG_BINDING_DOMAIN,
+             "f98372c35460c41b117bf142f993d805ae47ff2c0d3fbc6cd124f9d8e750dfe2"),
+        ] {
+            let got: String = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }

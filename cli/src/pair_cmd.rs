@@ -242,7 +242,8 @@ pub(crate) async fn pair_cmd(
             // the server rejects it, and the user is told "codes burn after one
             // use" about a token that was never claimed, with a remedy
             // (`re-run tunlion add`) that mints a code and cannot help.
-            if c.starts_with("filament-invite:") {
+            // PROTOCOL LITERAL: frozen, do not rename (shared constant).
+            if c.starts_with(crate::file_io::INVITE_PREFIX) {
                 bail!("{}", invitation_not_a_code_msg());
             }
             // Claimer: normalize the typed code, split, send ONLY the nameplate.

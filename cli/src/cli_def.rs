@@ -141,7 +141,7 @@ pub(crate) enum Cmd {
         /// Name this device (default: hostname).
         #[arg(long)]
         name: Option<String>,
-        /// Directory where received files land (default: ~/Tunlion).
+        /// Directory where received files land (default: ~/Filament if it exists, else ~/Tunlion).
         #[arg(long)]
         inbox: Option<PathBuf>,
         /// Write the recovery phrase to a new owner-only file for automation.
@@ -339,7 +339,7 @@ pub(crate) enum Cmd {
         /// when available, userspace otherwise).
         #[arg(long)]
         userspace: bool,
-        /// Drop directory (default: `tunlion config dir`, else ~/Tunlion)
+        /// Drop directory (default: `tunlion config dir`, else ~/Filament if it exists, else ~/Tunlion)
         #[arg(long)]
         dir: Option<PathBuf>,
         /// Accept seamless `tunlion shell --ssh` from ANY paired (proof-verified) device,
