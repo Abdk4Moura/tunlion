@@ -4,7 +4,8 @@
 # These are NOT in the required-check set (the map document's design:
 # macOS macFUSE cannot be provisioned on hosted runners; Windows WinFsp
 # CAN be via choco with no reboot). Run on push to branches matching
-# mount-* or feat/mount-* plus workflow_dispatch.
+# mount-* or feat/mount-*, on PRs touching the adapters or their deps,
+# weekly on a schedule, and on workflow_dispatch.
 
 name: Mount CI
 
@@ -13,11 +14,21 @@ on:
     branches:
       - mount-*
       - 'feat/mount-*'
+  # The path filter used to name only the mount sources, so this workflow had
+  # never run on main: a dependency bump (cli/Cargo.toml, Cargo.lock) or a change
+  # in a crate the adapters build against could break the feature builds with no
+  # run to notice. Those paths are watched now, and a weekly run catches drift
+  # that no PR touches (a new toolchain, a yanked dependency, runner images).
   pull_request:
     paths:
       - 'cli/src/mount_*.rs'
       - 'cli/src/mount_proto.rs'
+      - 'cli/Cargo.toml'
+      - 'cli/Cargo.lock'
+      - 'crates/**'
       - '.github/workflows/mount-ci.yml'
+  schedule:
+    - cron: '17 4 * * 1'
   workflow_dispatch: {}
 
 concurrency:
@@ -47,3 +58,22 @@ jobs:
         run: cargo test --features mount-windows -- mount_winfsp::escape_tests
         env:
           RUST_MIN_STACK: 8388608
+
+  # mount-macos is a real feature in cli/Cargo.toml (dep:fuser), and it was
+  # compiled by nothing: the release and test builds leave it off, and this
+  # workflow had only a Windows job. A type check is what a hosted runner can
+  # honestly give: macFUSE's headers install there, but its kernel extension
+  # cannot load, so the adapter is checked, not mounted.
+  mount-macos:
+    name: mount (macos, check)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install macFUSE (headers and pkg-config file)
+        run: brew install --cask macfuse
+
+      - name: Check with mount-macos feature
+        working-directory: cli
+        run: cargo check --features mount-macos

@@ -998,31 +998,27 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
 
     // 4. B must hold A's CERT for the revocation gate to bind (cert_revoked_for
     // keys off deviceCert.devicePub). The daemon records it when it resolves A's
-    // identity during the control; if not, record A's REAL cert now.
+    // identity during the control. This used to be PATCHED when missing (A's
+    // cert written into B's devices.json by the test), which meant the test
+    // could pass while the product never recorded the identity it revokes on:
+    // the revocation would then bind only because the test supplied its input.
+    // It is asserted instead, so a product that fails to record A's cert is red
+    // here, by name.
     let b_records = read_devices_json(&h.b_dir);
     let b_has_a_cert = b_records.as_array().unwrap().iter().any(|d| {
         d["name"].as_str() == Some("test-a") && d["deviceCert"]["devicePub"].as_str().is_some()
     });
-    if !b_has_a_cert {
-        let a_cert_val: Value = serde_json::from_str(
-            &std::fs::read_to_string(&a_cert_path).expect("a device cert"),
-        )
-        .expect("parse a device cert");
-        let a_cert = a_cert_val["cert"].clone();
-        assert!(a_cert["devicePub"].as_str().is_some(), "A's device cert has a devicePub");
-        let mut arr: Vec<Value> = read_devices_json(&h.b_dir).as_array().unwrap().clone();
-        for d in arr.iter_mut() {
-            if d["name"].as_str() == Some("test-a") {
-                d["userKey"] = serde_json::json!(a_cert["userPub"].as_str().unwrap_or_default());
-                d["deviceCert"] = a_cert.clone();
-            }
-        }
-        std::fs::write(
-            h.b_dir.join("devices.json"),
-            serde_json::to_string_pretty(&arr).unwrap(),
-        )
-        .expect("write b devices.json with A's cert");
-    }
+    let a_cert_on_disk = std::fs::read_to_string(&a_cert_path).unwrap_or_default();
+    assert!(
+        b_has_a_cert,
+        "B's daemon did not record A's device certificate after the control transfer \
+         resolved A, so a revocation on B has no devicePub to bind to (cert_revoked_for \
+         would be false whatever the product did). The test no longer writes the cert in \
+         for it.\nB devices.json:\n{}\nA device-cert.json:\n{a_cert_on_disk}\ncontrol send:\n{}{}",
+        serde_json::to_string_pretty(&b_records).unwrap_or_default(),
+        ctrl_send.stdout,
+        ctrl_send.stderr
+    );
 
     // 5. Revoke A on B.
     let revoke = Command::new(&bin)
