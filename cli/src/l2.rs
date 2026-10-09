@@ -5016,7 +5016,16 @@ mod term_tests {
     fn a_term_with_no_terminfo_falls_back_instead_of_breaking_curses_apps() {
         // Reproduced: TERM=xterm-kitty on a server without that entry made a
         // remote `tmux` exit with "missing or unsuitable terminal".
-        assert_eq!(effective_term("definitely-not-a-real-terminal-x9"), "xterm-256color");
+        //
+        // The contract, portably: effective_term keeps a name exactly when the
+        // platform says it has terminfo for it, and otherwise falls back. On
+        // unix an invented name has none (pinned in platform/'s own tests); on
+        // Windows there is no terminfo and every name is kept by design. The
+        // first version asserted the unix outcome everywhere and failed on the
+        // Windows runner, which was the test being wrong, not the code.
+        let name = "definitely-not-a-real-terminal-x9";
+        let want = if crate::platform::terminfo_exists(name) { name } else { "xterm-256color" };
+        assert_eq!(effective_term(name), want);
         assert_eq!(effective_term(""), "xterm-256color");
     }
 

@@ -1562,6 +1562,16 @@ fn win_console_set(which: u32, mode: u32) {
 /// Windows needs SeCreateSymbolicLinkPrivilege (or Developer Mode), so a caller checks the capability
 /// rather than guessing it from the platform, and an error means "this host cannot exercise that arm",
 /// not "the product is broken".
+/// The platform fact effective_term relies on, tested where the conditional
+/// lives: on unix an invented terminal name has no terminfo entry, and a name
+/// every CI image ships does. (On Windows terminfo_exists is true by design.)
+#[cfg(all(test, unix))]
+#[test]
+fn terminfo_lookup_distinguishes_known_from_invented_names() {
+    assert!(!terminfo_exists("definitely-not-a-real-terminal-x9"));
+    assert!(terminfo_exists("xterm-256color"), "every Linux/macOS image ships xterm-256color");
+}
+
 #[cfg(test)]
 pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
