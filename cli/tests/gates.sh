@@ -358,9 +358,12 @@ kill $R 2>/dev/null
 # "declined", which is precisely the contract #274 called a bug: a script could
 # not tell a delivered transfer from a refused one. Asserting 1 specifically,
 # not merely nonzero, so a `timeout` kill (124) cannot satisfy this gate.
-if [ $G8 -eq 1 ] && grep -q "declined" "$WORK/g8-send.log" \
+# Now 4, not 1: the exit-code taxonomy (cli/src/exit_codes.rs, `tunlion --help`
+# EXIT CODES) gives "every file declined by the peer" the denied code; a partial
+# send (some delivered) is 8.
+if [ $G8 -eq 4 ] && grep -q "declined" "$WORK/g8-send.log" \
    && grep -q "no files delivered" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
-  ok "offer declined without consent; sender reported the decline and exited 1"
+  ok "offer declined without consent; sender reported the decline and exited 4 (denied)"
 else bad "consent decline"; tail -n 3 "$WORK/g8-send.log" "$WORK/g8-recv.log"; fi
 
 # ---------------------------------------------------------------- gate 9 ----
