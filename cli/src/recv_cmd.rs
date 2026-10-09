@@ -4864,7 +4864,16 @@ pub(crate) async fn recv_cmd(
                 // verify window expiring and a HEALTHY link being dropped as a zombie
                 // (which made every warm `forward` fall to a cold link). See
                 // l2::Mux::on_open_ack.
-                Some("l2-open-ack") if l2_enabled => {
+                // NOT gated on `l2_enabled`, for the reason spelled out on the
+                // `l2-close` arm just below: `l2_enabled` answers "will I ACCEPT
+                // inbound opens", and an ack is the peer ANSWERING an open WE sent.
+                // The gate was applied here anyway, so on a delegate daemon (L2 off
+                // unless it serves shells) a warm `forward` to a client-speaks-first
+                // service never heard its ack, the verify window expired, and a
+                // healthy link was dropped as a zombie and replaced by a cold one.
+                // Same defect as the `l2-close` guard in handle_forward_open, one
+                // arm away; the mux only acts on an ack for a sid it opened.
+                Some("l2-open-ack") => {
                     if let Some(sid) = l2::wire_sid(&v) {
                         if let Some(mux) = l2_muxes.get(&pid) {
                             mux.on_open_ack(sid).await;
