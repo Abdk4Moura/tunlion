@@ -283,7 +283,26 @@ async fn handle_forward_open(
     // reload that turns L2 off cannot be outrun by an open that parked while it
     // was on), and the denial is byte-identical to the live arm's so the peer
     // gets one reason for one cause.
-    if !l2_enabled {
+    //
+    // THE GUARD APPLIES TO OPENS ONLY. This is the establishment stall that held
+    // the gate suite red from 2026-09-18: the guard was written as `!l2_enabled`
+    // alone, while the live arm it claims to mirror is
+    // `l2_enabled || type == "l2-close"`. So it ALSO caught the peer's `l2-close`
+    // for a stream WE opened -- which is the one message a node with L2 off must
+    // still act on, exactly as the live arm's own comment explains. The close was
+    // admitted by the dispatch, then discarded here before `on_close`, so:
+    //
+    //   - the stream was never dropped and its pipe never closed;
+    //   - the warm bridge (dc_to_socket) never ended, so the local client's
+    //     socket stayed ESTABLISHED and `tunlion shell <peer> -- cmd` hung after
+    //     printing the command's output (roster gate B, shell-gates gateA2);
+    //   - and this branch answered the close with an l2-close{TUNNEL_OFF} of its
+    //     own, which is the unexplained "rx l2-close <- <delegate>" in the
+    //     acceptor's log.
+    //
+    // Every delegate daemon runs with L2 off unless it serves shells itself, so
+    // this hit every daemon-mediated one-shot from a delegate.
+    if !l2_enabled && v["type"].as_str() != Some("l2-close") {
         if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
             let _ = t
                 .send_control(&json!({
