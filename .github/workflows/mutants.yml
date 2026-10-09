@@ -43,6 +43,13 @@ on:
         default: ""
   schedule:
     - cron: "17 3 * * 0"
+  # GitHub only lets a workflow be dispatched once it is registered, and a
+  # file that exists only on a branch is registered by its first run. This
+  # trigger fires only when this file changes on the probe branch, so it
+  # registers the workflow without running on PRs. Drop it before merging.
+  push:
+    branches: [test/mutation-probe]
+    paths: [.github/workflows/mutants.yml]
 
 concurrency:
   group: mutants-${{ github.ref }}
