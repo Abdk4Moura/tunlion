@@ -43,13 +43,6 @@ on:
         default: ""
   schedule:
     - cron: "17 3 * * 0"
-  # GitHub only lets a workflow be dispatched once it is registered, and a
-  # file that exists only on a branch is registered by its first run. This
-  # trigger fires only when this file changes on the probe branch, so it
-  # registers the workflow without running on PRs. Drop it before merging.
-  push:
-    branches: [test/mutation-probe]
-    paths: [.github/workflows/mutants.yml]
 
 concurrency:
   group: mutants-${{ github.ref }}
@@ -138,7 +131,9 @@ jobs:
       - name: Run cargo-mutants
         working-directory: ${{ matrix.dir }}
         run: |
-          set -uo pipefail
+          # Actions runs this under `bash -e`; the exit code is inspected
+          # below, so do not let a findings exit kill the step first.
+          set +e -uo pipefail
           args=()
           for f in ${{ matrix.files }}; do args+=(--file "$f"); done
           # --in-place: the crates reach each other through relative path
