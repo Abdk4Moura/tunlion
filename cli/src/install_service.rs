@@ -26,32 +26,20 @@ use anyhow::bail;
 /// cap, retires a pre-existing --user service, and enables it, using ONE `sudo` for
 /// the privileged steps (a single interactive prompt, NOT a per-update one). If it
 /// cannot elevate, it prints the exact unit + commands to run by hand.
+///
+/// `argv` is the daemon's argument list (`["up", ...]`, built by
+/// `up_logs::DaemonOpts::daemon_argv`), so every `up` flag the user gave
+/// reaches the unit, quoted for systemd, not just the shell posture.
 #[cfg(target_os = "linux")]
-pub(crate) fn install_system_service(
-    shell: bool,
-    shell_only: &Option<String>,
-    shell_user: &Option<String>,
-    i_know: bool,
-) -> Result<()> {
-    let exe = std::env::current_exe()?.display().to_string();
+pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
+    let exe_path = std::env::current_exe()?;
+    let exe = exe_path.display().to_string();
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "root".into());
     let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"));
 
-    // Carry the same shell posture the user asked for into the unit's ExecStart.
-    let mut up_args = String::from(" up");
-    if let Some(csv) = shell_only {
-        up_args.push_str(&format!(" --shell-only {csv}"));
-    } else if shell {
-        up_args.push_str(" --shell");
-    }
-    if let Some(u) = shell_user {
-        up_args.push_str(&format!(" --shell-user {u}"));
-    }
-    if i_know {
-        up_args.push_str(" --i-know");
-    }
+    let exec_start = crate::platform::systemd_exec_start(&exe_path, argv);
 
     let unit = format!(
         "[Unit]\n\
@@ -63,7 +51,7 @@ pub(crate) fn install_system_service(
          User={user}\n\
          Environment=HOME={home}\n\
          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-         ExecStart={exe}{up_args}\n\
+         ExecStart={exec_start}\n\
          AmbientCapabilities=CAP_NET_ADMIN\n\
          CapabilityBoundingSet=CAP_NET_ADMIN\n\
          Restart=always\n\
@@ -142,7 +130,7 @@ pub(crate) fn install_system_service(
         ));
         ui::say(&format!("  sudo setcap -r {exe} 2>/dev/null || true"));
         ui::say("  sudo systemctl daemon-reload && sudo systemctl enable --now filament");
-        return Ok(());
+        anyhow::bail!("the system service was not installed (could not write {unit_path})");
     }
     // Drop any stale file cap (ambient replaces it; keeps updates clean); retire a
     // pre-existing --user service so the two don't fight over the mesh. Best-effort.
@@ -159,7 +147,12 @@ pub(crate) fn install_system_service(
         ));
         ui::say("  logs: journalctl -u filament");
     } else {
-        ui::say("  wrote the unit; enable it with: sudo systemctl enable --now filament");
+        // Not "installed": the unit is on disk but nothing runs it. Say what
+        // failed and stop, so the exit code tells a script the same thing.
+        ui::say("  wrote the unit, but `systemctl daemon-reload` / `enable --now filament` failed");
+        anyhow::bail!(
+            "the system service is not running; enable it by hand: sudo systemctl daemon-reload && sudo systemctl enable --now filament"
+        );
     }
 
     // Belt-and-suspenders: a NOPASSWD sudoers drop-in scoped to JUST restarting this
@@ -220,15 +213,21 @@ pub(crate) fn install_system_service(
     Ok(())
 }
 
+/// macOS: a LaunchDaemon, elevating through the administrator prompt.
+/// Elsewhere there is no working system tier yet, so refuse before asking for
+/// elevation rather than after.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn install_system_service(
-    _shell: bool,
-    _shell_only: &Option<String>,
-    _shell_user: &Option<String>,
-    _i_know: bool,
-) -> Result<()> {
-    let hint = platform::ServiceHost::detect().install_instructions();
-    bail!(
-        "--install --system (ambient-cap system service) is not supported on this platform. {hint}"
-    );
+pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
+    let host = platform::ServiceHost::detect();
+    if host != platform::ServiceHost::Launchd {
+        let hint = host.install_instructions();
+        bail!("--install --system is not supported on this platform. {hint}");
+    }
+    let exe = std::env::current_exe()?;
+    host.install_system(&exe, argv)?;
+    crate::ui::say(&format!(
+        "  {} installed as a system service (autostart at boot)",
+        crate::ui::paint(crate::ui::Tone::Ok, crate::ui::glyph_ok())
+    ));
+    Ok(())
 }

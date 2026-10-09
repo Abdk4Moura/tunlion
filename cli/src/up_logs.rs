@@ -22,11 +22,131 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Every `up` option that changes what the DAEMON does, as the user typed it.
+///
+/// `up --install`, `up --install --system`, `up --detach` and the elevated
+/// re-run all start a SECOND process, and that process only knows what is in
+/// its argv. Each path used to build that argv by hand from whichever flags its
+/// author thought of: `--install` carried the shell posture and nothing else,
+/// `--detach` carried `--server`/`--dir` and nothing else. `up --install
+/// --userspace --no-relay` installed a service that used the kernel overlay
+/// and the relay, with no message. Now there is one list, built here, and
+/// `up_flags_round_trip_through_the_daemon_argv` fails the build when an `up`
+/// flag is neither forwarded nor named as launch-only.
+///
+/// Values are the RAW flags, not flags merged with settings: the daemon reads
+/// the settings itself on every start, so baking `set shell on` into a unit
+/// would make a later `set shell off` silently not apply to the service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DaemonOpts {
+    /// `--server` (or FILAMENT_SERVER) when it is not the default. A service
+    /// does not inherit this shell's environment, so an env value is forwarded
+    /// as a flag.
+    pub(crate) server: Option<String>,
+    pub(crate) relay: bool,
+    pub(crate) no_relay: bool,
+    pub(crate) name_as: Option<String>,
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) userspace: bool,
+    pub(crate) shell: bool,
+    pub(crate) shell_only: Option<String>,
+    pub(crate) shell_program: Option<String>,
+    pub(crate) shell_user: Option<String>,
+    pub(crate) i_know: bool,
+    pub(crate) no_proxy_fallback: bool,
+}
+
+impl DaemonOpts {
+    /// The daemon options of a parsed `up` invocation; `None` for any other
+    /// command.
+    pub(crate) fn from_cli(cli: &crate::Cli) -> Option<DaemonOpts> {
+        let Some(crate::Cmd::Up {
+            install: _,
+            detach: _,
+            system: _,
+            install_system: _,
+            userspace,
+            dir,
+            shell,
+            shell_only,
+            shell_program,
+            shell_user,
+            i_know,
+            no_proxy_fallback,
+        }) = &cli.cmd
+        else {
+            return None;
+        };
+        Some(DaemonOpts {
+            server: (cli.server != crate::DEFAULT_SERVER).then(|| cli.server.clone()),
+            relay: cli.relay,
+            no_relay: cli.no_relay,
+            name_as: cli.name_as.clone(),
+            dir: dir.clone(),
+            userspace: *userspace,
+            shell: *shell,
+            shell_only: shell_only.clone(),
+            shell_program: shell_program.clone(),
+            shell_user: shell_user.clone(),
+            i_know: *i_know,
+            no_proxy_fallback: *no_proxy_fallback,
+        })
+    }
+
+    /// The argv (without the program) that starts a daemon with these
+    /// options: `["up", "--flag", "--key=value", ...]`. Values use the
+    /// `--key=value` form so one that starts with `-` cannot be read as a flag.
+    pub(crate) fn daemon_argv(&self) -> Vec<String> {
+        let mut a: Vec<String> = vec!["up".into()];
+        let val = |a: &mut Vec<String>, k: &str, v: &Option<String>| {
+            if let Some(v) = v {
+                a.push(format!("--{k}={v}"));
+            }
+        };
+        val(&mut a, "server", &self.server);
+        if self.relay {
+            a.push("--relay".into());
+        }
+        if self.no_relay {
+            a.push("--no-relay".into());
+        }
+        val(&mut a, "name-as", &self.name_as);
+        let dir = self.dir.as_ref().map(|d| d.to_string_lossy().into_owned());
+        val(&mut a, "dir", &dir);
+        if self.userspace {
+            a.push("--userspace".into());
+        }
+        if self.shell {
+            a.push("--shell".into());
+        }
+        val(&mut a, "shell-only", &self.shell_only);
+        val(&mut a, "shell-program", &self.shell_program);
+        val(&mut a, "shell-user", &self.shell_user);
+        if self.i_know {
+            a.push("--i-know".into());
+        }
+        if self.no_proxy_fallback {
+            a.push("--no-proxy-fallback".into());
+        }
+        a
+    }
+}
+
+/// How `up` was asked to run, as opposed to what the daemon does.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct UpMode {
+    pub(crate) install: bool,
+    pub(crate) system: bool,
+    pub(crate) detach: bool,
+    /// Internal: this process IS the elevated re-run; install and exit.
+    pub(crate) install_system: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn up_cmd(
     server: &str,
-    install: bool,
-    system: bool,
-    detach: bool,
+    mode: UpMode,
+    daemon: &DaemonOpts,
     dir: Option<PathBuf>,
     relay: bool,
     shell: bool,
@@ -34,33 +154,27 @@ pub(crate) async fn up_cmd(
     shell_program: Option<String>,
     shell_user: Option<String>,
     i_know: bool,
-    install_system_flag: bool,
     no_proxy_fallback: bool,
 ) -> Result<()> {
+    let UpMode {
+        install,
+        system,
+        detach,
+        install_system: install_system_flag,
+    } = mode;
+    let daemon_argv = daemon.daemon_argv();
     let shell_enabled = shell || shell_only.is_some();
     let shell_config = settings::get_str("shell-program", None);
     let can_use_user =
         platform::Paths::shell_argv(None, shell_config.as_deref(), shell_user.as_deref()).1;
     require_shell_owner_ack(shell_enabled, shell_user.as_deref(), can_use_user, i_know)?;
-    // Internal: re-invoked after elevation. Do the system-level install directly
-    // and return. The privileged backend registers the service/daemon/task and exits.
+    // Internal: re-invoked after elevation (macOS's administrator prompt). Do
+    // the system-level install directly and return. This process was started
+    // with the same daemon flags, so its own argv is the one to install.
     if install_system_flag {
         let host = platform::ServiceHost::detect();
         let exe = std::env::current_exe()?;
-        // Build shell args from the current flag carried by the elevated process.
-        let mut up_args = String::new();
-        if let Some(csv) = &shell_only {
-            up_args.push_str(&format!(" --shell-only {csv}"));
-        } else if shell {
-            up_args.push_str(" --shell");
-        }
-        if let Some(u) = &shell_user {
-            up_args.push_str(&format!(" --shell-user {u}"));
-        }
-        if i_know {
-            up_args.push_str(" --i-know");
-        }
-        host.install_system(&exe, &up_args)?;
+        host.install_system(&exe, &daemon_argv)?;
         return Ok(());
     }
     // --shell-program -- persist it so the daemon picks it up (shell_argv reads
@@ -95,37 +209,26 @@ pub(crate) async fn up_cmd(
         ));
     }
     if install && system {
-        return install_system_service(shell, &shell_only, &shell_user, i_know);
+        return install_system_service(&daemon_argv);
     }
     if install {
-        // Gate --install on a detected service manager.
+        // `--install` is the USER service, everywhere, and only that. It used
+        // to try a root system service first whenever elevation worked (and on
+        // Linux that unit had no `User=`), so the help's "user service" was
+        // true only on machines where asking for root failed. A system service
+        // is `--install --system`, an explicit request.
         let host = platform::ServiceHost::detect();
         if !host.supports_install() {
             let hint = host.install_instructions();
-            eprintln!("tunlion: --install is not supported on this platform. {hint}");
-            return Ok(());
+            anyhow::bail!("--install is not supported on this platform. {hint}");
         }
         let exe = std::env::current_exe()?;
-        let mut up_args = String::new();
-        if let Some(csv) = &shell_only {
-            up_args.push_str(&format!(" --shell-only {csv}"));
-        } else if shell {
-            up_args.push_str(" --shell");
-        }
-        if let Some(u) = &shell_user {
-            up_args.push_str(&format!(" --shell-user {u}"));
-        }
-        if i_know {
-            up_args.push_str(" --i-know");
-        }
-        // Try privileged system install (elevation popup). On decline, fall
-        // back to user-level autostart. Never fail hard.
-        // #173: on Windows the DEFAULT background receiver is per-user (HKCU
-        // Run, no elevation), matching systemd --user and the LaunchAgent. A
-        // machine-wide service is an explicit `--install-system` request; the
-        // first-run wizard must not demand UAC.
+        // An Err here names the step that failed and the command to finish by
+        // hand; nothing below claims success unless this returned Ok.
+        host.install_user(&exe, &daemon_argv)?;
+        // #173: on Windows the background receiver is per-user (HKCU Run, no
+        // elevation), matching systemd --user and the LaunchAgent.
         if cfg!(windows) {
-            host.install_user(&exe, &up_args)?;
             // #182: HKCU Run only fires at logon. The user asked for the
             // inbox NOW (the other platforms' service managers do `enable
             // --now` / bootstrap). Start the receiver now, detached, and
@@ -133,7 +236,8 @@ pub(crate) async fn up_cmd(
             // portable operation as `up --detach` (platform::spawn_detached),
             // so the receiver's console lands in daemon.log.
             let log_path = crate::platform::Paths::config_path("daemon.log");
-            let started = match crate::platform::spawn_detached(&exe, &["up"], &log_path) {
+            let args: Vec<&str> = daemon_argv.iter().map(String::as_str).collect();
+            let started = match crate::platform::spawn_detached(&exe, &args, &log_path) {
                 Ok(_) => {
                     // Give the receiver a moment to write its pidfile.
                     let mut live = false;
@@ -160,25 +264,16 @@ pub(crate) async fn up_cmd(
                 ));
             }
         } else {
-            match host.install_system(&exe, &up_args) {
-                Ok(platform::InstallResult::System) => {
-                    ui::say(&format!(
-                        "  {} installed as a system service (autostart at boot)",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                    ));
-                }
-                Ok(platform::InstallResult::User) | Err(_) => {
-                    // Elevation declined: user-level autostart
-                    host.install_user(&exe, &up_args)?;
-                    ui::say(&format!(
-                        "  {} installed as a user-level autostart",
-                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                    ));
-                    ui::say(&format!(
-                        "  {} run `tunlion up --install` again to grant admin for kernel overlay",
-                        ui::paint(ui::Tone::Dim, "note:")
-                    ));
-                }
+            ui::say(&format!(
+                "  {} installed as a user service (starts at login)",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            ));
+            if host == platform::ServiceHost::Systemd {
+                ui::say(&format!(
+                    "  {} for a machine-wide service (starts at boot, CAP_NET_ADMIN from systemd): \
+                     tunlion up --install --system",
+                    ui::paint(ui::Tone::Dim, "note:")
+                ));
             }
         }
         #[cfg(target_os = "windows")]
@@ -202,7 +297,7 @@ pub(crate) async fn up_cmd(
         // --detach: spawn the daemon in the background, redirect its console to
         // {config}/daemon.log, return to the shell. The child writes the pidfile
         // and serves detached (survives closing this terminal).
-        return detach_up(server, dir).await;
+        return detach_up(&daemon_argv).await;
     }
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
@@ -319,60 +414,78 @@ pub(crate) async fn up_cmd(
     res
 }
 
-/// Follow or tail the daemon's diagnostic timeline (diag.jsonl). The daemon
-/// writes structured JSONL connect spans here; `logs` renders them readably and
-/// refuses to flood: a bounded backlog (default 20 lines, --tail 0 = live
-/// only), then follows live with -f.
+/// Where `tunlion logs` reads from. Pure, so the order is pinned by a test.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LogSource {
+    /// The running daemon is under systemd: its output is in the journal.
+    Journal,
+    /// `{config}/daemon.log`, which `up --detach` (and the Windows autostart)
+    /// redirect the daemon's console into.
+    ConsoleLog,
+    /// `{config}/diag.jsonl`, the structured connect timeline, as raw JSONL.
+    DiagTimeline,
+}
+
+/// The source the RUNNING daemon actually writes wins. daemon.log used to win
+/// whenever it existed, so a box that once ran `up --detach` and now runs as a
+/// service showed that old, dead log forever while the journal had the live
+/// one.
+pub(crate) fn log_source(running_under_service_manager: bool, console_log_exists: bool) -> LogSource {
+    if running_under_service_manager {
+        LogSource::Journal
+    } else if console_log_exists {
+        LogSource::ConsoleLog
+    } else {
+        LogSource::DiagTimeline
+    }
+}
+
+/// Show the daemon's output: the journal for a daemon running under systemd,
+/// else `{config}/daemon.log` (written by `up --detach`), else the diagnostic
+/// timeline `diag.jsonl`, printed as the raw JSON lines the daemon wrote. A
+/// bounded backlog (default 20 lines, --tail 0 = live only), then follows live
+/// with -f.
 pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
-    // The daemon's human console output goes to daemon.log when detached, and
-    // the diagnostic timeline is diag.jsonl. Follow whichever exists; prefer
-    // the console log when present (it is what a user means by "logs").
     let console = crate::platform::Paths::config_path("daemon.log");
+    let managed = daemon_alive().and_then(|pid| service_manager_for_pid(pid).map(|m| (pid, m)));
+    let source = log_source(managed.is_some(), console.exists());
 
     // A daemon under a service manager writes to the journal, not to a file we
-    // own, so there is nothing here to read and there never will be. That is
-    // the DEFAULT path: first-run offers "Stay available in the background?"
-    // and installs a service, after which `tunlion logs` said "no log yet (the
-    // daemon writes it while it runs)" forever, on a daemon that was running
-    // and was writing plenty. The sentence blamed timing for a condition that
-    // does not change. Hand the user the journal instead.
-    if !console.exists() {
-        if let Some(pid) = daemon_alive() {
-            if let Some(mgr) = service_manager_for_pid(pid) {
-                let scope = match mgr {
-                    ServiceManager::SystemdSystem => "",
-                    ServiceManager::SystemdUser => "--user ",
-                };
-                let n = tail.max(1);
-                let follow_flag = if follow { "-f " } else { "" };
-                let unit = crate::platform::SYSTEMD_UNIT;
-                let cmd = format!("journalctl {scope}-u {unit} {follow_flag}-n {n} --no-pager");
-                ui::say(&format!(
-                    "  this daemon runs as a service (pid {pid}); its output goes to the journal"
-                ));
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
-                let status = std::process::Command::new("journalctl")
-                    .args(scope.split_whitespace())
-                    .args(["-u", unit])
-                    .args(if follow { vec!["-f"] } else { vec![] })
-                    .args(["-n", &n.to_string(), "--no-pager"])
-                    .status();
-                return match status {
-                    Ok(st) if st.success() => Ok(()),
-                    // Say which step failed. "no log yet" would be a third
-                    // wrong explanation for the same situation.
-                    _ => {
-                        ui::say(
-                            "  could not read the journal here; run the command above directly",
-                        );
-                        Ok(())
-                    }
-                };
+    // own. That is the DEFAULT path: first-run offers "Stay available in the
+    // background?" and installs a service, after which `tunlion logs` said "no
+    // log yet (the daemon writes it while it runs)" forever, on a daemon that
+    // was running and was writing plenty. Hand the user the journal instead.
+    if let (LogSource::Journal, Some((pid, mgr))) = (&source, managed) {
+        let scope = match mgr {
+            ServiceManager::SystemdSystem => "",
+            ServiceManager::SystemdUser => "--user ",
+        };
+        let n = tail.max(1);
+        let follow_flag = if follow { "-f " } else { "" };
+        let unit = crate::platform::SYSTEMD_UNIT;
+        let cmd = format!("journalctl {scope}-u {unit} {follow_flag}-n {n} --no-pager");
+        ui::say(&format!(
+            "  this daemon runs as a service (pid {pid}); its output goes to the journal"
+        ));
+        ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
+        let status = std::process::Command::new("journalctl")
+            .args(scope.split_whitespace())
+            .args(["-u", unit])
+            .args(if follow { vec!["-f"] } else { vec![] })
+            .args(["-n", &n.to_string(), "--no-pager"])
+            .status();
+        return match status {
+            Ok(st) if st.success() => Ok(()),
+            // Say which step failed. "no log yet" would be a third
+            // wrong explanation for the same situation.
+            _ => {
+                ui::say("  could not read the journal here; run the command above directly");
+                Ok(())
             }
-        }
+        };
     }
 
-    let path = if console.exists() {
+    let path = if source == LogSource::ConsoleLog {
         console
     } else {
         crate::platform::Paths::config_path("diag.jsonl")
@@ -474,5 +587,161 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 continue;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// `up` flags that choose HOW this invocation starts the daemon. They are
+    /// the one thing the daemon argv must never carry.
+    const LAUNCH_ONLY: &[&str] = &["install", "detach", "system", "install_system"];
+    /// Global flags that shape this invocation's own terminal output and
+    /// prompts. The daemon has no terminal to apply them to.
+    const PER_INVOCATION: &[&str] = &[
+        "verbose",
+        "quiet",
+        "no_interactive",
+        "interactive",
+        "color",
+        "json",
+        "yes",
+        "help",
+        "version",
+    ];
+
+    fn parse(argv: &[String]) -> crate::Cli {
+        let mut full = vec!["tunlion".to_string()];
+        full.extend(argv.iter().cloned());
+        crate::Cli::try_parse_from(&full)
+            .unwrap_or_else(|e| panic!("argv does not parse: {argv:?}\n{e}"))
+    }
+
+    fn opts_of(argv: &[&str]) -> DaemonOpts {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        DaemonOpts::from_cli(&parse(&argv)).expect("an `up` command")
+    }
+
+    /// Every `up` flag survives the trip into the daemon argv and back: parse
+    /// the user's command, build the argv a service/detached daemon gets, parse
+    /// THAT with the real clap surface, and the daemon options are identical.
+    #[test]
+    fn up_flags_round_trip_through_the_daemon_argv() {
+        let everything: &[&str] = &[
+            "--server",
+            "https://sig.example",
+            "--relay",
+            "--name-as",
+            "box one",
+            "up",
+            "--install",
+            "--dir",
+            "/srv/My Inbox",
+            "--userspace",
+            "--shell",
+            "--shell-only",
+            "a,b",
+            "--shell-program",
+            "bash -l",
+            "--shell-user=-odd",
+            "--i-know",
+            "--no-proxy-fallback",
+        ];
+        let full = opts_of(everything);
+        // The parse captured every flag (a field left at its default here
+        // would make the round trip below vacuous for that field).
+        assert_eq!(
+            full,
+            DaemonOpts {
+                server: Some("https://sig.example".into()),
+                relay: true,
+                no_relay: false,
+                name_as: Some("box one".into()),
+                dir: Some(PathBuf::from("/srv/My Inbox")),
+                userspace: true,
+                shell: true,
+                shell_only: Some("a,b".into()),
+                shell_program: Some("bash -l".into()),
+                shell_user: Some("-odd".into()),
+                i_know: true,
+                no_proxy_fallback: true,
+            }
+        );
+        let cases: Vec<DaemonOpts> = vec![
+            full,
+            opts_of(&["up", "--detach", "--no-relay", "--i-know"]),
+            opts_of(&["up", "--install", "--system"]),
+            opts_of(&["up"]),
+        ];
+        assert!(cases[1].no_relay, "--no-relay must be captured");
+        for opts in cases {
+            let argv = opts.daemon_argv();
+            assert_eq!(argv[0], "up");
+            for launch in ["--install", "--detach", "--system", "--install-system"] {
+                assert!(
+                    !argv.iter().any(|a| a == launch),
+                    "the daemon argv must not re-launch: {argv:?}"
+                );
+            }
+            let back = DaemonOpts::from_cli(&parse(&argv)).expect("daemon argv is an `up` command");
+            assert_eq!(back, opts, "daemon argv {argv:?} lost or changed a flag");
+        }
+    }
+
+    /// The guard against the next flag: every argument `up` accepts (its own
+    /// and the globals it inherits) is either forwarded to the daemon argv or
+    /// named above as launch-only / per-invocation. A new flag fails here until
+    /// someone decides which it is, instead of being dropped silently.
+    #[test]
+    fn every_up_flag_is_forwarded_or_deliberately_not() {
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        let up = cmd.find_subcommand("up").expect("`up` exists");
+        let all = DaemonOpts {
+            server: Some("https://x".into()),
+            relay: true,
+            no_relay: true,
+            name_as: Some("n".into()),
+            dir: Some(PathBuf::from("/d")),
+            userspace: true,
+            shell: true,
+            shell_only: Some("a".into()),
+            shell_program: Some("sh".into()),
+            shell_user: Some("u".into()),
+            i_know: true,
+            no_proxy_fallback: true,
+        }
+        .daemon_argv();
+        let mut seen = 0;
+        for arg in up.get_arguments() {
+            let id = arg.get_id().as_str();
+            if LAUNCH_ONLY.contains(&id) || PER_INVOCATION.contains(&id) {
+                continue;
+            }
+            let long = arg
+                .get_long()
+                .unwrap_or_else(|| panic!("`up` argument {id} has no long name"));
+            let flag = format!("--{long}");
+            let prefix = format!("--{long}=");
+            assert!(
+                all.iter().any(|a| *a == flag || a.starts_with(&prefix)),
+                "`up {flag}` is not forwarded to the daemon argv and not listed as \
+                 launch-only or per-invocation: `up --install`/`--detach` would drop it"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 12, "expected the globals to be visible on `up` after build(); saw {seen}");
+    }
+
+    #[test]
+    fn logs_read_what_the_running_daemon_writes() {
+        // A service-managed daemon writes the journal even if an old
+        // daemon.log from a past `up --detach` is still on disk.
+        assert_eq!(log_source(true, true), LogSource::Journal);
+        assert_eq!(log_source(true, false), LogSource::Journal);
+        assert_eq!(log_source(false, true), LogSource::ConsoleLog);
+        assert_eq!(log_source(false, false), LogSource::DiagTimeline);
     }
 }

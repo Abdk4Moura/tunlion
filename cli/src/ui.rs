@@ -723,3 +723,19 @@ mod verbosity_tests {
         VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod transfer_units {
+    /// Transfer sizes and rates divide by 1024, so they carry the binary
+    /// labels. "1.0 MB" for 1048576 bytes was a decimal label on a binary
+    /// number.
+    #[test]
+    fn human_labels_match_the_1024_divisor() {
+        assert_eq!(crate::human(512), "512 B");
+        assert_eq!(crate::human(1024), "1.0 KiB");
+        assert_eq!(crate::human(1536), "1.5 KiB");
+        assert_eq!(crate::human(1024 * 1024), "1.0 MiB");
+        assert_eq!(crate::human(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(crate::human(2 * 1024u64.pow(4)), "2.0 TiB");
+    }
+}

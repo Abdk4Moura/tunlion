@@ -48,7 +48,7 @@ tunlion send video.mp4 --code       # speak the code aloud
 tunlion receive clever-lynx-63      # …or open the website on the other device
 
 tunlion add --name phone            # remember a device (no file needed)
-tunlion up                          # receive in the background
+tunlion up --install                # receive in the background (always-on service)
 ```
 
 - **The other end can be a browser** — your wife's phone with nothing installed opens a URL and taps accept.
@@ -61,12 +61,12 @@ tunlion up                          # receive in the background
 Once two machines are paired, they share a crypto-addressed overlay — each device's public key *is* its address. On top of that:
 
 ```sh
-tunlion dovm                        # open a shell on a paired device
+tunlion shell dovm                  # open a shell on a paired device (or just: tunlion dovm)
 tunlion reach dovm                  # is it reachable, and over which route?
 tunlion reach dovm --until-direct   # wait for the link to leave the relay
 tunlion expose 5432                 # publish a local port on the mesh
-tunlion forward 5432 dovm:5432      # forward a remote port to localhost
-tunlion mount dovm:~/data ./data    # mount a remote folder (sshfs over the mesh)
+tunlion forward dovm:5432           # forward a remote port to the same local port
+tunlion mount dovm /srv/data ./data # mount a remote folder over the mesh
 ```
 
 No inbound ports, no VPN config, no accounts — reachability rides the same authenticated link as file transfer, so a headless box in another network is one command away.

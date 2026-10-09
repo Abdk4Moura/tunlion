@@ -1,4 +1,5 @@
-//! Interactivity contract: one Affordance, three renderers.
+//! Interactive editors for `tunlion set <key>` at a terminal (a checklist for
+//! interface membership, a reorderable list for prefer).
 
 use std::io::Write;
 use std::net::IpAddr;
@@ -55,10 +56,7 @@ pub fn enumerate_interfaces() -> Vec<InterfaceInfo> {
 
 pub struct Affordance {
     pub command: String,
-    pub needs: String,
-    pub example: String,
     pub options: Option<Vec<OptionEntry>>,
-    pub options_label: String, // "interfaces" | "peers"
 }
 
 pub struct OptionEntry {
@@ -68,37 +66,9 @@ pub struct OptionEntry {
     pub checked: bool,
 }
 
-// --------------------------------------------------------------- renderers --
-
-pub fn render_steer(aff: &Affordance) -> ! {
-    eprintln!("error: `{}` needs a value: {}", aff.command, aff.needs);
-    if let Some(ref opts) = aff.options {
-        if !opts.is_empty() {
-            let names: Vec<&str> = opts.iter().map(|o| o.label.as_str()).collect();
-            eprintln!("{} on this machine: {}", aff.options_label, names.join(", "));
-            let mut groups: Vec<&str> = Vec::new();
-            for o in opts { if !groups.contains(&o.group.as_str()) { groups.push(&o.group); } }
-            groups.sort();
-            eprintln!("groups: {}", groups.join(", "));
-        }
-    }
-    eprintln!("example: {}", aff.example);
-    std::process::exit(2);
-}
-
-pub fn render_json_steer(aff: &Affordance) -> ! {
-    let mut obj = serde_json::json!({
-        "error": "missing_value", "command": aff.command, "needs": aff.needs, "example": aff.example,
-    });
-    if let Some(ref opts) = aff.options {
-        let interfaces: Vec<String> = opts.iter().map(|o| o.label.clone()).collect();
-        let mut groups: Vec<String> = opts.iter().map(|o| o.group.clone()).collect();
-        groups.sort(); groups.dedup();
-        obj["valid"] = serde_json::json!({"interfaces": interfaces, "groups": groups});
-    }
-    eprintln!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
-    std::process::exit(2);
-}
+// The non-terminal renderers (render_steer / render_json_steer) lived here and
+// answered `tunlion set <key>` from a pipe with "needs a value" and exit 2.
+// That form READS the value now (settings::run_get), so they had no caller.
 
 // ---------------------------------------------------- shared raw-mode guard --
 

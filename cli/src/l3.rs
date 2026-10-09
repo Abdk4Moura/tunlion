@@ -942,19 +942,30 @@ fn open_kernel(
 const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
 
-/// Get this machine's hostname for MagicDNS.
+/// This machine's short hostname (MagicDNS, the `init` name suggestion, the
+/// forward-to-self check). Asks the OS (`platform::os_hostname`) instead of
+/// reading /etc/hostname, which macOS does not have, so every Mac was "cli".
 pub fn hostname() -> String {
-    // #183.1: /etc/hostname is UNIX-only; Windows provides COMPUTERNAME.
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into())
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
+}
+
+/// `Kabir-MacBook.local` -> `kabir-macbook`: the first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label. Falls back to "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mut label = String::new();
+    for c in first.chars() {
+        let c = c.to_ascii_lowercase();
+        let c = if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' };
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
     }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into())
-    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
 }
 
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
@@ -1331,6 +1342,26 @@ mod tests {
         let cleared = render_hosts(&again, &[]);
         assert!(!cleared.contains("filament-mesh"));
         assert!(cleared.contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn hostname_is_the_short_os_label() {
+        use super::short_host_label as l;
+        assert_eq!(l("laptop"), "laptop");
+        assert_eq!(l("Kabir-MacBook-Pro.local"), "kabir-macbook-pro");
+        assert_eq!(l("vps3584156.trouble-free.net"), "vps3584156");
+        assert_eq!(l("DESKTOP-7Q2K1"), "desktop-7q2k1");
+        assert_eq!(l("my_box  two"), "my-box-two");
+        assert_eq!(l("-edge-"), "edge");
+        assert_eq!(l(""), "device");
+        assert_eq!(l("...."), "device");
+        assert_eq!(l(&"a".repeat(80)).len(), 63);
+        // The OS answers, so the name is the machine's, never the old
+        // /etc/hostname fallback constant.
+        let os = crate::platform::os_hostname();
+        assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+        assert_eq!(super::hostname(), l(os.as_deref().unwrap()));
+        assert_ne!(super::hostname(), "cli");
     }
 
     #[test]

@@ -99,6 +99,49 @@ use serde_json::{Value, json};
 use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Commands that honour the global `--json`. The global flag's help names
+/// exactly these; `json_help_lists_exactly_the_supported_commands` keeps the
+/// two in agreement.
+pub(crate) fn json_supported(cmd: &Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Init { .. }
+            | Cmd::Add { .. }
+            | Cmd::Join { .. }
+            | Cmd::Id { .. }
+            | Cmd::Status { .. }
+            | Cmd::Set { .. }
+            | Cmd::Reach { .. }
+            | Cmd::Sync { .. }
+            | Cmd::Doctor { .. }
+            | Cmd::Addr { .. }
+            | Cmd::Devices { action: None, .. }
+    )
+}
+
+/// `grant <device> <cap>` or `grant --tag <tag> <cap>`: with --tag the one
+/// positional is the capability. Returns (device, capability).
+pub(crate) fn grant_operands(
+    device: Option<String>,
+    capability: Option<String>,
+    tag: Option<&str>,
+) -> Result<(Option<String>, String)> {
+    match (tag, device, capability) {
+        (Some(_), Some(cap), None) => Ok((None, cap)),
+        (Some(t), Some(dev), Some(_)) => bail!(
+            "grant --tag {t} takes only the capability (`tunlion grant --tag {t} <capability>`); drop '{dev}' or drop --tag"
+        ),
+        (Some(t), None, _) => bail!("missing the capability: tunlion grant --tag {t} <capability>"),
+        (None, Some(dev), Some(cap)) => Ok((Some(dev), cap)),
+        (None, Some(dev), None) => {
+            bail!("missing the capability: tunlion grant {dev} <capability> (e.g. shell)")
+        }
+        (None, None, _) => bail!(
+            "name a device or a tag: tunlion grant <device> <capability>, or tunlion grant --tag <tag> <capability>"
+        ),
+    }
+}
+
 pub(crate) async fn async_main() -> Result<()> {
     // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
     // purpose: skipping it for local-only commands was tried and measured at
@@ -398,27 +441,15 @@ pub(crate) async fn async_main() -> Result<()> {
         cli.server.clone()
     };
     let server = server.trim_end_matches('/').to_string();
+    // `up`'s daemon flags exactly as typed, for the paths that start a second
+    // process (--install, --detach): taken before `cli.cmd` is moved below.
+    let up_daemon = crate::up_logs::DaemonOpts::from_cli(&cli);
     // Bare `tunlion` (no subcommand): a short, state-aware tour of what you'd do
     // next, instead of clap's wall of subcommands. Power users still get --help.
     let Some(cmd) = cli.cmd else {
         return tour_cmd();
     };
-    if cli.json
-        && !matches!(
-            &cmd,
-            Cmd::Init { .. }
-                | Cmd::Add { .. }
-                | Cmd::Join { .. }
-                | Cmd::Id { .. }
-                | Cmd::Status { .. }
-                | Cmd::Set { .. }
-                | Cmd::Reach { .. }
-                | Cmd::Sync { .. }
-                | Cmd::Doctor { .. }
-                | Cmd::Addr { .. }
-                | Cmd::Devices { action: None, .. }
-        )
-    {
+    if cli.json && !json_supported(&cmd) {
         bail!(
             "--json is not implemented for this operation; refusing to mix human output with machine data"
         );
@@ -523,14 +554,18 @@ pub(crate) async fn async_main() -> Result<()> {
                 .await
             }
         }
+        // Every field is named: a `..` here is how `set --yes`, `--json` and
+        // `--out` were once accepted and then dropped on the floor (the local
+        // --yes even shadowed the global one, so `set --reset --yes` refused).
         Cmd::Set {
             key,
             value,
             peer,
             dry_run,
             reset,
+            unset,
             hard,
-            ..
+            soft,
         } => {
             settings::run_set(
                 key.as_deref(),
@@ -538,7 +573,9 @@ pub(crate) async fn async_main() -> Result<()> {
                 &peer,
                 dry_run,
                 reset,
+                unset,
                 hard,
+                soft,
                 ui_caps.yes,
                 ui_caps.json || cli.json,
             )
@@ -851,11 +888,16 @@ pub(crate) async fn async_main() -> Result<()> {
             if shell || shell_only.as_ref().is_some_and(|s| !s.is_empty()) {
                 crate::sshd::arm_ssh_ca_for_serving().await;
             }
+            let daemon = up_daemon.unwrap_or_default();
             up_cmd(
                 &server,
-                install,
-                system,
-                detach,
+                crate::up_logs::UpMode {
+                    install,
+                    system,
+                    detach,
+                    install_system,
+                },
+                &daemon,
                 dir,
                 relay,
                 shell,
@@ -863,7 +905,6 @@ pub(crate) async fn async_main() -> Result<()> {
                 shell_program,
                 shell_user,
                 i_know,
-                install_system,
                 no_proxy_fallback,
             )
             .await
@@ -1511,6 +1552,7 @@ pub(crate) async fn async_main() -> Result<()> {
             capability,
             tag,
         } => {
+            let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
             // The owner key resolves the RESOURCE, so it is needed before the
             // capability name is final: `route:10.0.0.0/24` names an owner-bound
             // resource, while `shell` names "self".
@@ -1548,6 +1590,10 @@ pub(crate) async fn async_main() -> Result<()> {
                 println!("granted '{capability}' to tag '{t}'.");
                 return Ok(());
             }
+            // grant_operands returns a device whenever there is no --tag.
+            let Some(device) = device else {
+                bail!("name a device: tunlion grant <device> <capability>");
+            };
             // Device path. The owner PUBLIC key is needed up front for the same
             // reason as the tag path: it resolves a `route:CIDR` spec to its
             // owner-bound resource id.

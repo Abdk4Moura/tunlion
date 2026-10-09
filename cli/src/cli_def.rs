@@ -121,12 +121,15 @@ pub(crate) struct Cli {
     /// overrides NO_COLOR/TERM. Equivalent to FILAMENT_COLOR.
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     pub(crate) color: Option<String>,
-    /// JSON output for every command (structured, parseable). Independent of
-    /// TTY: a pipe still gets human text unless --json is set.
+    /// JSON output (structured, parseable) where a command supports it: init,
+    /// add, join, id, status, set, reach, sync, doctor, addr and devices. Any
+    /// other command refuses --json rather than mixing human text into it.
+    /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
     pub(crate) json: bool,
-    /// Auto-confirm destructive actions (revoke, unmount, unexpose).
-    /// Required from a non-TTY; a TTY prompts instead.
+    /// Auto-confirm prompts: down, reset, revoke, devices revoke, unmount,
+    /// unexpose, set --reset, add --for with remote authority, and init.
+    /// Required for these from a non-TTY; a TTY prompts instead.
     #[arg(short = 'y', long = "yes", global = true)]
     pub(crate) yes: bool,
     #[command(subcommand)]
@@ -317,20 +320,26 @@ pub(crate) enum Cmd {
     },
     /// Always-on receiver: trusted known devices only, invisible to strangers
     Up {
-        /// Install + start a systemd user service instead of running attached
+        /// Install + start a per-user service instead of running attached
+        /// (systemd --user on Linux, a LaunchAgent on macOS, a logon entry on
+        /// Windows). Every other `up` flag given here is carried into it. Add
+        /// --system for a machine-wide service instead.
         #[arg(long)]
         install: bool,
         /// Run the daemon detached from this terminal (background). For
         /// machines without a service manager, this is the middle between
         /// attached-now and service-forever; the daemon survives closing the
-        /// terminal. Its output goes to {config}/daemon.log.
+        /// terminal. Its output goes to {config}/daemon.log. Every other `up`
+        /// flag given here is carried into the detached daemon.
         #[arg(long)]
         detach: bool,
-        /// With --install: install a SYSTEM service (root, one-time sudo) that gets
-        /// CAP_NET_ADMIN from systemd via AmbientCapabilities. The overlay's kernel
-        /// TUN then needs NO setcap on the binary, so `tunlion update` never prompts
-        /// for a password again. Recommended for the kernelspace (kernel-TUN) path.
-        #[arg(long)]
+        /// With --install: install a machine-wide service instead of a per-user
+        /// one. On Linux, a system unit (one-time sudo) that runs as you and gets
+        /// CAP_NET_ADMIN from systemd via AmbientCapabilities, so the overlay's
+        /// kernel TUN needs NO setcap on the binary and `tunlion update` never
+        /// prompts for a password again. On macOS, a LaunchDaemon (administrator
+        /// prompt). Not available on Windows yet.
+        #[arg(long, requires = "install")]
         system: bool,
         /// Force the ZERO-PRIVILEGE userspace overlay (an in-process smoltcp netstack
         /// instead of a kernel TUN): no CAP_NET_ADMIN, no /dev/net/tun, works in a
@@ -385,7 +394,9 @@ pub(crate) enum Cmd {
     // ── Advanced ────────────────────────────────────────────────────
     /// Stop the daemon
     Down,
-    /// Follow the daemon's diagnostic timeline (diag.jsonl).
+    /// Show the daemon's output: the journal when it runs as a systemd
+    /// service, else {config}/daemon.log (written by `up --detach`), else the
+    /// diagnostic timeline diag.jsonl as raw JSON lines.
     Logs {
         /// Follow the log as new lines arrive (like docker logs -f).
         #[arg(short = 'f', long)]
@@ -405,14 +416,16 @@ pub(crate) enum Cmd {
         tunlion set                          show every setting + where it came from\n  \
         tunlion set auto-extract on          change one setting (partial, never resets others)\n  \
         tunlion set shell on --peer laptop   per-device override\n  \
-        tunlion set drop-dir                 read one value (bare value on stdout)\n  \
-        tunlion set relay --reset            revert settings to their defaults\n\n\
-        Keys: name, server, drop-dir, relay, auto-extract, shell, shell-user"
+        tunlion set drop-dir                 read one value (bare value on stdout when piped)\n  \
+        tunlion set relay --unset            reset one setting to its default\n  \
+        tunlion set --reset --yes            reset ALL settings to their defaults\n\n\
+        Some keys: name, server, drop-dir, relay, auto-extract, shell, shell-user (`tunlion set` lists all)"
     )]
     Set {
         /// Setting name (run `tunlion set` to list them all)
         key: Option<String>,
-        /// New value. `tunlion set` with no arguments lists every setting.
+        /// New value. `tunlion set` with no arguments lists every setting;
+        /// `tunlion set <key>` reads one.
         value: Option<String>,
         /// Scope this change to one or more known devices (per-peer settings
         /// only). Comma-separated or repeatable: --peer a,b  or  --peer a --peer b
@@ -421,22 +434,20 @@ pub(crate) enum Cmd {
         /// Show what would change without writing
         #[arg(long)]
         dry_run: bool,
-        /// Reset ALL settings to their defaults (clears global + per-peer)
-        #[arg(long)]
+        /// With a key: reset that one setting to its default (same as --unset).
+        /// Without a key: reset ALL settings (global and per-device); asks
+        /// first, and needs the global --yes from a pipe or CI.
+        #[arg(long, conflicts_with = "value")]
         reset: bool,
-        /// Skip the confirmation prompt (required for --reset in a pipe/CI)
-        #[arg(long)]
-        yes: bool,
-        /// Write the secret key bundle to a new owner-only file.
-        #[arg(long, value_name = "PATH")]
-        out: Option<PathBuf>,
-        /// Machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-        /// Prefer strength: hard (always prefer, even if slower)
+        /// Reset this one setting to its default; with --peer, remove just that
+        /// device's override.
+        #[arg(long, requires = "key", conflicts_with_all = ["value", "reset"])]
+        unset: bool,
+        /// Prefer strength: hard (always prefer, even if slower). `prefer` only.
         #[arg(long, conflicts_with = "soft")]
         hard: bool,
-        /// Prefer strength: soft (prefer unless much faster) — default
+        /// Prefer strength: soft (prefer unless much faster), the default.
+        /// `prefer` only.
         #[arg(long, conflicts_with = "hard")]
         soft: bool,
     },
@@ -586,11 +597,16 @@ pub(crate) enum Cmd {
     /// Grant a known device a capability (deny-by-default). `shell` permits
     /// seamless `tunlion shell --ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
+    ///
+    /// `tunlion grant <device> <capability>`, or `tunlion grant --tag <tag>
+    /// <capability>` to grant every device carrying that tag.
     Grant {
-        /// Known device (petname), or omit with --tag
-        device: String,
+        /// Known device (petname). Omit it when --tag is given.
+        #[arg(value_name = "DEVICE")]
+        device: Option<String>,
         /// Capability to grant (e.g. `shell`, or `route:10.0.0.0/24`)
-        capability: String,
+        #[arg(value_name = "CAPABILITY")]
+        capability: Option<String>,
         /// Target a tag instead of a device
         #[arg(long)]
         tag: Option<String>,
@@ -901,5 +917,149 @@ mod tests {
                 "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
             );
         }
+    }
+
+    fn parse(words: &[&str]) -> Result<Cli, clap::Error> {
+        use clap::Parser;
+        Cli::try_parse_from(std::iter::once("tunlion").chain(words.iter().copied()))
+    }
+
+    /// Every `tunlion ...` line in README.md's fenced blocks is a command this
+    /// build accepts, and does what its comment says where that is checkable.
+    /// The README had `tunlion forward 5432 dovm:5432` (does not parse),
+    /// `tunlion mount dovm:~/data ./data` (parses, mounts the wrong thing) and
+    /// `tunlion up  # receive in the background` (runs attached).
+    #[test]
+    fn readme_commands_parse_and_mean_what_they_say() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../README.md");
+        let readme = std::fs::read_to_string(&path).expect("README.md next to cli/");
+        let mut in_fence = false;
+        let mut checked = 0;
+        for line in readme.lines() {
+            let t = line.trim();
+            if t.starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if !in_fence || !t.starts_with("tunlion ") {
+                continue;
+            }
+            let (cmd, comment) = match t.split_once(" #") {
+                Some((c, rest)) => (c.trim(), rest),
+                None => (t, ""),
+            };
+            if cmd.contains('<') {
+                continue; // a placeholder, not a runnable command
+            }
+            let words: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+            let cli = parse(&words)
+                .unwrap_or_else(|e| panic!("README command does not parse: `{cmd}`\n{e}"));
+            match cli.cmd {
+                Some(crate::Cmd::Up { install, detach, .. }) if comment.contains("background") => {
+                    assert!(
+                        install || detach,
+                        "README says `{cmd}` runs in the background, but plain `up` runs attached"
+                    );
+                }
+                // `<device>:<path>` is only split when no remote is given; with
+                // one, the whole `dev:path` would be taken as the device name.
+                Some(crate::Cmd::Mount { peer: Some(ref p), remote: Some(_), .. }) => {
+                    assert!(!p.contains(':'), "README `{cmd}`: device '{p}' is not a device name");
+                }
+                _ => {}
+            }
+            checked += 1;
+        }
+        assert!(checked >= 8, "found only {checked} README commands; did the fences move?");
+    }
+
+    /// The global --json help names exactly the commands that honour it.
+    #[test]
+    fn json_help_lists_exactly_the_supported_commands() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "json")
+            .and_then(|a| a.get_long_help().or(a.get_help()))
+            .expect("--json has help")
+            .to_string();
+        let list = help
+            .split("supports it:")
+            .nth(1)
+            .and_then(|rest| rest.split('.').next())
+            .expect("the --json help lists the supporting commands");
+        let names: Vec<String> = list
+            .replace(" and ", ", ")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(names.len() >= 5, "parsed {names:?} from {help:?}");
+        let sample = |name: &str| -> Vec<&str> {
+            match name {
+                "sync" => vec!["sync", ".", "laptop:dir"],
+                other => vec![other],
+            }
+        };
+        for name in &names {
+            let cli = parse(&sample(name))
+                .unwrap_or_else(|e| panic!("--json help names `{name}`, which does not parse: {e}"));
+            let c = cli.cmd.expect("a subcommand");
+            assert!(
+                crate::dispatch::json_supported(&c),
+                "--json help names `{name}` but dispatch refuses --json for it"
+            );
+        }
+        let down = parse(&["down"]).unwrap().cmd.unwrap();
+        assert!(!crate::dispatch::json_supported(&down));
+        assert!(!names.iter().any(|n| n == "down"));
+    }
+
+    /// `grant --tag <tag> <capability>` works as the help says: the device is
+    /// optional with --tag (it was a required positional, so the documented
+    /// form was a parse error).
+    #[test]
+    fn grant_takes_a_tag_instead_of_a_device() {
+        use crate::dispatch::grant_operands;
+        let get = |words: &[&str]| match parse(words).expect("parses").cmd {
+            Some(crate::Cmd::Grant { device, capability, tag }) => (device, capability, tag),
+            _ => unreachable!(),
+        };
+        let (d, c, t) = get(&["grant", "--tag", "ci", "shell"]);
+        assert_eq!(grant_operands(d, c, t.as_deref()).unwrap(), (None, "shell".to_string()));
+        let (d, c, t) = get(&["grant", "laptop", "shell"]);
+        assert_eq!(
+            grant_operands(d, c, t.as_deref()).unwrap(),
+            (Some("laptop".to_string()), "shell".to_string())
+        );
+        let (d, c, t) = get(&["grant", "laptop"]);
+        assert!(grant_operands(d, c, t.as_deref()).is_err(), "a device grant needs a capability");
+        let (d, c, t) = get(&["grant", "--tag", "ci", "laptop", "shell"]);
+        assert!(grant_operands(d, c, t.as_deref()).is_err(), "--tag with a device is ambiguous");
+    }
+
+    /// The global -y help names `down`, which refuses without it from a pipe.
+    #[test]
+    fn yes_help_names_the_commands_that_need_it() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let help = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "yes")
+            .and_then(|a| a.get_long_help().or(a.get_help()))
+            .expect("--yes has help")
+            .to_string();
+        for verb in ["down", "reset", "revoke", "unmount", "unexpose", "set --reset"] {
+            assert!(help.contains(verb), "-y help does not mention {verb}: {help}");
+        }
+    }
+
+    /// The pairing-timeout hint names the verbs the two sides actually run.
+    #[test]
+    fn pairing_timeout_hint_names_add_and_join() {
+        let src = include_str!("pair_cmd.rs");
+        assert!(!src.contains("make sure both run `tunlion add`"));
+        assert!(src.contains("while the other runs `tunlion join <code>`"));
     }
 }

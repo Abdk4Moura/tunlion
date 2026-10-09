@@ -621,7 +621,7 @@ pub(crate) async fn pair_cmd(
         if let Some(dl) = ceremony_deadline {
             if Instant::now() > dl {
                 bail!(
-                    "the other device disconnected before setup finished; make sure both run `tunlion add` at the same time, then try again"
+                    "the other device disconnected before setup finished; keep `tunlion add` running on one device while the other runs `tunlion join <code>`, then try again"
                 );
             }
         }
