@@ -331,10 +331,24 @@ pub async fn arm_ssh_ca_for_serving() {
     // "Permission denied (publickey,password)"; with the line it logs in;
     // and a cert for a different principal is still refused.
     let per_user_trust = install_user_ca_trust(&config_dir, &user);
-    if let Err(e) = &per_user_trust {
-        crate::ui::say(&format!(
-            "ssh CA: could not add the per-user trust line ({e}); `shell --ssh` will need the system-wide setup below"
-        ));
+    match &per_user_trust {
+        // PER-USER TRUST IS SUFFICIENT, SO DO NOT TOUCH /etc/ssh AT ALL.
+        //
+        // The system-wide route below copies THIS daemon's CA over the one
+        // shared file sshd trusts, /etc/ssh/filament_ca.pub, unconditionally.
+        // So any second daemon running as root -- a test, a second instance, a
+        // reinstall with a fresh config -- silently took over root ssh trust
+        // from the first, and broke the first one's --ssh. This happened on a
+        // production box during development: a scratch test daemon replaced
+        // the trusted CA, and sshd trusted a throwaway key for root until it
+        // was found and quarantined. Shared system state written without an
+        // ownership check is the defect; not writing it is the fix whenever
+        // the per-user line, which is scoped to one user and one daemon's
+        // HOME, already does the job.
+        Ok(()) => return,
+        Err(e) => crate::ui::say(&format!(
+            "ssh CA: could not add the per-user trust line ({e}); falling back to the system-wide setup"
+        )),
     }
 
     // Trust anchor next: copy the daemon CA pub where the Match block
@@ -344,12 +358,6 @@ pub async fn arm_ssh_ca_for_serving() {
     let anchor = ca_pub_anchor_path();
     let ca_src = crate::ssh_ca::ca_key_path(&config_dir).with_extension("pub");
     if let Err(e) = install_ca_pub_anchor(&ca_src, &anchor) {
-        if per_user_trust.is_ok() {
-            // Expected for a non-root daemon, and harmless: the per-user line
-            // above already makes cert logins work.
-            crate::ui::debug(&format!("ssh CA: system-wide anchor not writable ({e}); using per-user trust"));
-            return;
-        }
         crate::ui::say(&format!(
             "ssh CA arming skipped (anchor unwritable: {e}); cert logins will refuse until applied:\n{}",
             sshd_ca_manual_steps(
