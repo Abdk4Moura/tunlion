@@ -2651,6 +2651,14 @@ fn cap_store_grant_count(config_dir: &Path) -> usize {
 /// written during the ceremony is legitimate and would break a byte comparison;
 /// the grant count is the strongest assertion available there.
 #[test]
+// Windows has no daemon control channel yet (#205, open): `up` creates no
+// control.sock there, so the enrollment room this cell needs can never be
+// armed and the join has nothing to claim. That is a filed product gap, not a
+// flake, and no harness change can make this cell pass on Windows; only #205
+// can. Ignored there BY NAME so the matrix stays meaningful and the gap stays
+// visible, the same convention as the #31 cell below. It runs and passes on
+// Linux and macOS. Remove this attribute when #205 lands.
+#[cfg_attr(windows, ignore = "#205: no daemon control channel on Windows, so the enrollment room cannot be armed")]
 fn join_does_not_change_the_capability_store() {
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
