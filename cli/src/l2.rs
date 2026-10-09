@@ -2691,19 +2691,111 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// sequences and renders unusable.
 struct RawGuard {
     active: bool,
+    /// Windows only: the console's ORIGINAL input/output modes, restored exactly
+    /// on drop. Mode numbers only, never a HANDLE: a HANDLE is a raw pointer
+    /// (not Send) and this guard lives inside async code.
+    #[cfg(windows)]
+    win_saved: win_console::Saved,
 }
 impl RawGuard {
     fn enable() -> Result<Self> {
+        #[cfg(windows)]
+        let win_saved = win_console::snapshot();
         crossterm::terminal::enable_raw_mode()?;
-        Ok(RawGuard { active: true })
+        #[cfg(windows)]
+        win_console::enable_vt(&win_saved);
+        Ok(RawGuard {
+            active: true,
+            #[cfg(windows)]
+            win_saved,
+        })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
         if self.active {
             let _ = crossterm::terminal::disable_raw_mode();
+            #[cfg(windows)]
+            win_console::restore(&self.win_saved);
             crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
             eprint!("\r\n");
+        }
+    }
+}
+
+/// Windows console input for a remote PTY.
+///
+/// Reported: tmux mouse works over `shell --ssh` but not the native PTY, from a
+/// Windows PC. crossterm's raw mode on Windows only CLEARS line input, echo and
+/// processed input; it does not set ENABLE_VIRTUAL_TERMINAL_INPUT. Without that
+/// flag the console delivers mouse (and arrow, function and other special keys)
+/// as INPUT_RECORDs, which the plain stdin read in `spawn_stdin_reader` never
+/// sees, so a remote tmux asking for mouse reports never got one. OpenSSH for
+/// Windows sets the flag itself, which is exactly why `--ssh` worked.
+///
+/// Three changes, all reverted on drop to the exact original modes:
+///   input  + ENABLE_VIRTUAL_TERMINAL_INPUT   keys and mouse arrive as VT bytes
+///   input  - ENABLE_QUICK_EDIT_MODE          otherwise the console keeps clicks
+///            (+ ENABLE_EXTENDED_FLAGS)       for its own text selection; quick
+///                                            edit changes need this flag set
+///   output + ENABLE_VIRTUAL_TERMINAL_PROCESSING  so the remote app's DECSET
+///                                            mouse request is honoured even on
+///                                            the classic console host
+/// Every call is best-effort: a handle that is not a console (redirected IO)
+/// simply has no mode to change.
+#[cfg(windows)]
+mod win_console {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+
+    pub(super) struct Saved {
+        input: Option<u32>,
+        output: Option<u32>,
+    }
+
+    fn get(which: u32) -> Option<u32> {
+        let mut mode: u32 = 0;
+        // SAFETY: GetStdHandle has no preconditions; GetConsoleMode writes one
+        // u32 through a valid pointer and fails cleanly on a non-console handle.
+        let ok = unsafe { GetConsoleMode(GetStdHandle(which), &mut mode) };
+        (ok != 0).then_some(mode)
+    }
+
+    fn set(which: u32, mode: u32) {
+        // SAFETY: as above; a failure leaves the console unchanged.
+        unsafe {
+            SetConsoleMode(GetStdHandle(which), mode);
+        }
+    }
+
+    pub(super) fn snapshot() -> Saved {
+        Saved {
+            input: get(STD_INPUT_HANDLE),
+            output: get(STD_OUTPUT_HANDLE),
+        }
+    }
+
+    /// Called AFTER crossterm's raw mode, so it starts from the raw input mode.
+    pub(super) fn enable_vt(_original: &Saved) {
+        if let Some(cur) = get(STD_INPUT_HANDLE) {
+            let want = (cur | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
+                & !ENABLE_QUICK_EDIT_MODE;
+            set(STD_INPUT_HANDLE, want);
+        }
+        if let Some(cur) = get(STD_OUTPUT_HANDLE) {
+            set(STD_OUTPUT_HANDLE, cur | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+
+    pub(super) fn restore(saved: &Saved) {
+        if let Some(m) = saved.input {
+            set(STD_INPUT_HANDLE, m);
+        }
+        if let Some(m) = saved.output {
+            set(STD_OUTPUT_HANDLE, m);
         }
     }
 }
