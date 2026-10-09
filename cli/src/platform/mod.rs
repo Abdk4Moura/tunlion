@@ -1416,6 +1416,144 @@ pub mod policy_route {
     }
 }
 
+/// Whether a compiled terminfo entry for `name` is installed on this machine.
+///
+/// Used to decide the TERM a remote shell gets (l2::effective_term): forwarding
+/// a terminal name the machine has no entry for makes curses programs refuse
+/// outright ("missing or unsuitable terminal: xterm-kitty"). Probes ncurses' own
+/// search path -- $TERMINFO, ~/.terminfo, $TERMINFO_DIRS, then the system
+/// directories -- in both the first-character and the hex-code subdirectory
+/// layouts (Linux and macOS respectively). `name` must already be validated by
+/// the caller: it comes from a peer and is joined onto directories here.
+///
+/// Windows has no terminfo (ConPTY), so every name is "available" and the
+/// requested one is kept.
+pub fn terminfo_exists(name: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(first) = name.chars().next() else { return false };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(d) = std::env::var_os("TERMINFO") {
+            dirs.push(d.into());
+        }
+        dirs.push(Paths::home_dir().join(".terminfo"));
+        if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
+            dirs.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
+        }
+        for d in [
+            "/etc/terminfo",
+            "/lib/terminfo",
+            "/usr/share/terminfo",
+            "/usr/lib/terminfo",
+            "/usr/local/share/terminfo",
+        ] {
+            dirs.push(d.into());
+        }
+        let hex = format!("{:x}", first as u32);
+        dirs.iter().any(|d| {
+            d.join(first.to_string()).join(name).is_file() || d.join(&hex).join(name).is_file()
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        true
+    }
+}
+
+/// The local console's modes around an interactive remote PTY.
+///
+/// WINDOWS: crossterm's raw mode only clears line input, echo and processed
+/// input. It never sets ENABLE_VIRTUAL_TERMINAL_INPUT, so mouse events (and
+/// arrow, function and other special keys) arrive as INPUT_RECORDs that a plain
+/// stdin byte read never sees: a remote tmux asking for mouse reports never got
+/// one, while `--ssh` worked because OpenSSH for Windows sets the flag itself.
+/// `enable_vt` adds VT input, clears quick-edit (with ENABLE_EXTENDED_FLAGS, or
+/// the change is ignored) so clicks are not kept for the console's own
+/// selection, and adds VT output processing so the remote app's mouse request is
+/// honoured even on the classic console host. `restore` puts back the exact
+/// original modes. Only mode numbers are kept, never a HANDLE: in windows-sys
+/// 0.59 a HANDLE is a raw pointer (not Send) and this lives in async code.
+///
+/// ELSEWHERE: a terminal already delivers mouse and keys as bytes in raw mode,
+/// so every call is a no-op.
+pub struct ConsoleModes {
+    #[cfg(windows)]
+    input: Option<u32>,
+    #[cfg(windows)]
+    output: Option<u32>,
+}
+
+impl ConsoleModes {
+    /// Record the console's modes as they are now, BEFORE anything changes them.
+    pub fn snapshot() -> Self {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            ConsoleModes {
+                input: win_console_get(STD_INPUT_HANDLE),
+                output: win_console_get(STD_OUTPUT_HANDLE),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ConsoleModes {}
+        }
+    }
+
+    /// Call AFTER entering raw mode.
+    pub fn enable_vt(&self) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{
+                ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+                ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            if let Some(cur) = win_console_get(STD_INPUT_HANDLE) {
+                let want = (cur | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
+                    & !ENABLE_QUICK_EDIT_MODE;
+                win_console_set(STD_INPUT_HANDLE, want);
+            }
+            if let Some(cur) = win_console_get(STD_OUTPUT_HANDLE) {
+                win_console_set(STD_OUTPUT_HANDLE, cur | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+
+    /// Put back exactly what `snapshot` recorded.
+    pub fn restore(&self) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            if let Some(m) = self.input {
+                win_console_set(STD_INPUT_HANDLE, m);
+            }
+            if let Some(m) = self.output {
+                win_console_set(STD_OUTPUT_HANDLE, m);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win_console_get(which: u32) -> Option<u32> {
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle};
+    let mut mode: u32 = 0;
+    // SAFETY: GetStdHandle has no preconditions; GetConsoleMode writes one u32
+    // through a valid pointer and fails cleanly on a non-console handle.
+    let ok = unsafe { GetConsoleMode(GetStdHandle(which), &mut mode) };
+    (ok != 0).then_some(mode)
+}
+
+#[cfg(windows)]
+fn win_console_set(which: u32, mode: u32) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode};
+    // SAFETY: as above; a failure leaves the console unchanged.
+    unsafe {
+        SetConsoleMode(GetStdHandle(which), mode);
+    }
+}
+
 /// Create a symlink, for tests that need a symlinked entry in a fixture.
 ///
 /// Both arms live here because platform differences belong in `platform/` (docs/architecture/PLATFORM.md):

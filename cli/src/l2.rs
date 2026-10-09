@@ -642,42 +642,11 @@ pub(crate) fn effective_term(requested: &str) -> String {
     if !plausible {
         return FALLBACK.to_string();
     }
-    if terminfo_exists(requested) {
+    if crate::platform::terminfo_exists(requested) {
         requested.to_string()
     } else {
         FALLBACK.to_string()
     }
-}
-
-/// Whether a compiled terminfo entry for `name` is installed. Probes the same
-/// search path ncurses uses: $TERMINFO, ~/.terminfo, each $TERMINFO_DIRS entry,
-/// then the system directories. Entries live under a first-character
-/// subdirectory, named by the character itself on Linux and by its hex code on
-/// macOS, so both are checked. `name` must already be validated by the caller.
-#[cfg(unix)]
-fn terminfo_exists(name: &str) -> bool {
-    let Some(first) = name.chars().next() else { return false };
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(d) = std::env::var_os("TERMINFO") {
-        dirs.push(d.into());
-    }
-    dirs.push(crate::platform::Paths::home_dir().join(".terminfo"));
-    if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
-        dirs.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
-    }
-    for d in ["/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo", "/usr/lib/terminfo", "/usr/local/share/terminfo"] {
-        dirs.push(d.into());
-    }
-    let hex = format!("{:x}", first as u32);
-    dirs.iter().any(|d| {
-        d.join(first.to_string()).join(name).is_file() || d.join(&hex).join(name).is_file()
-    })
-}
-
-/// No terminfo on this platform (ConPTY): the name is advisory, keep it.
-#[cfg(not(unix))]
-fn terminfo_exists(_name: &str) -> bool {
-    true
 }
 
 /// Terminal-mode reset emitted to the client right AFTER a reattach replay.
@@ -2691,114 +2660,30 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// sequences and renders unusable.
 struct RawGuard {
     active: bool,
-    /// Windows only: the console's ORIGINAL input/output modes, restored exactly
-    /// on drop. Mode numbers only, never a HANDLE: a HANDLE is a raw pointer
-    /// (not Send) and this guard lives inside async code.
-    #[cfg(windows)]
-    win_saved: win_console::Saved,
+    /// The console's original modes, restored exactly on drop. On Windows this
+    /// is what turns on VT input so mouse and special keys reach the remote PTY
+    /// (see platform::ConsoleModes); elsewhere it is a no-op.
+    console: crate::platform::ConsoleModes,
 }
 impl RawGuard {
     fn enable() -> Result<Self> {
-        #[cfg(windows)]
-        let win_saved = win_console::snapshot();
+        let console = crate::platform::ConsoleModes::snapshot();
         crossterm::terminal::enable_raw_mode()?;
-        #[cfg(windows)]
-        win_console::enable_vt(&win_saved);
-        Ok(RawGuard {
-            active: true,
-            #[cfg(windows)]
-            win_saved,
-        })
+        console.enable_vt();
+        Ok(RawGuard { active: true, console })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
         if self.active {
             let _ = crossterm::terminal::disable_raw_mode();
-            #[cfg(windows)]
-            win_console::restore(&self.win_saved);
+            self.console.restore();
             crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
             eprint!("\r\n");
         }
     }
 }
 
-/// Windows console input for a remote PTY.
-///
-/// Reported: tmux mouse works over `shell --ssh` but not the native PTY, from a
-/// Windows PC. crossterm's raw mode on Windows only CLEARS line input, echo and
-/// processed input; it does not set ENABLE_VIRTUAL_TERMINAL_INPUT. Without that
-/// flag the console delivers mouse (and arrow, function and other special keys)
-/// as INPUT_RECORDs, which the plain stdin read in `spawn_stdin_reader` never
-/// sees, so a remote tmux asking for mouse reports never got one. OpenSSH for
-/// Windows sets the flag itself, which is exactly why `--ssh` worked.
-///
-/// Three changes, all reverted on drop to the exact original modes:
-///   input  + ENABLE_VIRTUAL_TERMINAL_INPUT   keys and mouse arrive as VT bytes
-///   input  - ENABLE_QUICK_EDIT_MODE          otherwise the console keeps clicks
-///            (+ ENABLE_EXTENDED_FLAGS)       for its own text selection; quick
-///                                            edit changes need this flag set
-///   output + ENABLE_VIRTUAL_TERMINAL_PROCESSING  so the remote app's DECSET
-///                                            mouse request is honoured even on
-///                                            the classic console host
-/// Every call is best-effort: a handle that is not a console (redirected IO)
-/// simply has no mode to change.
-#[cfg(windows)]
-mod win_console {
-    use windows_sys::Win32::System::Console::{
-        ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
-        STD_OUTPUT_HANDLE, SetConsoleMode,
-    };
-
-    pub(super) struct Saved {
-        input: Option<u32>,
-        output: Option<u32>,
-    }
-
-    fn get(which: u32) -> Option<u32> {
-        let mut mode: u32 = 0;
-        // SAFETY: GetStdHandle has no preconditions; GetConsoleMode writes one
-        // u32 through a valid pointer and fails cleanly on a non-console handle.
-        let ok = unsafe { GetConsoleMode(GetStdHandle(which), &mut mode) };
-        (ok != 0).then_some(mode)
-    }
-
-    fn set(which: u32, mode: u32) {
-        // SAFETY: as above; a failure leaves the console unchanged.
-        unsafe {
-            SetConsoleMode(GetStdHandle(which), mode);
-        }
-    }
-
-    pub(super) fn snapshot() -> Saved {
-        Saved {
-            input: get(STD_INPUT_HANDLE),
-            output: get(STD_OUTPUT_HANDLE),
-        }
-    }
-
-    /// Called AFTER crossterm's raw mode, so it starts from the raw input mode.
-    pub(super) fn enable_vt(_original: &Saved) {
-        if let Some(cur) = get(STD_INPUT_HANDLE) {
-            let want = (cur | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
-                & !ENABLE_QUICK_EDIT_MODE;
-            set(STD_INPUT_HANDLE, want);
-        }
-        if let Some(cur) = get(STD_OUTPUT_HANDLE) {
-            set(STD_OUTPUT_HANDLE, cur | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-        }
-    }
-
-    pub(super) fn restore(saved: &Saved) {
-        if let Some(m) = saved.input {
-            set(STD_INPUT_HANDLE, m);
-        }
-        if let Some(m) = saved.output {
-            set(STD_OUTPUT_HANDLE, m);
-        }
-    }
-}
 
 /// Why a single PTY attach ended.
 enum PtyOutcome {
@@ -5135,10 +5020,10 @@ mod term_tests {
         assert_eq!(effective_term(""), "xterm-256color");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_term_this_machine_knows_is_kept() {
-        // Every Linux and macOS CI image ships xterm-256color.
+        // Every Linux and macOS CI image ships xterm-256color, and on Windows
+        // (no terminfo) the requested name is always kept.
         assert_eq!(effective_term("xterm-256color"), "xterm-256color");
     }
 
