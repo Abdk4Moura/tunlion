@@ -1006,6 +1006,28 @@ pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+// ------------------------------------------------------------ hostname --
+
+/// The machine's hostname as the OS reports it, or `None` when it cannot be
+/// read. Unix asks the kernel (`gethostname`) rather than reading
+/// /etc/hostname, which macOS does not have; Windows reads COMPUTERNAME.
+#[cfg(unix)]
+pub fn os_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(windows)]
+pub fn os_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|s| !s.trim().is_empty())
+}
+
 // ------------------------------------------------------- InstallSource --
 
 /// How tunlion was installed. Used to gate `tunlion update`:

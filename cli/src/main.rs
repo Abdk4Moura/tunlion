@@ -703,28 +703,37 @@ pub(crate) fn display_name() -> String {
     default_display_name()
 }
 
-/// The computed display name when nothing is configured (user@host). Kept
-/// separate so the settings readout can show the true default.
+/// The computed display name when nothing is configured: the short hostname
+/// (`laptop`, not `kabir@laptop.home.lan`). Kept separate so the settings
+/// readout can show the true default.
 pub(crate) fn default_display_name() -> String {
-    // #183.1: USER and /etc/hostname are UNIX-only. On Windows the platform
-    // provides USERNAME and COMPUTERNAME and no /etc/hostname, so the unix
-    // read would offer every device the literal name "cli".
-    #[cfg(not(target_os = "windows"))]
-    {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        let host = std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into());
-        format!("{user}@{host}")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into());
-        format!("{user}@{host}")
-    }
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
 }
 
+/// `Kabir-MacBook.local` -> `kabir-macbook`. The first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label and reads the same on every peer. Falls back to
+/// "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mapped: String = first
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }
+        })
+        .collect();
+    let mut label = String::new();
+    for c in mapped.chars() {
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
+    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
+}
 
 pub(crate) fn human(bytes: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
