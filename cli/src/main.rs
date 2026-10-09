@@ -1859,3 +1859,6 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 
 #[cfg(test)]
 mod tests;
+/// Security decisions the mutation probe found unpinned.
+#[cfg(test)]
+mod security_pins_tests;
