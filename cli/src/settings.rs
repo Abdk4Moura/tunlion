@@ -961,7 +961,7 @@ pub async fn run_set(
             };
             for tgt in targets {
                 let scope = tgt.map(|p| format!("peer:{p}")).unwrap_or_else(|| "global".into());
-                eprintln!("would reset {} (currently {}, {scope})", s.key, resolve(s, tgt).0);
+                ui::say(&format!("would reset {} (currently {}, {scope})", s.key, resolve(s, tgt).0));
             }
             return Ok(());
         }
