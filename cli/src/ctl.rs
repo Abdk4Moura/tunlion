@@ -43,13 +43,13 @@ pub fn reuse_disabled() -> bool {
 pub use imp::{
     daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
     try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
-    try_reload_expose, try_resize, try_unmount, Req, ReqKind,
+    try_reload_expose, try_resize, try_unmount, try_wake, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
     daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
-    try_list_pending, try_list_warm, try_ping,
+    try_list_pending, try_list_warm, try_ping, try_wake,
     Req,
 };
 
@@ -316,6 +316,22 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Wake the running daemon so it re-runs its arm gate immediately (see
+    /// ReqKind::Wake). Fire-and-forget in spirit: a short timeout, and `None`
+    /// when no daemon answered, which only means the next tick does the work.
+    pub async fn try_wake() -> Option<Value> {
+        let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+        let mut line = serde_json::to_vec(&json!({ "op": "wake" })).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).await.ok()?;
+        s.flush().await.ok()?;
+        let reply = tokio::time::timeout(std::time::Duration::from_millis(1500), read_line(&mut s, 256))
+            .await
+            .ok()?
+            .ok()?;
+        serde_json::from_str(&reply).ok()
+    }
+
     /// Ask a running `up` daemon to RELOAD onto a freshly `tunlion update`d binary
     /// with no manual restart and no sudo. The daemon gracefully shuts down (the
     /// same path a `systemctl restart` / SIGTERM takes, which cleanly closes the
@@ -557,6 +573,15 @@ mod imp {
         /// `{"ok":true,"live":true,"count":<n>}` where `n` is the number of ports
         /// now bound; `live:false` if L3 is not up in the daemon.
         ReloadExpose,
+        /// A no-op that exists to WAKE the daemon loop. The mint sends it right
+        /// after writing armed.json so the per-iteration arm gate subscribes the
+        /// enrollment channel NOW, instead of on the loop's next idle tick. That
+        /// tick cost a joiner up to a second whenever it arrived fast (a phone
+        /// scanning the QR code, or a scripted add | join): it reached the empty
+        /// channel first and waited. armed.json stays the source of truth -- this
+        /// carries no state, so a platform without a control socket loses nothing
+        /// but the speed-up. Answered INLINE with `{"ok":true}`.
+        Wake,
         /// Gracefully restart to pick up an updated binary (`tunlion update`).
         /// Handled INLINE: if supervised (systemd), reply then self-SIGTERM so the
         /// supervisor restarts us cleanly; otherwise decline (don't exit into down).
@@ -715,6 +740,7 @@ mod imp {
                         ReqKind::Reconfigure { key }
                     }
                     Some("reload-expose") => ReqKind::ReloadExpose,
+                    Some("wake") => ReqKind::Wake,
                     Some("reload") => ReqKind::Reload,
                     Some("mount") => {
                         let Some(peer) = v["peer"].as_str().map(str::to_string) else { return };
@@ -871,6 +897,12 @@ mod stub {
     /// back to a fresh establish. Present so the `via_daemon`-gated call sites —
     /// dead here, since `via_daemon` is always false on non-unix — still compile.
     pub async fn try_ping(_peer: &str) -> Option<Value> {
+        None
+    }
+
+    /// No control socket here (#205), so there is no loop to wake; the
+    /// daemon's own tick picks up armed.json, exactly as before Wake existed.
+    pub async fn try_wake() -> Option<Value> {
         None
     }
 
