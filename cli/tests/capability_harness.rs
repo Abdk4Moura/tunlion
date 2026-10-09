@@ -868,7 +868,14 @@ fn live_pair(
     claim.envs(envs.iter().map(|(k, v)| (*k, *v)))
         .env("FILAMENT_CONFIG_DIR", b_dir)
         .env("FILAMENT_NAME", "test-b")
-        .arg("add")
+        // `join` CLAIMS a code; `add` only offers one. Since #291 the CLI refuses
+        // `add <code>` outright ("`add` offers, `join` accepts"), so this claim
+        // exited at once, the create waited for a claimant that never came, and
+        // the helper reported "pair create failed". This helper was written in
+        // August against the old surface and went stale when #290 rebased it
+        // onto main. Its one caller is the #172 revocation gate, which therefore
+        // never got past setup in CI. The mesh pairing cell already uses `join`.
+        .arg("join")
         .arg(&code)
         .arg("--server")
         .arg(server);
