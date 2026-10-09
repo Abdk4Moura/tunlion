@@ -45,7 +45,7 @@ on:
     - cron: "17 3 * * 0"
 
 concurrency:
-  group: mutants-${{ github.ref }}
+  group: mutants-${{ github.ref }}-${{ github.event.inputs.targets }}-${{ github.event.inputs.files }}
   cancel-in-progress: false
 
 env:
