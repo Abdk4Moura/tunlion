@@ -568,12 +568,20 @@ async fn handle_warm_open(
     // timeout (the 25s ssh ConnectTimeout we measured). Spawned so the verify wait
     // never blocks the event loop (F8).
     tokio::spawn(async move {
-        match l2::open_stream_verified(&mux, rport, l2::warm_verify_window()).await {
-            Ok((sid, first, rx)) => {
+        match l2::open_stream_verified_reason(&mux, rport, l2::warm_verify_window()).await {
+            l2::WarmOpen::Opened(sid, first, rx) => {
                 let sock = req.accept().await;
                 l2::serve_verified_stream(mux, sid, sock, first, rx).await;
             }
-            Err(e) => {
+            // The peer ANSWERED: the link is healthy, keep it, and relay the
+            // reason so the client can show it (it used to be read as a zombie).
+            l2::WarmOpen::Refused(reason) => {
+                ui::debug(&format!(
+                    "tunlion: warm open to '{peer}':{rport} refused by the peer ({reason})"
+                ));
+                req.reject(&format!("refused: {reason}")).await;
+            }
+            l2::WarmOpen::Dead(e) => {
                 ui::debug(&format!(
                     "tunlion: warm link to '{peer}' is a zombie ({e}); dropping + establishing fresh"
                 ));

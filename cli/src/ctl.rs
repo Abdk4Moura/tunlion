@@ -41,15 +41,15 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
-    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
+    daemon_present, forward_probe, send_reply, serve_at, try_approve_request, try_bootstrap,
+    try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_open_reason, try_ping, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, try_wake, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
-    try_list_pending, try_list_warm, try_ping, try_wake,
+    daemon_present, forward_probe, try_approve_request, try_cap_status, try_deny_request,
+    try_fleet_rendezvous, try_list_pending, try_list_warm, try_ping, try_wake,
     Req,
 };
 
@@ -147,6 +147,42 @@ mod imp {
             Some(s)
         } else {
             None
+        }
+    }
+
+    /// Like `try_open`, but reports WHY the daemon said no, as `try_pty_reason`
+    /// does: `Err(Some("refused: ..."))` is the PEER's answer and definitive.
+    pub async fn try_open_reason(
+        peer: &str,
+        rport: u16,
+    ) -> std::result::Result<UnixStream, Option<String>> {
+        if reuse_disabled() {
+            return Err(None);
+        }
+        let mut s = UnixStream::connect(control_sock_path()).await.map_err(|_| None)?;
+        let req = json!({ "op": "open", "peer": peer, "rport": rport });
+        let mut line = serde_json::to_vec(&req).map_err(|_| None)?;
+        line.push(b'\n');
+        s.write_all(&line).await.map_err(|_| None)?;
+        s.flush().await.map_err(|_| None)?;
+        let reply = read_line(&mut s, 4096).await.map_err(|_| None)?;
+        let v: Value = serde_json::from_str(&reply).map_err(|_| None)?;
+        if v["ok"].as_bool() == Some(true) {
+            return Ok(s);
+        }
+        Err(Some(v["err"].as_str().unwrap_or("rejected").to_string()))
+    }
+
+    /// One probe open of `peer`:`rport` through the daemon's warm link, closed
+    /// at once. `Some(Ok)` = the peer accepted, `Some(Err(reason))` = the peer
+    /// refused, `None` = no warm path to ask through (unknown).
+    pub async fn forward_probe(peer: &str, rport: u16) -> Option<std::result::Result<(), String>> {
+        match try_open_reason(peer, rport).await {
+            Ok(_sock) => Some(Ok(())), // dropping it closes the bridged stream
+            Err(Some(r)) if r.starts_with("refused:") => {
+                Some(Err(r.trim_start_matches("refused:").trim().to_string()))
+            }
+            Err(_) => None,
         }
     }
 
@@ -933,6 +969,14 @@ mod stub {
     }
 
     pub async fn try_list_warm() -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so no daemon to probe a forward through.
+    pub async fn forward_probe(
+        _peer: &str,
+        _rport: u16,
+    ) -> Option<std::result::Result<(), String>> {
         None
     }
 

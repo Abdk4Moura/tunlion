@@ -178,6 +178,19 @@ impl Link {
         self.verified_name.as_deref().unwrap_or(&self.name)
     }
 
+    /// DISPLAY only, never a lookup key: the proven petname, else the petname
+    /// this link is being dialed as (the known-device hypothesis, not yet
+    /// proven), else the broadcast name. Progress lines read "ok <petname>"
+    /// instead of a raw peer id or `user@host` for a device the user named.
+    /// `shown()` stays as it is because last-seen and overlay naming key on
+    /// it, and an unproven hypothesis must not touch a device record.
+    pub(crate) fn label(&self) -> &str {
+        self.verified_name
+            .as_deref()
+            .or(self.expected_secret.as_ref().map(|(n, _)| n.as_str()))
+            .unwrap_or(&self.name)
+    }
+
     /// Admit this link as a delegated (auth-key-enrolled) principal.
     /// Ensures caps are structurally tied to the Proven identity — a Delegated
     /// principal CANNOT exist without its ceiling.
@@ -227,6 +240,15 @@ impl Link {
         // would leak into legacy_ok for gates that read it directly (e.g. mount),
         // handing an ephemeral borrower an unbounded, un-ceilinged grant.
     }
+}
+
+/// How long a command waits on a known device with NO presence before saying
+/// it may simply be offline (it keeps waiting until its own timeout).
+pub(crate) const OFFLINE_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// The one-time hint for a known device that has not appeared at all.
+pub(crate) fn offline_hint(peer: &str) -> String {
+    format!("tunlion: {peer} doesn't seem to be online. Is `tunlion up` running there?")
 }
 
 /// C26: per-peer presence for the static status roster.
@@ -3759,10 +3781,10 @@ impl Conn {
         for (id, l) in links {
             if id == pid {
                 seen = true;
-                parts.push(peer_entry(l.shown(), mark, tone, note));
+                parts.push(peer_entry(l.label(), mark, tone, note));
             } else {
                 let (m, t, n) = presence_glyph(l.presence);
-                parts.push(peer_entry(l.shown(), m, t, n));
+                parts.push(peer_entry(l.label(), m, t, n));
             }
         }
         if !seen {

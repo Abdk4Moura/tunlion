@@ -424,9 +424,10 @@ async fn handle_forward_open(
             .as_deref()
             .unwrap_or("device not granted shell");
         ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
-        let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
-                .await;
+        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+        let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
+        crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
+        let _ = t.send_control(&close).await;
     } else {
         // Opt-in gateway: if the target is non-loopback, allow it
         // only when the operator's l2-allow.json lists it for this
@@ -508,9 +509,9 @@ async fn handle_pty_open(
     // no output. Say so, so the initiator errors instead of waiting.
     if !l2_enabled {
         let sid = l2::wire_sid(&v).unwrap_or(0);
-        let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `tunlion up --shell` on that device" }))
-                .await;
+        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+        let refusal = crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
     // wire_sid rejects a missing OR out-of-range sid instead of
@@ -558,10 +559,30 @@ async fn handle_pty_open(
         // produced and then thrown away before it crossed the wire,
         // so the initiator read an empty success instead of the
         // refusal. The fallback stays coarse on purpose.
-        let reason = cap_reason.unwrap_or_else(|| "shell capability not granted".to_string());
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
-            .await;
+        // With a precise code and our name for the peer, so its remedy is
+        // the one that applies (a missing grant is not "serving is off").
+        let refusal = crate::refusal::Refusal::from_shell_gate(
+            gate_inputs.cert_revoked,
+            gate_inputs.denied,
+            cap_reason.as_deref(),
+            dev.clone(),
+        );
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
+        return;
+    }
+    // A configured user drop (`--shell-user`, or `set shell-user` applied
+    // live) needs root for runuser. Without it the spawn "succeeds" into a
+    // shell that dies at once with runuser's own complaint; refuse up front
+    // and say which setting is the problem. `shell_argv(..).1` is false where
+    // the platform ignores --shell-user entirely (nothing to drop to there).
+    if shell_user.is_some()
+        && crate::shell_root_note().is_empty()
+        && shell_argv(None, shell_user.as_deref()).1
+    {
+        let refusal =
+            crate::refusal::Refusal::new(crate::refusal::Code::UserDropUnavailable, dev.clone());
+        ui::say(&format!("l2: pty refused: {}", refusal.reason));
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
@@ -1117,11 +1138,15 @@ pub(crate) async fn recv_cmd(
     // `tunlion grant <dev> shell` works on a plain `up` without restarting with a
     // flag, matching what the grant command tells the user). The per-device gate
     // below still denies every non-granted device, so this never widens access.
-    let l2_enabled = shell_policy.enables_l2()
+    // The launch posture (`--shell`/`--shell-only`, FILAMENT_L2) is fixed for
+    // the daemon's life: it is what `--i-know` was checked against, so a live
+    // `set shell on` must not widen it past that gate. The GRANT half is not
+    // fixed: it is recomputed at the top of every loop iteration below.
+    let l2_launch = shell_policy.enables_l2()
         || std::env::var("FILAMENT_L2")
             .map(|v| v == "1")
-            .unwrap_or(false)
-        || any_shell_grant();
+            .unwrap_or(false);
+    let mut l2_enabled = l2_launch || any_shell_grant();
 
     let mut conn = Conn::for_command(
         server,
@@ -1637,6 +1662,10 @@ pub(crate) async fn recv_cmd(
     }
 
     loop {
+        // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
+        // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
+        // restart and refused every granted device with "shell serving is off".
+        l2_enabled = l2_launch || crate::shell_support::any_shell_grant_live();
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
         // - the backstop for the stall that also freezes the reconnect code.
@@ -3855,7 +3884,7 @@ pub(crate) async fn recv_cmd(
                     ui::say(&format!(
                         "  {} {}",
                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.shown())
+                        ui::paint(ui::Tone::Bold, l.label())
                     ));
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
@@ -4976,28 +5005,22 @@ pub(crate) async fn recv_cmd(
                 // (#206), so the client gets a clean, immediate, explained close
                 // instead of a hang.
                 Some("l2-open") if !l2_enabled => {
-                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "l2-close",
-                                "sid": sid,
-                                "err": crate::capability::TUNNEL_OFF_REASON,
-                            }))
-                            .await;
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
+                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::TunnelOff, who);
+                        let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
                 }
                 // exec-open when serving is off: refuse loudly like l2-open, so
                 // the caller errors instead of hanging on a silent drop.
                 Some("exec-open") if !l2_enabled => {
-                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "l2-close",
-                                "sid": sid,
-                                "err": crate::capability::SHELL_OFF_REASON,
-                            }))
-                            .await;
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
+                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                        let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
                 }
@@ -5018,12 +5041,15 @@ pub(crate) async fn recv_cmd(
                 #[cfg(unix)]
                 Some("shell-bootstrap") if !l2_enabled => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "shell-bootstrap-deny",
-                                "reason": crate::capability::SHELL_OFF_REASON,
-                            }))
-                            .await;
+                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                        let mut f = json!({
+                            "type": "shell-bootstrap-deny",
+                            "reason": refusal.reason,
+                        });
+                        refusal.annotate(&mut f);
+                        let _ = t.send_control(&f).await;
                     }
                     continue;
                 }
@@ -5132,12 +5158,21 @@ pub(crate) async fn recv_cmd(
                             granted.deny_reason("no shell cap / untrusted")
                         ));
                         enqueue_if_requestable(who, "shell");
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "shell-bootstrap-deny",
-                                "reason": "shell capability not granted"
-                            }))
-                            .await;
+                        let cap_reason = granted.deny_reason("");
+                        let refusal = crate::refusal::Refusal::from_shell_gate(
+                            false,
+                            dev.as_deref()
+                                .map(|n| device_capability_denied(n, "shell"))
+                                .unwrap_or(false),
+                            (!cap_reason.is_empty()).then_some(cap_reason),
+                            dev.clone(),
+                        );
+                        let mut f = json!({
+                            "type": "shell-bootstrap-deny",
+                            "reason": refusal.reason,
+                        });
+                        refusal.annotate(&mut f);
+                        let _ = t.send_control(&f).await;
                         continue;
                     }
                     let device = dev.unwrap();
@@ -5930,7 +5965,9 @@ pub(crate) async fn recv_cmd(
                                                                                 l.identity_binding = crate::capability::BindingStrength::Proven;
                                                                                 l.identity_cert_expires = Some(cert.expires);
                                                                             }
-                                                                            ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
+                                                                            // The peer by name, not its raw signaling id.
+                                                                            let who = conn.link(&pid).map(|l| l.label().to_string()).unwrap_or_else(|| pid.to_string());
+                                                                            ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), who));
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
                     }

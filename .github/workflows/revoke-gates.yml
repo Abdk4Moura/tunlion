@@ -128,7 +128,7 @@ jobs:
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3
             [cli/tests/shell-posture-gates.sh]=3
-            [cli/tests/forward-refusal-gates.sh]=5
+            [cli/tests/forward-refusal-gates.sh]=6
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \

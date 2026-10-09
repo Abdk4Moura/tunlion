@@ -36,6 +36,42 @@ pub(crate) fn any_shell_grant_at(path: &Path) -> bool {
     !shell_grant_names_at(path).is_empty()
 }
 
+/// `any_shell_grant`, re-read whenever devices.json changes.
+///
+/// The daemon used to evaluate `any_shell_grant()` ONCE, at startup, into its
+/// `l2_enabled` switch. So on a plain `up`, `tunlion grant <dev> shell` wrote a
+/// grant the running daemon could never act on: every open was refused with
+/// "shell serving is off there" (true of the stale switch, false of the
+/// config) until someone restarted the daemon, and nothing said a restart was
+/// needed. The receive loop now asks this on every iteration, so a grant (or
+/// the revoke of the last one) takes effect on the next open. Keyed on the
+/// file's mtime and length, the same cross-process invalidation the cap-store
+/// cache uses, so the hot loop pays one stat, not a parse.
+pub(crate) fn any_shell_grant_live() -> bool {
+    use std::sync::Mutex;
+    type Key = (PathBuf, Option<std::time::SystemTime>, u64);
+    static CACHE: Mutex<Option<(Key, bool)>> = Mutex::new(None);
+    let path = devices_path();
+    let meta = std::fs::metadata(&path).ok();
+    let key: Key = (
+        path.clone(),
+        meta.as_ref().and_then(|m| m.modified().ok()),
+        meta.as_ref().map(|m| m.len()).unwrap_or(0),
+    );
+    if let Ok(c) = CACHE.lock() {
+        if let Some((k, v)) = c.as_ref() {
+            if *k == key {
+                return *v;
+            }
+        }
+    }
+    let v = any_shell_grant_at(&path);
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((key, v));
+    }
+    v
+}
+
 pub(crate) fn shell_grant_names() -> Vec<String> {
     shell_grant_names_at(&devices_path())
 }
@@ -126,12 +162,31 @@ pub(crate) fn require_shell_owner_ack(
         );
     }
     if shell_enabled && shell_user.is_none() && !i_know {
-        bail!(
-            "serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{} Pass --shell-user or --i-know to continue.",
-            shell_root_note()
-        );
+        bail!("{}", owner_shell_refusal(!shell_root_note().is_empty()));
     }
     Ok(())
+}
+
+/// The refusal for serving a shell as the owner without saying so. One plain
+/// sentence of risk, then `--i-know` as the explicit choice it is. The gate
+/// itself is unchanged; only the words are. For a non-root user `--i-know` is
+/// the only way to serve a shell at all (`--shell-user` needs root for
+/// runuser), so it is presented as the path, not buried as an override.
+pub(crate) fn owner_shell_refusal(is_root: bool) -> String {
+    let risk = "A shell served this way runs as you, so any device you let in gets the owner's authority: it can do anything you can, including use your tunlion keys to act as you.";
+    if is_root {
+        format!(
+            "{risk} This process is root, so that means the whole machine.\n\
+             To serve it anyway, say so explicitly:  tunlion up --shell --i-know\n\
+             Safer: drop shells to a separate account:  tunlion up --shell --shell-user <account>"
+        )
+    } else {
+        format!(
+            "{risk}\n\
+             If that is what you want, say so explicitly:  tunlion up --shell --i-know\n\
+             (or allow single devices instead of all of them:  tunlion grant <device> shell)"
+        )
+    }
 }
 
 pub(crate) fn service_manager_for_cgroup(cg: &str) -> Option<ServiceManager> {

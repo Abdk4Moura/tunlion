@@ -338,6 +338,9 @@ pub(crate) async fn pair_cmd(
     // `add --internal` reporting success on the owner side while the device stayed
     // EXTERNAL.
     let mut enrol_settled = false;
+    // Set when the owner's enrol-grant was persisted: this device JOINED the
+    // owner's mesh, so the peer is not someone else's device after all.
+    let mut joined_mesh = false;
     let mut enrol_deadline: Option<Instant> = None;
     let mut sent_identity: bool = false;
     let mut identity_exchange_window: Option<std::time::Instant> = None;
@@ -585,6 +588,20 @@ pub(crate) async fn pair_cmd(
                             .context("atomic store secret+cert")?;
                             // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
                             store_provisional_identity(&n, pcert).context("store provisional")?;
+                        }
+                        // A pairing between two DIFFERENT identities files the peer
+                        // as EXTERNAL (someone else's, time-boxed, deny-by-default).
+                        // That used to happen silently, even for `add <device>`,
+                        // which reads as "make it one of mine". Say so, on both
+                        // ends, and name the real path to one identity.
+                        if !same_person
+                            && !joined_mesh
+                            && issued_cert.is_none()
+                            && peer_identity_cert.is_some()
+                        {
+                            let (headline, detail, steps) =
+                                external_pairing_notice(&n, &display_name(), internal);
+                            ui::caution(&headline, Some(detail.as_str()), &steps);
                         }
                         if same_person {
                             ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
@@ -1037,7 +1054,9 @@ pub(crate) async fn pair_cmd(
                                         if let Ok(grant) = serde_json::from_slice::<Value>(&pt) {
                                             enrol_settled = true;
                                             match persist_mesh_grant(&grant) {
-                                                Ok(()) => ui::say(&format!(
+                                                Ok(()) => {
+                                                    joined_mesh = true;
+                                                    ui::say(&format!(
                                                     "  {} joined {}'s mesh",
                                                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                                     ui::paint(
@@ -1046,7 +1065,8 @@ pub(crate) async fn pair_cmd(
                                                             .as_str()
                                                             .unwrap_or("the owner")
                                                     )
-                                                )),
+                                                ));
+                                                }
                                                 Err(e) => ui::say(&ui::paint(
                                                     ui::Tone::Warn,
                                                     &format!(
@@ -1185,10 +1205,12 @@ pub(crate) async fn pair_cmd(
                     }
                     None => continue,
                 };
+                // The petname when one is settled (`add <name>`, `--name`): the
+                // name the user chose, not the peer's broadcast `user@host`.
                 ui::say(&format!(
                     "  {} {}",
                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                    ui::paint(ui::Tone::Bold, &display)
+                    ui::paint(ui::Tone::Bold, petname.as_deref().unwrap_or(&display))
                 ));
                 peer = Some((pid.clone(), display.clone()));
                 let _ = &t; // transport not used on the v2 path (no secret over DC)
@@ -1268,6 +1290,70 @@ pub(crate) async fn pair_cmd(
             }
             Ev::Interrupted => bail!("interrupted"),
             _ => {}
+        }
+    }
+}
+
+/// What to say when a pairing filed the peer as EXTERNAL because the two
+/// devices already hold DIFFERENT identities. `asked_to_own` is `add <device>`
+/// (`--internal`): the operator meant "one of mine", so the steps make the PEER
+/// join this identity; otherwise they make THIS device join the peer's.
+/// Every step is a command the CLI accepts (pinned by the test below).
+pub(crate) fn external_pairing_notice(
+    peer: &str,
+    me: &str,
+    asked_to_own: bool,
+) -> (String, String, Vec<String>) {
+    let peer_w = crate::refusal::word(peer);
+    let me_w = crate::refusal::word(me);
+    let headline = format!("'{peer}' was filed as EXTERNAL, not as one of your devices");
+    let detail = if asked_to_own {
+        format!(
+            "'{peer}' already has its own identity, different from this device's, so pairing could not make it yours. External devices are someone else's: time-boxed and deny-by-default."
+        )
+    } else {
+        format!(
+            "'{peer}' and this device have different identities, so each is EXTERNAL to the other: time-boxed and deny-by-default."
+        )
+    };
+    let steps = if asked_to_own {
+        vec![
+            format!("if '{peer}' is yours, on '{peer}' run: tunlion down --yes && tunlion reset"),
+            format!("then here: tunlion devices forget {peer_w} && tunlion add {peer_w} (and do what it prints on '{peer}')"),
+        ]
+    } else {
+        vec![
+            format!("if this device should be one of '{peer}'s, run here: tunlion down --yes && tunlion reset"),
+            format!("then on '{peer}': tunlion add {me_w} (and do what it prints here)"),
+        ]
+    };
+    (headline, detail, steps)
+}
+
+#[cfg(test)]
+mod external_notice_tests {
+    use super::external_pairing_notice;
+
+    /// The commands in the steps parse, so a copy-paste never meets clap's
+    /// "unexpected argument".
+    #[test]
+    fn the_steps_name_commands_that_parse() {
+        use clap::Parser;
+        for own in [true, false] {
+            let (headline, _, steps) = external_pairing_notice("p1-b", "p1-a", own);
+            assert!(headline.contains("EXTERNAL"), "{headline}");
+            for step in steps {
+                let Some(start) = step.find("tunlion ") else { continue };
+                let tail = &step[start..];
+                let tail = tail.split(" (").next().unwrap_or(tail);
+                for cmd in tail.split(" && ") {
+                    let argv: Vec<&str> = cmd.split_whitespace().collect();
+                    assert!(
+                        crate::Cli::try_parse_from(&argv).is_ok(),
+                        "does not parse: {cmd}"
+                    );
+                }
+            }
         }
     }
 }
