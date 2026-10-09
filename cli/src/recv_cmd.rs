@@ -30,7 +30,7 @@ use crate::{
     flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
     handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
     interactive_requested, is_self_uid, issue_proven_challenge_and_hold,
-    issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_nonce,
+    issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
     load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
     mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding, overlay,
@@ -843,14 +843,12 @@ pub(crate) async fn recv_cmd(
     // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
-    // C29: an in-session pairing ceremony (daemon mode): typed code or a
-    // minted one, exactly ONE side hands over a fresh secret (creator
-    // initiates; a claimer waits 3 s for the creator, then takes over,
-    // browsers never initiate). Some(true) = we minted; Some(false) = we
-    // claimed; None = no ceremony pending.
-    let mut ceremony: Option<bool> = None;
-    let mut ceremony_pid: Option<String> = None;
-    let mut ceremony_secret = fresh_secret();
+    // C29's in-session pairing ceremony (a code typed into, or minted by, the
+    // interactive `up` console) is GONE. It claimed a v1 code (`pair-claim`
+    // without `v:2`) and then handed a fresh pair secret over a DataChannel
+    // whose DTLS fingerprints the signaling server chose, so a malicious
+    // server could MITM it and keep the secret. Pairing from the console now
+    // points at `tunlion pair`, which runs the SPAKE2 ceremony.
     // Receive-side transfer/consent state, grouped out of this function's locals
     // (still a plain local; no handler extraction yet). See `RecvState`.
     let mut st = RecvState {
@@ -3796,6 +3794,8 @@ pub(crate) async fn recv_cmd(
                             .and_then(|l| l.expected_secret.as_ref().map(|(n, _)| n.clone())),
                     ));
                 }
+                // H1: a DataChannel's binding folds in its DTLS fingerprints.
+                let link_fps = link_fingerprints(&conn, &pid).await;
                 if !fleet_verified.contains(&pid)
                     && fleet::rv().is_some()
                     && (fleet_pending.contains(&pid) || fleet_shaped_link(&conn, &pid))
@@ -3803,7 +3803,7 @@ pub(crate) async fn recv_cmd(
                     // Mark it, so the L3 gate and the drop-cleanup track this link
                     // even when it arrived via warm-hold rather than presence.
                     fleet_pending.insert(pid.clone());
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         match fleet::make_hello(&cb, &display_name()) {
                             Ok(hello) => {
                                 fleet_greeted.insert(pid.clone());
@@ -3815,12 +3815,12 @@ pub(crate) async fn recv_cmd(
                 }
                 #[cfg(l3)]
                 if let Some(l3) = l3.as_ref() {
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         if let Some(ann) = l3.make_announce(&cb) {
                             let _ = t.send_control(&ann.to_json()).await;
                         }
                     }
-                    if let Some(cb) = in_binding(&t, &pid, &bind_ours) {
+                    if let Some(cb) = in_binding(&t, &pid, &bind_ours, link_fps.as_ref()) {
                         if let Some(pending) = l3_seen.get(&pid) {
                             if let Ok(ip) = pending.verify(&cb) {
                                 // Seq check AFTER verify, never before, so an
@@ -3960,48 +3960,6 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
-                // C29: an in-session pairing, exactly one side hands over a
-                // secret; consent (pair-keep-ack / our store) completes it.
-                // Only links that aren't ALREADY known are candidates.
-                // "No pair secret" USED to mean "a peer we have never met", which
-                // is what makes a link a candidate for the in-session ceremony.
-                // Fleet auto-mesh broke that: a sibling whose direct dial fell
-                // back to WebRTC also has no pair secret, and it would consume the
-                // code the human just typed, handing the ceremony secret to a
-                // device we already know and leaving the intended one unpaired.
-                // A fleet peer is never a pairing candidate.
-                let fresh_link = conn
-                    .link(&pid)
-                    .map(|l| l.expected_secret.is_none())
-                    .unwrap_or(false)
-                    && !fleet_pending.contains(&pid)
-                    && !fleet_verified.contains(&pid);
-                if fresh_link {
-                    match ceremony {
-                        Some(true) => {
-                            // we minted the code, initiate now
-                            ceremony = None;
-                            ceremony_pid = Some(pid.clone());
-                            t.send_control(
-                                &json!({ "type": "pair-keep", "secret": ceremony_secret }),
-                            )
-                            .await
-                            .ok();
-                        }
-                        Some(false) => {
-                            // we claimed, give a CLI creator 3 s to initiate
-                            // (browsers never do), then take over.
-                            let tx = tx.clone();
-                            let pid = pid.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(3)).await;
-                                let _ =
-                                    tx.send(Ev::Control(pid, json!({ "type": "__pair_fallback" })));
-                            });
-                        }
-                        None => {}
-                    }
-                }
             }
             Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str()) {
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
@@ -4028,7 +3986,10 @@ pub(crate) async fn recv_cmd(
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
-                                if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                                let link_fps = link_fingerprints(&conn, &pid).await;
+                                if let Some(cb) =
+                                    out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
+                                {
                                     #[cfg(l3)]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(ann) = l3.make_announce(&cb) {
@@ -4065,9 +4026,10 @@ pub(crate) async fn recv_cmd(
                 // owner key, and both naming the same device key. Anything less
                 // and the link stays unverified, so it never gains a route.
                 Some(fleet::HELLO) => {
+                    let link_fps = link_fingerprints(&conn, &pid).await;
                     let cb = conn
                         .transport_of(&pid)
-                        .and_then(|t| in_binding(&t, &pid, &bind_ours));
+                        .and_then(|t| in_binding(&t, &pid, &bind_ours, link_fps.as_ref()));
                     let owner = fleet::my_owner_pub();
                     match (cb, owner) {
                         (Some(cb), Some(owner)) => {
@@ -4347,8 +4309,10 @@ pub(crate) async fn recv_cmd(
                             l3_seen.insert(pid.clone(), ann.clone());
                             // Try to process immediately if transport is available.
                             if let Some(l3) = l3.as_ref() {
+                                let link_fps = link_fingerprints(&conn, &pid).await;
                                 match conn.transport_of(&pid).and_then(|t| {
-                                    in_binding(&t, &pid, &bind_ours).map(|cb| (t, cb))
+                                    in_binding(&t, &pid, &bind_ours, link_fps.as_ref())
+                                        .map(|cb| (t, cb))
                                 }) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
@@ -5341,13 +5305,21 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    // Decode the requested root up front: the fleet mount scope
-                    // (read-only, within the share root) is decided at the gate.
+                    // Decode the requested root up front and CONFINE it to the
+                    // share root (mount_gate.rs): a relative root resolves
+                    // against the share root, and anything that lands outside
+                    // it (`/`, `..`, a symlink out) is refused below in BOTH
+                    // modes. The peer names a path; only the owner's `share`
+                    // setting decides what is servable.
                     let root_encoded = v["root"].as_str().unwrap_or(".");
-                    let root_path = mount_proto::path_decode(root_encoded)
+                    let requested_root = mount_proto::path_decode(root_encoded)
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let within_share =
-                        crate::path_within_canonical(&crate::fleet_share_root(), &root_path);
+                    let confined_root = crate::mount_gate::confine_mount_root(
+                        &crate::fleet_share_root(),
+                        &requested_root,
+                    );
+                    let within_share = confined_root.is_some();
+                    let verified = conn.link(&pid).and_then(|l| l.verified_name.clone());
                     // Capability layer for mount evaluated unconditionally (shadow
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
@@ -5403,10 +5375,28 @@ pub(crate) async fn recv_cmd(
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
-                        // No deny list is consulted on the mount path today;
-                        // false preserves that exactly.
-                        let d = crate::capability::cap_gate_effective(
+                        // The legacy input, which IS the verdict in shadow mode:
+                        // a trusted link is not enough, the device must hold
+                        // `mount` (record grant or owner-signed grant) and carry
+                        // no recorded deny. Before this it was `trusted` alone,
+                        // so a transfer-only device got a read-write mount.
+                        let (record_grants, denied) = verified
+                            .as_deref()
+                            .map(|n| {
+                                (
+                                    device_allows(n, crate::capability::CAP_MOUNT),
+                                    device_capability_denied(n, crate::capability::CAP_MOUNT),
+                                )
+                            })
+                            .unwrap_or((false, false));
+                        let legacy_ok = crate::mount_gate::mount_legacy_allowed(
                             trusted,
+                            record_grants,
+                            has_grant,
+                            denied,
+                        );
+                        let d = crate::capability::cap_gate_effective(
+                            legacy_ok,
                             &outcome,
                             crate::capability::CAP_MOUNT,
                             "self",
@@ -5419,7 +5409,7 @@ pub(crate) async fn recv_cmd(
                             mount_scoped_default,
                             has_grant,
                             cert_revoked,
-                            false,
+                            denied,
                             false,
                         );
                         (d, read_only)
@@ -5441,6 +5431,16 @@ pub(crate) async fn recv_cmd(
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
+                    let Some(root_path) = confined_root else {
+                        let who = verified.clone().unwrap_or_else(|| "<unverified>".into());
+                        ui::say(&format!(
+                            "mount: refused for '{who}': {} is outside the share root {} (set `share` in the config to serve another directory)",
+                            requested_root.display(),
+                            crate::fleet_share_root().display()
+                        ));
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: path is outside the share root" })).await;
+                        continue;
+                    };
                     let mut caps = mount_proto::mount_caps_for_root(&root_path);
                     // A read-only fleet share advertises zero writable size so a
                     // well-behaved client sees it is read-only; the server also
@@ -5562,38 +5562,46 @@ pub(crate) async fn recv_cmd(
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
-                        let kept = if let Some(name) = &remember {
-                            devices_store(name, &sec)?;
-                            ui::say(&format!(
-                                "remembered this device as '{name}', future sends auto-accept after proof"
-                            ));
-                            true
-                        } else if ceremony == Some(false) {
-                            // C29: we typed their code into this session, the
-                            // creator initiated first; that's our ceremony.
-                            ceremony = None;
-                            let n = conn
-                                .link(&pid)
-                                .map(|l| l.name.clone())
-                                .unwrap_or_else(|| "device".into());
-                            devices_store(&n, &sec)?;
-                            devices.push((n.clone(), sec.clone()));
-                            sess.channels.push(channel_of(&sec)); // C30: desire grows; session repairs
-                            sess.touch();
-                            sio.emit("subscribe", json!({ "channels": [channel_of(&sec)] }))
-                                .await
-                                .ok();
-                            ui::say(&format!(
-                                "  {} {} mutually remembered, rename anytime: tunlion devices rename {n} <new>",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                                ui::paint(ui::Tone::Bold, &n),
-                            ));
-                            true
-                        } else {
-                            ui::say(
-                                "(sender offered to be remembered; re-run with --remember <name> to keep it)",
-                            );
-                            false
+                        // A secret is remembered ONLY from the peer whose code
+                        // ceremony confirmed on this receive: `--remember` means
+                        // "remember the device I typed the code from", so the
+                        // SPAKE2-bound peer is the only one it can name. Any other
+                        // link (a room peer, a second candidate, a link whose DTLS
+                        // the signaling server chose) is refused. And the secret
+                        // always lands in a NEW record: a peer can never re-key
+                        // an existing device by naming it.
+                        let ceremony_peer = recv_code_path
+                            && recv_pake_done
+                            && conn.is_bound_active_peer(&pid);
+                        let kept = match (&remember, ceremony_peer) {
+                            (Some(name), true) => match devices_store(name, &sec) {
+                                Ok(stored) => {
+                                    ui::say(&format!(
+                                        "remembered this device as '{stored}', future sends auto-accept after proof"
+                                    ));
+                                    true
+                                }
+                                Err(e) => {
+                                    ui::say(&ui::paint(
+                                        ui::Tone::Warn,
+                                        &format!("  not remembered: {e}"),
+                                    ));
+                                    false
+                                }
+                            },
+                            (Some(_), false) => {
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Warn,
+                                    "ignored a remember offer from a peer that is not this code's sender",
+                                ));
+                                false
+                            }
+                            (None, _) => {
+                                ui::say(
+                                    "(sender offered to be remembered; re-run with --remember <name> to keep it)",
+                                );
+                                false
+                            }
                         };
                         // C27: answer either way, a declined sender discards
                         // its half instead of waving at a dead meeting point.
@@ -5601,57 +5609,6 @@ pub(crate) async fn recv_cmd(
                             t.send_control(&json!({ "type": "pair-keep-ack", "ok": kept }))
                                 .await
                                 .ok();
-                        }
-                    }
-                }
-                // C29: claimer fallback, the creator never initiated
-                // (browsers don't); hand over OUR secret instead.
-                Some("__pair_fallback") => {
-                    if ceremony == Some(false) {
-                        ceremony = None;
-                        ceremony_pid = Some(pid.clone());
-                        if let Some(t) = conn.transport_of(&pid) {
-                            t.send_control(
-                                &json!({ "type": "pair-keep", "secret": ceremony_secret }),
-                            )
-                            .await
-                            .ok();
-                        }
-                    }
-                }
-                // C29: their answer to OUR in-session remember offer.
-                Some("pair-keep-ack") => {
-                    if ceremony_pid.as_deref() == Some(pid.as_str()) {
-                        ceremony_pid = None;
-                        let n = conn
-                            .link(&pid)
-                            .map(|l| l.name.clone())
-                            .unwrap_or_else(|| "device".into());
-                        if v["ok"].as_bool() == Some(false) {
-                            ui::say(&conn.roster(
-                                &pid,
-                                ui::glyph_err(),
-                                ui::Tone::Warn,
-                                "declined to be remembered, nothing stored",
-                                &n,
-                            ));
-                        } else {
-                            devices_store(&n, &ceremony_secret)?;
-                            devices.push((n.clone(), ceremony_secret.clone()));
-                            sess.channels.push(channel_of(&ceremony_secret)); // C30
-                            sess.touch();
-                            sio.emit(
-                                "subscribe",
-                                json!({ "channels": [channel_of(&ceremony_secret)] }),
-                            )
-                            .await
-                            .ok();
-                            ceremony_secret = fresh_secret(); // never reuse across devices
-                            ui::say(&format!(
-                                "  {} {} mutually remembered, rename anytime: tunlion devices rename {n} <new>",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                                ui::paint(ui::Tone::Bold, &n),
-                            ));
                         }
                     }
                 }
@@ -5750,13 +5707,49 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("pair-intro") => {
                     // C19/C20: only a fingerprint-verified known device may
-                    // vouch new trust into this store.
+                    // vouch new trust into this store. "Verified" means the
+                    // link resolved to one of OUR records by its pair secret
+                    // (`verified_name`), and that record was paired directly:
+                    // a device that was itself introduced cannot introduce in
+                    // turn, so a vouch is always one hop from a device the
+                    // owner paired. The vouched secret always becomes a NEW
+                    // record (suffixed on a name clash, refused if any record
+                    // already holds that secret): a hub can never re-key an
+                    // existing device and inherit its grants by naming it.
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let iname = v["name"].as_str().unwrap_or_default().to_string();
                     let isec = v["secret"].as_str().unwrap_or_default().to_string();
                     let hub = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                    if trusted && isec.len() == 64 && !iname.is_empty() {
-                        devices_store(&iname, &isec)?;
+                    let hub_record = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    let may_vouch = trusted
+                        && hub_record
+                            .as_deref()
+                            .is_some_and(|h| !crate::devices_store::device_was_introduced(h));
+                    let stored = if may_vouch && isec.len() == 64 && !iname.is_empty() {
+                        match crate::devices_store::devices_store_new(
+                            &iname,
+                            &isec,
+                            hub_record.as_deref(),
+                        ) {
+                            Ok(stored) => Some(stored),
+                            Err(e) => {
+                                ui::say(&ui::paint(
+                                    ui::Tone::Warn,
+                                    &format!("  ignored pair-intro from {hub}: {e}"),
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        if !may_vouch {
+                            ui::say(&ui::paint(
+                                ui::Tone::Warn,
+                                &format!("  ignored pair-intro from unverified peer {hub}"),
+                            ));
+                        }
+                        None
+                    };
+                    if let Some(iname) = stored {
                         devices.push((iname.clone(), isec.clone()));
                         sess.channels.push(channel_of(&isec)); // C30
                         sess.touch();
@@ -5789,11 +5782,6 @@ pub(crate) async fn recv_cmd(
                                 let _ = t.send_control(&challenge).await;
                             }
                         }
-                    } else {
-                        ui::say(&ui::paint(
-                            ui::Tone::Warn,
-                            &format!("  ignored pair-intro from unverified peer {hub}"),
-                        ));
                     }
                 }
                 Some("identity-nonce-challenge") => {
@@ -7048,12 +7036,17 @@ pub(crate) async fn recv_cmd(
                             &format!("  no device named '{n}' (try `devices`)"),
                         ));
                     }
+                } else if daemon && (ans == "pair" || ans == "code" || regex_lite_code(&line)) {
+                    // The console no longer pairs in-session: that ceremony
+                    // was a v1 code plus a pair secret over a DataChannel the
+                    // signaling server could MITM. `tunlion pair` runs the
+                    // SPAKE2 ceremony, and the running daemon picks the new
+                    // device up from the store.
+                    ui::say(&ui::paint(
+                        ui::Tone::Dim,
+                        "  to pair a device, run `tunlion pair` (or `tunlion pair <code>`) in another terminal",
+                    ));
                 } else if ans == "pair" || ans == "code" {
-                    // C29: mint a code; whoever claims it gets the remember
-                    // ceremony on connect (we created it, so WE initiate).
-                    if daemon {
-                        ceremony = Some(true);
-                    }
                     sio.emit("pair-create", json!({})).await.ok();
                 } else if regex_lite_code(&line) {
                     if claim_in_flight {
@@ -7068,9 +7061,6 @@ pub(crate) async fn recv_cmd(
                         ));
                         paired = true;
                         claim_in_flight = true;
-                        if daemon {
-                            ceremony = Some(false); // C29: in a session, pairing means remembering
-                        }
                         sio.emit("pair-claim", json!({ "code": line.to_lowercase() }))
                             .await
                             .ok();
