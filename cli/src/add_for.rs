@@ -245,6 +245,11 @@ pub(crate) async fn add_for_cmd(
     // mint cannot guarantee is that a RECEIVER is actually running to pick the
     // key up - check that, and offer to start one.
     crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
+    // Make the daemon subscribe the enrollment channel NOW rather than on its next
+    // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
+    // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs
+    // ~0.2 s once subscribed. No daemon, or no control socket (#205): harmless.
+    let _ = crate::ctl::try_wake().await;
     // #207: a minted code that nothing can claim is not an invitation, it is a
     // lie with a QR on it. The receiver is what claims; if none is running,
     // say so before printing and offer to start one.

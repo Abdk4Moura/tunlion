@@ -111,6 +111,11 @@ pub(crate) async fn pair_cmd(
     relay: bool,
     internal: bool,
     posture: Vec<String>,
+    // `add <name>` on a terminal: the person has said who, and nothing else is
+    // worth asking before the code is on screen. Skips the guided "choose words"
+    // entry (Enter there only ever meant "generate them") and puts the file
+    // alternative on the code screen instead, where it is relevant.
+    quick: bool,
 ) -> Result<()> {
     if code.is_none() && word.is_none() && !interactive_allowed() {
         let (message, exit_code) = fleet_ui::pair_ui::err_pair_interactive();
@@ -137,6 +142,8 @@ pub(crate) async fn pair_cmd(
             pw.is_empty() || np.is_empty()
         });
         match (&code, malformed) {
+            // `add <name>`: generated words, no entry. --word still chooses them.
+            (None, _) if quick => {}
             // No code at all -> CREATE entry.
             (None, _) => {
                 let auto_np = crate::pake::words::mint_pair_nameplate();
@@ -772,6 +779,15 @@ pub(crate) async fn pair_cmd(
                     ui::Tone::Dim,
                     "  keep this window open until the other device claims it",
                 ));
+                if quick {
+                    // The HOW question was skipped to get here in one step, so
+                    // its other answer is offered here instead: the file path
+                    // was once reachable only by a flag nobody was told about.
+                    ui::say(&ui::paint(
+                        ui::Tone::Dim,
+                        "  not both here? add --via file writes an invitation to claim later",
+                    ));
+                }
                 ui::say(&ui::paint(
                     ui::Tone::Dim,
                     "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)",

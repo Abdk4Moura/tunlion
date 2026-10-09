@@ -90,6 +90,9 @@ pub(crate) async fn handle_warm_req(
         // Reload is handled inline in the daemon loop (it self-SIGTERMs); answer
         // defensively if it ever reaches here.
         ctl::ReqKind::Reload => req.reply(&json!({ "ok": true, "reloading": false })).await,
+        // Wake is handled inline in the daemon loop (its whole purpose is to make
+        // the loop iterate); answer defensively if it ever reaches here.
+        ctl::ReqKind::Wake => req.reply(&json!({ "ok": true })).await,
         // Mount/Unmount/ListMounts/MountHealth are handled inline in the daemon
         // loop (they need access to DaemonMounts); answer defensively if reached.
         ctl::ReqKind::Mount { .. } => req.reject("mount not handled here").await,
