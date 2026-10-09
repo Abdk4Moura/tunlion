@@ -3330,8 +3330,14 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
 /// without touching the network).
 fn port_in_use_msg(lport: u16, peer: &str, rport: u16) -> String {
     let suggested = lport.saturating_add(1);
+    // The suggestion must be a command that PARSES. It used to print the
+    // positional form `forward <lport> <peer> <rport>`, which the CLI rejects
+    // ("unexpected argument"); a first-time-user test copied it verbatim, and it
+    // was the one place the tool told them something wrong. The real shape is
+    // `forward <device>:<port> --lport <n>` (cli_def.rs Forward), and
+    // a_suggested_forward_command_parses pins that.
     format!(
-        "tunlion: local port {lport} is already in use, pick another (e.g. tunlion forward {suggested} {peer} {rport})"
+        "tunlion: local port {lport} is already in use, pick another (e.g. tunlion forward {peer}:{rport} --lport {suggested})"
     )
 }
 
@@ -5559,6 +5565,25 @@ mod h1_tests {
             sessions.get_live("sess-x").await.is_none(),
             "ended session must leave the store"
         );
+    }
+
+    /// The retry hint must be a command the CLI ACCEPTS, not just one containing
+    /// the right words. The substring test below passed for months while the
+    /// hint printed `tunlion forward 8081 laptop 22`, which clap rejects; a
+    /// first-time user copied it and got "unexpected argument". Same parse
+    /// check fleet_ui/pair_ui uses for its suggestions.
+    #[test]
+    fn a_suggested_forward_command_parses() {
+        use clap::Parser;
+        let msg = port_in_use_msg(8080, "laptop", 22);
+        let start = msg.find("e.g. ").expect("the message offers an example") + "e.g. ".len();
+        let cmd = msg[start..].trim_end_matches(')').trim();
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(
+            crate::Cli::try_parse_from(&argv).is_ok(),
+            "suggested command does not parse: {cmd}"
+        );
+        assert!(cmd.contains("--lport 8081"), "{cmd}");
     }
 
     /// The `port_in_use_msg` helper must surface the conflicting port and a

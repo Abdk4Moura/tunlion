@@ -226,7 +226,17 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                 Some(v) => ui::say(&fleet_ui::requests::render_requests(&request_entries(
                     &v, false,
                 ))),
-                None => ui::say("  daemon not running; no pending request state"),
+                // `None` means the control socket did not answer, which is not
+                // the same as "no daemon". Saying "not running" while `status`
+                // shows it up is the contradiction a first-time-user test hit.
+                None => match crate::shell_support::daemon_alive() {
+                    Some(pid) => ui::say(&format!(
+                        "  the daemon is running (pid {pid}) but did not answer on its control socket at {}; \
+                         check `tunlion up`'s output for why",
+                        crate::ctl::control_sock_path().display()
+                    )),
+                    None => ui::say("  daemon not running; no pending request state"),
+                },
             }
         }
         Some(RequestsAction::List { all: true }) => {

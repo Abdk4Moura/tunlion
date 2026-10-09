@@ -959,7 +959,23 @@ pub(crate) async fn recv_cmd(
                 if let Err(e) =
                     ctl::serve_at(crate::ctl::control_sock_path(), ctl_tx, Some(ready_tx)).await
                 {
-                    crate::ui::trace(&format!("tunlion: control socket disabled: {e}"));
+                    // LOUD, not trace. Without the control socket every
+                    // daemon-backed feature degrades silently -- warm links,
+                    // `requests`, instant invitations -- and other commands then
+                    // report things that are false, such as "daemon not running"
+                    // while this daemon is plainly up. The common real cause is
+                    // a socket path longer than the kernel allows (108 bytes on
+                    // Linux, 104 on macOS), e.g. a deep FILAMENT_CONFIG_DIR or a
+                    // CI/macOS temp directory; found by a first-time-user test
+                    // whose sandbox path was 110 bytes.
+                    let path = crate::ctl::control_sock_path();
+                    crate::ui::say(&format!(
+                        "tunlion: control socket unavailable at {} ({} bytes): {e}\n  \
+                         warm links, `tunlion requests` and instant invitations will not work; \
+                         a shorter config directory (FILAMENT_CONFIG_DIR) fixes it",
+                        path.display(),
+                        path.as_os_str().len()
+                    ));
                 }
             });
         }

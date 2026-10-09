@@ -1424,6 +1424,18 @@ impl Transport for DirectTransport {
 /// the release builds the gates run, which is why a one-way link cost a day of
 /// instrumentation to find. Workers stay at debug: a one-shot worker ending is
 /// routine, and saying so on every transfer would be noise.
+/// The connection ended because one side CLOSED it on purpose: we did
+/// (`LocallyClosed`, e.g. a one-shot finishing) or the peer did
+/// (`ApplicationClosed`). Not a failure, so it is never printed as one.
+fn is_clean_close(e: &quinn::ReadExactError) -> bool {
+    matches!(
+        e,
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::LocallyClosed | quinn::ConnectionError::ApplicationClosed(_)
+        ))
+    )
+}
+
 fn note_reader_exit(peer_id: &str, primary: bool, reason: &str, frames: u64, dead: bool) {
     let line = format!(
         "l2: link reader exited peer={peer_id} primary={primary} reason={reason} frames={frames} dead={dead}"
@@ -1466,6 +1478,19 @@ fn spawn_reader(
                     note_reader_exit(&peer_id, primary, "finished-early(hdr)", frames, false);
                     break;
                 }
+                // A connection WE closed (a one-shot `exec` finishing) or one the
+                // peer closed cleanly is the normal end of a link. It is still
+                // dead -- the liveness logic must know -- but it is not an alarm.
+                // It used to print `[DEAD] spawn_reader ... LocallyClosed` plus
+                // `l2: link reader exited ... dead=true` after every SUCCESSFUL
+                // exec, which a first-time-user test read as a crash.
+                if is_clean_close(&e) {
+                    dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::hooks::debug(&format!(
+                        "l2: link closed cleanly peer={peer_id} primary={primary} frames={frames} ({e})"
+                    ));
+                    break;
+                }
                 eprintln!("[DEAD] spawn_reader: peer={} answerer={answerer} read hdr error: {e:?}", peer_id);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 note_reader_exit(&peer_id, primary, "read-error(hdr)", frames, true);
@@ -1490,6 +1515,13 @@ fn spawn_reader(
                 if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
                     rx_ended.store(true, std::sync::atomic::Ordering::Relaxed);
                     note_reader_exit(&peer_id, primary, "finished-early(body)", frames, false);
+                    break;
+                }
+                if is_clean_close(&e) {
+                    dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::hooks::debug(&format!(
+                        "l2: link closed cleanly mid-frame peer={peer_id} primary={primary} frames={frames} ({e})"
+                    ));
                     break;
                 }
                 eprintln!("[DEAD] spawn_reader: peer={} read body error kind={} err={e:?}", peer_id, kind);
