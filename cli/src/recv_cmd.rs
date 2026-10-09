@@ -4832,13 +4832,18 @@ pub(crate) async fn recv_cmd(
                             dpub.as_slice().try_into().map(|a: &[u8; 32]| *a),
                             sig.as_slice().try_into().map(|a: &[u8; 64]| *a),
                         ) {
-                            if crate::identity::verify_possession_sig(
-                                &dpub_arr,
-                                msg.as_bytes(),
-                                &sig_arr,
-                            )
-                            .is_ok()
+                            // The message must be EXACTLY the depart text for
+                            // this key (rebuilt here, never trusted from the
+                            // wire); a valid signature over anything else is a
+                            // different statement and must not lapse the device.
+                            if let Err(why) =
+                                crate::membership::verify_depart(&dpub_arr, msg, &sig_arr)
                             {
+                                ui::say(&format!(
+                                    "{} refused a depart request from {pid}: {why}",
+                                    ui::paint(ui::Tone::Warn, "!")
+                                ));
+                            } else {
                                 if let Some(name) = mark_lapsed_now(&dpub_arr) {
                                     ui::say(&format!(
                                         "{} {name} departed; slot freed immediately",

@@ -22,7 +22,10 @@ mkdir -p "$OUT"
 
 echo "fetching SHA256SUMS for $TAG ..."
 SUMS=$(curl -fsSL "https://github.com/$REPO/releases/download/$TAG/SHA256SUMS")
-sum_for() { echo "$SUMS" | grep "$1" | cut -d' ' -f1; }
+# Exact-name match: SHA256SUMS lists every asset twice (tunlion-* and the
+# pre-rename filament-* alias), so a suffix grep would return two hashes. The
+# brew formula and winget manifest point at the tunlion-* assets.
+sum_for() { echo "$SUMS" | awk -v f="tunlion-$1" '$2 == f || $2 == "*" f { print $1 }'; }
 SHA_LINUX=$(sum_for x86_64-unknown-linux-musl.tar.gz)
 SHA_MAC_ARM=$(sum_for aarch64-apple-darwin.tar.gz)
 SHA_MAC_X64=$(sum_for x86_64-apple-darwin.tar.gz)

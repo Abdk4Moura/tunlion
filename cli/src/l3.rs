@@ -937,7 +937,9 @@ fn open_kernel(
     Ok(tun)
 }
 
-const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by tunlion; edits here are overwritten)";
+// PROTOCOL LITERAL: frozen, do not rename. The /etc/hosts block markers
+// released builds wrote; the BEGIN line is matched by its prefix on rewrite.
+const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
 
 /// Get this machine's hostname for MagicDNS.

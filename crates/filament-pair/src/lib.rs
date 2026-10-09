@@ -40,6 +40,7 @@ pub fn os_rng() -> impl RngCore + CryptoRng {
 
 /// Domain-separation prefix for the SPAKE2 identity. BOTH peers bind to the
 /// nameplate so a code is domain-separated (spec §3.1).
+// PROTOCOL LITERAL: frozen, do not rename (this and the two below).
 const IDENTITY_PREFIX: &[u8] = b"filament-pair-pake-v1:";
 /// HKDF info that turns K into the pinned device secret (spec §5.1).
 const SECRET_INFO: &[u8] = b"filament-pair-pake-v1:pinned-secret";
@@ -614,5 +615,31 @@ mod tests {
         );
         assert_eq!(canonical_caps(&[]), "");
         assert_eq!(canonical_caps(&["transfer".into(), "transfer".into()]), "transfer");
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn pake_domains_are_frozen() {
+        use sha2_pake::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("IDENTITY_PREFIX", super::IDENTITY_PREFIX,
+             "ab5c7de260f7f33548fbd03ff9bbfe0ae467a610b4eb6786eefaa467750b4dba"),
+            ("SECRET_INFO", super::SECRET_INFO,
+             "f7d0f437a6bff77a7af64c8afa44e39fcb3bdf3c215d7a253255adf408e3e0f4"),
+            ("CONFIRM_LABEL", super::CONFIRM_LABEL,
+             "a9740f19c0c906245e0c79b0fba39f660eaa980ddde5ad33a0bda6a86b96e869"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }
