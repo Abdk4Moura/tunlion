@@ -432,7 +432,20 @@ fn spawn_daemon_inner(
         .arg("--i-know")
         .arg("--server")
         .arg(server)
-        .arg("--relay")
+        // NO `--relay` HERE. It means "force TURN relay": the ICE transport
+        // policy becomes Relay, so only relay candidates are usable. This
+        // harness's backend advertises STUN only and never a TURN server, so a
+        // daemon spawned with it can offer NO candidate at all. Every cell that
+        // needs a WebRTC first contact with this daemon therefore failed with
+        // ICE "failed" and "no response from peer": enrolment
+        // (join_does_not_change_the_capability_store) and the WebRTC-only #172
+        // gate (revoked_device_direct_blocked_gets_no_fallback_access), which
+        // died in its own pairing setup and so has never executed its
+        // revocation check in CI. Cells that already hold a pair secret win on
+        // direct-QUIC, which this flag does not touch, which is how it went
+        // unnoticed from the harness's creation in July. A cell that wants
+        // forced relay passes it on its own spawn (see
+        // warm_all_makes_first_contact_warm).
         .arg("--dir")
         .arg(config_dir.join("drops").to_str().unwrap())
         .stdout(Stdio::piped())
