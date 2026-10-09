@@ -236,7 +236,13 @@ pub(crate) async fn add_for_cmd(
     )?;
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
-        "filament-invite:{}",
+        // `v2:` IS PART OF THE WIRE FORMAT, not decoration. 0.8.4 and 0.8.5 --
+        // the releases in users' hands -- parse only `filament-invite:v2:`, so a
+        // token minted without it reads as "unknown format" on every device that
+        // has not upgraded. #291 dropped the segment with no payload change,
+        // which silently broke enrolment across the release boundary in both
+        // directions. Keep minting it until no supported release needs it.
+        "filament-invite:v2:{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
     // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in

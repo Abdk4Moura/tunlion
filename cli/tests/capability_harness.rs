@@ -432,7 +432,20 @@ fn spawn_daemon_inner(
         .arg("--i-know")
         .arg("--server")
         .arg(server)
-        .arg("--relay")
+        // NO `--relay` HERE. It means "force TURN relay": the ICE transport
+        // policy becomes Relay, so only relay candidates are usable. This
+        // harness's backend advertises STUN only and never a TURN server, so a
+        // daemon spawned with it can offer NO candidate at all. Every cell that
+        // needs a WebRTC first contact with this daemon therefore failed with
+        // ICE "failed" and "no response from peer": enrolment
+        // (join_does_not_change_the_capability_store) and the WebRTC-only #172
+        // gate (revoked_device_direct_blocked_gets_no_fallback_access), which
+        // died in its own pairing setup and so has never executed its
+        // revocation check in CI. Cells that already hold a pair secret win on
+        // direct-QUIC, which this flag does not touch, which is how it went
+        // unnoticed from the harness's creation in July. A cell that wants
+        // forced relay passes it on its own spawn (see
+        // warm_all_makes_first_contact_warm).
         .arg("--dir")
         .arg(config_dir.join("drops").to_str().unwrap())
         .stdout(Stdio::piped())
@@ -855,7 +868,14 @@ fn live_pair(
     claim.envs(envs.iter().map(|(k, v)| (*k, *v)))
         .env("FILAMENT_CONFIG_DIR", b_dir)
         .env("FILAMENT_NAME", "test-b")
-        .arg("add")
+        // `join` CLAIMS a code; `add` only offers one. Since #291 the CLI refuses
+        // `add <code>` outright ("`add` offers, `join` accepts"), so this claim
+        // exited at once, the create waited for a claimant that never came, and
+        // the helper reported "pair create failed". This helper was written in
+        // August against the old surface and went stale when #290 rebased it
+        // onto main. Its one caller is the #172 revocation gate, which therefore
+        // never got past setup in CI. The mesh pairing cell already uses `join`.
+        .arg("join")
         .arg(&code)
         .arg("--server")
         .arg(server);
@@ -2452,13 +2472,13 @@ fn add_for_device_and_person_carry_different_caps() {
     let parse = |file: &Path| -> Invitation {
         let raw = std::fs::read_to_string(file).expect("read invitation file");
         let token = raw.trim();
-        // The prefix is `filament-invite:` with no version segment: the payload
-        // carries its own version byte, which is what `from_token` checks. It
-        // was `filament-invite:v2:` when this test was written in August.
-        // Anchored to what add_for.rs emits today (`cli/src/add_for.rs:240`) and
-        // what file_io::parse_invitation consumes.
+        // The minted prefix is `filament-invite:v2:` and must stay that way: it
+        // is what the released 0.8.4/0.8.5 parsers require. An earlier edit to
+        // this very line relaxed it to match a mint that had dropped `v2:`, and
+        // in doing so hid a cross-release enrolment break. Asserting the exact
+        // prefix is the point: if the mint changes, this should fail.
         let encoded = token
-            .strip_prefix("filament-invite:")
+            .strip_prefix("filament-invite:v2:")
             .unwrap_or_else(|| panic!("token has the invitation prefix: {token}"));
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded)
@@ -2631,6 +2651,14 @@ fn cap_store_grant_count(config_dir: &Path) -> usize {
 /// written during the ceremony is legitimate and would break a byte comparison;
 /// the grant count is the strongest assertion available there.
 #[test]
+// Windows has no daemon control channel yet (#205, open): `up` creates no
+// control.sock there, so the enrollment room this cell needs can never be
+// armed and the join has nothing to claim. That is a filed product gap, not a
+// flake, and no harness change can make this cell pass on Windows; only #205
+// can. Ignored there BY NAME so the matrix stays meaningful and the gap stays
+// visible, the same convention as the #31 cell below. It runs and passes on
+// Linux and macOS. Remove this attribute when #205 lands.
+#[cfg_attr(windows, ignore = "#205: no daemon control channel on Windows, so the enrollment room cannot be armed")]
 fn join_does_not_change_the_capability_store() {
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();

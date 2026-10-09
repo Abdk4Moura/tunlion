@@ -133,8 +133,25 @@ pub(crate) fn parse_mint_ttl(raw: &str) -> Result<u64> {
 pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation> {
     use base64::Engine;
     let token = raw.trim();
+    // Three forms exist in the wild, and they are the same v2 payload except v1:
+    //
+    //   filament-invite:v1:...    0.8.0-0.8.3, a JSON token replaced in 0.8.4.
+    //                             Stale, not malformed: say so, as 0.8.5 does.
+    //   filament-invite:v2:<b64>  0.8.4-0.8.5 and current. The canonical form.
+    //   filament-invite:<b64>     minted by unreleased builds between #291 and
+    //                             the fix that restored `v2:`. Same bytes.
+    //
+    // Before this, only the third was accepted, so an invitation from the
+    // RELEASED 0.8.5 failed as "not valid base64url": the parser decoded
+    // `v2:...` and choked on the colon.
+    if token.starts_with("filament-invite:v1:") {
+        bail!(
+            "this invitation uses the pre-0.8.4 format; ask the owner to mint a new one with `tunlion add --for`"
+        );
+    }
     let encoded = token
-        .strip_prefix("filament-invite:")
+        .strip_prefix("filament-invite:v2:")
+        .or_else(|| token.strip_prefix("filament-invite:"))
         .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
     let bytes = Zeroizing::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
