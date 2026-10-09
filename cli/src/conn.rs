@@ -135,6 +135,9 @@ const ICE_CONFIG_BUDGET: Duration = Duration::from_secs(3);
 const ICE_CONFIG_STALE_OK: Duration = Duration::from_secs(20 * 60);
 /// Ceiling on building a WebRTC peer connection inside an establish.
 const PEER_BUILD_BUDGET: Duration = Duration::from_secs(5);
+/// How long `drop_link` lets a dropped link's last frames reach the peer
+/// before it closes the QUIC connection under them.
+const DROP_CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// Backoff before retry `attempts` of the stuck-link ladder: 1, 2, 4, 8s,
 /// capped at 10s.
@@ -1627,20 +1630,30 @@ impl Conn {
                 tokio::spawn(async move { p.close().await });
             }
             // CLOSE the direct transports explicitly. Dropping the Link only
-            // drops OUR Arc: the L3 overlay pump, the mesh accept loop and any
-            // warm stream hold their own clones, so the QUIC connection stayed
-            // up and the peer never learned the link was gone. It kept its own
-            // direct link for this pid and ignored our WebRTC offers (no
-            // `peer` on its link to apply them to), our ladder exhausted, and
-            // the cycle repeated forever: split-brain. Closing sends
-            // ApplicationClose, the peer sees ConnectionLost, drops its side and
-            // both ends re-converge. No-op for transports without a connection
-            // to close (DataChannel, local).
-            if let Some(t) = old.transport.as_ref() {
-                t.force_close();
-            }
-            for w in &old.workers {
-                w.force_close();
+            // drops OUR Arc: the L3 overlay pump, the mesh accept loop, the
+            // endpoint keeper and any warm stream hold their own clones, so the
+            // QUIC connection stayed up and the peer never learned the link was
+            // gone. It kept its own direct link for this pid and ignored our
+            // WebRTC offers (no `peer` on its link to apply them to), our ladder
+            // exhausted, and the cycle repeated forever: split-brain. Closing
+            // sends ApplicationClose, the peer sees ConnectionLost, drops its
+            // side and both ends re-converge.
+            //
+            // After a short grace, not at once: QUIC has no flush-on-close
+            // (RFC 9000 s10.2), and several callers drop right after writing a
+            // last frame on this link (the l2-close that answers a parked open,
+            // a refusal). Closing immediately discarded that frame and the
+            // client saw "no answer" instead of the reason. No-op for transports
+            // without a connection to close (DataChannel, local).
+            let closing: Vec<Arc<dyn Transport>> =
+                old.transport.into_iter().chain(old.workers).collect();
+            if !closing.is_empty() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(DROP_CLOSE_GRACE).await;
+                    for t in closing {
+                        t.force_close();
+                    }
+                });
             }
         }
         if self.is_active(pid) {
@@ -4689,6 +4702,7 @@ mod warm_identity_tests {
             Some("x"),
             "the pair binding must carry over"
         );
+        tokio::time::sleep(DROP_CLOSE_GRACE + Duration::from_millis(300)).await;
         assert_eq!(t.closes.load(Ordering::Relaxed), 1, "the dropped transport was not closed");
     }
 
@@ -4702,6 +4716,9 @@ mod warm_identity_tests {
         conn.links.insert("sid-1".into(), l);
         conn.drop_link("sid-1");
         assert!(!conn.links.contains_key("sid-1"));
+        // Not at once: a last frame written before the drop must get out first.
+        assert_eq!(t.closes.load(Ordering::Relaxed), 0, "closed before the grace");
+        tokio::time::sleep(DROP_CLOSE_GRACE + Duration::from_millis(300)).await;
         assert_eq!(t.closes.load(Ordering::Relaxed), 1, "primary QUIC left open: split-brain");
         assert_eq!(w.closes.load(Ordering::Relaxed), 1, "worker QUIC left open");
     }
