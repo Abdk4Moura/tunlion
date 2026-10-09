@@ -615,6 +615,71 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 /// without letting an abandoned-but-not-reaped session hoard memory.
 pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 
+/// The TERM the remote shell actually gets.
+///
+/// The client sends ITS terminal's name, and forwarding it verbatim is right only
+/// when this machine has a terminfo entry for it. Modern terminals (kitty,
+/// ghostty, wezterm, ...) use names most servers have never heard of, and then
+/// every curses program degrades or refuses outright -- tmux exits with
+/// "missing or unsuitable terminal: xterm-kitty", so a remote tmux never starts
+/// and mouse events land on the shell prompt as `64;20;10M`. `ssh` appears not
+/// to have this problem only because those terminals' ssh integrations copy
+/// their terminfo to the remote first; this path has no such step. Fall back to
+/// xterm-256color, which every system ships and which supports 256 colours and
+/// mouse tracking.
+///
+/// THE VALUE COMES FROM THE PEER and is used to build a filesystem path below,
+/// so anything that is not a plausible terminal name is replaced before it is
+/// ever joined onto a directory (`../../etc/passwd` must not become a probe).
+pub(crate) fn effective_term(requested: &str) -> String {
+    const FALLBACK: &str = "xterm-256color";
+    let plausible = !requested.is_empty()
+        && requested.len() <= 64
+        && requested
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+        && !requested.starts_with('.');
+    if !plausible {
+        return FALLBACK.to_string();
+    }
+    if terminfo_exists(requested) {
+        requested.to_string()
+    } else {
+        FALLBACK.to_string()
+    }
+}
+
+/// Whether a compiled terminfo entry for `name` is installed. Probes the same
+/// search path ncurses uses: $TERMINFO, ~/.terminfo, each $TERMINFO_DIRS entry,
+/// then the system directories. Entries live under a first-character
+/// subdirectory, named by the character itself on Linux and by its hex code on
+/// macOS, so both are checked. `name` must already be validated by the caller.
+#[cfg(unix)]
+fn terminfo_exists(name: &str) -> bool {
+    let Some(first) = name.chars().next() else { return false };
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = std::env::var_os("TERMINFO") {
+        dirs.push(d.into());
+    }
+    dirs.push(crate::platform::Paths::home_dir().join(".terminfo"));
+    if let Some(list) = std::env::var_os("TERMINFO_DIRS") {
+        dirs.extend(std::env::split_paths(&list).filter(|p| !p.as_os_str().is_empty()));
+    }
+    for d in ["/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo", "/usr/lib/terminfo", "/usr/local/share/terminfo"] {
+        dirs.push(d.into());
+    }
+    let hex = format!("{:x}", first as u32);
+    dirs.iter().any(|d| {
+        d.join(first.to_string()).join(name).is_file() || d.join(&hex).join(name).is_file()
+    })
+}
+
+/// No terminfo on this platform (ConPTY): the name is advisory, keep it.
+#[cfg(not(unix))]
+fn terminfo_exists(_name: &str) -> bool {
+    true
+}
+
 /// Terminal-mode reset emitted to the client right AFTER a reattach replay.
 /// A TUI that gets cut off mid-run (link drop, then the app dies before it can
 /// emit its own disable) leaves the client terminal stuck in mouse-reporting
@@ -822,14 +887,7 @@ pub async fn spawn_pty_session(
     for a in &argv[1..] {
         cmd.arg(a);
     }
-    cmd.env(
-        "TERM",
-        if term.is_empty() {
-            "xterm-256color"
-        } else {
-            term
-        },
-    );
+    cmd.env("TERM", effective_term(term));
     // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
     // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
     // truecolor fine, so set this to get full-color output (verified: opencode
@@ -4928,6 +4986,46 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
         Ok(Ok(_)) => Some(true),   // a listener answered (sshd banner)
         Ok(Err(_)) => Some(false), // stream error: treat as unreachable
         Err(_) => None,            // no banner in time: inconclusive, don't block
+    }
+}
+
+#[cfg(test)]
+mod term_tests {
+    use super::effective_term;
+
+    #[test]
+    fn a_term_with_no_terminfo_falls_back_instead_of_breaking_curses_apps() {
+        // Reproduced: TERM=xterm-kitty on a server without that entry made a
+        // remote `tmux` exit with "missing or unsuitable terminal".
+        assert_eq!(effective_term("definitely-not-a-real-terminal-x9"), "xterm-256color");
+        assert_eq!(effective_term(""), "xterm-256color");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_term_this_machine_knows_is_kept() {
+        // Every Linux and macOS CI image ships xterm-256color.
+        assert_eq!(effective_term("xterm-256color"), "xterm-256color");
+    }
+
+    #[test]
+    fn a_peer_supplied_term_cannot_become_a_path_probe() {
+        // TERM is chosen by the PEER and joined onto terminfo directories, so
+        // anything that is not a plain terminal name is replaced before use.
+        let too_long = "z".repeat(65);
+        let hostile_names: [&str; 8] = [
+            "../../etc/passwd",
+            "..",
+            ".hidden",
+            "a/b",
+            "x\\y",
+            "term\0nul",
+            "has space",
+            too_long.as_str(),
+        ];
+        for hostile in hostile_names {
+            assert_eq!(effective_term(hostile), "xterm-256color", "{hostile:?}");
+        }
     }
 }
 
