@@ -68,8 +68,17 @@ fn join(
     (p, device_pub)
 }
 
+/// The wall clock, read independently of the crate's own `now_secs`, so a
+/// broken crate clock cannot also move the test's notion of "expired".
+fn wall_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 fn far_future() -> u64 {
-    now_secs() + 3600
+    wall_now() + 3600
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +128,7 @@ fn compact_enrollment_from_another_owner_is_refused() {
 #[test]
 fn compact_enrollment_after_expiry_is_refused() {
     let owner = keypair();
-    let inv = invitation(&owner, random32(), now_secs() - 1, Reuse::Once);
+    let inv = invitation(&owner, random32(), wall_now() - 1, Reuse::Once);
     let nonce = random32();
     let verifier = [0xABu8; 32];
     let (p, _) = join(&inv.to_token(), nonce, verifier);
