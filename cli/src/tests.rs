@@ -2244,6 +2244,240 @@ fn a_device_with_no_identity_is_offered_both_ways_in() {
     );
 }
 
+/// Every product source under cli/src, recursively, as (path relative to the
+/// crate, text).
+///
+/// The printed-hint scanners used to read a hand-picked list of nine files and
+/// `continue` past any they could not read. As the CLI was split into modules,
+/// most hint strings moved into files nobody scanned (dispatch.rs, settings.rs,
+/// recv_cmd.rs, status_cmd.rs, up_logs.rs, pair_cmd.rs, add_for.rs,
+/// runtime_support.rs, ...), and a renamed file would have shrunk the scan
+/// silently. Walking the tree covers a new module on arrival, and every read
+/// is `expect`ed so an unreadable file fails instead of vanishing.
+///
+/// Test code is not product output: this file (tests.rs) is skipped, and in
+/// every other file a `#[cfg(test)] mod ... { ... }` block is blanked, kept as
+/// empty lines so reported line numbers stay true.
+fn product_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let rd = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+        for entry in rd {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|x| x == "rs") {
+                continue;
+            }
+            let rel = format!(
+                "src/{}",
+                path.strip_prefix(&root)
+                    .expect("walked path is under src/")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            if rel == "src/tests.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+            out.push((rel, blank_test_modules(&text)));
+        }
+    }
+    out.sort();
+    assert!(
+        out.len() >= 50,
+        "found only {} source files under src/; the walk is broken and every \
+         scan built on it would pass vacuously",
+        out.len()
+    );
+    out
+}
+
+/// Blank the lines of each `#[cfg(test)] mod name { ... }` block (rustfmt puts
+/// the closing brace at the `mod` line's indent), keeping the line count.
+fn blank_test_modules(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut keep = vec![true; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "#[cfg(test)]" {
+            let mut j = i + 1;
+            while j < lines.len()
+                && (lines[j].trim().is_empty() || lines[j].trim_start().starts_with("#["))
+            {
+                j += 1;
+            }
+            if j < lines.len() {
+                let m = lines[j];
+                let t = m.trim_start();
+                let is_mod = t.starts_with("mod ")
+                    || t.starts_with("pub mod ")
+                    || t.starts_with("pub(crate) mod ");
+                if is_mod && m.trim_end().ends_with('{') {
+                    let close = format!("{}}}", &m[..m.len() - t.len()]);
+                    let mut k = j + 1;
+                    while k < lines.len() && lines[k].trim_end() != close {
+                        k += 1;
+                    }
+                    let end = (k + 1).min(lines.len());
+                    for flag in &mut keep[i..end] {
+                        *flag = false;
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    lines
+        .iter()
+        .zip(keep)
+        .map(|(l, k)| if k { *l } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace every `open ... close` span in `s` with `with`.
+fn replace_spans(s: &str, open: char, close: char, with: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(a) = rest.find(open) {
+        let Some(b) = rest[a + open.len_utf8()..].find(close) else {
+            break;
+        };
+        out.push_str(&rest[..a]);
+        out.push_str(with);
+        rest = &rest[a + open.len_utf8() + b + close.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn printed_hints_parse_as_typed() {
+    // The two scanners below each check ONE property of a printed hint: that
+    // its verb exists, and that it carries the subcommand's required flags.
+    // Neither asks the question a user asks, which is whether the command as
+    // printed parses. `tunlion requests --notify ...`, `tunlion grant <peer>
+    // <cap> --for <expiry>`, `mount ... --read-only` and the `forward <lport>
+    // <peer> <rport>` permission-denied retry all passed both and were usage
+    // errors when typed. This extracts every printed `tunlion <verb> ...` from
+    // the product sources and hands it to clap.
+    //
+    // Extraction: a hint starts at "tunlion " and ends at the first delimiter
+    // that closes an inline command in our prose (a backtick or quote, an
+    // escape, two spaces before a description column, " / " or ", " between
+    // alternatives, ": " after a label, ")" or " (" around an aside, " - " or
+    // an em dash before a description, " to "/" then " joining a sentence).
+    //
+    // What it substitutes, and what it skips, so the coverage is honest:
+    //   - `{...}` interpolations and `<...>` placeholders are replaced with
+    //     the sample value "1", which every positional and flag value in the
+    //     CLI accepts (names, paths, ports, request ids, durations).
+    //   - `[...]` optional parts are dropped: an optional part may be omitted.
+    //   - hints containing "..." are skipped (an elided command cannot be
+    //     typed as shown).
+    //   - hints whose first word is not a clap verb are skipped; that is
+    //     `printed_hints_name_verbs_that_exist`'s question, and it is also how
+    //     prose such as "tunlion needs CAP_NET_ADMIN" and the bare-send form
+    //     `tunlion <file>` (rewritten before clap) stay out.
+    //   - a bare `tunlion <verb>` with nothing after it is skipped: it names
+    //     the verb ("rsync is required for `tunlion backup`") rather than
+    //     telling anyone to type it alone, and its existence is checked by
+    //     the verb test.
+    use clap::{CommandFactory, Parser};
+    let cmd = Cli::command();
+    let verbs: std::collections::HashSet<String> = cmd
+        .get_subcommands()
+        .flat_map(|sc| {
+            let mut v = vec![sc.get_name().to_string()];
+            v.extend(sc.get_all_aliases().map(str::to_string));
+            v
+        })
+        .collect();
+
+    const STOPS: [&str; 18] = [
+        "`", "'", "\"", "\\", "  ", " / ", " && ", ", ", ": ", "; ", ". ", ")", " (",
+        " \u{b7}", " \u{2014}", " - ", " to ", " then ",
+    ];
+
+    let mut bad = Vec::new();
+    let mut checked = 0usize;
+    for (rel, text) in product_sources() {
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for (i, _) in line.match_indices("tunlion ") {
+                // "tunlion" inside a longer word or a path is not a command.
+                if line[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || "_-/.".contains(c))
+                {
+                    continue;
+                }
+                let rest = &line[i + "tunlion ".len()..];
+                let end = STOPS
+                    .iter()
+                    .filter_map(|s| rest.find(s))
+                    .min()
+                    .unwrap_or(rest.len());
+                let hint = &rest[..end];
+                if hint.contains("...") {
+                    continue;
+                }
+                let hint = replace_spans(hint, '[', ']', " ");
+                let hint = replace_spans(&hint, '{', '}', "1");
+                let hint = replace_spans(&hint, '<', '>', "1");
+                let mut toks: Vec<String> = hint.split_whitespace().map(str::to_string).collect();
+                while let Some(last) = toks.last_mut() {
+                    let trimmed = last.trim_end_matches(['.', ':', ',', ';']).to_string();
+                    if trimmed.is_empty() {
+                        toks.pop();
+                    } else {
+                        *last = trimmed;
+                        break;
+                    }
+                }
+                if toks.len() < 2 || !verbs.contains(&toks[0]) {
+                    continue;
+                }
+                let mut argv = vec!["tunlion".to_string()];
+                argv.extend(toks.iter().cloned());
+                checked += 1;
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    let first = e.to_string();
+                    let first = first.lines().next().unwrap_or("");
+                    bad.push(format!(
+                        "  {rel}:{}: `{}` does not parse ({first})\n    {}",
+                        n + 1,
+                        argv.join(" "),
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 50,
+        "parsed only {checked} printed hints; the extraction drifted from the \
+         source and this test no longer proves anything"
+    );
+    assert!(
+        bad.is_empty(),
+        "printed hints that clap rejects when typed as shown:\n{}",
+        bad.join("\n")
+    );
+}
+
 #[test]
 fn printed_hints_carry_every_required_flag() {
     // #227: `tunlion requests` printed `[ tunlion requests approve 1 ]`.
@@ -2284,22 +2518,8 @@ fn printed_hints_carry_every_required_flag() {
         }
     }
 
-    let manifest = env!("CARGO_MANIFEST_DIR");
     let mut bad = Vec::new();
-    for rel in [
-        "src/main.rs",
-        "src/mount.rs",
-        "src/l2.rs",
-        "src/ui.rs",
-        "src/daemon_ctl.rs",
-        "src/recv_files.rs",
-        "src/fleet_ui/devices.rs",
-        "src/fleet_ui/requests.rs",
-        "src/fleet_ui/mint.rs",
-    ] {
-        let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else {
-            continue;
-        };
+    for (rel, text) in product_sources() {
         for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
             if t.starts_with("//") {
@@ -2336,8 +2556,6 @@ fn printed_hints_carry_every_required_flag() {
     );
 }
 
-#[test]
-#[test]
 #[test]
 fn hooks_that_nothing_calls() {
     // A hook with no call site is not dead code, it is a DISCONNECTED
@@ -2422,7 +2640,6 @@ fn hooks_that_nothing_calls() {
 }
 
 #[test]
-#[test]
 fn petname_collision_ignores_case() {
     // `Laptop` and `laptop` used to become two devices: the collision check
     // was an exact compare while `devices_name_taken` (unused) implemented
@@ -2459,6 +2676,14 @@ fn petname_collision_ignores_case() {
     );
 }
 
+// This test, `help_banner_names_commands_that_exist` and
+// `printed_hints_name_verbs_that_exist` had lost their `#[test]` attributes:
+// the attributes had drifted up onto `hooks_that_nothing_calls` (three of
+// them), `petname_collision_ignores_case` (two) and
+// `ephemeral_enrolment_never_carries_the_fleet_meeting_point` (two), the
+// shape a bad conflict resolution leaves. So three tests compiled as plain
+// functions and ran nowhere while the suite reported green.
+#[test]
 fn upgrade_never_promotes_a_link_to_owner() {
     // Regression test for the escalation fixed in the relay->direct cutover.
     // `adopt_direct_transport` hardcoded `(true, OwnerDevice)`, so ANY link
@@ -2504,6 +2729,7 @@ fn upgrade_never_promotes_a_link_to_owner() {
     assert_eq!(gone.1, PrincipalKind::OwnerDevice);
 }
 
+#[test]
 fn help_banner_names_commands_that_exist() {
     // The banner printed `ephemeral mint`, a verb deleted when minting
     // collapsed into `add --for runner`. A user reading --help typed it and
@@ -2629,6 +2855,7 @@ fn help_banner_names_commands_that_exist() {
     );
 }
 
+#[test]
 fn printed_hints_name_verbs_that_exist() {
     // #229, and the reason this test exists rather than a fifth point fix:
     // `tunlion unmount` was printed after every successful mount and has
@@ -2659,28 +2886,21 @@ fn printed_hints_name_verbs_that_exist() {
     // test once and gets added deliberately, which is the point: the cost of
     // adding a word is a moment's thought about whether it is prose or an
     // instruction.
+    //
+    // The second row arrived with the whole-tree scan: "tunlion needs
+    // CAP_NET_ADMIN", "only one tunlion per host", "tunlion has no service
+    // protocol", "start tunlion with `tunlion up`", "enable --now tunlion
+    // failed", "# Added by tunlion for L3 overlay access". Each was read and
+    // is prose about the program, not an instruction.
     for prose in [
         "daemon", "state", "mounts", "was", "from", "video", "identity",
+        "needs", "per", "has", "with", "failed", "for",
     ] {
         valid.insert(prose.into());
     }
 
-    let manifest = env!("CARGO_MANIFEST_DIR");
     let mut bad = Vec::new();
-    for rel in [
-        "src/main.rs",
-        "src/mount.rs",
-        "src/l2.rs",
-        "src/ui.rs",
-        "src/daemon_ctl.rs",
-        "src/recv_files.rs",
-        "src/fleet_ui/devices.rs",
-        "src/fleet_ui/requests.rs",
-        "src/fleet_ui/mint.rs",
-    ] {
-        let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else {
-            continue;
-        };
+    for (rel, text) in product_sources() {
         for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
             // Comments explain history ("replaces `tunlion unmount`") and
@@ -2957,20 +3177,8 @@ fn internal_subcommand_invocations_name_real_verbs() {
             v
         })
         .collect();
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let sources = [
-        "src/main.rs",
-        "src/mount.rs",
-        "src/backup.rs",
-        "src/l2.rs",
-        "src/daemon_ctl.rs",
-        "src/recv_files.rs",
-    ];
     let mut checked = 0usize;
-    for f in sources {
-        let Ok(text) = std::fs::read_to_string(format!("{manifest}/{f}")) else {
-            continue;
-        };
+    for (f, text) in product_sources() {
         for line in text.lines() {
             let bytes = line.as_bytes();
             let mut i = 0usize;
@@ -3034,7 +3242,6 @@ impl identity::KeyStore for ScratchStore {
 // Written BEFORE the pairing path could issue anything, so they constrain
 // the implementation rather than describe it.
 
-#[test]
 #[test]
 fn ephemeral_enrolment_never_carries_the_fleet_meeting_point() {
     // fleet_rv is standing membership. A borrower holds a certificate for one

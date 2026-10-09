@@ -1246,6 +1246,7 @@ fn two_nodes_pair_each_other() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "cold establish not yet verified on this platform")]
 fn pty_one_shot_exec_smoke() {
     // PTY one-shot exec smoke: starts daemons, pairs them, then runs
     // `tunlion pty <peer> -- echo NONCE` and verifies the echo output.
@@ -1258,13 +1259,9 @@ fn pty_one_shot_exec_smoke() {
     // fresh with known devices, giving the daemon warm link to stabilize
     // before the PTY command. The 3s kill gap + 12s settle was proven
     // effective in earlier CI runs (commit 1213120).
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("pty_one_shot_exec_smoke: skipped on {os} (cold establish not yet verified on this platform)",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    //
+    // Windows/macOS: IGNORED via cfg_attr above, not skipped by an early
+    // return, so the result says "ignored" instead of a false "ok".
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1429,6 +1426,7 @@ fn shell_owner_gate_refuses_real_spawn() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "cold establish not yet verified on this platform")]
 fn shell_daemon_live_pairing_no_restart() {
     // Proves the fix for main.rs:8381 — a `--shell` daemon started with
     // no known devices in a non-interactive context must NOT bail, AND the
@@ -1439,13 +1437,8 @@ fn shell_daemon_live_pairing_no_restart() {
     // that is necessary-not-sufficient: if the 9065 scan were broken,
     // the daemon would stay up but never find the new peer, making the
     // fix worthless. This test proves BOTH.
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("shell_daemon_live_pairing_no_restart: skipped on {os} (cold establish not yet verified on this platform)",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    //
+    // Windows/macOS: IGNORED via cfg_attr above (not an early-return "ok").
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1608,12 +1601,8 @@ fn shell_daemon_live_pairing_no_restart() {
 /// linux + windows, macOS needs real hardware.
 #[cfg(not(target_os = "macos"))]
 #[test]
+#[cfg_attr(windows, ignore = "warm-all first contact not yet verified on Windows")]
 fn warm_all_makes_first_contact_warm() {
-    #[cfg(windows)]
-    {
-        eprintln!("warm_all_makes_first_contact_warm: skipped on Windows");
-        return;
-    }
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1867,6 +1856,7 @@ fn warm_all_makes_first_contact_warm() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "warm-reuse pty not yet verified on this platform")]
 fn warm_one_shot_pty_reuse() {
     // Proves fix/warm-one-shot-pty: a scripted `pty <peer> -- cmd` reuses the
     // daemon's warm-held link instead of cold-establishing.
@@ -1878,13 +1868,7 @@ fn warm_one_shot_pty_reuse() {
     //
     // Linux-only: macOS hyperkit bridge transport can't reliably complete a
     // QUIC establish. Verified on ubuntu with trace-confirmed warm reuse.
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("warm_one_shot_pty_reuse: skipped on {os} (warm-reuse pty not yet verified)",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    // Windows/macOS: IGNORED via cfg_attr above (not an early-return "ok").
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -2230,6 +2214,7 @@ fn freeze_stall_detector_classification() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "instant-EOF warm pty not yet verified on this platform")]
 fn warm_one_shot_pty_instant_eof() {
     // Proves fix/warm-oneshot-pty-reuse: one-shot `pty <peer> -- printf ...`
     // with INSTANT stdin-EOF (</dev/null) returns rc=0 with full output.
@@ -2238,13 +2223,7 @@ fn warm_one_shot_pty_instant_eof() {
     // writer, tearing down the pty before output arrived (hang / rc=124).
     // After the fix, the writer waits for the daemon to close the socket
     // (command exit), so output is delivered and the client returns cleanly.
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("warm_one_shot_pty_instant_eof: skipped on {os}",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    // Windows/macOS: IGNORED via cfg_attr above (not an early-return "ok").
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();

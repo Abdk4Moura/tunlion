@@ -250,7 +250,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: true,
-            help: "Accept seamless `tunlion ssh` from paired devices (per-peer with --peer)",
+            help: "Accept seamless `tunlion shell` from paired devices (per-peer with --peer)",
         },
         Setting {
             key: "shell-user",
@@ -1310,7 +1310,7 @@ fn readout(json_out: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset: tunlion unset <key>")
+        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset all: tunlion set --reset")
     );
     Ok(())
 }

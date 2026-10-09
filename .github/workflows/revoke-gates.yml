@@ -155,12 +155,20 @@ jobs:
             # failing status while suppressing errexit; `|| true` on the
             # count does the same for grep's exit 1 on zero matches.
             code=0
-            out="$(bash "$g" 2>&1)" || code=$?
+            # A PER-GATE BOUND, the same one gate-suite.yml carries. Without it
+            # one hanging gate consumed the whole job budget and hid every
+            # revocation gate after it in the loop, and the job died at its
+            # timeout naming nothing. The slowest script here (fleet-cert) runs
+            # in about 90s, so 300s is generous and still leaves the later
+            # gates time to run after a hang.
+            out="$(timeout 300 bash "$g" 2>&1)" || code=$?
             echo "$out"
             echo "::endgroup::"
             got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
             want=${EXPECT[$g]}
-            if [ "$code" -ne 0 ]; then
+            if [ "$code" -eq 124 ]; then
+              echo "::error::$g HUNG: killed by the 300s per-gate timeout, so the output above is partial and every gate after it in this suite still ran"; rc=1
+            elif [ "$code" -ne 0 ]; then
               echo "::error::$g exited $code"; rc=1
             elif [ "$got" -ne "$want" ]; then
               echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1
