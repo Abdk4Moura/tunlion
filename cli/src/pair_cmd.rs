@@ -23,7 +23,6 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -312,6 +311,9 @@ pub(crate) async fn pair_cmd(
 
     let mut petname = name; // resolved --name, prompt answer, or peer's display name
     let mut prompted = false;
+    // True when the petname came from the peer's own name rather than --name, so
+    // the success line can say how to change it.
+    let mut named_by_default = false;
     let mut peer: Option<(String, String)> = None; // (pid, display name)
 
     // ---- L1-a PAKE state (shared ceremony) ----------------------------------
@@ -592,6 +594,12 @@ pub(crate) async fn pair_cmd(
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
+                            if named_by_default {
+                                ui::say(&ui::paint(
+                                    ui::Tone::Dim,
+                                    &format!("  remembered as '{n}'; rename it any time:  tunlion devices rename {n} <name>"),
+                                ));
+                            }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
                                 &format!("  try: tunlion send <file> --to {n}   ·   tunlion up"),
@@ -1192,24 +1200,19 @@ pub(crate) async fn pair_cmd(
                 // sends our SPAKE2 element and, once K + fingerprints are known,
                 // the key-confirmation MAC. NO secret is sent over the DataChannel.
                 pake_peer.get_or_insert(pid.clone());
-                // Settle the petname: --name wins; otherwise ask (tty) or
-                // default to their display name (scripts, pipes).
+                // Settle the petname: --name wins; otherwise their own name, NOW.
+                //
+                // This used to stop and ask "remember this device as [..]:" on a
+                // terminal. Pairing then completed on the OTHER side, which
+                // printed "joined ... mutually remembered", while this side sat on
+                // the prompt; a first-time-user test read the other side's
+                // success as the end and never noticed this one was still
+                // waiting. Their own name is a sensible default, and renaming is
+                // one command (`devices rename`), which the success line names.
                 if petname.is_none() && !prompted {
                     prompted = true;
-                    if std::io::stdin().is_terminal() {
-                        eprint!("  remember this device as [{display}]: ");
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            use tokio::io::AsyncBufReadExt;
-                            let mut line = String::new();
-                            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-                            if reader.read_line(&mut line).await.is_ok() {
-                                let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
-                            }
-                        });
-                    } else {
-                        petname = Some(display.clone());
-                    }
+                    petname = Some(display.clone());
+                    named_by_default = true;
                 }
             }
             Ev::StdinLine(line) => {
