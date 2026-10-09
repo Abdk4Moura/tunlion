@@ -117,13 +117,13 @@ jobs:
           # that a machine cannot see is the thing #249 exists to catch.
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=6
-            [cli/tests/exec-gates.sh]=13
+            [cli/tests/exec-gates.sh]=14
             [cli/tests/sync-gates.sh]=17
-            # 23 = 22 gate slots + the RECON (post-restart link re-establishment)
-            # verdict. AUTH-A keeps its slot while it is KNOWN-RED: the count
+            # 24 = 23 gate slots + the RECON (post-restart link re-establishment)
+            # verdict (FORGET-REFUSED is the 23rd slot). AUTH-A keeps its slot while it is KNOWN-RED: the count
             # below includes KNOWN-RED lines, so a tracked failure can never make
             # the total look short and can never be silently dropped.
-            [cli/tests/fleet-cert-gates.sh]=23
+            [cli/tests/fleet-cert-gates.sh]=24
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3

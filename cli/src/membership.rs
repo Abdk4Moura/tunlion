@@ -252,7 +252,8 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             upgrade_probe: HashMap::new(),
             iface_snapshot: Vec::new(),
         },
-        direct_ok: direct::direct_enabled(),
+        // --relay: never direct (see `direct_permitted`).
+        direct_ok: crate::conn::direct_permitted(relay, direct::direct_enabled()),
         local_port: None,
         local_listener: None,
         direct_endpoint: None,

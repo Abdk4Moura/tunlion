@@ -2116,6 +2116,7 @@ pub(crate) async fn recv_cmd(
                             mux,
                             &p.v,
                             &shell_policy,
+                            &shell_user,
                             &mut parked_opens,
                         )
                         .await;
@@ -5269,6 +5270,7 @@ pub(crate) async fn recv_cmd(
                         mux,
                         &v,
                         &shell_policy,
+                        &shell_user,
                         &mut parked_opens,
                     )
                     .await;

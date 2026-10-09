@@ -186,6 +186,75 @@ impl Paths {
         }
     }
 
+    /// The argv that runs one `tunlion exec` program, dropped to `shell_user`
+    /// through the SAME mechanism `shell_argv` uses for the PTY (`runuser` on
+    /// Unix). The exec path spawns argv[] directly with no shell, so the drop
+    /// uses runuser's command form (`-u <user> -- <program> <args>`) instead of
+    /// `-l <user>`, which would need a shell to carry the command and lose argv
+    /// exactness. No user: the argv is returned unchanged.
+    ///
+    /// Err where the PTY drop does not exist (Windows, see `shell_argv`): the
+    /// caller must REFUSE the exec rather than run it as the daemon user, which
+    /// would hand the peer the very authority `--shell-user` was set to remove.
+    pub fn exec_as_user_argv(
+        program: &str,
+        args: &[String],
+        shell_user: Option<&str>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let mut direct = Vec::with_capacity(args.len() + 1);
+        direct.push(program.to_string());
+        direct.extend(args.iter().cloned());
+        let Some(user) = shell_user else {
+            return Ok(direct);
+        };
+        #[cfg(unix)]
+        {
+            let mut argv: Vec<String> = vec!["runuser".into(), "-u".into(), user.into(), "--".into()];
+            argv.extend(direct);
+            Ok(argv)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = direct;
+            Err(format!(
+                "exec refused: --shell-user {user} is set but this platform cannot run a command as another account, and running it as the daemon user would ignore that setting"
+            ))
+        }
+    }
+
+    /// Home directory of a named local account, when the platform can say.
+    /// Used to give a dropped exec the same starting directory a login shell
+    /// for that account would have. None when unknown; callers fall back.
+    pub fn home_of_user(user: &str) -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            use std::ffi::{CStr, CString};
+            let name = CString::new(user).ok()?;
+            // SAFETY: getpwnam_r writes only into `pwd` and `buf`, both owned
+            // here and sized as passed; `result` is either null or `&pwd`.
+            let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut buf = vec![0 as libc::c_char; 16 * 1024];
+            let mut result: *mut libc::passwd = std::ptr::null_mut();
+            let rc = unsafe {
+                libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+            };
+            if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+                return None;
+            }
+            let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_str().ok()?;
+            if dir.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(dir))
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = user;
+            None
+        }
+    }
+
     fn default_shell() -> String {
         #[cfg(unix)]
         {
@@ -1109,6 +1178,12 @@ impl ShellHost {
         }
     }
 
+    /// True when the argv is the `--shell-user` drop built by `shell_argv`.
+    fn is_user_drop(&self) -> bool {
+        self.argv.len() >= 3
+            && Path::new(&self.argv[0]).file_name().and_then(|n| n.to_str()) == Some("runuser")
+    }
+
     /// Args for spawning an INTERACTIVE login shell (PTY session).
     pub fn interactive_args(&self) -> Vec<String> {
         let mut args = self.argv.clone();
@@ -1125,6 +1200,16 @@ impl ShellHost {
 
     /// Args for running a one-shot COMMAND (returns, no interactive shell).
     pub fn exec_cmd_args(&self, cmd: &str) -> Vec<String> {
+        // A `--shell-user` argv is `runuser -l <user>`. Keeping only argv[0]
+        // here would yield `runuser -c <cmd>`, and runuser with no user named
+        // defaults to root: the one-shot command would run as root while the
+        // operator asked for <user>. Keep the whole drop prefix instead.
+        if self.is_user_drop() {
+            let mut args = self.argv.clone();
+            args.push("-c".into());
+            args.push(cmd.to_string());
+            return args;
+        }
         let mut args = vec![self.argv[0].clone()];
         match self.kind {
             ShellKind::Posix => {
@@ -1254,6 +1339,41 @@ mod tests {
         let args = sh.exec_cmd_args("dir");
         assert_eq!(args[1], "/c");
         assert_eq!(args[2], "dir");
+    }
+
+    // --shell-user one-shot PTY command: the drop prefix must survive, or
+    // `runuser -c <cmd>` runs the command as root.
+    #[test]
+    fn shell_host_exec_keeps_the_shell_user_drop() {
+        let sh = ShellHost::new(&["runuser".into(), "-l".into(), "nobody".into()]);
+        assert_eq!(
+            sh.exec_cmd_args("id -un"),
+            vec!["runuser", "-l", "nobody", "-c", "id -un"]
+        );
+        assert_eq!(sh.interactive_args(), vec!["runuser", "-l", "nobody"]);
+    }
+
+    #[test]
+    fn exec_as_user_argv_without_user_is_the_direct_argv() {
+        let argv = Paths::exec_as_user_argv("/bin/echo", &["a b".into()], None).unwrap();
+        assert_eq!(argv, vec!["/bin/echo", "a b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_as_user_argv_drops_through_runuser_on_unix() {
+        let argv = Paths::exec_as_user_argv("/usr/bin/id", &["-un".into()], Some("nobody")).unwrap();
+        assert_eq!(argv, vec!["runuser", "-u", "nobody", "--", "/usr/bin/id", "-un"]);
+        // Same tool as the PTY drop: one mechanism, not two.
+        let (pty, _) = Paths::shell_argv(Some("bash"), None, Some("nobody"));
+        assert_eq!(pty[0], argv[0]);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn exec_as_user_argv_refuses_where_no_drop_exists() {
+        let err = Paths::exec_as_user_argv("cmd", &[], Some("nobody")).unwrap_err();
+        assert!(err.contains("--shell-user"), "{err}");
     }
 
     #[test]
