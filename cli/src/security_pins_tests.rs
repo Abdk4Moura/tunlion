@@ -378,6 +378,10 @@ fn signed_bounded_grant_reaches_the_gate_under_one_header() {
         let peer = user();
         let device = rand32();
         write_devices(dir, json!([{"name": "alpha", "secret": "s", "deviceCert": cert(&peer, device).to_json()}]));
+        // A header for a DIFFERENT resource is not a "self" header: the grant
+        // must still get its own, or it lands where the gate never looks.
+        let other = header("route-elsewhere", owner.public_key_bytes()).to_json();
+        crate::capability::save_cap_store(dir, &[other]).unwrap();
         let exp = identity::now_secs() + 3600;
         assert!(issue_signed_bounded_grant("alpha", "shell", exp).unwrap());
         assert!(issue_signed_bounded_grant("alpha", "mount", exp).unwrap());
