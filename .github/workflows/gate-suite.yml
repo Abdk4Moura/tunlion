@@ -18,6 +18,7 @@
 #   warm-hold-idle-gates.sh    two paired daemons whose petnames differ from
 #                              their display names sit idle on ONE link: no
 #                              warm-hold re-dials, no reaps, no stall ladder,
+#                              while the peer runs one-shot commands at it,
 #                              and the control socket stays responsive
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
@@ -130,7 +131,7 @@ jobs:
             [cli/tests/roster-gates.sh]=8
             [cli/tests/shell-gates.sh]=6
             [cli/tests/whoami-candidate-gates.sh]=8
-            [cli/tests/warm-hold-idle-gates.sh]=8
+            [cli/tests/warm-hold-idle-gates.sh]=9
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top

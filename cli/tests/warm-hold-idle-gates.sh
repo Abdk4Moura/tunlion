@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Idle warm-hold stability: two paired daemons on loopback whose PETNAMES
-# differ from their DISPLAY names (the normal case: petname `boxB`, display
-# `user@boxB-host`) must sit on one link and do nothing. Standalone, hermetic,
+# Warm-hold stability: two paired daemons on loopback whose PETNAMES differ
+# from their DISPLAY names (the normal case: petname `boxB`, display
+# `user@boxB-host`) must sit on one link and do nothing, while the peer device
+# runs ordinary one-shot commands at them now and then. Standalone, hermetic,
 # fixture port 8131 ONLY.
 #
 #   FILAMENT_BIN=/path/to/tunlion ./warm-hold-idle-gates.sh
@@ -14,6 +15,17 @@
 # WebRTC offers, the retry ladder exhausted, and the cycle repeated about
 # every 95s forever. The ladder's backoff was also SLEPT on the event loop, so
 # control requests waited up to 4s (7-10ms normal) and peer exec stalled.
+#
+# THE TRAFFIC IS WHAT TRIGGERS IT. Measured: two daemons left completely idle
+# on unfixed main pass every zero-count gate below, because the one link they
+# form is born under the display name. What the lab ran, and what real use
+# looks like, is the peer device issuing one-shot commands: every one-shot is a
+# new sid on the shared pair channel under the SAME display name. Those sids
+# stayed in the roster forever, warm-hold looked them up by display name,
+# dialled the departed ones and tore down the live link. So during the window
+# B runs `reach boxA` and `send <file> --to boxA` every 30s, exactly the lab's
+# probe loop minus exec (which needs a shell grant), and those round trips must
+# succeed quickly too.
 #
 # Gates (each line below is one PASS):
 #   setup     A holds a verified link to boxB, keyed by petname
@@ -28,14 +40,17 @@
 #             request (`list-warm`, answered on the event loop) every 0.3s
 #   stable    the link to the peer was present in every probe on both sides,
 #             under ONE pid (never torn down and rebuilt)
+#   traffic   every one-shot round from B during the window succeeded (reach
+#             ok, the file landed on A), each command within 15s
 #   rtt       a `reach boxB` round trip at the end succeeds within 10s
 #
-# WHY 180s IDLE. The first wrong establish fired at the first warm tick after
-# the link came up (ticks are 10s apart), so the cycle shows within ~20s; 180s
-# spans 18 ticks and nearly two full ~95s re-dial cycles, enough for the ghost
-# re-dials and the digest reaper (two 30s sync ticks) to show too. It fits the
-# Gate Suite's per-gate bound for this script with setup (~20s) and the
-# round trip. Override with WARM_IDLE_SECS for a longer local soak.
+# WHY 180s. In the lab the first wrong establish fired 21s after the first
+# one-shot ghost appeared (warm ticks are 10s apart), and the re-dial cycle
+# is ~95s. 180s holds five one-shot rounds, 18 warm ticks, nearly two full
+# cycles and six 30s digest ticks (the reaper needs two), so every symptom has
+# room to show more than once. It fits the Gate Suite's per-gate bound for this
+# script with setup (~20s) and the final round trip. Override with
+# WARM_IDLE_SECS for a longer local soak.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -76,7 +91,7 @@ end = time.monotonic() + secs
 with open(out_path, "w") as out:
     while time.monotonic() < end:
         t0 = time.monotonic()
-        row = {"ms": None, "pid": None}
+        row = {"ms": None, "pids": []}
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(10)
@@ -91,9 +106,12 @@ with open(out_path, "w") as out:
             s.close()
             row["ms"] = (time.monotonic() - t0) * 1000.0
             reply = json.loads(buf.decode() or "{}")
-            for l in reply.get("links", []):
-                if l.get("name", "").lower() == peer.lower():
-                    row["pid"] = l.get("pid")
+            # Every held link to the peer: the one-shot commands the peer runs
+            # show up here too while they last, beside the daemon's own link.
+            row["pids"] = sorted(
+                l.get("pid") for l in reply.get("links", [])
+                if l.get("name", "").lower() == peer.lower() and l.get("pid")
+            )
         except Exception as e:
             row["err"] = str(e)
         out.write(json.dumps(row) + "\n")
@@ -106,7 +124,7 @@ say "setup: link up under the petname"
 linked=0
 for _ in $(seq 1 60); do
   if python3 "$WORK/probe.py" "$DA/control.sock" "$WORK/once.jsonl" 0.1 boxB 2>/dev/null \
-     && grep -q '"pid": "' "$WORK/once.jsonl"; then
+     && grep -q '"pids": \["' "$WORK/once.jsonl"; then
     linked=1; break
   fi
   sleep 1
@@ -129,7 +147,27 @@ python3 "$WORK/probe.py" "$DA/control.sock" "$WORK/probeA.jsonl" "$IDLE_SECS" bo
 PA=$!
 python3 "$WORK/probe.py" "$DB/control.sock" "$WORK/probeB.jsonl" "$IDLE_SECS" boxA &
 PB=$!
+# The peer device's ordinary use: one-shot commands at A every 30s.
+cat >"$WORK/traffic.sh" <<'SH'
+#!/usr/bin/env bash
+# $1 = rounds. Writes one line per command: "<tag> rc=<rc> ms=<ms>".
+for n in $(seq 1 "$1"); do
+  t0=$(date +%s%N)
+  timeout 15 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach boxA --json </dev/null >"$WORK/traffic-reach-$n.out" 2>&1
+  rc=$?; t1=$(date +%s%N); echo "reach-$n rc=$rc ms=$(( (t1 - t0) / 1000000 ))"
+  printf 'probe %s\n' "$n" >"$WORK/probe-$n.txt"
+  t0=$(date +%s%N)
+  timeout 15 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" send "$WORK/probe-$n.txt" --to boxA </dev/null >"$WORK/traffic-send-$n.out" 2>&1
+  rc=$?; t1=$(date +%s%N); echo "send-$n rc=$rc ms=$(( (t1 - t0) / 1000000 ))"
+  sleep 30
+done
+SH
+ROUNDS=$(( IDLE_SECS / 32 ))
+[ "$ROUNDS" -ge 1 ] || ROUNDS=1
+DB="$DB" BIN="$BIN" SERVER="$SERVER" WORK="$WORK" bash "$WORK/traffic.sh" "$ROUNDS" >"$WORK/traffic.log" 2>&1 &
+PT=$!
 wait "$PA" "$PB"
+wait "$PT"
 
 idle_log() { tail -n +"$(( $2 + 1 ))" "$1"; }
 idle_log "$WORK/upA.log" "$LA0" >"$WORK/idleA.log"
@@ -189,11 +227,13 @@ for path, side in ((a, "A"), (b, "B")):
     notes.append(f"{side}: n={len(ms)} p50={ms[len(ms)//2]:.1f}ms p99={p99:.1f}ms max={ms[-1]:.1f}ms errors={errs}")
     if p99 >= 250 or errs:
         lat_ok = False
-    pids = [r.get("pid") for r in rows]
-    missing = sum(1 for p in pids if not p)
-    distinct = sorted({p for p in pids if p})
-    notes.append(f"{side}: link absent in {missing}/{len(pids)} probes, pids={distinct}")
-    if missing or len(distinct) != 1:
+    # The daemons' own link must be in EVERY probe: some pid common to all of
+    # them. A one-shot's transient link may come and go beside it.
+    sets = [set(r.get("pids") or []) for r in rows]
+    missing = sum(1 for x in sets if not x)
+    common = set.intersection(*sets) if sets else set()
+    notes.append(f"{side}: no link in {missing}/{len(sets)} probes, held throughout={sorted(common)}")
+    if missing or len(common) != 1:
         stable_ok = False
 print(("LAT_OK" if lat_ok else "LAT_BAD") + " " + ("STABLE_OK" if stable_ok else "STABLE_BAD"))
 for n in notes:
@@ -206,9 +246,24 @@ case "$verdict" in
   *)       bad "latency: control-socket p99 >= 250ms (or probe errors) during idle" ;;
 esac
 case "$verdict" in
-  *STABLE_OK*) ok "stable: one link to the peer, same pid, present in every probe on both sides" ;;
+  *STABLE_OK*) ok "stable: one link to the peer held under the same pid through every probe on both sides" ;;
   *)           bad "stable: the link to the peer was missing or replaced during idle" ;;
 esac
+
+# --- the peer's one-shot traffic --------------------------------------------
+cat "$WORK/traffic.log"
+want_cmds=$(( ROUNDS * 2 ))
+good=$(grep -c ' rc=0 ' "$WORK/traffic.log" || true)
+landed=0
+for n in $(seq 1 "$ROUNDS"); do
+  [ -f "$WORK/Adrop/probe-$n.txt" ] && landed=$((landed + 1))
+done
+if [ "$good" -eq "$want_cmds" ] && [ "$landed" -eq "$ROUNDS" ]; then
+  ok "traffic: all $ROUNDS one-shot rounds from B succeeded ($good/$want_cmds commands, $landed files landed on A)"
+else
+  for f in "$WORK"/traffic-*.out; do echo "-- $f"; tail -3 "$f"; done
+  bad "traffic: $good/$want_cmds one-shot commands succeeded, $landed/$ROUNDS files landed on A"
+fi
 
 # --- a round trip at the end --------------------------------------------------
 say "round trip after idle"
