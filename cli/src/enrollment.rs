@@ -455,7 +455,7 @@ pub(crate) async fn enroll_cmd(
                 _ => {}
             },
             Ev::Interrupted => bail!("cancelled"),
-            Ev::SignalingDown(reason) => {
+            Ev::SignalingDown(reason, _) => {
                 bail!("signaling connection lost: {reason}");
             }
             _ => {}
