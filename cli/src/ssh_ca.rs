@@ -417,6 +417,13 @@ pub(crate) async fn ensure_ca_key_with(
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        // ssh-keygen creates the .pub under the umask, which made it 0666 under
+        // `umask 0000`: anyone could swap the CA public key sshd is told to
+        // trust. Only this user and root (sshd) need to read it.
+        let _ = std::fs::set_permissions(
+            key.with_extension("pub"),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     Ok(key)
 }

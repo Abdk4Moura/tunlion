@@ -4732,7 +4732,8 @@ fn a_detached_up_never_follows_its_own_log() {
     // (cli/tests/hostile-env-gates.sh runs it): up_cmd decides "headless" from
     // the console being daemon.log or the detach marker, and a headless loser
     // exits instead of following the log it is writing into.
-    let src = include_str!("up_logs.rs");
+    // A Windows checkout has CRLF line endings; the shape below is about LF.
+    let src = include_str!("up_logs.rs").replace("\r\n", "\n");
     let body = &src[src.find("pub(crate) async fn up_cmd").unwrap()..];
     let body = &body[..body.find("\n}\n").unwrap()];
     assert!(body.contains("stdio_is_file(&console_log)"), "headless must compare the console with daemon.log");
