@@ -39,8 +39,18 @@ use tokio_tungstenite::tungstenite::Message;
 pub enum Incoming {
     /// A Socket.IO event and its first argument.
     Event { name: String, data: Value },
-    /// The connection ended. The reason is for logging only.
-    Down(String),
+    /// The connection ended. `conn` is the [`Client::id`] of the connection
+    /// that ended, so a caller that has already replaced it can tell a late
+    /// close of the OLD connection from the loss of the current one. The
+    /// reason is for logging only.
+    Down { conn: u64, reason: String },
+}
+
+/// Connection ids, unique for the life of the process. Zero is never issued.
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 type Writer = Arc<
@@ -61,6 +71,9 @@ type Pending = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Vec<Value>>>>
 
 #[derive(Clone)]
 pub struct Client {
+    /// Which connection this handle writes to. Clones share it; every
+    /// `connect` gets a new one.
+    id: u64,
     writer: Writer,
     /// Ack ids are client-chosen and must be unique per connection; the server
     /// echoes them back on `43`.
@@ -69,6 +82,20 @@ pub struct Client {
 }
 
 impl Client {
+    /// The id of the connection behind this handle, the same value its
+    /// [`Incoming::Down`] carries when it ends.
+    ///
+    /// LOAD-BEARING for any caller that re-dials. Every connection shares the
+    /// caller's event channel, so without the id a close that arrives AFTER a
+    /// re-dial (the old socket's read loop ending a moment late) is
+    /// indistinguishable from the new connection dropping. Acting on it tears
+    /// down the healthy new connection, whose own close then arrives after the
+    /// next re-dial, and the cycle sustains itself: the reconnect storm a
+    /// daemon fell into after a long SIGSTOP.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Send a Socket.IO event with a single JSON argument.
     pub async fn emit(&self, event: &str, data: Value) -> Result<()> {
         // 42 = Socket.IO EVENT inside Engine.IO MESSAGE, then the argument
@@ -269,17 +296,20 @@ async fn connect_inner(base_url: &str, tx: mpsc::UnboundedSender<Incoming>) -> R
     }
 
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let id = next_conn_id();
     let client = Client {
+        id,
         writer: writer.clone(),
         next_ack: Arc::new(AtomicU64::new(1)),
         pending: pending.clone(),
     };
-    tokio::spawn(read_loop(reader, writer, tx, pending));
+    tokio::spawn(read_loop(id, reader, writer, tx, pending));
     Ok(client)
 }
 
 /// Pump packets until the socket ends, then report why exactly once.
 async fn read_loop(
+    conn: u64,
     mut reader: futures_util::stream::SplitStream<
         tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -336,7 +366,7 @@ async fn read_loop(
             _ => {}
         }
     };
-    let _ = tx.send(Incoming::Down(reason));
+    let _ = tx.send(Incoming::Down { conn, reason });
 }
 
 #[cfg(test)]
@@ -385,6 +415,19 @@ mod tests {
         assert!(parse_event("not json").is_none());
         assert!(parse_event("[]").is_none());
         assert!(parse_event(r#"[{"not":"a name"}]"#).is_none());
+    }
+
+    /// A re-dialing caller tells a late close of a replaced connection from the
+    /// loss of the current one by comparing these ids, so two connections must
+    /// never share one.
+    #[test]
+    fn connection_ids_are_never_reused_or_zero() {
+        let ids: Vec<u64> = (0..64).map(|_| next_conn_id()).collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len());
+        assert!(ids.iter().all(|&i| i != 0));
     }
 
     #[test]
