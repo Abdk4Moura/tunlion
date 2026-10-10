@@ -262,12 +262,7 @@ pub(crate) async fn up_cmd(
                 other => return crate::daemon_stop::report_holder(other, &lock_path),
             }
         }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!(
-                "cannot take the daemon lock {} (is the config directory writable?)",
-                lock_path.display()
-            )));
-        }
+        Err(e) => return Err(lock_error(e, &lock_path)),
     };
     // A write that died part way (a full disk, a kill) leaves `<file>.tmp.<pid>`
     // behind; nothing else ever removes them.
@@ -571,3 +566,96 @@ pub(crate) fn already_running(pid: Option<u32>) {
     ));
 }
 
+
+/// Why the daemon lock could not be taken, in words that name the real cause.
+/// It always said "(is the config directory writable?)", including for a
+/// config path longer than the system allows (ENAMETOOLONG), where the
+/// directory was perfectly writable and the path was the problem.
+pub(crate) fn lock_error(e: std::io::Error, lock_path: &std::path::Path) -> anyhow::Error {
+    let shown = short_path(lock_path);
+    let why = match platform::storage_failure(&e) {
+        Some(platform::StorageFailure::NameTooLong) => format!(
+            "the config directory path is too long for this system ({} bytes); point FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME at a shorter path",
+            lock_path.as_os_str().len()
+        ),
+        Some(platform::StorageFailure::ReadOnly) => {
+            "the config directory is on a read-only filesystem".to_string()
+        }
+        Some(platform::StorageFailure::Permission) => {
+            "the config directory is not writable by this user".to_string()
+        }
+        Some(platform::StorageFailure::NoSpace) => {
+            "the disk holding the config directory is full".to_string()
+        }
+        None => e.to_string(),
+    };
+    anyhow::Error::new(e).context(format!("cannot take the daemon lock {shown}: {why}"))
+}
+
+/// A path for a message: whole when it is reasonable, otherwise its start and
+/// end around an ellipsis, so a 4 KB path does not bury the sentence.
+fn short_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    if s.chars().count() <= 160 {
+        return s;
+    }
+    let head: String = s.chars().take(60).collect();
+    let tail: String = {
+        let v: Vec<char> = s.chars().collect();
+        v[v.len() - 60..].iter().collect()
+    };
+    format!("{head}...{tail}")
+}
+
+#[cfg(test)]
+mod lock_error_tests {
+    use super::lock_error;
+
+    /// The blind test's >4096-byte config path: `up` blamed writability, the
+    /// real error was ENAMETOOLONG. The message names the length problem, and
+    /// only a permission problem is called one.
+    #[test]
+    fn a_lock_error_names_its_real_cause() {
+        let p = std::path::Path::new("/x/up.lock");
+        let long = lock_error(
+            std::io::Error::new(std::io::ErrorKind::InvalidFilename, "File name too long"),
+            p,
+        );
+        let long = format!("{long:#}");
+        assert!(long.contains("too long") && !long.contains("writable"), "{long}");
+        let ro = format!(
+            "{:#}",
+            lock_error(std::io::Error::new(std::io::ErrorKind::ReadOnlyFilesystem, "ro"), p)
+        );
+        assert!(ro.contains("read-only"), "{ro}");
+        let perm = format!(
+            "{:#}",
+            lock_error(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no"), p)
+        );
+        assert!(perm.contains("not writable"), "{perm}");
+        let other = format!("{:#}", lock_error(std::io::Error::other("boom"), p));
+        assert!(other.contains("boom") && !other.contains("writable"), "{other}");
+    }
+
+    /// The same through a REAL lock attempt on a path past PATH_MAX.
+    #[test]
+    fn a_config_path_past_the_limit_is_reported_as_too_long() {
+        if !cfg!(unix) {
+            return;
+        }
+        let top = std::env::temp_dir().join(format!("tl-deep-{}", std::process::id()));
+        let mut deep = top.clone();
+        for _ in 0..24 {
+            deep.push("d".repeat(200));
+        }
+        let lock = deep.join("up.lock");
+        assert!(lock.as_os_str().len() > 4096);
+        let e = crate::platform::InstanceLock::try_acquire(&lock)
+            .err()
+            .expect("a path past PATH_MAX cannot be locked");
+        let msg = format!("{:#}", lock_error(e, &lock));
+        assert!(msg.contains("too long"), "{msg}");
+        assert!(msg.len() < 1200, "the message must not quote the whole 4 KB path: {} bytes", msg.len());
+        let _ = std::fs::remove_dir_all(&top);
+    }
+}

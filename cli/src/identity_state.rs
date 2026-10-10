@@ -347,6 +347,20 @@ pub(crate) fn reenrol_steps(device: &str, owner: &str, capability: &str, ceiling
     )
 }
 
+/// The refusal for `shell`, `exec` or `mount` to a device whose enrolment
+/// ceiling (recorded HERE, from its invitation) excludes the capability. The
+/// decision is made locally before anything is sent, so the words say so: it
+/// used to read "exec denied by bravo", and bravo was never asked. The remedy
+/// is the re-enrolment that works (`reenrol_steps`), not a grant, which cannot
+/// widen a ceiling.
+pub(crate) fn ceiling_refusal_here(verb: &str, peer: &str, capability: &str, ceiling: &[String]) -> String {
+    format!(
+        "{verb} refused here, before contacting {peer}: {peer} joined with an invitation ceiling of ({}), which does not include {capability}, so it cannot serve {verb}. Nothing was sent.\n{}",
+        ceiling.join(", "),
+        reenrol_steps(peer, &crate::display_name(), capability, ceiling)
+    )
+}
+
 /// The persisted capability ceiling of a device record, when that record is a
 /// delegated (joined) device. None for an owner device or a plain pair, which
 /// are not ceiling-restricted.

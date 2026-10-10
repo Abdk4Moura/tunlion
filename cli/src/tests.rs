@@ -3997,6 +3997,22 @@ fn a_detached_up_never_follows_its_own_log() {
     assert!(logs.contains("stdio_is_file(&console)"), "logs -f must refuse to follow its own output file");
 }
 
+/// `exec bravo -- hostname` said "exec denied by bravo" about a decision this
+/// device made from bravo's recorded ceiling, without asking bravo. The text
+/// says where it was decided and carries the re-enrolment that widens it.
+#[test]
+fn a_local_ceiling_refusal_says_it_was_decided_here_and_how_to_widen_it() {
+    let caps = vec!["transfer".to_string(), "mount".to_string()];
+    let m = crate::identity_state::ceiling_refusal_here("exec", "bravo", "shell", &caps);
+    assert!(m.starts_with("exec refused here, before contacting bravo"), "{m}");
+    assert!(!m.contains("denied by bravo"), "{m}");
+    assert!(m.contains("(transfer, mount)") && m.contains("does not include shell"), "{m}");
+    assert!(m.contains("tunlion add --for bravo --allow transfer,mount,shell"), "{m}");
+    assert!(m.contains("tunlion reset -y") && m.contains("tunlion join --invite-file bravo-invite.txt"), "{m}");
+    let mount = crate::identity_state::ceiling_refusal_here("mount", "bravo", "mount", &["transfer".to_string()]);
+    assert!(mount.contains("--allow transfer,mount"), "{mount}");
+}
+
 #[test]
 fn the_reenrolment_advice_is_complete_and_keeps_the_ceiling() {
     let s = crate::identity_state::reenrol_steps(
