@@ -1798,13 +1798,17 @@ pub fn prepare_socket_dir(sock: &Path) -> std::io::Result<()> {
 }
 
 /// Err unless `dir` is a directory (not a symlink) owned by this user and not
-/// writable by group or others.
+/// writable by group or others. Root may use a directory another user owns: a
+/// daemon run with sudo against that user's FILAMENT_CONFIG_DIR (the
+/// `--shell-user` setup) binds its socket there, and root can already do
+/// anything that user can.
 #[cfg(unix)]
 fn private_dir_check(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(dir)?;
     let uid = unsafe { libc::geteuid() };
-    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+    let owner_ok = meta.uid() == uid || uid == 0;
+    if !meta.is_dir() || !owner_ok || meta.mode() & 0o022 != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
