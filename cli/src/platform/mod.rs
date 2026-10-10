@@ -1891,8 +1891,8 @@ pub fn process_exists(pid: u32) -> bool {
 pub fn process_exists(pid: u32) -> bool {
     // Signal 0 checks existence and permission without delivering anything;
     // EPERM still means the process exists.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
