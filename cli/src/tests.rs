@@ -4787,6 +4787,8 @@ fn the_reenrolment_advice_is_complete_and_keeps_the_ceiling() {
     // A capability already in the ceiling is not listed twice.
     let again = crate::identity_state::reenrol_steps("d", "o", "mount", &["mount".to_string()]);
     assert!(again.contains("--allow mount --out"), "{again}");
+}
+
 // ------------------------------------------------------- peer presence (F4) --
 
 /// Blind test F4: `devices` showed a SIGSTOPped, then wiped, peer as "online

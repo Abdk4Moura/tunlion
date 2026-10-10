@@ -174,6 +174,7 @@ impl Client {
         let (writer, _reader) = ws.split();
         Ok((
             Client {
+                id: next_conn_id(),
                 writer: Arc::new(Mutex::new(writer)),
                 next_ack: Arc::new(AtomicU64::new(1)),
                 pending: Arc::new(Mutex::new(HashMap::new())),

@@ -1972,6 +1972,8 @@ mod tests {
                 assert!(m.contains("/dev/fuse"), "{m}");
             }
         }
+    }
+
     /// The /proc/locks parser: the holder, never a waiter, device numbers in
     /// hex, inode in decimal, and an OFD lock's -1 is "held, pid unknown".
     #[test]
