@@ -242,7 +242,8 @@ pub(crate) async fn pair_cmd(
             // the server rejects it, and the user is told "codes burn after one
             // use" about a token that was never claimed, with a remedy
             // (`re-run tunlion add`) that mints a code and cannot help.
-            if c.starts_with("filament-invite:") {
+            // PROTOCOL LITERAL: frozen, do not rename (shared constant).
+            if c.starts_with(crate::file_io::INVITE_PREFIX) {
                 bail!("{}", invitation_not_a_code_msg());
             }
             // Claimer: normalize the typed code, split, send ONLY the nameplate.
@@ -620,7 +621,7 @@ pub(crate) async fn pair_cmd(
         if let Some(dl) = ceremony_deadline {
             if Instant::now() > dl {
                 bail!(
-                    "the other device disconnected before setup finished; make sure both run `tunlion add` at the same time, then try again"
+                    "the other device disconnected before setup finished; keep `tunlion add` running on one device while the other runs `tunlion join <code>`, then try again"
                 );
             }
         }

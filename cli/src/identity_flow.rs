@@ -298,7 +298,7 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
             eprintln!("  Anyone who captures this QR can become you.");
             eprintln!(
                 "{}",
-                ui::qr_or_text(&format!("filament-recovery:v1:{phrase}"), 2)
+                ui::qr_or_text(&format!("{RECOVERY_QR_PREFIX}{phrase}"), 2)
             );
             let _ = prompt_line("  Press Enter after saving it somewhere you control: ")?;
         }
@@ -420,18 +420,22 @@ pub(crate) async fn init_experience(
         false
     };
     if start_background {
+        // No daemon flags are forwarded: the inbox was just written to the
+        // config (`dir` above), which the service reads on every start, so a
+        // later `tunlion set drop-dir` still applies to it.
         up_cmd(
             server,
-            true,
-            false,
-            false,
+            crate::up_logs::UpMode {
+                install: true,
+                ..Default::default()
+            },
+            &crate::up_logs::DaemonOpts::default(),
             Some(inbox.clone()),
             relay,
             false,
             None,
             None,
             None,
-            false,
             false,
             false,
         )
@@ -624,4 +628,74 @@ pub(crate) async fn open_enrollment(
             "device_pub": hex::encode(device_pub),
         }))
         .await;
+}
+
+/// PROTOCOL LITERAL: frozen, do not rename. The prefix of the recovery QR
+/// export; released builds printed QRs with exactly this text, and restore
+/// must keep reading them for as long as anyone holds one.
+pub(crate) const RECOVERY_QR_PREFIX: &str = "filament-recovery:v1:";
+
+/// The recovery words inside whatever the user supplied: the bare 12 words,
+/// or the full text of the recovery QR (`filament-recovery:v1:<words>`), which
+/// is what a phone's QR scanner hands back.
+pub(crate) fn recovery_words(input: &str) -> &str {
+    let t = input.trim();
+    t.strip_prefix(RECOVERY_QR_PREFIX).map(str::trim).unwrap_or(t)
+}
+
+#[cfg(test)]
+mod recovery_qr_tests {
+    use super::*;
+
+    const WORDS: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn bare_words_pass_through() {
+        assert_eq!(recovery_words(WORDS), WORDS);
+        assert_eq!(recovery_words(&format!("  {WORDS}\n")), WORDS);
+    }
+
+    #[test]
+    fn the_qr_export_text_restores() {
+        let qr = format!("{RECOVERY_QR_PREFIX}{WORDS}");
+        assert_eq!(recovery_words(&qr), WORDS);
+        assert_eq!(recovery_words(&format!("{qr}\n")), WORDS);
+        // And the stripped words really restore (same identity as the bare
+        // phrase; the golden value lives in filament-id).
+        let dir = std::env::temp_dir().join(format!("recovery-qr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        struct Store(std::path::PathBuf);
+        impl crate::identity::KeyStore for Store {
+            fn write_secret(&self, path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+                std::fs::write(path, data)
+            }
+            fn read(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+                std::fs::read(path)
+            }
+            fn config_path(&self, relative: &str) -> std::path::PathBuf {
+                self.0.join(relative)
+            }
+        }
+        let key = crate::identity::UserKey::restore(&Store(dir.clone()), recovery_words(&qr)).unwrap();
+        assert_eq!(
+            key.public_key_hex(),
+            "2562276a8902accb0bff0b4f09bc8014bf10639be6734fb4c2ceda9594964205"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinned by the SHA-256 of the original prefix
+    /// (`printf '%s' 'filament-recovery:v1:' | sha256sum`).
+    #[test]
+    fn recovery_qr_prefix_is_frozen() {
+        use sha2::{Digest, Sha256};
+        let got: String = Sha256::digest(RECOVERY_QR_PREFIX.as_bytes())
+            .as_slice()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, "bf1a055f157070e84038dd122108ee8f7c68d621bd4118125f40fa1632e0495c");
+    }
 }

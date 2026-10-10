@@ -53,7 +53,7 @@ pub fn watchdog() {
     notify("WATCHDOG=1");
 }
 
-/// One-line human status shown by `systemctl --user status tunlion`.
+/// One-line human status shown by `systemctl --user status filament`.
 pub fn status(s: &str) {
     notify(&format!("STATUS={s}"));
 }

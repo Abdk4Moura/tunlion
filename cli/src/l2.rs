@@ -4672,13 +4672,35 @@ pub(crate) struct PeerSshInfo {
 
 /// Ensure our managed key is installed on the peer and host keys are pinned.
 /// Returns `PeerSshInfo` with everything needed to spawn sshfs/rsync/ssh.
+// PROTOCOL LITERAL: frozen, do not rename. `filament-<peer>` is the host alias
+// written into the managed known_hosts / bootstrap pin store; released builds
+// wrote it and look it up by exactly this spelling, so a renamed prefix makes
+// every pinned peer look unpinned (and re-bootstraps or prompts).
+const SSH_HOST_ALIAS_PREFIX: &str = "filament-";
+/// Read only, never written: the prefix an unreleased build wrote for a short
+/// while after the rename. Still recognised when mapping an alias to its peer.
+const SSH_HOST_ALIAS_PREFIX_RENAMED: &str = "tunlion-";
+
+/// The host alias for `peer` (always the frozen `filament-` spelling).
+fn ssh_host_alias(peer: &str) -> String {
+    format!("{SSH_HOST_ALIAS_PREFIX}{peer}")
+}
+
+/// The peer name inside a host alias, accepting both spellings.
+#[allow(dead_code)] // only the Linux L3 path reads it outside tests
+fn peer_from_ssh_host_alias(host: &str) -> &str {
+    host.strip_prefix(SSH_HOST_ALIAS_PREFIX)
+        .or_else(|| host.strip_prefix(SSH_HOST_ALIAS_PREFIX_RENAMED))
+        .unwrap_or(host)
+}
+
 pub(crate) async fn ensure_peer_bootstrap(
     server: &str,
     peer: &str,
     relay: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let _host = format!("tunlion-{peer}");
+    let _host = ssh_host_alias(peer);
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -4697,7 +4719,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
     cert_only: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("tunlion-{peer}");
+    let host = ssh_host_alias(peer);
 
     let cached = if crate::sshkeys::host_pinned(&host) {
         crate::sshkeys::bootstrap_cache_get(peer)
@@ -4729,7 +4751,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
 /// Invalidate bootstrap cache and re-bootstrap a peer (for retry after exit 255).
 pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool, cert_only: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("tunlion-{peer}");
+    let host = ssh_host_alias(peer);
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -4800,7 +4822,7 @@ pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
 /// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
 #[cfg(target_os = "linux")]
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
-    let peer = info.host.strip_prefix("tunlion-").unwrap_or(&info.host);
+    let peer = peer_from_ssh_host_alias(&info.host);
     let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
 
     // Retry with increasing timeouts (like run_ssh does with revive+poll).
@@ -5780,5 +5802,32 @@ mod h1_tests {
         mux.on_frame(sid, Bytes::new()).await;
         drop(client);
         s.await.expect("serve task panicked");
+    }
+}
+
+#[cfg(test)]
+mod ssh_host_alias_tests {
+    use super::*;
+
+    /// The alias is on-disk format shared with released builds: pinned by the
+    /// SHA-256 of the original prefix (`printf '%s' '<prefix>' | sha256sum`),
+    /// which a find-and-replace cannot keep in step.
+    #[test]
+    fn writer_uses_the_frozen_prefix() {
+        use sha2::{Digest, Sha256};
+        let got: String = Sha256::digest(SSH_HOST_ALIAS_PREFIX.as_bytes())
+            .as_slice()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, "a9b2366d5c35fecae4becd94bbbdcd150323114f356d1404517649b7dbf3cab4");
+        assert_eq!(ssh_host_alias("laptop"), format!("{SSH_HOST_ALIAS_PREFIX}laptop"));
+    }
+
+    #[test]
+    fn reader_accepts_both_spellings() {
+        assert_eq!(peer_from_ssh_host_alias(&ssh_host_alias("laptop")), "laptop");
+        assert_eq!(peer_from_ssh_host_alias("tunlion-laptop"), "laptop");
+        assert_eq!(peer_from_ssh_host_alias("laptop"), "laptop");
     }
 }

@@ -36,8 +36,11 @@ impl Paths {
         // like a fresh install. A brand is not worth that, and a migration that
         // moves live secrets is a worse risk than a directory with the old name.
         //
-        // The new name is honoured when it is ALREADY the one in use, so anyone
-        // who starts fresh after the rename lands on `tunlion` and keeps it.
+        // A `tunlion` directory is honoured only when it ALREADY exists (for
+        // example one created by hand). Nothing here creates it: a fresh
+        // install, before or after the rename, gets the `filament` directory.
+        //
+        // PROTOCOL LITERAL: frozen, do not rename (the `filament` dir name).
         if let Some(proj) = directories::ProjectDirs::from("", "", "tunlion") {
             let new_dir = proj.config_dir().to_path_buf();
             if new_dir.exists() {
@@ -429,8 +432,17 @@ impl Drop for DevicesFileLock {
 /// - **system**: privileged, kernel TUN, autostart at boot (requires admin).
 /// - **user**: unprivileged, userspace-only, autostart at logon.
 ///
-/// `tunlion up --install` tries system first (elevation popup), falls back to
-/// user on decline. `--uninstall` removes whatever was installed.
+/// `tunlion up --install` installs the user tier and nothing else. The system
+/// tier is only ever an explicit `--install --system`: a root service is a
+/// different consent from "keep receiving while I am logged in", and asking
+/// for it implicitly (the old "try system first" order) handed the receiver to
+/// root on any machine where elevation happened to succeed.
+///
+/// Every installer takes the daemon's argv as a LIST (`["up", "--shell", ..]`)
+/// and encodes it for its own format: a quoted systemd ExecStart, one plist
+/// `<string>` per element, a CommandLineToArgvW-safe command line. Splicing a
+/// pre-joined string was how the plist ended up with `--shell` as raw text
+/// between `<string>` elements, which launchd never passes as an argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceHost {
     Systemd,
@@ -441,10 +453,10 @@ pub enum ServiceHost {
 
 /// Outcome of an install attempt.
 pub enum InstallResult {
-    /// Privileged system-level service installed.
+    /// Privileged system-level service installed. (There is no "fell back to
+    /// a user service" outcome: a declined elevation is an error, never a
+    /// quiet switch to the other tier.)
     System,
-    /// User-level autostart installed (admin declined or unavailable).
-    User,
 }
 
 impl ServiceHost {
@@ -476,16 +488,21 @@ impl ServiceHost {
     }
 
     /// Attempt privileged install (system-level). Returns Ok if the privileged
-    /// path completed, Err if elevation was declined or unavailable (caller
-    /// should fall back to install_user).
-    pub fn install_system(&self, exe: &Path, shell_args: &str) -> Result<InstallResult> {
+    /// path completed, Err if elevation was declined or unavailable, or the
+    /// install itself failed. Never falls back to a user service: the caller
+    /// asked for a system one, and the other tier is a different thing.
+    ///
+    /// Linux does not come through here: `up --install --system` there is
+    /// `install_service::install_system_service`, which writes a unit with
+    /// `User=` and ambient CAP_NET_ADMIN instead of a bare root service.
+    pub fn install_system(&self, exe: &Path, argv: &[String]) -> Result<InstallResult> {
         // If already elevated (root on unix, admin on Windows), do the actual
         // system install directly. Otherwise, try to elevate.
         if self.is_elevated() {
-            self.do_install_system(exe, shell_args)?;
+            self.do_install_system(exe, argv)?;
             return Ok(InstallResult::System);
         }
-        let elevated = self.try_elevate(exe, shell_args)?;
+        let elevated = self.try_elevate(exe, argv)?;
         if elevated {
             return Ok(InstallResult::System);
         }
@@ -535,18 +552,12 @@ impl ServiceHost {
         { false }
     }
 
-    fn do_install_system(&self, exe: &Path, shell_args: &str) -> Result<()> {
+    fn do_install_system(&self, exe: &Path, argv: &[String]) -> Result<()> {
+        // No Linux arm. The one that lived here wrote a unit with no `User=`,
+        // so the receiver ran as root, and ignored both systemctl results.
+        // Linux's system tier is `up --install --system` (install_service.rs).
+        let _ = (exe, argv);
         match self {
-            #[cfg(target_os = "linux")]
-            ServiceHost::Systemd => {
-                let unit = std::path::Path::new("/etc/systemd/system/filament.service");
-                std::fs::write(unit, format!(
-                    "[Unit]\nDescription=Tunlion drop target\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=multi-user.target\n",
-                    exe.display(), shell_args
-                ))?;
-                let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
-                let _ = std::process::Command::new("systemctl").args(["enable", "--now", "tunlion"]).status();
-            }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
                 // 0.8.5 (rec 4): a machine-wide Windows service cannot work yet.
@@ -556,42 +567,32 @@ impl ServiceHost {
                 // exists, refuse clearly instead of half-installing. The default
                 // per-user autostart (HKCU Run) is unaffected and never reaches
                 // this path.
-                anyhow::bail!(
+                Err(anyhow::anyhow!(
                     "a machine-wide Windows service is not supported yet: tunlion has no service protocol, \
                      so the installed service could never start. The per-user autostart (the default) is \
                      already installed. See #177."
-                );
+                ))
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
+                // PROTOCOL LITERAL: frozen, do not rename (plist file = LAUNCHD_LABEL).
                 let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.filament.plist");
-                std::fs::write(plist, format!(
-                    r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>autumated.tunlion</string>
-  <key>ProgramArguments</key>
-  <array><string>{}</string><string>up</string>{}</array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict>
-</plist>"#,
-                    exe.display(), shell_args
-                ))?;
-                let _ = std::process::Command::new("launchctl").args(["bootstrap", "system"]).arg(plist).status();
+                std::fs::write(plist, launchd_plist(LAUNCHD_LABEL, exe, argv))?;
+                launchctl_bootstrap("system", plist)
             }
-            _ => anyhow::bail!("system install not supported"),
+            ServiceHost::Systemd => Err(anyhow::anyhow!(
+                "a system service on Linux is `tunlion up --install --system`"
+            )),
+            _ => Err(anyhow::anyhow!("system install not supported")),
         }
-        Ok(())
     }
 
     /// Install user-level autostart (no elevation needed).
-    pub fn install_user(&self, exe: &Path, shell_args: &str) -> Result<()> {
+    pub fn install_user(&self, exe: &Path, argv: &[String]) -> Result<()> {
         match self {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
-                install_systemd_user(exe, shell_args)
+                install_systemd_user(exe, argv)
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
@@ -600,11 +601,11 @@ impl ServiceHost {
                 // administrative act, and the first-run wizard must not demand
                 // UAC for it (matches systemd --user and the LaunchAgent). A
                 // machine-wide service is the explicit --install-system path.
-                install_run_key(exe, shell_args)
+                install_run_key(exe, argv)
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
-                install_launch_agent(exe, shell_args)
+                install_launch_agent(exe, argv)
             }
             _ => Err(anyhow::anyhow!("no service manager detected")),
         }
@@ -616,10 +617,10 @@ impl ServiceHost {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
                 let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "disable", "--now", "tunlion"])
+                    .args(["--user", "disable", "--now", SYSTEMD_UNIT])
                     .status();
                 let _ = std::process::Command::new("systemctl")
-                    .args(["disable", "--now", "tunlion"])
+                    .args(["disable", "--now", SYSTEMD_UNIT])
                     .status();
             }
             #[cfg(target_os = "windows")]
@@ -629,7 +630,7 @@ impl ServiceHost {
                 // with the HKCU Run entry, which needs no elevation.
                 if self.is_elevated() {
                     let _ = std::process::Command::new("sc")
-                        .args(["delete", "tunlion"])
+                        .args(["delete", WINDOWS_SERVICE_NAME])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();
@@ -638,14 +639,14 @@ impl ServiceHost {
                     .args([
                         "delete",
                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                        "/v", "Tunlion",
+                        "/v", WINDOWS_AUTOSTART_NAME,
                         "/f",
                     ])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
                 let _ = std::process::Command::new("schtasks")
-                    .args(["/delete", "/tn", "Tunlion", "/f"])
+                    .args(["/delete", "/tn", WINDOWS_AUTOSTART_NAME, "/f"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
@@ -653,7 +654,8 @@ impl ServiceHost {
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
                 let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", "gui/501/autumated.tunlion"])
+                    .arg("bootout")
+                    .arg(format!("gui/{}/{LAUNCHD_LABEL}", unsafe { libc::getuid() }))
                     .status();
             }
             _ => {}
@@ -662,17 +664,13 @@ impl ServiceHost {
 
     /// Try to elevate and re-run ourselves with admin privileges. Returns
     /// true if the elevation dialog was accepted, false if declined.
-    fn try_elevate(&self, exe: &Path, shell_args: &str) -> Result<bool> {
-        #[cfg(target_os = "linux")]
-        {
-            let ok = std::process::Command::new("pkexec")
-                .arg(exe)
-                .args(["--install-system", shell_args])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            return Ok(ok);
-        }
+    fn try_elevate(&self, exe: &Path, argv: &[String]) -> Result<bool> {
+        // The elevated child re-runs `up` with the same daemon flags plus the
+        // hidden `--install-system`, which makes it write the system service
+        // and exit. (The pkexec arm that lived here ran `<exe> --install-system
+        // <every flag as ONE argument>`, which clap rejects before any install.)
+        let elevated_argv = elevated_install_argv(argv);
+        let _ = (exe, &elevated_argv);
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::ffi::OsStrExt;
@@ -710,7 +708,7 @@ impl ServiceHost {
             const SW_HIDE: i32 = 0;
 
             let exe_win: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-            let args = format!("--install-system {shell_args}");
+            let args = windows_args_line(&elevated_argv);
             let args_win: Vec<u16> = args.encode_utf16().chain(std::iter::once(0)).collect();
             let verb: Vec<u16> = "runas\0".encode_utf16().collect();
 
@@ -762,14 +760,17 @@ impl ServiceHost {
         }
         #[cfg(target_os = "macos")]
         {
-            // Escape the exe path and shell_args for the AppleScript do-shell-script
-            // double-quote context. The shell_args are our own --shell / --shell-only
-            // flags so they are constrained, but we escape defensively anyway.
+            // Each word is single-quoted for `sh` (do shell script runs sh), then
+            // the whole line is escaped for the AppleScript string around it.
+            let mut line = sh_quote(&exe.display().to_string());
+            for a in &elevated_argv {
+                line.push(' ');
+                line.push_str(&sh_quote(a));
+            }
             let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!(
-                "do shell script \"'{}' --install-system {}\" with administrator privileges",
-                esc(&exe.display().to_string()),
-                esc(shell_args)
+                "do shell script \"{}\" with administrator privileges",
+                esc(&line)
             );
             let ok = std::process::Command::new("osascript")
                 .args(["-e", &script])
@@ -778,7 +779,7 @@ impl ServiceHost {
                 .unwrap_or(false);
             return Ok(ok);
         }
-        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         { Ok(false) }
     }
 
@@ -788,38 +789,257 @@ impl ServiceHost {
     }
 }
 
+// PROTOCOL LITERAL: frozen, do not rename. These are the names released builds
+// registered with the OS service managers (systemd unit `filament.service`,
+// launchd label `autumated.filament`, HKCU Run value and scheduled task
+// `Filament`, SCM service `filament`, firewall rule `Filament QUIC`). Every
+// later start, stop, status, log, uninstall and sudoers rule must name the SAME
+// thing, or an upgraded install can no longer manage the service it already
+// has (and a second one appears beside it). Pinned by `frozen_service_names`.
+pub(crate) const SYSTEMD_UNIT: &str = "filament";
+#[allow(dead_code)] // macOS only
+const LAUNCHD_LABEL: &str = "autumated.filament";
+#[allow(dead_code)] // Windows only
+const WINDOWS_AUTOSTART_NAME: &str = "Filament";
+#[allow(dead_code)] // Windows only
+const WINDOWS_SERVICE_NAME: &str = "filament";
+#[allow(dead_code)] // Windows only
+const WINDOWS_FIREWALL_RULE: &str = "name=Filament QUIC";
+
+#[cfg(test)]
+mod frozen_service_names {
+    /// Each digest is SHA-256 of the ORIGINAL literal (`printf '%s' '<name>' |
+    /// sha256sum`); a find-and-replace cannot keep a digest in step.
+    #[test]
+    fn frozen_service_names() {
+        use sha2::{Digest, Sha256};
+        for (name, value, digest) in [
+            ("SYSTEMD_UNIT", super::SYSTEMD_UNIT, "5696d135fe7eb0f05ce06041ec050633b7e8820d0afc490c936e73e5cafb378e"),
+            ("LAUNCHD_LABEL", super::LAUNCHD_LABEL, "550c6c611b45bb2f7a356cfa36bf28a44df6b963c22b7dd8517db8b592b4c3c2"),
+            ("WINDOWS_AUTOSTART_NAME", super::WINDOWS_AUTOSTART_NAME, "0a9066fa6acd2d7a545af769171444d090e5b7940f5dd39e77b9a2c924b5982c"),
+            ("WINDOWS_SERVICE_NAME", super::WINDOWS_SERVICE_NAME, "5696d135fe7eb0f05ce06041ec050633b7e8820d0afc490c936e73e5cafb378e"),
+            ("WINDOWS_FIREWALL_RULE", super::WINDOWS_FIREWALL_RULE, "89a571ce57a1e8b0ed042cfa0e474c33e112170f01d9175f64f5123781a5fb1d"),
+        ] {
+            let got: String = Sha256::digest(value.as_bytes())
+                .as_slice()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(got, digest, "frozen service name {name} changed");
+        }
+    }
+}
+
+// ----------------------------------------------- service argv encoders --
+//
+// The daemon's argv reaches four service formats. Each gets the SAME list and
+// encodes it for itself, so an argument is either passed exactly or the format
+// says it cannot be. These are pure so their output is unit-tested on every
+// platform, not just the one that ships the format.
+
+/// Escape text for an XML element body or attribute value.
+#[allow(dead_code)] // macOS (plist) and Windows (task XML) only
+pub(crate) fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// A launchd plist that runs `exe` with `argv`, one `<string>` per element.
+#[allow(dead_code)] // macOS only
+pub(crate) fn launchd_plist(label: &str, exe: &Path, argv: &[String]) -> String {
+    let mut args = format!("    <string>{}</string>\n", xml_escape(&exe.display().to_string()));
+    for a in argv {
+        args.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict>
+</plist>
+"#,
+        xml_escape(label)
+    )
+}
+
+/// One word for a systemd `ExecStart=` line. systemd expands `%` specifiers
+/// and `$VAR` everywhere in the line, so those are doubled; anything that
+/// would split or confuse the word is double-quoted with C-style escapes.
+fn systemd_word(s: &str) -> String {
+    let escaped = s.replace('%', "%%").replace('$', "$$");
+    let plain = !escaped.is_empty()
+        && escaped
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._,=:@+-%$".contains(c));
+    if plain {
+        return escaped;
+    }
+    let mut out = String::from("\"");
+    for c in escaped.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `ExecStart=` value (without the key) that runs `exe` with `argv`.
+#[allow(dead_code)] // Linux only
+pub(crate) fn systemd_exec_start(exe: &Path, argv: &[String]) -> String {
+    let mut line = systemd_word(&exe.display().to_string());
+    for a in argv {
+        line.push(' ');
+        line.push_str(&systemd_word(a));
+    }
+    line
+}
+
+/// The per-user systemd unit `up --install` writes on Linux.
+#[allow(dead_code)] // Linux only
+pub(crate) fn systemd_user_unit(exe: &Path, argv: &[String]) -> String {
+    format!(
+        "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_start(exe, argv)
+    )
+}
+
+/// Quote one argument the way CommandLineToArgvW (and the MSVC runtime)
+/// splits it back: backslashes are literal except before a quote, where they
+/// must be doubled.
+#[allow(dead_code)] // Windows only
+fn windows_arg(s: &str) -> String {
+    if !s.is_empty() && !s.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '"')) {
+        return s.to_string();
+    }
+    let mut out = String::from("\"");
+    let mut backslashes = 0usize;
+    for c in s.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// The arguments part of a Windows command line (no program name).
+#[allow(dead_code)] // Windows only
+pub(crate) fn windows_args_line(argv: &[String]) -> String {
+    argv.iter().map(|a| windows_arg(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// A full Windows command line: quoted program, then the arguments.
+#[allow(dead_code)] // Windows only
+pub(crate) fn windows_command_line(exe: &Path, argv: &[String]) -> String {
+    let exe = format!("\"{}\"", exe.display());
+    if argv.is_empty() {
+        exe
+    } else {
+        format!("{exe} {}", windows_args_line(argv))
+    }
+}
+
+/// Single-quote one word for `sh`.
+#[allow(dead_code)] // macOS only (osascript elevation)
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The argv an elevated child runs: the daemon argv with the hidden
+/// `--install-system` added to `up`, so the child installs and exits.
+fn elevated_install_argv(argv: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = argv.to_vec();
+    let at = out.iter().position(|a| a == "up").map(|i| i + 1).unwrap_or(0);
+    if at == 0 {
+        out.insert(0, "up".into());
+        out.insert(1, "--install-system".into());
+    } else {
+        out.insert(at, "--install-system".into());
+    }
+    out
+}
+
+/// Run a command and turn anything but a zero exit into an error that names
+/// the command, so a caller can say exactly which step failed.
+#[allow(dead_code)] // Linux and macOS installers
+fn run_checked(program: &str, args: &[&str]) -> Result<()> {
+    let shown = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match std::process::Command::new(program).args(args).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => anyhow::bail!("`{shown}` failed ({st})"),
+        Err(e) => anyhow::bail!("could not run `{shown}`: {e}"),
+    }
+}
+
 // ------------------------------------------------- platform installers --
 
 #[cfg(target_os = "linux")]
-fn install_systemd_user(exe: &Path, shell_args: &str) -> Result<()> {
+fn install_systemd_user(exe: &Path, argv: &[String]) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
-    let unit = unit_dir.join("filament.service");
-    std::fs::write(&unit, format!(
-        "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
-        exe.display(), shell_args
-    ))?;
-    let ok = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()
-        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "tunlion"]).status())
-        .map(|s| s.success()).unwrap_or(false);
-    if !ok {
-        anyhow::bail!("systemctl --user enable --now tunlion failed; run it manually or check journalctl --user -u tunlion");
-    }
-    Ok(())
+    let unit = unit_dir.join(format!("{SYSTEMD_UNIT}.service"));
+    std::fs::write(&unit, systemd_user_unit(exe, argv))?;
+    // Each step's result is checked: `daemon-reload` failing (no user bus, as
+    // in a bare ssh session or a container) means `enable` cannot work either,
+    // and the user must hear which one broke, not "installed".
+    run_checked("systemctl", &["--user", "daemon-reload"])
+        .and_then(|_| run_checked("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT]))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "wrote {} but {e}. Finish by hand: systemctl --user daemon-reload && systemctl --user enable --now {SYSTEMD_UNIT}",
+                unit.display()
+            )
+        })
 }
 
 #[cfg(target_os = "windows")]
-fn install_run_key(exe: &Path, shell_args: &str) -> Result<()> {
+fn install_run_key(exe: &Path, argv: &[String]) -> Result<()> {
     // Per-user autostart via HKCU\Software\Microsoft\Windows\CurrentVersion\Run.
     // Runs as the current user at logon with no elevation. This is the default
     // background receiver on Windows.
-    let cmd = format!("\"{}\" up{}", exe.display(), shell_args);
+    let cmd = windows_command_line(exe, argv);
     let out = std::process::Command::new("reg")
         .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v", "Tunlion",
+            "/v", WINDOWS_AUTOSTART_NAME,
             "/t", "REG_SZ",
             "/d", &cmd,
             "/f",
@@ -833,20 +1053,22 @@ fn install_run_key(exe: &Path, shell_args: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn install_scheduled_task(exe: &Path, shell_args: &str) -> Result<()> {
+#[allow(dead_code)]
+fn install_scheduled_task(exe: &Path, argv: &[String]) -> Result<()> {
     let task_xml = format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><LogonTrigger/></Triggers>
   <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType></Principal></Principals>
-  <Actions><Exec><Command>{}</Command><Arguments>up{}</Arguments></Exec></Actions>
+  <Actions><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>
 </Task>"#,
-        exe.display(), shell_args
+        xml_escape(&exe.display().to_string()),
+        xml_escape(&windows_args_line(argv))
     );
     let tmp = std::env::temp_dir().join("filament-task.xml");
     std::fs::write(&tmp, &task_xml)?;
     let out = std::process::Command::new("schtasks")
-        .args(["/create", "/tn", "Tunlion", "/xml", &tmp.to_string_lossy(), "/f"])
+        .args(["/create", "/tn", WINDOWS_AUTOSTART_NAME, "/xml", &tmp.to_string_lossy(), "/f"])
         .output()?;
     let _ = std::fs::remove_file(&tmp);
     if !out.status.success() {
@@ -856,35 +1078,135 @@ fn install_scheduled_task(exe: &Path, shell_args: &str) -> Result<()> {
     Ok(())
 }
 
+/// Load a plist into a launchd domain, replacing any copy already loaded
+/// (bootstrap refuses a label that is already there, which is every re-run of
+/// `up --install`). The bootout is allowed to fail: nothing loaded is fine.
 #[cfg(target_os = "macos")]
-fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
+fn launchctl_bootstrap(domain: &str, plist: &Path) -> Result<()> {
+    let _ = std::process::Command::new("launchctl")
+        .arg("bootout")
+        .arg(format!("{domain}/{LAUNCHD_LABEL}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let path = plist.display().to_string();
+    run_checked("launchctl", &["bootstrap", domain, &path]).map_err(|e| {
+        anyhow::anyhow!("wrote {path} but {e}. Load it by hand: launchctl bootstrap {domain} {path}")
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn install_launch_agent(exe: &Path, argv: &[String]) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = PathBuf::from(&home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir)?;
-    let plist = dir.join("autumated.filament.plist");
-    std::fs::write(&plist, format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>autumated.tunlion</string>
-  <key>ProgramArguments</key>
-  <array><string>{}</string><string>up</string>{}</array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict>
-</plist>"#,
-        exe.display(), shell_args
-    ))?;
-    let _ = std::process::Command::new("launchctl").args(["bootstrap", "gui/501", &plist.to_string_lossy()]).status();
-    Ok(())
+    let plist = dir.join(format!("{LAUNCHD_LABEL}.plist"));
+    std::fs::write(&plist, launchd_plist(LAUNCHD_LABEL, exe, argv))?;
+    launchctl_bootstrap(&format!("gui/{}", unsafe { libc::getuid() }), &plist)
+}
+
+#[cfg(test)]
+mod service_argv_encoding {
+    use super::*;
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The plist carries every argument as its own `<string>`, escaped. The
+    /// defect this pins: `--shell` spliced as raw text inside `<array>`, which
+    /// launchd does not pass to the program at all.
+    #[test]
+    fn plist_has_one_string_element_per_argument() {
+        let a = argv(&["up", "--shell-only=a,b", "--dir=/Users/k/A&B <x>", "--i-know"]);
+        let p = launchd_plist("autumated.filament", Path::new("/opt/tun lion/tunlion"), &a);
+        let start = p.find("<array>").expect("array");
+        let end = p.find("</array>").expect("array end");
+        let body = &p[start + "<array>".len()..end];
+        let strings: Vec<&str> = body
+            .split("<string>")
+            .skip(1)
+            .map(|s| s.split("</string>").next().unwrap())
+            .collect();
+        assert_eq!(
+            strings,
+            vec![
+                "/opt/tun lion/tunlion",
+                "up",
+                "--shell-only=a,b",
+                "--dir=/Users/k/A&amp;B &lt;x&gt;",
+                "--i-know",
+            ]
+        );
+        // Nothing but whitespace between the elements: no raw argument text.
+        let stripped: String = body
+            .split("<string>")
+            .map(|s| s.split("</string>").nth(1).unwrap_or(""))
+            .collect::<String>();
+        assert!(stripped.trim().is_empty(), "raw text inside <array>: {stripped:?}");
+        assert!(p.contains("<key>Label</key><string>autumated.filament</string>"));
+    }
+
+    #[test]
+    fn xml_escape_covers_the_five_entities() {
+        assert_eq!(xml_escape(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    }
+
+    #[test]
+    fn systemd_exec_start_quotes_what_would_split_or_expand() {
+        let a = argv(&[
+            "up",
+            "--shell-only=a,b",
+            "--dir=/home/u/My Files",
+            "--shell-program=bash -l",
+            "--name-as=100%",
+            "--server=https://x.example/$HOME",
+            "--shell-user=say \"hi\"",
+        ]);
+        let line = systemd_exec_start(Path::new("/usr/local/bin/tunlion"), &a);
+        assert_eq!(
+            line,
+            "/usr/local/bin/tunlion up --shell-only=a,b \"--dir=/home/u/My Files\" \
+             \"--shell-program=bash -l\" --name-as=100%% \
+             --server=https://x.example/$$HOME \"--shell-user=say \\\"hi\\\"\""
+        );
+        let unit = systemd_user_unit(Path::new("/usr/local/bin/tunlion"), &argv(&["up", "--shell"]));
+        assert!(unit.contains("\nExecStart=/usr/local/bin/tunlion up --shell\n"), "{unit}");
+    }
+
+    #[test]
+    fn windows_command_line_round_trips_the_msvc_rules() {
+        assert_eq!(windows_arg("plain"), "plain");
+        assert_eq!(windows_arg(""), "\"\"");
+        assert_eq!(windows_arg("a b"), "\"a b\"");
+        assert_eq!(windows_arg("C:\\x y\\"), "\"C:\\x y\\\\\"");
+        assert_eq!(windows_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(
+            windows_command_line(Path::new("C:\\T\\tunlion.exe"), &argv(&["up", "--dir=C:\\My Files"])),
+            "\"C:\\T\\tunlion.exe\" up \"--dir=C:\\My Files\""
+        );
+    }
+
+    #[test]
+    fn elevated_child_runs_up_with_install_system() {
+        assert_eq!(
+            elevated_install_argv(&argv(&["up", "--shell", "--dir=/x"])),
+            argv(&["up", "--install-system", "--shell", "--dir=/x"])
+        );
+        assert_eq!(elevated_install_argv(&[]), argv(&["up", "--install-system"]));
+    }
+
+    #[test]
+    fn sh_quote_survives_single_quotes() {
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
 }
 
 #[cfg(target_os = "windows")]
 pub fn add_firewall_rule(exe: &Path) {
     let _ = std::process::Command::new("netsh")
         .args(["advfirewall", "firewall", "add", "rule",
-            "name=Tunlion QUIC", "dir=in", "action=allow",
+            WINDOWS_FIREWALL_RULE, "dir=in", "action=allow",
             "protocol=udp",
             "program=", &exe.display().to_string(),
             "enable=yes"])
@@ -1004,6 +1326,28 @@ pub fn process_exe_path(pid: u32) -> Option<PathBuf> {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn process_exe_path(_pid: u32) -> Option<PathBuf> {
     None
+}
+
+// ------------------------------------------------------------ hostname --
+
+/// The machine's hostname as the OS reports it, or `None` when it cannot be
+/// read. Unix asks the kernel (`gethostname`) rather than reading
+/// /etc/hostname, which macOS does not have; Windows reads COMPUTERNAME.
+#[cfg(unix)]
+pub fn os_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(windows)]
+pub fn os_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|s| !s.trim().is_empty())
 }
 
 // ------------------------------------------------------- InstallSource --

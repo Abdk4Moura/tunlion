@@ -36,6 +36,7 @@ const PREFIX_LEN: u8 = 48;
 
 /// Domain-separation tags so a hash/signature here can never be mistaken for one
 /// from another tunlion protocol (or a future overlay version).
+// PROTOCOL LITERAL: frozen, do not rename (overlay address derivation).
 const ADDR_DOMAIN: &[u8] = b"filament/overlay-addr/v1\0";
 const BIND_DOMAIN: &[u8] = b"filament/overlay-bind/v1\0";
 
@@ -79,6 +80,7 @@ const V4_PREFIX_LEN: u8 = 15;
 /// Low 17 bits = the host part of a `/15`.
 const V4_HOST_MASK: u32 = 0x0001_FFFF;
 /// Domain tag for the v4 host derivation, distinct from the v6 addr tag.
+// PROTOCOL LITERAL: frozen, do not rename.
 const ADDR_V4_DOMAIN: &[u8] = b"filament/overlay-v4-addr/v1\0";
 
 /// The v4 overlay prefix as a CIDR string for route installation.
@@ -253,6 +255,7 @@ fn bind_message(addr: &Ipv6Addr, seq: u64, cb: &[u8]) -> Vec<u8> {
 /// an older peer computing the digest without a routes field would fail to
 /// verify a newer peer's announce and interop would break on upgrade. A second
 /// signature over a second domain leaves the first untouched.
+// PROTOCOL LITERAL: frozen, do not rename.
 const ROUTES_DOMAIN: &[u8] = b"filament-l3-routes-v1";
 
 /// Bytes signed to authenticate an advertised route set.
@@ -731,6 +734,34 @@ mod tests {
         for len in [0usize, 1, 2, 3, 31, 32, 64, 100] {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             assert_eq!(unb64(&b64(&data)).unwrap(), data, "len {len}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn overlay_domains_are_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("ADDR_DOMAIN", super::ADDR_DOMAIN,
+             "80a30f44af893716e5de95f43203de443d8135aac7dea0aaf65576e806fc60e2"),
+            ("BIND_DOMAIN", super::BIND_DOMAIN,
+             "3c634f3ec1526142423bc93de8d42e68cf465c8547f5934a6dd043aac2b0d825"),
+            ("ADDR_V4_DOMAIN", super::ADDR_V4_DOMAIN,
+             "4456c390f77130c4f8994ab3e5c0f3f7d871a8379001906b87fdf7dbbaf9a5aa"),
+            ("ROUTES_DOMAIN", super::ROUTES_DOMAIN,
+             "2db1d93638a4a10000e02d1fdb8d9d6f5aee7f26633769aacbf0a60315450850"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
         }
     }
 }

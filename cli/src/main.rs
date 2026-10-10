@@ -727,7 +727,11 @@ pub(crate) fn default_display_name() -> String {
 
 
 pub(crate) fn human(bytes: u64) -> String {
-    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Byte counts and rates for all transfer output, in binary units: the
+    // divisor is 1024, so the labels are the IEC ones. They used to say
+    // KB/MB/GB over the same divisor, which reads as decimal and understated
+    // every size and rate (by about 7% at the GB scale).
     let mut v = bytes as f64;
     let mut i = 0;
     while v >= 1024.0 && i < U.len() - 1 {
@@ -957,6 +961,7 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 
 pub(crate) fn channel_of(secret: &str) -> String {
     let mut h = Sha256::new();
+    // PROTOCOL LITERAL: frozen, do not rename (rendezvous channel derivation).
     h.update(b"filament-pair:");
     h.update(secret.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -973,6 +978,7 @@ pub(crate) fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str
     let (f_lo, f_hi) = if fp1 < fp2 { (fp1, fp2) } else { (fp2, fp1) };
     hmac_sha256(
         secret.as_bytes(),
+        // PROTOCOL LITERAL: frozen, do not rename (pair proof domain).
         format!("filament-proof2:{prover_uid}|{lo}|{hi}|{f_lo}|{f_hi}").as_bytes(),
     )
 }
@@ -984,10 +990,44 @@ fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
     flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(default_drop_dir)
 }
 
-/// The built-in drop directory when nothing is configured (~/Tunlion). Shared
-/// with the settings readout so it shows the true default.
+/// The built-in drop directory when nothing is configured. Shared with the
+/// settings readout so it shows the true default.
 pub(crate) fn default_drop_dir() -> PathBuf {
-    platform::Paths::home_dir().join("Tunlion")
+    drop_dir_under(&platform::Paths::home_dir())
+}
+
+/// `~/Filament` when it already exists, else `~/Tunlion`.
+///
+/// PROTOCOL LITERAL: frozen, do not rename. `~/Filament` is where every
+/// released build saved received files. An existing user who upgrades must
+/// keep receiving into the folder they already know, not into a new empty
+/// one; only a machine that never had it gets the new name.
+fn drop_dir_under(home: &Path) -> PathBuf {
+    let legacy = home.join("Filament");
+    if legacy.is_dir() {
+        legacy
+    } else {
+        home.join("Tunlion")
+    }
+}
+
+#[cfg(test)]
+mod drop_dir_tests {
+    use super::drop_dir_under;
+
+    #[test]
+    fn existing_filament_folder_wins_else_tunlion() {
+        let home = std::env::temp_dir().join(format!("drop-dir-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Tunlion"));
+        std::fs::create_dir(home.join("Filament")).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Filament"));
+        // Both present: the one released builds used still wins.
+        std::fs::create_dir(home.join("Tunlion")).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Filament"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 
