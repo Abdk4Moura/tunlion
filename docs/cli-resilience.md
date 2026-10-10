@@ -405,6 +405,11 @@ a claimer waits 3 s (browsers never initiate), then takes over. Headless
 `up --install` (no tty) is unchanged — stdin-free. Gate 17 asserts the
 sharp invariant: after the ceremony, both stores' channel ids are EQUAL
 (one mutual secret, not two halves of nothing).
+**Superseded for the `up` console:** the in-session ceremony claimed a v1
+code and handed the secret over a DataChannel whose fingerprints the
+signaling server chose, so a malicious server could keep it. The console now
+points at `tunlion pair` (SPAKE2), and the running daemon picks the new device
+up from the store within ~2 s.
 
 ### C30. The lost-emit disease class — **PHASE 1 VERIFIED (gate 19)**
 Design: `design-c30-convergent-session.md`. Five field incidents shared one

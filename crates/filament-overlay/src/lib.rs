@@ -39,6 +39,38 @@ const PREFIX_LEN: u8 = 48;
 // PROTOCOL LITERAL: frozen, do not rename (overlay address derivation).
 const ADDR_DOMAIN: &[u8] = b"filament/overlay-addr/v1\0";
 const BIND_DOMAIN: &[u8] = b"filament/overlay-bind/v1\0";
+const DTLS_BIND_LABEL: &[u8] = b"filament/dtls-link-binding/v1\0";
+
+/// The channel binding for a link with NO RFC-5705 exporter (a WebRTC
+/// DataChannel): `SHA-256(label || len||fp_lo || len||fp_hi || nonce)`.
+///
+/// A bare nonce is not a binding. It is fresh, but nothing ties it to THIS
+/// DTLS session, so a party sitting in two WebRTC sessions (A-M and M-B) can
+/// hand A's challenge nonce to B, relay B's signed `fleet-hello` back, and be
+/// admitted by A as B. The two DTLS certificate fingerprints are what identify
+/// the session end to end, exactly as `pair-proof` binds them: a relay
+/// terminates DTLS on each leg, so each leg has a DIFFERENT fingerprint pair
+/// and a binding computed on one leg never verifies on the other. The nonce is
+/// kept for freshness, because the fingerprint pair alone is stable across
+/// reconnects between the same two peers (docs/design-l3-over-relay.md).
+///
+/// The fingerprints are sorted, so both ends (which see them as local/remote
+/// in opposite order) compute the same bytes. They are trimmed and uppercased
+/// the same way `pair-proof` normalizes them, and length-prefixed so no two
+/// pairs can concatenate to the same bytes.
+pub fn dtls_channel_binding(fp_a: &str, fp_b: &str, nonce: &[u8]) -> Vec<u8> {
+    let a = fp_a.trim().to_ascii_uppercase();
+    let b = fp_b.trim().to_ascii_uppercase();
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(DTLS_BIND_LABEL);
+    h.update((lo.len() as u32).to_be_bytes());
+    h.update(lo.as_bytes());
+    h.update((hi.len() as u32).to_be_bytes());
+    h.update(hi.as_bytes());
+    h.update(nonce);
+    h.finalize().to_vec()
+}
 
 /// The overlay prefix as a `<addr>/48` string for route installation.
 pub fn prefix_cidr() -> String {
@@ -735,6 +767,50 @@ mod tests {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             assert_eq!(unb64(&b64(&data)).unwrap(), data, "len {len}");
         }
+    }
+
+    const FP_A: &str = "SHA-256 AA:BB:CC";
+    const FP_M1: &str = "SHA-256 11:22:33";
+    const FP_M2: &str = "SHA-256 44:55:66";
+    const FP_B: &str = "SHA-256 DD:EE:FF";
+
+    #[test]
+    fn dtls_binding_is_symmetric_and_normalized() {
+        let n = [7u8; 32];
+        // Each end sees (local, remote) in the opposite order.
+        assert_eq!(dtls_channel_binding(FP_A, FP_M1, &n), dtls_channel_binding(FP_M1, FP_A, &n));
+        assert_eq!(
+            dtls_channel_binding(" sha-256 aa:bb:cc ", FP_M1, &n),
+            dtls_channel_binding(FP_A, FP_M1, &n),
+            "normalized like pair-proof (trimmed, uppercased)"
+        );
+    }
+
+    /// The relay attack: M sits in two WebRTC sessions, A-M and M-B, hands A's
+    /// nonce to B and relays B's signed hello back to A. B signed over ITS
+    /// session's fingerprints; A verifies over its own, so it must not verify.
+    #[test]
+    fn binding_for_one_fingerprint_pair_does_not_verify_under_another() {
+        let nonce_from_a = [9u8; 32];
+        let b_signs_over = dtls_channel_binding(FP_M2, FP_B, &nonce_from_a);
+        let a_verifies_over = dtls_channel_binding(FP_A, FP_M1, &nonce_from_a);
+        assert_ne!(b_signs_over, a_verifies_over);
+
+        let b = ident();
+        let ann = b.announce(1, &b_signs_over);
+        assert!(ann.verify(&b_signs_over).is_ok(), "honest same-session verify");
+        assert!(ann.verify(&a_verifies_over).is_err(), "relayed across sessions must fail");
+        // And the nonce still matters: the same session on a NEW link (same
+        // fingerprints after a reconnect) gets a fresh binding.
+        assert_ne!(
+            dtls_channel_binding(FP_A, FP_M1, &[1u8; 32]),
+            dtls_channel_binding(FP_A, FP_M1, &[2u8; 32])
+        );
+        // Length-prefixed: shifting bytes between the two fingerprints changes it.
+        assert_ne!(
+            dtls_channel_binding("AB", "C", &[0u8; 16]),
+            dtls_channel_binding("A", "BC", &[0u8; 16])
+        );
     }
 }
 

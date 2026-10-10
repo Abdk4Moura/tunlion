@@ -1166,17 +1166,34 @@ fn forget_and_store_preserve_other_devices_caps() {
     assert!(device_caps_at(&p, "dupe").is_none(), "dupe should be gone");
 
     // Storing a NEW pairing must also preserve 'shellbox''s caps.
-    devices_store("newpeer", &sec).unwrap();
+    // (Its own secret: a secret another record already holds is now refused,
+    // since two records answering one pair-proof make identity order-dependent.)
+    devices_store("newpeer", &"d".repeat(64)).unwrap();
+    assert!(
+        devices_store("dupe-again", &sec).is_err(),
+        "a secret shellbox already holds must not be stored a second time"
+    );
     assert!(
         device_allows_at(&p, "shellbox", "shell"),
         "store wiped a survivor's shell cap"
     );
-    // And re-storing an existing name keeps its caps (only the secret rotates).
-    devices_store("shellbox", &"c".repeat(64)).unwrap();
+    // A network-supplied secret under an existing name must NOT re-key that
+    // record (it used to rotate the secret in place and keep the caps, which
+    // handed the record's grants to whoever sent the secret). It becomes a
+    // NEW, capless record, and the original keeps both its caps and secret.
+    let stored = devices_store("shellbox", &"c".repeat(64)).unwrap();
+    assert_eq!(stored, "shellbox-2", "a clashing name is suffixed, never overwritten");
     assert!(
         device_allows_at(&p, "shellbox", "shell"),
         "re-store dropped the device's own caps"
     );
+    assert!(
+        !device_allows_at(&p, "shellbox-2", "shell"),
+        "the new record must not inherit the existing device's grants"
+    );
+    let arr: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let orig = arr.iter().find(|d| d["name"] == "shellbox").unwrap();
+    assert_eq!(orig["secret"].as_str(), Some(sec.as_str()), "original secret untouched");
 
     unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
@@ -4223,4 +4240,117 @@ fn the_default_device_name_comes_from_the_os_not_a_constant() {
     let name = crate::default_display_name();
     assert_ne!(name, "cli");
     assert!(!name.contains('@'), "the default must not carry the user: {name}");
+}
+
+// --- C1: the writer refuses to re-key an existing record ----------------------
+//
+// pair-intro / pair-keep used to call devices_store(name, secret), which updated
+// an existing record's secret IN PLACE and kept its caps, deviceCert and userKey:
+// any peer that could send a secret under an existing name inherited that
+// device's grants. The refusal lives in the writer, in the same lock cycle.
+
+fn c1_seed(dir: &std::path::Path) -> String {
+    let before = serde_json::to_string(&serde_json::json!([{
+        "name": "laptop",
+        "secret": "a".repeat(64),
+        "v": 2,
+        "caps": ["transfer", "shell", "mount"],
+    }]))
+    .unwrap();
+    std::fs::write(dir.join("devices.json"), &before).unwrap();
+    before
+}
+
+#[test]
+fn c1_secret_only_write_to_existing_name_is_refused() {
+    let _guard = lock_test_config();
+    let dir = td("c1-refuse");
+    let before = c1_seed(&dir);
+    for alias in ["laptop", "laptop ", "laptop\u{7}"] {
+        let res = crate::devices_store::devices_upsert_atomic(
+            alias,
+            Some(&"e".repeat(64)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(res.is_err(), "secret-only re-key via '{alias}' must be refused");
+        let after = std::fs::read_to_string(dir.join("devices.json")).unwrap();
+        assert_eq!(after, before, "the existing record must be byte-identical");
+    }
+    // Writing back the SAME secret is not a re-key.
+    assert!(
+        crate::devices_store::devices_upsert_atomic(
+            "laptop",
+            Some(&"a".repeat(64)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn c1_new_name_is_accepted() {
+    let _guard = lock_test_config();
+    let dir = td("c1-new");
+    c1_seed(&dir);
+    let stored = crate::devices_store::devices_upsert_atomic(
+        "phone",
+        Some(&"f".repeat(64)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(stored, "phone");
+    assert!(!device_allows_at(&dir.join("devices.json"), "phone", "shell"));
+}
+
+#[test]
+fn c1_owner_repair_still_rekeys() {
+    let _guard = lock_test_config();
+    let dir = td("c1-owner");
+    c1_seed(&dir);
+    // The owner-run `tunlion pair` path (devices_store_v2 -> allow_reanchor).
+    devices_store_v2("laptop", &"9".repeat(64), &["transfer".to_string()]).unwrap();
+    let arr: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("devices.json")).unwrap()).unwrap();
+    assert_eq!(arr.len(), 1, "re-pair updates in place, no duplicate");
+    assert_eq!(arr[0]["secret"].as_str(), Some("9".repeat(64).as_str()));
+}
+
+#[test]
+fn c1_network_secret_lands_in_a_new_record() {
+    let mut arr: Vec<Value> = serde_json::from_str(&format!(
+        r#"[{{"name":"Laptop","secret":"{}","caps":["transfer","shell"]}}]"#,
+        "a".repeat(64)
+    ))
+    .unwrap();
+    let stored = crate::devices_store::insert_new_peer_record(
+        &mut arr,
+        "laptop",
+        &"b".repeat(64),
+        Some("hub"),
+    )
+    .unwrap();
+    assert_eq!(stored, "laptop-2", "case-insensitive clash is suffixed");
+    assert_eq!(arr[0]["secret"].as_str(), Some("a".repeat(64).as_str()));
+    assert_eq!(arr[1]["introducedBy"].as_str(), Some("hub"));
+    assert!(arr[1].get("caps").is_none(), "no grants carried over");
+    // A secret any record already holds is refused.
+    assert!(
+        crate::devices_store::insert_new_peer_record(&mut arr, "x", &"a".repeat(64), None)
+            .is_err()
+    );
 }

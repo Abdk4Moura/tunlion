@@ -1386,7 +1386,15 @@ pub(crate) async fn send_cmd(
                 Some("l3-nonce") | Some(fleet::HELLO)
                     if fleet_target && !fleet_sess.proved(&pid) =>
                 {
-                    let exporter = conn.transport_of(&pid).and_then(|t| t.channel_binding());
+                    let tr = conn.transport_of(&pid);
+                    let exporter = tr.as_ref().and_then(|t| t.channel_binding());
+                    // H1: with no exporter, the nonce is bound to this link's
+                    // DTLS fingerprints (same rule as the daemon's in/out_binding).
+                    let link_fps = crate::link_fingerprints(&conn, &pid).await;
+                    let bind = |n: &[u8]| {
+                        tr.as_ref()
+                            .and_then(|t| crate::nonce_binding(t, link_fps.as_ref(), n))
+                    };
                     let outcome = fleet_sess.on_control(
                         &pid,
                         &v,
@@ -1397,6 +1405,7 @@ pub(crate) async fn send_cmd(
                         link_nonce,
                         |cb| fleet::make_hello(cb, &display_name()),
                         |pubk| device_name_for_pub(pubk),
+                        bind,
                     );
                     match outcome {
                         fleet_session::Outcome::Ignored => {}

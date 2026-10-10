@@ -205,6 +205,147 @@ pub(crate) fn name_pinned_by_other(name: &str, device_pub_hex: &str) -> bool {
     })
 }
 
+/// The writer's ownership guard, pure so it is unit-testable without the
+/// process-global config path. Runs inside `with_devices_mut`, in the SAME lock
+/// cycle as the write it guards.
+///
+/// Records are keyed by identity; names are presentation. Two writes would
+/// silently hand an existing record's grants to whoever presents them:
+///
+/// - a CERT under an existing name whose pinned key differs (a fleet sibling
+///   naming itself after a ceilinged device; a record with NO pinned cert is
+///   not a free slot either), and
+/// - a SECRET under an existing name that differs from the stored one. The pair
+///   secret IS the identity of a certless record (pair-proof resolves a link to
+///   whichever record's secret matches), so replacing it in place keeps the
+///   record's `caps`, `deviceCert`, `userKey` and every name-keyed grant
+///   (`device_allows`, `ShellPolicy::Only`) and hands them to the new holder.
+///   That is what a `pair-intro` or `pair-keep` naming an existing device did.
+///
+/// Both are refused unless the caller holds `allow_reanchor`, the explicit
+/// owner decision (an owner-run `tunlion pair`, joining under an owner-signed
+/// invitation, re-enrolling the same key). Writing the SAME secret back is not
+/// a re-key and passes. A network-driven write that wants a record must create
+/// a NEW one: see `devices_store_new`.
+pub(crate) fn refuse_unowned_rewrite(
+    arr: &[Value],
+    name: &str,
+    secret: Option<&str>,
+    cert: Option<&identity::DeviceCert>,
+    allow_reanchor: bool,
+) -> Result<()> {
+    if allow_reanchor {
+        return Ok(());
+    }
+    let Some(existing) = arr.iter().find(|d| d["name"].as_str() == Some(name)) else {
+        return Ok(());
+    };
+    if let Some(c) = cert {
+        let incoming = hex::encode(c.device_pub);
+        let pinned_matches = existing["deviceCert"]["devicePub"]
+            .as_str()
+            .is_some_and(|pinned| pinned == incoming.as_str());
+        if !pinned_matches {
+            anyhow::bail!(
+                "refusing to re-anchor record '{name}': presented key {incoming} is not the pinned identity"
+            );
+        }
+    }
+    if let Some(s) = secret {
+        if existing["secret"].as_str() != Some(s) {
+            anyhow::bail!(
+                "refusing to re-key record '{name}': a new pair secret for an existing device needs an owner re-pair (`tunlion pair`)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A name no record holds, compared case-insensitively (the same rule as the
+/// new-device branch of `upsert_peer_record`): `name` itself when free,
+/// otherwise `name-2`, `name-3`, ...
+pub(crate) fn free_device_name(arr: &[Value], name: &str) -> String {
+    let taken = |n: &str| {
+        arr.iter().any(|d| {
+            d["name"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case(n))
+        })
+    };
+    if !taken(name) {
+        return name.to_string();
+    }
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{name}-{suffix}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// Pure core of `devices_store_new`: insert a NEW secret-only record and never
+/// touch an existing one. The name is suffixed past any record that already
+/// holds it, and a secret some record already holds is refused outright (two
+/// records answering the same pair-proof would make the link's identity depend
+/// on store order). `introduced_by` marks a vouched record with the device that
+/// vouched for it, so a vouched record cannot vouch in turn.
+pub(crate) fn insert_new_peer_record(
+    arr: &mut Vec<Value>,
+    name: &str,
+    secret: &str,
+    introduced_by: Option<&str>,
+) -> Result<String> {
+    if arr.iter().any(|d| d["secret"].as_str() == Some(secret)) {
+        anyhow::bail!("refusing to store a pair secret another device record already holds");
+    }
+    let free = free_device_name(arr, name);
+    let stored = upsert_peer_record(arr, &free, Some(secret), None, None, None, None, None);
+    if let Some(hub) = introduced_by {
+        if let Some(rec) = arr
+            .iter_mut()
+            .find(|d| d["name"].as_str() == Some(stored.as_str()))
+        {
+            rec["introducedBy"] = json!(hub);
+        }
+    }
+    Ok(stored)
+}
+
+/// Store a pair secret handed to us over the NETWORK (`pair-keep`,
+/// `pair-intro`) as a NEW record and return the name it landed under. Never
+/// re-keys an existing record, whatever name the peer asked for: a peer that
+/// could name its secret after an existing device would inherit that device's
+/// grants. Same lock cycle as every other store write.
+pub(crate) fn devices_store_new(
+    name: &str,
+    secret: &str,
+    introduced_by: Option<&str>,
+) -> Result<String> {
+    let clean = sanitize_device_name(name);
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).context("create config dir")?;
+    }
+    with_devices_mut(|arr| insert_new_peer_record(arr, &clean, secret, introduced_by))
+}
+
+/// Whether the record `name` was created by a `pair-intro` (it carries
+/// `introducedBy`). A vouched device may not vouch for others: introductions
+/// come from a device the owner paired directly, never transitively.
+pub(crate) fn device_was_introduced(name: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else {
+        return false;
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        return false;
+    };
+    arr.iter()
+        .find(|d| d["name"].as_str() == Some(name))
+        .is_some_and(|d| d.get("introducedBy").is_some_and(|v| !v.is_null()))
+}
+
 pub(crate) fn devices_upsert_atomic(
     name: &str,
     secret: Option<&str>,
@@ -224,27 +365,14 @@ pub(crate) fn devices_upsert_atomic(
     with_devices_mut(|arr| {
         // Identity pinning: records are keyed by identity, names are
         // presentation. A cert write under an existing name is refused
-        // unless the incoming key matches the record's pinned one, or the
-        // caller holds the owner-decision opt-out: a fleet sibling naming
-        // itself after a ceilinged device is a takeover, and a record with
-        // NO pinned cert yet is not a free slot either (secret-only and
-        // vouched records would re-key silently -- userKey, deviceCert and
-        // scope overwritten, caps cleared). Refused HERE, in the writer,
-        // in the SAME lock cycle as the write -- never delegated to callers
-        // and with no TOCTOU window between check and write.
-        if let Some(c) = cert {
-            if let Some(existing) = arr.iter().find(|d| d["name"].as_str() == Some(name)) {
-                let incoming = hex::encode(c.device_pub);
-                let pinned_matches = existing["deviceCert"]["devicePub"]
-                    .as_str()
-                    .is_some_and(|pinned| pinned == incoming.as_str());
-                if !pinned_matches && !allow_reanchor {
-                    anyhow::bail!(
-                        "refusing to re-anchor record '{name}': presented key {incoming} is not the pinned identity"
-                    );
-                }
-            }
-        }
+        // unless the incoming key matches the record's pinned one, and a
+        // secret write under an existing name is refused unless it is the
+        // secret already stored, in both cases unless the caller holds the
+        // owner-decision opt-out (see `refuse_unowned_rewrite`). Refused
+        // HERE, in the writer, in the SAME lock cycle as the write -- never
+        // delegated to callers and with no TOCTOU window between check and
+        // write.
+        refuse_unowned_rewrite(arr, name, secret, cert, allow_reanchor)?;
         let final_name = upsert_peer_record(
             arr,
             name,

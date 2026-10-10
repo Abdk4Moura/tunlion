@@ -115,6 +115,8 @@ mod device_perms;
 pub(crate) use device_view::{devices_store, devices_store_v2, device_cert_for, device_cert_valid_for, device_record_exists, device_name_for_pub, device_cert_revoked, devices_find_by_device_pub, devices_sweep_lapsed, devices_touch, devices_info, device_countdown, device_entries};
 #[cfg(test)]
 pub(crate) use device_view::devices_touch_at;
+/// The pure `mount-open` decision inputs (capability + share-root confinement).
+mod mount_gate;
 /// Mount planning/implementation and reset.
 mod mount_cmd;
 pub(crate) use mount_cmd::{reset_cmd, resolve_mount_plan};
@@ -836,22 +838,61 @@ fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
 /// the nonce the PEER chose: they will verify against what they sent. `None`
 /// means the challenge has not completed yet and the caller must simply wait,
 /// which is why every send site is inside an `if let`.
+///
+/// `fps` are this link's DTLS fingerprints (`link_fingerprints`); on a
+/// DataChannel the nonce is folded together with them (`nonce_binding`).
 fn out_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     theirs: &HashMap<String, Vec<u8>>,
+    fps: Option<&(String, String)>,
 ) -> Option<Vec<u8>> {
-    t.channel_binding().or_else(|| theirs.get(pid).cloned())
+    t.channel_binding()
+        .or_else(|| theirs.get(pid).and_then(|n| nonce_binding(t, fps, n)))
 }
 
 /// The binding to VERIFY an incoming `l3-announce` / `fleet-hello` against: our
-/// own exporter value, or the nonce WE chose and sent to that peer.
+/// own exporter value, or the nonce WE chose and sent to that peer (bound to
+/// the DTLS fingerprints on a DataChannel).
 fn in_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     ours: &HashMap<String, Vec<u8>>,
+    fps: Option<&(String, String)>,
 ) -> Option<Vec<u8>> {
-    t.channel_binding().or_else(|| ours.get(pid).cloned())
+    t.channel_binding()
+        .or_else(|| ours.get(pid).and_then(|n| nonce_binding(t, fps, n)))
+}
+
+/// Turn a link-challenge nonce into the channel binding for a transport with
+/// no RFC-5705 exporter.
+///
+/// A WebRTC DataChannel: `dtls_channel_binding(fps, nonce)`. A bare nonce there
+/// let a party in two WebRTC sessions relay a sibling's challenge and response
+/// and be admitted as that sibling; the fingerprint pair is what differs
+/// between the two legs (pair-proof binds them for the same reason). `None`
+/// while the fingerprints are unknown: the caller waits, it never falls back
+/// to the bare nonce.
+///
+/// Any other exporter-less transport (the same-host `local-tcp` link) has no
+/// DTLS session to bind to and keeps the bare nonce, as before.
+fn nonce_binding(
+    t: &Arc<dyn Transport>,
+    fps: Option<&(String, String)>,
+    nonce: &[u8],
+) -> Option<Vec<u8>> {
+    if t.as_any().is::<net::DataChannelTransport>() {
+        let (a, b) = fps?;
+        Some(overlay::dtls_channel_binding(a, b, nonce))
+    } else {
+        Some(nonce.to_vec())
+    }
+}
+
+/// This link's DTLS fingerprints (ours, theirs), when it has a WebRTC peer.
+async fn link_fingerprints(conn: &conn::Conn, pid: &str) -> Option<(String, String)> {
+    let peer = conn.link(pid)?.peer.clone()?;
+    peer.fingerprints().await
 }
 
 
