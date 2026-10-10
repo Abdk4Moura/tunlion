@@ -427,9 +427,10 @@ pub(crate) async fn up_cmd(
     // has gone missing (`up --dir` may differ from the configured one).
     // Best-effort: a status that cannot read it checks the configured inbox.
     let inbox_abs = std::path::absolute(&dir).unwrap_or_else(|_| dir.clone());
-    let _ = std::fs::write(
+    // Owner-only and atomic like the pidfile beside it, whatever the umask.
+    let _ = crate::platform::SecretFile::write_str(
         crate::recv_files::daemon_inbox_marker(),
-        format!("{}\n", inbox_abs.display()),
+        &format!("{}\n", inbox_abs.display()),
     );
     let granted_names = shell_grant_names();
     match &shell_policy {
