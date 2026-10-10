@@ -2462,7 +2462,15 @@ pub(crate) async fn recv_cmd(
             let live: Vec<String> = conn
                 .links
                 .iter()
-                .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+                // Present, not merely open: a relay link to a stopped or wiped
+                // peer stays `is_alive()` while our own keepalive writes keep
+                // succeeding, and touching it here kept that device "last seen
+                // just now" forever. See daemon_ctl::peer_present.
+                .filter(|(_, l)| {
+                    l.transport.as_ref().is_some_and(|t| {
+                        crate::daemon_ctl::peer_present(t.is_alive(), l.direct, t.heard_ms(), t.idle_ms())
+                    })
+                })
                 .map(|(_, l)| l.shown().to_string())
                 .collect();
             for who in live {

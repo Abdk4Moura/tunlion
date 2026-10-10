@@ -3913,3 +3913,27 @@ fn tour_screen_never_mints_an_identity() {
         "tour_cmd no longer reads the identity at all, so this test has drifted from the source"
     );
 }
+
+// ------------------------------------------------------- peer presence (F4) --
+
+/// Blind test F4: `devices` showed a SIGSTOPped, then wiped, peer as "online
+/// (last seen just now)". A relay link's `idle_ms` is stamped by our own
+/// keepalive writes, which keep succeeding with nobody listening, so it never
+/// grew. Presence is judged on what the PEER last sent.
+#[test]
+fn a_relay_peer_that_went_silent_is_not_present() {
+    use crate::daemon_ctl::peer_present;
+    // Relay, the peer's keepalive heard 2 s ago: present.
+    assert!(peer_present(true, false, Some(2_000), 0));
+    // The defect: our writes keep idle at 0, but the peer has been silent 30 s.
+    assert!(!peer_present(true, false, Some(30_000), 0));
+    // A dead transport is never present, whatever the stamps say.
+    assert!(!peer_present(false, false, Some(0), 0));
+    // Direct QUIC tracks no heard time and is judged by its own liveness,
+    // which its 21 s idle timeout flips.
+    assert!(peer_present(true, true, None, u64::MAX));
+    assert!(!peer_present(false, true, None, 0));
+    // A transport that tracks neither keeps the old relay idle rule.
+    assert!(peer_present(true, false, None, 1_000));
+    assert!(!peer_present(true, false, None, 9_000));
+}
