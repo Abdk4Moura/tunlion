@@ -139,6 +139,10 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("overlay.announce-seq", "overlay announce sequence"),
     ("device.id", "install id"),
     ("devices.json", "paired-device store (device certs)"),
+    (
+        crate::fleet_support::KEY_REVOCATIONS_FILE,
+        "revoked device keys (forgotten certificate holders)",
+    ),
     ("caps.json", "capability store"),
     ("requests.json", "pending consent requests"),
     ("expose.json", "exposed-service records"),
@@ -197,6 +201,37 @@ pub(crate) fn reset_state_in(
     remove: &dyn Fn(&std::path::Path) -> std::io::Result<bool>,
 ) -> ResetOutcome {
     let mut out = ResetOutcome::default();
+    // Files named per peer, which a fixed list cannot spell: the provisional
+    // identity records a code-based transfer writes (`provisional_peer-<id>.json`,
+    // each holding a peer's device key, certificate and user key). One per
+    // transfer piled up, and `reset` called the machine a clean slate while
+    // every one of them survived. Swept before the fixed list, by prefix.
+    let mut per_peer: Vec<std::path::PathBuf> = std::fs::read_dir(cfg)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_provisional_identity_file)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    per_peer.sort();
+    let mut provisional = 0usize;
+    for path in &per_peer {
+        match remove(path) {
+            Ok(true) => provisional += 1,
+            Ok(false) => {}
+            Err(e) => out.failed.push(format!("provisional peer identity  ({}): {e}", path.display())),
+        }
+    }
+    if provisional > 0 {
+        out.wiped.push(format!(
+            "provisional peer identities: {provisional} file(s)  ({}/provisional_*.json)",
+            cfg.display()
+        ));
+    }
     for (name, label) in RESET_STATE {
         let path = cfg.join(name);
         match remove(&path) {
@@ -206,6 +241,11 @@ pub(crate) fn reset_state_in(
         }
     }
     out
+}
+
+/// A provisional peer identity record: `provisional_<name>.json`. Pure.
+pub(crate) fn is_provisional_identity_file(name: &str) -> bool {
+    name.starts_with("provisional_") && name.ends_with(".json")
 }
 
 pub(crate) fn resolve_mount_plan(
@@ -493,9 +533,34 @@ mod reset_tests {
             "devices.json",
             "caps.json",
             "ssh",
+            "revoked-keys.json",
         ] {
             assert!(names.contains(&must), "reset does not remove {must}");
         }
+    }
+
+    // Per-peer provisional identity records (peer device key, certificate and
+    // user key, one per code-based transfer) are swept by prefix: a reset that
+    // left them was not the clean slate it said it was.
+    #[test]
+    fn reset_removes_every_provisional_peer_identity() {
+        let dir = temp_cfg("prov");
+        for id in ["peer-hNZONFIoto2k9bQ9ABGV", "peer-abc", "bravo"] {
+            std::fs::write(dir.join(format!("provisional_{id}.json")), b"{}").unwrap();
+        }
+        std::fs::write(dir.join("provisional-notes.txt"), b"keep").unwrap();
+        let out = reset_state_in(&dir, &crate::reset_remove);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert!(out.wiped.iter().any(|w| w.contains("3 file(s)")), "{:?}", out.wiped);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["provisional-notes.txt".to_string()], "{left:?}");
+        assert!(super::is_provisional_identity_file("provisional_peer-x.json"));
+        assert!(!super::is_provisional_identity_file("provisional_peer-x.json.tmp"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A real directory: everything on the list goes, nothing else does.

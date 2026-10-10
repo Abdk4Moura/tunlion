@@ -3992,11 +3992,12 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
 }
 // `devices forget` on a device holding a live fleet certificate used to print
 // "it can no longer find or auto-connect to this machine" while fleet-hello
-// re-admitted it (no record means "not revoked"). The forget must refuse there,
-// and point at the remedy that does remove the access.
+// re-admitted it (no record means "not revoked"). It then REFUSED, which made
+// the name unusable for the certificate's life. Now the key is revoked apart
+// from the record, so forget both cuts the device off and frees the name.
 #[test]
-fn forget_refuses_a_live_fleet_certificate_and_says_why() {
-    use crate::fleet_support::{ForgetVerdict, forget_refusal, forget_verdict};
+fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
+    use crate::fleet_support::{ForgetVerdict, forget_report, forget_verdict};
     let cert = identity::DeviceCert::from_json(&serde_json::json!({
         "devicePub": hex::encode([0x11u8; 32]),
         "userPub": hex::encode([0x22u8; 32]),
@@ -4008,17 +4009,16 @@ fn forget_refuses_a_live_fleet_certificate_and_says_why() {
     let owner = Some([0x22u8; 32]);
 
     let live = forget_verdict(Some(&cert), false, owner, 100);
-    assert_eq!(live, ForgetVerdict::RefuseCertified { days_left: 3 });
-    let msg = forget_refusal("laptop", &live).expect("refused");
-    assert!(msg.contains("tunlion revoke laptop --certificate"), "{msg}");
-    assert!(!msg.contains("can no longer find"), "{msg}");
+    assert_eq!(live, ForgetVerdict::RevokeThenRemove { days_left: 3 });
+    let msg = forget_report("laptop", &live);
+    assert!(msg.contains("revoked its fleet certificate") && msg.contains("3 more day(s)"), "{msg}");
+    assert!(!msg.contains("can no longer find"), "a live certificate must not be reported as plain removal: {msg}");
 
-    // Revoked: the record is the revocation, so it is kept too.
     let revoked = forget_verdict(Some(&cert), true, owner, 100);
-    assert_eq!(revoked, ForgetVerdict::RefuseRevoked { days_left: 3 });
-    assert!(forget_refusal("laptop", &revoked).unwrap().contains("revocation in force"));
+    assert_eq!(revoked, ForgetVerdict::KeepRevocationThenRemove { days_left: 3 });
+    assert!(forget_report("laptop", &revoked).contains("revocation stays in force"));
 
-    // Forgetting IS the remedy when no live certificate from us exists.
+    // Plain removal when no live certificate from us exists.
     assert_eq!(forget_verdict(None, false, owner, 100), ForgetVerdict::Remove);
     assert_eq!(forget_verdict(Some(&cert), false, Some([0x33; 32]), 100), ForgetVerdict::Remove);
     assert_eq!(forget_verdict(Some(&cert), false, None, 100), ForgetVerdict::Remove);
@@ -4026,17 +4026,90 @@ fn forget_refuses_a_live_fleet_certificate_and_says_why() {
         forget_verdict(Some(&cert), false, owner, 100 + 3 * 86_400),
         ForgetVerdict::Remove
     );
-    assert!(forget_refusal("laptop", &ForgetVerdict::Remove).is_none());
-
-    // Every suggested command parses.
-    use clap::Parser;
-    for argv in [
-        vec!["tunlion", "revoke", "laptop", "--certificate"],
-        vec!["tunlion", "devices", "restore", "laptop"],
-    ] {
-        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
-    }
 }
+
+/// A key revocation is in force until its certificate expires, matches by key
+/// and never by name, and an unreadable key list fails closed.
+#[test]
+fn key_revocations_match_by_key_until_the_certificate_expires() {
+    use crate::fleet_support::{key_revocation_in_force, load_key_revocations_at};
+    let k = [0x11u8; 32];
+    let entries = vec![serde_json::json!({
+        "devicePub": hex::encode(k), "certExpires": 500, "name": "laptop"
+    })];
+    assert!(key_revocation_in_force(&entries, &k, 100));
+    assert!(!key_revocation_in_force(&entries, &k, 500), "ends when the certificate does");
+    assert!(!key_revocation_in_force(&entries, &[0x12u8; 32], 100), "another key is not revoked");
+    let dir = std::env::temp_dir().join(format!("fil-keyrev-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("revoked-keys.json");
+    assert_eq!(load_key_revocations_at(&p), Ok(Vec::new()), "absent is empty, not revoked");
+    std::fs::write(&p, b"{not json").unwrap();
+    assert!(load_key_revocations_at(&p).is_err(), "corrupt fails closed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The re-link chain a reset device's owner is told to run, executed as
+/// printed against a store: a live certified record and its re-joined
+/// successor. Every step parses, every step succeeds, the name ends up on the
+/// new key, and the old key stays refused.
+#[test]
+fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
+    use clap::Parser;
+    let _guard = lock_test_config();
+    let dir = std::env::temp_dir().join(format!(
+        "fil-relink-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+    let now = identity::now_secs();
+    let old = identity::DeviceCert::certify(&uk, [0x51u8; 32], now, 30 * 86_400).unwrap();
+    let new = identity::DeviceCert::certify(&uk, [0x52u8; 32], now, 30 * 86_400).unwrap();
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&serde_json::json!([
+            { "name": "p9-b",   "secret": "a".repeat(64), "deviceCert": old.to_json() },
+            { "name": "p9-b-2", "secret": "b".repeat(64), "deviceCert": new.to_json() },
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!device_cert_revoked(&old.device_pub));
+
+    // The chain, exactly as the hints print it.
+    let chain = ["tunlion devices forget p9-b", "tunlion devices rename p9-b-2 p9-b"];
+    for step in chain {
+        let argv: Vec<&str> = step.split_whitespace().collect();
+        let cli = crate::Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
+        let result = match cli.cmd {
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
+                crate::fleet_support::forget_device(&name, now).map(|_| ())
+            }
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Rename { old, new }), .. }) => {
+                crate::fleet_support::rename_device(&old, &new)
+            }
+            _ => panic!("`{step}` is not a devices forget/rename"),
+        };
+        result.unwrap_or_else(|e| panic!("`{step}` failed: {e}"));
+    }
+
+    let named = crate::device_view::device_cert_for("p9-b").expect("p9-b exists again");
+    assert_eq!(named.device_pub, new.device_pub, "the name now belongs to the re-joined key");
+    assert!(crate::device_view::device_cert_for("p9-b-2").is_none());
+    assert!(device_cert_revoked(&old.device_pub), "the forgotten live key stays refused");
+    assert!(!device_cert_revoked(&new.device_pub), "the re-joined key is not");
+
+    // A revoked record is forgettable too, and keeps its revocation.
+    crate::set_device_cert_revoked("p9-b", true).unwrap();
+    crate::fleet_support::forget_device("p9-b", now).expect("a revoked record can be forgotten");
+    assert!(device_cert_revoked(&new.device_pub), "its revocation outlives the record");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // `down` printed "stopped" and deleted the pidfile even when `kill` failed (a
 // daemon started with sudo), hiding a running daemon from status and reset.
 // The kill result now decides: failure is reported and the pidfile kept.

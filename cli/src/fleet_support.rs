@@ -56,24 +56,36 @@ pub(crate) fn fleet_certificate_warning_for(
     ))
 }
 
-/// What `devices forget` can truthfully do with a record.
+/// What `devices forget` must do with a record so that what it prints is true.
 ///
 /// Forgetting deletes the pair secret, which ends a PAIRED device's access. It
 /// does not end a CERTIFIED one's: fleet-hello admits any valid certificate
-/// chained to our owner key unless a record marks it revoked, and the absence
-/// of a record means "not revoked" (see the marker notes below). So for a
-/// device holding a live fleet certificate, forget would print "it can no
-/// longer find or auto-connect to this machine" while fleet auto-mesh let it
-/// straight back in. Such a forget is refused instead, with the remedy that
-/// actually removes the access.
+/// chained to our owner key unless something marks that key revoked. The record
+/// used to be the only such mark, so forgetting a live certificate holder
+/// printed "it can no longer find or auto-connect to this machine" while fleet
+/// auto-mesh let it straight back in. That was first fixed by REFUSING the
+/// forget, which made the name unusable for the certificate's whole life: a
+/// device that was reset and re-joined sat beside its stale record as
+/// `<name>-2`, every printed re-link chain began with a forget that refused,
+/// and `rename` then said the name was taken.
+///
+/// The revocation now lives apart from the name, in `revoked-keys.json`, keyed
+/// by the DEVICE KEY and kept until that key's certificate expires
+/// (`device_key_revoked`, consulted by `device_cert_revoked`). So forgetting a
+/// live certificate holder records its key as revoked first and then drops the
+/// record, and a revoked record can be forgotten with its revocation kept. The
+/// security property is unchanged where it matters (that key is denied until
+/// its certificate could no longer pass anyway) and stronger where forget used
+/// to refuse: the device is cut off, not merely left in place.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ForgetVerdict {
     /// No live fleet certificate from our owner: removing the record ends it.
     Remove,
-    /// A live certificate, not revoked: revoke the certificate instead.
-    RefuseCertified { days_left: u64 },
-    /// A live certificate, revoked: this record IS the revocation.
-    RefuseRevoked { days_left: u64 },
+    /// A live certificate, not revoked: revoke its key, then remove the record.
+    RevokeThenRemove { days_left: u64 },
+    /// A live certificate, already revoked: carry the revocation over to the
+    /// key list, then remove the record.
+    KeepRevocationThenRemove { days_left: u64 },
 }
 
 pub(crate) fn forget_verdict(
@@ -92,32 +104,146 @@ pub(crate) fn forget_verdict(
     }
     let days_left = cert.expires.saturating_sub(now).div_ceil(86_400);
     if revoked {
-        ForgetVerdict::RefuseRevoked { days_left }
+        ForgetVerdict::KeepRevocationThenRemove { days_left }
     } else {
-        ForgetVerdict::RefuseCertified { days_left }
+        ForgetVerdict::RevokeThenRemove { days_left }
     }
 }
 
-/// The refusal printed for a forget that would not remove the access, or None
-/// when forgetting is the truthful remedy.
-pub(crate) fn forget_refusal(name: &str, verdict: &ForgetVerdict) -> Option<String> {
+/// What `devices forget` prints once it has done what the verdict says. Pure.
+pub(crate) fn forget_report(name: &str, verdict: &ForgetVerdict) -> String {
     match verdict {
-        ForgetVerdict::Remove => None,
-        ForgetVerdict::RefuseCertified { days_left } => Some(format!(
-            "'{name}' holds a fleet certificate from you that is valid for {days_left} more day(s). \
-             Forgetting it would not cut it off: fleet auto-mesh admits a valid certificate unless a \
-             record marks it revoked, so it would reconnect. Revoke the certificate instead; that \
-             keeps this record as the revocation:\n  tunlion revoke {name} --certificate"
-        )),
-        ForgetVerdict::RefuseRevoked { days_left } => Some(format!(
-            "'{name}' is revoked, and its fleet certificate stays valid for {days_left} more day(s). \
-             This record is what keeps the revocation in force; forgetting it would let the device \
-             reconnect through fleet auto-mesh. It can be forgotten once the certificate expires. \
-             To let it back in now instead:\n  tunlion devices restore {name}"
-        )),
+        ForgetVerdict::Remove => {
+            format!("forgot '{name}', it can no longer find or auto-connect to this machine")
+        }
+        ForgetVerdict::RevokeThenRemove { days_left } => format!(
+            "forgot '{name}' and revoked its fleet certificate (valid for {days_left} more day(s)): \
+             that device key is refused here until the certificate expires, so it cannot reconnect \
+             through fleet auto-mesh. The name '{name}' is free now."
+        ),
+        ForgetVerdict::KeepRevocationThenRemove { days_left } => format!(
+            "forgot '{name}'; its revocation stays in force for that device key until its certificate \
+             expires in {days_left} day(s). The name '{name}' is free now."
+        ),
     }
 }
 
+/// The file that holds revocations by device key, apart from any name.
+pub(crate) const KEY_REVOCATIONS_FILE: &str = "revoked-keys.json";
+
+fn key_revocations_path() -> PathBuf {
+    crate::platform::Paths::config_path(KEY_REVOCATIONS_FILE)
+}
+
+/// The key revocations at `path`. Ok(empty) when the file is absent; Err when
+/// it exists but cannot be read or parsed, which callers treat as "revoked"
+/// (fail closed, the rule `device_cert_revoked` applies to devices.json: a
+/// corrupt store must not silently un-revoke every key in it).
+pub(crate) fn load_key_revocations_at(path: &Path) -> std::result::Result<Vec<Value>, ()> {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(()),
+        Ok(_) => {}
+    }
+    let raw = std::fs::read_to_string(path).map_err(|_| ())?;
+    serde_json::from_str::<Vec<Value>>(&raw).map_err(|_| ())
+}
+
+/// Is `device_pub` named by a revocation that is still in force at `now`? An
+/// entry ends when the certificate it revoked expires: past that point the
+/// certificate cannot pass fleet-hello anyway, which is the same horizon the
+/// record-based revocation always had. Pure.
+pub(crate) fn key_revocation_in_force(entries: &[Value], device_pub: &[u8; 32], now: u64) -> bool {
+    let key = hex::encode(device_pub);
+    entries.iter().any(|e| {
+        e["devicePub"].as_str() == Some(key.as_str())
+            && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
+    })
+}
+
+/// Is this device key revoked by a revocation kept apart from any record?
+pub(crate) fn device_key_revoked(device_pub: &[u8; 32], now: u64) -> bool {
+    match load_key_revocations_at(&key_revocations_path()) {
+        Ok(entries) => key_revocation_in_force(&entries, device_pub, now),
+        Err(()) => true,
+    }
+}
+
+/// Record `cert`'s key as revoked until the certificate expires, pruning
+/// entries that have run out. `name` is kept for the reader only; nothing
+/// matches on it.
+pub(crate) fn record_key_revocation_at(
+    path: &Path,
+    cert: &identity::DeviceCert,
+    name: &str,
+    now: u64,
+) -> Result<()> {
+    let mut entries = load_key_revocations_at(path).map_err(|()| {
+        anyhow::anyhow!(
+            "{} exists but cannot be read; fix or remove it before forgetting a certified device",
+            path.display()
+        )
+    })?;
+    let key = hex::encode(cert.device_pub);
+    entries.retain(|e| {
+        e["devicePub"].as_str() != Some(key.as_str())
+            && e["certExpires"].as_u64().map_or(true, |exp| exp > now)
+    });
+    entries.push(json!({
+        "devicePub": key,
+        "userPub": hex::encode(cert.user_pub),
+        "certExpires": cert.expires,
+        "revokedAt": now,
+        "name": name,
+    }));
+    crate::platform::SecretFile::write_str(path, &serde_json::to_string_pretty(&entries)?)?;
+    Ok(())
+}
+
+/// `devices forget <name>`: carry out the verdict, revocation FIRST, so a
+/// failure to record it leaves the record (and with it the revocation or the
+/// live certificate) exactly where it was. Returns the line to print.
+pub(crate) fn forget_device(name: &str, now: u64) -> Result<String> {
+    if !crate::device_record_exists(name) {
+        anyhow::bail!("no device named '{name}', see `tunlion devices`");
+    }
+    let was_revoked = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default()
+        .iter()
+        .any(|d| d["name"].as_str() == Some(name) && crate::device_view::record_is_revoked(d));
+    let cert = device_cert_for(name);
+    let verdict = forget_verdict(cert.as_ref(), was_revoked, fleet::my_owner_pub(), now);
+    if let (ForgetVerdict::RevokeThenRemove { .. } | ForgetVerdict::KeepRevocationThenRemove { .. }, Some(cert)) =
+        (&verdict, cert.as_ref())
+    {
+        record_key_revocation_at(&key_revocations_path(), cert, name, now)?;
+    }
+    crate::device_caps::devices_remove(name)?;
+    Ok(forget_report(name, &verdict))
+}
+
+/// `devices rename <old> <new>`: in place on the raw record, so caps and v2
+/// fields ride along. A name held by another record is refused; forgetting
+/// that record frees it (`forget_device`). Shared by dispatch and the tests
+/// that run the printed re-link chains.
+pub(crate) fn rename_device(old: &str, new: &str) -> Result<()> {
+    crate::devices_store::with_devices_mut(|arr| {
+        if !arr.iter().any(|d| d["name"].as_str() == Some(old)) {
+            anyhow::bail!("no device named '{old}', see `tunlion devices`");
+        }
+        if arr.iter().any(|d| d["name"].as_str() == Some(new)) {
+            anyhow::bail!("'{new}' already exists, forget it first or pick another name");
+        }
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some(old) {
+                d["name"] = json!(new);
+            }
+        }
+        Ok(())
+    })
+}
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
 ///

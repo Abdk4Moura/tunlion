@@ -436,6 +436,21 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // decision, not an accident: refuse, and tell the owner only
             // `devices restore` undoes it.
             let prior = devices_find_by_device_pub(&device_pub);
+            // A key revoked and then forgotten has no record left to refuse
+            // it, so a fresh invitation would have re-admitted the very key
+            // the owner cut off. The key list keeps that decision.
+            if prior.is_none()
+                && crate::fleet_support::device_key_revoked(&device_pub, identity::now_secs())
+            {
+                ui::debug(&format!("enroll response refused: device {pid} holds a revoked key"));
+                let _ = t
+                    .send_control(&json!({
+                        "type": "identity-auth-key-enroll-error",
+                        "reason": "this device key was revoked by the owner; run `tunlion reset` on this device for a new key, then join again"
+                    }))
+                    .await;
+                return;
+            }
             if let Some(prior_record) = &prior {
                 if let Some(reason) = enrollment_refusal(prior_record) {
                     ui::debug(&format!(
