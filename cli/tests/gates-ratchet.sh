@@ -67,6 +67,8 @@ EXPECTED_GREEN=(
   "unreadable-source: mode-000|unreadable-source"
   "shrinking-source: sender stopped|shrinking-source"
   "dead receiver: sender gave up|dead receiver"
+  "stdout-pipe: -o - into a slow pipe|stdout-pipe"
+  "sender-killed: receiver gave up|sender-killed"
 )
 
 # A missing PASS line has three different causes and they want different

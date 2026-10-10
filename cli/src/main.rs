@@ -116,6 +116,9 @@ mod send_report;
 mod transfer_history;
 /// What `send` says, and how long it waits, when its receiver goes away.
 mod send_liveness;
+/// What a transfer says about itself when it resumes, streams or loses its
+/// peer: the pure decisions and sentences, kept testable.
+mod transfer_truth;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;
@@ -293,12 +296,20 @@ use zeroize::Zeroizing;
 // files). Loop until the whole buffer lands; return Err on a real failure so the caller
 // can react instead of silently dropping bytes.
 
+/// How long a peer that vanished WITHOUT announcing it (no `brb`) is waited
+/// for. 25 s, the bound a sender already gives a receiver that was killed
+/// mid-transfer: a signaling blip reconnects well inside it, and a process that
+/// was killed is not coming back, so waiting longer only delays the honest
+/// answer (a receiver whose sender was SIGKILLed used to wait ~96 s). A peer
+/// that said `brb` gets its declared window instead (see `on_peer_left`).
+pub(crate) const REJOIN_UNWARNED_DEFAULT: Duration = Duration::from_secs(25);
+
 fn rejoin_unwarned() -> Duration {
     std::env::var("FILAMENT_REJOIN_SECS") // test knob (gate 15)
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(45))
+        .unwrap_or(REJOIN_UNWARNED_DEFAULT)
 }
 
 /// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
