@@ -565,7 +565,6 @@ impl LaunchAsk {
             no_proxy_fallback: o.no_proxy_fallback,
         }
     }
-    }
 }
 
 /// What a running daemon reports about how it was launched, for `cap-status`
