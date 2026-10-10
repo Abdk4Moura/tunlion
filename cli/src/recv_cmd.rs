@@ -68,6 +68,13 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+/// How long the event loop waits, after writing a delivery-ack, for the peer to
+/// acknowledge it at the transport. Short on purpose: the ack is already queued
+/// and is delivered without this wait; it only lets a live peer take it before
+/// the loop moves on, and a peer that will never acknowledge must not hold the
+/// receiver (and its exit) hostage.
+const ACK_FLUSH_BUDGET: Duration = Duration::from_secs(2);
+
 /// A shell-class open parked while its link's possession proof is in flight
 /// (settle-then-evaluate). The link is identified by pid AND the device key
 /// known at park time: only a proof for the same identity on the same link
@@ -6608,7 +6615,17 @@ pub(crate) async fn recv_cmd(
                                         let _ = t
                                             .send_control(&protocol::delivery_ack_msg(&id, sid))
                                             .await;
-                                        let _ = t.flush().await;
+                                        // BOUNDED: this runs inline in the event
+                                        // loop. The ack is already queued and goes
+                                        // out on its own; the flush only waits for
+                                        // the peer to acknowledge it, and a sender
+                                        // that reads the ack and exits never does.
+                                        // Unbounded, that parked the whole loop, so
+                                        // the receiver never saw the peer-left that
+                                        // ends it and held the finished file until
+                                        // its timeout (gate 11c, G-k).
+                                        let _ = tokio::time::timeout(ACK_FLUSH_BUDGET, t.flush())
+                                            .await;
                                         ui::say(&ui::paint(
                                             ui::Tone::Dim,
                                             &format!(
