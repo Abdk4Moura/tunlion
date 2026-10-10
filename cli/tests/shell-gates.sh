@@ -220,6 +220,8 @@ fi
 # ===================================================================== GATE F ==
 # `up --detach` with DIFFERENT flags while a daemon runs: must not block, must
 # not claim success, must name the restart. The plain daemon above is running.
+# The restart must carry EVERY daemon flag, --server included (#391's argv):
+# without it the restarted daemon would go to the default server.
 say F
 t0=$(date +%s)
 timeout 20 env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" --server "$SERVER" \
@@ -229,7 +231,7 @@ tF=$(( $(date +%s) - t0 ))
 echo "## (up --detach --shell over a plain daemon) rc=$rcF in ${tF}s"
 if [ "$rcF" = "3" ] \
    && grep -q "different settings" "$WORK/F.out" \
-   && grep -q "tunlion down --yes && tunlion up --detach --shell --i-know" "$WORK/F.out" \
+   && grep -qF "tunlion down --yes && tunlion up --detach --server=$SERVER --shell --i-know" "$WORK/F.out" \
    && ! grep -q "following its log" "$WORK/F.out"; then
   ok "gateF: up --detach with new flags returned at once (exit 3) and named the restart"
 else
