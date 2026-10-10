@@ -78,6 +78,7 @@ say "C: the printed steps work"
 cd "$WORK" || exit 2
 # On the owner, exactly as printed (plus --yes: no terminal to confirm on).
 "${A_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$DEV" >"$WORK/c-forget.log" 2>&1
+rcF=$?
 "${A_ENV[@]}" timeout 45 "$BIN" --server "$SERVER" add --for "$DEV" --allow "${ALLOW:-shell}" --out "$DEV-invite.txt" --yes >"$WORK/c-add.log" 2>&1
 # On the device, exactly as printed.
 "${D_ENV[@]}" timeout 20 "$BIN" down -y >"$WORK/c-down.log" 2>&1
@@ -90,12 +91,24 @@ sleep 5
 OUTC=$(timeout 60 "${D_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo REENROL-OK 2>"$WORK/C.err" </dev/null)
 rcC=$?
 echo "## (join) rc=$rcJ (exec) rc=$rcC out='$OUTC'"
-if [ "$rcC" = "0" ] && [ "$OUTC" = "REENROL-OK" ]; then
+# The first printed step must itself succeed, and the device must come back
+# under its own name. This gate used to ignore the forget's exit code, so it
+# stayed green while `forget` refused (a live certificate) and the re-enrolled
+# device was quietly filed as "$DEV-2" beside its stale record.
+NAMES=$("${A_ENV[@]}" "$BIN" devices --json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+if isinstance(d, dict):
+    d = d.get("devices") or (d.get("data") or {}).get("devices") or []
+print(" ".join(sorted(x["name"] for x in d)))' 2>/dev/null)
+echo "## (forget) rc=$rcF; owner devices after re-enrolment: [$NAMES]"
+if [ "$rcF" = "0" ] && echo " $NAMES " | grep -q " $DEV " && ! echo " $NAMES " | grep -q " $DEV-2 " \
+   && [ "$rcC" = "0" ] && [ "$OUTC" = "REENROL-OK" ]; then
   ok "gateC: after the printed re-enrolment the device runs exec on its owner"
 else
   for f in c-forget c-add c-down c-reset c-join; do echo "-- $f --"; tail -4 "$WORK/$f.log"; done
   echo "-- C.err --"; tail -6 "$WORK/C.err"
-  bad "gateC: the printed re-enrolment did not give the device shell (join rc=$rcJ exec rc=$rcC)"
+  bad "gateC: the printed re-enrolment did not work as printed (forget rc=$rcF devices=[$NAMES] join rc=$rcJ exec rc=$rcC)"
 fi
 
 echo
