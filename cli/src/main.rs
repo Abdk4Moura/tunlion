@@ -114,6 +114,8 @@ mod send_source;
 /// `tunlion send --json`: the result object.
 mod send_report;
 mod transfer_history;
+/// What `send` says, and how long it waits, when its receiver goes away.
+mod send_liveness;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;

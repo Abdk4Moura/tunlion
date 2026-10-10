@@ -66,6 +66,7 @@ EXPECTED_GREEN=(
   "exit codes: send missing file|exit-codes-blind-run"
   "unreadable-source: mode-000|unreadable-source"
   "shrinking-source: sender stopped|shrinking-source"
+  "dead receiver: sender gave up|dead receiver"
 )
 
 # A missing PASS line has three different causes and they want different

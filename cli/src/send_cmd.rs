@@ -10,7 +10,6 @@
 use crate::DEFAULT_SERVER;
 use crate::MAX_ATTEMPTS;
 use crate::PakeInbound;
-use crate::REJOIN_WINDOW;
 use crate::SendOutcome;
 use crate::channel_of;
 use crate::codeentry;
@@ -768,6 +767,8 @@ pub(crate) async fn send_cmd(
         .unwrap_or(SEND_ANSWER_WAIT);
     let mut answer_clock: Option<Instant> = None;
     let mut receiver_asking = false;
+    // The receiver the unfinished files were last offered to (its signaling id).
+    let mut offered_to: Option<String> = None;
 
     loop {
         // No answer to an outstanding offer within the bound: fail, and say what
@@ -842,6 +843,20 @@ pub(crate) async fn send_cmd(
                 offline_hinted = true;
                 ui::clear_sticky();
                 ui::say(&crate::conn::offline_hint(n));
+            }
+        }
+        // The receiver left and did not come back within the window this send
+        // announced: end here, saying so and saying what can work. The shared
+        // expiry in `next_ev` claimed "partial state kept for resume", which
+        // the sender cannot know, and offered nothing for a burned code.
+        if let Some(since) = conn.rejoin.waiting_rejoin {
+            if since.elapsed() > conn.rejoin.rejoin_window {
+                ui::clear_sticky();
+                let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                bail!(crate::send_liveness::receiver_gone_message(
+                    conn.rejoin.rejoin_window.as_secs(),
+                    use_code && known_target.is_none(),
+                ));
             }
         }
         // The wait-for-peer deadline only applies while we have no peer (F3).
@@ -1502,6 +1517,25 @@ pub(crate) async fn send_cmd(
                             ));
                         }
                     }
+                    // Everything unfinished is offered again below, so it will be
+                    // streamed again from the receiver's offset: its delivery-ack
+                    // wait starts over, instead of inheriting a window that ran
+                    // out while the previous receiver was gone (which failed a
+                    // send to a daemon restarted within seconds). Only for a NEW
+                    // receiver: the same one re-announcing its link may still be
+                    // verifying what it has, and then ignores the re-offer.
+                    if offered_to.as_deref().is_some_and(|prev| prev != pid) {
+                        {
+                            let mut out = outgoing.lock().await;
+                            for o in out.iter_mut().filter(|o| !o.done) {
+                                o.sent = false;
+                            }
+                        }
+                        sent_all_at = None;
+                        ack_reprobed = false;
+                        reprobed_at = None;
+                    }
+                    offered_to = Some(pid.clone());
                     // (Re-)offer everything unfinished; resume:true after a
                     // prior accept so receivers continue from their partial.
                     // (The `--code` path offers later, post-PAKE; this is the
@@ -2130,21 +2164,17 @@ pub(crate) async fn send_cmd(
                 if conn.on_peer_left(&v) {
                     let all_done = outgoing.lock().await.iter().all(|o| o.done);
                     if !all_done {
-                        let secs = REJOIN_WINDOW.as_secs();
-                        let gid = v["id"].as_str().unwrap_or_default();
-                        match gone {
-                            Some(n) => ui::say(&conn.roster(
-                                gid,
-                                "○",
-                                ui::Tone::Dim,
-                                &format!("disconnected, waiting up to {secs}s"),
-                                &n,
-                            )),
-                            // DEBUG, resilience internal (peer-disconnect wait).
-                            None => ui::debug(&format!(
-                                "peer disconnected, waiting up to {secs}s for them to come back"
-                            )),
-                        }
+                        // The window `on_peer_left` just opened is the one the
+                        // loop enforces; REJOIN_WINDOW (120 s) was printed while
+                        // the unannounced wait was 45 s. And a plain sentence,
+                        // not a roster entry: with no name the entry read as an
+                        // empty name ("the other device  disconnected").
+                        let secs = conn.rejoin.rejoin_window.as_secs();
+                        let by_code = use_code && known_target.is_none();
+                        ui::say(&ui::paint(
+                            ui::Tone::Dim,
+                            &crate::send_liveness::disconnect_line(gone.as_deref(), secs, by_code),
+                        ));
                     }
                 }
             }
@@ -2181,7 +2211,16 @@ pub(crate) async fn send_cmd(
                         .unwrap_or(false);
                     // Only act once a window has elapsed: the first ack_wait, or
                     // (after a re-probe) the shorter ack_reprobe window.
-                    if (!ack_reprobed && window_elapsed) || (ack_reprobed && reprobe_elapsed) {
+                    // Not while a rejoin window is open: the receiver left and may
+                    // come back (a restarted daemon, a reconnecting receiver),
+                    // and the window has its own bounded, honest ending. Giving
+                    // up on the ack first is what ended a send ~15 s into a
+                    // "waiting up to 120s", and what made a send ignore a
+                    // replacement daemon that was up 4 s after the kill.
+                    let rejoin_open = conn.rejoin.waiting_rejoin.is_some();
+                    if !rejoin_open
+                        && ((!ack_reprobed && window_elapsed) || (ack_reprobed && reprobe_elapsed))
+                    {
                         // A live transport attached is the "link alive" signal
                         // (mirrors the browser's data-channel-open check). A
                         // black-hole that QUIC hasn't noticed still reports a
