@@ -113,7 +113,20 @@ pub(crate) fn device_name_for_pub(device_pub: &[u8; 32]) -> Option<String> {
         .and_then(|d| d["name"].as_str().map(str::to_string))
 }
 
+/// Is this device record revoked (the certificate marker, or a durable device
+/// revoke)? The one test `devices`, `send` and `forget` share. Pure.
+pub(crate) fn record_is_revoked(record: &Value) -> bool {
+    record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED)
+}
+
 pub(crate) fn device_cert_revoked(device_pub: &[u8; 32]) -> bool {
+    // A revocation kept by KEY, apart from any record: what `devices forget`
+    // leaves behind for a certificate that is still valid. Checked first, so a
+    // forgotten key stays refused whatever the device store holds.
+    if crate::fleet_support::device_key_revoked(device_pub, crate::identity::now_secs()) {
+        return true;
+    }
     let p = devices_path();
     // A GENUINELY ABSENT store means no device records at all: every peer is
     // unknown, not revoked (a fresh init has no devices.json until the first
@@ -365,7 +378,15 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
             // trusted in full rather than scoped. The tier's own design is #191
             // and #195 and is not settled here; this only stops the screen
             // asserting a blocked state and an impossible remedy.
-            let caps_summary = if tier == fleet_ui::devices::DeviceTier::NeedsReview {
+            // A revoked device has no access, whatever its record still lists:
+            // the row used to read "idle  inbox mount ... revoked", offering
+            // capabilities the gate refuses.
+            let revoked = records.iter().any(|r| {
+                r["name"].as_str() == Some(name.as_str()) && record_is_revoked(r)
+            });
+            let caps_summary = if revoked {
+                "no access (revoked)".to_string()
+            } else if tier == fleet_ui::devices::DeviceTier::NeedsReview {
                 "uncertified · trusted in full".to_string()
             } else {
                 device_caps_summary(&caps, tier)

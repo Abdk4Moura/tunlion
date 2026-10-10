@@ -33,13 +33,13 @@ use crate::config_set;
 use crate::conn::owner_pub_for_resources;
 use crate::ctl;
 use crate::daemon_alive;
-use crate::device_caps::{device_set_cap, devices_remove, effective_device_caps};
+use crate::device_caps::{device_set_cap, effective_device_caps};
 use crate::device_cert_for;
 use crate::device_countdown;
 use crate::device_entries;
 use crate::device_record_exists;
 use crate::devices_info;
-use crate::devices_store::{devices_load, devices_path, with_devices_mut};
+use crate::devices_store::devices_load;
 use crate::doctor;
 use crate::down_cmd;
 use crate::drop_dir;
@@ -1138,48 +1138,12 @@ pub(crate) async fn async_main() -> Result<()> {
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
-                    let had = device_record_exists(&name);
-                    if !had {
-                        bail!("no device named '{name}', see `tunlion devices`");
-                    }
-                    // advisor's anti-theatre point: deleting the record also
-                    // discards any revocation on it, and the copy must say so.
-                    // Otherwise a revoked device that is forgotten looks like a
-                    // first-time peer again, and typing its code (its own or a
-                    // fresh mint) reads as ordinary pairing with nothing
-                    // signalling the revocation was just undone.
-                    let was_revoked = std::fs::read_to_string(devices_path())
-                        .ok()
-                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                        .and_then(|v| v.as_array().cloned())
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|d| {
-                            d["name"].as_str() == Some(name.as_str())
-                                && d["certRevoked"].as_bool() == Some(true)
-                        });
-                    // A live fleet certificate outlives its record: fleet-hello
-                    // would admit it again, so "can no longer find or
-                    // auto-connect" would be false. Refuse with the real remedy.
-                    let verdict = crate::fleet_support::forget_verdict(
-                        device_cert_for(&name).as_ref(),
-                        was_revoked,
-                        crate::fleet::my_owner_pub(),
-                        identity::now_secs(),
-                    );
-                    if let Some(why) = crate::fleet_support::forget_refusal(&name, &verdict) {
-                        bail!("{why}");
-                    }
-                    devices_remove(&name)?;
-                    if was_revoked {
-                        println!(
-                            "forgot '{name}' and its revocation; it can now be added or joined again (if it still holds its key)"
-                        );
-                    } else {
-                        println!(
-                            "forgot '{name}', it can no longer find or auto-connect to this machine"
-                        );
-                    }
+                    // A live fleet certificate outlives its record, so a forget
+                    // records its KEY as revoked before dropping the record, and
+                    // a revoked record carries its revocation over the same way
+                    // (fleet_support::forget_device). The name is then free.
+                    let report = crate::fleet_support::forget_device(&name, identity::now_secs())?;
+                    println!("{report}");
                     println!(
                         "(their side still holds its half; it will hear \"never met you\" on the next proof)"
                     );
@@ -1187,20 +1151,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 Some(DevicesAction::Rename { old, new }) => {
                     // Rename in place on the raw record so caps/v2 fields ride
                     // along (remove+store dropped the renamed device's caps).
-                    with_devices_mut(|arr| {
-                        if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
-                            bail!("no device named '{old}', see `tunlion devices`");
-                        }
-                        if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
-                            bail!("'{new}' already exists, forget it first or pick another name");
-                        }
-                        for d in arr.iter_mut() {
-                            if d["name"].as_str() == Some(old.as_str()) {
-                                d["name"] = json!(new);
-                            }
-                        }
-                        Ok(())
-                    })?;
+                    crate::fleet_support::rename_device(&old, &new)?;
                     println!(
                         "renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)"
                     );
