@@ -2287,7 +2287,7 @@ fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Er
     }
     anyhow::anyhow!(
         "could not stage {what} for sending: the local temp spool at {} ran out of space after {} ({e}). \
-         tunlion stages it in full before offering it, because the offer carries its size and SHA-256, \
+         It is staged in full before it is offered, because the offer carries its size and SHA-256, \
          so the temp directory needs room for all of it. Point TMPDIR at a directory on a disk with \
          room, for example:  TMPDIR=/var/tmp tunlion send - ...  (or send a file path instead of stdin, \
          which is read in place and needs no staging)",
