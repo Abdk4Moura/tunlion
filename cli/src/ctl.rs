@@ -41,14 +41,14 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
+    daemon_present, dns_request, send_reply, serve_at, try_approve_request, try_bootstrap,
     try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, try_wake, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
+    daemon_present, dns_request, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
     try_list_pending, try_list_warm, try_ping, try_wake,
     Req,
 };
@@ -515,6 +515,27 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Ask the daemon's mesh name responder (`dns-query` / `dns-names`).
+    ///
+    /// BLOCKING on purpose, with a short bound: its callers (`status`, the ssh
+    /// L3 path, `l3_dest` for sshfs/rsync) are synchronous, and resolving a
+    /// `.mesh` name through the daemon is what frees them from the OS resolver.
+    /// `None` when no daemon answered or it refused (L3 down).
+    pub fn dns_request(req: &Value) -> Option<Value> {
+        use std::io::{BufRead, Read, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(control_sock_path()).ok()?;
+        let bound = Some(std::time::Duration::from_secs(2));
+        s.set_read_timeout(bound).ok()?;
+        s.set_write_timeout(bound).ok()?;
+        let mut line = serde_json::to_vec(req).ok()?;
+        line.push(b'\n');
+        s.write_all(&line).ok()?;
+        let mut reply = String::new();
+        std::io::BufReader::new(s.take(1 << 20)).read_line(&mut reply).ok()?;
+        let v: Value = serde_json::from_str(&reply).ok()?;
+        (v["ok"].as_bool() == Some(true)).then_some(v)
+    }
+
     /// Ask the daemon to deny a pending request by id.
     pub async fn try_deny_request(id: u64) -> Option<Value> {
         let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
@@ -612,6 +633,12 @@ mod imp {
         ApproveRequest { id: u64, allow: String, expires: u64 },
         /// Deny a pending request by id.
         DenyRequest { id: u64 },
+        /// Ask the mesh name responder one question (`tunlion dns query`).
+        /// Answered INLINE from the same zone and code path a packet to the
+        /// responder address takes.
+        DnsQuery { name: String, qtype: u16 },
+        /// The responder's name table and its collisions (`status`, `doctor`).
+        DnsNames,
     }
 
     /// A parsed request handed to the daemon's event loop, which owns the link
@@ -777,6 +804,12 @@ mod imp {
                         let Some(id) = v["id"].as_u64() else { return };
                         ReqKind::DenyRequest { id }
                     }
+                    Some("dns-query") => {
+                        let Some(name) = v["name"].as_str().filter(|s| s.len() <= 255).map(str::to_string) else { return };
+                        let Some(qtype) = v["qtype"].as_u64().and_then(|n| u16::try_from(n).ok()) else { return };
+                        ReqKind::DnsQuery { name, qtype }
+                    }
+                    Some("dns-names") => ReqKind::DnsNames,
                     _ => return,
                 };
                 let _ = tx.send(Req { kind, sock });
@@ -951,6 +984,12 @@ mod stub {
     /// No control socket here, so there is no daemon consent queue to deny
     /// against. Callers treat `None` as "no daemon reply" and degrade gracefully.
     pub async fn try_deny_request(_id: u64) -> Option<Value> {
+        None
+    }
+
+    /// No control socket here, so no daemon responder to ask. Callers report
+    /// "no daemon" (`dns query`) or skip the name-table rows (`status`).
+    pub fn dns_request(_req: &Value) -> Option<Value> {
         None
     }
 }

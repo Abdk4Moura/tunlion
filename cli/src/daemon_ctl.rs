@@ -107,6 +107,11 @@ pub(crate) async fn handle_warm_req(
         ctl::ReqKind::ListPending => req.reject("list-pending not handled here").await,
         ctl::ReqKind::ApproveRequest { .. } => req.reject("approve-request not handled here").await,
         ctl::ReqKind::DenyRequest { .. } => req.reject("deny-request not handled here").await,
+        // The name responder needs the L3 manager, so the daemon loop answers it
+        // inline; answer defensively if it ever reaches here.
+        ctl::ReqKind::DnsQuery { .. } | ctl::ReqKind::DnsNames => {
+            req.reject("dns not handled here").await
+        }
     }
 }
 

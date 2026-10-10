@@ -50,6 +50,7 @@ COMMANDS
     status                 what the daemon is doing / recently received
   Mesh
     addr                   show your overlay address (or a device's)
+    dns query <name>       ask the mesh name responder (A, AAAA, PTR; no OS setup)
     doctor                 diagnose a link
 
 EXAMPLES
@@ -450,6 +451,12 @@ pub(crate) enum Cmd {
         #[arg(long)]
         v4: bool,
     },
+    /// Ask the daemon's mesh name responder (`<name>.mesh`, reverse lookups)
+    #[command(next_help_heading = "Mesh")]
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+    },
     // ── Identity ────────────────────────────────────────────────────
     /// Manage your user identity (key + device certs)
     #[command(next_help_heading = "Identity")]
@@ -803,6 +810,21 @@ pub(crate) enum IdAction {
         /// Read recovery words from an already-open file descriptor.
         #[arg(long, value_name = "FD", conflicts_with = "words_file")]
         words_fd: Option<i32>,
+    },
+}
+
+/// Questions for the mesh name responder.
+#[derive(Subcommand)]
+pub(crate) enum DnsAction {
+    /// Resolve a device name (`laptop`, `laptop.mesh`) or an overlay address
+    /// (reverse lookup) through the running daemon, exactly as a resolver
+    /// pointed at fdf1:1af7:c30d::53 would. Answers print one per line.
+    Query {
+        /// Device name, `<name>.mesh`, or an overlay address
+        name: String,
+        /// Record type: A, AAAA or PTR (default: A and AAAA for a name, PTR for an address)
+        #[arg(long = "type", value_name = "TYPE")]
+        qtype: Option<String>,
     },
 }
 

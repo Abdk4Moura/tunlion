@@ -371,9 +371,14 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
     let sshca = crate::sshd::check_sshd_ca();
+    // The running daemon's name table, if one answers: a collided name resolves
+    // to nothing, which looks like a dead link unless something says why.
+    let mesh = crate::ctl::dns_request(&json!({ "op": "dns-names" }));
 
     if json_out {
-        println!("{}", preflight_json(server, &sig, &ice, &ifaces, &history, &sshca).to_string());
+        let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
+        v["mesh_dns"] = mesh.clone().unwrap_or(Value::Null);
+        println!("{}", v.to_string());
         return Ok(());
     }
 
@@ -433,6 +438,33 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             "sshd-ca",
             ui::paint(Tone::Warn, "unconfigured"),
             ui::paint(Tone::Dim, e),
+        )),
+    }
+
+    // Mesh names (the daemon's responder). Human rows, so ui::say.
+    match &mesh {
+        Some(v) => {
+            let collisions = crate::mesh_dns::collision_lines(v);
+            let n = v["names"].as_array().map_or(0, |a| a.len());
+            ui::say(&format!(
+                "  {:<13} {}  {}",
+                "mesh-dns",
+                if collisions.is_empty() {
+                    ui::paint(Tone::Ok, "serving")
+                } else {
+                    ui::paint(Tone::Warn, "name collision")
+                },
+                ui::paint(Tone::Dim, &format!("{n} name(s) at {}", v["responder"].as_str().unwrap_or("?"))),
+            ));
+            for line in collisions {
+                ui::say(&format!("  {:<13} {}", "", ui::paint(Tone::Warn, &line)));
+            }
+        }
+        None => ui::say(&format!(
+            "  {:<13} {}  {}",
+            "mesh-dns",
+            ui::paint(Tone::Dim, "no daemon"),
+            ui::paint(Tone::Dim, "names resolve through a running `tunlion up` with L3 on"),
         )),
     }
 

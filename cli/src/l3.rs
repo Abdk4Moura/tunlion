@@ -228,9 +228,15 @@ pub struct L3 {
     /// message can never poison the map.
     seen_seq: Mutex<HashMap<[u8; 32], u64>>,
     /// MagicDNS: pid -> (petname, v6 overlay addr, optional v4 overlay addr) for
-    /// VERIFIED peers, mirrored into a managed block in /etc/hosts so native tools
-    /// resolve `<petname>` / `<petname>.mesh` (both AAAA and A records).
-    names: Mutex<HashMap<String, (String, Ipv6Addr, Option<Ipv4Addr>)>>,
+    /// VERIFIED peers, plus `__self__`. Names are canonical (lowercase). Served by
+    /// the mesh name responder (`mesh_dns`, read from the TUN loop, hence the
+    /// Arc) and mirrored into a managed block in /etc/hosts. A name held by two
+    /// devices resolves to neither; see `mesh_dns::Zone`.
+    names: Arc<Mutex<HashMap<String, (String, Ipv6Addr, Option<Ipv4Addr>)>>>,
+    /// pid -> when that link was first seen gone from the daemon's link table.
+    /// A link that stays gone past `LINK_GONE_GRACE` has its names and routes
+    /// pruned (`sweep_departed`); one that comes back inside it is untouched.
+    departed: Mutex<HashMap<String, std::time::Instant>>,
     /// `Some` when the endpoint is the userspace netstack (no kernel TUN). Held as
     /// the concrete type so `bind`/`dial` can open smoltcp sockets; its presence also
     /// means there is no kernel route to the overlay, so we do NOT write /etc/hosts
@@ -294,6 +300,8 @@ impl L3 {
         };
         let userspace = netstack.is_some();
         let routes: Arc<Mutex<RouteTable>> = Arc::new(Mutex::new(RouteTable::default()));
+        let names: Arc<Mutex<HashMap<String, (String, Ipv6Addr, Option<Ipv4Addr>)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let l3 = Arc::new(L3 {
             tun: tun.clone(),
             routes: routes.clone(),
@@ -303,7 +311,8 @@ impl L3 {
             kernel_subnets: Mutex::new(std::collections::HashSet::new()),
             exit_route_installed: Mutex::new(false),
             seen_seq: Mutex::new(HashMap::new()),
-            names: Mutex::new(HashMap::new()),
+            names: names.clone(),
+            departed: Mutex::new(HashMap::new()),
             netstack,
         });
         // Clear any stale MagicDNS block from a previous run - but only in kernel
@@ -324,6 +333,18 @@ impl L3 {
                     Err(_) => break, // TUN closed -> daemon shutting down
                 };
                 let Some(dst) = dest_ip(&buf[..n]) else { continue };
+                // The mesh name responder. A query to its reserved address is
+                // answered HERE, by writing the reply back into the TUN: no
+                // socket, no port-53 privilege, and nothing on the wire. Checked
+                // before the route lookup so no route (a subnet a peer
+                // advertises, say) can ever capture the responder's address.
+                if dst == IpAddr::V6(crate::mesh_dns::RESPONDER_V6) {
+                    let zone = zone_of(&*names.lock().await);
+                    if let Some(reply) = crate::mesh_dns::udp6_reply(&buf[..n], &zone) {
+                        let _ = tun.send(&reply).await;
+                    }
+                    continue;
+                }
                 let peer = routes.lock().await.lookup(dst);
                 if let Some(t) = peer {
                     let _ = t.send_datagram(&buf[..n]);
@@ -358,7 +379,12 @@ impl L3 {
 
     /// Insert a name entry into the MagicDNS table (for self-registration).
     pub async fn names_insert(&self, pid: &str, name: &str, v6: Ipv6Addr, v4: Option<Ipv4Addr>) {
-        self.names.lock().await.insert(pid.to_string(), (name.to_string(), v6, v4));
+        self.names.lock().await.insert(pid.to_string(), (sanitize_host(name), v6, v4));
+    }
+
+    /// A snapshot of the name table as the responder serves it.
+    pub async fn zone(&self) -> crate::mesh_dns::Zone {
+        zone_of(&*self.names.lock().await)
     }
 
     /// Re-label an existing peer without touching its routes.
@@ -371,6 +397,7 @@ impl L3 {
     /// to catch up, or the peer is reachable as a nonsense hostname.
     /// Returns true when an entry was actually re-labelled.
     pub async fn rename_peer(&self, pid: &str, name: &str) -> bool {
+        let name = &sanitize_host(name);
         let mut names = self.names.lock().await;
         match names.get(pid) {
             Some((current, v6, v4)) if current != name => {
@@ -430,15 +457,20 @@ impl L3 {
     /// Resolve a verified peer's petname to its overlay address (the inverse of
     /// `petname_of`). The daemon uses this so a `dial` targets an address DERIVED
     /// from a paired identity, never one the client asserts.
+    ///
+    /// Through the SAME zone the responder answers from, so a name two devices
+    /// share resolves to nothing here too (the dial, the SOCKS proxy and ssh
+    /// would otherwise reach whichever device the HashMap yielded first), and a
+    /// `<name>-<4hex>` alias reaches the one device it names.
     pub async fn addr_of(&self, name: &str) -> Option<Ipv6Addr> {
-        let name = sanitize_host(name);
-        self.names.lock().await.values().find(|(n, _, _)| *n == name).map(|(_, a, _)| *a)
+        let name = sanitize_host(name.strip_suffix(".mesh").unwrap_or(name));
+        self.zone().await.resolve(&name).map(|e| e.v6)
     }
 
     /// Resolve a verified peer's petname to its v4 overlay address (if dual-stack).
     pub async fn addr_v4_of(&self, name: &str) -> Option<Ipv4Addr> {
-        let name = sanitize_host(name);
-        self.names.lock().await.values().find(|(n, _, _)| *n == name).and_then(|(_, _, a)| *a)
+        let name = sanitize_host(name.strip_suffix(".mesh").unwrap_or(name));
+        self.zone().await.resolve(&name).and_then(|e| e.v4)
     }
 
     /// Build a signed announce of our address bound to link channel-binding `cb`.
@@ -507,6 +539,15 @@ impl L3 {
         t: Arc<dyn Transport>,
     ) {
         if !t.supports_datagrams() {
+            return;
+        }
+        // The responder's address is never a peer's. A device address is a key
+        // hash, so claiming it is a preimage search; refusing it here anyway
+        // means no announce can ever route the name responder to a peer.
+        if peer_ip == IpAddr::V6(crate::mesh_dns::RESPONDER_V6) {
+            crate::ui::debug(&format!(
+                "  l3: refused {petname}: it announced the reserved name-responder address"
+            ));
             return;
         }
         // Every overlay address this peer answers to (v6 always; v4 in dual-stack).
@@ -856,15 +897,25 @@ impl L3 {
         self.routes.lock().await.remove_host(&ip);
     }
 
-    /// Retract every route a link (by pid) installed and abort its pump. NOT called
-    /// on a transient link drop (that would break continuity across a repair);
-    /// reserved for an explicit device-forget path. Kept for that use.
-    #[allow(dead_code)]
+    /// Retract every route a link (by pid) installed, abort its pump and drop its
+    /// name. NOT called on a transient drop (that would open a gap across a
+    /// repair): `sweep_departed` calls it once a link has stayed gone past
+    /// `LINK_GONE_GRACE`, which is how a name stops resolving after its device
+    /// leaves instead of living until the daemon restarts.
+    ///
+    /// A route is retracted only if no OTHER link has since installed the same
+    /// address: a peer that came back on a fresh link id owns that address now,
+    /// and pruning the old id must not unroute it.
     pub async fn remove_by_pid(&self, pid: &str) {
-        if let Some(ips) = self.by_pid.lock().await.remove(pid) {
+        let removed = self.by_pid.lock().await.remove(pid);
+        if let Some(ips) = removed {
+            let still_owned: Vec<IpAddr> =
+                self.by_pid.lock().await.values().flatten().copied().collect();
             let mut map = self.routes.lock().await;
             for ip in ips {
-                map.remove_host(&ip);
+                if !still_owned.contains(&ip) {
+                    map.remove_host(&ip);
+                }
             }
         }
         if let Some(r) = self.readers.lock().await.remove(pid) {
@@ -872,6 +923,40 @@ impl L3 {
         }
         if self.names.lock().await.remove(pid).is_some() {
             self.refresh_hosts().await;
+        }
+    }
+
+    /// Prune every link that has been absent from `live` (the daemon's link
+    /// table) for longer than `LINK_GONE_GRACE`. A link that returns inside the
+    /// grace keeps everything, which is the continuity a repair relies on; one
+    /// that does not has its routes, pump and NAME removed. Before this, nothing
+    /// removed a name while the daemon ran, so a departed device kept resolving
+    /// and a stale entry could collide with a live device of the same name.
+    pub async fn sweep_departed(&self, live: &std::collections::HashSet<String>, now: std::time::Instant) {
+        let mut known: Vec<String> = self.by_pid.lock().await.keys().cloned().collect();
+        known.extend(self.names.lock().await.keys().cloned());
+        known.sort();
+        known.dedup();
+        let mut gone = Vec::new();
+        {
+            let mut departed = self.departed.lock().await;
+            departed.retain(|pid, _| !live.contains(pid));
+            for pid in known {
+                if pid == SELF_PID || live.contains(&pid) {
+                    continue;
+                }
+                let since = *departed.entry(pid.clone()).or_insert(now);
+                if now.saturating_duration_since(since) >= LINK_GONE_GRACE {
+                    gone.push(pid);
+                }
+            }
+            for pid in &gone {
+                departed.remove(pid);
+            }
+        }
+        for pid in gone {
+            crate::ui::debug(&format!("  l3: link {pid} gone; pruning its routes and name"));
+            self.remove_by_pid(&pid).await;
         }
     }
 
@@ -940,19 +1025,57 @@ fn open_kernel(
 const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by tunlion; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
 
-/// Get this machine's hostname for MagicDNS.
+/// The name-table key this machine registers itself under.
+pub const SELF_PID: &str = "__self__";
+
+/// How long a link may be absent from the daemon's link table before its routes
+/// and name are pruned. Long enough to cover a repair (which swaps the transport
+/// under the same addresses); short enough that a departed device stops
+/// resolving within a minute rather than at the next daemon restart.
+pub const LINK_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The name table as the responder sees it.
+fn zone_of(names: &HashMap<String, (String, Ipv6Addr, Option<Ipv4Addr>)>) -> crate::mesh_dns::Zone {
+    crate::mesh_dns::Zone::new(names.iter().map(|(pid, (n, v6, v4))| crate::mesh_dns::Entry {
+        name: n.clone(),
+        v6: *v6,
+        v4: *v4,
+        is_self: pid == SELF_PID,
+    }))
+}
+
+/// The name this machine registers for itself, and the one the banner prints:
+/// the `name` setting if set, else the short hostname, canonicalised. One
+/// function so the two cannot disagree again (the banner used to print the
+/// hostname while the table registered the setting).
+pub fn self_mesh_name() -> String {
+    sanitize_host(&crate::config_get("name").unwrap_or_else(hostname))
+}
+
+/// This machine's short hostname (MagicDNS, the `init` name suggestion, the
+/// forward-to-self check). Asks the OS (`platform::os_hostname`) instead of
+/// reading /etc/hostname, which macOS does not have, so every Mac was "cli".
 pub fn hostname() -> String {
-    // #183.1: /etc/hostname is UNIX-only; Windows provides COMPUTERNAME.
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into())
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
+}
+
+/// `Kabir-MacBook.local` -> `kabir-macbook`: the first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label. Falls back to "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mut label = String::new();
+    for c in first.chars() {
+        let c = c.to_ascii_lowercase();
+        let c = if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' };
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
     }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into())
-    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
 }
 
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
@@ -976,9 +1099,12 @@ fn hosts_path() -> std::path::PathBuf {
 pub(crate) fn sanitize_host(name: &str) -> String {
     // If name contains @, extract just the hostname part (user@host → host)
     let base = name.split('@').last().unwrap_or(name);
+    // LOWERCASE: DNS is case-insensitive, so `Laptop` and `laptop` are one
+    // name. Kept as typed they were two table entries that the hosts file then
+    // served round-robin for the same `.mesh` name.
     let s: String = base
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '-' })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c.to_ascii_lowercase() } else { '-' })
         .collect();
     s.trim_matches('-').to_string()
 }
@@ -1023,15 +1149,19 @@ fn render_hosts(current: &str, entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)])
         out.push_str(line);
         out.push('\n');
     }
-    // Dedup exact (name, v6_addr) pairs: the names table is keyed per-link, so a
-    // peer that reconnected under several link ids can appear more than once and
-    // would otherwise emit duplicate /etc/hosts lines.
-    let mut seen = std::collections::HashSet::new();
-    let live: Vec<&(String, Ipv6Addr, Option<Ipv4Addr>)> = entries
-        .iter()
-        .filter(|(n, _, _)| is_safe_mesh_name(n))
-        .filter(|(n, v6, _)| seen.insert((n.clone(), *v6)))
-        .collect();
+    // The SAME zone the responder serves: (name, v6) pairs de-duplicated (the
+    // table is keyed per link, so one peer can appear under several link ids),
+    // unsafe names dropped, and a name two devices share written ONLY as each
+    // device's `<name>-<4hex>` alias. It used to be written once per device,
+    // which made the OS resolver round-robin a connection onto either machine.
+    let zone = crate::mesh_dns::Zone::new(entries.iter().map(|(n, v6, v4)| crate::mesh_dns::Entry {
+        name: n.clone(),
+        v6: *v6,
+        v4: *v4,
+        is_self: false,
+    }));
+    let live: Vec<(String, Ipv6Addr, Option<Ipv4Addr>)> =
+        zone.served().into_iter().map(|(n, e)| (n, e.v6, e.v4)).collect();
     if !live.is_empty() {
         out.push_str(HOSTS_BEGIN);
         out.push('\n');
@@ -1054,15 +1184,6 @@ fn render_hosts(current: &str, entries: &[(String, Ipv6Addr, Option<Ipv4Addr>)])
         out.push('\n');
     }
     out
-}
-
-/// Reject empty or reserved labels so a mesh name can never map to something
-/// load-bearing even under `.mesh` (defense in depth beyond the `.mesh` suffix).
-fn is_safe_mesh_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    !matches!(name.to_ascii_lowercase().as_str(), "localhost" | "localhost4" | "localhost6")
 }
 
 /// Standalone point-to-point serve_tun (no signaling): open `dev` with `tun_addr`
@@ -1336,11 +1457,35 @@ mod tests {
         assert_eq!(sanitize_host("other-do"), "other-do");
         assert_eq!(sanitize_host("user@cli"), "cli");  // strips user@ prefix
         assert_eq!(sanitize_host("a b/c"), "a-b-c");
+        // Canonical: DNS names are case-insensitive, so the table holds one form.
+        assert_eq!(sanitize_host("Kabir-MacBook"), "kabir-macbook");
+    }
+
+    /// The same rule and the same function names as #381/#391, so those merge
+    /// without a conflict in meaning.
+    #[test]
+    fn hostname_is_the_short_os_label() {
+        use super::short_host_label as l;
+        assert_eq!(l("laptop"), "laptop");
+        assert_eq!(l("Kabir-MacBook-Pro.local"), "kabir-macbook-pro");
+        assert_eq!(l("vps3584156.trouble-free.net"), "vps3584156");
+        assert_eq!(l("DESKTOP-7Q2K1"), "desktop-7q2k1");
+        assert_eq!(l("my_box  two"), "my-box-two");
+        assert_eq!(l("-edge-"), "edge");
+        assert_eq!(l(""), "device");
+        assert_eq!(l("...."), "device");
+        assert_eq!(l(&"a".repeat(80)).len(), 63);
+        // The OS answers, so the name is the machine's, never the old
+        // /etc/hostname fallback constant (every Mac was "cli").
+        let os = crate::platform::os_hostname();
+        assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+        assert_eq!(super::hostname(), l(os.as_deref().unwrap()));
+        assert_ne!(super::hostname(), "cli");
     }
 
     #[test]
     fn reserved_and_empty_names_are_dropped() {
-        use super::is_safe_mesh_name;
+        use crate::mesh_dns::is_safe_mesh_name;
         assert!(!is_safe_mesh_name(""));
         assert!(!is_safe_mesh_name("localhost"));
         assert!(!is_safe_mesh_name("LocalHost"));
@@ -1515,7 +1660,8 @@ mod tests {
             kernel_subnets: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             exit_route_installed: tokio::sync::Mutex::new(false),
             seen_seq: Mutex::new(HashMap::new()),
-            names: tokio::sync::Mutex::new(HashMap::new()),
+            names: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            departed: tokio::sync::Mutex::new(HashMap::new()),
             netstack: Some(ns),
         })
     }
@@ -1597,16 +1743,24 @@ mod tests {
         });
     }
 
+    // THE DECISION THIS CHANGES. These two tests used to assert that two
+    // devices sharing a name were BOTH written to the hosts file under that name
+    // ("DNS round-robin"), so a connection to `host1.mesh` landed on whichever
+    // device the resolver picked. That was a deliberate choice and it is
+    // deliberately reversed: an ambiguous name now resolves to nothing, in the
+    // hosts block, in the responder and in `addr_of`, and each device is served
+    // under its key-derived `<name>-<4hex>` alias instead. Routing is untouched:
+    // both peers stay routable by address, which these tests still assert.
     #[test]
-    fn magicdns_same_name_different_peers_both_emitted() {
+    fn magicdns_same_name_different_peers_resolve_to_neither() {
         use super::Transport;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let l3 = test_l3();
             // Two peers with the same petname "host1" but different addresses
-            let v6a: IpAddr = "fdf1:1af7:c30d::aa".parse().unwrap();
+            let v6a: IpAddr = "fdf1:1af7:c30d:aa00::aa".parse().unwrap();
             let v4a: IpAddr = "198.18.1.1".parse().unwrap();
-            let v6b: IpAddr = "fdf1:1af7:c30d::bb".parse().unwrap();
+            let v6b: IpAddr = "fdf1:1af7:c30d:bb00::bb".parse().unwrap();
             let v4b: IpAddr = "198.18.2.2".parse().unwrap();
             let ta: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
             let tb: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
@@ -1621,31 +1775,37 @@ mod tests {
             // petname_of returns one of them (which one is implementation-defined)
             let found = l3.petname_of(v6a).await;
             assert!(found.is_some(), "petname_of must return a result for known peer");
-            // render_hosts emits both entries (DNS round-robin)
-            let base = "";
+            // The name itself resolves to neither device...
+            assert_eq!(l3.addr_of("host1").await, None, "an ambiguous name must not pick a device");
+            assert_eq!(l3.addr_v4_of("host1").await, None);
+            // ...and each alias resolves to exactly its own.
+            assert_eq!(l3.addr_of("host1-aa00").await, Some("fdf1:1af7:c30d:aa00::aa".parse().unwrap()));
+            assert_eq!(l3.addr_of("host1-bb00.mesh").await, Some("fdf1:1af7:c30d:bb00::bb".parse().unwrap()));
             let entries: Vec<(String, std::net::Ipv6Addr, Option<std::net::Ipv4Addr>)> = vec![
-                ("host1".into(), "fdf1:1af7:c30d::aa".parse().unwrap(), Some("198.18.1.1".parse().unwrap())),
-                ("host1".into(), "fdf1:1af7:c30d::bb".parse().unwrap(), Some("198.18.2.2".parse().unwrap())),
+                ("host1".into(), "fdf1:1af7:c30d:aa00::aa".parse().unwrap(), Some("198.18.1.1".parse().unwrap())),
+                ("host1".into(), "fdf1:1af7:c30d:bb00::bb".parse().unwrap(), Some("198.18.2.2".parse().unwrap())),
             ];
-            let out = render_hosts(base, &entries);
-            // Both v6 addresses should appear as host1.mesh
-            assert!(out.contains("fdf1:1af7:c30d::aa host1.mesh"));
-            assert!(out.contains("fdf1:1af7:c30d::bb host1.mesh"));
-            // Both v4 addresses should appear as host1.mesh
-            assert!(out.contains("198.18.1.1 host1.mesh"));
-            assert!(out.contains("198.18.2.2 host1.mesh"));
+            let out = render_hosts("", &entries);
+            // The ambiguous name is never written, for either family.
+            assert!(!out.contains(" host1.mesh"), "no round-robin entry: {out}");
+            // Each device is written once per family under its alias.
+            assert!(out.contains("fdf1:1af7:c30d:aa00::aa host1-aa00.mesh"));
+            assert!(out.contains("fdf1:1af7:c30d:bb00::bb host1-bb00.mesh"));
+            assert!(out.contains("198.18.1.1 host1-aa00.mesh"));
+            assert!(out.contains("198.18.2.2 host1-bb00.mesh"));
         });
     }
 
     #[test]
     fn magicdns_case_insensitive_collision() {
-        // "Host1" and "host1" should collide after sanitization
+        // "Host1" and "host1" are ONE name after canonicalisation, so two
+        // devices holding them collide (they used to be two table entries).
         use super::Transport;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let l3 = test_l3();
-            let v6a: IpAddr = "fdf1:1af7:c30d::aa".parse().unwrap();
-            let v6b: IpAddr = "fdf1:1af7:c30d::bb".parse().unwrap();
+            let v6a: IpAddr = "fdf1:1af7:c30d:aa00::aa".parse().unwrap();
+            let v6b: IpAddr = "fdf1:1af7:c30d:bb00::bb".parse().unwrap();
             let ta: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
             let tb: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
             // Different case names
@@ -1654,15 +1814,75 @@ mod tests {
             // Both are routable
             assert!(l3.is_verified_peer(v6a).await);
             assert!(l3.is_verified_peer(v6b).await);
-            // render_hosts deduplicates by (sanitized_name, v6) - different v6 means both emitted
+            // Stored canonical, and therefore detected as a collision.
+            assert_eq!(l3.petname_of(v6a).await.as_deref(), Some("host1"));
+            let zone = l3.zone().await;
+            assert_eq!(zone.collisions().len(), 1, "Host1 and host1 are the same name");
+            assert_eq!(l3.addr_of("HOST1").await, None);
             let entries: Vec<(String, std::net::Ipv6Addr, Option<std::net::Ipv4Addr>)> = vec![
-                ("host1".into(), "fdf1:1af7:c30d::aa".parse().unwrap(), None),
-                ("host1".into(), "fdf1:1af7:c30d::bb".parse().unwrap(), None),
+                ("Host1".into(), "fdf1:1af7:c30d:aa00::aa".parse().unwrap(), None),
+                ("host1".into(), "fdf1:1af7:c30d:bb00::bb".parse().unwrap(), None),
             ];
             let out = render_hosts("", &entries);
-            assert!(out.contains("fdf1:1af7:c30d::aa host1.mesh"));
-            assert!(out.contains("fdf1:1af7:c30d::bb host1.mesh"));
+            assert!(!out.contains(" host1.mesh") && !out.contains(" Host1.mesh"), "{out}");
+            assert!(out.contains("fdf1:1af7:c30d:aa00::aa host1-aa00.mesh"));
+            assert!(out.contains("fdf1:1af7:c30d:bb00::bb host1-bb00.mesh"));
         });
+    }
+
+    /// A departed link's name and routes are pruned after the grace, not before,
+    /// and pruning an old link id never unroutes an address a newer link owns.
+    #[tokio::test]
+    async fn departed_links_are_pruned_after_the_grace_only() {
+        use super::{Transport, LINK_GONE_GRACE};
+        use std::collections::HashSet;
+        let l3 = test_l3();
+        let v6: IpAddr = "fdf1:1af7:c30d:a11c::1".parse().unwrap();
+        let t: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+        l3.add_peer("pidA", "alice", v6, None, t.clone()).await;
+        l3.names_insert(super::SELF_PID, "Me", "fdf1:1af7:c30d:5e1f::5".parse().unwrap(), None).await;
+        let t0 = std::time::Instant::now();
+        let none: HashSet<String> = HashSet::new();
+
+        // Gone, but inside the grace (a repair): nothing changes.
+        l3.sweep_departed(&none, t0).await;
+        l3.sweep_departed(&none, t0 + LINK_GONE_GRACE / 2).await;
+        assert!(l3.addr_of("alice").await.is_some());
+        assert!(l3.is_verified_peer(v6).await);
+
+        // Back before the grace ran out: the clock resets.
+        let live: HashSet<String> = ["pidA".to_string()].into();
+        l3.sweep_departed(&live, t0 + LINK_GONE_GRACE / 2).await;
+        l3.sweep_departed(&none, t0 + LINK_GONE_GRACE).await;
+        assert!(l3.addr_of("alice").await.is_some(), "the absence clock restarted");
+
+        // The same device returns on a NEW link id, then the old id is pruned:
+        // the name stays (via the new id) and so does the route.
+        l3.add_peer("pidA2", "alice", v6, None, t.clone()).await;
+        let live2: HashSet<String> = ["pidA2".to_string()].into();
+        l3.sweep_departed(&live2, t0 + LINK_GONE_GRACE * 3).await;
+        assert!(!l3.by_pid.lock().await.contains_key("pidA"), "old id pruned");
+        assert!(l3.is_verified_peer(v6).await, "pruning the old id must not unroute the new one");
+        assert!(l3.addr_of("alice").await.is_some());
+
+        // Gone for good: name, route and pump all leave. Self never does.
+        l3.sweep_departed(&none, t0 + LINK_GONE_GRACE * 4).await;
+        l3.sweep_departed(&none, t0 + LINK_GONE_GRACE * 6).await;
+        assert_eq!(l3.addr_of("alice").await, None);
+        assert!(!l3.is_verified_peer(v6).await);
+        assert!(l3.readers.lock().await.is_empty());
+        assert!(l3.addr_of("me").await.is_some(), "self is never pruned");
+    }
+
+    #[tokio::test]
+    async fn the_responder_address_is_never_a_peer() {
+        use super::Transport;
+        let l3 = test_l3();
+        let t: std::sync::Arc<dyn Transport> = std::sync::Arc::new(DgramTransport);
+        let dns = IpAddr::V6(crate::mesh_dns::RESPONDER_V6);
+        l3.add_peer("pidX", "evil", dns, None, t).await;
+        assert!(!l3.is_verified_peer(dns).await, "no route to the responder");
+        assert_eq!(l3.addr_of("evil").await, None, "and no name");
     }
 
     #[tokio::test]

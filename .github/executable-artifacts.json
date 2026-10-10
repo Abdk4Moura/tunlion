@@ -292,6 +292,17 @@
       "reference": "docs/executable-artifact-registry.md#retired-artifacts"
     },
     {
+      "path": "cli/tests/mesh-dns-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/mesh-dns-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/roster-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/roster-gates.sh",
