@@ -256,6 +256,12 @@ pub fn ensure_net_admin_for_l3() -> bool {
     false
 }
 
+/// No one-time grant exists on macOS (utun needs the daemon itself to run as
+/// root), so there is nothing to offer at `init`.
+pub fn l3_grant_pending() -> Option<String> {
+    None
+}
+
 /// The macOS daemon runs as root (utun requires it), so /etc/hosts is already
 /// writable for MagicDNS. Nothing to grant.
 pub fn ensure_hosts_writable() {}

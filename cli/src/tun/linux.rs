@@ -132,6 +132,21 @@ pub fn ensure_hosts_writable() {
     }
 }
 
+/// What a one-time grant would still add here, as the ONE command a person can
+/// run later to add it; `None` when nothing is missing. Reads only: deciding
+/// whether to ASK is the caller's job (`init` asks, default no), and this must
+/// never prompt or escalate on its own.
+pub fn l3_grant_pending() -> Option<String> {
+    let need_cap = !have_net_admin();
+    let need_hosts = !hosts_writable() && std::env::var("USER").is_ok();
+    match (need_cap, need_hosts) {
+        (false, false) => None,
+        (true, false) => Some(cap_grant_cmd()),
+        (false, true) => Some(hosts_grant_cmd()),
+        (true, true) => Some(format!("{} && {}", cap_grant_cmd(), hosts_grant_cmd())),
+    }
+}
+
 /// Make L3 work for a non-root daemon with as few steps as possible: if we lack
 /// CAP_NET_ADMIN and we're at a terminal, run the one-time `setcap` now (a single
 /// sudo prompt) so a later `tunlion up` just works; otherwise print the exact

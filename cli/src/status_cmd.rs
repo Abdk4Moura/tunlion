@@ -75,7 +75,11 @@ pub(crate) fn tour_cmd() -> Result<()> {
         )),
         None => ui::say(&format!(
             "  identity {}",
-            ui::paint_when(color, ui::Tone::Dim, "created when you first use one")
+            ui::paint_when(
+                color,
+                ui::Tone::Dim,
+                "none yet: tunlion init, or tunlion join <invitation>"
+            )
         )),
     }
     ui::say("");
@@ -99,6 +103,16 @@ pub(crate) fn tour_cmd() -> Result<()> {
     Ok(())
 }
 
+/// The identity as `status --json` reports it: the owner fingerprint, the
+/// string "joined" on a joined device, or null when there is none yet.
+fn identity_summary() -> Value {
+    match identity::UserKey::load(&crate::platform::PlatformKeyStore) {
+        Ok(Some(key)) => json!(key.fingerprint()),
+        _ if local_device_cert().is_some() => json!("joined"),
+        _ => Value::Null,
+    }
+}
+
 pub(crate) fn status_cmd(json: bool) -> Result<()> {
     if json {
         let pid = daemon_alive();
@@ -118,9 +132,19 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
+                // The fingerprint, "joined" for a joined device, or null: a
+                // device with no identity yet. Read only; status never mints.
+                "identity": identity_summary(),
             }))?
         );
         return Ok(());
+    }
+    if !crate::identity_flow::has_identity() {
+        ui::say(&format!(
+            "  {} {}",
+            ui::paint(ui::Tone::Dim, "·"),
+            crate::identity_flow::NO_IDENTITY_MSG
+        ));
     }
     match daemon_alive() {
         Some(pid) => ui::say(&format!(
@@ -383,30 +407,135 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_path = crate::platform::Paths::config_path("daemon.log");
     let args: Vec<&str> = daemon_argv.iter().map(String::as_str).collect();
-    let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
-    // Let the child write its pidfile before we return; poll briefly.
-    let mut came_up = false;
-    for _ in 0..50 {
-        if daemon_alive().is_some() {
-            came_up = true;
-            break;
+    // daemon.log is appended to, so remember where THIS run's output starts:
+    // a failure report must quote this daemon, not the last one.
+    let log_start = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let mut child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
+    let pid = child.id();
+    // "ok daemon detached" used to mean only "a pidfile appeared", and `up`
+    // writes its pidfile before it has done anything, so a daemon that died a
+    // moment later (no network, a bad --dir) was reported as running and this
+    // exited 0. Wait, bounded, for the daemon to say it is SERVING (the ready
+    // marker it writes beside sd_notify READY=1, or its control socket), or to
+    // exit, whichever comes first.
+    let deadline = std::time::Instant::now() + DETACH_READY_WAIT;
+    let outcome = loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            break DetachOutcome::Exited(status.code());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        if crate::file_io::ready_marker_pid() == Some(pid)
+            || (crate::ctl::daemon_present().await && daemon_alive() == Some(pid))
+        {
+            break DetachOutcome::Ready;
+        }
+        if std::time::Instant::now() >= deadline {
+            break DetachOutcome::NotReadyYet;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let tail = log_tail_since(&log_path, log_start, DETACH_LOG_LINES);
+    match outcome {
+        DetachOutcome::Ready => {
+            ui::say(&format!(
+                "  {} daemon detached and serving (pid {pid}, pidfile at {}) - output: {}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                pidfile().display(),
+                log_path.display()
+            ));
+            Ok(())
+        }
+        DetachOutcome::NotReadyYet => {
+            // Alive, not serving yet: it is still waiting for the network (the
+            // daemon retries by design rather than exit), so this is not a
+            // failure, but it must not read as "serving" either.
+            ui::say(&format!(
+                "  {} daemon started (pid {pid}) but is not connected yet; it keeps retrying in the background. Check with `tunlion status`. Output: {}",
+                ui::paint(ui::Tone::Warn, "!"),
+                log_path.display()
+            ));
+            if let Some(last) = tail.last() {
+                ui::say(&format!("    last: {last}"));
+            }
+            Ok(())
+        }
+        DetachOutcome::Exited(code) => {
+            let kind = detach_failure_kind(&tail);
+            ui::critical(&format!(
+                "{} the daemon exited during startup ({}). Its last output ({}):",
+                ui::paint(ui::Tone::Err, ui::glyph_err()),
+                code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed by a signal".into()),
+                log_path.display()
+            ));
+            if tail.is_empty() {
+                ui::critical("    (nothing was written)");
+            }
+            for line in &tail {
+                ui::critical(&format!("    {line}"));
+            }
+            Err(crate::exit_codes::reported(kind))
+        }
     }
-    let _ = child;
-    if came_up {
-        ui::say(&format!(
-            "  {} daemon detached (pidfile at {}) - output: {}",
-            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-            pidfile().display(),
-            log_path.display()
-        ));
-    } else {
-        ui::say(&format!(
-            "  {} spawned the daemon but it did not come up within 5s - output: {}",
-            ui::paint(ui::Tone::Warn, "!"),
-            log_path.display()
-        ));
+}
+
+/// How long `up --detach` waits for the daemon to report it is serving.
+const DETACH_READY_WAIT: Duration = Duration::from_secs(10);
+/// How many lines of the daemon's own output a failed `up --detach` quotes.
+const DETACH_LOG_LINES: usize = 12;
+
+/// What became of a detached daemon within `DETACH_READY_WAIT`.
+enum DetachOutcome {
+    Ready,
+    NotReadyYet,
+    Exited(Option<i32>),
+}
+
+/// The last `n` non-empty lines written to `path` after byte `start`, without
+/// terminal colour codes. Pure apart from the read.
+pub(crate) fn log_tail_since(path: &std::path::Path, start: u64, n: usize) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let from = usize::try_from(start).unwrap_or(0).min(bytes.len());
+    tail_lines(&String::from_utf8_lossy(&bytes[from..]), n)
+}
+
+/// The last `n` non-empty lines of `text`, ANSI escapes removed.
+pub(crate) fn tail_lines(text: &str, n: usize) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(strip_ansi)
+        .map(|l| l.trim_end().to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
     }
-    Ok(())
+    out
+}
+
+/// The exit kind for a daemon that died during `up --detach`, read from what
+/// it printed: the network if that is what it said, otherwise "other".
+pub(crate) fn detach_failure_kind(tail: &[String]) -> crate::exit_codes::ExitKind {
+    let text = tail.join("\n");
+    match crate::exit_codes::classify_text(&text) {
+        crate::exit_codes::ExitKind::Network => crate::exit_codes::ExitKind::Network,
+        _ => crate::exit_codes::ExitKind::Other,
+    }
 }

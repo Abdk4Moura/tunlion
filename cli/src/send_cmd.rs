@@ -658,6 +658,7 @@ pub(crate) async fn send_cmd(
             let _ = tx.send(Ev::Interrupted);
         });
     }
+    crate::send_report::record(&outgoing);
     let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
     let started = Instant::now();
     let claim_deadline = Duration::from_secs(600);
@@ -2069,6 +2070,7 @@ pub(crate) async fn send_cmd(
                 }
                 let completed = out.iter().filter(|o| o.done && !o.declined).count();
                 let declined = out.iter().filter(|o| o.declined).count();
+                crate::send_report::record(&out);
                 match send_outcome(completed, declined) {
                     SendOutcome::Complete { .. } => ui::say("done."),
                     SendOutcome::Declined {
@@ -2093,7 +2095,9 @@ pub(crate) async fn send_cmd(
                     SendOutcome::Declined {
                         completed,
                         declined,
-                    } => bail!("send incomplete: {completed} delivered, {declined} declined"),
+                    } => {
+                        return Err(crate::send_report::incomplete(completed, declined));
+                    }
                 }
             }
         }

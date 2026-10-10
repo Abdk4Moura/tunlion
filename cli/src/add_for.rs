@@ -373,8 +373,23 @@ pub(crate) async fn add_for_cmd(
     if !caps.interactive && daemon_alive().is_none() {
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running; start `tunlion up --install` before anyone claims this invitation.",
+            &receiver_not_running_note(crate::platform::ServiceHost::detect().supports_install()),
         ));
     }
     Ok(())
+}
+
+/// The warning for an invitation written while no receiver is running. It
+/// used to say "start `tunlion up --install`" on every platform, including the
+/// ones where `--install` then answers that it is not supported. Suggest it
+/// only where a service manager exists; `up --detach` works everywhere.
+pub(crate) fn receiver_not_running_note(can_install: bool) -> String {
+    let start = if can_install {
+        "tunlion up --install"
+    } else {
+        "tunlion up --detach"
+    };
+    format!(
+        "  note: the always-on receiver is not running; start `{start}` before anyone claims this invitation."
+    )
 }

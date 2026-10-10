@@ -302,6 +302,16 @@ pub fn say(line: &str) {
     }
 }
 
+/// One machine-readable JSON document on STDOUT, a line of its own. The
+/// `--json` result and failure envelopes go through here rather than a bare
+/// print so stdout carries exactly what a script parses and nothing else; it
+/// is never verbosity-gated, because a `-q` script still needs its answer.
+pub fn json_out(v: &serde_json::Value) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
+}
+
 /// CRITICAL level: the value-prop + must-see lines, the route label, the relay
 /// banner, P1's fall-to-relay, P5's upgrade/relay-released, and fatal errors.
 /// ALWAYS printed, even under `-q` (critical is level 0).

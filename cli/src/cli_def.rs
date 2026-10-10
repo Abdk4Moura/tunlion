@@ -64,7 +64,23 @@ EXAMPLES
   tunlion forward laptop:5432       tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://tunlion.autumated.com
-  Run `tunlion <command> --help` for details.";
+  Run `tunlion <command> --help` for details.
+
+EXIT CODES
+  0    success
+  1    any other error
+  2    usage: bad arguments or flags
+  3    unknown device, or not paired with this one
+  4    denied: refused by the peer, a capability, or the system
+  5    reach --until-direct: the link is up but still on a relay
+  6    the peer is offline, unreachable, or did not answer in time
+  7    can't reach the tunlion server (no internet or DNS)
+  8    partial: some files moved and some did not
+  9    this device has no identity yet (init, or join an invitation)
+  130  interrupted
+  exec passes the remote command's own exit status through.
+  With --json, a failure is one JSON object on stdout:
+  {\"ok\":false,\"error\":{\"code\":\"unknown_device\",\"exit\":3,\"message\":\"...\"}}";
 
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
@@ -122,7 +138,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "WHEN", value_parser = ["auto", "always", "never"])]
     pub(crate) color: Option<String>,
     /// JSON output (structured, parseable) where a command supports it: init,
-    /// add, join, id, status, set, reach, sync, doctor, addr and devices. Any
+    /// add, join, id, status, set, reach, send, sync, doctor, addr and devices. Any
     /// other command refuses --json rather than mixing human text into it.
     /// Independent of TTY: a pipe still gets human text unless --json is set.
     #[arg(long, global = true)]
@@ -573,12 +589,14 @@ pub(crate) enum Cmd {
         /// Device to probe (omit for the environment preflight).
         dev: Option<String>,
         /// Keep probing (one line a second) until the link is direct: exit 0 on
-        /// the first direct path, exit 5 if it is still on a relay at --timeout.
+        /// the first direct path, exit 5 if it is still on a relay at --timeout,
+        /// exit 6 if there is no link at all (the peer is offline).
         #[arg(long)]
         until_direct: bool,
-        /// Seconds to wait for a direct path with --until-direct.
-        #[arg(long, value_name = "SECS", default_value_t = 30)]
-        timeout: u64,
+        /// Seconds to wait (default 30): for the peer to answer, or with
+        /// --until-direct for a direct path. An unreachable peer exits 6.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,

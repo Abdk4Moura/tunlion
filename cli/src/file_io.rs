@@ -18,14 +18,66 @@ pub(crate) fn pidfile() -> PathBuf {
     devices_path().with_file_name("up.pid")
 }
 
+/// Where the daemon records the executable it started from, beside `up.pid`.
+pub(crate) fn pidfile_exe() -> PathBuf {
+    devices_path().with_file_name("up.exe")
+}
+
+/// Written once the daemon is serving (connected to signaling, control socket
+/// bound), holding its pid. `up --detach` waits on it: a pidfile alone exists
+/// from the first instant of `up`, so it cannot tell "serving" from "about to
+/// die".
+pub(crate) fn ready_marker() -> PathBuf {
+    devices_path().with_file_name("up.ready")
+}
+
 /// Record the daemon's identity beside its pid. A pid alone can be recycled and
-/// a name substring can lie, so the pidfile carries the executable path the
-/// daemon started from; `daemon_alive` confirms it against the live process.
+/// a name substring can lie, so the executable path the daemon started from is
+/// recorded too; `daemon_alive` confirms it against the live process.
+///
+/// `up.pid` holds the pid ALONE, so `kill $(cat up.pid)` works. The path used
+/// to be its second line, which made that idiom expand to `kill <pid> <path>`
+/// and fail; it lives in `up.exe` now. `daemon_alive` still reads a two-line
+/// pidfile written by an older daemon that is running across an upgrade.
 pub(crate) fn write_pidfile() -> Result<()> {
     let pid = std::process::id();
     let exe = std::env::current_exe()?;
-    crate::platform::SecretFile::write_str(&pidfile(), &format!("{pid}\n{}\n", exe.display()))?;
+    let _ = std::fs::remove_file(ready_marker());
+    // Owner-only, like the rest of the config dir (#388).
+    crate::platform::SecretFile::write_str(&pidfile_exe(), &format!("{}\n", exe.display()))?;
+    crate::platform::SecretFile::write_str(&pidfile(), &format!("{pid}\n"))?;
     Ok(())
+}
+
+/// Remove what `write_pidfile` and `mark_daemon_ready` wrote.
+pub(crate) fn remove_pidfile() {
+    let _ = std::fs::remove_file(pidfile());
+    let _ = std::fs::remove_file(pidfile_exe());
+    let _ = std::fs::remove_file(ready_marker());
+}
+
+/// The daemon is serving. Best-effort: a missing marker only makes
+/// `up --detach` report "not ready yet", never a false success.
+pub(crate) fn mark_daemon_ready() {
+    let _ = std::fs::write(ready_marker(), format!("{}\n", std::process::id()));
+}
+
+/// The pid recorded in the ready marker, if any.
+pub(crate) fn ready_marker_pid() -> Option<u32> {
+    std::fs::read_to_string(ready_marker()).ok()?.trim().parse().ok()
+}
+
+/// Parse a pidfile: the pid on the first line, and (legacy format only) the
+/// executable path on the second.
+pub(crate) fn parse_pidfile(raw: &str) -> Option<(u32, Option<PathBuf>)> {
+    let mut lines = raw.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let legacy_exe = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    Some((pid, legacy_exe))
 }
 
 pub(crate) fn write_owner_only_file(path: &Path, contents: &str) -> Result<()> {
@@ -191,5 +243,27 @@ mod invitation_prefix_tests {
                 .collect();
             assert_eq!(got, digest, "frozen invitation prefix {name} changed");
         }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pidfile_tests {
+    use super::parse_pidfile;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_pidfile_is_the_pid_alone_and_the_legacy_form_still_reads() {
+        // What write_pidfile writes now: `kill $(cat up.pid)` gets one word.
+        assert_eq!(parse_pidfile("4242\n"), Some((4242, None)));
+        let written = format!("{}\n", 4242);
+        assert_eq!(written.split_whitespace().count(), 1, "one token for kill");
+        // What an older daemon wrote: the pid, then its executable.
+        assert_eq!(
+            parse_pidfile("4242\n/usr/bin/tunlion\n"),
+            Some((4242, Some(PathBuf::from("/usr/bin/tunlion"))))
+        );
+        assert_eq!(parse_pidfile(""), None);
+        assert_eq!(parse_pidfile("not-a-pid\n"), None);
     }
 }

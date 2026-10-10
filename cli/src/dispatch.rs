@@ -112,6 +112,7 @@ pub(crate) fn json_supported(cmd: &Cmd) -> bool {
             | Cmd::Status { .. }
             | Cmd::Set { .. }
             | Cmd::Reach { .. }
+            | Cmd::Send { .. }
             | Cmd::Sync { .. }
             | Cmd::Doctor { .. }
             | Cmd::Addr { .. }
@@ -390,7 +391,22 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
     }
+    // The verb's name, for the --json failure envelope. The first argv token
+    // that names a subcommand (aliases resolve to the canonical name).
+    let verb_name: Option<String> = {
+        use clap::CommandFactory;
+        let c = Cli::command();
+        argv.iter().skip(1).find_map(|t| {
+            c.get_subcommands()
+                .find(|sc| sc.get_name() == t || sc.get_all_aliases().any(|a| a == t))
+                .map(|sc| sc.get_name().to_string())
+        })
+    };
     let cli = Cli::parse_from(argv);
+    // From here every failure under --json is reported as the JSON envelope on
+    // stdout (exit_codes::report). Subcommands with their own `json` flag
+    // (reach, doctor) shadow the global one and set it again in their arm.
+    crate::exit_codes::set_json_mode(cli.json, verb_name.as_deref());
     let ui_caps = UiCapability::from_cli(&cli);
     // Resolve the global output verbosity ONCE, before any worker spawns:
     // FILAMENT_LOG (if set) overrides the -v/-q flags. Default = info.
@@ -451,9 +467,10 @@ pub(crate) async fn async_main() -> Result<()> {
         return tour_cmd();
     };
     if cli.json && !json_supported(&cmd) {
-        bail!(
-            "--json is not implemented for this operation; refusing to mix human output with machine data"
-        );
+        return Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            "--json is not implemented for this operation; refusing to mix human output with machine data",
+        ));
     }
     match cmd {
         Cmd::Init {
@@ -499,7 +516,9 @@ pub(crate) async fn async_main() -> Result<()> {
             remember,
             auth_key,
         } => {
-            if let Some(ak_path) = auth_key {
+            let json_out = ui_caps.json || cli.json;
+            let peer = to.clone();
+            let res = if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
             } else {
                 send_cmd(
@@ -514,7 +533,12 @@ pub(crate) async fn async_main() -> Result<()> {
                     remember,
                 )
                 .await
+            };
+            if json_out {
+                // One result object on stdout, success or failure.
+                return crate::send_report::emit(res, peer.as_deref());
             }
+            res
         }
         Cmd::Receive {
             code,
@@ -681,23 +705,13 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Id { action } => {
             match action.unwrap_or(IdAction::Show) {
                 IdAction::Show => {
-                    // U1: a keyless device gets its identity minted here, and
-                    // `id` is the one inspect verb that should mint, because the
-                    // identity IS its subject. Two devices keep the pre-U1
-                    // no-key display below instead: a joined one, which must
-                    // never quietly become a second owner, and one that set the
-                    // opt-out, which asked for the old answer and must keep
-                    // getting it (`{"configured": false}`, exit 0) rather than
-                    // an error the old build never returned.
-                    let key = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
-                        Some(key) => Some(key),
-                        None if local_device_cert_path().exists()
-                            || crate::identity_flow::implicit_init_disabled() =>
-                        {
-                            None
-                        }
-                        None => Some(crate::identity_flow::ensure_user_key(ui_caps.json)?),
-                    };
+                    // `id` LOOKS; it never mints. It used to (U1, "the identity
+                    // is its subject"), and a first-time user who ran `tunlion
+                    // id` to see where they stood then found `tunlion join`
+                    // refusing the machine for already having an identity.
+                    // A keyless device gets the answer every read-only verb
+                    // gives: no identity yet, exit 9 (exit_codes::NoIdentity).
+                    let key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
                     match key {
                         None => {
                             if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
@@ -747,21 +761,19 @@ pub(crate) async fn async_main() -> Result<()> {
                                     }
                                 }
                             }
-                            if ui_caps.json {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({ "configured": false }))?
-                                );
-                            } else if local_device_cert_path().exists() {
-                                crate::ui::say(&format!(
-                                    "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
-                                ));
+                            if local_device_cert_path().exists() {
+                                if ui_caps.json {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&json!({ "configured": false }))?
+                                    );
+                                } else {
+                                    crate::ui::say(&format!(
+                                        "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
+                                    ));
+                                }
                             } else {
-                                // The opt-out path: implicit minting is off, so
-                                // this is the pre-U1 answer, verbatim.
-                                println!(
-                                    "no identity yet. Run 'tunlion init' or 'tunlion join'."
-                                );
+                                return Err(crate::identity_flow::no_identity(ui_caps.json));
                             }
                         }
                         Some(uk) => {
@@ -1063,6 +1075,9 @@ pub(crate) async fn async_main() -> Result<()> {
                 // before the ceremony so a bad value fails before a code shows.
                 let enrol_ttl = crate::pair_cmd::code_enrolment_ttl(expires.as_deref(), internal)?;
                 let quick = ui_caps.interactive && who_given && via_defaulted;
+                if code.is_none() && word.is_none() && !crate::interactive_allowed() {
+                    return Err(add_code_needs_people(named.as_deref()));
+                }
                 pair_cmd(
                     &server,
                     code,
@@ -1081,6 +1096,12 @@ pub(crate) async fn async_main() -> Result<()> {
                 // pre-existing behaviour. It issues no certificate, so a
                 // `--expires` here would bound nothing: refused, not ignored.
                 crate::pair_cmd::code_enrolment_ttl(expires.as_deref(), false)?;
+                // `pair_cmd` refuses a non-terminal with the message for a BARE
+                // `add`. If arguments were given, answer what was typed instead.
+                let args_given = via.is_some() || name.is_some() || !allow.is_empty() || expires.is_some();
+                if args_given && code.is_none() && word.is_none() && !crate::interactive_allowed() {
+                    return Err(add_code_needs_people(name.as_deref()));
+                }
                 pair_cmd(&server, code, name, word, relay, false, allow, None, false).await
             }
         }
@@ -1124,6 +1145,7 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Depart => depart_cmd(&server, relay).await,
         Cmd::Devices { action, json, caps } => {
+            crate::exit_codes::set_json_mode(json || ui_caps.json, Some("devices"));
             if let Some(selector) = caps {
                 if action.is_some() {
                     bail!("--caps is a view; it takes a device name, not a subcommand");
@@ -1177,6 +1199,11 @@ pub(crate) async fn async_main() -> Result<()> {
                             roster_heading,
                         );
                         println!("{rendered}");
+                        // Read only: a device with no identity is told how to
+                        // get one, and nothing is minted by looking.
+                        if !crate::identity_flow::has_identity() {
+                            ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+                        }
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
@@ -1469,6 +1496,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 );
             }
             let json = json || ui_caps.json;
+            crate::exit_codes::set_json_mode(json, Some("reach"));
             match dev {
                 Some(d) if d.contains(':') => bail!(
                     "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `tunlion forward {d}`"
@@ -1501,9 +1529,9 @@ pub(crate) async fn async_main() -> Result<()> {
                         return Ok(());
                     }
                     if until_direct {
-                        crate::ping::reach_until_direct(&d, timeout, json, relay).await
+                        crate::ping::reach_until_direct(&d, timeout.unwrap_or(30), json, relay).await
                     } else {
-                        crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                        crate::ping::ping_cmd(&server, &d, 1, json, relay, timeout).await
                     }
                 }
                 None => bail!(
@@ -1573,6 +1601,7 @@ pub(crate) async fn async_main() -> Result<()> {
             repeat,
             json,
         } => {
+            crate::exit_codes::set_json_mode(json || ui_caps.json, Some("doctor"));
             if let Some(d) = &device {
                 require_known_device(d)?;
             }
@@ -2189,4 +2218,12 @@ pub(crate) async fn async_main() -> Result<()> {
             .await
         }
     }
+}
+
+/// `add ... --via code` with no terminal: print the refusal addressed to the
+/// arguments that were given, and fail as a usage error (exit 2).
+fn add_code_needs_people(named: Option<&str>) -> anyhow::Error {
+    let (message, _) = fleet_ui::pair_ui::err_add_code_noninteractive(named);
+    ui::critical(&message);
+    crate::exit_codes::reported(crate::exit_codes::ExitKind::Usage)
 }

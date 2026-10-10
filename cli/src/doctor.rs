@@ -17,6 +17,7 @@
 // It is purely additive: it changes no wire framing or control messages.
 
 use crate::diag::{self, Phase};
+use crate::exit_codes::{self, ExitKind};
 use crate::ui::{self, Tone};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -61,11 +62,11 @@ async fn probe_mode(
     if runs == 1 {
         let outcome = crate::l2::establish_probe(server, device, relay).await?;
         if json_out {
-            println!("{}", single_json(device, &outcome).to_string());
+            ui::json_out(&single_json(device, &outcome));
         } else {
             print_ladder(device, &outcome);
         }
-        return Ok(());
+        return probe_result(std::slice::from_ref(&outcome));
     }
 
     // Repeat: collect outcomes, then print (or emit) a distribution summary.
@@ -89,11 +90,29 @@ async fn probe_mode(
     }
 
     if json_out {
-        println!("{}", repeat_json(device, &outcomes).to_string());
+        ui::json_out(&repeat_json(device, &outcomes));
     } else {
         print_distribution(device, &outcomes);
     }
-    Ok(())
+    probe_result(&outcomes)
+}
+
+/// The process result for a set of probes. `doctor <device>` used to exit 0
+/// whatever it found, so `doctor laptop && deploy` deployed to an offline
+/// laptop. Every probe must establish: one that did not is exit 6 (the peer),
+/// or 7 when what failed was reaching the tunlion server. The report was
+/// already printed, so the error carries only the code.
+fn probe_result(outcomes: &[crate::l2::ProbeOutcome]) -> Result<()> {
+    match probe_failure_kind(outcomes) {
+        None => Ok(()),
+        Some(kind) => Err(exit_codes::reported(kind)),
+    }
+}
+
+/// Pure half of `probe_result`: `None` when every probe established.
+fn probe_failure_kind(outcomes: &[crate::l2::ProbeOutcome]) -> Option<ExitKind> {
+    let failed = outcomes.iter().find(|o| !o.established)?;
+    Some(crate::ping::cold_failure_kind(failed.error.as_deref()))
 }
 
 /// A computed verdict for one probe: the headline phase + a human line.
@@ -293,6 +312,8 @@ const PHASES: &[Phase] = &[
 fn single_json(device: &str, o: &crate::l2::ProbeOutcome) -> Value {
     let v = verdict(o);
     json!({
+        // `ok` is the answer: the peer was reached. Exit code agrees (6 if not).
+        "ok": o.established,
         "kind": "filament-doctor-probe",
         "device": device,
         "established": o.established,
@@ -340,6 +361,8 @@ fn repeat_json(device: &str, outcomes: &[crate::l2::ProbeOutcome]) -> Value {
     }
     let unhealthy = outcomes.iter().filter(|o| !verdict(o).healthy).count();
     json!({
+        // Every run established, the same rule the exit code applies.
+        "ok": established == n,
         "kind": "filament-doctor-repeat",
         "device": device,
         "runs": n,
@@ -373,8 +396,8 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     let sshca = crate::sshd::check_sshd_ca();
 
     if json_out {
-        println!("{}", preflight_json(server, &sig, &ice, &ifaces, &history, &sshca).to_string());
-        return Ok(());
+        ui::json_out(&preflight_json(server, &sig, &ice, &ifaces, &history, &sshca));
+        return preflight_result(&sig);
     }
 
     println!();
@@ -458,7 +481,19 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     println!();
     print_history(&history);
     println!();
-    Ok(())
+    if !crate::identity_flow::has_identity() {
+        ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+    }
+    preflight_result(&sig)
+}
+
+/// The preflight is healthy when the tunlion server answered; without it
+/// nothing else works, so that is exit 7 rather than 0.
+fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
+    match sig {
+        Ok(_) => Ok(()),
+        Err(_) => Err(exit_codes::reported(ExitKind::Network)),
+    }
 }
 
 fn print_history(h: &diag::Summary) {
@@ -725,6 +760,16 @@ fn preflight_json(
         Err(e) => json!({ "configured": false, "detail": e }),
     };
     json!({
+        // Healthy means the tunlion server answered (the exit code agrees).
+        "ok": sig.is_ok(),
+        // Read only: the fingerprint, "joined", or null with no identity yet.
+        "identity": crate::identity_flow::has_identity().then(|| {
+            crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
+                .ok()
+                .flatten()
+                .map(|k| k.fingerprint())
+                .unwrap_or_else(|| "joined".to_string())
+        }),
         "kind": "filament-doctor-preflight",
         "server": server,
         "signaling": sig_json,
@@ -766,6 +811,35 @@ mod tests {
 
     fn t(phase: Phase, dur_ms: u64) -> PhaseTiming {
         PhaseTiming { phase, dur_ms, over_budget: diag::over_budget(phase, dur_ms) }
+    }
+
+    fn offline(error: &str) -> ProbeOutcome {
+        ProbeOutcome {
+            timings: vec![t(Phase::Signaling, 300)],
+            total_ms: 30_000,
+            established: false,
+            failed_phase: Some(Phase::Presence),
+            error: Some(error.to_string()),
+            path: None,
+        }
+    }
+
+    /// The reported defect: `doctor <offline> --json` said ok and exited 0.
+    #[test]
+    fn an_offline_peer_is_not_ok_and_exits_unreachable() {
+        let o = offline("establishment timed out after 30s");
+        assert_eq!(single_json("laptop", &o)["ok"], json!(false));
+        assert_eq!(probe_failure_kind(std::slice::from_ref(&o)), Some(ExitKind::Unreachable));
+        let net = offline("signaling connect to https://x: dns error");
+        assert_eq!(probe_failure_kind(&[net]), Some(ExitKind::Network));
+        let mut up = offline("");
+        up.established = true;
+        up.error = None;
+        assert_eq!(single_json("laptop", &up)["ok"], json!(true));
+        assert_eq!(probe_failure_kind(std::slice::from_ref(&up)), None);
+        // One failed run in a --repeat is not healthy.
+        let v = repeat_json("laptop", &[up, offline("timed out")]);
+        assert_eq!(v["ok"], json!(false));
     }
 
     #[test]
