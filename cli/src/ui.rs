@@ -272,6 +272,50 @@ fn paint_live(line: &str) {
     LIVE.store(true, Ordering::Relaxed);
 }
 
+// ------------------------------------------------------------- broken pipe --
+
+/// A reader that stopped reading is not a failure of this command.
+///
+/// `tunlion status | head -2` exited 101 with a Rust panic: Rust ignores
+/// SIGPIPE, so every write after `head` exits returns EPIPE, and `println!` /
+/// `eprintln!` panic on any write error. Standard tools die quietly there
+/// (SIGPIPE); this does the equivalent for the output macros everywhere at
+/// once: a panic whose cause is a print hitting a closed pipe exits 0 with
+/// nothing on the terminal, and every other panic reports exactly as before.
+/// Exit 0, as ripgrep does: the consumer asked for less, and a pipeline under
+/// `set -o pipefail` must not fail because `head` did its job.
+///
+/// SIGPIPE itself stays ignored on purpose. Restoring its default would also
+/// kill the daemon on any write to a peer or a child that went away, which is
+/// exactly the case the ignored signal exists for.
+pub fn exit_quietly_on_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if is_broken_pipe_print(payload) {
+            std::process::exit(0);
+        }
+        previous(info);
+    }));
+}
+
+/// True for the panic std raises when `print!`/`eprint!` hit a closed pipe:
+/// "failed printing to stdout: Broken pipe (os error 32)". Windows words EPIPE
+/// as "The pipe is being closed. (os error 232)".
+pub fn is_broken_pipe_print(msg: &str) -> bool {
+    msg.starts_with("failed printing to")
+        && (msg.contains("Broken pipe") || msg.contains("os error 32)") || msg.contains("os error 232)"))
+}
+// Deliberately NOT also "any error whose cause is BrokenPipe": a peer socket
+// or a child's stdin closing mid-transfer is a real failure of the command,
+// and exiting 0 on it would report a send that did not happen as a success.
+// Only the print macros' own panic names our stdout or stderr for certain.
+
 /// Permanent line (survives in scrollback); repaints any sticky line below.
 /// The raw emitter, every leveled helper funnels through here once it has
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
@@ -721,5 +765,20 @@ mod verbosity_tests {
 
         // restore default for any later same-process readers.
         VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
+    }
+
+    /// `tunlion status | head -2` exited 101: std panics with exactly this
+    /// text when a print hits a closed pipe. Only that panic is quiet; any
+    /// other panic, including one that merely mentions a pipe, still reports.
+    #[test]
+    fn only_a_print_into_a_closed_pipe_is_a_quiet_exit() {
+        assert!(is_broken_pipe_print("failed printing to stdout: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print("failed printing to stderr: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print(
+            "failed printing to stdout: The pipe is being closed. (os error 232)"
+        ));
+        assert!(!is_broken_pipe_print("failed printing to stdout: No space left on device (os error 28)"));
+        assert!(!is_broken_pipe_print("called `Result::unwrap()` on an `Err` value: Broken pipe"));
+        assert!(!is_broken_pipe_print("index out of bounds"));
     }
 }
