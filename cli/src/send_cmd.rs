@@ -918,14 +918,24 @@ pub(crate) async fn send_cmd(
             last_state_ping = Instant::now();
             for l in conn.links.values() {
                 if let Some(t) = &l.transport {
-                    let _ = t
-                        .send_control(&json!({
+                    // BOUNDED, as the receiver's identical loop already is. A
+                    // data-channel write to a receiver that was killed mid-transfer
+                    // never returns (the SCTP send queue is full and nothing will
+                    // ever acknowledge it), and this runs inline in the event loop:
+                    // unbounded, it parked the whole sender, which then never saw
+                    // the peer leave, never opened the rejoin window and never
+                    // answered the replacement receiver (gate 2 hung CI for 85
+                    // minutes at a time). The ping is best-effort; cap it.
+                    let _ = tokio::time::timeout(
+                        crate::conn::CONTROL_PROBE_BUDGET,
+                        t.send_control(&json!({
                             "type": "state", "v": 1,
                             "transfers": {},
                             "trusted": l.trusted,
                             "away": false,
-                        }))
-                        .await;
+                        })),
+                    )
+                    .await;
                 }
             }
         }
