@@ -238,6 +238,14 @@ pub(crate) enum Presence {
     Reconnecting,
 }
 
+/// Is a dropped link's departure worth a line? Not when another link to a
+/// peer of the same name is still up: that was a stale duplicate, and "alpha
+/// left" beside "ok alpha" is a contradiction on one line. An unnamed link
+/// (empty name) is always news. Pure.
+pub(crate) fn departure_is_news<'a>(name: &str, remaining: impl IntoIterator<Item = &'a str>) -> bool {
+    name.is_empty() || !remaining.into_iter().any(|n| n == name)
+}
+
 fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
     match p {
         Presence::Ready => (ui::glyph_ok(), ui::Tone::Ok, ""),
@@ -3903,5 +3911,18 @@ mod tests {
             "unrelated-paired-sid",
             Some("unrelated-install")
         ));
+    }
+}
+
+#[cfg(test)]
+mod departure_tests {
+    use super::departure_is_news;
+
+    #[test]
+    fn a_stale_duplicate_of_a_linked_peer_is_not_a_departure() {
+        assert!(!departure_is_news("alpha", ["alpha", "bravo"]), "alpha is still linked");
+        assert!(departure_is_news("alpha", ["bravo"]));
+        assert!(departure_is_news("alpha", std::iter::empty::<&str>()));
+        assert!(departure_is_news("", ["", "alpha"]), "an unnamed link is always reported");
     }
 }
