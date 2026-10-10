@@ -281,6 +281,11 @@ struct Report {
     json: bool,
     moved: u64,
     counts: BTreeMap<&'static str, u64>,
+    /// Files on the device that the local directory does not have, left in
+    /// place because `--delete` was not given. Counted so the summary can say
+    /// so: sync is a one-way update, and a deletion on the source that is not
+    /// carried over must not pass silently.
+    kept_on_peer: u64,
 }
 impl Report {
     fn line(&mut self, state: &'static str, p: &str, bytes: u64, reason: Option<&str>) {
@@ -314,7 +319,7 @@ pub(crate) async fn run(
     relay: bool,
     opts: SyncOpts,
 ) -> i32 {
-    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new() };
+    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new(), kept_on_peer: 0 };
     match sync_inner(server, local, peer, remote_dir, relay, &opts, &mut rep).await {
         Ok(total) => {
             let partial = rep.counts.get("failed").copied().unwrap_or(0) > 0;
@@ -324,6 +329,7 @@ pub(crate) async fn run(
                 for (k, v) in &rep.counts {
                     d[k] = json!(v);
                 }
+                d["only_on_peer"] = json!(rep.kept_on_peer);
                 println!("{}", json!({ "ok": !partial, "verb": "sync", "data": d }));
             } else {
                 let c = |k: &str| rep.counts.get(k).copied().unwrap_or(0);
@@ -344,6 +350,9 @@ pub(crate) async fn run(
                     },
                     if partial { format!(", {} FAILED", c("failed")) } else { String::new() },
                 ));
+                if let Some(line) = kept_on_peer_line(rep.kept_on_peer, peer) {
+                    ui::say(&line);
+                }
             }
             exit
         }
@@ -363,6 +372,19 @@ pub(crate) async fn run(
             exit
         }
     }
+}
+
+/// The honest end of a sync without `--delete`: files that exist only on the
+/// device were left there. A first-time-user test deleted a file locally,
+/// re-ran sync, and saw nothing say that the device still had it.
+fn kept_on_peer_line(n: u64, peer: &str) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "  {n} file{} exist{} only on '{peer}' (not deleted; use --delete to remove)",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "s" } else { "" },
+        )
+    })
 }
 
 async fn sync_inner(
@@ -492,6 +514,9 @@ async fn sync_inner(
             rep.line("failed", &n.p, bytes, Some(ack["err"].as_str().unwrap_or("receiver refused the file")));
         }
     }
+    if !opts.delete {
+        rep.kept_on_peer = plan.extra.len() as u64;
+    }
     if opts.delete && !plan.extra.is_empty() {
         if opts.dry_run {
             for p in &plan.extra {
@@ -581,7 +606,8 @@ pub(crate) fn resolve_root(drop_dir: &Path, req: &str, create: bool) -> Result<P
     if !create && !target.exists() {
         return Ok(target);
     }
-    std::fs::create_dir_all(&target).map_err(|e| format!("cannot create remote dir: {e}"))?;
+    crate::platform::create_content_dirs(drop_dir, &target)
+        .map_err(|e| format!("cannot create remote dir: {e}"))?;
     if !crate::path_within_canonical(drop_dir, &target) {
         return Err(outside());
     }
@@ -701,9 +727,7 @@ async fn serve_sync(
                 let mut gone = Vec::new();
                 for p in m["paths"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
                     let Some(rel) = safe_relpath(p) else { continue };
-                    let target = root.join(rel);
-                    let is_file = std::fs::symlink_metadata(&target).map(|md| md.is_file()).unwrap_or(false);
-                    if crate::path_within(root, &target) && is_file && std::fs::remove_file(&target).is_ok() {
+                    if delete_within(root, &rel) {
                         gone.push(p.to_string());
                     }
                 }
@@ -722,6 +746,52 @@ async fn serve_sync(
 /// the root: every existing ancestor first, then the parent once it exists.
 /// Nothing is written before both hold.
 fn bound_parent(root: &Path, parent: &Path) -> Result<()> {
+    refuse_symlinked_ancestors(root, parent)?;
+    let mut probe = parent.to_path_buf();
+    while !probe.exists() {
+        probe = match probe.parent() {
+            Some(p) => p.to_path_buf(),
+            None => bail!("path escapes the remote dir"),
+        };
+    }
+    if !crate::path_within_canonical(root, &probe) {
+        bail!("path escapes the remote dir");
+    }
+    crate::platform::create_content_dirs(root, parent)?;
+    if !crate::path_within_canonical(root, parent) {
+        bail!("path escapes the remote dir");
+    }
+    Ok(())
+}
+
+/// Remove `root/rel` for `sync --delete`, under the SAME containment rule the
+/// writes use. `path_within` is lexical and `symlink_metadata` only looks at
+/// the last component, so `root/sub -> /elsewhere` used to make `sub/f` a
+/// deletable path that removed `/elsewhere/f`. Here every ancestor below the
+/// root must exist and not be a symlink, the parent must canonicalize inside
+/// the root, and the target itself must be a regular file (a symlink is never
+/// followed). Creates nothing. Returns whether a file was removed.
+fn delete_within(root: &Path, rel: &Path) -> bool {
+    let target = root.join(rel);
+    if !crate::path_within(root, &target) {
+        return false;
+    }
+    let Some(parent) = target.parent() else { return false };
+    if refuse_symlinked_ancestors(root, parent).is_err() {
+        return false;
+    }
+    // A parent that does not exist holds nothing to delete.
+    if !parent.is_dir() || !crate::path_within_canonical(root, parent) {
+        return false;
+    }
+    let is_file = std::fs::symlink_metadata(&target).map(|md| md.is_file()).unwrap_or(false);
+    is_file && std::fs::remove_file(&target).is_ok()
+}
+
+/// Refuse any symlinked component of `parent` below `root` (root itself is not
+/// walked, so a root reached through a symlink stays legitimate). Shared by the
+/// write path (`bound_parent`) and the delete path (`delete_within`).
+fn refuse_symlinked_ancestors(root: &Path, parent: &Path) -> Result<()> {
     // REFUSE BEFORE CREATING. Every component of `parent` below `root` is checked for
     // symlinks before anything is created, because the checks below can only report what
     // they find: `create_dir_all` follows a symlinked parent, so a refusal issued after it
@@ -746,20 +816,6 @@ fn bound_parent(root: &Path, parent: &Path) -> Result<()> {
                 Err(_) => break,
             }
         }
-    }
-    let mut probe = parent.to_path_buf();
-    while !probe.exists() {
-        probe = match probe.parent() {
-            Some(p) => p.to_path_buf(),
-            None => bail!("path escapes the remote dir"),
-        };
-    }
-    if !crate::path_within_canonical(root, &probe) {
-        bail!("path escapes the remote dir");
-    }
-    std::fs::create_dir_all(parent)?;
-    if !crate::path_within_canonical(root, parent) {
-        bail!("path escapes the remote dir");
     }
     Ok(())
 }
@@ -959,6 +1015,44 @@ mod tests {
             // verbatim paths) and this is the assertion that caught it, while on Unix the old
             // canonical re-check already refused before creating anything below the symlink.
             assert!(!out.join("x").exists(), "nothing was created outside the root");
+        } else {
+            crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn files_left_on_the_peer_are_reported_not_silent() {
+        assert_eq!(kept_on_peer_line(0, "box"), None);
+        assert_eq!(
+            kept_on_peer_line(1, "box").as_deref(),
+            Some("  1 file exists only on 'box' (not deleted; use --delete to remove)")
+        );
+        assert_eq!(
+            kept_on_peer_line(3, "box").as_deref(),
+            Some("  3 files exist only on 'box' (not deleted; use --delete to remove)")
+        );
+    }
+
+    /// `sync --delete` must use the same containment as the writes: a
+    /// symlinked directory inside the root pointing outside is not a way to
+    /// delete files outside it.
+    #[test]
+    fn delete_does_not_follow_a_symlinked_dir_out_of_the_root() {
+        let root = tmp("del");
+        let out = tmp("del-outside");
+        std::fs::write(out.join("victim"), b"keep me").unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("real/gone"), b"x").unwrap();
+        assert!(delete_within(&root, Path::new("real/gone")), "a plain file inside is deleted");
+        assert!(!root.join("real/gone").exists());
+        assert!(!delete_within(&root, Path::new("missing/f")), "nothing to delete, nothing created");
+        assert!(!root.join("missing").exists());
+        if crate::platform::symlink(&out, &root.join("sub")).is_ok() {
+            assert!(crate::path_within(&root, &root.join("sub/victim")), "lexically inside");
+            assert!(!delete_within(&root, Path::new("sub/victim")), "a symlinked parent must be refused");
+            assert_eq!(std::fs::read(out.join("victim")).unwrap(), b"keep me", "the outside file survives");
         } else {
             crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
         }

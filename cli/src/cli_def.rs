@@ -29,7 +29,7 @@ COMMANDS
     receive [code]         receive from a code or your nearby network
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     exec <device> [--] cmd run a command on a device (argv crosses exactly)
-    sync <dir> <device>:<dir>  mirror a directory onto a device (only changes move)
+    sync <dir> <device>:<dir>  update a directory on a device (one-way; only changes move)
     reach <device>         check if a device is reachable (direct/relay + rtt)
     forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
@@ -513,6 +513,10 @@ pub(crate) enum Cmd {
         /// HTTP CONNECT proxy port (0 = disabled)
         #[arg(long, default_value_t = 0)]
         http_port: u16,
+        /// Allow --bind to a non-loopback address (the proxy is then reachable
+        /// from the network, guarded only by its password). Refused without it.
+        #[arg(long)]
+        allow_remote: bool,
     },
     /// (hidden for one release) The netcat shape moved into `forward --stdio`.
     #[command(hide = true)]
@@ -704,15 +708,17 @@ pub(crate) enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
-    /// Mirror a local directory onto a paired device; only changed chunks move.
+    /// Update a directory on a paired device from a local one; only changed chunks move.
     ///
-    /// The receiver's `tunlion up` writes under its drop directory, so
+    /// One-way: new and changed files go to the device. A file deleted here is
+    /// NOT deleted there unless you pass --delete; without it, the summary
+    /// counts the files that exist only on the device. The receiver's `tunlion up` writes under its drop directory, so
     /// <remote-dir> is relative to (or absolute within) that directory. The
     /// receiver's consent is the existing pairing and transfer grant: there is
     /// no prompt on either end. Re-running after an interruption moves only
     /// what is still missing.
     Sync {
-        /// Local directory to mirror
+        /// Local directory to copy from
         local: PathBuf,
         /// Destination as <device>:<remote-dir>
         dest: String,

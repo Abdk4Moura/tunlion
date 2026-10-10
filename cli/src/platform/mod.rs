@@ -1,3 +1,5 @@
+pub mod fs_at;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -251,6 +253,196 @@ pub fn tighten_new_dir(dir: &Path) {
     #[cfg(not(unix))]
     {
         let _ = dir;
+    }
+}
+
+/// Create the receiving inbox (the drop dir, `~/Tunlion` by default) and any
+/// missing parent, owner-only (0700 on unix). Peers write into it, so it is not
+/// a shared folder: before this it took the process umask (0777 & ~umask), and
+/// under umask 0 anyone on the machine could plant or swap files in it. An
+/// inbox that already exists is left as the user set it. Windows: the
+/// profile's inherited ACL already makes it owner-only; nothing to set.
+pub fn create_inbox_dir(dir: &Path) -> std::io::Result<()> {
+    create_dirs_with_mode(dir, 0o700)
+}
+
+/// Create directories for content received or synced from a peer, under
+/// `inbox` (created owner-only first when missing). Content directories take
+/// the ordinary 0755 masked by the umask, matching received files (0644 masked
+/// by the umask, `publish_received_file`): never world-writable, and private in
+/// practice because the inbox above them is 0700.
+pub fn create_content_dirs(inbox: &Path, dir: &Path) -> std::io::Result<()> {
+    if !inbox.exists() {
+        create_inbox_dir(inbox)?;
+    }
+    create_dirs_with_mode(dir, 0o755)
+}
+
+fn create_dirs_with_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(mode).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Keep the config dir owner-only on EVERY start, not just at the one-time
+/// migration: it holds keys, grants and the proxy token, and a dir someone
+/// loosened (or a tool created 0755) would expose new files' NAMES and any file
+/// a writer forgot to restrict. Only a directory this user owns, that is not a
+/// symlink, and that is not a shared sticky dir (a FILAMENT_CONFIG_DIR pointed
+/// at /tmp must never be chmodded) is touched. Windows: the profile ACL is
+/// already owner-only.
+pub fn tighten_config_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(md) = std::fs::symlink_metadata(dir) else { return };
+        let mode = md.permissions().mode();
+        let mine = md.uid() == unsafe { libc::getuid() };
+        if md.is_dir() && mine && mode & 0o1000 == 0 && mode & 0o077 != 0 {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+/// Open an owner-only (0600 on unix) log-style file, creating it if needed,
+/// for appending, or truncating when `truncate`. An existing file with a
+/// looser mode is tightened through the handle. Used for diag.jsonl and the
+/// daemon logs, which carry peer names, addresses and activity.
+pub fn open_private_log(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    if truncate {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata().map(|m| m.permissions().mode() & 0o077 != 0).unwrap_or(false) {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(file)
+}
+
+/// Create a NEW file for writing that is owner-only (0600 on unix) from the
+/// moment it exists: the mode is passed to the create itself, so there is no
+/// window in which another account could open it, and it does not depend on
+/// the process umask (a daemon started with umask 0 made 0666 sidecars).
+/// Fails if anything (a file, a planted symlink) already sits at `path`.
+/// Windows: files take the containing directory's ACL; nothing to set here.
+pub fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Make an already-open file owner-only (0600 on unix) through its handle,
+/// never through a path that could have been swapped for a symlink. Used on a
+/// resumed partial that an older build created with a looser mode. Windows:
+/// nothing to set.
+pub fn restrict_open_file(file: &std::fs::File) -> std::io::Result<()> {
+    fs_at::set_mode_via_handle(file, 0o600)
+}
+
+/// The mode a freshly received file takes once it is complete: what a plain
+/// create would have given it (0644 masked by the process umask). A partial is
+/// assembled owner-only; this restores the ordinary mode through the handle
+/// just before the partial is renamed into place, so a finished download is
+/// readable exactly as it was before partials became private.
+/// Windows: nothing to set.
+pub fn publish_received_file(file: &std::fs::File) -> std::io::Result<()> {
+    fs_at::set_mode_via_handle(file, 0o644 & !process_umask())
+}
+
+/// The same received-file mode for something auto-extract just created at
+/// `path` (never a symlink: extraction skips links and never overwrites):
+/// 0644 under the umask, or 0755 for a directory or an executable. Windows:
+/// nothing to set.
+pub fn publish_received_path(path: &Path, executable: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Ok(());
+        }
+        let base = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(base & !process_umask()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, executable);
+        Ok(())
+    }
+}
+
+/// The process umask. Linux reads it from /proc/self/status (no side effect);
+/// other unix learns it once by the set-and-restore dance, cached so the brief
+/// swap happens at most once per process. Non-unix: 0 (unused).
+fn process_umask() -> u32 {
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+                if let Some(v) = s.lines().find_map(|l| l.strip_prefix("Umask:")) {
+                    if let Ok(m) = u32::from_str_radix(v.trim(), 8) {
+                        return m & 0o777;
+                    }
+                }
+            }
+            0o022
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let old = unsafe { libc::umask(0o077) };
+            unsafe { libc::umask(old) };
+            (old as u32) & 0o777
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    })
+}
+
+/// Permission bits of the file at `path` (the link itself, never its target),
+/// or None where the platform has no POSIX modes. Lets portable tests assert
+/// owner-only files without a platform branch of their own.
+#[cfg(test)]
+pub fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -905,10 +1097,7 @@ pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::proc
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)?;
+    let log_file = open_private_log(log, false)?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::null());
@@ -1147,6 +1336,81 @@ impl ShellHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mode_tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tunlion-mode-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The inbox peers write into is owner-only, and content directories are
+    /// never world-writable, whatever the umask (it can only remove bits from
+    /// the explicit modes, so these hold under umask 0 as well).
+    #[test]
+    fn inbox_is_owner_only_and_content_dirs_are_not_world_writable() {
+        let d = mode_tmp("inbox");
+        let inbox = d.join("Tunlion");
+        let sub = inbox.join("synced").join("deep");
+        create_content_dirs(&inbox, &sub).unwrap();
+        assert!(sub.is_dir());
+        if let Some(m) = file_mode(&inbox) {
+            assert_eq!(m & 0o077, 0, "the inbox must be owner-only, got {m:o}");
+        }
+        for p in [inbox.join("synced"), sub.clone()] {
+            if let Some(m) = file_mode(&p) {
+                assert_eq!(m & 0o022, 0, "{} must not be group/world-writable, got {m:o}", p.display());
+            }
+        }
+        // An existing inbox is left alone, and creating it again is not an error.
+        create_inbox_dir(&inbox).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The partial-receive sidecars are created through this; it must be
+    /// owner-only at creation, never umask-dependent.
+    #[test]
+    fn create_new_private_is_owner_only() {
+        let d = mode_tmp("private");
+        let p = d.join("x.part.meta");
+        drop(create_new_private(&p).unwrap());
+        if let Some(m) = file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a new private file must be 0600, got {m:o}");
+        }
+        // create_new: it never reuses (or writes through) what is already there.
+        assert!(create_new_private(&p).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn restrict_open_file_tightens_a_loose_file() {
+        let d = mode_tmp("restrict");
+        let p = d.join("old.part");
+        let f = std::fs::File::create(&p).unwrap();
+        fs_at::set_mode_via_handle(&f, 0o666).unwrap();
+        restrict_open_file(&f).unwrap();
+        drop(f);
+        if let Some(m) = file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a resumed partial must end up 0600, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A finished receive gets the ordinary create mode back: 0644 under the
+    /// process umask, never more than that and never executable.
+    #[test]
+    fn publish_received_file_restores_the_umask_mode() {
+        let d = mode_tmp("publish");
+        let p = d.join("done.bin");
+        let f = create_new_private(&p).unwrap();
+        publish_received_file(&f).unwrap();
+        drop(f);
+        if let Some(m) = file_mode(&p) {
+            assert_eq!(m & 0o777, 0o644 & !process_umask(), "got {m:o}");
+            assert_eq!(m & 0o133, 0, "never group/other writable nor executable, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn detect_returns_a_valid_variant() {

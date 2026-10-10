@@ -119,6 +119,10 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
+                // The SOCKS proxy the daemon auto-starts without a TUN: its
+                // address and how to use it (the token's PATH, never the
+                // token), or null when none is running.
+                "proxy": crate::proxy_state::to_json(crate::proxy_state::current().as_ref()),
             }))?
         );
         return Ok(());
@@ -154,6 +158,11 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 b.target,
                 scope
             ));
+        }
+    }
+    if let Some(p) = crate::proxy_state::current() {
+        for line in crate::proxy_state::status_lines(&p) {
+            ui::say(&line);
         }
     }
     if let Ok(log) = std::fs::read_to_string(up_log()) {

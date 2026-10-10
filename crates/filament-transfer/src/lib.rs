@@ -85,18 +85,45 @@ pub fn pwrite_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Resu
 
 /// Reduce a remote-supplied filename to a safe single path component.
 ///
-/// Never trust a remote name: basename only, no separators, no control bytes.
+/// Never trust a remote name: basename only, no separators, no control bytes,
+/// and no invisible bidi/format characters. The name is printed to the user
+/// (the accept prompt, decline and completion lines), so U+202E RIGHT-TO-LEFT
+/// OVERRIDE would let `invoice\u{202E}fdp.exe` display as `invoiceexe.pdf`.
 pub fn safe_incoming_name(raw: &str) -> String {
     let base = std::path::Path::new(raw)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file.bin".into());
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).collect();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
+        .collect();
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "file.bin".to_string()
-    } else {
-        cleaned
+        return "file.bin".to_string();
     }
+    // The receiver keeps `<name>.part` and `<name>.part.meta` beside the final
+    // file. A peer naming a file `x.part` or `x.part.meta` would land (on
+    // completion) on top of the in-progress partial or sidecar of `x`. Such a
+    // name gets a trailing `_` so it can never equal another file's partial.
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.ends_with(".part") || lower.ends_with(".part.meta") {
+        return format!("{cleaned}_");
+    }
+    cleaned
+}
+
+/// Bidi controls and zero-width characters: they change how a name DISPLAYS
+/// without being visible themselves.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'                // ARABIC LETTER MARK
+            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LRM, RLM
+            | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+            | '\u{FEFF}'              // zero-width no-break space / BOM
+    )
 }
 
 /// Record `[pos, pos+len)` into a sorted set of disjoint intervals, merging
@@ -142,6 +169,23 @@ pub fn record_range(ranges: &mut Vec<(u64, u64)>, pos: u64, len: usize) -> (u64,
     let delta = new_len.saturating_sub(removed_total);
     let total: u64 = ranges.iter().map(|(s, e)| e - s).sum();
     (delta, total)
+}
+
+/// Upper bound on the disjoint ranges a single incoming file may accumulate.
+/// A well-behaved sender has a handful in flight (one per parallel stream); a
+/// hostile one can send tiny non-adjacent chunks to grow the list (and the
+/// O(n) merge) without bound. 64Ki ranges is ~1 MiB of bookkeeping.
+pub const MAX_RECV_RANGES: usize = 64 * 1024;
+
+/// True iff a chunk of `len` bytes at `pos` lies entirely inside the `size`
+/// the sender offered. Overflow counts as outside. The peer picks both numbers,
+/// so without this a single frame at a huge offset makes a sparse file of any
+/// size on the receiver's disk.
+pub fn chunk_fits_offer(pos: u64, len: usize, size: u64) -> bool {
+    match pos.checked_add(len as u64) {
+        Some(end) => end <= size,
+        None => false,
+    }
 }
 
 /// `record_range` for callers that only want the running total.
@@ -320,6 +364,34 @@ mod tests {
     fn nothing_received_is_incomplete_and_resumes_at_zero() {
         assert!(!coverage_complete(&[], 100));
         assert_eq!(first_gap(&[], 100), Some(0));
+    }
+
+    #[test]
+    fn incoming_names_lose_bidi_and_invisible_controls() {
+        assert_eq!(safe_incoming_name("invoice\u{202E}fdp.exe"), "invoicefdp.exe");
+        assert_eq!(safe_incoming_name("a\u{2066}b\u{2069}c\u{200B}.txt"), "abc.txt");
+        assert_eq!(safe_incoming_name("\u{202E}"), "file.bin");
+        assert_eq!(safe_incoming_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_incoming_name("caf\u{e9}.txt"), "caf\u{e9}.txt", "ordinary non-ASCII is kept");
+    }
+
+    #[test]
+    fn incoming_names_cannot_impersonate_a_partial() {
+        assert_eq!(safe_incoming_name("x.part"), "x.part_");
+        assert_eq!(safe_incoming_name("x.PART.meta"), "x.PART.meta_");
+        assert_eq!(safe_incoming_name("x.partial"), "x.partial", "only the exact suffixes");
+        assert_eq!(safe_incoming_name("report.meta"), "report.meta");
+    }
+
+    #[test]
+    fn chunks_must_stay_inside_the_offered_size() {
+        assert!(chunk_fits_offer(0, 100, 100));
+        assert!(chunk_fits_offer(40, 60, 100));
+        assert!(chunk_fits_offer(100, 0, 100));
+        assert!(!chunk_fits_offer(41, 60, 100), "one byte past the end");
+        assert!(!chunk_fits_offer(1 << 40, 1, 100), "far past the end");
+        assert!(!chunk_fits_offer(u64::MAX, 2, u64::MAX), "overflow is outside");
+        assert!(!chunk_fits_offer(0, 1, 0), "nothing fits an empty offer");
     }
 
     #[test]

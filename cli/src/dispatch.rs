@@ -129,6 +129,7 @@ pub(crate) async fn async_main() -> Result<()> {
         Ok(_) => {}
         Err(e) => eprintln!("tunlion: sensitive config permission repair failed: {e}"),
     }
+    platform::tighten_config_dir(&platform::Paths::config_dir());
     // Bare-arg comfort dispatch: `tunlion <path>` sends it with a code;
     // `tunlion <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
@@ -609,6 +610,9 @@ pub(crate) async fn async_main() -> Result<()> {
                             .unwrap_or_default();
                         println!("  overlay:  {v6}{v4_str}");
                         println!("  mesh:     {name}.mesh");
+                        if let Some(p) = crate::proxy_state::current() {
+                            ui::say(&crate::proxy_state::mesh_hint(&p));
+                        }
                     }
                     // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
                     // (what THIS machine authorized the peer to do), NOT what the peer offers.
@@ -636,6 +640,9 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     println!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     println!("  mesh:     {mesh_name}.mesh");
+                    if let Some(p) = crate::proxy_state::current() {
+                        ui::say(&crate::proxy_state::mesh_hint(&p));
+                    }
                 }
             }
             Ok(())
@@ -1448,6 +1455,7 @@ pub(crate) async fn async_main() -> Result<()> {
             port,
             bind,
             http_port,
+            allow_remote,
         } => {
             let (peer, rport) = match target.split_once(':') {
                 Some((p, r)) => (
@@ -1465,7 +1473,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 require_known_device(&peer)?;
                 l2::netcat_cmd(&server, &peer, rport, relay).await
             } else if socks {
-                l2::proxy_cmd(&server, &bind, port, http_port, relay).await
+                l2::proxy_cmd(&server, &bind, port, http_port, relay, allow_remote).await
             } else {
                 require_known_device(&peer)?;
                 let lport = lport.unwrap_or(rport);

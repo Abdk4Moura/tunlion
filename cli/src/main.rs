@@ -51,6 +51,7 @@ mod holepunch;
 pub(crate) use filament_id as identity;
 mod interact;
 mod l2;
+mod proxy_state;
 mod mount;
 mod mount_proto;
 #[cfg(target_os = "linux")]
@@ -754,8 +755,22 @@ impl PartMeta {
         }
         raw.trim().parse::<u64>().ok().map(|size| PartMeta { size, head: None, full: None })
     }
+    /// Write the sidecar WITHOUT following a symlink at `path`: the download
+    /// dir may be writable by others, and `std::fs::write` through a planted
+    /// `x.part.meta -> ~/.bashrc` would overwrite the link's target. Unlink
+    /// first (removes a link, never its target), then create exclusively, so a
+    /// link re-planted in between makes this fail instead of writing through.
+    /// Created owner-only (0600) regardless of umask: it names the file, its
+    /// size and digests, and sits in a download dir others may read.
     fn store(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, json!({ "size": self.size, "head": self.head, "full": self.full }).to_string())
+        use std::io::Write;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut f = crate::platform::create_new_private(path)?;
+        f.write_all(json!({ "size": self.size, "head": self.head, "full": self.full }).to_string().as_bytes())
     }
 }
 
@@ -1845,6 +1860,9 @@ fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
 
 fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
     let sender = if sender.is_empty() { "unknown peer" } else { sender };
+    // The offered name is the peer's raw string: show it the way it would be
+    // saved (no separators, controls, or bidi overrides), never verbatim.
+    let name = safe_incoming_name(name);
     let hint = if paired { " [paired]" } else { "" };
     format!(
         "  {}{} offers {} ({}), accept? [y/N] ",

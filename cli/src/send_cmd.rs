@@ -234,13 +234,20 @@ pub(crate) async fn send_cmd(
     let single = paths.len() == 1;
     let my_uid = mk_uid("s");
     let mut outgoing: Vec<Outgoing> = Vec::new();
+    // `send -` and directory sends stage a copy before offering it. That copy
+    // is the user's data, so it goes in a private (0700, fresh, random) dir
+    // created exclusively, never a predictable name in the shared temp dir
+    // where another local user could read it or pre-plant a symlink. The guard
+    // removes the dir on every exit from this function, not only on success.
+    let mut spool_dir: Option<SpoolDir> = None;
     for (i, p) in paths.iter().enumerate() {
         let sid = (i + 1) as u32;
         let id = format!("{}-{}", my_uid, sid);
         if p == "-" {
-            let spool = std::env::temp_dir().join(format!("filament-stdin-{}", std::process::id()));
-            let mut f = std::fs::File::create(&spool)?;
-            let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
+            let spool = SpoolDir::path_in(&mut spool_dir, "stdin")?;
+            let mut f = SpoolDir::create(&spool)?;
+            let n = spool_copy(&mut std::io::stdin().lock(), &mut f)
+                .map_err(|(written, e)| spool_error("stdin", &spool, written, e))?;
             drop(f);
             let head = head_hash(&spool);
             let full = full_hash(&spool);
@@ -279,17 +286,16 @@ pub(crate) async fn send_cmd(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "dir".into());
-                let spool = std::env::temp_dir().join(format!(
-                    "filament-tar-{}-{}.tar",
-                    std::process::id(),
-                    i
-                ));
+                let spool = SpoolDir::path_in(&mut spool_dir, &format!("tar-{i}.tar"))?;
                 ui::say(&format!("packing {p} -> {dirname}.tar ..."));
                 {
-                    let f = std::fs::File::create(&spool)?;
+                    let f = SpoolDir::create(&spool)?;
                     let mut b = tar::Builder::new(f);
-                    b.append_dir_all(&dirname, &path)?;
-                    b.finish()?;
+                    let packed = b.append_dir_all(&dirname, &path).and_then(|()| b.finish());
+                    if let Err(e) = packed {
+                        let written = std::fs::metadata(&spool).map(|m| m.len()).unwrap_or(0);
+                        return Err(spool_error(&format!("the directory {p}"), &spool, written, e));
+                    }
                 }
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
@@ -2064,6 +2070,115 @@ pub(crate) async fn send_cmd(
     }
 }
 
+/// Copy `from` into the spool file, returning the bytes written, or the bytes
+/// written so far with the error: a full spool is reported with how far it got.
+fn spool_copy(
+    from: &mut impl std::io::Read,
+    to: &mut impl std::io::Write,
+) -> std::result::Result<u64, (u64, std::io::Error)> {
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err((written, e)),
+        };
+        to.write_all(&buf[..n]).map_err(|e| (written, e))?;
+        written += n as u64;
+    }
+    to.flush().map_err(|e| (written, e))?;
+    Ok(written)
+}
+
+/// The error for staging `what` into the spool file `spool`. A send of stdin
+/// is STAGED IN FULL before anything is offered, because the offer carries the
+/// whole file's size and SHA-256 (the receiver checks both, and resumes by
+/// them); it cannot be streamed. So a 30 MB `head -c ... | tunlion send -`
+/// on a 16 MB /tmp failed in 23 ms with only "No space left on device (os
+/// error 28)", which named neither the disk that filled nor why it was used.
+/// This names both and the fix: TMPDIR on a disk with room.
+fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Error) -> anyhow::Error {
+    let dir = spool.parent().unwrap_or(spool);
+    let full = matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    );
+    if !full {
+        return anyhow::Error::new(e).context(format!(
+            "could not stage {what} for sending in the local temp spool at {}",
+            dir.display()
+        ));
+    }
+    anyhow::anyhow!(
+        "could not stage {what} for sending: the local temp spool at {} ran out of space after {} ({e}). \
+         It is staged in full before it is offered, because the offer carries its size and SHA-256, \
+         so the temp directory needs room for all of it. Point TMPDIR at a directory on a disk with \
+         room, for example:  TMPDIR=/var/tmp tunlion send - ...  (or send a file path instead of stdin, \
+         which is read in place and needs no staging)",
+        dir.display(),
+        crate::human(written)
+    )
+}
+
+/// The error for a spool directory that cannot be created at all. Following
+/// the advice above on a read-only root (`TMPDIR=/var/tmp`) or with a TMPDIR
+/// that does not exist gave only "Read-only file system (os error 30)" or
+/// "No such file or directory (os error 2)", naming neither TMPDIR nor the
+/// path. `base` is where the spool was to go, `tmpdir` the variable as set.
+fn spool_dir_error(base: &std::path::Path, tmpdir: Option<&str>, e: anyhow::Error) -> anyhow::Error {
+    let source = match tmpdir {
+        Some(v) => format!("TMPDIR={v}"),
+        None => "TMPDIR is not set, so the system default".to_string(),
+    };
+    anyhow::anyhow!(
+        "could not create the local temp spool for sending in {} ({source}): {e:#}. `send -` and \
+         directory sends stage a copy there before offering it; set TMPDIR to an existing, \
+         writable directory with room (or send a file path, which is read in place and needs no \
+         staging)",
+        base.display()
+    )
+}
+
+/// Private staging directory for `send -` and directory sends, removed with
+/// everything in it when dropped. Created lazily so a plain-file send makes
+/// nothing on disk.
+struct SpoolDir(PathBuf);
+
+impl SpoolDir {
+    /// A path for `name` inside the (lazily created) private spool dir.
+    fn path_in(slot: &mut Option<SpoolDir>, name: &str) -> Result<PathBuf> {
+        if slot.is_none() {
+            let dir = crate::ssh_ca::secure_tempdir("send-spool").map_err(|e| {
+                spool_dir_error(
+                    &std::env::temp_dir(),
+                    std::env::var_os("TMPDIR").as_deref().map(|v| v.to_string_lossy()).as_deref(),
+                    e,
+                )
+            })?;
+            *slot = Some(SpoolDir(dir));
+        }
+        Ok(slot.as_ref().map(|d| d.0.join(name)).unwrap_or_default())
+    }
+
+    /// Create a staging file exclusively: an existing entry (including a
+    /// symlink) is an error, never something to write through.
+    fn create(path: &std::path::Path) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create staging file {}", path.display()))
+    }
+}
+
+impl Drop for SpoolDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn stream_one(
     outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
     transports: Vec<Arc<dyn Transport>>,
@@ -2299,3 +2414,84 @@ async fn stream_one(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod spool_tests {
+    use super::{spool_copy, spool_dir_error, spool_error};
+
+    /// A writer that fills after `room` bytes, like a 16 MB /tmp.
+    struct Small {
+        room: usize,
+        got: usize,
+    }
+    impl std::io::Write for Small {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.got >= self.room {
+                return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            let n = b.len().min(self.room - self.got);
+            self.got += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `head -c 30000000 /dev/zero | tunlion send -` on a 16 MB /tmp: the
+    /// error names the spool directory, how far it got, why stdin is staged,
+    /// and TMPDIR. It used to be "No space left on device (os error 28)".
+    #[test]
+    fn a_full_spool_names_the_directory_the_reason_and_tmpdir() {
+        let mut input = std::io::Read::take(std::io::repeat(0), 30_000_000);
+        let mut out = Small { room: 16 * 1024 * 1024, got: 0 };
+        let (written, e) = spool_copy(&mut input, &mut out).unwrap_err();
+        assert!(written <= 16 * 1024 * 1024 && written > 15 * 1024 * 1024, "{written}");
+        let spool = std::path::Path::new("/tmp/fil-send-spool-1/stdin");
+        let msg = format!("{:#}", spool_error("stdin", spool, written, e));
+        assert!(msg.contains("/tmp/fil-send-spool-1"), "{msg}");
+        assert!(msg.contains("ran out of space after"), "{msg}");
+        assert!(msg.contains("TMPDIR="), "{msg}");
+        assert!(msg.contains("SHA-256"), "{msg}");
+        // Anything else is reported as itself, with the spool named.
+        let other = format!(
+            "{:#}",
+            spool_error("stdin", spool, 0, std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        );
+        assert!(other.contains("could not stage stdin") && !other.contains("TMPDIR="), "{other}");
+    }
+
+    /// `TMPDIR=/var/tmp tunlion send -` on a read-only root, and a TMPDIR that
+    /// does not exist: the message names TMPDIR, its value and the directory,
+    /// with the OS's reason, instead of a bare "(os error 30)".
+    #[test]
+    fn a_spool_that_cannot_be_created_names_tmpdir_and_the_path() {
+        let ro = std::io::Error::from_raw_os_error(30);
+        let m = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/var/tmp"), Some("/var/tmp"), ro.into())
+        );
+        assert!(m.contains("TMPDIR=/var/tmp") && m.contains("in /var/tmp"), "{m}");
+        assert!(m.contains("os error 30"), "the OS's reason stays: {m}");
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let m = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/nonexist"), Some("/nonexist"), missing.into())
+        );
+        assert!(m.contains("TMPDIR=/nonexist") && m.contains("existing, writable directory"), "{m}");
+        let unset = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/tmp"), None, anyhow::anyhow!("x"))
+        );
+        assert!(unset.contains("TMPDIR is not set"), "{unset}");
+    }
+
+    #[test]
+    fn a_spool_copy_that_fits_copies_everything() {
+        let mut input = std::io::Read::take(std::io::repeat(7), 1_000_000);
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(spool_copy(&mut input, &mut out).unwrap(), 1_000_000);
+        assert_eq!(out.len(), 1_000_000);
+    }
+}
+
