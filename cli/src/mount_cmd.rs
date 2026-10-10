@@ -157,6 +157,14 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("up.log", "daemon session log"),
     ("daemon.log", "daemon console log"),
     ("up.pid", "daemon pidfile"),
+    // The daemon's other run-state: its executable record, its readiness
+    // marker, its single-instance lock and the local proxy's token. A reset
+    // that left these behind was not a clean slate (the hostile-env test
+    // found up.ready, up.exe and proxy.token surviving `reset -y`).
+    ("up.exe", "daemon executable record"),
+    ("up.ready", "daemon readiness marker"),
+    ("up.lock", "daemon single-instance lock"),
+    ("proxy.token", "local proxy token"),
     ("control.sock", "daemon control socket"),
     ("mount-profiles", "saved mount profiles"),
     // Managed ssh material (private key, known_hosts pins, bootstrap cache, the
@@ -470,6 +478,10 @@ mod reset_tests {
             "device.id",
             "overlay.announce-seq",
             "up.pid",
+            "up.exe",
+            "up.ready",
+            "up.lock",
+            "proxy.token",
             "control.sock",
             "identity",
             "devices.json",

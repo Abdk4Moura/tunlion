@@ -276,15 +276,20 @@ pub(crate) fn remedy(code: Code, peer: &str, me: &str) -> (String, Option<String
                 Some(cmd),
             )
         }
-        Code::Ceiling => {
-            let cmd = format!("tunlion add --for {me_w} --allow shell");
-            (
-                format!(
-                    "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite it with shell, on '{peer}':"
-                ),
-                Some(cmd),
-            )
-        }
+        // Not one command: a grant cannot widen a ceiling, and a joined device
+        // refuses a second invitation while it holds the first, so
+        // `add --for <me> --allow shell` alone dead-ended on this device. The
+        // steps that work are the full re-enrolment, each on the machine that
+        // runs it (cli/tests/reenrol-advice-gates.sh follows them).
+        Code::Ceiling => (
+            format!(
+                "shell is outside this device's invitation ceiling, and a grant cannot widen one. \
+                 To give it shell, enrol it again with shell in its invitation:\n    \
+                 {}",
+                ceiling_steps(peer, &me_w).join("\n    ")
+            ),
+            None,
+        ),
         Code::UserDropUnavailable => (
             format!(
                 "'{peer}' is set to run shells as a separate account (--shell-user), which needs it to run as root. On '{peer}', restart `tunlion up` as root, or drop --shell-user and accept the risk with --i-know."
@@ -292,6 +297,24 @@ pub(crate) fn remedy(code: Code, peer: &str, me: &str) -> (String, Option<String
             None,
         ),
     }
+}
+
+/// The re-enrolment that widens this device's ceiling, as `on X:  command`
+/// lines in the order they must run. `--allow` replaces the default ceiling,
+/// so the defaults (transfer, mount) are carried over.
+pub(crate) fn ceiling_steps(peer: &str, me: &str) -> Vec<String> {
+    let invite = format!("{me}-invite.txt");
+    let owner = format!("on '{peer}':");
+    let here = "on this device:".to_string();
+    let w = owner.len().max(here.len());
+    let pad = " ".repeat(w);
+    vec![
+        format!("{owner:<w$}  tunlion devices forget {me}"),
+        format!("{pad}  tunlion add --for {me} --allow transfer,mount,shell --out {invite}"),
+        format!("{here:<w$}  tunlion down"),
+        format!("{pad}  tunlion reset -y"),
+        format!("{pad}  tunlion join --invite-file {invite} --name {me}"),
+    ]
 }
 
 /// One user-facing explanation: "<verb> refused by 'peer': reason" plus the
@@ -387,6 +410,38 @@ mod tests {
         // An older acceptor: only the string. Still classified.
         let old = json!({"type": "l2-close", "sid": 7, "err": crate::capability::SHELL_OFF_REASON});
         assert_eq!(from_frame(&old, "err").0, Some(Code::ShellOff));
+    }
+
+    /// The ceiling remedy is a sequence, and every step in it is a command the
+    /// CLI accepts, in the order that works: the old single step (`add --for
+    /// <me> --allow shell`) produced an invitation the joined device refused.
+    #[test]
+    fn the_ceiling_remedy_is_the_full_reenrolment_and_every_step_parses() {
+        use clap::Parser;
+        let steps = ceiling_steps("p1-a", "p1-b");
+        let cmds: Vec<String> = steps
+            .iter()
+            .map(|l| l[l.find("tunlion").unwrap()..].to_string())
+            .collect();
+        assert_eq!(
+            cmds,
+            [
+                "tunlion devices forget p1-b",
+                "tunlion add --for p1-b --allow transfer,mount,shell --out p1-b-invite.txt",
+                "tunlion down",
+                "tunlion reset -y",
+                "tunlion join --invite-file p1-b-invite.txt --name p1-b",
+            ]
+        );
+        for cmd in &cmds {
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "step does not parse: {cmd}");
+        }
+        assert!(steps[0].contains("on 'p1-a':") && steps[2].contains("on this device:"));
+        let msg = explain("exec", "p1-a", crate::capability::CEILING_REASON, Some(Code::Ceiling), Some("p1-b"));
+        for cmd in &cmds {
+            assert!(msg.contains(cmd.as_str()), "{msg}");
+        }
     }
 
     /// Every suggested command is one the CLI ACCEPTS, not merely one with the
