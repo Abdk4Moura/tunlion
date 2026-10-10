@@ -379,7 +379,10 @@ impl<W: std::io::Write> StdoutSink<W> {
         }
         let skip = (self.next - pos) as usize;
         self.emit(&data[skip..])?;
-        while let Some((&p, _)) = self.pending.iter().next() {
+        loop {
+            let Some(p) = self.pending.keys().next().copied() else {
+                break;
+            };
             if p > self.next {
                 break;
             }

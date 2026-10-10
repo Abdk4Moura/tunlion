@@ -66,11 +66,19 @@ pub(crate) fn kept_partials(parts: &[SessionPart]) -> Vec<KeptPartial> {
                 have: m.len(),
                 size: p.size,
             }),
-            Ok(m) if m.is_file() => crate::recv_files::discard_partial(&p.part),
+            Ok(m) if m.is_file() => remove_partial(&p.part),
             _ => {}
         }
     }
     kept
+}
+
+/// Remove a `.part` and its `.part.meta` sidecar.
+fn remove_partial(part: &Path) {
+    let _ = std::fs::remove_file(part);
+    let mut meta = part.as_os_str().to_owned();
+    meta.push(".meta");
+    let _ = std::fs::remove_file(PathBuf::from(meta));
 }
 
 /// What a one-shot receive says when its sender is gone for good. `why` is the
