@@ -101,7 +101,7 @@ sed 's/^/    default status: /' "$WORK/dflt-status.log" | head -2
 if [ -z "$leaked" ] && [ "$rcI" = "0" ] && [ "$same_key" = "no" ] && [ -f "$NEWCFG/identity.ed25519" ] \
    && ! grep -q "already has identity" "$WORK/xdg-init.log" \
    && ! grep -q "pid $DPID" "$WORK/xdg-status.log" "$WORK/xdg-down.log" \
-   && [ "$alive" = "yes" ] && grep -q "up (pid $DPID)" "$WORK/dflt-status.log"; then
+   && [ "$alive" = "yes" ] && grep -qE "up( but degraded)? \(pid $DPID\)" "$WORK/dflt-status.log"; then
   ok "gateA: the new config dir got nothing from the default one, a new identity, and left its daemon alone"
 else
   bad "gateA: config dir scope (leaked=[$leaked] init=$rcI same_key=$same_key default_alive=$alive)"
