@@ -14,6 +14,7 @@
 //! (`anyhow::Context` for `.with_context`, `std::io::IsTerminal` for `.is_terminal`) are
 //! imported; the rest travel inside the body's own function-local `use`s.
 use crate::dlog;
+use crate::signaling_health;
 #[cfg(l3)]
 use crate::l3;
 #[cfg(l3)]
@@ -1669,7 +1670,18 @@ pub(crate) async fn recv_cmd(
     let mut signaling_down_since: Option<Instant> = None;
     let mut reconnect_attempt: u32 = 0;
     let mut last_reconnect_try = Instant::now();
-    let mut probed_silence = false; // fired one forced sync before declaring down
+    let mut reconnect_wait = Duration::ZERO;
+    // When the current connection came up (None while down). The ladder only
+    // restarts after a connection that stayed up signaling_health::STABLE_AFTER.
+    let mut signaling_up_since: Option<Instant> = Some(Instant::now());
+    let mut down_reason = String::new();
+    // When the forced `sync` probe went out (None: no probe outstanding).
+    let mut probed_silence: Option<Instant> = None;
+    // Repeated reconnect lines are collapsed, not written once per cycle.
+    let mut signaling_log = signaling_health::LogCollapse::default();
+    if signaling_self_heal {
+        signaling_health::note_serving();
+    }
     let mut last_watchdog = Instant::now();
     // Link self-heal cadence (the multi-minute-outage fix, #3). A transport that
     // died past the QUIC idle timeout lingers in `links` as a zombie and SUPPRESSES
@@ -1850,6 +1862,11 @@ pub(crate) async fn recv_cmd(
                                 },
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
+                                // The signaling link as the serving loop sees it, so
+                                // `status` and `doctor` can tell a daemon that answers
+                                // here but is off the server (or keeps dropping) from a
+                                // healthy one. See signaling_health.
+                                "signaling": signaling_health::snapshot_json(),
                                 "summary": counts.summary(),
                                 // #244: the LIVE shell posture. `revoke <dev> shell`
                                 // reads this so it can say when the shell it just
@@ -2356,10 +2373,27 @@ pub(crate) async fn recv_cmd(
             // (1) Liveness accounting. Any inbound signaling event proves the
             // socket is alive; a successful `sync` ack (Ev::Synced) is the
             // strongest signal (the server answered). The fast-path close/error
-            // callback marks the link down immediately.
+            // callback marks the link down immediately, but ONLY for the
+            // current connection: a close of one this loop already replaced is
+            // history (see signaling_health, defect 1). Acting on it is what
+            // turned one late close into an endless reconnect storm.
+            //
+            // An inbound event no longer resets the backoff ladder: the new
+            // connection's own `welcome` did, so the ladder could never climb
+            // (defect 2). Only a connection that stays up STABLE_AFTER does.
             let mut saw_down = false;
             match &ev {
-                Some(Ev::SignalingDown(_)) => saw_down = true,
+                Some(Ev::SignalingDown(reason, closed)) => {
+                    if signaling_health::close_is_current(*closed, sio.id()) {
+                        saw_down = true;
+                        down_reason = reason.clone();
+                    } else {
+                        ui::debug(&format!(
+                            "  signaling: ignoring the close of replaced connection {closed} ({reason}); current is {}",
+                            sio.id()
+                        ));
+                    }
+                }
                 Some(
                     Ev::Welcome(_)
                     | Ev::Synced(_)
@@ -2376,9 +2410,7 @@ pub(crate) async fn recv_cmd(
                     | Ev::PairError(_),
                 ) => {
                     last_signaling = Instant::now();
-                    signaling_down_since = None;
-                    probed_silence = false;
-                    reconnect_attempt = 0;
+                    probed_silence = None;
                 }
                 _ => {}
             }
@@ -2387,110 +2419,138 @@ pub(crate) async fn recv_cmd(
             // fires no close callback, so we watch the inbound gap. Once it
             // exceeds the threshold, fire ONE forced `sync` (the heartbeat); if
             // the socket is alive the server's `synced` ack lands within a tick
-            // and resets the gap. If a second threshold passes with still no
-            // event, the socket is dead, declare it down.
+            // and resets the gap. If the probe then goes unanswered for its own
+            // window, the socket is dead, declare it down.
+            //
+            // The probe's window is measured from when it was SENT. It used to
+            // be judged on the inbound gap alone, so after a freeze longer than
+            // twice the threshold the very next loop iteration declared the link
+            // dead before the probe could be answered, and re-dialed while the
+            // old socket's close was still in flight (the storm's seed).
             let silence = net::signaling_silence_ms();
             let silent_ms = last_signaling.elapsed().as_millis() as u64;
             if signaling_down_since.is_none() {
+                let mut declare: Option<String> = None;
                 if saw_down {
-                    signaling_down_since = Some(Instant::now());
-                    last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
-                    // Visible (not just debug): a node dropping off signaling was
-                    // previously silent until it bit someone. Surface it + reflect
-                    // it in `systemctl status` so it's diagnosable at a glance.
-                    ui::say(&ui::paint(
-                        ui::Tone::Warn,
-                        "signaling link closed, reconnecting...",
-                    ));
-                    sdnotify::status("signaling down - reconnecting");
+                    declare = Some(format!("closed ({down_reason})"));
                 } else if silent_ms >= silence {
-                    if !probed_silence {
-                        // Heartbeat probe: an ACK'd `sync` round-trip, the only
-                        // liveness signal that works for a room-less idle
-                        // acceptor. `sess.tick()` can't serve here: it returns
-                        // early when there is no room (the `up` case) AND when
-                        // the session is already confirmed-fresh, so on a quiet
-                        // link it emitted nothing and the watchdog falsely
-                        // reconnected every ~30 s, churning presence. The server
-                        // acks `sync` unconditionally; the ack wakes the loop as
-                        // Ev::SignalingAlive, which resets the gap below.
-                        probed_silence = true;
-                        net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
-                    } else if silent_ms >= silence.saturating_mul(2) {
-                        signaling_down_since = Some(Instant::now());
-                        last_reconnect_try = Instant::now() - Duration::from_secs(60);
-                        // Visible: a silent (half-open) signaling link is the exact
-                        // way a node falls off presence without anyone noticing.
-                        ui::say(&ui::paint(
-                            ui::Tone::Warn,
-                            &format!("signaling silent for {silent_ms}ms, reconnecting..."),
-                        ));
-                        sdnotify::status("signaling silent - reconnecting");
+                    match probed_silence {
+                        None => {
+                            // Heartbeat probe: an ACK'd `sync` round-trip, the only
+                            // liveness signal that works for a room-less idle
+                            // acceptor. `sess.tick()` can't serve here: it returns
+                            // early when there is no room (the `up` case) AND when
+                            // the session is already confirmed-fresh, so on a quiet
+                            // link it emitted nothing and the watchdog falsely
+                            // reconnected every ~30 s, churning presence. The server
+                            // acks `sync` unconditionally; the ack wakes the loop as
+                            // Ev::SignalingAlive, which resets the gap below.
+                            probed_silence = Some(Instant::now());
+                            net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
+                        }
+                        Some(sent)
+                            if silent_ms >= silence.saturating_mul(2)
+                                && sent.elapsed() >= signaling_health::PROBE_WINDOW =>
+                        {
+                            declare = Some(format!("silent for {}s", silent_ms / 1000));
+                        }
+                        Some(_) => {}
                     }
+                }
+                if let Some(why) = declare {
+                    let now = Instant::now();
+                    signaling_down_since = Some(now);
+                    // The ladder restarts only if the link that just went down
+                    // had been up long enough to count as stable.
+                    reconnect_attempt = signaling_health::attempt_after_close(
+                        reconnect_attempt,
+                        signaling_up_since.map(|t| now.saturating_duration_since(t)),
+                    );
+                    signaling_up_since = None;
+                    reconnect_wait = signaling_health::reconnect_delay(
+                        reconnect_attempt,
+                        signaling_health::jitter_unit(),
+                    );
+                    last_reconnect_try = now;
+                    signaling_health::note_down(&why);
+                    // Visible (not just debug): a node dropping off signaling was
+                    // previously silent until it bit someone. Collapsed, so a
+                    // link that keeps dropping cannot fill the disk with it.
+                    if let Some(line) = signaling_log.admit(
+                        "down",
+                        &format!("signaling link {why}, reconnecting..."),
+                        now,
+                    ) {
+                        ui::say(&ui::paint(ui::Tone::Warn, &line));
+                    }
+                    sdnotify::status("signaling down - reconnecting");
                 }
             }
 
-            // (3) Re-dial with backoff + jitter. Idempotent: a fresh `welcome`
-            // re-asserts room + channel subscriptions through the C30 session
-            // (sess.invalidate forces it next tick). Live DATA links are NOT torn
-            // down, they ride independent WebRTC/QUIC transports and keep
-            // flowing across the cosmetic signaling reconnect (the #28 contract).
-            if let Some(down_at) = signaling_down_since {
-                // backoff: 0.5s, 1s, 2s, 4s ... capped at 8s, +/-25% jitter.
-                let base = 500u64
-                    .saturating_mul(1 << reconnect_attempt.min(4))
-                    .min(8_000);
-                let jitter = (down_at.elapsed().as_nanos() as u64 % (base / 2 + 1)) as i64
-                    - (base as i64 / 4);
-                let backoff = Duration::from_millis((base as i64 + jitter).max(100) as u64);
-                if last_reconnect_try.elapsed() >= backoff {
-                    last_reconnect_try = Instant::now();
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    let _ = sio.disconnect().await; // drop the dead client (no-op if already gone)
-                    match net::reconnect_signaling(server, tx.clone()).await {
-                        Ok(new_sio) => {
-                            sio = new_sio;
-                            conn.sio = sio.clone();
-                            // C30: a fresh sid voids everything the server held,
-                            // re-assert room + channels on the next tick. Re-fire
-                            // the fast-path join/subscribe immediately too.
-                            sess.invalidate();
-                            if let Some(room) = sess.room.clone() {
-                                sess.emit(
-                                    &sio,
-                                    "join",
-                                    json!({ "room": room, "name": display_name(), "uid": my_uid }),
-                                )
+            // (3) Re-dial with bounded, jittered backoff. Idempotent: a fresh
+            // `welcome` re-asserts room + channel subscriptions through the C30
+            // session (sess.invalidate forces it next tick). Live DATA links are
+            // NOT torn down, they ride independent WebRTC/QUIC transports and
+            // keep flowing across the cosmetic signaling reconnect (the #28
+            // contract).
+            if signaling_down_since.is_some() && last_reconnect_try.elapsed() >= reconnect_wait {
+                last_reconnect_try = Instant::now();
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                reconnect_wait = signaling_health::reconnect_delay(
+                    reconnect_attempt,
+                    signaling_health::jitter_unit(),
+                );
+                // Drop the old client (no-op if already gone). Its close, when
+                // it lands, carries the old id and is ignored above.
+                let _ = sio.disconnect().await;
+                match net::reconnect_signaling(server, tx.clone()).await {
+                    Ok(new_sio) => {
+                        sio = new_sio;
+                        conn.sio = sio.clone();
+                        // C30: a fresh sid voids everything the server held,
+                        // re-assert room + channels on the next tick. Re-fire
+                        // the fast-path join/subscribe immediately too.
+                        sess.invalidate();
+                        if let Some(room) = sess.room.clone() {
+                            sess.emit(
+                                &sio,
+                                "join",
+                                json!({ "room": room, "name": display_name(), "uid": my_uid }),
+                            )
+                            .await;
+                        }
+                        if !sess.channels.is_empty() {
+                            let chans = sess.channels.clone();
+                            sess.emit(&sio, "subscribe", json!({ "channels": chans }))
                                 .await;
-                            }
-                            if !sess.channels.is_empty() {
-                                let chans = sess.channels.clone();
-                                sess.emit(&sio, "subscribe", json!({ "channels": chans }))
-                                    .await;
-                            }
-                            sess.tick(&sio).await;
-                            // optimistic: a clean connect proves reachability; let
-                            // the welcome confirm it (which resets the counters).
-                            last_signaling = Instant::now();
-                            signaling_down_since = None;
-                            probed_silence = false;
-                            // Visible: pairs with the "reconnecting..." line so the
-                            // recovery is observable end to end.
-                            ui::say(&ui::paint(
-                                ui::Tone::Ok,
-                                "signaling reconnected, re-announcing presence",
-                            ));
-                            sdnotify::status("up - serving");
                         }
-                        Err(e) => {
-                            // DEBUG, resilience internal (signaling reconnect retry).
-                            ui::debug(&ui::paint(
-                                ui::Tone::Dim,
-                                &format!(
-                                    "  signaling reconnect failed ({e}), retrying with backoff"
-                                ),
-                            ));
+                        sess.tick(&sio).await;
+                        // optimistic: a clean connect proves reachability.
+                        last_signaling = Instant::now();
+                        signaling_down_since = None;
+                        signaling_up_since = Some(Instant::now());
+                        probed_silence = None;
+                        signaling_health::note_redialed();
+                        // Visible: pairs with the "reconnecting..." line so the
+                        // recovery is observable end to end. Collapsed with it.
+                        if let Some(line) = signaling_log.admit(
+                            "up",
+                            "signaling reconnected, re-announcing presence",
+                            Instant::now(),
+                        ) {
+                            ui::say(&ui::paint(ui::Tone::Ok, &line));
                         }
+                        sdnotify::status("up - serving");
+                    }
+                    Err(e) => {
+                        // DEBUG, resilience internal (signaling reconnect retry).
+                        ui::debug(&ui::paint(
+                            ui::Tone::Dim,
+                            &format!(
+                                "  signaling reconnect failed ({e}), retrying in {}ms",
+                                reconnect_wait.as_millis()
+                            ),
+                        ));
                     }
                 }
             }

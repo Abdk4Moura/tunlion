@@ -344,8 +344,14 @@ pub enum Ev {
     /// protocol error; a hard TCP sever (the flaky-proxy case) produces NO
     /// callback at all, so the silence watchdog (`signaling_silence_ms`) is the
     /// authoritative trigger and this is purely an accelerant.
-    #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
-    SignalingDown(String),
+    ///
+    /// The `u64` is the id of the connection that ended
+    /// (`filament_signal::Client::id`). Every connection a re-dialing daemon
+    /// opens shares one event channel, so a close can arrive after the loop has
+    /// already replaced that connection; only a close whose id matches the
+    /// CURRENT client means the link is down. Acting on a stale one tore down
+    /// each fresh connection in turn: the post-SIGSTOP reconnect storm.
+    SignalingDown(String, u64),
     /// Warm-reuse opened a stream over this held link and it black-holed (no
     /// response within the verify window) - the link is a zombie (alive at the
     /// QUIC layer but dead for new streams). The loop drops it so the daemon
@@ -1078,7 +1084,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         tokio::spawn(async move {
             while let Some(msg) = raw_rx.recv().await {
                 let ev = match msg {
-                    filament_signal::Incoming::Down(reason) => Ev::SignalingDown(reason),
+                    filament_signal::Incoming::Down { conn, reason } => Ev::SignalingDown(reason, conn),
                     filament_signal::Incoming::Event { name, data } => match name.as_str() {
                         "welcome" => Ev::Welcome(data),
                         "peer-joined" => Ev::PeerJoined(data),

@@ -136,6 +136,16 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         Some(_) => crate::ctl::daemon_responds(STATUS_PROBE).await,
         None => Some(false),
     };
+    // Suspended (SIGSTOP) is told apart from wedged where the kernel says so.
+    let suspended = pid_alive.is_some_and(|p| crate::platform::process_stopped(p) == Some(true));
+    // Answering is not serving either: a daemon whose signaling link is down
+    // or flapping answers here while no peer can reach it. It reports its link.
+    let signaling = if responding == Some(true) {
+        crate::daemon_health::signaling().await
+    } else {
+        None
+    };
+    let degraded = signaling.as_ref().and_then(crate::daemon_health::degraded_reason);
     if json {
         let pid = pid_alive;
         let exposed: Vec<Value> = expose::load()
@@ -155,6 +165,11 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 // false: a process holds the pidfile but does not answer on its
                 // control socket. null: this platform cannot ask.
                 "responding": responding,
+                "suspended": suspended,
+                // The daemon's own view of its signaling link, and the reason
+                // it is degraded (null when healthy or not running).
+                "signaling": signaling,
+                "degraded": degraded,
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
@@ -179,11 +194,28 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         ));
     }
     match pid_alive {
-        Some(pid) if responding == Some(false) => ui::say(&format!(
-            "  {} running but not responding (pid {pid}): it did not answer on its control socket ({}) within {}s. It may be stopped (SIGSTOP) or wedged; `tunlion down` then `tunlion up` restarts it",
+        Some(pid) if responding == Some(false) && suspended => ui::say(&format!(
+            "  {} running but not responding (pid {pid}): it is suspended (SIGSTOP), so it serves nothing. `kill -CONT {pid}` resumes it; `tunlion down` stops it",
             ui::paint(ui::Tone::Err, ui::glyph_err()),
-            crate::ctl::control_sock_path().display(),
-            STATUS_PROBE.as_secs_f32()
+        )),
+        Some(pid) if responding == Some(false) => {
+            let sock = crate::ctl::control_sock_path();
+            // Say which: no socket at all (it was never bound, or was removed)
+            // is a different fault from a socket nobody answers on.
+            let at = if sock.exists() {
+                format!("it did not answer on its control socket ({}) within {}s", sock.display(), STATUS_PROBE.as_secs_f32())
+            } else {
+                format!("its control socket ({}) does not exist", sock.display())
+            };
+            ui::say(&format!(
+                "  {} running but not responding (pid {pid}): {at}. It may be stopped (SIGSTOP) or wedged; `tunlion down` then `tunlion up` restarts it",
+                ui::paint(ui::Tone::Err, ui::glyph_err()),
+            ))
+        }
+        Some(pid) if degraded.is_some() => ui::say(&format!(
+            "  {} up but degraded (pid {pid}): {}",
+            ui::paint(ui::Tone::Warn, "!"),
+            degraded.as_deref().unwrap_or_default()
         )),
         Some(pid) => ui::say(&format!(
             "  {} up (pid {pid})",
@@ -238,7 +270,51 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
+    match status_exit_code(pid_alive.is_some(), responding) {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
+}
+
+/// `status` exits 0 only when a daemon serves this config dir and answers.
+/// Otherwise a script branches on the code instead of parsing prose (it exited
+/// 0 for both of these):
+///
+/// - 11 (`STATUS_NOT_RUNNING`): no daemon serves this config dir.
+/// - 6 (`unreachable` in the exit-code taxonomy): a daemon holds this config
+///   dir but did not answer on its control socket in time (suspended, wedged,
+///   or no socket).
+///
+/// `status --json` keeps exit 0 and reports both in `running`/`responding`:
+/// the JSON is the answer, and its reader asked for data, not a verdict.
+/// A platform that cannot ask the daemon (`responding` null) is not a failure.
+pub(crate) fn status_exit_code(running: bool, responding: Option<bool>) -> i32 {
+    match (running, responding) {
+        (false, _) => STATUS_NOT_RUNNING,
+        (true, Some(false)) => STATUS_NOT_RESPONDING,
+        _ => 0,
+    }
+}
+
+/// No daemon serves this config dir. A status-only code (like `up`'s 10),
+/// listed under EXIT CODES in `tunlion --help`.
+pub(crate) const STATUS_NOT_RUNNING: i32 = 11;
+/// A daemon runs but did not answer in time: the taxonomy's 6, `unreachable`
+/// ("did not answer in time"), so one number keeps one meaning across verbs.
+pub(crate) const STATUS_NOT_RESPONDING: i32 = 6;
+
+#[cfg(test)]
+mod status_exit_tests {
+    use super::status_exit_code;
+
+    #[test]
+    fn status_exits_nonzero_unless_a_daemon_serves_and_answers() {
+        assert_eq!(status_exit_code(true, Some(true)), 0);
+        assert_eq!(status_exit_code(true, None), 0, "a platform that cannot ask is not a failure");
+        assert_eq!(status_exit_code(true, Some(false)), 6);
+        assert_eq!(status_exit_code(false, Some(false)), 11);
+        assert_eq!(status_exit_code(false, None), 11);
+    }
 }
 
 /// How many transfers `status` shows.
@@ -470,16 +546,16 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     match crate::platform::InstanceLock::try_acquire(&lock_path) {
         Ok(Some(lock)) => drop(lock),
         Ok(None) => {
-            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
-            return Ok(());
+            return crate::daemon_stop::report_holder(
+                crate::daemon_stop::lock_holder(&lock_path),
+                &lock_path,
+            );
         }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!(
-                "cannot take the daemon lock {} (is the config directory writable?)",
-                lock_path.display()
-            )));
-        }
+        Err(e) => return Err(crate::up_logs::lock_error(e, &lock_path)),
     }
+    // For the startup-death message below: a `down` that ran after this
+    // moment is the likely reason a fresh daemon died by a signal.
+    let spawned_at = std::time::SystemTime::now();
     let mut child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
     let pid = child.id();
     // "ok daemon detached" used to mean only "a pidfile appeared", and `up`
@@ -518,9 +594,13 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     match outcome {
         // Another `up` won the single-instance election at the same instant: a
         // daemon is running, which is what was asked for.
+        // Say which process holds it; a suspended or unnamed holder is not
+        // "running".
         DetachOutcome::Exited(Some(code)) if code == crate::up_logs::UP_LOST_ELECTION_EXIT => {
-            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
-            Ok(())
+            crate::daemon_stop::report_holder(
+                crate::daemon_stop::lock_holder(&lock_path),
+                &lock_path,
+            )
         }
         DetachOutcome::Ready => {
             ui::say(&format!(
@@ -548,9 +628,14 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
         DetachOutcome::Exited(code) => {
             let kind = detach_failure_kind(&tail);
             ui::critical(&format!(
-                "{} the daemon exited during startup ({}). Its last output ({}):",
+                "{} the daemon exited during startup ({}){}. Its last output ({}):",
                 ui::paint(ui::Tone::Err, ui::glyph_err()),
                 code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed by a signal".into()),
+                if crate::daemon_stop::stopped_by_down_since(spawned_at) {
+                    "; a `tunlion down` ran while it was starting and stopped it"
+                } else {
+                    ""
+                },
                 log_path.display()
             ));
             if tail.is_empty() {

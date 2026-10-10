@@ -14,7 +14,15 @@
 #      0600 after init, set, and a daemon run.
 #   S  a config dir too deep for a unix socket path: the daemon still gets a
 #      control socket (short per-user path) and `status` reports it responding.
-#   P  a SIGSTOPped daemon: `status` says "not responding", never "up".
+#   K  a client whose XDG_RUNTIME_DIR differs from the daemon's (unset, or
+#      another directory) still reaches its short control socket.
+#   P  a SIGSTOPped daemon: `status` says "not responding", never "up", and
+#      exits 6.
+#   C  a copy of a config dir whose daemon is running (`cp -a`, up.pid and
+#      up.lock included): `status` there says not running (exit 11) and `down`
+#      there leaves the original's daemon alone.
+#   Z  after `down`, `status` says not running and exits 11 (it exited 0).
+#   L  a config path past PATH_MAX: `up` names the length, not writability.
 #   D  a send into a 2 MB disk: refused BEFORE streaming, the sender exits 4 and
 #      names "out of disk space" with both sizes; nothing is left on that disk.
 #   W  two files that each fit but not together: the write that hits ENOSPC is
@@ -157,21 +165,85 @@ else
   tail -5 "$DS/daemon.log" 2>/dev/null
 fi
 
+# ===================================================================== GATE K ==
+say "K: a client with a different XDG_RUNTIME_DIR still reaches the daemon"
+# The daemon picked its short socket directory from ITS environment. A client
+# run under sudo, cron or a bare ssh command has no XDG_RUNTIME_DIR, or another
+# one; it computed a different directory and called a healthy daemon "not
+# responding" at a path that never existed.
+OTHERRUN="$WORK/other-run"; mkdir -p "$OTHERRUN"; chmod 700 "$OTHERRUN"
+STK1=$(env -u XDG_RUNTIME_DIR FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcK1=$?
+STK2=$(env XDG_RUNTIME_DIR="$OTHERRUN" FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcK2=$?
+echo "## XDG_RUNTIME_DIR unset: rc=$rcK1; XDG_RUNTIME_DIR=$OTHERRUN: rc=$rcK2 (daemon's: ${XDG_RUNTIME_DIR:-unset})"
+echo "$STK1" | head -2 | sed 's/^/    unset: /'; echo "$STK2" | head -2 | sed 's/^/    other: /'
+if [ "$rcK1" = "0" ] && [ "$rcK2" = "0" ] && echo "$STK1" | grep -qE "up( but degraded)? \(pid $DPID\)" \
+   && echo "$STK2" | grep -qE "up( but degraded)? \(pid $DPID\)"; then
+  ok "gateK: clients with any XDG_RUNTIME_DIR reach the daemon's short control socket"
+else
+  bad "gateK: control socket not found from a different environment (rc unset=$rcK1 other=$rcK2)"
+fi
+
 # ===================================================================== GATE P ==
 say "P: a stopped daemon is not reported up"
 if [ -n "$DPID" ] && kill -STOP "$DPID" 2>/dev/null; then
-  STP=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1)
+  STP=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcP=$?
   kill -CONT "$DPID" 2>/dev/null
-  echo "$STP" | sed 's/^/    /'
-  if echo "$STP" | grep -q "not responding" && ! echo "$STP" | grep -q " up (pid"; then
-    ok "gateP: SIGSTOPped daemon reported as running but not responding"
+  echo "## status rc=$rcP"; echo "$STP" | sed 's/^/    /'
+  if echo "$STP" | grep -q "not responding" && ! echo "$STP" | grep -q " up (pid" && [ "$rcP" = "6" ]; then
+    ok "gateP: SIGSTOPped daemon reported as running but not responding, exit 6"
   else
-    bad "gateP: SIGSTOPped daemon still reported up"
+    bad "gateP: SIGSTOPped daemon still reported up, or status exited $rcP (want 6)"
   fi
 else
   bad "gateP: no daemon pid to stop (gate S setup failed)"
 fi
+
+# ===================================================================== GATE C ==
+say "C: a copied config dir does not see or stop the original's daemon"
+# cp -a carries up.pid (the live daemon's pid) and up.lock (as a NEW inode,
+# held by nobody). The copy has no daemon. It used to report the original's
+# daemon as its own, and `down` there killed it.
+sleep 1
+DC="$WORK/cfg-copy"
+cp -a "$DS" "$DC" 2>/dev/null
+STC=$(env FILAMENT_CONFIG_DIR="$DC" timeout 20 "$BIN" status 2>&1); rcC=$?
+DNC=$(env FILAMENT_CONFIG_DIR="$DC" timeout 20 "$BIN" down -y 2>&1)
+sleep 1
+aliveC=no; [ -n "$DPID" ] && kill -0 "$DPID" 2>/dev/null && aliveC=yes
+STO=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1)
+echo "## copy has up.pid=$(head -1 "$DC/up.pid" 2>/dev/null); copy status rc=$rcC; original pid $DPID alive after down in copy: $aliveC"
+echo "$STC" | head -1 | sed 's/^/    copy status: /'; echo "$DNC" | head -1 | sed 's/^/    copy down:   /'
+echo "$STO" | head -1 | sed 's/^/    original:    /'
+if [ "$rcC" = "11" ] && echo "$STC" | grep -q "not running" && ! echo "$DNC" | grep -q "stopped" \
+   && [ "$aliveC" = "yes" ] && echo "$STO" | grep -qE "(up|up but degraded|running but not responding) \(pid $DPID\)"; then
+  ok "gateC: a copied config dir sees no daemon, and its down leaves the original running"
+else
+  bad "gateC: copied config dir acted on the original's daemon (status rc=$rcC, original alive=$aliveC)"
+fi
 env FILAMENT_CONFIG_DIR="$DS" timeout 15 "$BIN" down -y >/dev/null 2>&1
+
+# ===================================================================== GATE Z ==
+say "Z: status after down says not running and exits 11"
+STZ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcZ=$?
+STZJ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcZJ=$?
+echo "## status rc=$rcZ, status --json rc=$rcZJ"; echo "$STZ" | head -1 | sed 's/^/    /'
+if [ "$rcZ" = "11" ] && echo "$STZ" | grep -q "not running" && [ "$rcZJ" = "0" ] \
+   && echo "$STZJ" | "$PYV" -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("running") is False else 1)'; then
+  ok "gateZ: no daemon is exit 11 (text), and --json reports running:false with exit 0"
+else
+  bad "gateZ: status with no daemon (rc=$rcZ, --json rc=$rcZJ)"
+fi
+
+# ===================================================================== GATE L ==
+say "L: a config path past PATH_MAX names the length"
+DL="$WORK/cfg-long"; for _ in $(seq 1 22); do DL="$DL/$(printf 'L%.0s' $(seq 1 200))"; done
+outL=$(env FILAMENT_CONFIG_DIR="$DL" timeout 30 "$BIN" --server "$SERVER" up --detach 2>&1); rcL=$?
+echo "## config path ${#DL} bytes; up rc=$rcL"; echo "$outL" | tail -2 | cut -c1-300 | sed 's/^/    /'
+if [ "$rcL" != "0" ] && echo "$outL" | grep -q "too long" && ! echo "$outL" | grep -q "writable?"; then
+  ok "gateL: the failure names the path length, not writability"
+else
+  bad "gateL: over-long config path (rc=$rcL)"
+fi
 
 # ===================================================================== GATE X ==
 say "X: the auto SOCKS5 proxy reports the port it actually bound"

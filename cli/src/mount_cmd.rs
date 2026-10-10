@@ -256,10 +256,7 @@ pub(crate) fn resolve_mount_plan(
     // ceiling (an owner device or a plain pair) is not restricted here.
     if let Some(caps) = principal_ceiling_for(&peer) {
         if !caps.iter().any(|c| c == "mount") {
-            bail!(
-                "mount denied by {peer}: this device's invitation ceiling ({}) does not include mount",
-                caps.join(", ")
-            );
+            bail!("{}", crate::identity_state::ceiling_refusal_here("mount", &peer, "mount", &caps));
         }
     }
     let remote = match remote {

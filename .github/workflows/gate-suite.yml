@@ -25,6 +25,15 @@
 #                              (mounts small tmpfs disks, so it uses sudo)
 #   reenrol-advice-gates.sh    the advice for widening a joined device's ceiling
 #                              is run exactly as printed, and it works
+#   daemon-stop-gates.sh       `down` on a suspended daemon returns only once
+#                              it is gone, the next `up` starts one instead of
+#                              "already running (starting)", a suspended lock
+#                              holder is named, and a daemon cut off from its
+#                              server is reported degraded by status and doctor
+#   signaling-freeze-gates.sh  a daemon frozen (SIGSTOP) for 80 s while paired
+#                              comes back within seconds of SIGCONT, without a
+#                              reconnect storm (counted by the server), without
+#                              a log line per cycle, and a send to it works
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
 # 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
@@ -68,6 +77,8 @@ on:
       - 'cli/tests/warm-hold-idle-gates.sh'
       - 'cli/tests/hostile-env-gates.sh'
       - 'cli/tests/reenrol-advice-gates.sh'
+      - 'cli/tests/daemon-stop-gates.sh'
+      - 'cli/tests/signaling-freeze-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -149,8 +160,10 @@ jobs:
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
-            [cli/tests/hostile-env-gates.sh]=12
+            [cli/tests/hostile-env-gates.sh]=16
             [cli/tests/reenrol-advice-gates.sh]=3
+            [cli/tests/daemon-stop-gates.sh]=4
+            [cli/tests/signaling-freeze-gates.sh]=5
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -176,7 +189,9 @@ jobs:
                    cli/tests/whoami-candidate-gates.sh \
                    cli/tests/warm-hold-idle-gates.sh \
                    cli/tests/hostile-env-gates.sh \
-                   cli/tests/reenrol-advice-gates.sh; do
+                   cli/tests/reenrol-advice-gates.sh \
+                   cli/tests/daemon-stop-gates.sh \
+                   cli/tests/signaling-freeze-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare

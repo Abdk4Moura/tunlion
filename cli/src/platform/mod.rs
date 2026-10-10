@@ -1972,6 +1972,121 @@ mod tests {
                 assert!(m.contains("/dev/fuse"), "{m}");
             }
         }
+    /// The /proc/locks parser: the holder, never a waiter, device numbers in
+    /// hex, inode in decimal, and an OFD lock's -1 is "held, pid unknown".
+    #[test]
+    fn the_lock_holder_is_read_from_proc_locks_text() {
+        let text = "1: FLOCK  ADVISORY  WRITE 4242 fd:01:131087 0 EOF\n\
+                    1: -> FLOCK  ADVISORY  WRITE 5151 fd:01:131087 0 EOF\n\
+                    2: POSIX  ADVISORY  WRITE 777 08:02:99 0 EOF\n\
+                    3: OFDLCK ADVISORY  READ  -1 08:02:1234 0 EOF\n";
+        assert_eq!(lock_holder_in(text, 0xfd, 0x01, 131087), LockHolder::Held(Some(4242)));
+        assert_eq!(lock_holder_in(text, 0x08, 0x02, 99), LockHolder::Held(Some(777)));
+        assert_eq!(lock_holder_in(text, 0x08, 0x02, 1234), LockHolder::Held(None));
+        // Same inode number on another device, and a free inode.
+        assert_eq!(lock_holder_in(text, 0x08, 0x03, 99), LockHolder::Free);
+        assert_eq!(lock_holder_in(text, 0xfd, 0x01, 5), LockHolder::Free);
+        assert_eq!(lock_holder_in("", 0xfd, 0x01, 5), LockHolder::Free);
+    }
+
+    /// The setcap'd daemon: a process that is NOT dumpable (what a file
+    /// capability makes it) holding the instance lock. Its /proc/<pid>/exe is
+    /// unreadable to its own user, which the old executable check read as
+    /// "dead", so `status` said "not running" for everyone on kernel TUN. The
+    /// lock names it anyway, the daemon check accepts it, and once it dies the
+    /// lock is free and the same pidfile no longer counts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_dumpable_daemon_is_found_by_its_lock_not_its_exe() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("tl-lockholder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("up.lock");
+        let pidfile = dir.join("up.pid");
+        std::fs::write(&lock, b"").unwrap();
+        let c_lock = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // The child does only async-signal-safe syscalls: it opens the lock
+        // file ITSELF (a lock taken through an fd inherited from this process
+        // would outlive the child), drops dumpability, locks, reports, waits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+                let fd = libc::open(c_lock.as_ptr(), libc::O_RDWR);
+                if fd < 0 || libc::flock(fd, libc::LOCK_EX) != 0 {
+                    libc::_exit(3);
+                }
+                libc::write(fds[1], b"k".as_ptr() as *const libc::c_void, 1);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(fds[0], b.as_mut_ptr() as *mut libc::c_void, 1) };
+        let child = child as u32;
+        let outcome = std::panic::catch_unwind(|| {
+            assert_eq!(n, 1, "the child never took the lock");
+            if unsafe { libc::geteuid() } != 0 {
+                // The precondition the bug needs (root may read it anyway).
+                assert_eq!(process_exe_path(child), None, "the child should be non-dumpable");
+            }
+            assert_eq!(instance_lock_holder(&lock), LockHolder::Held(Some(child)));
+            std::fs::write(&pidfile, format!("{child}\n")).unwrap();
+            assert_eq!(crate::shell_support::daemon_alive_in(&pidfile, &lock), Some(child));
+            // A pidfile naming any other live process is not this config's daemon.
+            std::fs::write(&pidfile, format!("{}\n", std::process::id())).unwrap();
+            assert_eq!(crate::shell_support::daemon_alive_in(&pidfile, &lock), None);
+        });
+        unsafe {
+            libc::kill(child as i32, libc::SIGKILL);
+            libc::waitpid(child as i32, std::ptr::null_mut(), 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        if let Err(e) = outcome {
+            std::panic::resume_unwind(e);
+        }
+        // Dead: the lock is free, and the pidfile naming it is nobody.
+        assert_eq!(instance_lock_holder(&lock), LockHolder::Free);
+        std::fs::write(&pidfile, format!("{child}\n")).unwrap();
+        assert_eq!(crate::shell_support::daemon_alive_in(&pidfile, &lock), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The copied-config case without a fork: this process holds the lock on
+    /// one config dir; the other dir's `up.lock` and `up.pid` are byte-for-byte
+    /// copies (pid included), and the other dir still has no daemon.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_copied_config_dir_does_not_inherit_the_daemon() {
+        let base = std::env::temp_dir().join(format!("tl-cfgcopy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let held = InstanceLock::try_acquire(&a.join("up.lock")).unwrap().expect("lock");
+        let me = std::process::id();
+        std::fs::write(a.join("up.pid"), format!("{me}\n")).unwrap();
+        std::fs::copy(a.join("up.lock"), b.join("up.lock")).unwrap();
+        std::fs::copy(a.join("up.pid"), b.join("up.pid")).unwrap();
+        assert_eq!(instance_lock_holder(&a.join("up.lock")), LockHolder::Held(Some(me)));
+        assert_eq!(instance_lock_holder(&b.join("up.lock")), LockHolder::Free);
+        assert_eq!(
+            crate::shell_support::daemon_alive_in(&a.join("up.pid"), &a.join("up.lock")),
+            Some(me)
+        );
+        assert_eq!(
+            crate::shell_support::daemon_alive_in(&b.join("up.pid"), &b.join("up.lock")),
+            None,
+            "a copied config dir must not see the original's daemon"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2498,6 +2613,89 @@ pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+// ------------------------------------------------------- instance lock holder --
+
+/// Who holds a daemon's single-instance lock (`{config}/up.lock`), as the
+/// kernel reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockHolder {
+    /// Held, by this pid when the kernel names it (None: it is held by a
+    /// process this one cannot name, e.g. in another pid namespace).
+    Held(Option<u32>),
+    /// The lock file exists and nobody holds it: no daemon serves this config.
+    Free,
+    /// This platform (or this box: no /proc/locks, no lock file yet) cannot
+    /// say. The caller falls back to the pidfile and the executable check.
+    Unknown,
+}
+
+/// Who holds the instance lock at `path`, read WITHOUT taking it.
+///
+/// WHY THE LOCK AND NOT THE PIDFILE. The pidfile is only a claim: a copied or
+/// migrated config dir carries another config's `up.pid`, and that config's
+/// live daemon then passed every check, so `up` there said "already running",
+/// `status` probed a socket nobody served, and `down` killed the other config's
+/// daemon. The lock is held by exactly the process serving THIS config dir: a
+/// copy of `up.lock` is a different inode that nobody holds.
+///
+/// WHY NOT /proc/<pid>/exe EITHER. A daemon run from a binary given
+/// CAP_NET_ADMIN by `setcap` (the kernel-TUN setup `init` recommends) is not
+/// dumpable, so its `/proc/<pid>/exe` cannot be read by its own user and the
+/// old check called a healthy daemon dead. /proc/locks is world-readable and
+/// names the holder of every lock by device and inode.
+///
+/// Read-only on purpose: probing by TAKING the lock would make a concurrent
+/// `up` lose the election to a `status` that happened to look at that instant.
+pub fn instance_lock_holder(path: &Path) -> LockHolder {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return LockHolder::Unknown;
+        };
+        let Ok(locks) = std::fs::read_to_string("/proc/locks") else {
+            return LockHolder::Unknown;
+        };
+        let dev = meta.dev();
+        // glibc/musl dev_t encoding (what `major(3)`/`minor(3)` decode).
+        let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0x0fff);
+        let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0x00ff);
+        lock_holder_in(&locks, major, minor, meta.ino())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        LockHolder::Unknown
+    }
+}
+
+/// The holder of the lock on inode (`major`:`minor`, `ino`) in the text of
+/// /proc/locks, whose lines read
+/// `1: FLOCK  ADVISORY  WRITE 1234 08:02:131087 0 EOF`
+/// (device numbers in hex, inode in decimal; `-> ` marks a waiter, not a
+/// holder; an OFD lock has pid -1). Any lock type counts: on NFS a flock is
+/// carried as a POSIX lock. Pure.
+pub fn lock_holder_in(locks: &str, major: u64, minor: u64, ino: u64) -> LockHolder {
+    for line in locks.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 || fields[1] == "->" {
+            continue;
+        }
+        let mut id = fields[5].split(':');
+        let (Some(ma), Some(mi), Some(ino_s)) = (id.next(), id.next(), id.next()) else {
+            continue;
+        };
+        let same = u64::from_str_radix(ma, 16).ok() == Some(major)
+            && u64::from_str_radix(mi, 16).ok() == Some(minor)
+            && ino_s.parse::<u64>().ok() == Some(ino);
+        if same {
+            let pid = fields[4].parse::<i64>().ok().filter(|p| *p > 0).map(|p| p as u32);
+            return LockHolder::Held(pid);
+        }
+    }
+    LockHolder::Free
+}
+
 // ------------------------------------------------------------ InstanceLock --
 
 /// The daemon's single-instance election: an exclusive lock on `{config}/up.lock`,
@@ -2577,6 +2775,121 @@ impl InstanceLock {
         }
         Ok(Some(InstanceLock { _file: file }))
     }
+
+    /// Write this process's pid into the lock file, so a loser can say WHICH
+    /// process holds the election. Holding the lock already proves the holder is
+    /// alive (the kernel drops it on exit); the pid is what turns "already running
+    /// (starting)" into a claim that can be checked. Best effort.
+    pub fn record_owner(&self) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = &self._file;
+        let _ = f.set_len(0);
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = writeln!(f, "{}", std::process::id());
+        let _ = f.flush();
+    }
+
+    /// The pid the current holder recorded in `path`, if any. On Windows a held
+    /// lock blocks the read, so this is None there and callers fall back to the
+    /// pidfile alone.
+    pub fn recorded_owner(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+}
+
+// --------------------------------------------------------- process control --
+
+/// The signals `down` uses beyond its first polite request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escalate {
+    /// Resume a stopped (SIGSTOP) process so it can act on the request to exit
+    /// it already has pending. A no-op where processes cannot be stopped.
+    Continue,
+    /// End it now (SIGKILL; TerminateProcess on Windows).
+    Kill,
+}
+
+#[cfg(unix)]
+pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
+    let sig = match how {
+        Escalate::Continue => libc::SIGCONT,
+        Escalate::Kill => libc::SIGKILL,
+    };
+    if unsafe { libc::kill(pid as libc::pid_t, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
+    match how {
+        Escalate::Continue => Ok(()),
+        Escalate::Kill => {
+            let st = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if st.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("taskkill exited {st}")))
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn escalate(_pid: u32, _how: Escalate) -> std::io::Result<()> {
+    Err(std::io::Error::other("cannot signal processes on this platform"))
+}
+
+/// Is `pid` stopped (SIGSTOP, a debugger, a terminal stop)? Some(true/false)
+/// where the kernel says, None where this platform cannot tell. A stopped
+/// process keeps its pid and its locks but runs nothing: it neither serves nor
+/// exits when asked, which is why `status` and `up` must not call it running.
+#[cfg(target_os = "linux")]
+pub fn process_stopped(pid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The state is the first field after the parenthesised command name, which
+    // may itself contain spaces or parentheses, so split at the LAST ')'.
+    let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
+    Some(matches!(state, "T" | "t"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_stopped(_pid: u32) -> Option<bool> {
+    None
+}
+
+/// Does `pid` name a process that has not exited? A zombie (exited, waiting to
+/// be reaped) has exited. Unlike `process_exe_path` this works for a daemon
+/// whose executable cannot be read (one run from a setcap'd binary is not
+/// dumpable), which `down` must not mistake for gone.
+#[cfg(target_os = "linux")]
+pub fn process_exists(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => !matches!(
+            stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next()),
+            Some("Z" | "X") | None
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn process_exists(pid: u32) -> bool {
+    // Signal 0 checks existence and permission without delivering anything;
+    // EPERM still means the process exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub fn process_exists(pid: u32) -> bool {
+    process_exe_path(pid).is_some()
 }
 
 /// Make `opts` create the file owner-only (0600), whatever the umask. A no-op
@@ -2736,27 +3049,53 @@ pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::FileTypeExt;
         let key = config_dir_key(config_dir);
         let uid = unsafe { libc::geteuid() };
+        // Every short directory the socket may live in, in order of preference.
+        // `/run/user/<uid>` is listed even when XDG_RUNTIME_DIR is not set,
+        // because it is where XDG_RUNTIME_DIR points for a daemon started from
+        // a login session or a user service, while `sudo`, cron and a bare ssh
+        // command run without the variable.
         let mut bases: Vec<PathBuf> = Vec::new();
         if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
             if x.is_absolute() && x.is_dir() {
                 bases.push(x);
             }
         }
-        bases.push(PathBuf::from("/tmp"));
-        for base in bases {
-            let dir = base.join(format!("tunlion-{uid}"));
-            let sock = dir.join(format!("{key}.sock"));
-            if sock.as_os_str().len() >= SOCKET_PATH_MAX {
-                continue;
-            }
-            if dir.exists() && private_dir_check(&dir).is_err() {
-                continue;
-            }
-            return sock;
+        let run_user = PathBuf::from(format!("/run/user/{uid}"));
+        if run_user.is_dir() && !bases.contains(&run_user) {
+            bases.push(run_user);
         }
-        preferred.to_path_buf()
+        bases.push(PathBuf::from("/tmp"));
+        let candidates: Vec<PathBuf> = bases
+            .into_iter()
+            .map(|base| base.join(format!("tunlion-{uid}")).join(format!("{key}.sock")))
+            .filter(|sock| sock.as_os_str().len() < SOCKET_PATH_MAX)
+            .filter(|sock| {
+                let dir = sock.parent().unwrap_or(Path::new("/"));
+                !dir.exists() || private_dir_check(dir).is_ok()
+            })
+            .collect();
+        // The daemon and its clients must MEET. A client whose environment
+        // differs from the daemon's (XDG_RUNTIME_DIR set for one and not the
+        // other) used to compute a different directory and report a healthy
+        // daemon as "not responding" at a path that never existed. A socket
+        // that already exists for THIS config (the name is this config dir's
+        // key, so another config's socket can never match) is the one a daemon
+        // bound; the newest wins when an old one lingers. With none, the first
+        // candidate, which is where a starting daemon binds and creates it.
+        let existing = candidates
+            .iter()
+            .filter_map(|sock| {
+                let md = std::fs::symlink_metadata(sock).ok()?;
+                md.file_type().is_socket().then(|| (md.modified().ok(), sock))
+            })
+            .max_by_key(|(mtime, _)| *mtime)
+            .map(|(_, sock)| sock.clone());
+        existing
+            .or_else(|| candidates.first().cloned())
+            .unwrap_or_else(|| preferred.to_path_buf())
     }
     #[cfg(not(unix))]
     {

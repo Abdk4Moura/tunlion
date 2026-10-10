@@ -421,7 +421,11 @@ pub(crate) enum Cmd {
         #[arg(long)]
         no_proxy_fallback: bool,
     },
-    /// Show whether the daemon runs and what it received recently
+    /// Show whether the daemon runs and what it received recently.
+    ///
+    /// Exits 0 when the daemon serving this config dir answers, 11 when no
+    /// daemon serves it, and 6 when one runs but does not answer in time.
+    /// `--json` always exits 0 and reports both in `running`/`responding`.
     Status {
         /// Machine-readable JSON (for scripts): {running, pid, devices, exposed, recent}.
         #[arg(long)]

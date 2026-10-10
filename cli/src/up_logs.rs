@@ -297,6 +297,14 @@ pub(crate) async fn up_cmd(
     let headless = std::env::var_os(platform::DETACHED_CHILD_ENV).is_some()
         || platform::stdio_is_file(&console_log);
     if let Some(pid) = daemon_alive() {
+        // A suspended daemon keeps its pid and its lock but serves nothing;
+        // "already running; nothing to do" about it was false.
+        if platform::process_stopped(pid) == Some(true) {
+            return crate::daemon_stop::report_holder(
+                crate::daemon_stop::Holder::Stopped(pid),
+                &platform::Paths::config_path("up.lock"),
+            );
+        }
         dlog!(
             "[up] already-up: pidfile={:?} pid={pid} cmdline={:?}",
             crate::pidfile(),
@@ -376,27 +384,35 @@ pub(crate) async fn up_cmd(
     // lives until `up_cmd` returns) and the kernel drops it if we die.
     let lock_path = platform::Paths::config_path("up.lock");
     let _instance = match platform::InstanceLock::try_acquire(&lock_path) {
-        Ok(Some(lock)) => lock,
+        Ok(Some(lock)) => {
+            // Name ourselves in the lock, so a loser can say which process
+            // holds it instead of "already running (starting)" about nobody.
+            lock.record_owner();
+            lock
+        }
         Ok(None) => {
-            let pid = wait_for_winner_pid();
+            let holder = crate::daemon_stop::lock_holder(&lock_path);
             if headless {
-                // The losing child of a concurrent `up --detach`: its parent turns
-                // this exit into "already running".
-                already_running(pid);
+                // The losing child of a concurrent `up --detach`: its parent
+                // reports the holder itself; this line is for daemon.log.
+                if let Err(e) = crate::daemon_stop::report_holder(holder, &lock_path) {
+                    ui::say(&format!("  {e}"));
+                }
                 std::process::exit(UP_LOST_ELECTION_EXIT);
             }
-            ui::say(&format!(
-                "  daemon already running{}; following its log (ctrl-c to detach)",
-                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
-            ));
-            return logs_cmd(true, 20).await;
+            match holder {
+                crate::daemon_stop::Holder::Serving(p) | crate::daemon_stop::Holder::Starting(p) => {
+                    ui::say(&format!(
+                        "  daemon already running (pid {p}); following its log (ctrl-c to detach)"
+                    ));
+                    return logs_cmd(true, 20).await;
+                }
+                // A suspended holder, or one nobody can name, is not a daemon
+                // to follow: say so rather than tail a log nothing writes.
+                other => return crate::daemon_stop::report_holder(other, &lock_path),
+            }
         }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!(
-                "cannot take the daemon lock {} (is the config directory writable?)",
-                lock_path.display()
-            )));
-        }
+        Err(e) => return Err(lock_error(e, &lock_path)),
     };
     // A write that died part way (a full disk, a kill) leaves `<file>.tmp.<pid>`
     // behind; nothing else ever removes them.
@@ -1338,19 +1354,100 @@ pub(crate) fn already_running(pid: Option<u32>) {
     ui::say(&format!(
         "  {} daemon already running{}; nothing to do",
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        pid.map(|p| format!(" (pid {p})")).unwrap_or_else(|| " (starting)".to_string())
+        pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
     ));
 }
 
-/// The pid of the daemon that won the election, once it has written its
-/// pidfile. The winner takes the lock first and writes the pidfile a moment
-/// later, so a loser waits briefly rather than reporting no pid.
-pub(crate) fn wait_for_winner_pid() -> Option<u32> {
-    for _ in 0..20 {
-        if let Some(pid) = daemon_alive() {
-            return Some(pid);
+
+/// Why the daemon lock could not be taken, in words that name the real cause.
+/// It always said "(is the config directory writable?)", including for a
+/// config path longer than the system allows (ENAMETOOLONG), where the
+/// directory was perfectly writable and the path was the problem.
+pub(crate) fn lock_error(e: std::io::Error, lock_path: &std::path::Path) -> anyhow::Error {
+    let shown = short_path(lock_path);
+    let why = match platform::storage_failure(&e) {
+        Some(platform::StorageFailure::NameTooLong) => format!(
+            "the config directory path is too long for this system ({} bytes); point FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME at a shorter path",
+            lock_path.as_os_str().len()
+        ),
+        Some(platform::StorageFailure::ReadOnly) => {
+            "the config directory is on a read-only filesystem".to_string()
         }
-        std::thread::sleep(Duration::from_millis(50));
+        Some(platform::StorageFailure::Permission) => {
+            "the config directory is not writable by this user".to_string()
+        }
+        Some(platform::StorageFailure::NoSpace) => {
+            "the disk holding the config directory is full".to_string()
+        }
+        None => e.to_string(),
+    };
+    anyhow::Error::new(e).context(format!("cannot take the daemon lock {shown}: {why}"))
+}
+
+/// A path for a message: whole when it is reasonable, otherwise its start and
+/// end around an ellipsis, so a 4 KB path does not bury the sentence.
+fn short_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    if s.chars().count() <= 160 {
+        return s;
     }
-    None
+    let head: String = s.chars().take(60).collect();
+    let tail: String = {
+        let v: Vec<char> = s.chars().collect();
+        v[v.len() - 60..].iter().collect()
+    };
+    format!("{head}...{tail}")
+}
+
+#[cfg(test)]
+mod lock_error_tests {
+    use super::lock_error;
+
+    /// The blind test's >4096-byte config path: `up` blamed writability, the
+    /// real error was ENAMETOOLONG. The message names the length problem, and
+    /// only a permission problem is called one.
+    #[test]
+    fn a_lock_error_names_its_real_cause() {
+        let p = std::path::Path::new("/x/up.lock");
+        let long = lock_error(
+            std::io::Error::new(std::io::ErrorKind::InvalidFilename, "File name too long"),
+            p,
+        );
+        let long = format!("{long:#}");
+        assert!(long.contains("too long") && !long.contains("writable"), "{long}");
+        let ro = format!(
+            "{:#}",
+            lock_error(std::io::Error::new(std::io::ErrorKind::ReadOnlyFilesystem, "ro"), p)
+        );
+        assert!(ro.contains("read-only"), "{ro}");
+        let perm = format!(
+            "{:#}",
+            lock_error(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "no"), p)
+        );
+        assert!(perm.contains("not writable"), "{perm}");
+        let other = format!("{:#}", lock_error(std::io::Error::other("boom"), p));
+        assert!(other.contains("boom") && !other.contains("writable"), "{other}");
+    }
+
+    /// The same through a REAL lock attempt on a path past PATH_MAX.
+    #[test]
+    fn a_config_path_past_the_limit_is_reported_as_too_long() {
+        if !cfg!(unix) {
+            return;
+        }
+        let top = std::env::temp_dir().join(format!("tl-deep-{}", std::process::id()));
+        let mut deep = top.clone();
+        for _ in 0..24 {
+            deep.push("d".repeat(200));
+        }
+        let lock = deep.join("up.lock");
+        assert!(lock.as_os_str().len() > 4096);
+        let e = crate::platform::InstanceLock::try_acquire(&lock)
+            .err()
+            .expect("a path past PATH_MAX cannot be locked");
+        let msg = format!("{:#}", lock_error(e, &lock));
+        assert!(msg.contains("too long"), "{msg}");
+        assert!(msg.len() < 1200, "the message must not quote the whole 4 KB path: {} bytes", msg.len());
+        let _ = std::fs::remove_dir_all(&top);
+    }
 }

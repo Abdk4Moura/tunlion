@@ -179,7 +179,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
                     acked = true;
                 }
             }
-            Ev::SignalingDown(reason) => {
+            Ev::SignalingDown(reason, _) => {
                 ui::debug(&format!("depart: signaling down: {reason}"));
                 break;
             }

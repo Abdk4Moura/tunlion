@@ -106,28 +106,52 @@ pub(crate) fn daemon_running() -> bool {
 }
 
 pub(crate) fn daemon_alive() -> Option<u32> {
-    let raw = std::fs::read_to_string(pidfile()).ok()?;
+    daemon_alive_in(&pidfile(), &platform::Paths::config_path("up.lock"))
+}
+
+/// The daemon serving the config dir whose pidfile and instance lock are
+/// these, or None. SCOPED TO THAT CONFIG DIR: the pid must be the process the
+/// kernel says holds THIS dir's `up.lock`. A pidfile alone is a claim anyone
+/// can copy (a config dir copied or migrated with its `up.pid` made `up`,
+/// `status` and `down` act on ANOTHER config's daemon), and reading
+/// `/proc/<pid>/exe` fails for a daemon whose binary carries a file capability
+/// (it is not dumpable), so a healthy kernel-TUN daemon read as dead.
+///
+/// Where the platform cannot name the lock holder (no /proc/locks, or a lock
+/// file from before the lock existed), the executable check stands in: the
+/// recorded executable must be what the live pid runs.
+pub(crate) fn daemon_alive_in(pidfile: &Path, lock: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(pidfile).ok()?;
     // `up.pid` is the pid alone; the executable the daemon recorded is in
-    // `up.exe`. A daemon started by an older build wrote both into `up.pid`
-    // (pid, then path), so that second line is still honoured. With neither,
-    // the daemon and this CLI are the same installed binary, so fall back to
-    // our own executable.
-    // A two-line pidfile was written by the old daemon that owns it, so its own
-    // path wins over an `up.exe` that may be left from another run.
+    // `up.exe` beside it. A daemon started by an older build wrote both into
+    // `up.pid` (pid, then path), so that second line is still honoured, and it
+    // wins over an `up.exe` that may be left from another run.
     let (pid, legacy_exe) = crate::file_io::parse_pidfile(&raw)?;
-    let recorded = legacy_exe.or_else(|| {
-        std::fs::read_to_string(crate::file_io::pidfile_exe())
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    });
-    let expected = recorded.or_else(|| std::env::current_exe().ok())?;
-    // Identify the process by its executable path, never by matching a name.
-    // process_exe_path returns None for a dead or recycled pid, which is
-    // exactly the case the pidfile alone cannot detect.
-    let live = platform::process_exe_path(pid)?;
-    same_executable(&live, &expected).then_some(pid)
+    match platform::instance_lock_holder(lock) {
+        // Held by the process the pidfile names: that is this config's daemon.
+        platform::LockHolder::Held(Some(holder)) => (holder == pid).then_some(pid),
+        // Nobody holds this config's lock, so no daemon serves it, whatever
+        // the pidfile says and whatever process now has that pid.
+        platform::LockHolder::Free => None,
+        // Held, holder unnamed; or the platform cannot say. The executable
+        // check, as before.
+        platform::LockHolder::Held(None) | platform::LockHolder::Unknown => {
+            let recorded = legacy_exe.or_else(|| {
+                std::fs::read_to_string(pidfile.with_file_name("up.exe"))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            });
+            // With neither, the daemon and this CLI are the same installed
+            // binary.
+            let expected = recorded.or_else(|| std::env::current_exe().ok())?;
+            // Identify the process by its executable path, never by matching
+            // a name. None for a dead or recycled pid.
+            let live = platform::process_exe_path(pid)?;
+            same_executable(&live, &expected).then_some(pid)
+        }
+    }
 }
 
 /// The argv for a web-shell PTY.

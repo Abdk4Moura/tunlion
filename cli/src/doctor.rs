@@ -403,9 +403,15 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     let history = diag::summarize(HISTORY_LIMIT);
     // Local file read (fast, no IO worth joining): sshd CA trust presence.
     let sshca = crate::sshd::check_sshd_ca();
+    // The RUNNING daemon, not just a fresh connection from here: a daemon stuck
+    // re-dialing the server passed every check above while no peer could reach
+    // it. See daemon_health.
+    let daemon = crate::daemon_health::inspect().await;
 
     if json_out {
-        ui::json_out(&preflight_json(server, &sig, &ice, &ifaces, &history, &sshca));
+        let mut v = preflight_json(server, &sig, &ice, &ifaces, &history, &sshca);
+        v["daemon"] = daemon.to_json();
+        ui::json_out(&v);
         return preflight_result(&sig);
     }
 
@@ -428,6 +434,15 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ui::paint(Tone::Dim, &format!("{server}: {e}")),
         ),
     }
+
+    // The running daemon (its own signaling link, not this probe's).
+    let (tone, word, detail) = daemon.row();
+    ui::say(&format!(
+        "  {:<13} {}  {}",
+        "daemon",
+        ui::paint(tone, word),
+        ui::paint(Tone::Dim, &detail),
+    ));
 
     // ICE / STUN.
     match &ice {

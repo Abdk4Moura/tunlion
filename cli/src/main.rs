@@ -72,6 +72,12 @@ mod pake_ceremony;
 mod ping;
 mod roster;
 mod sdnotify;
+/// Stopping the daemon for real, and naming who holds its election.
+mod daemon_stop;
+/// What status and doctor say about the running daemon beyond a live pid.
+mod daemon_health;
+/// The daemon's signaling link: re-dial policy, log collapse, reported health.
+mod signaling_health;
 // The wire vocabulary and its pure decisions now live in their own crate. Kept
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;
@@ -1555,8 +1561,15 @@ fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
 }
 
 fn down_cmd() -> Result<()> {
-    match daemon_alive() {
+    // The pidfile names the daemon; a daemon whose pidfile is gone (an older
+    // `down` deleted it while the process lived on) is still found through the
+    // pid it recorded in the election lock it holds.
+    match daemon_alive().or_else(daemon_stop::orphaned_lock_holder) {
         Some(pid) => {
+            // Taken BEFORE signalling, so the wait below can tell this daemon
+            // from an unrelated process that later reuses its pid.
+            let exe = platform::process_exe_path(pid);
+            daemon_stop::mark_down(pid);
             // #191: a managed service restarts a killed process. systemd's
             // Restart=always reacts to an UNEXPECTED exit; a manual
             // `systemctl stop` is authoritative and is not restarted. So stop
@@ -1572,8 +1585,17 @@ fn down_cmd() -> Result<()> {
                     bail!("{why}");
                 }
             }
+            // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
+            // busy one may take a moment; "stopped" used to be printed 6 ms
+            // after the signal while the process lived on, holding the lock the
+            // next `up` then lost to. Wait (bounded), resume, then kill.
+            let how = daemon_stop::await_exit(pid, exe.as_deref())?;
             let _ = std::fs::remove_file(pidfile());
-            ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            ui::say(&format!(
+                "  {} stopped (pid {pid}){}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                how.note()
+            ));
             Ok(())
         }
         None => {
