@@ -273,6 +273,28 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
     Ok(tokio::fs::File::from_std(file))
 }
 
+/// Transfer id -> the final name a finished file was stored under, read once
+/// by the delivery-ack that follows.
+static STORED: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+fn note_stored(id: &str, name: &str) {
+    if let Ok(mut m) = STORED.lock() {
+        m.get_or_insert_with(Default::default).insert(id.to_string(), name.to_string());
+    }
+}
+
+/// The delivery-ack for transfer `id`, carrying the name it was stored under
+/// when this side knows it. `stored` is additive: an older sender ignores it.
+pub(crate) fn delivery_ack(id: &str, sid: u32) -> serde_json::Value {
+    let mut m = crate::protocol::delivery_ack_msg(id, sid);
+    let stored = STORED.lock().ok().and_then(|mut s| s.as_mut()?.remove(id));
+    if let Some(name) = stored {
+        m["stored"] = serde_json::json!(name);
+    }
+    m
+}
+
 pub(crate) struct IncomingFile {
     pub(crate) id: String,
     pub(crate) name: String,
@@ -470,6 +492,23 @@ pub(crate) async fn finalize_incoming(
             }
         }
     }
+    // The receiver's half of the structured history (both modes), and the
+    // stored name its delivery-ack reports back to the sender.
+    let stored_name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    note_stored(&inc.id, &stored_name);
+    crate::transfer_history::append(&[crate::transfer_history::Record {
+        time: crate::transfer_history::now_secs(),
+        direction: "in",
+        peer: (!from_name.is_empty()).then(|| from_name.to_string()),
+        file: inc.name.clone(),
+        stored: Some(shown.clone()),
+        bytes: recvd,
+        sha256: inc.full.clone(),
+        ok,
+    }]);
     if daemon {
         use std::io::Write as _;
         if let Ok(mut f) = crate::platform::open_private_log(&up_log(), false) {

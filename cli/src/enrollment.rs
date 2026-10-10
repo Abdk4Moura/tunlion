@@ -415,6 +415,8 @@ pub(crate) async fn enroll_cmd(
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
+                                "ok": true,
+                                "verb": "join",
                                 "joined": true,
                                 "name": name,
                                 "devicePub": hex::encode(device_pub),

@@ -193,7 +193,7 @@ test holds to the help text.
 |---|---|---|
 | 0 | | success |
 | 1 | `error` | anything not classified below |
-| 2 | `usage` | bad arguments or flags |
+| 2 | `usage` | bad arguments or flags, or a missing local prerequisite (`mount` with no FUSE) |
 | 3 | `unknown_device` | no such device, or not paired with this one |
 | 4 | `denied` | refused by the peer, a capability or ceiling, or the system |
 | 5 | `still_relayed` | `reach --until-direct`: the link is up but still on a relay |
@@ -219,6 +219,26 @@ Rules that go with them:
   `"identity": null`). `status --json` and `doctor --json` report
   `"identity": null` and keep their own exit rules; `status` and `devices`
   print the same one-line hint.
+- **`identity` is always the owner fingerprint or null**, on every verb that
+  reports it (`id`, `init`, `status`, `doctor`). Whether this device holds the
+  owner key or joined someone else's is a separate field, `role`: `"owner"`,
+  `"joined-device"`, or null.
+- **Every `--json` success carries `"ok": true`** (and `verb`), the mirror of
+  the failure envelope. `devices --json` and `set --json` print an array and
+  stay arrays; each `devices` entry carries a live `online` (the daemon holds a
+  link to it and it answered a liveness ping just now).
+- **`reach` confirms liveness.** A warm link is reported only after the peer
+  answers a `reach-ping` on it (1.5 s, FILAMENT_REACH_PING_MS); a peer stopped
+  or killed keeps its link "alive" locally until QUIC's idle timeout, so with
+  no answer reach falls through to the full probe and reports offline, exit 6.
+- **`send` exit codes:** an unreadable local file is 2 (nothing contacted); a
+  known device that never appears on the server is offline, 6, after 10 s
+  (FILAMENT_SEND_OFFLINE_SECS) instead of the whole `--timeout`; no peer within
+  `--timeout` (default 60, FILAMENT_SEND_TIMEOUT as the fallback, 0 = no limit)
+  is 6; bytes sent but never acknowledged whole is 8.
+- **Transfer history is structured on both ends.** `status --json` `recent` is
+  a list of objects `{time, direction, peer, file, stored, bytes, sha256, ok}`
+  (newest last, the file keeps 200); text mode renders one line each.
 - **`ok` describes the outcome, not the invocation.** `reach` and `doctor` on
   an offline peer are `"ok": false` with exit 6; `doctor` with the tunlion
   server unreachable is `"ok": false` with exit 7.
@@ -232,9 +252,10 @@ Rules that go with them:
 - **`send --json`** prints one result object: `ok`, `verb`, `peer`, `bytes`
   (total), `files` (each with `file`, `bytes`, `sha256`, `delivered`,
   `declined`), `file` and `sha256` at the top when exactly one file was sent,
-  and `error` on failure. There is no `stored_name`: no receiver reports the
-  name it stored under. A send whose files were all declined exits 4; some
-  delivered and some declined exits 8.
+  and `error` on failure. `stored_name` (top level for one file, and per file)
+  is the name the receiver stored it under, from an additive field on its
+  delivery-ack; null from an older receiver. A send whose files were all
+  declined exits 4; some delivered and some declined exits 8.
 - **`up --detach` waits up to 10 s** for the daemon to report it is serving
   (the ready marker it writes beside systemd's READY=1, or its control
   socket). A daemon that exits during startup is reported with its last lines

@@ -994,6 +994,42 @@ else
   tail -n 5 "$WORK/g21-up.log" "$WORK/g21-detach.log" "$WORK/g21-detach-wait.log"
 fi
 
+say "22: exit codes from the blind automation run: usage is 2, an offline known device is 6, fast"
+# Each of these exited 1 before. Usage (2): a missing local file for `send`
+# (and its --json names the local file, not the peer), non-interactive `init`
+# without --recovery-file/--yes, `add <name> --for <name>`, `grant` with an
+# unknown capability. Offline (6): `send --to` a known device whose daemon is
+# not running answers after the short offline wait, not the 60 s timeout.
+D22="$WORK/g22-cfg"; rm -rf "$D22"; mkdir -p "$D22"
+FILAMENT_CONFIG_DIR="$D22" "$BIN" --server "$SERVER" send "$WORK/g22-no-such-file" --to nobody >"$WORK/g22-send.out" 2>"$WORK/g22-send.err"; R22S=$?
+FILAMENT_CONFIG_DIR="$D22" "$BIN" --server "$SERVER" send "$WORK/g22-no-such-file" --to nobody --json >"$WORK/g22-sendj.out" 2>"$WORK/g22-sendj.err"; R22SJ=$?
+J22=$(python3 -c "
+import json
+v=json.load(open('$WORK/g22-sendj.out'))
+e=v['error']
+print('ok' if v['ok'] is False and e['code']=='usage' and e['exit']==2 and 'g22-no-such-file' in e['message'] and 'peer' not in e['message'].lower() else 'bad')
+" 2>/dev/null)
+D22I="$WORK/g22-init"; rm -rf "$D22I"
+FILAMENT_CONFIG_DIR="$D22I" "$BIN" init --no-interactive --name g22 </dev/null >"$WORK/g22-init.log" 2>&1; R22I=$?
+FILAMENT_CONFIG_DIR="$D22" "$BIN" add g22a --for g22b </dev/null >"$WORK/g22-add.log" 2>&1; R22A=$?
+FILAMENT_CONFIG_DIR="$D22" "$BIN" grant g22peer nosuchcap >"$WORK/g22-grant.log" 2>&1; R22G=$?
+# A known device that never comes online. The secret only names its channel.
+printf '[{"name":"g22off","secret":"%s"}]' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$D22/devices.json"
+T22=$(date +%s)
+FILAMENT_CONFIG_DIR="$D22" timeout 50 "$BIN" --server "$SERVER" send "$SMALL" --to g22off >"$WORK/g22-off.out" 2>"$WORK/g22-off.err"; R22O=$?
+E22=$(( $(date +%s) - T22 ))
+if [ $R22S -eq 2 ] && [ $R22SJ -eq 2 ] && [ "$J22" = ok ] \
+   && [ $R22I -eq 2 ] && grep -q "non-interactive init needs" "$WORK/g22-init.log" \
+   && [ $R22A -eq 2 ] && grep -q "named the invitee twice" "$WORK/g22-add.log" \
+   && [ $R22G -eq 2 ] && grep -q "unknown capability" "$WORK/g22-grant.log" \
+   && [ $R22O -eq 6 ] && grep -q "is offline" "$WORK/g22-off.err" && [ "$E22" -lt 40 ]; then
+  ok "exit codes: send missing file / init / add twice / unknown capability are usage (2), send to an offline known device is 6 in ${E22}s"
+else
+  bad "exit-codes-blind-run"
+  echo "  rc: send-missing=$R22S json=$R22SJ/$J22 init=$R22I add-twice=$R22A grant=$R22G offline=$R22O in ${E22}s"
+  tail -n 3 "$WORK/g22-send.err" "$WORK/g22-sendj.out" "$WORK/g22-init.log" "$WORK/g22-add.log" "$WORK/g22-grant.log" "$WORK/g22-off.err"
+fi
+
 # --------------------------------------------------------- L2 tunnel gates ---
 # ssh / TCP over the data channel (docs/L2-tunnel-design.md). These run their
 # OWN fixture backend on port 8097 (NOT this suite's 8077) and are OPT-IN:

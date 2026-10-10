@@ -51,6 +51,7 @@ use crate::session;
 use crate::shutdown;
 use crate::test_hooks;
 use crate::ui;
+use crate::exit_codes::{self, ExitKind};
 use anyhow::{Context, Result, anyhow, bail};
 use filament_transfer::Outgoing;
 use filament_transport::direct;
@@ -75,6 +76,7 @@ pub(crate) async fn send_cmd(
     name: Option<String>,
     relay: bool,
     remember: Option<String>,
+    timeout: Option<u64>,
 ) -> Result<()> {
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
@@ -99,9 +101,10 @@ pub(crate) async fn send_cmd(
     }
     if paths.is_empty() {
         if !interactive_allowed() {
-            bail!(
-                "nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin"
-            );
+            return Err(exit_codes::err(
+                ExitKind::Usage,
+                "nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin",
+            ));
         }
         let path = prompt_line("  What do you want to send? ")?;
         if path.is_empty() {
@@ -132,7 +135,9 @@ pub(crate) async fn send_cmd(
                     }
                     paths[0] = again;
                 }
-                Err(e) => bail!("cannot send '{first}': {e}"),
+                // The local input is wrong, not the peer: a usage error (exit
+                // 2), and nothing has been contacted yet.
+                Err(e) => return Err(missing_input(&first, &e)),
             }
         }
     }
@@ -273,7 +278,7 @@ pub(crate) async fn send_cmd(
             });
         } else {
             let path = PathBuf::from(p);
-            let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
+            let meta = std::fs::metadata(&path).map_err(|e| missing_input(p, &e))?;
             if meta.is_dir() {
                 if name.is_some() && single {
                     ui::say(&ui::paint(
@@ -668,11 +673,19 @@ pub(crate) async fn send_cmd(
     // FIRST live data channel (ChannelReady); once a channel is up, a long
     // legitimate transfer is never interrupted by this. Overridable / disablable
     // (0 = off) via FILAMENT_SEND_TIMEOUT.
-    let establish_deadline = std::env::var("FILAMENT_SEND_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(60));
+    // `--timeout` wins over FILAMENT_SEND_TIMEOUT, which stays as the fallback.
+    let establish_deadline = establish_window(
+        timeout,
+        std::env::var("FILAMENT_SEND_TIMEOUT").ok().as_deref(),
+    );
+    // A known device that has shown NO presence on the server is offline, and
+    // waiting the whole establishment window for it only delays the answer.
+    // Fail with exit 6 after this short, bounded wait instead. Disabled with
+    // the window (0 = wait without limit).
+    let offline_after = offline_window(
+        establish_deadline,
+        std::env::var("FILAMENT_SEND_OFFLINE_SECS").ok().as_deref(),
+    );
     let mut established = false;
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
     let mut stuck_while_connecting = 0u32;
@@ -711,11 +724,20 @@ pub(crate) async fn send_cmd(
         if !established && !establish_deadline.is_zero() && started.elapsed() >= establish_deadline
         {
             ui::clear_sticky();
-            bail!(
-                "no peer connected within {}s, is a receiver running / the page open? \
-                 (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
-                establish_deadline.as_secs()
-            );
+            return Err(exit_codes::err(
+                ExitKind::Unreachable,
+                format!(
+                    "no peer connected within {}s, is a receiver running / the page open? \
+                     (--timeout <secs> to change, 0 to wait without limit)",
+                    establish_deadline.as_secs()
+                ),
+            ));
+        }
+        if let (Some((n, _)), Some(after)) = (&known_target, offline_after) {
+            if !established && saw_known_peer.is_empty() && started.elapsed() >= after {
+                ui::clear_sticky();
+                return Err(exit_codes::err(ExitKind::Unreachable, offline_message(n, after)));
+            }
         }
         // A known device that never appears is usually one whose daemon is not
         // running. Say so once, then keep waiting until the timeout.
@@ -1751,6 +1773,11 @@ pub(crate) async fn send_cmd(
                 // transport: the sender deterministically KNOWS it landed whole.
                 Some("delivery-ack") => {
                     let id = v["id"].as_str().unwrap_or_default();
+                    // Additive: a receiver that reports the name it stored the
+                    // file under says so here; an older one omits it.
+                    if let Some(stored) = v["stored"].as_str() {
+                        crate::send_report::note_stored(id, stored);
+                    }
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
                         if !o.acked {
@@ -1776,6 +1803,9 @@ pub(crate) async fn send_cmd(
                             ));
                         }
                     }
+                    // Keep the report current per file, so a send that fails
+                    // later still reports (and records) what did land.
+                    crate::send_report::record(&out);
                 }
                 _ => {}
             },
@@ -2040,10 +2070,15 @@ pub(crate) async fn send_cmd(
                     ));
                 }
                 let _ = sio.disconnect().await;
-                bail!(
-                    "delivery not confirmed: {} file(s) sent but never delivery-acked by the receiver (treating as unconfirmed, not delivered)",
-                    names.len().max(1)
-                );
+                // Bytes left and no whole-file ack came back: a partial outcome
+                // (exit 8), not a generic failure. The source is untouched.
+                return Err(exit_codes::err(
+                    ExitKind::Partial,
+                    format!(
+                        "delivery not confirmed: {} file(s) sent but never delivery-acked by the receiver (treating as unconfirmed, not delivered)",
+                        names.len().max(1)
+                    ),
+                ));
             }
         }
         // Exit when every transfer reached a terminal state (`done` = acked, or the
@@ -2369,4 +2404,50 @@ async fn stream_one(
         }
     }
     Ok(())
+}
+
+/// The establishment window: `--timeout` first, then FILAMENT_SEND_TIMEOUT,
+/// then 60 s. Zero means "wait without limit". Pure.
+pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration {
+    let secs = flag
+        .or_else(|| env.and_then(|v| v.trim().parse::<u64>().ok()))
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// How long a known device may show no presence at all before `send` calls it
+/// offline: 10 s (FILAMENT_SEND_OFFLINE_SECS overrides), never longer than the
+/// establishment window, and `None` when that window is unlimited. Pure.
+pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<Duration> {
+    if establish.is_zero() {
+        return None;
+    }
+    let secs = env
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10);
+    Some(Duration::from_secs(secs).min(establish))
+}
+
+/// The answer for a known device that never appeared. Pure.
+pub(crate) fn offline_message(peer: &str, after: Duration) -> String {
+    format!(
+        "{peer} is offline: it did not appear on the tunlion server within {}s. \
+         Is `tunlion up` running there? Nothing was sent.",
+        after.as_secs()
+    )
+}
+
+/// A path to send that cannot be read: a usage error (exit 2) about the local
+/// input, never a statement about the peer.
+pub(crate) fn missing_input(path: &str, e: &std::io::Error) -> anyhow::Error {
+    let why = if e.kind() == std::io::ErrorKind::NotFound {
+        "no such file or directory".to_string()
+    } else {
+        e.to_string()
+    };
+    exit_codes::err(
+        ExitKind::Usage,
+        format!("cannot send '{path}': {why} (a local file problem; nothing was sent)"),
+    )
 }

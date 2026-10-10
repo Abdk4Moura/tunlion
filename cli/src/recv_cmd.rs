@@ -4925,6 +4925,15 @@ pub(crate) async fn recv_cmd(
                 // healthy link was dropped as a zombie and replaced by a cold one.
                 // Same defect as the `l2-close` guard in handle_forward_open, one
                 // arm away; the mux only acts on an ack for a sid it opened.
+                // `reach` liveness: answer a peer's ping on this link, and wake
+                // our own waiting probe when its pong comes back. Not gated on
+                // L2: it opens nothing and only proves this end is here.
+                Some("reach-ping") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                    }
+                }
+                Some("reach-pong") => crate::daemon_ctl::liveness_answered(&v),
                 Some("l2-open-ack") => {
                     if let Some(sid) = l2::wire_sid(&v) {
                         if let Some(mux) = l2_muxes.get(&pid) {
@@ -6671,7 +6680,7 @@ pub(crate) async fn recv_cmd(
                                         ));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
-                                            .send_control(&protocol::delivery_ack_msg(&id, sid))
+                                            .send_control(&crate::recv_files::delivery_ack(&id, sid))
                                             .await;
                                         let _ = t.flush().await;
                                         ui::say(&ui::paint(
@@ -6827,7 +6836,7 @@ pub(crate) async fn recv_cmd(
                                         ));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
-                                            .send_control(&protocol::delivery_ack_msg(&id, ack_sid))
+                                            .send_control(&crate::recv_files::delivery_ack(&id, ack_sid))
                                             .await;
                                         ui::say(&ui::paint(
                                             ui::Tone::Dim,
