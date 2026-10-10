@@ -256,6 +256,41 @@ pub fn tighten_new_dir(dir: &Path) {
     }
 }
 
+/// Create the receiving inbox (the drop dir, `~/Tunlion` by default) and any
+/// missing parent, owner-only (0700 on unix). Peers write into it, so it is not
+/// a shared folder: before this it took the process umask (0777 & ~umask), and
+/// under umask 0 anyone on the machine could plant or swap files in it. An
+/// inbox that already exists is left as the user set it. Windows: the
+/// profile's inherited ACL already makes it owner-only; nothing to set.
+pub fn create_inbox_dir(dir: &Path) -> std::io::Result<()> {
+    create_dirs_with_mode(dir, 0o700)
+}
+
+/// Create directories for content received or synced from a peer, under
+/// `inbox` (created owner-only first when missing). Content directories take
+/// the ordinary 0755 masked by the umask, matching received files (0644 masked
+/// by the umask, `publish_received_file`): never world-writable, and private in
+/// practice because the inbox above them is 0700.
+pub fn create_content_dirs(inbox: &Path, dir: &Path) -> std::io::Result<()> {
+    if !inbox.exists() {
+        create_inbox_dir(inbox)?;
+    }
+    create_dirs_with_mode(dir, 0o755)
+}
+
+fn create_dirs_with_mode(dir: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(mode).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir_all(dir)
+    }
+}
+
 /// Keep the config dir owner-only on EVERY start, not just at the one-time
 /// migration: it holds keys, grants and the proxy token, and a dir someone
 /// loosened (or a tool created 0755) would expose new files' NAMES and any file
@@ -1286,6 +1321,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The inbox peers write into is owner-only, and content directories are
+    /// never world-writable, whatever the umask (it can only remove bits from
+    /// the explicit modes, so these hold under umask 0 as well).
+    #[test]
+    fn inbox_is_owner_only_and_content_dirs_are_not_world_writable() {
+        let d = mode_tmp("inbox");
+        let inbox = d.join("Tunlion");
+        let sub = inbox.join("synced").join("deep");
+        create_content_dirs(&inbox, &sub).unwrap();
+        assert!(sub.is_dir());
+        if let Some(m) = file_mode(&inbox) {
+            assert_eq!(m & 0o077, 0, "the inbox must be owner-only, got {m:o}");
+        }
+        for p in [inbox.join("synced"), sub.clone()] {
+            if let Some(m) = file_mode(&p) {
+                assert_eq!(m & 0o022, 0, "{} must not be group/world-writable, got {m:o}", p.display());
+            }
+        }
+        // An existing inbox is left alone, and creating it again is not an error.
+        create_inbox_dir(&inbox).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The partial-receive sidecars are created through this; it must be

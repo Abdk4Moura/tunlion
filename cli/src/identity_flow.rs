@@ -387,7 +387,7 @@ pub(crate) async fn init_experience(
     let user_key = pending.commit(&store)?;
     config_set("name", &device_name)?;
     config_set("dir", &inbox.display().to_string())?;
-    std::fs::create_dir_all(&inbox)?;
+    crate::platform::create_inbox_dir(&inbox)?;
     certify_local_device(&user_key, &device_name)?;
     ensure_self_genesis_header(&crate::settings::config_dir(), &user_key);
     let start_background = if no_background {
