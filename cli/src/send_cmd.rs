@@ -2122,6 +2122,25 @@ fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Er
     )
 }
 
+/// The error for a spool directory that cannot be created at all. Following
+/// the advice above on a read-only root (`TMPDIR=/var/tmp`) or with a TMPDIR
+/// that does not exist gave only "Read-only file system (os error 30)" or
+/// "No such file or directory (os error 2)", naming neither TMPDIR nor the
+/// path. `base` is where the spool was to go, `tmpdir` the variable as set.
+fn spool_dir_error(base: &std::path::Path, tmpdir: Option<&str>, e: anyhow::Error) -> anyhow::Error {
+    let source = match tmpdir {
+        Some(v) => format!("TMPDIR={v}"),
+        None => "TMPDIR is not set, so the system default".to_string(),
+    };
+    anyhow::anyhow!(
+        "could not create the local temp spool for sending in {} ({source}): {e:#}. `send -` and \
+         directory sends stage a copy there before offering it; set TMPDIR to an existing, \
+         writable directory with room (or send a file path, which is read in place and needs no \
+         staging)",
+        base.display()
+    )
+}
+
 /// Private staging directory for `send -` and directory sends, removed with
 /// everything in it when dropped. Created lazily so a plain-file send makes
 /// nothing on disk.
@@ -2131,7 +2150,14 @@ impl SpoolDir {
     /// A path for `name` inside the (lazily created) private spool dir.
     fn path_in(slot: &mut Option<SpoolDir>, name: &str) -> Result<PathBuf> {
         if slot.is_none() {
-            *slot = Some(SpoolDir(crate::ssh_ca::secure_tempdir("send-spool")?));
+            let dir = crate::ssh_ca::secure_tempdir("send-spool").map_err(|e| {
+                spool_dir_error(
+                    &std::env::temp_dir(),
+                    std::env::var_os("TMPDIR").as_deref().map(|v| v.to_string_lossy()).as_deref(),
+                    e,
+                )
+            })?;
+            *slot = Some(SpoolDir(dir));
         }
         Ok(slot.as_ref().map(|d| d.0.join(name)).unwrap_or_default())
     }
@@ -2391,7 +2417,7 @@ async fn stream_one(
 
 #[cfg(test)]
 mod spool_tests {
-    use super::{spool_copy, spool_error};
+    use super::{spool_copy, spool_dir_error, spool_error};
 
     /// A writer that fills after `room` bytes, like a 16 MB /tmp.
     struct Small {
@@ -2433,6 +2459,31 @@ mod spool_tests {
             spool_error("stdin", spool, 0, std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         );
         assert!(other.contains("could not stage stdin") && !other.contains("TMPDIR="), "{other}");
+    }
+
+    /// `TMPDIR=/var/tmp tunlion send -` on a read-only root, and a TMPDIR that
+    /// does not exist: the message names TMPDIR, its value and the directory,
+    /// with the OS's reason, instead of a bare "(os error 30)".
+    #[test]
+    fn a_spool_that_cannot_be_created_names_tmpdir_and_the_path() {
+        let ro = std::io::Error::from_raw_os_error(30);
+        let m = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/var/tmp"), Some("/var/tmp"), ro.into())
+        );
+        assert!(m.contains("TMPDIR=/var/tmp") && m.contains("in /var/tmp"), "{m}");
+        assert!(m.contains("os error 30"), "the OS's reason stays: {m}");
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let m = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/nonexist"), Some("/nonexist"), missing.into())
+        );
+        assert!(m.contains("TMPDIR=/nonexist") && m.contains("existing, writable directory"), "{m}");
+        let unset = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/tmp"), None, anyhow::anyhow!("x"))
+        );
+        assert!(unset.contains("TMPDIR is not set"), "{unset}");
     }
 
     #[test]
