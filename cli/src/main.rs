@@ -71,6 +71,8 @@ mod pake_ceremony;
 mod ping;
 mod roster;
 mod sdnotify;
+/// What to say when a paired device was reset and came back under a new key.
+mod reset_hints;
 // The wire vocabulary and its pure decisions now live in their own crate. Kept
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;
@@ -100,6 +102,11 @@ mod recv_cmd;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
+/// `tunlion send`'s source checks: refuse what cannot be read before offering.
+mod send_source;
+/// `tunlion send --json`: the result object.
+mod send_report;
+mod transfer_history;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;
@@ -560,6 +567,8 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
 
 /// The clap command surface.
 mod cli_def;
+/// The documented exit codes and the one place a failure is reported.
+mod exit_codes;
 pub(crate) use cli_def::{Cli, Cmd, DevicesAction, EphemeralAction, IdAction};
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
@@ -1674,17 +1683,29 @@ fn install_transport_hooks() {
 }
 
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
     let first = std::env::args().nth(1);
     let rt = if is_light_command(first.as_deref()) {
-        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
     } else {
-        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()
     };
-    rt.block_on(async_main())
+    let result = match rt {
+        Ok(rt) => rt.block_on(async_main()),
+        Err(e) => Err(e.into()),
+    };
+    // Every failure leaves through here: one report, in the form the caller
+    // asked for, with a code from the documented taxonomy (exit_codes.rs).
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let code = exit_codes::report(&e);
+            std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+    }
 }
 
 

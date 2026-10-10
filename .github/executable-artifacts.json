@@ -42,6 +42,17 @@
       ]
     },
     {
+      "path": "cli/tests/identity-relink-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/identity-relink-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/sync-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/sync-gates.sh",

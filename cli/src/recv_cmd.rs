@@ -837,9 +837,19 @@ pub(crate) async fn recv_cmd(
     // swap in a freshly-dialed signaling client after a drop (see below). The
     // short-lived `recv`/`send` paths never reconnect, they re-invoke fresh,
     // so this is only exercised by the daemon (`up`/`up --dir`).
-    let mut sio = net::connect_signaling(server, tx.clone()).await?;
+    // The daemon waits for the network instead of exiting (see
+    // `connect_signaling_patiently`); a one-shot receive still fails fast.
+    let mut sio = if daemon {
+        crate::up_logs::connect_signaling_patiently(server, tx.clone()).await?
+    } else {
+        net::connect_signaling(server, tx.clone()).await?
+    };
 
     let mut paired = code.is_some();
+    // Set when the sender cancels a transfer because it could not read its own
+    // source (`file-cancel`). A one-shot receive then ends saying so, instead of
+    // holding the line for a sender that has already given up.
+    let mut sender_cancelled: Option<String> = None;
     // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
@@ -1629,6 +1639,8 @@ pub(crate) async fn recv_cmd(
     if daemon {
         sdnotify::ready();
         sdnotify::status("up - serving");
+        // The same edge for `up --detach`, which has no systemd to tell it.
+        crate::file_io::mark_daemon_ready();
     }
 
     // Restore mounts that were marked with auto_restore.
@@ -1651,6 +1663,21 @@ pub(crate) async fn recv_cmd(
         // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
+        }
+        if !daemon && !keep_open && st.by_sid.is_empty() {
+            if let Some(what) = sender_cancelled.take() {
+                ui::clear_sticky();
+                let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
+                bail!(
+                    "the sender cancelled the transfer because it could not read its file ({what}); \
+                     nothing of it was kept here{}",
+                    if st.completed > 0 {
+                        format!(" ({} other file(s) were received)", st.completed)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
         }
         let ev = tokio::select! {
             biased;
@@ -4895,6 +4922,15 @@ pub(crate) async fn recv_cmd(
                 // healthy link was dropped as a zombie and replaced by a cold one.
                 // Same defect as the `l2-close` guard in handle_forward_open, one
                 // arm away; the mux only acts on an ack for a sid it opened.
+                // `reach` liveness: answer a peer's ping on this link, and wake
+                // our own waiting probe when its pong comes back. Not gated on
+                // L2: it opens nothing and only proves this end is here.
+                Some("reach-ping") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                    }
+                }
+                Some("reach-pong") => crate::daemon_ctl::liveness_answered(&v),
                 Some("l2-open-ack") => {
                     if let Some(sid) = l2::wire_sid(&v) {
                         if let Some(mux) = l2_muxes.get(&pid) {
@@ -6506,6 +6542,61 @@ pub(crate) async fn recv_cmd(
                     );
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
                 }
+                // The sender could not read its own source part way through: the
+                // partial here can never be completed from it, so it is removed,
+                // never kept as junk (`unread`, `unread.part`, `unread.part.meta`
+                // were left behind before this message existed).
+                Some("file-cancel") => {
+                    let id = v["id"].as_str().unwrap_or_default().to_string();
+                    let reason: String = v["reason"]
+                        .as_str()
+                        .unwrap_or("the sender cancelled it")
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(300)
+                        .collect();
+                    let keys: Vec<(String, u32)> = st
+                        .by_sid
+                        .iter()
+                        .filter(|((p, _), inc)| *p == pid && inc.id == id)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    let remove_part = |part: &Path| {
+                        let _ = std::fs::remove_file(part);
+                        let mut meta = part.as_os_str().to_owned();
+                        meta.push(".meta");
+                        let _ = std::fs::remove_file(PathBuf::from(meta));
+                    };
+                    // The stream may already be parked (the sender's leave can
+                    // land first and flush it out of the table), so the partial
+                    // is also found by the name it was offered under.
+                    let mut names: Vec<String> = Vec::new();
+                    for k in keys {
+                        if let Some(inc) = st.by_sid.remove(&k) {
+                            if !to_stdout {
+                                remove_part(inc.part_path.as_path());
+                            }
+                            names.push(inc.name.clone());
+                        }
+                    }
+                    if names.is_empty() && !to_stdout {
+                        if let Some(raw) = v["name"].as_str() {
+                            let name = safe_incoming_name(raw);
+                            let part = dir.join(format!("{name}.part"));
+                            if part.is_file() {
+                                remove_part(part.as_path());
+                                names.push(name);
+                            }
+                        }
+                    }
+                    for name in names {
+                        ui::critical(&ui::paint(
+                            ui::Tone::Warn,
+                            &format!("  {name}: the sender cancelled it ({reason}); its partial was removed"),
+                        ));
+                        sender_cancelled = Some(format!("{name}: {reason}"));
+                    }
+                }
                 Some("file-end") => {
                     // Test hook (gate 18 standalone repro): drop the file-end
                     // control frame so a fully-received stream is stranded in
@@ -6606,7 +6697,7 @@ pub(crate) async fn recv_cmd(
                                         ));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
-                                            .send_control(&protocol::delivery_ack_msg(&id, sid))
+                                            .send_control(&crate::recv_files::delivery_ack(&id, sid))
                                             .await;
                                         let _ = t.flush().await;
                                         ui::say(&ui::paint(
@@ -6762,7 +6853,7 @@ pub(crate) async fn recv_cmd(
                                         ));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
-                                            .send_control(&protocol::delivery_ack_msg(&id, ack_sid))
+                                            .send_control(&crate::recv_files::delivery_ack(&id, ack_sid))
                                             .await;
                                         ui::say(&ui::paint(
                                             ui::Tone::Dim,

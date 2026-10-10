@@ -358,9 +358,12 @@ kill $R 2>/dev/null
 # "declined", which is precisely the contract #274 called a bug: a script could
 # not tell a delivered transfer from a refused one. Asserting 1 specifically,
 # not merely nonzero, so a `timeout` kill (124) cannot satisfy this gate.
-if [ $G8 -eq 1 ] && grep -q "declined" "$WORK/g8-send.log" \
+# Now 4, not 1: the exit-code taxonomy (cli/src/exit_codes.rs, `tunlion --help`
+# EXIT CODES) gives "every file declined by the peer" the denied code; a partial
+# send (some delivered) is 8.
+if [ $G8 -eq 4 ] && grep -q "declined" "$WORK/g8-send.log" \
    && grep -q "no files delivered" "$WORK/g8-send.log" && [ ! -e "$D/small.bin" ]; then
-  ok "offer declined without consent; sender reported the decline and exited 1"
+  ok "offer declined without consent; sender reported the decline and exited 4 (denied)"
 else bad "consent decline"; tail -n 3 "$WORK/g8-send.log" "$WORK/g8-recv.log"; fi
 
 # ---------------------------------------------------------------- gate 9 ----
@@ -903,39 +906,210 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
 # ============================================================================
 
-say "20: U1 implicit identity: minted once on first use, never twice, inspect screens mint nothing"
+say "20: U1 implicit identity: minted once by a verb that signs, never by one that only looks"
 # The config dir is NOT pre-created: the accessor makes it (0700) and the key
-# (0600). Run 1 creates and says so once on stderr; run 2 says nothing and
-# prints the same identity; `init` afterwards still refuses; `--json` never
-# gets the prose line. Then the three that must NOT mint: the bare tour screen
-# (an inspect surface, which must also not FAIL on a device that cannot mint),
-# `id` under the opt-out (the pre-U1 answer, exit 0, nothing written), and a
-# verb that must sign under the opt-out (still fails fast).
+# (0600). `id` used to be the minting verb here; it no longer mints (a fresh
+# machine that ran `tunlion id` was then refused by `tunlion join` for already
+# having an identity). So: `id` on a fresh dir answers "no identity yet" with
+# exit 9 (ExitKind::NoIdentity) and writes nothing, `id --json` answers
+# `"identity": null` with exit 9 and writes nothing, and the minting is proven
+# on `grant`, a verb that SIGNS: run 1 creates and says so once on stderr, run 2
+# says nothing, `id` then prints the same identity twice, and `init`
+# afterwards still refuses. Then the two that must NOT mint: the bare tour
+# screen, and a signing verb under the opt-out (still fails fast).
+#
+# Changed with the exit-code taxonomy: the opt-out `id` used to exit 0 with
+# "no identity yet"; it now exits 9 like every keyless `id` (documented in
+# `tunlion --help`, EXIT CODES).
 D20="$WORK/g20-cfg"; rm -rf "$D20"
-FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"; R20A=$?
-FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"; R20B=$?
-N20A=$(grep -c "created your identity" "$WORK/g20-1.err"); N20B=$(grep -c "created your identity" "$WORK/g20-2.err")
-M20K=$(stat -c %a "$D20/identity.ed25519" 2>/dev/null); M20D=$(stat -c %a "$D20" 2>/dev/null)
-FILAMENT_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
+D20Z="$WORK/g20-fresh"; rm -rf "$D20Z"
+FILAMENT_CONFIG_DIR="$D20Z" "$BIN" id >"$WORK/g20-0.out" 2>"$WORK/g20-0.err"; R20Z=$?
 D20J="$WORK/g20-json"; rm -rf "$D20J"
 FILAMENT_CONFIG_DIR="$D20J" "$BIN" id --json >"$WORK/g20-j.out" 2>"$WORK/g20-j.err"; R20J=$?
+J20=$(python3 -c "
+import json,sys
+v=json.load(open('$WORK/g20-j.out'))
+print('ok' if v.get('identity',1) is None and v.get('ok') is False and v['error']['exit']==9 else 'bad')
+" 2>/dev/null)
+FILAMENT_CONFIG_DIR="$D20" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"
+FILAMENT_CONFIG_DIR="$D20" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"
+N20A=$(grep -c "created your identity" "$WORK/g20-1.err"); N20B=$(grep -c "created your identity" "$WORK/g20-2.err")
+M20K=$(stat -c %a "$D20/identity.ed25519" 2>/dev/null); M20D=$(stat -c %a "$D20" 2>/dev/null)
+FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-id1.out" 2>&1; R20A=$?
+FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-id2.out" 2>&1; R20B=$?
+FILAMENT_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
 D20T="$WORK/g20-tour"; rm -rf "$D20T"
 FILAMENT_CONFIG_DIR="$D20T" "$BIN" >"$WORK/g20-t.log" 2>&1; R20T=$?
 D20N="$WORK/g20-noimplicit"; rm -rf "$D20N"
 FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" id >"$WORK/g20-n.log" 2>&1; R20N=$?
 FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-g.log" 2>&1; R20G=$?
-if [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] \
-   && cmp -s "$WORK/g20-1.out" "$WORK/g20-2.out" && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+if [ $R20Z -eq 9 ] && grep -q "no identity yet" "$WORK/g20-0.err" && [ ! -e "$D20Z/identity.ed25519" ] \
+   && [ $R20J -eq 9 ] && [ "$J20" = ok ] && [ ! -e "$D20J/identity.ed25519" ] \
+   && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+   && [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && cmp -s "$WORK/g20-id1.out" "$WORK/g20-id2.out" \
    && [ $R20I -ne 0 ] && grep -q "already has identity" "$WORK/g20-init.log" \
-   && [ $R20J -eq 0 ] && ! grep -q "created your identity" "$WORK/g20-j.err" && [ -f "$D20J/identity.ed25519" ] \
    && [ $R20T -eq 0 ] && grep -q "do this:" "$WORK/g20-t.log" && [ ! -e "$D20T/identity.ed25519" ] \
-   && [ $R20N -eq 0 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
+   && [ $R20N -eq 9 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
    && [ $R20G -ne 0 ] && grep -q "tunlion init" "$WORK/g20-g.log" && [ ! -e "$D20N/identity.ed25519" ]; then
-  ok "U1: created once ($N20A line, key $M20K, dir $M20D), second run silent, init refuses, --json silent, tour and opt-out mint nothing"
+  ok "U1: created once ($N20A line, key $M20K, dir $M20D) by a signing verb, second run silent, init refuses; id and id --json mint nothing (exit 9), tour and opt-out mint nothing"
 else
   bad "u1-implicit-init"
-  echo "  rc: id=$R20A/$R20B lines=$N20A/$N20B key=$M20K dir=$M20D init=$R20I json=$R20J tour=$R20T optout-id=$R20N optout-grant=$R20G"
-  tail -n 3 "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-j.err" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+  echo "  rc: id-fresh=$R20Z id-json=$R20J/$J20 lines=$N20A/$N20B key=$M20K dir=$M20D id=$R20A/$R20B init=$R20I tour=$R20T optout-id=$R20N optout-grant=$R20G"
+  tail -n 3 "$WORK/g20-0.err" "$WORK/g20-j.out" "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+fi
+
+say "21: up waits for the network instead of exiting; up --detach reports a dead daemon"
+# Item 7: a daemon whose server is unreachable (127.0.0.1:9, nothing listens)
+# must stay up, say it is waiting, and keep retrying; it used to exit at once.
+# Item 6: `up --detach` used to print "daemon detached" and exit 0 for a
+# daemon that died a moment later. Here the daemon dies at startup (its --dir
+# is a regular FILE, so creating it fails): --detach must exit nonzero and
+# quote the daemon's own last output. And for the waiting daemon, --detach
+# must not claim it is serving.
+D21="$WORK/g21-cfg"; rm -rf "$D21"; mkdir -p "$D21"
+FILAMENT_CONFIG_DIR="$D21" "$BIN" --server http://127.0.0.1:9 up --dir "$WORK/g21-drop" >"$WORK/g21-up.log" 2>&1 &
+P21=$!; pids+=($P21)
+sleep 6
+A21=0; kill -0 $P21 2>/dev/null && A21=1
+W21=$(grep -c "waiting for network" "$WORK/g21-up.log")
+PIDLINES=$(wc -l < "$D21/up.pid" 2>/dev/null | tr -d ' ')
+PIDVAL=$(cat "$D21/up.pid" 2>/dev/null)
+kill "$P21" 2>/dev/null; wait "$P21" 2>/dev/null
+D21B="$WORK/g21-cfg-b"; rm -rf "$D21B"; mkdir -p "$D21B"
+: > "$WORK/g21-notadir"
+FILAMENT_CONFIG_DIR="$D21B" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/g21-notadir" >"$WORK/g21-detach.log" 2>&1; R21D=$?
+D21C="$WORK/g21-cfg-c"; rm -rf "$D21C"; mkdir -p "$D21C"
+FILAMENT_CONFIG_DIR="$D21C" timeout 30 "$BIN" --server http://127.0.0.1:9 up --detach --dir "$WORK/g21-drop-c" >"$WORK/g21-detach-wait.log" 2>&1; R21W=$?
+P21C=$(cat "$D21C/up.pid" 2>/dev/null)
+[ -n "$P21C" ] && kill "$P21C" 2>/dev/null
+if [ "$A21" = 1 ] && [ "$W21" -ge 1 ] && [ "$PIDLINES" = 1 ] && [ "$PIDVAL" = "$P21" ] \
+   && [ $R21D -ne 0 ] && [ $R21D -ne 124 ] && grep -q "exited during startup" "$WORK/g21-detach.log" \
+   && ! grep -q "detached and serving" "$WORK/g21-detach.log" \
+   && [ $R21W -eq 0 ] && grep -q "not connected yet" "$WORK/g21-detach-wait.log" \
+   && ! grep -q "detached and serving" "$WORK/g21-detach-wait.log"; then
+  ok "daemon waits for the network (alive after 6s, says so), up.pid is the pid alone, --detach exits $R21D on a dead daemon and does not claim a waiting one is serving"
+else
+  bad "daemon-network-wait"
+  echo "  alive=$A21 waiting-lines=$W21 pidlines=$PIDLINES pid=$PIDVAL/$P21 detach-dead=$R21D detach-wait=$R21W"
+  tail -n 5 "$WORK/g21-up.log" "$WORK/g21-detach.log" "$WORK/g21-detach-wait.log"
+fi
+
+say "22: exit codes from the blind automation run: usage is 2, an offline known device is 6, fast"
+# Each of these exited 1 before. Usage (2): a missing local file for `send`
+# (and its --json names the local file, not the peer), non-interactive `init`
+# without --recovery-file/--yes, `add <name> --for <name>`, `grant` with an
+# unknown capability. Offline (6): `send --to` a known device whose daemon is
+# not running answers after the short offline wait, not the 60 s timeout.
+D22="$WORK/g22-cfg"; rm -rf "$D22"; mkdir -p "$D22"
+FILAMENT_CONFIG_DIR="$D22" "$BIN" --server "$SERVER" send "$WORK/g22-no-such-file" --to nobody >"$WORK/g22-send.out" 2>"$WORK/g22-send.err"; R22S=$?
+FILAMENT_CONFIG_DIR="$D22" "$BIN" --server "$SERVER" send "$WORK/g22-no-such-file" --to nobody --json >"$WORK/g22-sendj.out" 2>"$WORK/g22-sendj.err"; R22SJ=$?
+J22=$(python3 -c "
+import json
+v=json.load(open('$WORK/g22-sendj.out'))
+e=v['error']
+print('ok' if v['ok'] is False and e['code']=='usage' and e['exit']==2 and 'g22-no-such-file' in e['message'] and 'peer' not in e['message'].lower() else 'bad')
+" 2>/dev/null)
+D22I="$WORK/g22-init"; rm -rf "$D22I"
+FILAMENT_CONFIG_DIR="$D22I" "$BIN" init --no-interactive --name g22 </dev/null >"$WORK/g22-init.log" 2>&1; R22I=$?
+FILAMENT_CONFIG_DIR="$D22" "$BIN" add g22a --for g22b </dev/null >"$WORK/g22-add.log" 2>&1; R22A=$?
+FILAMENT_CONFIG_DIR="$D22" "$BIN" grant g22peer nosuchcap >"$WORK/g22-grant.log" 2>&1; R22G=$?
+# A known device that never comes online. The secret only names its channel.
+printf '[{"name":"g22off","secret":"%s"}]' "$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$D22/devices.json"
+T22=$(date +%s)
+FILAMENT_CONFIG_DIR="$D22" timeout 50 "$BIN" --server "$SERVER" send "$SMALL" --to g22off >"$WORK/g22-off.out" 2>"$WORK/g22-off.err"; R22O=$?
+E22=$(( $(date +%s) - T22 ))
+if [ $R22S -eq 2 ] && [ $R22SJ -eq 2 ] && [ "$J22" = ok ] \
+   && [ $R22I -eq 2 ] && grep -q "non-interactive init needs" "$WORK/g22-init.log" \
+   && [ $R22A -eq 2 ] && grep -q "named the invitee twice" "$WORK/g22-add.log" \
+   && [ $R22G -eq 2 ] && grep -q "unknown capability" "$WORK/g22-grant.log" \
+   && [ $R22O -eq 6 ] && grep -q "is offline" "$WORK/g22-off.err" && [ "$E22" -lt 40 ]; then
+  ok "exit codes: send missing file / init / add twice / unknown capability are usage (2), send to an offline known device is 6 in ${E22}s"
+else
+  bad "exit-codes-blind-run"
+  echo "  rc: send-missing=$R22S json=$R22SJ/$J22 init=$R22I add-twice=$R22A grant=$R22G offline=$R22O in ${E22}s"
+  tail -n 3 "$WORK/g22-send.err" "$WORK/g22-sendj.out" "$WORK/g22-init.log" "$WORK/g22-add.log" "$WORK/g22-grant.log" "$WORK/g22-off.err"
+fi
+
+# ---------------------------------------------------------------- gate T1 ----
+say "T1/T2: a source send cannot read is a fast local error (exit 2) and reaches no receiver; a FIFO or device never hangs"
+# The blind run: a mode-000 file printed "ok", then blamed the network (exit 6,
+# "re-run the same tunlion send to resume"), or stalled until killed, and left
+# unread, unread.part and unread.part.meta on the receiver; an EMPTY mode-000
+# file reported "ok unread 0 B" (exit 0); a FIFO and /dev/zero hung silently.
+# A receiver waits in a room the whole time: it must receive nothing at all.
+DT1="$WORK/gT1"; rm -rf "$DT1"; mkdir -p "$DT1/rx"
+RT1="gT1room$$"
+"$BIN" receive -y --dir "$DT1/rx" --room "$RT1" --server "$SERVER" >"$WORK/gT1-recv.log" 2>&1 &
+RT1P=$!; pids+=($RT1P); sleep 3
+echo secret >"$DT1/unread"; chmod 000 "$DT1/unread"
+: >"$DT1/unread-empty"; chmod 000 "$DT1/unread-empty"
+mkfifo "$DT1/fifo"
+t1_run() {  # $1 = label, $2 = path; prints "rc seconds"
+  local t0 rc
+  t0=$(date +%s)
+  timeout 30 "$BIN" send "$2" --room "$RT1" --server "$SERVER" >"$WORK/gT1-$1.out" 2>"$WORK/gT1-$1.err"; rc=$?
+  echo "$rc $(( $(date +%s) - t0 ))"
+}
+read -r T1U T1US <<<"$(t1_run unread "$DT1/unread")"
+read -r T1E T1ES <<<"$(t1_run empty "$DT1/unread-empty")"
+read -r T1F T1FS <<<"$(t1_run fifo "$DT1/fifo")"
+read -r T1Z T1ZS <<<"$(t1_run zero /dev/zero)"
+sleep 2
+T1RX=$(ls -A "$DT1/rx" | tr '\n' ' ')
+kill_tree $RT1P
+chmod 600 "$DT1/unread" "$DT1/unread-empty" 2>/dev/null
+echo "  unreadable: rc=$T1U ${T1US}s; empty unreadable: rc=$T1E ${T1ES}s; fifo: rc=$T1F ${T1FS}s; /dev/zero: rc=$T1Z ${T1ZS}s; receiver holds: [$T1RX]"
+if [ "$(id -u)" = 0 ]; then
+  bad "unreadable-source: running as root, which can read a mode-000 file, so this gate cannot test it"
+elif [ "$T1U" = 2 ] && [ "$T1E" = 2 ] && [ "$T1F" = 2 ] && [ "$T1Z" = 2 ] \
+   && [ "$T1US" -le 5 ] && [ "$T1ES" -le 5 ] && [ "$T1FS" -le 5 ] && [ "$T1ZS" -le 5 ] \
+   && grep -q "$DT1/unread'" "$WORK/gT1-unread.err" && grep -qi "permission denied" "$WORK/gT1-unread.err" \
+   && grep -q "not a regular file" "$WORK/gT1-fifo.err" && grep -q "tunlion send -" "$WORK/gT1-fifo.err" \
+   && grep -q "not a regular file" "$WORK/gT1-zero.err" \
+   && ! grep -qh "^ok \|lost the receiving peer\|  ok " "$WORK"/gT1-*.err "$WORK"/gT1-*.out \
+   && [ -z "$T1RX" ]; then
+  ok "unreadable-source: mode-000 (and empty), FIFO and /dev/zero refused in seconds with exit 2 and the reason; the receiver got nothing"
+else
+  bad "unreadable-source"
+  tail -n 2 "$WORK/gT1-unread.err" "$WORK/gT1-empty.err" "$WORK/gT1-fifo.err" "$WORK/gT1-zero.err" "$WORK/gT1-recv.log"
+fi
+
+# --------------------------------------------------------------- gate T1b ----
+say "T1b: a source that stops being readable mid-transfer cancels it on both ends, exit 2, nothing left behind"
+# The source is truncated while it is being sent (the read the sender does
+# next returns end-of-file early). The sender must stop as a local problem,
+# never retry or blame the peer, and the receiver must discard its partial.
+DT1B="$WORK/gT1b"; rm -rf "$DT1B"; mkdir -p "$DT1B/rx"
+cp "$BIG" "$DT1B/shrinks.bin"
+RT1B="gT1broom$$"
+"$BIN" receive -y --dir "$DT1B/rx" --room "$RT1B" --server "$SERVER" >"$WORK/gT1b-recv.log" 2>&1 &
+RT1BP=$!; pids+=($RT1BP); sleep 3
+FILAMENT_TEST_TRANSFER_STALL_MS=10 \
+  "$BIN" send "$DT1B/shrinks.bin" --room "$RT1B" --server "$SERVER" >"$WORK/gT1b-send.log" 2>&1 &
+ST1B=$!; pids+=($ST1B)
+for _ in $(seq 1 120); do
+  sz=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((2 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+T1BSZ=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
+truncate -s 1048576 "$DT1B/shrinks.bin"
+T0=$(date +%s)
+wait_for_exit $ST1B 60; RT1BS=$?
+T1BT=$(( $(date +%s) - T0 ))
+wait_for_exit $RT1BP 60; RT1BR=$?
+T1BRX=$(ls -A "$DT1B/rx" | tr '\n' ' ')
+echo "  part at truncation: $T1BSZ; sender rc=$RT1BS in ${T1BT}s; receiver rc=$RT1BR; receiver holds: [$T1BRX]"
+if [ "$T1BSZ" -eq 0 ]; then
+  bad "shrinking-source: nothing was received before the truncation, so nothing was mid-transfer"
+elif [ $RT1BS -eq 2 ] && [ "$T1BT" -le 20 ] && grep -q "shorter than offered" "$WORK/gT1b-send.log" \
+   && ! grep -q "lost the receiving peer" "$WORK/gT1b-send.log" \
+   && [ $RT1BR -ne 0 ] && [ $RT1BR -ne 124 ] && grep -q "the sender cancelled" "$WORK/gT1b-recv.log" \
+   && [ -z "$T1BRX" ]; then
+  ok "shrinking-source: sender stopped in ${T1BT}s with exit 2, the receiver discarded its partial and said why"
+else
+  bad "shrinking-source"
+  tail -n 3 "$WORK/gT1b-send.log" "$WORK/gT1b-recv.log"
 fi
 
 # --------------------------------------------------------- L2 tunnel gates ---

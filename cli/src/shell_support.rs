@@ -71,16 +71,21 @@ pub(crate) fn daemon_running() -> bool {
 
 pub(crate) fn daemon_alive() -> Option<u32> {
     let raw = std::fs::read_to_string(pidfile()).ok()?;
-    let mut lines = raw.lines();
-    let pid: u32 = lines.next()?.trim().parse().ok()?;
-    // The executable the daemon recorded when it wrote the pidfile. A pidfile
-    // from before this fix records only the pid; the daemon and this CLI are
-    // the same installed binary, so fall back to our own executable.
-    let recorded = lines
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    // `up.pid` is the pid alone; the executable the daemon recorded is in
+    // `up.exe`. A daemon started by an older build wrote both into `up.pid`
+    // (pid, then path), so that second line is still honoured. With neither,
+    // the daemon and this CLI are the same installed binary, so fall back to
+    // our own executable.
+    // A two-line pidfile was written by the old daemon that owns it, so its own
+    // path wins over an `up.exe` that may be left from another run.
+    let (pid, legacy_exe) = crate::file_io::parse_pidfile(&raw)?;
+    let recorded = legacy_exe.or_else(|| {
+        std::fs::read_to_string(crate::file_io::pidfile_exe())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
     let expected = recorded.or_else(|| std::env::current_exe().ok())?;
     // Identify the process by its executable path, never by matching a name.
     // process_exe_path returns None for a dead or recycled pid, which is

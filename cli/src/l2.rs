@@ -1969,16 +1969,33 @@ pub struct ProbeOutcome {
 /// per-phase timings + verdict. Reuses `bring_up_to_known` (role "doctor"), so
 /// the phases/budgets are identical to a real connect, and cleans up BOTH the
 /// link (LinkGuard::close) and the mux (no leaked streams/pumps).
-pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<ProbeOutcome> {
+///
+/// `timeout_secs` is the caller's bound: `reach --timeout` and
+/// `doctor --timeout` pass theirs (None = FILAMENT_DOCTOR_PROBE_SECS or 30 s).
+/// The outer bound of one `doctor <device>` probe, in seconds: `--timeout`,
+/// else FILAMENT_DOCTOR_PROBE_SECS, else 30. Doctor announces it before it
+/// starts, so the wait is never a silent one.
+pub(crate) fn doctor_probe_secs(timeout_secs: Option<u64>) -> u64 {
+    timeout_secs.filter(|n| *n > 0).unwrap_or_else(|| {
+        std::env::var("FILAMENT_DOCTOR_PROBE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(30)
+    })
+}
+
+pub async fn establish_probe_within(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    timeout_secs: Option<u64>,
+) -> Result<ProbeOutcome> {
     // Overall safety bound so a wedged candidate cannot hang the probe forever
     // (the per-candidate rotation already re-races inside bring_up_to_known; this
     // is the outer wall). Generous: a slow-but-real ICE lands around 5s and we
     // want to OBSERVE that, not abort it prematurely. Overridable for the field.
-    let probe_secs: u64 = std::env::var("FILAMENT_DOCTOR_PROBE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(30);
+    let probe_secs = doctor_probe_secs(timeout_secs);
     let deadline = std::time::Duration::from_secs(probe_secs);
 
     match tokio::time::timeout(deadline, bring_up_to_known(server, peer, relay, "doctor")).await {

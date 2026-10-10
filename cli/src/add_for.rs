@@ -93,6 +93,24 @@ pub(crate) async fn add_for_cmd(
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
     let (kind, _invitee_name) = resolve_for_kind(caps, for_)?;
+    // A name already held by a paired device cannot pass to the new key this
+    // invitation enrols (it is stored as `<name>-2`), which is how a reset
+    // device came back as a second record beside its stale self. Say so now,
+    // while forgetting the old record first is still one command.
+    if let Some(name) = _invitee_name.as_deref() {
+        if crate::device_view::device_record_exists(name) {
+            let now = crate::identity::now_secs();
+            let seen = crate::device_view::devices_info(name)
+                .map(|(t, _, _)| t)
+                .filter(|t| *t > 0)
+                .map(|t| crate::reset_hints::ago(now.saturating_sub(t)));
+            ui::say(&format!(
+                "  {} {}",
+                ui::paint(ui::Tone::Warn, "!"),
+                crate::reset_hints::name_taken_note(name, seen.as_deref())
+            ));
+        }
+    }
     // The ergonomic gap behind "I want to shell into my own devices": shell has
     // to be in the invitation ceiling, because a grant cannot widen one later
     // (#226, which now refuses honestly instead of pretending). So the only way
@@ -250,7 +268,7 @@ pub(crate) async fn add_for_cmd(
     // no bind race, no platform branch, no control channel. The only thing the
     // mint cannot guarantee is that a RECEIVER is actually running to pick the
     // key up - check that, and offer to start one.
-    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
+    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires, _invitee_name.clone());
     // Make the daemon subscribe the enrollment channel NOW rather than on its next
     // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
     // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs
@@ -343,6 +361,8 @@ pub(crate) async fn add_for_cmd(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "verb": "add",
                 "kind": kind,
                 "ceiling": ceiling,
                 "maxOffline": inv.max_offline,
@@ -367,9 +387,7 @@ pub(crate) async fn add_for_cmd(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        ui::say(&format!(
-            "  next: copy it to the other device, then run there:  tunlion join {file_name}"
-        ));
+        ui::say(&join_next_step(&file_name, _invitee_name.as_deref()));
     }
     // Non-interactive (--out or a pipe): no offer was printed above. Warn that a
     // receiver must be running to claim, which is the one thing the file write
@@ -377,8 +395,59 @@ pub(crate) async fn add_for_cmd(
     if !caps.interactive && daemon_alive().is_none() {
         ui::say(&ui::paint(
             ui::Tone::Warn,
-            "  note: the always-on receiver is not running; start `tunlion up --install` before anyone claims this invitation.",
+            &receiver_not_running_note(crate::platform::ServiceHost::detect().supports_install()),
         ));
     }
     Ok(())
+}
+
+/// The warning for an invitation written while no receiver is running. It
+/// used to say "start `tunlion up --install`" on every platform, including the
+/// ones where `--install` then answers that it is not supported. Suggest it
+/// only where a service manager exists; `up --detach` works everywhere.
+pub(crate) fn receiver_not_running_note(can_install: bool) -> String {
+    let start = if can_install {
+        "tunlion up --install"
+    } else {
+        "tunlion up --detach"
+    };
+    format!(
+        "  note: the always-on receiver is not running; start `{start}` before anyone claims this invitation."
+    )
+}
+
+/// The step printed after `add --out`: copy the file, then join with it. When
+/// the owner named the invitee, the join names it too, so both ends call the
+/// device what the owner chose (the joiner otherwise names itself after its
+/// hostname, and that is the name the owner's list showed). The owner's store
+/// uses the chosen name either way (`armed::invitee_name`). Pure.
+pub(crate) fn join_next_step(file_name: &str, invitee: Option<&str>) -> String {
+    let file = if file_name.chars().any(char::is_whitespace) {
+        format!("'{file_name}'")
+    } else {
+        file_name.to_string()
+    };
+    match invitee.filter(|n| !n.chars().any(char::is_whitespace) && !n.is_empty()) {
+        Some(n) => format!(
+            "  next: copy it to the other device, then run there:  tunlion join {file} --name {n}"
+        ),
+        None => format!("  next: copy it to the other device, then run there:  tunlion join {file}"),
+    }
+}
+
+#[cfg(test)]
+mod join_next_step_tests {
+    use super::join_next_step;
+
+    #[test]
+    fn the_join_step_carries_the_name_the_owner_chose() {
+        let named = join_next_step("beta-invite.txt", Some("beta"));
+        assert!(named.ends_with("tunlion join beta-invite.txt --name beta"), "{named}");
+        let plain = join_next_step("invite.txt", None);
+        assert!(plain.ends_with("tunlion join invite.txt"), "{plain}");
+        use clap::Parser;
+        let cmd = &named[named.find("tunlion").unwrap()..];
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
+    }
 }

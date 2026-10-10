@@ -417,6 +417,18 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 .link(&pid)
                 .map(|link| link.name.clone())
                 .unwrap_or_else(|| "joined-device".to_string());
+            // The owner named this invitee when minting (`add beta --out f`):
+            // that choice wins over the name the joiner proposes (its
+            // hostname, unless `join --name` said otherwise). The usual rules
+            // below still apply to it: a name another key holds is suffixed.
+            if let Some(chosen) = crate::armed::invitee_name(&hex::encode(enroll_pub)) {
+                if chosen != requested_name {
+                    ui::say(&format!(
+                        "  a device that calls itself '{requested_name}' joined with the invitation you made for '{chosen}'; it is listed as '{chosen}'"
+                    ));
+                }
+                requested_name = chosen;
+            }
             // A device re-joining with its own device_pub meets its prior record.
             // LAPSED revives (a network accident): keep the name for continuity,
             // and the delegated write below OVERWRITES the whole bounding set
@@ -460,6 +472,15 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 while crate::devices_store::name_pinned_by_other(&candidate, &hex) && n < 1000 {
                     candidate = format!("{base}-{n}");
                     n += 1;
+                }
+                // The suffix is the security rule (a new key never takes over
+                // another key's name). Say it out loud, with the way back, so a
+                // reset device does not sit beside its stale self forever.
+                if candidate != base {
+                    ui::say(&format!(
+                        "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base}` then `tunlion devices rename {candidate} {base}`.",
+                        ui::paint(ui::Tone::Warn, "!")
+                    ));
                 }
             }
             let requested_name = candidate;

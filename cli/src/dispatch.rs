@@ -99,6 +99,57 @@ use serde_json::{Value, json};
 use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Which of `names` are online right now, for `devices --json`. A device
+/// counts only when the local daemon holds a link to it and the device answers
+/// a reach-ping on that link (bounded, all in parallel). This never
+/// establishes anything: a device with no held link is simply not online here.
+/// The link state alone is not enough: a peer stopped or killed -9 keeps its
+/// link "alive" locally until QUIC's idle timeout.
+async fn devices_online(names: Vec<String>) -> std::collections::HashSet<String> {
+    let warm = crate::warm_device_names(ctl::try_list_warm().await.as_ref());
+    let probes = names
+        .into_iter()
+        .filter(|n| warm.iter().any(|w| w.eq_ignore_ascii_case(n)))
+        .map(|n| async move { ctl::try_ping(&n).await.is_some().then_some(n) });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The daemon's warm-link reply with only the links whose device answered a
+/// liveness ping just now (bounded, in parallel; never establishes anything).
+/// `None` stays `None`: no daemon means the rows assert nothing (#217).
+async fn answering_links(warm: Option<Value>) -> Option<Value> {
+    let mut warm = warm?;
+    let names: Vec<String> = crate::warm_device_names(Some(&warm)).into_iter().collect();
+    let live: std::collections::HashSet<String> = futures_util::future::join_all(
+        names
+            .into_iter()
+            .map(|n| async move { ctl::try_ping(&n).await.is_some().then_some(n) }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(links) = warm.get_mut("links").and_then(Value::as_array_mut) {
+        links.retain(|l| {
+            l["name"]
+                .as_str()
+                .is_some_and(|n| live.iter().any(|x| x.eq_ignore_ascii_case(n)))
+        });
+    }
+    Some(warm)
+}
+
+/// A grant spec that does not parse (an unknown capability, `route` without a
+/// prefix, a resource on a self-scoped capability) is a usage error, exit 2:
+/// the command line is wrong, nothing was refused.
+pub(crate) fn grant_usage(e: anyhow::Error) -> anyhow::Error {
+    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, e.to_string())
+}
+
 pub(crate) async fn async_main() -> Result<()> {
     // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
     // purpose: skipping it for local-only commands was tried and measured at
@@ -346,7 +397,22 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
     }
+    // The verb's name, for the --json failure envelope. The first argv token
+    // that names a subcommand (aliases resolve to the canonical name).
+    let verb_name: Option<String> = {
+        use clap::CommandFactory;
+        let c = Cli::command();
+        argv.iter().skip(1).find_map(|t| {
+            c.get_subcommands()
+                .find(|sc| sc.get_name() == t || sc.get_all_aliases().any(|a| a == t))
+                .map(|sc| sc.get_name().to_string())
+        })
+    };
     let cli = Cli::parse_from(argv);
+    // From here every failure under --json is reported as the JSON envelope on
+    // stdout (exit_codes::report). Subcommands with their own `json` flag
+    // (reach, doctor) shadow the global one and set it again in their arm.
+    crate::exit_codes::set_json_mode(cli.json, verb_name.as_deref());
     let ui_caps = UiCapability::from_cli(&cli);
     // Resolve the global output verbosity ONCE, before any worker spawns:
     // FILAMENT_LOG (if set) overrides the -v/-q flags. Default = info.
@@ -413,15 +479,17 @@ pub(crate) async fn async_main() -> Result<()> {
                 | Cmd::Status { .. }
                 | Cmd::Set { .. }
                 | Cmd::Reach { .. }
+                | Cmd::Send { .. }
                 | Cmd::Sync { .. }
                 | Cmd::Doctor { .. }
                 | Cmd::Addr { .. }
                 | Cmd::Devices { action: None, .. }
         )
     {
-        bail!(
-            "--json is not implemented for this operation; refusing to mix human output with machine data"
-        );
+        return Err(crate::exit_codes::err(
+            crate::exit_codes::ExitKind::Usage,
+            "--json is not implemented for this operation; refusing to mix human output with machine data",
+        ));
     }
     match cmd {
         Cmd::Init {
@@ -466,8 +534,11 @@ pub(crate) async fn async_main() -> Result<()> {
             name,
             remember,
             auth_key,
+            timeout,
         } => {
-            if let Some(ak_path) = auth_key {
+            let json_out = ui_caps.json || cli.json;
+            let peer = to.clone();
+            let res = if let Some(ak_path) = auth_key {
                 enroll_and_send_cmd(&server, ak_path, to, paths, relay, remember).await
             } else {
                 send_cmd(
@@ -480,9 +551,17 @@ pub(crate) async fn async_main() -> Result<()> {
                     name,
                     relay,
                     remember,
+                    timeout,
                 )
                 .await
+            };
+            // Both ends keep a structured history; this is the sender's half.
+            crate::send_report::persist_history(peer.as_deref());
+            if json_out {
+                // One result object on stdout, success or failure.
+                return crate::send_report::emit(res, peer.as_deref());
             }
+            res
         }
         Cmd::Receive {
             code,
@@ -588,6 +667,8 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "verb": "addr",
                             "name": name,
                             "channel": channel,
                             "caps": caps,
@@ -624,6 +705,8 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&json!({
+                            "ok": true,
+                            "verb": "addr",
                             "name": mesh_name,
                             "overlayV6": id.addr().to_string(),
                             "overlayV4": id.addr_v4().to_string(),
@@ -643,23 +726,13 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Id { action } => {
             match action.unwrap_or(IdAction::Show) {
                 IdAction::Show => {
-                    // U1: a keyless device gets its identity minted here, and
-                    // `id` is the one inspect verb that should mint, because the
-                    // identity IS its subject. Two devices keep the pre-U1
-                    // no-key display below instead: a joined one, which must
-                    // never quietly become a second owner, and one that set the
-                    // opt-out, which asked for the old answer and must keep
-                    // getting it (`{"configured": false}`, exit 0) rather than
-                    // an error the old build never returned.
-                    let key = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
-                        Some(key) => Some(key),
-                        None if local_device_cert_path().exists()
-                            || crate::identity_flow::implicit_init_disabled() =>
-                        {
-                            None
-                        }
-                        None => Some(crate::identity_flow::ensure_user_key(ui_caps.json)?),
-                    };
+                    // `id` LOOKS; it never mints. It used to (U1, "the identity
+                    // is its subject"), and a first-time user who ran `tunlion
+                    // id` to see where they stood then found `tunlion join`
+                    // refusing the machine for already having an identity.
+                    // A keyless device gets the answer every read-only verb
+                    // gives: no identity yet, exit 9 (exit_codes::NoIdentity).
+                    let key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
                     match key {
                         None => {
                             if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
@@ -675,7 +748,10 @@ pub(crate) async fn async_main() -> Result<()> {
                                             println!(
                                                 "{}",
                                                 serde_json::to_string_pretty(&json!({
+                                                    "ok": true,
+                                                    "verb": "id",
                                                     "configured": true,
+                                                    "identity": fingerprint,
                                                     "fingerprint": fingerprint,
                                                     "role": "joined-device",
                                                     "holdsOwnerSigningKey": false,
@@ -709,21 +785,25 @@ pub(crate) async fn async_main() -> Result<()> {
                                     }
                                 }
                             }
-                            if ui_caps.json {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&json!({ "configured": false }))?
-                                );
-                            } else if local_device_cert_path().exists() {
-                                crate::ui::say(&format!(
-                                    "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
-                                ));
+                            if local_device_cert_path().exists() {
+                                if ui_caps.json {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&json!({
+                                            "ok": true,
+                                            "verb": "id",
+                                            "configured": false,
+                                            "identity": Value::Null,
+                                            "role": "joined-device",
+                                        }))?
+                                    );
+                                } else {
+                                    crate::ui::say(&format!(
+                                        "this device holds a joined certificate that could not be read; `tunlion join` again from a clean device."
+                                    ));
+                                }
                             } else {
-                                // The opt-out path: implicit minting is off, so
-                                // this is the pre-U1 answer, verbatim.
-                                println!(
-                                    "no identity yet. Run 'tunlion init' or 'tunlion join'."
-                                );
+                                return Err(crate::identity_flow::no_identity(ui_caps.json));
                             }
                         }
                         Some(uk) => {
@@ -743,7 +823,10 @@ pub(crate) async fn async_main() -> Result<()> {
                                 println!(
                                     "{}",
                                     serde_json::to_string_pretty(&json!({
+                                        "ok": true,
+                                        "verb": "id",
                                         "configured": true,
+                                        "identity": uk.fingerprint(),
                                         "fingerprint": uk.fingerprint(),
                                         "publicKey": uk.public_key_hex(),
                                         "role": "owner",
@@ -895,7 +978,10 @@ pub(crate) async fn async_main() -> Result<()> {
             let for_ = match (who, for_) {
                 (Some(w), None) => Some(w),
                 (Some(w), Some(f)) => {
-                    bail!("you named the invitee twice: `add {w}` and `--for {f}`. Use one.")
+                    return Err(crate::exit_codes::err(
+                        crate::exit_codes::ExitKind::Usage,
+                        format!("you named the invitee twice: `add {w}` and `--for {f}`. Use one."),
+                    ));
                 }
                 (None, f) => f,
             };
@@ -1017,11 +1103,21 @@ pub(crate) async fn async_main() -> Result<()> {
                     );
                 }
                 let quick = ui_caps.interactive && who_given && via_defaulted;
+                if code.is_none() && word.is_none() && !crate::interactive_allowed() {
+                    return Err(add_code_needs_people(named.as_deref()));
+                }
                 pair_cmd(&server, code, name.or(named), word, relay, internal, allow, quick).await
             } else {
                 // No answer given and none required: an ordinary pair, which
                 // confers no membership. This is the safe default and the
                 // pre-existing behaviour.
+                //
+                // `pair_cmd` refuses a non-terminal with the message for a BARE
+                // `add`. If arguments were given, answer what was typed instead.
+                let args_given = via.is_some() || name.is_some() || !allow.is_empty() || expires.is_some();
+                if args_given && code.is_none() && word.is_none() && !crate::interactive_allowed() {
+                    return Err(add_code_needs_people(name.as_deref()));
+                }
                 pair_cmd(&server, code, name, word, relay, false, allow, false).await
             }
         }
@@ -1065,6 +1161,7 @@ pub(crate) async fn async_main() -> Result<()> {
         }
         Cmd::Depart => depart_cmd(&server, relay).await,
         Cmd::Devices { action, json, caps } => {
+            crate::exit_codes::set_json_mode(json || ui_caps.json, Some("devices"));
             if let Some(selector) = caps {
                 if action.is_some() {
                     bail!("--caps is a view; it takes a device name, not a subcommand");
@@ -1075,7 +1172,20 @@ pub(crate) async fn async_main() -> Result<()> {
             match action {
                 None => {
                     let all = devices_load();
+                    // Nothing to list and no identity: the same answer `id`
+                    // gives (exit 9), not an empty list with exit 0 beside a
+                    // `status` that exits nonzero. A keyless device that
+                    // paired by code still lists its devices, with the hint.
+                    let nothing_to_list = crate::identity_flow::devices_has_nothing_to_list(
+                        crate::identity_flow::has_identity(),
+                        crate::device_view::device_entries(None).len(),
+                    );
+                    if nothing_to_list && (json || ui_caps.json) {
+                        return Err(crate::identity_flow::no_identity(true));
+                    }
                     if json || ui_caps.json {
+                        let online =
+                            devices_online(all.iter().map(|(n, _)| n.clone()).collect()).await;
                         let arr: Vec<Value> = all
                             .iter()
                             .map(|(n, s)| {
@@ -1090,12 +1200,21 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "lastSeen": last_seen,
                                     "address": addr,
                                     "mesh": mesh,
+                                    // Live, not remembered: the daemon holds a
+                                    // link to it AND the device answered a
+                                    // liveness ping on that link just now.
+                                    "online": online.contains(n),
                                 })
                             })
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&arr)?);
                     } else {
-                        let warm = ctl::try_list_warm().await;
+                        // "online" on this screen means what it means in
+                        // --json: the device answered a liveness ping on the
+                        // held link just now. A held link alone showed a
+                        // SIGSTOPped, stopped or wiped peer as "online (last
+                        // seen just now)" while every send to it failed.
+                        let warm = answering_links(ctl::try_list_warm().await).await;
                         let pending = ctl::try_list_pending().await;
                         let now = identity::now_secs();
                         // Honest roster heading: show the epoch and when it was
@@ -1118,6 +1237,18 @@ pub(crate) async fn async_main() -> Result<()> {
                             roster_heading,
                         );
                         println!("{rendered}");
+                        // Read only: a device with no identity is told how to
+                        // get one, and nothing is minted by looking.
+                        if !crate::identity_flow::has_identity() {
+                            ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+                        }
+                        // The screen keeps its shape (the empty list on
+                        // stdout, the hint above); the exit says why.
+                        if nothing_to_list {
+                            return Err(crate::exit_codes::reported(
+                                crate::exit_codes::ExitKind::NoIdentity,
+                            ));
+                        }
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
@@ -1398,6 +1529,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 );
             }
             let json = json || ui_caps.json;
+            crate::exit_codes::set_json_mode(json, Some("reach"));
             match dev {
                 Some(d) if d.contains(':') => bail!(
                     "`reach <device>:<port>` moved to `forward <device>:<port>`: reach probes only, forward tunnels. Run `tunlion forward {d}`"
@@ -1430,9 +1562,9 @@ pub(crate) async fn async_main() -> Result<()> {
                         return Ok(());
                     }
                     if until_direct {
-                        crate::ping::reach_until_direct(&d, timeout, json, relay).await
+                        crate::ping::reach_until_direct(&d, timeout.unwrap_or(30), json, relay).await
                     } else {
-                        crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                        crate::ping::ping_cmd(&server, &d, 1, json, relay, timeout).await
                     }
                 }
                 None => bail!(
@@ -1499,12 +1631,15 @@ pub(crate) async fn async_main() -> Result<()> {
             device,
             watch,
             repeat,
+            timeout,
             json,
         } => {
+            crate::exit_codes::set_json_mode(json || ui_caps.json, Some("doctor"));
             if let Some(d) = &device {
                 require_known_device(d)?;
             }
-            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay).await
+            doctor::doctor_cmd(&server, device, watch, repeat, json || ui_caps.json, relay, timeout)
+                .await
         }
         Cmd::Grant {
             device,
@@ -1525,7 +1660,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 // just the public half. Keep requiring a full identity here.
                 let user_key = crate::identity_flow::ensure_user_key(false)?;
                 let pk = user_key.public_key_bytes();
-                let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                 let (capability, resource) = (g.action.clone(), g.resource.clone());
                 let target_bytes = crate::capability::make_tag_target(&pk, t);
                 let ver = crate::capability::hlc_next(0, crate::capability::now_ms());
@@ -1570,7 +1705,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 .map(|k| k.public_key_bytes());
             let (capability, cap_resource, cap_nonce) = match owner_pk {
                 Some(pk) => {
-                    let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                    let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                     (g.action, g.resource, g.nonce)
                 }
                 None => {
@@ -1590,11 +1725,11 @@ pub(crate) async fn async_main() -> Result<()> {
                         // U1: not joined and no key, so this is the first use;
                         // mint the identity and bind the resource to it.
                         let pk = crate::identity_flow::ensure_user_key(false)?.public_key_bytes();
-                        let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                        let g = crate::capability::parse_grant_spec(&spec, &pk).map_err(grant_usage)?;
                         (g.action, g.resource, g.nonce)
                     } else {
                         (
-                            crate::capability::canonical_capability(&spec)?,
+                            crate::capability::canonical_capability(&spec).map_err(grant_usage)?,
                             "self".to_string(),
                             crate::capability::self_resource_nonce(),
                         )
@@ -2020,6 +2155,12 @@ pub(crate) async fn async_main() -> Result<()> {
                         "--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount"
                     );
                 }
+                // A missing local prerequisite (no FUSE) is a problem with this
+                // machine's setup, not a failure of the mount: exit 2 (usage:
+                // bad input or environment), before anything connects.
+                crate::platform::mount_prerequisite().map_err(|m| {
+                    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, m)
+                })?;
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
                 require_known_device(&plan.peer)?;
                 let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;
@@ -2060,4 +2201,12 @@ pub(crate) async fn async_main() -> Result<()> {
             .await
         }
     }
+}
+
+/// `add ... --via code` with no terminal: print the refusal addressed to the
+/// arguments that were given, and fail as a usage error (exit 2).
+fn add_code_needs_people(named: Option<&str>) -> anyhow::Error {
+    let (message, _) = fleet_ui::pair_ui::err_add_code_noninteractive(named);
+    ui::critical(&message);
+    crate::exit_codes::reported(crate::exit_codes::ExitKind::Usage)
 }

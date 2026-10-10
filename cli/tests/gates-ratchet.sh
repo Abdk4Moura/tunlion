@@ -61,6 +61,10 @@ EXPECTED_GREEN=(
   "deferred drop: flowing link survives its peer-left|deferred-drop (#28 trigger)"
   "stepped-away sender: held|stepped-away wait"
   "U1: created once|u1-implicit-init"
+  "daemon waits for the network|daemon-network-wait"
+  "exit codes: send missing file|exit-codes-blind-run"
+  "unreadable-source: mode-000|unreadable-source"
+  "shrinking-source: sender stopped|shrinking-source"
 )
 
 # A missing PASS line has three different causes and they want different

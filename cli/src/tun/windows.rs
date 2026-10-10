@@ -225,6 +225,18 @@ pub fn ensure_net_admin_for_l3() -> bool {
     true
 }
 
+/// No one-time grant exists on Windows (Wintun needs an elevated daemon), so
+/// there is nothing to offer at `init`.
+pub fn l3_grant_pending() -> Option<String> {
+    None
+}
+
+/// Nothing on Windows blocks the kernel overlay in a way a grant could not
+/// address; the daemon's own privilege decides it.
+pub fn l3_blocker() -> Option<String> {
+    None
+}
+
 /// The Windows daemon runs elevated (Wintun requires it), so the hosts file is
 /// writable for MagicDNS. Nothing to grant.
 pub fn ensure_hosts_writable() {}

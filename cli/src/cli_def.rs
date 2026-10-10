@@ -64,7 +64,26 @@ EXAMPLES
   tunlion forward laptop:5432       tunnel to a peer's localhost port
 
   The other end never needs anything installed: https://tunlion.autumated.com
-  Run `tunlion <command> --help` for details.";
+  Run `tunlion <command> --help` for details.
+
+EXIT CODES
+  0    success
+  1    any other error
+  2    usage: bad arguments or flags, or a missing local prerequisite (mount without FUSE)
+  3    unknown device, or not paired with this one
+  4    denied: refused by the peer, a capability, or the system
+  5    reach --until-direct: the link is up but still on a relay
+  6    the peer is offline, unreachable, or did not answer in time
+       (status: the daemon runs but did not answer)
+  7    can't reach the tunlion server (no internet or DNS)
+  8    partial: some files moved and some did not
+  9    this device has no identity yet (init, or join an invitation)
+  10   up: a daemon is already running with different settings (not applied)
+  11   status: no daemon is running for this config directory
+  130  interrupted
+  exec passes the remote command's own exit status through.
+  With --json, a failure is one JSON object on stdout:
+  {\"ok\":false,\"error\":{\"code\":\"unknown_device\",\"exit\":3,\"message\":\"...\"}}";
 
 #[derive(Parser)]
 // Custom help template: clap has no native grouping for SUBCOMMANDS
@@ -175,12 +194,18 @@ pub(crate) enum Cmd {
         /// Join an explicit room instead of the same-network auto room
         #[arg(long)]
         room: Option<String>,
-        /// Only connect to a peer whose display name contains this (C13)
+        /// Send to the known device with exactly this name (case-insensitive);
+        /// `tunlion devices` lists them
         #[arg(long)]
         to: Option<String>,
         /// Override the offered file name (for stdin '-', or a single file)
         #[arg(long)]
         name: Option<String>,
+        /// Seconds to wait for the peer to connect (default 60, or
+        /// FILAMENT_SEND_TIMEOUT; 0 waits without limit). A known device that
+        /// shows no presence at all fails sooner, with exit 6 (offline).
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// Enroll as delegated principal using an auth key file before sending
         #[arg(long, hide = true)]
         auth_key: Option<PathBuf>,
@@ -554,12 +579,14 @@ pub(crate) enum Cmd {
         /// Device to probe (omit for the environment preflight).
         dev: Option<String>,
         /// Keep probing (one line a second) until the link is direct: exit 0 on
-        /// the first direct path, exit 5 if it is still on a relay at --timeout.
+        /// the first direct path, exit 5 if it is still on a relay at --timeout,
+        /// exit 6 if there is no link at all (the peer is offline).
         #[arg(long)]
         until_direct: bool,
-        /// Seconds to wait for a direct path with --until-direct.
-        #[arg(long, value_name = "SECS", default_value_t = 30)]
-        timeout: u64,
+        /// Seconds to wait (default 30): for the peer to answer, or with
+        /// --until-direct for a direct path. An unreachable peer exits 6.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -579,6 +606,10 @@ pub(crate) enum Cmd {
         watch: bool,
         #[arg(long)]
         repeat: Option<u32>,
+        /// Seconds to wait for the device's probe (default 30). An offline
+        /// device exits 6, an unreachable tunlion server 7.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
         /// Machine-readable JSON output (for scripting)
         #[arg(long)]
         json: bool,
