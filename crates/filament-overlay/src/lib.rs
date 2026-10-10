@@ -140,8 +140,23 @@ pub fn next_announce_seq_at(path: &std::path::Path) -> u64 {
     // Best-effort persist. If this fails we still return a value the receiver
     // will accept for this session; the next restart falls back to the branch
     // above rather than to zero.
-    let _ = std::fs::write(path, next.to_string());
+    let _ = write_owner_only(path, next.to_string().as_bytes());
     next
+}
+
+/// Write `data` to `path` owner-only (0600 on unix) whatever the umask. The
+/// counter sits in the config directory, and `fs::write` let `umask 0000` make
+/// it world-writable, so anyone could wind it forward and lock this node out.
+fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(data)
 }
 
 /// Is `seq` fresh, given the highest previously accepted value from that

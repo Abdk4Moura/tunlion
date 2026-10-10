@@ -29,8 +29,15 @@ use std::path::PathBuf;
 /// `{config_dir}/control.sock`, honoring FILAMENT_CONFIG_DIR (hermetic tests),
 /// else `~/.config/filament`. Mirrors `devices_path()` / `pidfile()`. Portable
 /// (just path math); only used on unix where the socket is actually bound.
+///
+/// When that path is too long for a unix socket (a deep HOME or
+/// FILAMENT_CONFIG_DIR), a short per-user directory is used instead; see
+/// `platform::control_socket_path`. Daemon and clients both resolve it here.
 pub fn control_sock_path() -> PathBuf {
-    crate::platform::Paths::config_path("control.sock")
+    crate::platform::control_socket_path(
+        &crate::platform::Paths::config_path("control.sock"),
+        &crate::platform::Paths::config_dir(),
+    )
 }
 
 /// True if the warm-reuse fast path is disabled by the operator. An escape hatch
@@ -41,14 +48,14 @@ pub fn reuse_disabled() -> bool {
 
 #[cfg(unix)]
 pub use imp::{
-    daemon_present, send_reply, serve_at, try_approve_request, try_bootstrap,
+    daemon_present, daemon_responds, send_reply, serve_at, try_approve_request, try_bootstrap,
     try_cap_status, try_deny_request, try_dial, try_fleet_rendezvous, try_list_pending, try_list_warm, try_mount, try_open, try_ping, try_pty_reason, try_reconfigure, try_reload,
     try_reload_expose, try_resize, try_unmount, try_wake, Req, ReqKind,
 };
 
 #[cfg(not(unix))]
 pub use stub::{
-    daemon_present, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
+    daemon_present, daemon_responds, try_reconfigure, try_approve_request, try_cap_status, try_deny_request, try_fleet_rendezvous,
     try_list_pending, try_list_warm, try_ping, try_wake,
     Req,
 };
@@ -425,6 +432,24 @@ mod imp {
         (v["ok"].as_bool() == Some(true)).then_some(v)
     }
 
+    /// Does the daemon ANSWER on its control socket within `wait`? A live pid
+    /// is not an answer: a SIGSTOPped daemon keeps its pid (and the kernel even
+    /// accepts the connect into the listen backlog), and `status` reported it
+    /// "up". `Some(false)` covers both a missing socket and a silent one.
+    pub async fn daemon_responds(wait: std::time::Duration) -> Option<bool> {
+        let probe = async {
+            let mut s = UnixStream::connect(control_sock_path()).await.ok()?;
+            let mut line = serde_json::to_vec(&json!({ "op": "cap-status" })).ok()?;
+            line.push(b'\n');
+            s.write_all(&line).await.ok()?;
+            s.flush().await.ok()?;
+            let reply = read_line(&mut s, 4096).await.ok()?;
+            // Any well-formed reply is an answer, even a refusal.
+            serde_json::from_str::<Value>(&reply).ok().map(|_| true)
+        };
+        Some(matches!(tokio::time::timeout(wait, probe).await, Ok(Some(true))))
+    }
+
     /// Ask the daemon for its live capability shadow counters (synchronous).
     /// Returns the daemon's reply (`{"ok":true,"counts":{...}}`) or `None` if
     /// no daemon answered. A fresh process has zero counters; only the running
@@ -669,11 +694,13 @@ mod imp {
     /// up" must not print it until this fires, or a sibling process races the
     /// bind.
     pub async fn serve_at(path: PathBuf, tx: mpsc::UnboundedSender<Req>, ready: Option<tokio::sync::oneshot::Sender<()>>) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        // A private directory (0700, ours, not writable by anyone else) before
+        // anything is bound in it: the short fallback lives under /tmp.
+        crate::platform::prepare_socket_dir(&path)
+            .map_err(|e| anyhow!("cannot prepare the control socket directory for {}: {e}", path.display()))?;
         let _ = std::fs::remove_file(&path); // clear a stale leftover
-        let listener = UnixListener::bind(&path)?;
+        let listener = UnixListener::bind(&path)
+            .map_err(|e| anyhow!("cannot bind the control socket {} ({} bytes): {e}", path.display(), path.as_os_str().len()))?;
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -790,7 +817,34 @@ mod imp {
 
         #[test]
         fn control_sock_path_ends_with_socket_name() {
-            assert!(control_sock_path().ends_with("control.sock"));
+            // Whatever the test environment's config dir, the resolved path is a
+            // bindable socket path: under the limit, and named `.sock`.
+            let p = control_sock_path();
+            assert!(p.as_os_str().len() < crate::platform::SOCKET_PATH_MAX, "{}", p.display());
+            assert_eq!(p.extension().and_then(|e| e.to_str()), Some("sock"), "{}", p.display());
+            // A short config dir keeps the socket where it always was.
+            let short = std::path::Path::new("/home/u/.config/filament");
+            assert_eq!(
+                crate::platform::control_socket_path(&short.join("control.sock"), short),
+                short.join("control.sock")
+            );
+        }
+
+        #[test]
+        fn an_overlong_config_dir_gets_a_short_private_socket_path() {
+            // The first-time-user sandbox that found this was 110 bytes deep.
+            let deep = std::path::PathBuf::from(format!("/home/u/{}/filament", "d".repeat(120)));
+            let a = crate::platform::control_socket_path(&deep.join("control.sock"), &deep);
+            assert!(a.as_os_str().len() < crate::platform::SOCKET_PATH_MAX, "{}", a.display());
+            assert!(
+                a.parent().and_then(|d| d.file_name()).is_some_and(|n| n.to_string_lossy().starts_with("tunlion-")),
+                "{}",
+                a.display()
+            );
+            // Deterministic (daemon and client must meet) and per-config.
+            assert_eq!(a, crate::platform::control_socket_path(&deep.join("control.sock"), &deep));
+            let other = std::path::PathBuf::from(format!("/home/v/{}/filament", "d".repeat(120)));
+            assert_ne!(a, crate::platform::control_socket_path(&other.join("control.sock"), &other));
         }
 
         #[tokio::test]
@@ -924,6 +978,19 @@ mod stub {
     /// available at all, and here it never is.
     pub async fn daemon_present() -> bool {
         false
+    }
+
+    /// No control socket here, so whether the daemon answers is unknown, which
+    /// is not the same as "it does not": `status` says nothing rather than guess.
+    pub async fn daemon_responds(_wait: std::time::Duration) -> Option<bool> {
+        None
+    }
+
+    /// No control socket here, so a setting cannot be pushed into a running
+    /// daemon; the honest answer is "on the next start", which is what a
+    /// `live: false` reply says.
+    pub async fn try_reconfigure(_key: &str) -> Option<Value> {
+        Some(serde_json::json!({ "ok": true, "live": false }))
     }
 
     /// No control socket here, so no daemon can broker a rendezvous. `None`

@@ -14,6 +14,7 @@
 //! (`anyhow::Context` for `.with_context`, `std::io::IsTerminal` for `.is_terminal`) are
 //! imported; the rest travel inside the body's own function-local `use`s.
 use crate::dlog;
+use crate::signaling_health;
 #[cfg(l3)]
 use crate::l3;
 #[cfg(l3)]
@@ -968,13 +969,14 @@ pub(crate) async fn recv_cmd(
                     // Linux, 104 on macOS), e.g. a deep FILAMENT_CONFIG_DIR or a
                     // CI/macOS temp directory; found by a first-time-user test
                     // whose sandbox path was 110 bytes.
-                    let path = crate::ctl::control_sock_path();
-                    crate::ui::say(&format!(
-                        "tunlion: control socket unavailable at {} ({} bytes): {e}\n  \
-                         warm links, `tunlion requests` and instant invitations will not work; \
-                         a shorter config directory (FILAMENT_CONFIG_DIR) fixes it",
-                        path.display(),
-                        path.as_os_str().len()
+                    //
+                    // FATAL now, not a log line: the startup below waits on the
+                    // readiness signal this task drops, and stops the daemon with
+                    // this reason. A daemon nobody can talk to is not "up".
+                    crate::ui::critical(&format!(
+                        "tunlion: control socket unavailable: {e}\n  \
+                         without it, `status`, `set`, warm links, `tunlion requests` and \
+                         instant invitations cannot reach this daemon, so it will not start"
                     ));
                 }
             });
@@ -1019,7 +1021,14 @@ pub(crate) async fn recv_cmd(
             // a sibling `mint` that arms right after this line must not race a
             // socket that is not listening yet.
             if let Some(ready) = ctl_ready.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
+                // Ok(Err(_)): the server task ended without ever signalling ready,
+                // i.e. it could not create the socket (it said why, above).
+                if let Ok(Err(_)) = tokio::time::timeout(Duration::from_secs(5), ready).await {
+                    bail!(
+                        "the control socket {} could not be created; the daemon is not starting",
+                        crate::ctl::control_sock_path().display()
+                    );
+                }
             }
             if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
@@ -1323,27 +1332,43 @@ pub(crate) async fn recv_cmd(
                                 let auto_proxy =
                                     settings::get_bool("auto-proxy", None) && !no_proxy_fallback;
                                 if auto_proxy {
-                                    let server = server.to_string();
-                                    tokio::spawn(async move {
-                                        if let Err(e) =
-                                            l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay)
+                                    // Bind FIRST, then say what is true. Another daemon
+                                    // (another HOME on this machine) or a hand-started
+                                    // proxy may hold 1080 already.
+                                    match l2::bind_auto_proxy(1080).await {
+                                        Ok((listener, port)) => {
+                                            let server = server.to_string();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = l2::proxy_serve(
+                                                    &server, listener, "127.0.0.1", port, 0, relay,
+                                                )
                                                 .await
-                                        {
-                                            // Port already in use is expected (user started proxy manually);
-                                            // only log unexpected errors.
-                                            let msg = e.to_string();
-                                            if !msg.contains("already in use") {
-                                                ui::debug(&format!("auto-proxy: {e}"));
-                                            }
+                                                {
+                                                    ui::critical(&format!(
+                                                        "auto-proxy on 127.0.0.1:{port} stopped: {e}"
+                                                    ));
+                                                }
+                                            });
+                                            let note = if port == 1080 {
+                                                String::new()
+                                            } else {
+                                                " (1080 was taken)".to_string()
+                                            };
+                                            ui::say(&format!(
+                                                "  {} started SOCKS5 proxy on 127.0.0.1:{port}{note} (set your tools' proxy to this)",
+                                                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                            ));
+                                            ui::say(&format!(
+                                                "    e.g.  curl --socks5-hostname 127.0.0.1:{port} http://<peer>.mesh:8080/"
+                                            ));
                                         }
-                                    });
-                                    ui::say(&format!(
-                                        "  {} started SOCKS5 proxy on 127.0.0.1:1080 (set your tools' proxy to this)",
-                                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                                    ));
-                                    ui::say(&format!(
-                                        "    e.g.  curl --socks5-hostname 127.0.0.1:1080 http://<peer>.mesh:8080/"
-                                    ));
+                                        Err(why) => ui::say(&ui::paint(
+                                            ui::Tone::Warn,
+                                            &format!(
+                                                "  no SOCKS5 proxy: {why}. To run one on a free port: `tunlion forward <device>:<port> --socks --port <free port>`"
+                                            ),
+                                        )),
+                                    }
                                 }
                             } else {
                                 // Kernel mode is dual-stack: show the v4 address too
@@ -1597,7 +1622,18 @@ pub(crate) async fn recv_cmd(
     let mut signaling_down_since: Option<Instant> = None;
     let mut reconnect_attempt: u32 = 0;
     let mut last_reconnect_try = Instant::now();
-    let mut probed_silence = false; // fired one forced sync before declaring down
+    let mut reconnect_wait = Duration::ZERO;
+    // When the current connection came up (None while down). The ladder only
+    // restarts after a connection that stayed up signaling_health::STABLE_AFTER.
+    let mut signaling_up_since: Option<Instant> = Some(Instant::now());
+    let mut down_reason = String::new();
+    // When the forced `sync` probe went out (None: no probe outstanding).
+    let mut probed_silence: Option<Instant> = None;
+    // Repeated reconnect lines are collapsed, not written once per cycle.
+    let mut signaling_log = signaling_health::LogCollapse::default();
+    if signaling_self_heal {
+        signaling_health::note_serving();
+    }
     let mut last_watchdog = Instant::now();
     // Link self-heal cadence (the multi-minute-outage fix, #3). A transport that
     // died past the QUIC idle timeout lingers in `links` as a zombie and SUPPRESSES
@@ -1772,6 +1808,11 @@ pub(crate) async fn recv_cmd(
                                 },
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
+                                // The signaling link as the serving loop sees it, so
+                                // `status` and `doctor` can tell a daemon that answers
+                                // here but is off the server (or keeps dropping) from a
+                                // healthy one. See signaling_health.
+                                "signaling": signaling_health::snapshot_json(),
                                 "summary": counts.summary(),
                                 // #244: the LIVE shell posture. `revoke <dev> shell`
                                 // reads this so it can say when the shell it just
@@ -2267,10 +2308,27 @@ pub(crate) async fn recv_cmd(
             // (1) Liveness accounting. Any inbound signaling event proves the
             // socket is alive; a successful `sync` ack (Ev::Synced) is the
             // strongest signal (the server answered). The fast-path close/error
-            // callback marks the link down immediately.
+            // callback marks the link down immediately, but ONLY for the
+            // current connection: a close of one this loop already replaced is
+            // history (see signaling_health, defect 1). Acting on it is what
+            // turned one late close into an endless reconnect storm.
+            //
+            // An inbound event no longer resets the backoff ladder: the new
+            // connection's own `welcome` did, so the ladder could never climb
+            // (defect 2). Only a connection that stays up STABLE_AFTER does.
             let mut saw_down = false;
             match &ev {
-                Some(Ev::SignalingDown(_)) => saw_down = true,
+                Some(Ev::SignalingDown(reason, closed)) => {
+                    if signaling_health::close_is_current(*closed, sio.id()) {
+                        saw_down = true;
+                        down_reason = reason.clone();
+                    } else {
+                        ui::debug(&format!(
+                            "  signaling: ignoring the close of replaced connection {closed} ({reason}); current is {}",
+                            sio.id()
+                        ));
+                    }
+                }
                 Some(
                     Ev::Welcome(_)
                     | Ev::Synced(_)
@@ -2287,9 +2345,7 @@ pub(crate) async fn recv_cmd(
                     | Ev::PairError(_),
                 ) => {
                     last_signaling = Instant::now();
-                    signaling_down_since = None;
-                    probed_silence = false;
-                    reconnect_attempt = 0;
+                    probed_silence = None;
                 }
                 _ => {}
             }
@@ -2298,110 +2354,138 @@ pub(crate) async fn recv_cmd(
             // fires no close callback, so we watch the inbound gap. Once it
             // exceeds the threshold, fire ONE forced `sync` (the heartbeat); if
             // the socket is alive the server's `synced` ack lands within a tick
-            // and resets the gap. If a second threshold passes with still no
-            // event, the socket is dead, declare it down.
+            // and resets the gap. If the probe then goes unanswered for its own
+            // window, the socket is dead, declare it down.
+            //
+            // The probe's window is measured from when it was SENT. It used to
+            // be judged on the inbound gap alone, so after a freeze longer than
+            // twice the threshold the very next loop iteration declared the link
+            // dead before the probe could be answered, and re-dialed while the
+            // old socket's close was still in flight (the storm's seed).
             let silence = net::signaling_silence_ms();
             let silent_ms = last_signaling.elapsed().as_millis() as u64;
             if signaling_down_since.is_none() {
+                let mut declare: Option<String> = None;
                 if saw_down {
-                    signaling_down_since = Some(Instant::now());
-                    last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
-                    // Visible (not just debug): a node dropping off signaling was
-                    // previously silent until it bit someone. Surface it + reflect
-                    // it in `systemctl status` so it's diagnosable at a glance.
-                    ui::say(&ui::paint(
-                        ui::Tone::Warn,
-                        "signaling link closed, reconnecting...",
-                    ));
-                    sdnotify::status("signaling down - reconnecting");
+                    declare = Some(format!("closed ({down_reason})"));
                 } else if silent_ms >= silence {
-                    if !probed_silence {
-                        // Heartbeat probe: an ACK'd `sync` round-trip, the only
-                        // liveness signal that works for a room-less idle
-                        // acceptor. `sess.tick()` can't serve here: it returns
-                        // early when there is no room (the `up` case) AND when
-                        // the session is already confirmed-fresh, so on a quiet
-                        // link it emitted nothing and the watchdog falsely
-                        // reconnected every ~30 s, churning presence. The server
-                        // acks `sync` unconditionally; the ack wakes the loop as
-                        // Ev::SignalingAlive, which resets the gap below.
-                        probed_silence = true;
-                        net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
-                    } else if silent_ms >= silence.saturating_mul(2) {
-                        signaling_down_since = Some(Instant::now());
-                        last_reconnect_try = Instant::now() - Duration::from_secs(60);
-                        // Visible: a silent (half-open) signaling link is the exact
-                        // way a node falls off presence without anyone noticing.
-                        ui::say(&ui::paint(
-                            ui::Tone::Warn,
-                            &format!("signaling silent for {silent_ms}ms, reconnecting..."),
-                        ));
-                        sdnotify::status("signaling silent - reconnecting");
+                    match probed_silence {
+                        None => {
+                            // Heartbeat probe: an ACK'd `sync` round-trip, the only
+                            // liveness signal that works for a room-less idle
+                            // acceptor. `sess.tick()` can't serve here: it returns
+                            // early when there is no room (the `up` case) AND when
+                            // the session is already confirmed-fresh, so on a quiet
+                            // link it emitted nothing and the watchdog falsely
+                            // reconnected every ~30 s, churning presence. The server
+                            // acks `sync` unconditionally; the ack wakes the loop as
+                            // Ev::SignalingAlive, which resets the gap below.
+                            probed_silence = Some(Instant::now());
+                            net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
+                        }
+                        Some(sent)
+                            if silent_ms >= silence.saturating_mul(2)
+                                && sent.elapsed() >= signaling_health::PROBE_WINDOW =>
+                        {
+                            declare = Some(format!("silent for {}s", silent_ms / 1000));
+                        }
+                        Some(_) => {}
                     }
+                }
+                if let Some(why) = declare {
+                    let now = Instant::now();
+                    signaling_down_since = Some(now);
+                    // The ladder restarts only if the link that just went down
+                    // had been up long enough to count as stable.
+                    reconnect_attempt = signaling_health::attempt_after_close(
+                        reconnect_attempt,
+                        signaling_up_since.map(|t| now.saturating_duration_since(t)),
+                    );
+                    signaling_up_since = None;
+                    reconnect_wait = signaling_health::reconnect_delay(
+                        reconnect_attempt,
+                        signaling_health::jitter_unit(),
+                    );
+                    last_reconnect_try = now;
+                    signaling_health::note_down(&why);
+                    // Visible (not just debug): a node dropping off signaling was
+                    // previously silent until it bit someone. Collapsed, so a
+                    // link that keeps dropping cannot fill the disk with it.
+                    if let Some(line) = signaling_log.admit(
+                        "down",
+                        &format!("signaling link {why}, reconnecting..."),
+                        now,
+                    ) {
+                        ui::say(&ui::paint(ui::Tone::Warn, &line));
+                    }
+                    sdnotify::status("signaling down - reconnecting");
                 }
             }
 
-            // (3) Re-dial with backoff + jitter. Idempotent: a fresh `welcome`
-            // re-asserts room + channel subscriptions through the C30 session
-            // (sess.invalidate forces it next tick). Live DATA links are NOT torn
-            // down, they ride independent WebRTC/QUIC transports and keep
-            // flowing across the cosmetic signaling reconnect (the #28 contract).
-            if let Some(down_at) = signaling_down_since {
-                // backoff: 0.5s, 1s, 2s, 4s ... capped at 8s, +/-25% jitter.
-                let base = 500u64
-                    .saturating_mul(1 << reconnect_attempt.min(4))
-                    .min(8_000);
-                let jitter = (down_at.elapsed().as_nanos() as u64 % (base / 2 + 1)) as i64
-                    - (base as i64 / 4);
-                let backoff = Duration::from_millis((base as i64 + jitter).max(100) as u64);
-                if last_reconnect_try.elapsed() >= backoff {
-                    last_reconnect_try = Instant::now();
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    let _ = sio.disconnect().await; // drop the dead client (no-op if already gone)
-                    match net::reconnect_signaling(server, tx.clone()).await {
-                        Ok(new_sio) => {
-                            sio = new_sio;
-                            conn.sio = sio.clone();
-                            // C30: a fresh sid voids everything the server held,
-                            // re-assert room + channels on the next tick. Re-fire
-                            // the fast-path join/subscribe immediately too.
-                            sess.invalidate();
-                            if let Some(room) = sess.room.clone() {
-                                sess.emit(
-                                    &sio,
-                                    "join",
-                                    json!({ "room": room, "name": display_name(), "uid": my_uid }),
-                                )
+            // (3) Re-dial with bounded, jittered backoff. Idempotent: a fresh
+            // `welcome` re-asserts room + channel subscriptions through the C30
+            // session (sess.invalidate forces it next tick). Live DATA links are
+            // NOT torn down, they ride independent WebRTC/QUIC transports and
+            // keep flowing across the cosmetic signaling reconnect (the #28
+            // contract).
+            if signaling_down_since.is_some() && last_reconnect_try.elapsed() >= reconnect_wait {
+                last_reconnect_try = Instant::now();
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                reconnect_wait = signaling_health::reconnect_delay(
+                    reconnect_attempt,
+                    signaling_health::jitter_unit(),
+                );
+                // Drop the old client (no-op if already gone). Its close, when
+                // it lands, carries the old id and is ignored above.
+                let _ = sio.disconnect().await;
+                match net::reconnect_signaling(server, tx.clone()).await {
+                    Ok(new_sio) => {
+                        sio = new_sio;
+                        conn.sio = sio.clone();
+                        // C30: a fresh sid voids everything the server held,
+                        // re-assert room + channels on the next tick. Re-fire
+                        // the fast-path join/subscribe immediately too.
+                        sess.invalidate();
+                        if let Some(room) = sess.room.clone() {
+                            sess.emit(
+                                &sio,
+                                "join",
+                                json!({ "room": room, "name": display_name(), "uid": my_uid }),
+                            )
+                            .await;
+                        }
+                        if !sess.channels.is_empty() {
+                            let chans = sess.channels.clone();
+                            sess.emit(&sio, "subscribe", json!({ "channels": chans }))
                                 .await;
-                            }
-                            if !sess.channels.is_empty() {
-                                let chans = sess.channels.clone();
-                                sess.emit(&sio, "subscribe", json!({ "channels": chans }))
-                                    .await;
-                            }
-                            sess.tick(&sio).await;
-                            // optimistic: a clean connect proves reachability; let
-                            // the welcome confirm it (which resets the counters).
-                            last_signaling = Instant::now();
-                            signaling_down_since = None;
-                            probed_silence = false;
-                            // Visible: pairs with the "reconnecting..." line so the
-                            // recovery is observable end to end.
-                            ui::say(&ui::paint(
-                                ui::Tone::Ok,
-                                "signaling reconnected, re-announcing presence",
-                            ));
-                            sdnotify::status("up - serving");
                         }
-                        Err(e) => {
-                            // DEBUG, resilience internal (signaling reconnect retry).
-                            ui::debug(&ui::paint(
-                                ui::Tone::Dim,
-                                &format!(
-                                    "  signaling reconnect failed ({e}), retrying with backoff"
-                                ),
-                            ));
+                        sess.tick(&sio).await;
+                        // optimistic: a clean connect proves reachability.
+                        last_signaling = Instant::now();
+                        signaling_down_since = None;
+                        signaling_up_since = Some(Instant::now());
+                        probed_silence = None;
+                        signaling_health::note_redialed();
+                        // Visible: pairs with the "reconnecting..." line so the
+                        // recovery is observable end to end. Collapsed with it.
+                        if let Some(line) = signaling_log.admit(
+                            "up",
+                            "signaling reconnected, re-announcing presence",
+                            Instant::now(),
+                        ) {
+                            ui::say(&ui::paint(ui::Tone::Ok, &line));
                         }
+                        sdnotify::status("up - serving");
+                    }
+                    Err(e) => {
+                        // DEBUG, resilience internal (signaling reconnect retry).
+                        ui::debug(&ui::paint(
+                            ui::Tone::Dim,
+                            &format!(
+                                "  signaling reconnect failed ({e}), retrying in {}ms",
+                                reconnect_wait.as_millis()
+                            ),
+                        ));
                     }
                 }
             }
@@ -5157,7 +5241,7 @@ pub(crate) async fn recv_cmd(
                     // AND again inside install_authorized_key (defense in depth).
                     if cert_only {
                         let hostkeys = sshkeys::host_pubkeys();
-                        let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                        let login = platform::current_username().unwrap_or_else(|| "root".into());
                         let ssh_port = v["ssh_port"]
                             .as_u64()
                             .and_then(|n| u16::try_from(n).ok())
@@ -5196,7 +5280,7 @@ pub(crate) async fn recv_cmd(
                     match sshkeys::install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
-                            let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                            let login = platform::current_username().unwrap_or_else(|| "root".into());
                             // Tell the initiator whether an sshd is actually
                             // listening on the port `tunlion shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
@@ -6287,6 +6371,9 @@ pub(crate) async fn recv_cmd(
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() && xfer_deny_reason.is_none() {
                             st.pending.push_back((pid.clone(), v.clone()));
+                            // The sender's no-answer timeout must not fire on a
+                            // person who is still deciding; tell it so.
+                            let _ = t.send_control(&protocol::pending_msg(&id)).await;
                             st.question_open
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             if st.pending.len() == 1 {
@@ -6418,9 +6505,52 @@ pub(crate) async fn recv_cmd(
                                     ack_sid: 0,
                                     last_tick: 0,
                                     bar: ui::Progress::new("(stdout)", size),
+                                    write_err: Arc::new(std::sync::Mutex::new(None)),
                                 },
                             );
                             t.send_control(&protocol::accept_msg(&id, 0)).await?;
+                            continue;
+                        }
+                    }
+                    // The inbox may have been deleted while this ran: recreate it,
+                    // or refuse with that reason (not "No such file or directory").
+                    match crate::recv_files::ensure_inbox(&dir) {
+                        Ok(true) => ui::say(&ui::paint(
+                            ui::Tone::Warn,
+                            &format!("  the inbox {} was missing; recreated it", dir.display()),
+                        )),
+                        Ok(false) => {}
+                        Err(e) => {
+                            let (token, msg) = crate::recv_files::inbox_refusal(&dir, &name, &e);
+                            ui::critical(&ui::paint(
+                                ui::Tone::Err,
+                                &format!("  refused {name} from {sender_name}: {msg}"),
+                            ));
+                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            continue;
+                        }
+                    }
+                    // Refuse up front what cannot fit. Discovering ENOSPC half way
+                    // through used to read as a CORRUPT file ("checksum still wrong
+                    // after 3 re-fetches") on this side and "the receiver may have
+                    // gotten nothing" on the sender's, when the truth was one line:
+                    // the disk is full. Unknown free space (a platform that cannot
+                    // say) accepts, and a write that then fails is caught below.
+                    let need = size.saturating_sub(offset);
+                    if let Some(free) = platform::free_space(&dir) {
+                        if free < need {
+                            let (token, msg) = crate::recv_files::storage_refusal(
+                                Some(platform::StorageFailure::NoSpace),
+                                &name,
+                                "",
+                                Some(need),
+                                Some(free),
+                            );
+                            ui::critical(&ui::paint(
+                                ui::Tone::Err,
+                                &format!("  refused {name} from {sender_name}: {msg}"),
+                            ));
+                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                             continue;
                         }
                     }
@@ -6444,9 +6574,20 @@ pub(crate) async fn recv_cmd(
                         match safe_resume_part(&part_path).await {
                             Ok(f) => f,
                             Err(e) => {
-                                ui::debug(&format!(
-                                    "{name}: cannot open .part to resume, declining: {e}"
+                                // Typed refusal, never silence: a decline the sender
+                                // never hears about is a sender that waits forever.
+                                let (token, msg) = crate::recv_files::storage_refusal(
+                                    platform::storage_failure(&e),
+                                    &name,
+                                    &e.to_string(),
+                                    None,
+                                    None,
+                                );
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
+                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
                         }
@@ -6460,20 +6601,36 @@ pub(crate) async fn recv_cmd(
                         // not its target); a symlink planted in the gap still trips
                         // O_EXCL and is declined below, not followed.
                         let _ = std::fs::remove_file(&part_path);
-                        if let Err(e) = (PartMeta {
+                        let created = match (PartMeta {
                             size,
                             head: offer_head,
                             full: effective_full.clone(),
                         }
                         .store(&meta_path))
                         {
-                            ui::debug(&format!("{name}: cannot write .part.meta, declining: {e}"));
-                            continue;
-                        }
-                        match safe_create_part(&part_path).await {
+                            Ok(()) => safe_create_part(&part_path).await,
+                            Err(e) => Err(e),
+                        };
+                        match created {
                             Ok(f) => f,
                             Err(e) => {
-                                ui::debug(&format!("{name}: cannot create .part, declining: {e}"));
+                                // The create failed (disk full, a name the filesystem
+                                // refuses, a read-only or unwritable folder). This used
+                                // to be a debug line and a silent `continue`, so the
+                                // sender re-offered forever. Say why, to both ends.
+                                crate::recv_files::discard_partial(&part_path);
+                                let (token, msg) = crate::recv_files::storage_refusal(
+                                    platform::storage_failure(&e),
+                                    &name,
+                                    &e.to_string(),
+                                    None,
+                                    None,
+                                );
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  refused {name} from {sender_name}: {msg}"),
+                                ));
+                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
                         }
@@ -6502,6 +6659,7 @@ pub(crate) async fn recv_cmd(
                             ack_sid: 0,
                             last_tick: 0,
                             bar,
+                            write_err: Arc::new(std::sync::Mutex::new(None)),
                         },
                     );
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
@@ -6550,6 +6708,18 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let id = inc.id.clone();
+                    // A write already failed (disk full, read-only): that is the
+                    // answer, not a checksum mismatch to re-fetch three times.
+                    let failed = inc.write_err.lock().unwrap().clone();
+                    if let Some(wf) = failed {
+                        st.verify_fails.remove(&id);
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                        continue;
+                    }
                     if inc.full.is_some() {
                         let verdict = verify_incoming(&inc).await;
                         match verdict {
@@ -6706,6 +6876,18 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let id = inc.id.clone();
+                    // A write already failed (disk full, read-only): that is the
+                    // answer, not a checksum mismatch to re-fetch three times.
+                    let failed = inc.write_err.lock().unwrap().clone();
+                    if let Some(wf) = failed {
+                        st.verify_fails.remove(&id);
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                        continue;
+                    }
                     if inc.full.is_some() {
                         let verdict = verify_incoming(&inc).await;
                         match verdict {
@@ -6853,6 +7035,27 @@ pub(crate) async fn recv_cmd(
                 // its output dropped as "unknown sid" otherwise, and the
                 // verify then misreports a granted session as refused). The
                 // mux-map miss below still drops anything truly unknown.
+                // A write to this file already failed: stop taking its bytes and
+                // tell the sender why, now, instead of letting it stream the rest
+                // into a disk that cannot hold it.
+                let failed = if l2::is_l2_sid(sid) {
+                    None
+                } else {
+                    st.by_sid
+                        .get(&(pid.clone(), sid))
+                        .and_then(|inc| inc.write_err.lock().unwrap().clone())
+                };
+                if let Some(wf) = failed {
+                    if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        st.verify_fails.remove(&inc.id);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                    }
+                    continue;
+                }
                 if l2::is_l2_sid(sid) {
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.on_frame(sid, data).await;
@@ -6884,6 +7087,7 @@ pub(crate) async fn recv_cmd(
                     let end_seen = Arc::clone(&inc.end_seen);
                     let ranges = Arc::clone(&inc.ranges);
                     let received = Arc::clone(&inc.received);
+                    let write_err = Arc::clone(&inc.write_err);
                     let tx = tx.clone();
                     let pid_c = pid.clone();
                     let data_len = data.len();
@@ -6900,9 +7104,18 @@ pub(crate) async fn recv_cmd(
                         // byte-writing primitive. The primitive returns the fact
                         // now and the decision to report it lives out here.
                         let wrote = pwrite_at(&file, &data, pos);
-                        if let Err(_e) = &wrote {
-                            // Write failed: do NOT record coverage (leaves the gap).
-                            // The whole-file digest will fail and trigger a re-fetch.
+                        if let Err(e) = &wrote {
+                            // Write failed: do NOT record coverage (leaves the gap),
+                            // and record WHY, once. A full disk or a filesystem gone
+                            // read-only fails every later write too, and the event
+                            // loop turns this into a typed refusal instead of three
+                            // re-fetches and a false "corrupt file" verdict.
+                            {
+                                let mut slot = write_err.lock().unwrap();
+                                if slot.is_none() {
+                                    *slot = Some(crate::recv_files::WriteFailure::from_io(e));
+                                }
+                            }
                             dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
                         } else {
                             if let Ok(iters) = &wrote {
@@ -7418,4 +7631,30 @@ mod settle_tests {
         assert!(r.contains("2000"), "reason must name the bound: {r}");
         assert!(r.contains("retry"), "reason must offer the retry: {r}");
     }
+}
+
+/// A write to an incoming file failed. Report it on this side (must-see), drop
+/// the partial, and return the typed refusal (`id`, token, sentence) for the
+/// sender. `need` is what was still to come and `free` what the disk has now,
+/// so a full disk says by how much instead of calling the file corrupt.
+fn refuse_failed_write(
+    inc: IncomingFile,
+    dir: &Path,
+    wf: &crate::recv_files::WriteFailure,
+    from: &str,
+) -> (String, &'static str, String) {
+    let need = inc.size.saturating_sub(inc.received.load(Ordering::Relaxed));
+    let free = platform::free_space(dir);
+    let (token, msg) =
+        crate::recv_files::storage_refusal(wf.kind, &inc.name, &wf.detail, Some(need), free);
+    let from = if from.is_empty() { "the sender" } else { from };
+    ui::critical(&ui::paint(
+        ui::Tone::Err,
+        &format!("  refused {} from {from}: {msg}", inc.name),
+    ));
+    let id = inc.id.clone();
+    let part = inc.part_path.clone();
+    drop(inc);
+    crate::recv_files::discard_partial(&part);
+    (id, token, msg)
 }

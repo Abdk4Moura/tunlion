@@ -56,7 +56,7 @@ use filament_transfer::Outgoing;
 use filament_transport::direct;
 use filament_transport::net;
 use net::{Ev, Transport};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -377,6 +377,9 @@ pub(crate) async fn send_cmd(
         }
     }
 
+    // What "nobody connected" means depends on who we were waiting for. Only a
+    // code can be opened in a browser; a device name is another tunlion.
+    let peer_hint = no_peer_hint(to.as_deref(), use_code, room.as_deref());
     let room = match room {
         Some(r) => r,
         None => net::fetch_auto_room(server).await?,
@@ -697,8 +700,54 @@ pub(crate) async fn send_cmd(
     let mut sent_all_at: Option<Instant> = None;
     let mut ack_reprobed = false; // re-sent file-end once for the no-ack window?
     let mut reprobed_at: Option<Instant> = None;
+    // Typed refusals from the receiver (disk full, a name its filesystem
+    // refuses, no permission), in its own words. Any of these ends the send with
+    // SEND_REFUSED_EXIT rather than as a plain decline.
+    let mut refused: Vec<String> = Vec::new();
+    // The no-answer bound. An offer the receiver neither accepts nor refuses is
+    // a receiver that cannot answer (an older build that hit a write error says
+    // nothing at all), and the send used to wait for it forever. The clock runs
+    // only while an offer is outstanding, restarts on every answer, and stops
+    // while the receiver reports a person deciding (`file-pending`). Overridable
+    // with FILAMENT_SEND_STALL_SECS (0 disables).
+    let answer_wait = std::env::var("FILAMENT_SEND_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(SEND_ANSWER_WAIT);
+    let mut answer_clock: Option<Instant> = None;
+    let mut receiver_asking = false;
 
     loop {
+        // No answer to an outstanding offer within the bound: fail, and say what
+        // is most likely true, instead of waiting on silence forever.
+        if !answer_wait.is_zero() && !receiver_asking {
+            if let Some(since) = answer_clock {
+                if since.elapsed() >= answer_wait {
+                    let waiting: Vec<String> = outgoing
+                        .lock()
+                        .await
+                        .iter()
+                        .filter(|o| !o.done && !o.accepted_once)
+                        .map(|o| o.name.clone())
+                        .collect();
+                    if !waiting.is_empty() {
+                        ui::clear_sticky();
+                        ui::critical(&ui::paint(
+                            ui::Tone::Err,
+                            &format!(
+                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (FILAMENT_SEND_STALL_SECS changes this bound, 0 disables it.)",
+                                waiting.join(", "),
+                                answer_wait.as_secs()
+                            ),
+                        ));
+                        let _ = sio.disconnect().await;
+                        std::process::exit(SEND_STALLED_EXIT);
+                    }
+                    answer_clock = None;
+                }
+            }
+        }
         // Bug 6: no data channel has come up within the establishment window,
         // an ICE wedge or a peer that claimed the code but never connected. Fail
         // honestly instead of spinning forever. A non-zero deadline only; a live
@@ -707,7 +756,7 @@ pub(crate) async fn send_cmd(
         {
             ui::clear_sticky();
             bail!(
-                "no peer connected within {}s, is a receiver running / the page open? \
+                "no peer connected within {}s: {peer_hint} \
                  (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
                 establish_deadline.as_secs()
             );
@@ -1369,6 +1418,9 @@ pub(crate) async fn send_cmd(
                             o.accepted_once,
                         );
                         t.send_control(&offer).await?;
+                        if answer_clock.is_none() {
+                            answer_clock = Some(Instant::now());
+                        }
                     }
                 }
             }
@@ -1651,6 +1703,8 @@ pub(crate) async fn send_cmd(
                     }
                 }
                 Some("file-accept") => {
+                    answer_clock = Some(Instant::now());
+                    receiver_asking = false;
                     let Some(t) = conn.transport() else { continue };
                     // Build transport list: primary + any parallel QUIC workers.
                     let workers = conn
@@ -1706,13 +1760,35 @@ pub(crate) async fn send_cmd(
                     });
                 }
                 Some("file-decline") => {
+                    answer_clock = Some(Instant::now());
+                    receiver_asking = false;
                     let id = v["id"].as_str().unwrap_or_default();
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        ui::say(&format!("declined: {}", o.name));
+                        // A refusal carries the receiver's reason: say it, in its
+                        // words, instead of a bare "declined" that reads as a person
+                        // saying no.
+                        match refusal_text(&v) {
+                            Some(why) => {
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  {} not delivered: {why}", o.name),
+                                ));
+                                if !o.done {
+                                    refused.push(format!("{}: {why}", o.name));
+                                }
+                            }
+                            None => ui::say(&format!("declined: {}", o.name)),
+                        }
                         o.declined = true;
                         o.done = true;
                     }
+                }
+                // The receiver parked the offer for a person's yes/no; silence
+                // from here on is someone deciding, so the no-answer clock stops.
+                Some("file-pending") => {
+                    receiver_asking = true;
+                    answer_clock = Some(Instant::now());
                 }
                 // P4 (delivery-ack): the receiver computed the whole-file sha256
                 // of every byte it received and it MATCHED our offered digest,
@@ -1721,6 +1797,7 @@ pub(crate) async fn send_cmd(
                 // it). This closes the loop the runner had to fake above the
                 // transport: the sender deterministically KNOWS it landed whole.
                 Some("delivery-ack") => {
+                    answer_clock = Some(Instant::now());
                     let id = v["id"].as_str().unwrap_or_default();
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
@@ -2052,6 +2129,14 @@ pub(crate) async fn send_cmd(
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let _ = sio.disconnect().await;
+                if !refused.is_empty() {
+                    ui::critical(&format!(
+                        "send failed: the receiver could not store {} file(s):\n  {}",
+                        refused.len(),
+                        refused.join("\n  ")
+                    ));
+                    std::process::exit(SEND_REFUSED_EXIT);
+                }
                 match send_outcome(completed, declined) {
                     SendOutcome::Complete { .. } => return Ok(()),
                     SendOutcome::Declined {
@@ -2298,4 +2383,47 @@ async fn stream_one(
         }
     }
     Ok(())
+}
+
+/// Exit status when the receiver refused a file it could not store (out of
+/// disk space, a name its filesystem refuses, no permission, read-only). This
+/// is `ExitKind::Denied` (4) in the exit-code taxonomy (cli/src/exit_codes.rs,
+/// #393); a literal here only because this branch predates that file.
+pub(crate) const SEND_REFUSED_EXIT: i32 = 4;
+
+/// Exit status when the receiver never answered an offer within the bound.
+/// `ExitKind::Unreachable` (6) in the taxonomy ("did not answer in time");
+/// literal for the same reason as SEND_REFUSED_EXIT.
+pub(crate) const SEND_STALLED_EXIT: i32 = 6;
+
+/// How long an offer may go unanswered before the send fails. Long enough for
+/// any receiver that is working; a person deciding stops the clock entirely.
+const SEND_ANSWER_WAIT: Duration = Duration::from_secs(60);
+
+/// The receiver's reason, for a `file-decline` that carries one (a typed
+/// refusal); `None` for a plain decline (a person said no).
+pub(crate) fn refusal_text(v: &Value) -> Option<String> {
+    v.get("reason").and_then(Value::as_str)?;
+    let error = v
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|e| !e.trim().is_empty())
+        .unwrap_or("the receiver could not store it");
+    // Bounded: the text is peer-supplied and goes to a terminal.
+    let clean: String = error.chars().filter(|c| !c.is_control()).take(300).collect();
+    Some(clean)
+}
+
+/// What to check when nobody connected, worded for who we were waiting for.
+/// A device name is another tunlion; only a code can be opened in a browser.
+pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>) -> String {
+    match (to, use_code, room) {
+        (Some(dev), _, _) => format!("is '{dev}' online, with `tunlion up` running there?"),
+        (None, true, _) => {
+            "has the receiver entered the code (`tunlion receive <code>`, or the code in a browser)?"
+                .to_string()
+        }
+        (None, false, Some(r)) => format!("is a receiver waiting in room '{r}'?"),
+        _ => "is a receiver running on this network?".to_string(),
+    }
 }

@@ -868,7 +868,7 @@ pub(crate) async fn async_main() -> Result<()> {
             )
             .await
         }
-        Cmd::Status { json } => status_cmd(json || ui_caps.json),
+        Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
             down_cmd()
@@ -1267,10 +1267,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // before opening anything, matching the #206 mount pre-check.
             if let Some(caps) = principal_ceiling_for(&peer) {
                 if !caps.iter().any(|c| c == "shell") {
-                    bail!(
-                        "shell denied by {peer}: this device's invitation ceiling ({}) does not include shell",
-                        caps.join(", ")
-                    );
+                    bail!("{}", crate::identity_state::ceiling_refusal_here("shell", &peer, "shell", &caps));
                 }
             }
             if opened_flow {
@@ -1337,10 +1334,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // serve one. Say so before opening anything, like #219 did.
             if let Some(caps) = principal_ceiling_for(&peer) {
                 if !caps.iter().any(|c| c == "shell") {
-                    bail!(
-                        "exec denied by {peer}: this device's invitation ceiling ({}) does not include shell",
-                        caps.join(", ")
-                    );
+                    bail!("{}", crate::identity_state::ceiling_refusal_here("exec", &peer, "shell", &caps));
                 }
             }
             if argv.is_empty() {
@@ -1624,8 +1618,14 @@ pub(crate) async fn async_main() -> Result<()> {
                     );
                 }
                 bail!(
-                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
-                    ceiling.join(", ")
+                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                    ceiling.join(", "),
+                    crate::identity_state::reenrol_steps(
+                        &device,
+                        &crate::display_name(),
+                        &capability,
+                        &ceiling
+                    )
                 );
             }
             device_set_cap(&device, &capability, true, None)?;

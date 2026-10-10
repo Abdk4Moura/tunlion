@@ -374,7 +374,7 @@ pub(crate) async fn ensure_ca_key_with(
         return Ok(key);
     }
     if let Some(dir) = key.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::platform::create_private_dir_all(dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -405,6 +405,13 @@ pub(crate) async fn ensure_ca_key_with(
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        // ssh-keygen creates the .pub under the umask, which made it 0666 under
+        // `umask 0000`: anyone could swap the CA public key sshd is told to
+        // trust. Only this user and root (sshd) need to read it.
+        let _ = std::fs::set_permissions(
+            key.with_extension("pub"),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     Ok(key)
 }
@@ -434,7 +441,10 @@ pub(crate) fn daemon_username_from(
 /// Resolve the serving user for signing (thin wrapper over the pure core).
 pub(crate) fn daemon_username() -> Option<String> {
     let su = crate::settings::get_str("shell-user", None);
-    daemon_username_from(su.as_deref(), std::env::var("USER").ok().as_deref())
+    // The password database, not $USER: a daemon started without a login
+    // environment (cron, a container, `env -i`) has no $USER, and arming then
+    // failed with "cannot determine serving user" on a machine that knew.
+    daemon_username_from(su.as_deref(), crate::platform::current_username().as_deref())
 }
 
 /// Single-name check shared by every place a name enters sshd config (Match

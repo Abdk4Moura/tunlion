@@ -3186,10 +3186,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                     // the owner to a command that refuses, and the refusal named
                     // the real fix. Name it here instead, one step earlier.
                     format!(
-                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
-                        crate::ui::paint(
-                            crate::ui::Tone::Brand,
-                            "tunlion add --for <this-device> --allow shell"
+                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. {}",
+                        crate::identity_state::reenrol_steps(
+                            &crate::display_name(),
+                            peer,
+                            "shell",
+                            &[]
                         )
                     )
                 } else {
@@ -3727,6 +3729,38 @@ pub async fn proxy_cmd(
     crate::ui::say(&format!(
         "tunlion: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"
     ));
+    proxy_serve(server, listener, bind, port, http_port, relay).await
+}
+
+/// Bind the daemon's automatic SOCKS5 proxy on loopback: `first`, else the next
+/// free port in a small window. The listener is returned BOUND, so whatever the
+/// caller then prints about it is true. It used to print "started SOCKS5 proxy
+/// on 127.0.0.1:1080" and bind afterwards in the background, so a second daemon
+/// announced a port the first one held, and its own proxy never existed.
+pub async fn bind_auto_proxy(first: u16) -> std::result::Result<(TcpListener, u16), String> {
+    let mut last = String::new();
+    for port in first..first.saturating_add(10) {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => return Ok((l, port)),
+            Err(e) => last = format!("127.0.0.1:{port}: {e}"),
+        }
+    }
+    Err(format!(
+        "ports {first}-{} are all taken (last: {last})",
+        first.saturating_add(9)
+    ))
+}
+
+/// Serve the SOCKS5 proxy (and the optional HTTP CONNECT proxy) on an already
+/// bound listener. `port` is the SOCKS port the listener holds.
+pub async fn proxy_serve(
+    server: &str,
+    listener: TcpListener,
+    bind: &str,
+    port: u16,
+    http_port: u16,
+    relay: bool,
+) -> Result<()> {
     crate::ui::say(&format!(
         "  point apps here; {}.mesh rides the mesh, everything else connects directly",
         "<peer>"
@@ -4344,7 +4378,13 @@ async fn shell_bootstrap(
                     // carries its own fix gets no second one bolted on.
                     let fix = if why == crate::capability::CEILING_REASON {
                         format!(
-                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `tunlion add --for <this-device> --allow shell` on '{peer}'."
+                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. {}",
+                            crate::identity_state::reenrol_steps(
+                                &crate::display_name(),
+                                &peer,
+                                "shell",
+                                &[]
+                            )
                         )
                     } else if why == crate::capability::SHELL_OFF_REASON {
                         String::new()

@@ -441,7 +441,16 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
         .filter_map(|(pid, link)| {
             let name = link.verified_name.as_deref()?;
             let transport = link.transport.as_ref()?;
-            if !link.trusted || !transport.is_alive() {
+            // `devices` renders "online" from this list, so a link is listed only
+            // while it is FRESH, by the same rule warm reuse applies: alive, and
+            // for a relay link (no QUIC keepalive) not idle past the eviction
+            // window. A relay link to a peer that has gone away (stopped, wiped)
+            // keeps reading `is_alive()` for a while, and that showed the peer as
+            // "online, last seen just now" after it no longer existed.
+            if !link.trusted
+                || !transport.is_alive()
+                || (!link.direct && transport.idle_ms() >= WARM_RELAY_STALE_MS)
+            {
                 return None;
             }
             Some(json!({

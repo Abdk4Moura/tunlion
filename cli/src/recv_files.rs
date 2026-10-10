@@ -298,6 +298,142 @@ pub(crate) struct IncomingFile {
     /// re-ticking the same value). Not atomic — only accessed from the event loop.
     pub(crate) last_tick: u64,
     pub(crate) bar: ui::Progress,
+    /// The first write that failed on this file (disk full, a filesystem gone
+    /// read-only), recorded by the writer task that hit it. The event loop turns
+    /// it into a typed refusal to the sender. Before this a failed write only
+    /// left a hole, the whole-file digest then failed three times, and the user
+    /// was told the file was CORRUPT when the disk was full.
+    pub(crate) write_err: Arc<std::sync::Mutex<Option<WriteFailure>>>,
+}
+
+/// See `IncomingFile::write_err`.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteFailure {
+    pub(crate) kind: Option<crate::platform::StorageFailure>,
+    pub(crate) detail: String,
+}
+
+impl WriteFailure {
+    pub(crate) fn from_io(e: &std::io::Error) -> Self {
+        WriteFailure { kind: crate::platform::storage_failure(e), detail: e.to_string() }
+    }
+}
+
+/// A refusal's stable wire token and the sentence both ends show, for a file
+/// this receiver cannot store. `need`/`free` are bytes, named when known so
+/// "out of disk space" says by how much.
+pub(crate) fn storage_refusal(
+    kind: Option<crate::platform::StorageFailure>,
+    name: &str,
+    detail: &str,
+    need: Option<u64>,
+    free: Option<u64>,
+) -> (&'static str, String) {
+    use crate::platform::StorageFailure as F;
+    match kind {
+        Some(F::NoSpace) => (
+            "no_space",
+            match (need, free) {
+                (Some(n), Some(f)) => format!(
+                    "receiver is out of disk space for {name} (needs {}, has {})",
+                    human(n),
+                    human(f)
+                ),
+                _ => format!("receiver is out of disk space for {name} ({detail})"),
+            },
+        ),
+        Some(F::NameTooLong) => (
+            "name_too_long",
+            format!("receiver's filesystem refuses the name {name} ({detail})"),
+        ),
+        Some(F::ReadOnly) => (
+            "read_only",
+            format!("receiver's download folder is read-only, cannot save {name} ({detail})"),
+        ),
+        Some(F::Permission) => (
+            "permission",
+            format!("receiver has no permission to write {name} in its download folder ({detail})"),
+        ),
+        None => ("io", format!("receiver could not save {name}: {detail}")),
+    }
+}
+
+/// The inbox a daemon serves can be deleted while it runs; every file sent
+/// after that was refused "receiver could not save notes.txt: No such file or
+/// directory (os error 2)". Recreate it (owner-only, as it was made at start)
+/// before a file is accepted. `Ok(true)` when it had to be recreated.
+pub(crate) fn ensure_inbox(dir: &Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    crate::platform::create_private_dir_all(dir)?;
+    // Something other than a directory (a file) can sit at the path; creating
+    // "succeeds" around it without making a directory.
+    if !dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "something that is not a directory is in its place",
+        ));
+    }
+    Ok(true)
+}
+
+/// The typed refusal for an inbox that is missing and cannot be recreated
+/// (its parent is read-only, a file sits where it should be).
+pub(crate) fn inbox_refusal(dir: &Path, name: &str, e: &std::io::Error) -> (&'static str, String) {
+    (
+        "inbox_missing",
+        format!(
+            "receiver's inbox {} is missing and could not be recreated, so it cannot save {name} ({e})",
+            dir.display()
+        ),
+    )
+}
+
+/// What `status` and `doctor` say about an inbox, when something is wrong with
+/// it. `None` when it is a directory.
+pub(crate) fn inbox_problem(dir: &Path) -> Option<String> {
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some(format!(
+            "inbox {} is not a directory: files sent here are refused until it is",
+            dir.display()
+        )),
+        Err(_) => Some(format!(
+            "inbox {} is missing: the daemon recreates it when the next file arrives (or create it: mkdir -p {})",
+            dir.display(),
+            dir.display()
+        )),
+    }
+}
+
+/// Where the running daemon keeps its inbox, beside its pidfile: `status` and
+/// `doctor` check that directory, which `up --dir` may have set.
+pub(crate) fn daemon_inbox_marker() -> PathBuf {
+    crate::pidfile().with_file_name("up.inbox")
+}
+
+/// The inbox to check: the running daemon's, else the configured one.
+pub(crate) fn inbox_to_check(daemon_running: bool) -> PathBuf {
+    daemon_running
+        .then(|| std::fs::read_to_string(daemon_inbox_marker()).ok())
+        .flatten()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| crate::drop_dir(None))
+}
+
+/// Remove what a refused file left behind: its `.part` and `.part.meta`. A
+/// refused partial is not resumable (the cause was the disk or the name, not the
+/// link), and on a full disk it is holding the very space that ran out.
+pub(crate) fn discard_partial(part_path: &Path) {
+    let _ = std::fs::remove_file(part_path);
+    let meta = {
+        let mut m = part_path.as_os_str().to_owned();
+        m.push(".meta");
+        PathBuf::from(m)
+    };
+    let _ = std::fs::remove_file(meta);
 }
 
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
@@ -453,11 +589,10 @@ pub(crate) async fn finalize_incoming(
     }
     if daemon {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(up_log())
-        {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        crate::platform::owner_only_mode(&mut opts);
+        if let Ok(mut f) = opts.open(up_log()) {
             let _ = writeln!(
                 f,
                 "{}  {}  {}  from {}",
@@ -474,6 +609,30 @@ pub(crate) async fn finalize_incoming(
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+
+    /// The inbox deleted under a running daemon: the next offer recreates it
+    /// (status and doctor say it is missing until then); one that cannot be
+    /// recreated is a typed refusal naming the inbox, not a bare ENOENT.
+    #[test]
+    fn a_deleted_inbox_is_recreated_or_refused_by_name() {
+        let base = std::env::temp_dir().join(format!("tunlion-inbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let inbox = base.join("Tunlion");
+        assert!(super::inbox_problem(&inbox).unwrap().contains("is missing"));
+        assert!(super::ensure_inbox(&inbox).unwrap(), "recreated");
+        assert!(inbox.is_dir());
+        assert_eq!(super::inbox_problem(&inbox), None);
+        assert!(!super::ensure_inbox(&inbox).unwrap(), "already there: nothing to do");
+        // A file where the inbox should be cannot be turned into one.
+        let blocked = base.join("blocked");
+        std::fs::write(&blocked, b"x").unwrap();
+        assert!(super::inbox_problem(&blocked).unwrap().contains("not a directory"));
+        let e = super::ensure_inbox(&blocked).unwrap_err();
+        let (token, msg) = super::inbox_refusal(&blocked, "notes.txt", &e);
+        assert_eq!(token, "inbox_missing");
+        assert!(msg.contains(&blocked.display().to_string()) && msg.contains("notes.txt"), "{msg}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn full_hash_whole_file_integrity() {

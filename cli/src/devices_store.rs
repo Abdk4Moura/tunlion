@@ -219,7 +219,7 @@ pub(crate) fn devices_upsert_atomic(
     let name = clean.as_str();
     let p = devices_path();
     if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir).context("create config dir")?;
+        crate::platform::create_private_dir_all(dir).context("create config dir")?;
     }
     with_devices_mut(|arr| {
         // Identity pinning: records are keyed by identity, names are

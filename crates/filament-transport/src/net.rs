@@ -337,8 +337,14 @@ pub enum Ev {
     /// protocol error; a hard TCP sever (the flaky-proxy case) produces NO
     /// callback at all, so the silence watchdog (`signaling_silence_ms`) is the
     /// authoritative trigger and this is purely an accelerant.
-    #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
-    SignalingDown(String),
+    ///
+    /// The `u64` is the id of the connection that ended
+    /// (`filament_signal::Client::id`). Every connection a re-dialing daemon
+    /// opens shares one event channel, so a close can arrive after the loop has
+    /// already replaced that connection; only a close whose id matches the
+    /// CURRENT client means the link is down. Acting on a stale one tore down
+    /// each fresh connection in turn: the post-SIGSTOP reconnect storm.
+    SignalingDown(String, u64),
     /// Warm-reuse opened a stream over this held link and it black-holed (no
     /// response within the verify window) - the link is a zombie (alive at the
     /// QUIC layer but dead for new streams). The loop drops it so the daemon
@@ -842,7 +848,14 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
     }
     let path = dns_cache_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if !dir.is_dir() {
+            let _ = std::fs::create_dir_all(dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     let mut doc = std::fs::read_to_string(&path)
         .ok()
@@ -851,7 +864,19 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
         .unwrap_or_else(|| json!({}));
     let ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
     doc[host] = json!(ips);
-    let _ = std::fs::write(&path, doc.to_string());
+    // Owner-only whatever the umask: this sits in the config directory, and a
+    // world-writable cache lets anyone point the next connect elsewhere.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(doc.to_string().as_bytes());
+    }
 }
 
 /// Resolve `host:port` to connect targets, immune to a cold-resolver stall.
@@ -1052,7 +1077,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         tokio::spawn(async move {
             while let Some(msg) = raw_rx.recv().await {
                 let ev = match msg {
-                    filament_signal::Incoming::Down(reason) => Ev::SignalingDown(reason),
+                    filament_signal::Incoming::Down { conn, reason } => Ev::SignalingDown(reason, conn),
                     filament_signal::Incoming::Event { name, data } => match name.as_str() {
                         "welcome" => Ev::Welcome(data),
                         "peer-joined" => Ev::PeerJoined(data),

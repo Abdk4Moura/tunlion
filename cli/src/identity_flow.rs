@@ -250,7 +250,7 @@ pub(crate) fn ensure_user_key_inner() -> Result<(identity::UserKey, bool)> {
     }
     let dir = settings::config_dir();
     if !dir.exists() {
-        std::fs::create_dir_all(&dir)
+        crate::platform::create_private_dir_all(&dir)
             .with_context(|| format!("create config dir {}", dir.display()))?;
         crate::platform::tighten_new_dir(&dir);
     }
@@ -376,15 +376,37 @@ pub(crate) async fn init_experience(
     let phrase = Zeroizing::new(pending.mnemonic().to_string());
     let words = pending.mnemonic().words().collect::<Vec<_>>();
 
-    if let Some(path) = recovery_file.as_deref() {
-        write_owner_only_file(path, phrase.as_str())?;
-    } else if let Some(fd) = recovery_fd {
-        write_owner_only_fd(fd, phrase.as_str())?;
-    } else {
+    // ORDER MATTERS. The identity is persisted (atomically) FIRST and the
+    // recovery phrase written SECOND, and a failed phrase write takes the
+    // identity back out. The reverse order left an orphan phrase file on a
+    // read-only HOME: the phrase was written, the identity commit failed, and the
+    // file on disk recovered an identity that never existed. The interactive path
+    // only shows the phrase (nothing to clean up), so it confirms first as before.
+    let interactive_phrase = recovery_file.is_none() && recovery_fd.is_none();
+    if interactive_phrase {
         confirm_recovery_phrase(&words, phrase.as_str())?;
     }
-
     let user_key = pending.commit(&store)?;
+    if !interactive_phrase {
+        let exported = match (recovery_file.as_deref(), recovery_fd) {
+            (Some(path), _) => write_owner_only_file(path, phrase.as_str()),
+            (None, Some(fd)) => write_owner_only_fd(fd, phrase.as_str()),
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = exported {
+            // No identity without its way back: undo the commit.
+            let key_path = identity::user_key_path(&store);
+            let undone = std::fs::remove_file(&key_path).is_ok();
+            return Err(e.context(if undone {
+                "could not export the recovery phrase, so the identity was NOT created".to_string()
+            } else {
+                format!(
+                    "could not export the recovery phrase, and could not remove the new identity at {}; delete it before running init again",
+                    key_path.display()
+                )
+            }));
+        }
+    }
     config_set("name", &device_name)?;
     config_set("dir", &inbox.display().to_string())?;
     std::fs::create_dir_all(&inbox)?;
