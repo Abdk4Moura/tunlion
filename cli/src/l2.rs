@@ -3820,6 +3820,9 @@ pub async fn proxy_cmd(
             );
         }
     };
+    // `status`, `addr` and `expose` read this to say where the proxy is and how
+    // to use it; daemon.log was the only place that said so.
+    crate::proxy_state::record(bind, port);
     crate::ui::say(&format!(
         "tunlion: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"
     ));

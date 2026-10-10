@@ -85,6 +85,9 @@ pub(crate) async fn safe_create_part(path: &std::path::Path) -> std::io::Result<
             rel,
             (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as i32,
             true,
+            // Owner-only from creation: a partial is not yet a delivered file
+            // and the download dir may be readable by others.
+            0o600,
         )
         .map_err(|e| std::io::Error::new(e.kind(), format!("safe create .part: {e}")))
         .map(|f| tokio::fs::File::from_std(f))
@@ -96,6 +99,7 @@ pub(crate) async fn safe_create_part(path: &std::path::Path) -> std::io::Result<
         tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .await
@@ -127,6 +131,7 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
             rel,
             libc::O_WRONLY | libc::O_NONBLOCK as i32,
             true,
+            0,
         )
         .map_err(|e| std::io::Error::new(e.kind(), format!("safe resume .part: {e}")))?;
         // Verify what we opened is a regular file (not FIFO, device, etc.)
@@ -140,6 +145,8 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
                 ),
             ));
         }
+        // A partial left by an older build may be group/world readable.
+        let _ = crate::platform::restrict_open_file(&file);
         Ok(tokio::fs::File::from_std(file))
     }
     // Non-Linux Unix: open with O_NOFOLLOW, then fstat the opened fd
@@ -165,7 +172,9 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
                 ),
             ));
         }
-        Ok(file)
+        let file = file.into_std().await;
+        let _ = crate::platform::restrict_open_file(&file);
+        Ok(tokio::fs::File::from_std(file))
     }
 }
 
@@ -257,7 +266,11 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
         ));
     }
 
-    Ok(file)
+    // Portable tighten-through-the-handle (a no-op on this platform, where
+    // the file takes the directory's ACL); kept so every resume does it.
+    let file = file.into_std().await;
+    let _ = crate::platform::restrict_open_file(&file);
+    Ok(tokio::fs::File::from_std(file))
 }
 
 pub(crate) struct IncomingFile {
@@ -401,6 +414,12 @@ pub(crate) async fn finalize_incoming(
         let _ = f.sync_all();
     })
     .await;
+    // The partial was assembled owner-only; the delivered file gets the mode
+    // an ordinary create would have given it, set through the handle (never a
+    // path someone could swap for a symlink) before it is renamed into place.
+    if !inc.part_path.as_os_str().is_empty() {
+        let _ = crate::platform::publish_received_file(&inc.file);
+    }
     drop(inc.file);
     let final_path = unique_path(dir, rename_to.unwrap_or(&inc.name));
     if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
@@ -470,6 +489,41 @@ pub(crate) async fn finalize_incoming(
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+
+    fn mode_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("filament-test-partmode-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A fresh `.part` is owner-only from the create itself: the bytes of a
+    /// download in progress are not readable by other accounts.
+    #[tokio::test]
+    async fn fresh_part_is_owner_only() {
+        let d = mode_dir("fresh");
+        let p = d.join("data.bin.part");
+        drop(super::safe_create_part(&p).await.unwrap());
+        if let Some(m) = crate::platform::file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a fresh .part must be 0600, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Resuming a partial an older build left group/world readable tightens it.
+    #[tokio::test]
+    async fn resumed_part_is_tightened_to_owner_only() {
+        let d = mode_dir("resume");
+        let p = d.join("data.bin.part");
+        let f = std::fs::File::create(&p).unwrap();
+        crate::platform::fs_at::set_mode_via_handle(&f, 0o666).unwrap();
+        drop(f);
+        drop(super::safe_resume_part(&p).await.unwrap());
+        if let Some(m) = crate::platform::file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a resumed .part must be 0600, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn full_hash_whole_file_integrity() {

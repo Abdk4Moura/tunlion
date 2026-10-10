@@ -610,6 +610,9 @@ pub(crate) async fn async_main() -> Result<()> {
                             .unwrap_or_default();
                         println!("  overlay:  {v6}{v4_str}");
                         println!("  mesh:     {name}.mesh");
+                        if let Some(p) = crate::proxy_state::current() {
+                            ui::say(&crate::proxy_state::mesh_hint(&p));
+                        }
                     }
                     // "granted" (not "caps") makes clear this is the LOCAL GRANT RECORD
                     // (what THIS machine authorized the peer to do), NOT what the peer offers.
@@ -637,6 +640,9 @@ pub(crate) async fn async_main() -> Result<()> {
                     println!("  {}", ui::paint(ui::Tone::Bold, &mesh_name));
                     println!("  overlay:  {} (v4) / {} (v6)", id.addr_v4(), id.addr());
                     println!("  mesh:     {mesh_name}.mesh");
+                    if let Some(p) = crate::proxy_state::current() {
+                        ui::say(&crate::proxy_state::mesh_hint(&p));
+                    }
                 }
             }
             Ok(())

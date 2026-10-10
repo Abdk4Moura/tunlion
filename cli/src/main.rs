@@ -51,6 +51,7 @@ mod holepunch;
 pub(crate) use filament_id as identity;
 mod interact;
 mod l2;
+mod proxy_state;
 mod mount;
 mod mount_proto;
 #[cfg(target_os = "linux")]
@@ -759,6 +760,8 @@ impl PartMeta {
     /// `x.part.meta -> ~/.bashrc` would overwrite the link's target. Unlink
     /// first (removes a link, never its target), then create exclusively, so a
     /// link re-planted in between makes this fail instead of writing through.
+    /// Created owner-only (0600) regardless of umask: it names the file, its
+    /// size and digests, and sits in a download dir others may read.
     fn store(&self, path: &Path) -> std::io::Result<()> {
         use std::io::Write;
         match std::fs::remove_file(path) {
@@ -766,7 +769,7 @@ impl PartMeta {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        let mut f = crate::platform::create_new_private(path)?;
         f.write_all(json!({ "size": self.size, "head": self.head, "full": self.full }).to_string().as_bytes())
     }
 }

@@ -308,6 +308,88 @@ pub fn open_private_log(path: &Path, truncate: bool) -> std::io::Result<std::fs:
     Ok(file)
 }
 
+/// Create a NEW file for writing that is owner-only (0600 on unix) from the
+/// moment it exists: the mode is passed to the create itself, so there is no
+/// window in which another account could open it, and it does not depend on
+/// the process umask (a daemon started with umask 0 made 0666 sidecars).
+/// Fails if anything (a file, a planted symlink) already sits at `path`.
+/// Windows: files take the containing directory's ACL; nothing to set here.
+pub fn create_new_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Make an already-open file owner-only (0600 on unix) through its handle,
+/// never through a path that could have been swapped for a symlink. Used on a
+/// resumed partial that an older build created with a looser mode. Windows:
+/// nothing to set.
+pub fn restrict_open_file(file: &std::fs::File) -> std::io::Result<()> {
+    fs_at::set_mode_via_handle(file, 0o600)
+}
+
+/// The mode a freshly received file takes once it is complete: what a plain
+/// create would have given it (0644 masked by the process umask). A partial is
+/// assembled owner-only; this restores the ordinary mode through the handle
+/// just before the partial is renamed into place, so a finished download is
+/// readable exactly as it was before partials became private.
+/// Windows: nothing to set.
+pub fn publish_received_file(file: &std::fs::File) -> std::io::Result<()> {
+    fs_at::set_mode_via_handle(file, 0o644 & !process_umask())
+}
+
+/// The process umask. Linux reads it from /proc/self/status (no side effect);
+/// other unix learns it once by the set-and-restore dance, cached so the brief
+/// swap happens at most once per process. Non-unix: 0 (unused).
+fn process_umask() -> u32 {
+    static UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *UMASK.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+                if let Some(v) = s.lines().find_map(|l| l.strip_prefix("Umask:")) {
+                    if let Ok(m) = u32::from_str_radix(v.trim(), 8) {
+                        return m & 0o777;
+                    }
+                }
+            }
+            0o022
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let old = unsafe { libc::umask(0o077) };
+            unsafe { libc::umask(old) };
+            (old as u32) & 0o777
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    })
+}
+
+/// Permission bits of the file at `path` (the link itself, never its target),
+/// or None where the platform has no POSIX modes. Lets portable tests assert
+/// owner-only files without a platform branch of their own.
+#[cfg(test)]
+pub fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 fn repair_sensitive_dir(dir: &Path) -> std::io::Result<usize> {
     let mut repaired = 0;
     #[cfg(unix)]
@@ -1198,6 +1280,58 @@ impl ShellHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mode_tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tunlion-mode-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The partial-receive sidecars are created through this; it must be
+    /// owner-only at creation, never umask-dependent.
+    #[test]
+    fn create_new_private_is_owner_only() {
+        let d = mode_tmp("private");
+        let p = d.join("x.part.meta");
+        drop(create_new_private(&p).unwrap());
+        if let Some(m) = file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a new private file must be 0600, got {m:o}");
+        }
+        // create_new: it never reuses (or writes through) what is already there.
+        assert!(create_new_private(&p).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn restrict_open_file_tightens_a_loose_file() {
+        let d = mode_tmp("restrict");
+        let p = d.join("old.part");
+        let f = std::fs::File::create(&p).unwrap();
+        fs_at::set_mode_via_handle(&f, 0o666).unwrap();
+        restrict_open_file(&f).unwrap();
+        drop(f);
+        if let Some(m) = file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a resumed partial must end up 0600, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A finished receive gets the ordinary create mode back: 0644 under the
+    /// process umask, never more than that and never executable.
+    #[test]
+    fn publish_received_file_restores_the_umask_mode() {
+        let d = mode_tmp("publish");
+        let p = d.join("done.bin");
+        let f = create_new_private(&p).unwrap();
+        publish_received_file(&f).unwrap();
+        drop(f);
+        if let Some(m) = file_mode(&p) {
+            assert_eq!(m & 0o777, 0o644 & !process_umask(), "got {m:o}");
+            assert_eq!(m & 0o133, 0, "never group/other writable nor executable, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn detect_returns_a_valid_variant() {
