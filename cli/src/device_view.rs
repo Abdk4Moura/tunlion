@@ -23,10 +23,11 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(crate) fn devices_store(name: &str, secret: &str) -> Result<()> {
-    // Delegate to atomic upsert: secret only, preserve cert
-    devices_upsert_atomic(name, Some(secret), None, None, None, None, None, false)?;
-    Ok(())
+/// Store a pair secret received over the network as a NEW record, returning
+/// the name it landed under (suffixed when `name` is taken). Never re-keys an
+/// existing record: see `devices_store::devices_store_new`.
+pub(crate) fn devices_store(name: &str, secret: &str) -> Result<String> {
+    crate::devices_store::devices_store_new(name, secret, None)
 }
 
 /// L1-a (spec §8): store a v2 device record with its agreed capability set.
@@ -34,6 +35,13 @@ pub(crate) fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// grows `v` and `caps` but the existing `{name, secret}` fields are unchanged,
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
 /// working byte-for-byte, no regression.
+///
+/// Owner re-pair: the ONLY caller is the owner-run `tunlion add` ceremony
+/// (pair_cmd.rs), where the local user ran the command and the PAKE confirmed
+/// the peer. That is the owner decision that may re-key an existing record of
+/// the same name, so this passes `allow_reanchor`. A secret that arrives over
+/// the network without that decision goes through `devices_store` instead,
+/// which never overwrites.
 pub(crate) fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
     // Delegate to atomic upsert: secret + caps together, preserve cert
     devices_upsert_atomic(
@@ -44,7 +52,7 @@ pub(crate) fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Res
         None,
         None,
         None,
-        false,
+        true,
     )?;
     Ok(())
 }

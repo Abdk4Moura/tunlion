@@ -44,6 +44,11 @@ enroll_delegate bravo --allow mount
 
 mkdir -p "$WORK/share"
 echo "written before the revoke" > "$WORK/share/before.txt"
+# The acceptor serves a mount only inside its SHARE ROOT (the `share` config
+# key, default ~/filament-share); a peer can no longer name any path it likes.
+# Configure alpha's share root as the directory this gate mounts, explicitly,
+# the way an owner would. The daemon reads it per mount-open, so no restart.
+printf 'share %s\n' "$WORK/share" >> "$DA/config"
 
 # ===================================================================== GATE A ==
 say "mount-revoke gate A"

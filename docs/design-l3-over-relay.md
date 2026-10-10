@@ -78,6 +78,16 @@ an announce captured on one link would still verify on a later one between the
 same pair. The nonce is fresh per link, which is the property the exporter was
 providing.
 
+**Amended (security review): nonce AND fingerprints.** The nonce alone is fresh
+but not bound to the session: a party holding two WebRTC sessions (A-M, M-B)
+can hand A's nonce to B and relay B's signed `fleet-hello` back, and A admits M
+as B. The exporter never had that hole because a relay terminating TLS on each
+leg derives a different value. So on a DataChannel `cb` is now
+`SHA-256(label || sorted DTLS fingerprints || nonce)` on both sides
+(`filament_overlay::dtls_channel_binding`; CONTRACT.md, *Link channel
+binding*): the fingerprints tie it to this DTLS session, the nonce keeps it
+fresh across reconnects.
+
 The nonce is generated ONCE per link, not per `ChannelReady`. That event fires
 again on every re-establish and re-announce, and regenerating there invalidates
 the nonce the peer is already signing against, which presents as a permanent
