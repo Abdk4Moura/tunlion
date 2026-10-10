@@ -440,6 +440,17 @@ pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    // Re-check before claiming "serving": a `down` racing this start can stop
+    // the daemon after it signalled ready (the ready marker outlives it), and
+    // "detached and serving (pid N)" was then printed for a pid already gone.
+    let outcome = match outcome {
+        DetachOutcome::Ready => match child.try_wait() {
+            Ok(Some(status)) => DetachOutcome::Exited(status.code()),
+            _ if daemon_alive() != Some(pid) => DetachOutcome::Exited(None),
+            _ => DetachOutcome::Ready,
+        },
+        other => other,
+    };
     let tail = log_tail_since(&log_path, log_start, DETACH_LOG_LINES);
     match outcome {
         DetachOutcome::Ready => {
