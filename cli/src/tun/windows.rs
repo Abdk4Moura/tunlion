@@ -31,8 +31,9 @@ impl KernelTun {
     /// pumping. Needs Administrator + wintun.dll.
     pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
         let wintun = load_wintun().context("load wintun.dll (bundle it beside tunlion.exe)")?;
+        // PROTOCOL LITERAL: frozen, do not rename (wintun tunnel type of released builds).
         let adapter = wintun::Adapter::open(&wintun, name)
-            .or_else(|_| wintun::Adapter::create(&wintun, name, "Tunlion", None))
+            .or_else(|_| wintun::Adapter::create(&wintun, name, "Filament", None))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "create Wintun adapter '{name}': {e}. L3 on Windows needs Administrator and wintun.dll."

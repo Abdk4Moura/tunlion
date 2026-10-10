@@ -242,7 +242,9 @@ pub(crate) async fn add_for_cmd(
         // has not upgraded. #291 dropped the segment with no payload change,
         // which silently broke enrolment across the release boundary in both
         // directions. Keep minting it until no supported release needs it.
-        "filament-invite:v2:{}",
+        // PROTOCOL LITERAL: frozen, do not rename (file_io::INVITE_PREFIX_V2).
+        "{}{}",
+        crate::file_io::INVITE_PREFIX_V2,
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(inv.to_token())
     ));
     // #205/#211: arming is a FILE WRITE, not IPC. The mint records the key in

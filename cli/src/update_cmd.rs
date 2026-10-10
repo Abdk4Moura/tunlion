@@ -255,7 +255,7 @@ pub(crate) async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
             println!("reloading the daemon onto the new binary (graceful restart, no sudo)");
         } else if daemon_alive().is_some() {
             println!(
-                "restart the daemon to run the new binary: `systemctl restart tunlion` (or `tunlion down` then `tunlion up ...`)"
+                "restart the daemon to run the new binary: `systemctl restart filament` (or `tunlion down` then `tunlion up ...`)"
             );
         }
     }

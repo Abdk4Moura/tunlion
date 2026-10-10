@@ -36,8 +36,11 @@ impl Paths {
         // like a fresh install. A brand is not worth that, and a migration that
         // moves live secrets is a worse risk than a directory with the old name.
         //
-        // The new name is honoured when it is ALREADY the one in use, so anyone
-        // who starts fresh after the rename lands on `tunlion` and keeps it.
+        // A `tunlion` directory is honoured only when it ALREADY exists (for
+        // example one created by hand). Nothing here creates it: a fresh
+        // install, before or after the rename, gets the `filament` directory.
+        //
+        // PROTOCOL LITERAL: frozen, do not rename (the `filament` dir name).
         if let Some(proj) = directories::ProjectDirs::from("", "", "tunlion") {
             let new_dir = proj.config_dir().to_path_buf();
             if new_dir.exists() {
@@ -539,13 +542,14 @@ impl ServiceHost {
         match self {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
+                // PROTOCOL LITERAL: frozen, do not rename (unit file = SYSTEMD_UNIT).
                 let unit = std::path::Path::new("/etc/systemd/system/filament.service");
                 std::fs::write(unit, format!(
                     "[Unit]\nDescription=Tunlion drop target\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=multi-user.target\n",
                     exe.display(), shell_args
                 ))?;
                 let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
-                let _ = std::process::Command::new("systemctl").args(["enable", "--now", "tunlion"]).status();
+                let _ = std::process::Command::new("systemctl").args(["enable", "--now", SYSTEMD_UNIT]).status();
             }
             #[cfg(target_os = "windows")]
             ServiceHost::WindowsService => {
@@ -564,13 +568,14 @@ impl ServiceHost {
             }
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
+                // PROTOCOL LITERAL: frozen, do not rename (plist file = LAUNCHD_LABEL).
                 let plist = std::path::Path::new("/Library/LaunchDaemons/autumated.filament.plist");
                 std::fs::write(plist, format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>autumated.tunlion</string>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>up</string>{}</array>
   <key>RunAtLoad</key><true/>
@@ -616,10 +621,10 @@ impl ServiceHost {
             #[cfg(target_os = "linux")]
             ServiceHost::Systemd => {
                 let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "disable", "--now", "tunlion"])
+                    .args(["--user", "disable", "--now", SYSTEMD_UNIT])
                     .status();
                 let _ = std::process::Command::new("systemctl")
-                    .args(["disable", "--now", "tunlion"])
+                    .args(["disable", "--now", SYSTEMD_UNIT])
                     .status();
             }
             #[cfg(target_os = "windows")]
@@ -629,7 +634,7 @@ impl ServiceHost {
                 // with the HKCU Run entry, which needs no elevation.
                 if self.is_elevated() {
                     let _ = std::process::Command::new("sc")
-                        .args(["delete", "tunlion"])
+                        .args(["delete", WINDOWS_SERVICE_NAME])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
                         .status();
@@ -638,14 +643,14 @@ impl ServiceHost {
                     .args([
                         "delete",
                         r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                        "/v", "Tunlion",
+                        "/v", WINDOWS_AUTOSTART_NAME,
                         "/f",
                     ])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
                 let _ = std::process::Command::new("schtasks")
-                    .args(["/delete", "/tn", "Tunlion", "/f"])
+                    .args(["/delete", "/tn", WINDOWS_AUTOSTART_NAME, "/f"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
@@ -653,7 +658,8 @@ impl ServiceHost {
             #[cfg(target_os = "macos")]
             ServiceHost::Launchd => {
                 let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", "gui/501/autumated.tunlion"])
+                    .arg("bootout")
+                    .arg(format!("gui/{}/{LAUNCHD_LABEL}", unsafe { libc::getuid() }))
                     .status();
             }
             _ => {}
@@ -788,6 +794,47 @@ impl ServiceHost {
     }
 }
 
+// PROTOCOL LITERAL: frozen, do not rename. These are the names released builds
+// registered with the OS service managers (systemd unit `filament.service`,
+// launchd label `autumated.filament`, HKCU Run value and scheduled task
+// `Filament`, SCM service `filament`, firewall rule `Filament QUIC`). Every
+// later start, stop, status, log, uninstall and sudoers rule must name the SAME
+// thing, or an upgraded install can no longer manage the service it already
+// has (and a second one appears beside it). Pinned by `frozen_service_names`.
+pub(crate) const SYSTEMD_UNIT: &str = "filament";
+#[allow(dead_code)] // macOS only
+const LAUNCHD_LABEL: &str = "autumated.filament";
+#[allow(dead_code)] // Windows only
+const WINDOWS_AUTOSTART_NAME: &str = "Filament";
+#[allow(dead_code)] // Windows only
+const WINDOWS_SERVICE_NAME: &str = "filament";
+#[allow(dead_code)] // Windows only
+const WINDOWS_FIREWALL_RULE: &str = "name=Filament QUIC";
+
+#[cfg(test)]
+mod frozen_service_names {
+    /// Each digest is SHA-256 of the ORIGINAL literal (`printf '%s' '<name>' |
+    /// sha256sum`); a find-and-replace cannot keep a digest in step.
+    #[test]
+    fn frozen_service_names() {
+        use sha2::{Digest, Sha256};
+        for (name, value, digest) in [
+            ("SYSTEMD_UNIT", super::SYSTEMD_UNIT, "5696d135fe7eb0f05ce06041ec050633b7e8820d0afc490c936e73e5cafb378e"),
+            ("LAUNCHD_LABEL", super::LAUNCHD_LABEL, "550c6c611b45bb2f7a356cfa36bf28a44df6b963c22b7dd8517db8b592b4c3c2"),
+            ("WINDOWS_AUTOSTART_NAME", super::WINDOWS_AUTOSTART_NAME, "0a9066fa6acd2d7a545af769171444d090e5b7940f5dd39e77b9a2c924b5982c"),
+            ("WINDOWS_SERVICE_NAME", super::WINDOWS_SERVICE_NAME, "5696d135fe7eb0f05ce06041ec050633b7e8820d0afc490c936e73e5cafb378e"),
+            ("WINDOWS_FIREWALL_RULE", super::WINDOWS_FIREWALL_RULE, "89a571ce57a1e8b0ed042cfa0e474c33e112170f01d9175f64f5123781a5fb1d"),
+        ] {
+            let got: String = Sha256::digest(value.as_bytes())
+                .as_slice()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(got, digest, "frozen service name {name} changed");
+        }
+    }
+}
+
 // ------------------------------------------------- platform installers --
 
 #[cfg(target_os = "linux")]
@@ -795,16 +842,16 @@ fn install_systemd_user(exe: &Path, shell_args: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
-    let unit = unit_dir.join("filament.service");
+    let unit = unit_dir.join(format!("{SYSTEMD_UNIT}.service"));
     std::fs::write(&unit, format!(
         "[Unit]\nDescription=Tunlion drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nType=notify\nExecStart={} up{}\nRestart=always\nRestartSec=2\nWatchdogSec=45\n\n[Install]\nWantedBy=default.target\n",
         exe.display(), shell_args
     ))?;
     let ok = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status()
-        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "tunlion"]).status())
+        .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", SYSTEMD_UNIT]).status())
         .map(|s| s.success()).unwrap_or(false);
     if !ok {
-        anyhow::bail!("systemctl --user enable --now tunlion failed; run it manually or check journalctl --user -u tunlion");
+        anyhow::bail!("systemctl --user enable --now filament failed; run it manually or check journalctl --user -u filament");
     }
     Ok(())
 }
@@ -819,7 +866,7 @@ fn install_run_key(exe: &Path, shell_args: &str) -> Result<()> {
         .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v", "Tunlion",
+            "/v", WINDOWS_AUTOSTART_NAME,
             "/t", "REG_SZ",
             "/d", &cmd,
             "/f",
@@ -846,7 +893,7 @@ fn install_scheduled_task(exe: &Path, shell_args: &str) -> Result<()> {
     let tmp = std::env::temp_dir().join("filament-task.xml");
     std::fs::write(&tmp, &task_xml)?;
     let out = std::process::Command::new("schtasks")
-        .args(["/create", "/tn", "Tunlion", "/xml", &tmp.to_string_lossy(), "/f"])
+        .args(["/create", "/tn", WINDOWS_AUTOSTART_NAME, "/xml", &tmp.to_string_lossy(), "/f"])
         .output()?;
     let _ = std::fs::remove_file(&tmp);
     if !out.status.success() {
@@ -861,13 +908,13 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = PathBuf::from(&home).join("Library/LaunchAgents");
     std::fs::create_dir_all(&dir)?;
-    let plist = dir.join("autumated.filament.plist");
+    let plist = dir.join(format!("{LAUNCHD_LABEL}.plist"));
     std::fs::write(&plist, format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>autumated.tunlion</string>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>up</string>{}</array>
   <key>RunAtLoad</key><true/>
@@ -876,7 +923,7 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
 </plist>"#,
         exe.display(), shell_args
     ))?;
-    let _ = std::process::Command::new("launchctl").args(["bootstrap", "gui/501", &plist.to_string_lossy()]).status();
+    let _ = std::process::Command::new("launchctl").arg("bootstrap").arg(format!("gui/{}", unsafe { libc::getuid() })).arg(&plist).status();
     Ok(())
 }
 
@@ -884,7 +931,7 @@ fn install_launch_agent(exe: &Path, shell_args: &str) -> Result<()> {
 pub fn add_firewall_rule(exe: &Path) {
     let _ = std::process::Command::new("netsh")
         .args(["advfirewall", "firewall", "add", "rule",
-            "name=Tunlion QUIC", "dir=in", "action=allow",
+            WINDOWS_FIREWALL_RULE, "dir=in", "action=allow",
             "protocol=udp",
             "program=", &exe.display().to_string(),
             "enable=yes"])

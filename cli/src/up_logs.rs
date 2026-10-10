@@ -345,14 +345,15 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
                 };
                 let n = tail.max(1);
                 let follow_flag = if follow { "-f " } else { "" };
-                let cmd = format!("journalctl {scope}-u tunlion {follow_flag}-n {n} --no-pager");
+                let unit = crate::platform::SYSTEMD_UNIT;
+                let cmd = format!("journalctl {scope}-u {unit} {follow_flag}-n {n} --no-pager");
                 ui::say(&format!(
                     "  this daemon runs as a service (pid {pid}); its output goes to the journal"
                 ));
                 ui::say(&ui::paint(ui::Tone::Dim, &format!("    {cmd}")));
                 let status = std::process::Command::new("journalctl")
                     .args(scope.split_whitespace())
-                    .args(["-u", "tunlion"])
+                    .args(["-u", unit])
                     .args(if follow { vec!["-f"] } else { vec![] })
                     .args(["-n", &n.to_string(), "--no-pager"])
                     .status();

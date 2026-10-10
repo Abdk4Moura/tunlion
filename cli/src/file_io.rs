@@ -130,6 +130,13 @@ pub(crate) fn parse_mint_ttl(raw: &str) -> Result<u64> {
     Ok(value.saturating_mul(multiplier))
 }
 
+// PROTOCOL LITERAL: frozen, do not rename. Invitation token prefixes: released
+// builds mint and parse exactly these bytes (see the forms listed in
+// `parse_invitation`). Pinned by `invitation_prefixes_are_frozen`.
+pub(crate) const INVITE_PREFIX: &str = "filament-invite:";
+pub(crate) const INVITE_PREFIX_V1: &str = "filament-invite:v1:";
+pub(crate) const INVITE_PREFIX_V2: &str = "filament-invite:v2:";
+
 pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation> {
     use base64::Engine;
     let token = raw.trim();
@@ -144,14 +151,14 @@ pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation
     // Before this, only the third was accepted, so an invitation from the
     // RELEASED 0.8.5 failed as "not valid base64url": the parser decoded
     // `v2:...` and choked on the colon.
-    if token.starts_with("filament-invite:v1:") {
+    if token.starts_with(INVITE_PREFIX_V1) {
         bail!(
             "this invitation uses the pre-0.8.4 format; ask the owner to mint a new one with `tunlion add --for`"
         );
     }
     let encoded = token
-        .strip_prefix("filament-invite:v2:")
-        .or_else(|| token.strip_prefix("filament-invite:"))
+        .strip_prefix(INVITE_PREFIX_V2)
+        .or_else(|| token.strip_prefix(INVITE_PREFIX))
         .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
     let bytes = Zeroizing::new(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -160,4 +167,29 @@ pub(crate) fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation
     );
     crate::ephemeral::Invitation::from_token(bytes.as_slice())
         .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
+}
+
+#[cfg(test)]
+mod invitation_prefix_tests {
+    /// SHA-256 of each original literal (`printf '%s' '<prefix>' | sha256sum`);
+    /// a find-and-replace cannot keep a digest in step.
+    #[test]
+    fn invitation_prefixes_are_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, value, digest) in [
+            ("INVITE_PREFIX", super::INVITE_PREFIX,
+             "a24a44a9712c1a6c4efa6277ac1775b02ecadedd507ffca31f6b75487fe10ae1"),
+            ("INVITE_PREFIX_V1", super::INVITE_PREFIX_V1,
+             "7d2ed632f4de245cc1782b8c75c0c3bb87dd8c8e33d6d4fd336ba7c8cc783514"),
+            ("INVITE_PREFIX_V2", super::INVITE_PREFIX_V2,
+             "a75d6ce4983acdd4bc742dbfef4933b0c52fa3f8519979b396edef32ecb07cc6"),
+        ] {
+            let got: String = Sha256::digest(value.as_bytes())
+                .as_slice()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(got, digest, "frozen invitation prefix {name} changed");
+        }
+    }
 }
