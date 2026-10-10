@@ -201,6 +201,7 @@ test holds to the help text.
 | 7 | `network` | the tunlion server cannot be reached (no internet, DNS) |
 | 8 | `partial` | some files moved and some did not (`send`, `sync`) |
 | 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>` |
+| 10 | | `up`: a daemon is already running with different settings; nothing was applied, and the message names the restart (`DAEMON_CONFLICT`) |
 | 130 | | interrupted |
 
 Rules that go with them:

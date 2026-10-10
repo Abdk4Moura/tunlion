@@ -77,6 +77,7 @@ EXIT CODES
   7    can't reach the tunlion server (no internet or DNS)
   8    partial: some files moved and some did not
   9    this device has no identity yet (init, or join an invitation)
+  10   up: a daemon is already running with different settings (not applied)
   130  interrupted
   exec passes the remote command's own exit status through.
   With --json, a failure is one JSON object on stdout:

@@ -9,6 +9,8 @@
 //!   3  unknown device      `sync`, `devices --caps` (sync-gates.sh gate F)
 //!   4  denied              `sync` (sync-gates.sh gates D1/D2/I)
 //!   5  still on a relay    `reach --until-direct` (its --help says so)
+//!  10  daemon conflict     `up` over a running daemon with other settings
+//!                          ([`DAEMON_CONFLICT`], shell-gates.sh gates F/F3)
 //!
 //! `1` stays the catch-all, so the change is additive: a script that only tests
 //! `!= 0` is unaffected.
@@ -22,6 +24,16 @@ use crate::ui;
 use serde_json::{Value, json};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// `up` found a daemon already running with settings other than the ones it
+/// was given: nothing was applied, and the message names the restart. Not an
+/// [`ExitKind`]: it is never a failure of the command's own work, and `up`
+/// exits with it directly. #392 introduced this case (it used 3, which is
+/// "unknown device" here) and carries the literal 10 with a pointer to this
+/// constant, because it predates this file; once both are on main, `up` uses
+/// this constant instead of the literal.
+#[allow(dead_code)] // `up` (#392) is the user once both have merged
+pub(crate) const DAEMON_CONFLICT: i32 = 10;
 
 /// What kind of failure a command ended in. `code()` is the process exit code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,5 +394,11 @@ mod tests {
                 k.code()
             );
         }
+        assert!(
+            footer.lines().any(|l| l.trim_start().starts_with(&format!("{DAEMON_CONFLICT} "))),
+            "DAEMON_CONFLICT (exit {DAEMON_CONFLICT}) is missing from the EXIT CODES help section"
+        );
+        let kinds: Vec<i32> = ExitKind::ALL.iter().map(|k| k.code()).collect();
+        assert!(!kinds.contains(&DAEMON_CONFLICT), "DAEMON_CONFLICT must not reuse a kind's code");
     }
 }
