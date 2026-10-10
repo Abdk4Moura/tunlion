@@ -149,7 +149,7 @@ jobs:
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
-            [cli/tests/hostile-env-gates.sh]=11
+            [cli/tests/hostile-env-gates.sh]=12
             [cli/tests/reenrol-advice-gates.sh]=3
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
