@@ -353,20 +353,13 @@ pub(crate) fn delegated_device_state(
     if record["principalState"].as_str() == Some(PRINCIPAL_STATE_LAPSED) || deadline <= now {
         return Some(("lapsed".to_string(), ui::Tone::Warn));
     }
-    let secs = deadline - now;
-    let (n, unit) = if secs < 3600 {
-        (secs / 60, "m")
-    } else if secs < 86400 {
-        (secs / 3600, "h")
-    } else {
-        (secs / 86400, "d")
-    };
+    let left = crate::device_view::remaining_span(deadline - now);
     let clock_label = match clock {
         DeadlineClock::CertExpiry => "cert expires",
         DeadlineClock::AbsoluteStop => "stop time",
         DeadlineClock::LivenessBudget => "offline budget",
     };
-    Some((format!("{n}{unit} left ({clock_label})"), ui::Tone::Dim))
+    Some((format!("{left} left ({clock_label})"), ui::Tone::Dim))
 }
 
 /// CLI handler for `tunlion requests`

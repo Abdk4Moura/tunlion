@@ -258,19 +258,24 @@ pub(crate) fn device_countdown(
             .unwrap_or_else(|| "expired".to_string());
         return format!("expired {date}");
     }
-    // Round UP to the nearest whole unit, so a cert issued for 90 days reads
-    // "90d", not "129600m" or a seconds figure a few seconds short of the day.
-    let secs = cert.expires - now;
-    let text = if secs >= 86400 {
-        format!("{}d", (secs + 86399) / 86400)
+    format!("expires in {}", remaining_span(cert.expires - now))
+}
+
+/// A time remaining (`secs` until something expires), rounded UP to the
+/// nearest whole unit, so a cert issued for 90 days reads "90d", not
+/// "129600m" or a figure a few seconds short of the day. EVERY countdown to an
+/// expiry goes through here: `id` floored the same certificate that `devices`
+/// rounded up, and printed "valid 90d" and "valid 89d" seconds apart. Pure.
+pub(crate) fn remaining_span(secs: u64) -> String {
+    if secs >= 86400 {
+        format!("{}d", secs.div_ceil(86400))
     } else if secs >= 3600 {
-        format!("{}h", (secs + 3599) / 3600)
+        format!("{}h", secs.div_ceil(3600))
     } else if secs >= 60 {
-        format!("{}m", (secs + 59) / 60)
+        format!("{}m", secs.div_ceil(60))
     } else {
         format!("{secs}s")
-    };
-    format!("expires in {text}")
+    }
 }
 
 fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> String {
@@ -439,4 +444,23 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 .unwrap_or_default(),
         )
         .collect()
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::remaining_span;
+
+    /// A 90-day certificate reads 90d for its whole first day, whichever
+    /// command shows it; it only reads 89d once less than 89 days remain.
+    #[test]
+    fn a_countdown_rounds_up_and_is_stable_for_seconds() {
+        let ninety = 90 * 86400;
+        assert_eq!(remaining_span(ninety), "90d");
+        assert_eq!(remaining_span(ninety - 5), "90d");
+        assert_eq!(remaining_span(ninety - 86399), "90d");
+        assert_eq!(remaining_span(89 * 86400), "89d");
+        assert_eq!(remaining_span(3600 * 5 - 1), "5h");
+        assert_eq!(remaining_span(61), "2m");
+        assert_eq!(remaining_span(59), "59s");
+    }
 }

@@ -367,6 +367,27 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
     result
 }
 
+/// The inbox `init` writes to the config: always an absolute path. A relative
+/// one names a different directory from every working directory the daemon is
+/// started in. `env -u HOME tunlion init` printed "inbox: ./Tunlion" and wrote
+/// `dir ./Tunlion`. A relative `--inbox` is made absolute against the current
+/// directory, which is what the person typing it meant. With no `--inbox` and
+/// no home directory anywhere (HOME unset and none in the password database)
+/// there is no right default, so init refuses, before any key is written, and
+/// says how to choose one. `home_known` is `Paths::home_dir_known().is_some()`.
+pub(crate) fn resolve_init_inbox(flag: Option<PathBuf>, home_known: bool) -> Result<PathBuf> {
+    match flag {
+        Some(p) if p.is_absolute() => Ok(p),
+        Some(p) => Ok(std::env::current_dir()
+            .context("cannot resolve the relative --inbox: the current directory is unreadable")?
+            .join(p)),
+        None if home_known => Ok(default_drop_dir()),
+        None => Err(anyhow::anyhow!(
+            "cannot choose an inbox: HOME is not set and the password database has no home directory for this user. Set HOME, or pass an absolute path with --inbox <dir>",
+        )),
+    }
+}
+
 pub(crate) async fn init_experience(
     caps: &UiCapability,
     server: &str,
@@ -426,7 +447,7 @@ pub(crate) async fn init_experience(
         }
         None => bail!("non-interactive init requires --name <device>"),
     };
-    let inbox = inbox.unwrap_or_else(default_drop_dir);
+    let inbox = resolve_init_inbox(inbox, crate::platform::Paths::home_dir_known().is_some())?;
     let pending = identity::PendingIdentity::generate()?;
     let phrase = Zeroizing::new(pending.mnemonic().to_string());
     let words = pending.mnemonic().words().collect::<Vec<_>>();
@@ -665,6 +686,28 @@ pub(crate) fn l3_grant_answer_is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// What `tunlion reset` destroys, in the words the join refusals use. Kept
+/// next to them so the two refusals cannot drift apart.
+const RESET_DESTROYS: &str = "it permanently deletes this device's identity key, its paired devices, grants and managed ssh keys, and nothing else";
+
+/// `join` on a device that already owns an identity. It used to stop at "join
+/// starts from a clean Tunlion identity", which names no way to get one.
+pub(crate) fn join_refusal_with_identity(fingerprint: &str) -> String {
+    format!(
+        "this device already has identity {fingerprint}, and join enrols a device that has none. \
+         To join anyway, first run `tunlion down` then `tunlion reset` ({RESET_DESTROYS}; \
+         keep the recovery phrase if you may want identity {fingerprint} back), then run join again"
+    )
+}
+
+/// `join` on a device that already joined someone.
+pub(crate) fn join_refusal_already_joined() -> String {
+    format!(
+        "this device has already joined an identity. To join another, first run `tunlion down` \
+         then `tunlion reset` ({RESET_DESTROYS}), then run join again"
+    )
+}
+
 pub(crate) async fn join_cmd(
     caps: &UiCapability,
     server: &str,
@@ -674,11 +717,11 @@ pub(crate) async fn join_cmd(
     name: Option<String>,
     to: Option<String>,
 ) -> Result<()> {
-    if identity::UserKey::load(&crate::platform::PlatformKeyStore)?.is_some() {
-        bail!("this device already has an identity; join starts from a clean Tunlion identity");
+    if let Some(existing) = identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
+        bail!("{}", join_refusal_with_identity(&existing.fingerprint()));
     }
     if local_device_cert_path().exists() {
-        bail!("this device has already joined an identity; reset it before joining another");
+        bail!("{}", join_refusal_already_joined());
     }
     let invitation = Zeroizing::new(if let Some(path) = invite_file.as_deref() {
         read_owner_only_file(path)?
@@ -861,6 +904,22 @@ mod recovery_qr_tests {
 }
 
 #[cfg(test)]
+mod join_refusal_tests {
+    use super::{join_refusal_already_joined, join_refusal_with_identity};
+
+    /// Both refusals name the command that clears the way, and what it costs.
+    #[test]
+    fn join_refusals_name_reset_and_what_it_destroys() {
+        for msg in [join_refusal_with_identity("420953f3"), join_refusal_already_joined()] {
+            assert!(msg.contains("`tunlion reset`"), "{msg}");
+            assert!(msg.contains("`tunlion down`"), "{msg}");
+            assert!(msg.contains("identity key") && msg.contains("paired devices"), "{msg}");
+        }
+        assert!(join_refusal_with_identity("420953f3").contains("420953f3"));
+    }
+}
+
+#[cfg(test)]
 mod first_run_tests {
     use super::*;
     use clap::Parser;
@@ -977,5 +1036,28 @@ mod first_run_tests {
         let arm = arm.split("\n        Cmd::").next().unwrap_or(arm);
         assert!(!arm.contains("ensure_user_key"), "`tunlion id` must not create an identity");
         assert!(arm.contains("no_identity("), "`tunlion id` answers no_identity instead");
+    }
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::resolve_init_inbox;
+    use std::path::PathBuf;
+
+    /// `env -u HOME tunlion init` wrote `dir ./Tunlion`. Whatever init
+    /// persists is absolute, and with no home anywhere it refuses instead.
+    #[test]
+    fn init_never_persists_a_relative_inbox() {
+        let abs = std::env::temp_dir().join("inbox-abs");
+        assert_eq!(resolve_init_inbox(Some(abs.clone()), false).unwrap(), abs);
+        let rel = resolve_init_inbox(Some(PathBuf::from("Tunlion")), false).unwrap();
+        assert!(rel.is_absolute(), "{rel:?}");
+        assert_eq!(rel, std::env::current_dir().unwrap().join("Tunlion"));
+        let err = resolve_init_inbox(None, false).unwrap_err().to_string();
+        assert!(err.contains("HOME is not set") && err.contains("--inbox"), "{err}");
+        let _guard = crate::tests::lock_test_config();
+        if crate::platform::Paths::home_dir_known().is_some() {
+            assert!(resolve_init_inbox(None, true).unwrap().is_absolute());
+        }
     }
 }

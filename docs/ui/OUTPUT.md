@@ -94,6 +94,13 @@ that gets less output under `-q` is broken.
 
 **stderr is for humans**, and always through `ui::`. Never `eprintln!`.
 
+**A reader that stops reading is not an error.** `tunlion status | head -2`
+used to exit 101 with a Rust panic, because a print into a closed pipe panics.
+`main` installs `ui::exit_quietly_on_broken_pipe`, so a print into a closed
+pipe (stdout or stderr) ends the command with exit 0 and nothing printed, as
+`head` expects. Only the print itself counts: a socket or child pipe that
+closes under a command is still that command's failure.
+
 Mixing them inside one screen is the specific bug to avoid. The invitation
 screen currently prints its body with `eprintln!` and its footer with
 `ui::say`, so under `-q` you get the footer and not the invitation.

@@ -12,6 +12,11 @@
 #                              roster, and roster presence never authorises
 #   shell-gates.sh             a shell refusal reaches the initiator as a
 #                              nonzero exit WITH a reason (#219/#223)
+#   config-scope-gates.sh      a second config dir (XDG_CONFIG_HOME) gets no
+#                              copy of the default one's keys and cannot see
+#                              or stop its daemon; HOME unset never writes a
+#                              relative inbox; output into a closed pipe exits
+#                              0 instead of panicking
 #   whoami-candidate-gates.sh  an unchecked /api/whoami answer must not become
 #                              an advertised candidate (#237), observed on the
 #                              wire with tcpdump rather than from a log line
@@ -79,6 +84,7 @@ on:
       - 'cli/tests/reenrol-advice-gates.sh'
       - 'cli/tests/daemon-stop-gates.sh'
       - 'cli/tests/signaling-freeze-gates.sh'
+      - 'cli/tests/config-scope-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -164,6 +170,7 @@ jobs:
             [cli/tests/reenrol-advice-gates.sh]=3
             [cli/tests/daemon-stop-gates.sh]=4
             [cli/tests/signaling-freeze-gates.sh]=5
+            [cli/tests/config-scope-gates.sh]=3
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -191,7 +198,8 @@ jobs:
                    cli/tests/hostile-env-gates.sh \
                    cli/tests/reenrol-advice-gates.sh \
                    cli/tests/daemon-stop-gates.sh \
-                   cli/tests/signaling-freeze-gates.sh; do
+                   cli/tests/signaling-freeze-gates.sh \
+                   cli/tests/config-scope-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare

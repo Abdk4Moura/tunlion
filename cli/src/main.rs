@@ -1831,6 +1831,7 @@ fn main() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
+    ui::exit_quietly_on_broken_pipe();
     let first = std::env::args().nth(1);
     let rt = if is_light_command(first.as_deref()) {
         tokio::runtime::Builder::new_current_thread().enable_all().build()

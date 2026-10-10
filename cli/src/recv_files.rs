@@ -45,18 +45,60 @@ pub(crate) fn full_hash(path: &Path) -> Option<String> {
     Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Where a received `name` lands in `dir` without replacing anything already
+/// there: `name` itself when free, else `stem (1).ext`, `stem (2).ext`, ...
+///
+/// The counter goes BEFORE the extension. It used to be appended after it
+/// (`report.pdf.1`), which nothing opens as a PDF and which a file manager
+/// shows as an unknown type. A compound archive extension stays whole
+/// (`backup (1).tar.gz`). The result never exceeds the 255-byte name limit:
+/// the stem is shortened (on a character boundary) to make room for the
+/// counter, so a name already at the limit still gets a free slot rather than
+/// an ENAMETOOLONG.
 pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
         return candidate;
     }
     for i in 1..1000 {
-        let c = dir.join(format!("{name}.{i}"));
+        let c = dir.join(numbered_name(name, &format!(" ({i})")));
         if !c.exists() {
             return c;
         }
     }
-    dir.join(format!("{name}.dup"))
+    dir.join(numbered_name(name, " (dup)"))
+}
+
+/// The longest file name we create, in bytes (NAME_MAX on Linux and macOS).
+const NAME_LIMIT: usize = 255;
+
+/// `name` with `tag` inserted between its stem and its extension, the stem
+/// shortened if the whole would pass NAME_LIMIT. Pure.
+pub(crate) fn numbered_name(name: &str, tag: &str) -> String {
+    let (stem, ext) = split_extension(name);
+    let room = NAME_LIMIT.saturating_sub(tag.len() + ext.len());
+    let mut cut = stem.len().min(room);
+    while cut > 0 && !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{tag}{ext}", &stem[..cut])
+}
+
+/// (stem, extension-with-dot). A leading dot is part of the stem (`.bashrc`
+/// has no extension), a trailing dot is not an extension, and `.tar.<x>` is
+/// kept together.
+fn split_extension(name: &str) -> (&str, &str) {
+    let Some(dot) = name.rfind('.') else { return (name, "") };
+    if dot == 0 || dot + 1 == name.len() {
+        return (name, "");
+    }
+    let lower = name.to_ascii_lowercase();
+    if let Some(tar) = lower[..dot].rfind(".tar") {
+        if tar > 0 && tar + 4 == dot {
+            return (&name[..tar], &name[tar..]);
+        }
+    }
+    (&name[..dot], &name[dot..])
 }
 
 /// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
@@ -599,6 +641,7 @@ pub(crate) async fn finalize_incoming(
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+    use super::numbered_name;
 
     fn mode_dir(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("filament-test-partmode-{}-{name}", std::process::id()));
@@ -681,9 +724,35 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt"));
         std::fs::write(dir.join("f.txt"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.1"));
-        std::fs::write(dir.join("f.txt.1"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.2"));
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (1).txt"));
+        std::fs::write(dir.join("f (1).txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
+        // A name at the 255-byte limit still gets a free slot, at the limit,
+        // with its extension intact (the report: "...xxx.txt.1", 257 bytes).
+        let long = format!("{}.txt", "x".repeat(251));
+        assert_eq!(long.len(), 255);
+        std::fs::write(dir.join(&long), b"x").unwrap();
+        let next = unique_path(&dir, &long);
+        let got = next.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(got.ends_with(" (1).txt"), "{got}");
+        assert!(got.len() <= 255, "{} bytes", got.len());
+        std::fs::write(&next, b"x").unwrap();
+        assert!(!dir.join(&long).with_extension("txt.1").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_collision_counter_goes_before_the_extension() {
+        assert_eq!(numbered_name("report.pdf", " (1)"), "report (1).pdf");
+        assert_eq!(numbered_name("backup.tar.gz", " (3)"), "backup (3).tar.gz");
+        assert_eq!(numbered_name("Backup.TAR.XZ", " (1)"), "Backup (1).TAR.XZ");
+        assert_eq!(numbered_name(".bashrc", " (1)"), ".bashrc (1)");
+        assert_eq!(numbered_name("noext", " (2)"), "noext (2)");
+        assert_eq!(numbered_name("trailing.", " (1)"), "trailing. (1)");
+        assert_eq!(numbered_name(".tar.gz", " (1)"), ".tar (1).gz");
+        // Multi-byte stems are cut on a character boundary, never mid-char.
+        let wide = format!("{}.txt", "\u{e9}".repeat(200));
+        let out = numbered_name(&wide, " (1)");
+        assert!(out.len() <= 255 && out.ends_with(" (1).txt"), "{}", out.len());
     }
 }
