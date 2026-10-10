@@ -219,5 +219,4 @@ mod tests {
         assert_eq!(unconfirmed_kind(2, 1).code(), 8);
     }
 
-    use anyhow::Context;
 }

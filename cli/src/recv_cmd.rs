@@ -6574,7 +6574,7 @@ pub(crate) async fn recv_cmd(
                     for k in keys {
                         if let Some(inc) = st.by_sid.remove(&k) {
                             if !to_stdout {
-                                remove_part(&inc.part_path);
+                                remove_part(inc.part_path.as_path());
                             }
                             names.push(inc.name.clone());
                         }
@@ -6584,7 +6584,7 @@ pub(crate) async fn recv_cmd(
                             let name = safe_incoming_name(raw);
                             let part = dir.join(format!("{name}.part"));
                             if part.is_file() {
-                                remove_part(&part);
+                                remove_part(part.as_path());
                                 names.push(name);
                             }
                         }
