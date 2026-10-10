@@ -1624,8 +1624,14 @@ pub(crate) async fn async_main() -> Result<()> {
                     );
                 }
                 bail!(
-                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
-                    ceiling.join(", ")
+                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                    ceiling.join(", "),
+                    crate::identity_state::reenrol_steps(
+                        &device,
+                        &crate::display_name(),
+                        &capability,
+                        &ceiling
+                    )
                 );
             }
             device_set_cap(&device, &capability, true, None)?;

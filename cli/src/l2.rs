@@ -3186,10 +3186,12 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                     // the owner to a command that refuses, and the refusal named
                     // the real fix. Name it here instead, one step earlier.
                     format!(
-                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
-                        crate::ui::paint(
-                            crate::ui::Tone::Brand,
-                            "tunlion add --for <this-device> --allow shell"
+                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. {}",
+                        crate::identity_state::reenrol_steps(
+                            &crate::display_name(),
+                            peer,
+                            "shell",
+                            &[]
                         )
                     )
                 } else {
@@ -4376,7 +4378,13 @@ async fn shell_bootstrap(
                     // carries its own fix gets no second one bolted on.
                     let fix = if why == crate::capability::CEILING_REASON {
                         format!(
-                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `tunlion add --for <this-device> --allow shell` on '{peer}'."
+                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. {}",
+                            crate::identity_state::reenrol_steps(
+                                &crate::display_name(),
+                                &peer,
+                                "shell",
+                                &[]
+                            )
                         )
                     } else if why == crate::capability::SHELL_OFF_REASON {
                         String::new()

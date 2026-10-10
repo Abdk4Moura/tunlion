@@ -314,6 +314,39 @@ pub(crate) fn certify_local_device(
     Ok(cert)
 }
 
+/// The one supported way to give a joined device a capability its invitation
+/// ceiling does not include: enrol it again with the capability in a fresh
+/// invitation. A grant cannot widen a ceiling, and a joined device refuses a
+/// second invitation while it holds the first ("already joined an identity"),
+/// so the advice that used to be printed here (`add --for <dev> --allow shell`
+/// alone) dead-ended on the device. These are the steps that work, in order,
+/// with the machine each one runs on; `cli/tests/reenrol-advice-gates.sh`
+/// follows them end to end.
+///
+/// `ceiling` is the device's current ceiling: `--allow` REPLACES the default
+/// ceiling, so what it already had is carried over rather than lost.
+pub(crate) fn reenrol_steps(device: &str, owner: &str, capability: &str, ceiling: &[String]) -> String {
+    let mut caps: Vec<String> = ceiling.to_vec();
+    if !caps.iter().any(|c| c == capability) {
+        caps.push(capability.to_string());
+    }
+    let caps = caps.join(",");
+    let invite = format!("{device}-invite.txt");
+    let on_owner = format!("on {owner}:");
+    let on_device = format!("on {device}:");
+    let w = on_owner.len().max(on_device.len());
+    let pad = " ".repeat(w);
+    format!(
+        "To give {device} {capability}, enrol it again with {capability} in its invitation:\n  \
+         {on_owner:<w$}  tunlion devices forget {device}\n  \
+         {pad}  tunlion add --for {device} --allow {caps} --out {invite}\n  \
+         {on_device:<w$}  tunlion down\n  \
+         {pad}  tunlion reset -y\n  \
+         {pad}  tunlion join --invite-file {invite} --name {device}\n  \
+         (reset clears {device}'s local tunlion state; it rejoins under the same name)"
+    )
+}
+
 /// The persisted capability ceiling of a device record, when that record is a
 /// delegated (joined) device. None for an owner device or a plain pair, which
 /// are not ceiling-restricted.
