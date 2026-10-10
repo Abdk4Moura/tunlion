@@ -65,6 +65,9 @@
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
+#   FORGET-REFUSED  `devices forget` on a live certificate holder is refused
+#       (record kept, `revoke --certificate` named): forgetting would not
+#       stop fleet-hello re-admitting it.
 #   I1/I2/I3 IMPOSTOR (F1 acceptance, live): a sibling daemon hellos as the
 #       ceilinged device's exact name, trailing-space name, and control-char
 #       name; each is refused, the victim record is byte-identical, and the
@@ -356,7 +359,40 @@ DM="$WORK/$MALLORY"
 enroll_delegate "$MALLORY" --allow transfer
 start_spoke "$DM" "$MALLORY"
 sleep 6
+# FORGET-REFUSED: `devices forget` on a device holding a live fleet
+# certificate must REFUSE (it used to print "it can no longer find or
+# auto-connect to this machine" while fleet-hello let it straight back in) and
+# name the remedy that does cut it off. The record must survive the refusal.
+say "FORGET-REFUSED: forgetting a live certificate holder is refused, with the real remedy"
 "${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$MALLORY" >"$WORK/forget.log" 2>&1
+rcFG=$?
+if [ "$rcFG" != "0" ] \
+   && grep -q "tunlion revoke $MALLORY --certificate" "$WORK/forget.log" \
+   && ! grep -q "can no longer find" "$WORK/forget.log" \
+   && python3 -c "import json,sys;sys.exit(0 if any(d.get('name')=='$MALLORY' for d in json.load(open('$DA/devices.json'))) else 1)"; then
+  ok "gateFORGET-REFUSED: forget refused for a live fleet certificate, record kept, remedy named"
+else
+  echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
+  bad "gateFORGET-REFUSED: forget of a live certificate holder was not refused truthfully"
+fi
+# The impostor shape these gates need, "valid cert, no record", can no longer
+# be produced by `devices forget` (above). Build it the way forget used to:
+# drop the record from the store under the same devices.json.lock flock the
+# CLI and daemon take, with the same atomic owner-only replace. Fixture setup
+# only; nothing asserted below changes.
+python3 - "$DA" "$MALLORY" <<'PY'
+import fcntl, json, os, sys, tempfile
+d, name = sys.argv[1], sys.argv[2]
+with open(os.path.join(d, "devices.json.lock"), "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    p = os.path.join(d, "devices.json")
+    arr = [r for r in json.load(open(p)) if r.get("name") != name]
+    fd, tmp = tempfile.mkstemp(dir=d)
+    with os.fdopen(fd, "w") as f:
+        json.dump(arr, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+PY
 sleep 2
 # Stable fields only (timestamps/last_seen drift between snapshots, so a
 # whole-record comparison would fail spuriously -- gate B does the same).

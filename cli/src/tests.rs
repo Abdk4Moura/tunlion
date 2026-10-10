@@ -3949,6 +3949,80 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
 }
+// `devices forget` on a device holding a live fleet certificate used to print
+// "it can no longer find or auto-connect to this machine" while fleet-hello
+// re-admitted it (no record means "not revoked"). The forget must refuse there,
+// and point at the remedy that does remove the access.
+#[test]
+fn forget_refuses_a_live_fleet_certificate_and_says_why() {
+    use crate::fleet_support::{ForgetVerdict, forget_refusal, forget_verdict};
+    let cert = identity::DeviceCert::from_json(&serde_json::json!({
+        "devicePub": hex::encode([0x11u8; 32]),
+        "userPub": hex::encode([0x22u8; 32]),
+        "expires": 100 + 3 * 86_400,
+        "issued": 100,
+        "sig": hex::encode([0u8; 64]),
+    }))
+    .unwrap();
+    let owner = Some([0x22u8; 32]);
+
+    let live = forget_verdict(Some(&cert), false, owner, 100);
+    assert_eq!(live, ForgetVerdict::RefuseCertified { days_left: 3 });
+    let msg = forget_refusal("laptop", &live).expect("refused");
+    assert!(msg.contains("tunlion revoke laptop --certificate"), "{msg}");
+    assert!(!msg.contains("can no longer find"), "{msg}");
+
+    // Revoked: the record is the revocation, so it is kept too.
+    let revoked = forget_verdict(Some(&cert), true, owner, 100);
+    assert_eq!(revoked, ForgetVerdict::RefuseRevoked { days_left: 3 });
+    assert!(forget_refusal("laptop", &revoked).unwrap().contains("revocation in force"));
+
+    // Forgetting IS the remedy when no live certificate from us exists.
+    assert_eq!(forget_verdict(None, false, owner, 100), ForgetVerdict::Remove);
+    assert_eq!(forget_verdict(Some(&cert), false, Some([0x33; 32]), 100), ForgetVerdict::Remove);
+    assert_eq!(forget_verdict(Some(&cert), false, None, 100), ForgetVerdict::Remove);
+    assert_eq!(
+        forget_verdict(Some(&cert), false, owner, 100 + 3 * 86_400),
+        ForgetVerdict::Remove
+    );
+    assert!(forget_refusal("laptop", &ForgetVerdict::Remove).is_none());
+
+    // Every suggested command parses.
+    use clap::Parser;
+    for argv in [
+        vec!["tunlion", "revoke", "laptop", "--certificate"],
+        vec!["tunlion", "devices", "restore", "laptop"],
+    ] {
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{argv:?}");
+    }
+}
+// `down` printed "stopped" and deleted the pidfile even when `kill` failed (a
+// daemon started with sudo), hiding a running daemon from status and reset.
+// The kill result now decides: failure is reported and the pidfile kept.
+#[test]
+fn down_reports_a_failed_kill_instead_of_stopped() {
+    // A real failing exit status, portably: libtest rejects an unknown flag.
+    let failed = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--definitely-not-a-libtest-flag")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    let why = kill_failure(4242, &failed).expect("a failed kill is reported");
+    assert!(why.contains("pid 4242"), "{why}");
+    assert!(why.contains("still running"), "{why}");
+    assert!(why.contains("pidfile is kept"), "{why}");
+    assert!(!why.contains("stopped (pid"), "{why}");
+    let ok = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--list", "--exact", "no-such-test-name"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    assert!(kill_failure(4242, &ok).is_none());
+}
 // --- Windows reparse-point hardening tests (#43) ---
 // The resume/open tests use a file symlink to prove that the write cannot be
 // redirected outside the download directory. The create test remains a

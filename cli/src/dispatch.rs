@@ -1057,13 +1057,30 @@ pub(crate) async fn async_main() -> Result<()> {
                          `--for person` to pair without enrolling."
                     );
                 }
+                // `--expires` is the certificate lifetime here, parsed and
+                // bounded the same way as the invitation path above. Resolved
+                // before the ceremony so a bad value fails before a code shows.
+                let enrol_ttl = crate::pair_cmd::code_enrolment_ttl(expires.as_deref(), internal)?;
                 let quick = ui_caps.interactive && who_given && via_defaulted;
-                pair_cmd(&server, code, name.or(named), word, relay, internal, allow, quick).await
+                pair_cmd(
+                    &server,
+                    code,
+                    name.or(named),
+                    word,
+                    relay,
+                    internal,
+                    allow,
+                    enrol_ttl,
+                    quick,
+                )
+                .await
             } else {
                 // No answer given and none required: an ordinary pair, which
                 // confers no membership. This is the safe default and the
-                // pre-existing behaviour.
-                pair_cmd(&server, code, name, word, relay, false, allow, false).await
+                // pre-existing behaviour. It issues no certificate, so a
+                // `--expires` here would bound nothing: refused, not ignored.
+                crate::pair_cmd::code_enrolment_ttl(expires.as_deref(), false)?;
+                pair_cmd(&server, code, name, word, relay, false, allow, None, false).await
             }
         }
         Cmd::Join {
@@ -1099,7 +1116,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 // Same ceremony `add <code>` runs: accepting a code confers no
                 // membership by itself, the offering side decides that.
-                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), false).await
+                pair_cmd(&server, Some(code), name, None, relay, false, Vec::new(), None, false).await
             } else {
                 join_cmd(&ui_caps, &server, relay, invite_file, invite_fd, name, to).await
             }
@@ -1182,6 +1199,18 @@ pub(crate) async fn async_main() -> Result<()> {
                             d["name"].as_str() == Some(name.as_str())
                                 && d["certRevoked"].as_bool() == Some(true)
                         });
+                    // A live fleet certificate outlives its record: fleet-hello
+                    // would admit it again, so "can no longer find or
+                    // auto-connect" would be false. Refuse with the real remedy.
+                    let verdict = crate::fleet_support::forget_verdict(
+                        device_cert_for(&name).as_ref(),
+                        was_revoked,
+                        crate::fleet::my_owner_pub(),
+                        identity::now_secs(),
+                    );
+                    if let Some(why) = crate::fleet_support::forget_refusal(&name, &verdict) {
+                        bail!("{why}");
+                    }
                     devices_remove(&name)?;
                     if was_revoked {
                         println!(

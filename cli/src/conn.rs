@@ -994,6 +994,18 @@ pub(crate) fn upgrade_principal(
     }
 }
 
+/// `--relay` promises to hide this machine's address from the peer. Direct
+/// transport cannot keep that promise: its `transport-offer` carries our host
+/// and public candidates, and dialing the peer's candidates hands it our source
+/// address. So a relay-mode session never takes direct, whatever else asked for
+/// it (env gate, L2 acceptor, daemon anti-glare). Decided here once, at Conn
+/// construction, and `direct_ok` is never widened afterwards, so send, receive,
+/// pair and the `up` daemon all inherit it. Runtime escalation to relay
+/// (`relay_only` set later) is a different thing and is not this flag.
+pub(crate) fn direct_permitted(relay_only: bool, direct_ok: bool) -> bool {
+    direct_ok && !relay_only
+}
+
 impl Conn {
     /// Single constructor for the `pair`/`send`/`recv` command event loops, which
     /// built the identical ~17-field `Conn` literal three times (the only
@@ -1045,7 +1057,7 @@ impl Conn {
                 upgrade_probe: HashMap::new(),
                 iface_snapshot: Vec::new(),
             },
-            direct_ok,
+            direct_ok: direct_permitted(relay_only, direct_ok),
             local_port: None,
             local_listener: None,
             direct_endpoint: None,
@@ -3837,6 +3849,169 @@ impl Conn {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod relay_privacy_tests {
+    use super::*;
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn direct_is_never_permitted_in_relay_mode() {
+        for direct_ok in [false, true] {
+            assert!(!direct_permitted(true, direct_ok));
+        }
+        assert!(direct_permitted(false, true));
+        assert!(!direct_permitted(false, false));
+    }
+
+    /// One client->server websocket frame (clients always mask).
+    async fn read_client_frame(s: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        let mut h = [0u8; 2];
+        s.read_exact(&mut h).await.ok()?;
+        let opcode = h[0] & 0x0f;
+        let masked = h[1] & 0x80 != 0;
+        let mut len = (h[1] & 0x7f) as u64;
+        if len == 126 {
+            let mut b = [0u8; 2];
+            s.read_exact(&mut b).await.ok()?;
+            len = u16::from_be_bytes(b) as u64;
+        } else if len == 127 {
+            let mut b = [0u8; 8];
+            s.read_exact(&mut b).await.ok()?;
+            len = u64::from_be_bytes(b);
+        }
+        let mut mask = [0u8; 4];
+        if masked {
+            s.read_exact(&mut mask).await.ok()?;
+        }
+        let mut payload = vec![0u8; len as usize];
+        s.read_exact(&mut payload).await.ok()?;
+        if masked {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+        }
+        Some((opcode, payload))
+    }
+
+    /// One short unmasked server->client text frame.
+    async fn send_text(s: &mut tokio::net::TcpStream, text: &str) {
+        let bytes = text.as_bytes();
+        assert!(bytes.len() < 126);
+        let mut f = vec![0x81u8, bytes.len() as u8];
+        f.extend_from_slice(bytes);
+        s.write_all(&f).await.unwrap();
+    }
+
+    /// A minimal Engine.IO / Socket.IO endpoint: completes the handshake
+    /// `filament_signal::connect` expects, then records every text frame the
+    /// client sends until it closes. Everything a Conn emits is in that list.
+    async fn fake_signaling() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let h = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut byte).await.unwrap();
+                req.push(byte[0]);
+            }
+            let req = String::from_utf8_lossy(&req).to_string();
+            let key = req
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| v.trim().to_string())
+                })
+                .expect("websocket key");
+            let digest = ring::digest::digest(
+                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+                format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+            );
+            let accept = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
+            s.write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            send_text(&mut s, r#"0{"sid":"t","upgrades":[],"pingInterval":25000,"pingTimeout":20000}"#).await;
+            let mut seen = Vec::new();
+            while let Some((op, payload)) = read_client_frame(&mut s).await {
+                match op {
+                    0x1 => {
+                        let t = String::from_utf8_lossy(&payload).to_string();
+                        if t == "40" {
+                            send_text(&mut s, "40").await;
+                        }
+                        seen.push(t);
+                    }
+                    0x8 => break,
+                    _ => {}
+                }
+            }
+            seen
+        });
+        (url, h)
+    }
+
+    // --relay hides our IP from the peer. A relay-mode Conn, even one whose
+    // caller asked for direct (the daemon and L2 acceptors always do), must
+    // never send a transport-offer: it carries our host/public candidates.
+    #[test]
+    fn a_relay_mode_conn_never_sends_a_transport_offer() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (url, server) = fake_signaling().await;
+            let (itx, _irx) = mpsc::unbounded_channel::<filament_signal::Incoming>();
+            let sio = filament_signal::connect(&url, itx)
+                .await
+                .expect("connect to the fake signaling endpoint");
+            let (tx, _rx) = mpsc::unbounded_channel::<Ev>();
+            let mut conn = Conn::for_command(
+                &url,
+                sio.clone(),
+                tx,
+                "uid-relay-test".to_string(),
+                true, // --relay
+                None,
+                false,
+                true, // direct requested (as `up` and L2 acceptors do)
+            );
+            assert!(!conn.direct_ok, "relay mode must not keep direct_ok");
+            conn.start_direct("peer-sid", "peer", "00").await;
+            conn.start_direct_fleet("peer-sid", "00").await;
+            let _ = conn.start_direct_promote("peer-sid", "peer", "00").await;
+            assert!(conn.direct_pending.is_empty(), "no direct attempt may be armed");
+            // Control: the recorder really does see what this client emits.
+            sio.emit(
+                "signal",
+                json!({ "to": "peer-sid", "data": { "type": "control-marker" } }),
+            )
+            .await
+            .unwrap();
+            sio.disconnect().await.unwrap();
+            let seen = tokio::time::timeout(Duration::from_secs(10), server)
+                .await
+                .expect("fake signaling ended")
+                .unwrap();
+            assert!(seen.iter().any(|t| t.contains("control-marker")), "{seen:?}");
+            assert!(
+                !seen.iter().any(|t| t.contains("transport-offer")),
+                "relay mode sent a transport-offer: {seen:?}"
+            );
+        });
     }
 }
 

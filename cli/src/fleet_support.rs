@@ -56,6 +56,68 @@ pub(crate) fn fleet_certificate_warning_for(
     ))
 }
 
+/// What `devices forget` can truthfully do with a record.
+///
+/// Forgetting deletes the pair secret, which ends a PAIRED device's access. It
+/// does not end a CERTIFIED one's: fleet-hello admits any valid certificate
+/// chained to our owner key unless a record marks it revoked, and the absence
+/// of a record means "not revoked" (see the marker notes below). So for a
+/// device holding a live fleet certificate, forget would print "it can no
+/// longer find or auto-connect to this machine" while fleet auto-mesh let it
+/// straight back in. Such a forget is refused instead, with the remedy that
+/// actually removes the access.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ForgetVerdict {
+    /// No live fleet certificate from our owner: removing the record ends it.
+    Remove,
+    /// A live certificate, not revoked: revoke the certificate instead.
+    RefuseCertified { days_left: u64 },
+    /// A live certificate, revoked: this record IS the revocation.
+    RefuseRevoked { days_left: u64 },
+}
+
+pub(crate) fn forget_verdict(
+    cert: Option<&identity::DeviceCert>,
+    revoked: bool,
+    owner_pub: Option<[u8; 32]>,
+    now: u64,
+) -> ForgetVerdict {
+    let (Some(cert), Some(owner)) = (cert, owner_pub) else {
+        return ForgetVerdict::Remove;
+    };
+    // Same liveness test as `fleet_certificate_warning_for`: a certificate
+    // from another owner, or an expired one, cannot pass fleet-hello.
+    if cert.user_pub != owner || cert.expires <= now {
+        return ForgetVerdict::Remove;
+    }
+    let days_left = cert.expires.saturating_sub(now).div_ceil(86_400);
+    if revoked {
+        ForgetVerdict::RefuseRevoked { days_left }
+    } else {
+        ForgetVerdict::RefuseCertified { days_left }
+    }
+}
+
+/// The refusal printed for a forget that would not remove the access, or None
+/// when forgetting is the truthful remedy.
+pub(crate) fn forget_refusal(name: &str, verdict: &ForgetVerdict) -> Option<String> {
+    match verdict {
+        ForgetVerdict::Remove => None,
+        ForgetVerdict::RefuseCertified { days_left } => Some(format!(
+            "'{name}' holds a fleet certificate from you that is valid for {days_left} more day(s). \
+             Forgetting it would not cut it off: fleet auto-mesh admits a valid certificate unless a \
+             record marks it revoked, so it would reconnect. Revoke the certificate instead; that \
+             keeps this record as the revocation:\n  tunlion revoke {name} --certificate"
+        )),
+        ForgetVerdict::RefuseRevoked { days_left } => Some(format!(
+            "'{name}' is revoked, and its fleet certificate stays valid for {days_left} more day(s). \
+             This record is what keeps the revocation in force; forgetting it would let the device \
+             reconnect through fleet auto-mesh. It can be forgotten once the certificate expires. \
+             To let it back in now instead:\n  tunlion devices restore {name}"
+        )),
+    }
+}
+
 /// Local-only fleet certificate revocation marker. This deliberately lives
 /// beside the device record: no CRL or network dependency is introduced.
 ///

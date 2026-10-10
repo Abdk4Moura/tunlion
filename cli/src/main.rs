@@ -1478,6 +1478,18 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 
+/// The refusal for a `kill` that did not succeed, or None when it did.
+fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    Some(format!(
+        "could not stop the daemon (pid {pid}): `kill` failed ({status}), so it is still running. \
+         It is probably owned by another user, for example started with sudo; stop it as that user \
+         (`sudo tunlion down`). The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
+    ))
+}
+
 fn down_cmd() -> Result<()> {
     match daemon_alive() {
         Some(pid) => {
@@ -1488,7 +1500,13 @@ fn down_cmd() -> Result<()> {
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
             if !stop_managed_service(pid) {
-                std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                let status = std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                // A failed kill leaves the daemon running. Saying "stopped" and
+                // deleting the pidfile would hide it from `status` and `reset`
+                // while it keeps serving, so keep the pidfile and say why.
+                if let Some(why) = kill_failure(pid, &status) {
+                    bail!("{why}");
+                }
             }
             let _ = std::fs::remove_file(pidfile());
             ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
@@ -1515,18 +1533,16 @@ fn down_cmd() -> Result<()> {
 // <device>` blocks it installed in ~/.ssh/authorized_keys. It NEVER touches the
 // user's real ssh keys or any authorized_keys lines outside those blocks.
 
-/// Remove `path` if present, pushing a human line into `wiped`. Files and
-/// directories both handled; a missing path is silently skipped (idempotent).
-fn reset_remove(path: &std::path::Path, label: &str, wiped: &mut Vec<String>) {
-    let removed = if path.is_dir() {
-        std::fs::remove_dir_all(path).is_ok()
-    } else if path.exists() {
-        std::fs::remove_file(path).is_ok()
-    } else {
-        false
-    };
-    if removed {
-        wiped.push(format!("{label}  ({})", path.display()));
+/// Remove `path` if present: Ok(true) removed, Ok(false) absent (idempotent),
+/// Err when it exists and could not be removed. The error is the caller's to
+/// report: swallowing it is how `reset` used to print "clean slate" over state
+/// it had failed to delete. A symlink is removed, never followed.
+fn reset_remove(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path).map(|()| true),
+        Ok(_) => std::fs::remove_file(path).map(|()| true),
     }
 }
 

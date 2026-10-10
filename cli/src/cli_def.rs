@@ -367,8 +367,8 @@ pub(crate) enum Cmd {
         /// Env: `FILAMENT_SHELL`.
         #[arg(long, value_name = "PROGRAM")]
         shell_program: Option<String>,
-        /// Drop the web-shell / ssh PTY to this non-root account (via
-        /// `runuser -l <user>`). STRONGLY recommended when `up` runs as root:
+        /// Drop the web-shell / ssh PTY and `exec` commands to this non-root
+        /// account (via `runuser`). STRONGLY recommended when `up` runs as root:
         /// without it, a granted device gets a shell as the up-process user
         /// (often root). Requires `up` to run as root (runuser is setuid).
         #[arg(long, value_name = "USER")]
