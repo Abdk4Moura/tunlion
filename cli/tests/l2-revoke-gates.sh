@@ -78,13 +78,28 @@ fi
 # The stream must close (the client's connection breaks), not keep flowing and
 # not hang. A still-alive nc after the bound is a live stream (the bug); an nc
 # that cannot be reaped is a wedge.
+#
+# A dead nc alone is satisfied by ANY close (the forward process dying, the
+# link dropping, nc's own timeout), none of which is a revocation. So the
+# revoke must itself succeed, and the acceptor must say it closed the stream
+# BECAUSE the peer was revoked (the critical line l2.rs prints on that branch).
 say B
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+REASON="l2: peer revoked, closing the live stream"
+reason_before=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
+env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+revoke_rc=$?
 sleep "$GRACE"
-if kill -0 "$NC_PID" 2>/dev/null; then
+reason_after=$(grep -cF "$REASON" "$WORK/up.log" 2>/dev/null || true)
+echo "## revoke rc=$revoke_rc; acceptor revoked-close lines: $reason_before -> $reason_after"
+if [ "$revoke_rc" != "0" ]; then
+  bad "gateB: the revoke itself failed (rc $revoke_rc): $(tail -2 "$WORK/revoke.out" | tr '\n' ' ')"
+elif kill -0 "$NC_PID" 2>/dev/null; then
   bad "gateB: the revoked forward still streams (nc alive after ${GRACE}s)"
+elif [ "$reason_after" -le "$reason_before" ]; then
+  bad "gateB: the client's connection closed, but the acceptor never logged '$REASON', so it was not closed for the revocation"
+  echo "-- up.log (tail) --"; tail -8 "$WORK/up.log"
 else
-  ok "gateB: the revoked forward closed the client's connection within ${GRACE}s"
+  ok "gateB: the revoked forward closed the client's connection within ${GRACE}s, and the acceptor names the revocation"
 fi
 
 echo

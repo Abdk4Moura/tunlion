@@ -13,7 +13,7 @@
 # Gates:
 #   A  a forward to an acceptor with L2 OFF fails FAST, it does not hang   (#268)
 #   B  and the user is told the peer refused, with a reason                (#232)
-#   C  the accept-time line does not claim the peer forwarded anything     (#232)
+#   C  the refusal is reported, and nothing claims the peer forwarded it    (#232)
 #   D  with L2 ON and a live target, the same forward still works          (control)
 #
 # D is the control that matters. A, B and C could all be satisfied by a build
@@ -167,10 +167,20 @@ else
   bad "gateB: the peer refused and the forward never said so (#232)"
 fi
 
-if printf '%s\n' "$fwd" | grep -q 'first connection forwarded'; then
-  bad "gateC: still claims the peer FORWARDED it, at accept time (#232)"
+# Passing on the absence of ONE exact phrase ('first connection forwarded')
+# meant any rewording of a false success claim ("forwarded to", "the link is
+# live", "connected") passed, and so did a forward that printed nothing at all.
+# So: the refusal must be present with a non-empty reason (what the user SHOULD
+# see), and no success-shaped claim may appear anywhere in the output. The
+# accept-time line "first connection accepted, opening to" is allowed: accepting
+# the local connection is true, and claims nothing about the peer.
+SUCCESS_RE='forwarded|link is live|is live|connected to|delivered|succeeded|success'
+if ! printf '%s\n' "$fwd" | grep -qiE 'refused the connection: *[^ ]'; then
+  bad "gateC: no refusal with a reason was printed, so the absence of a success claim proves nothing"
+elif printf '%s\n' "$fwd" | grep -qiE "$SUCCESS_RE"; then
+  bad "gateC: claims success on a refused forward (#232): $(printf '%s\n' "$fwd" | grep -iE "$SUCCESS_RE" | head -1)"
 else
-  ok "gateC: no false success claim at accept time"
+  ok "gateC: the refusal is reported and nothing claims the peer forwarded it"
 fi
 
 # ---------------------------------------------------------------- gate D
@@ -190,10 +200,17 @@ elif [ "$CURL_RC" -eq 0 ]; then
 else
   bad "gateD: the control failed (rc=$CURL_RC); A/B/C prove nothing if every forward is refused"
 fi
-if printf '%s\n' "$fwd2" | grep -qi 'refused the connection'; then
-  bad "gateD2: cried refusal on a forward that should have worked"
+# Same shape as gateC: absence of the one phrase 'refused the connection'
+# passed on any reworded refusal, and on a control that never ran. So D2 needs
+# a forward that actually carried the request (D's own evidence) before the
+# absence of every refusal-shaped word means anything.
+REFUSAL_RE='refus|denied|reject|not allowed|not permitted|forbidden'
+if [ "${FORWARD_UP:-0}" -ne 1 ] || [ "$CURL_RC" -ne 0 ]; then
+  bad "gateD2: the working-path forward did not carry the request (rc=$CURL_RC), so there is nothing to judge"
+elif printf '%s\n' "$fwd2" | grep -qiE "$REFUSAL_RE"; then
+  bad "gateD2: cried refusal on a forward that worked: $(printf '%s\n' "$fwd2" | grep -iE "$REFUSAL_RE" | head -1)"
 else
-  ok "gateD2: no false refusal on the working path"
+  ok "gateD2: the working forward carried the request and printed no refusal"
 fi
 
 echo

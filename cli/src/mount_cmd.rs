@@ -363,7 +363,7 @@ pub(crate) async fn mount_fuse_cmd(
     //    pump keeps draining the transport. ctrl-c triggers an unmount, which
     //    makes the blocking session loop return.
     let mnt_run = mnt.clone();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
     let session =
         tokio::task::spawn_blocking(move || crate::mount_fuse::run_mount(client, &mnt_run));
     #[cfg(all(target_os = "windows", feature = "mount-windows"))]

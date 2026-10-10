@@ -564,7 +564,34 @@
         "macos",
         "windows"
       ],
-      "behavior": "Returns success after reporting that cold establish is unverified."
+      "behavior": "Ignored on macOS and Windows: cold establish is not yet verified there, so the test does not run."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "shell_daemon_live_pairing_no_restart",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "behavior": "Ignored on macOS and Windows: cold establish is not yet verified there, so the test does not run."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "warm_all_makes_first_contact_warm",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "behavior": "Compiled out on macOS (hyperkit runner cannot complete a QUIC establish) and ignored on Windows, so it runs on Linux only."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "warm_one_shot_pty_reuse",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "behavior": "Ignored on macOS and Windows: warm-reuse pty is not yet verified there, so the test does not run."
     },
     {
       "path": "cli/tests/capability_harness.rs",
@@ -573,7 +600,7 @@
         "macos",
         "windows"
       ],
-      "behavior": "Returns success after reporting a platform skip."
+      "behavior": "Ignored on macOS and Windows: instant-EOF warm pty is not yet verified there, so the test does not run."
     }
   ]
 }

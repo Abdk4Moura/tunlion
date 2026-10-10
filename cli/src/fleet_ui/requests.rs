@@ -77,8 +77,10 @@ pub fn render_requests(requests: &[RequestEntry]) -> String {
         lines.push(String::new());
     }
 
-    lines.push(ui::paint(Tone::Dim, "  Nothing pushes to you yet — check `tunlion requests`, or wire a hook:"));
-    lines.push(ui::paint(Tone::Dim, "    tunlion requests --notify 'notify-send %s'   (also: webhook, email)"));
+    // This used to offer `tunlion requests --notify 'notify-send %s'` as a hook.
+    // `requests` has no --notify flag and nothing implements one, so the line
+    // told the user to type a usage error. Say only what is true.
+    lines.push(ui::paint(Tone::Dim, "  Nothing pushes to you yet; check `tunlion requests` for new ones."));
 
     lines.join("\n")
 }

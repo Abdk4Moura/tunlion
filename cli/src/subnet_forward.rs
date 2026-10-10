@@ -229,7 +229,14 @@ mod tests {
     /// the real rules, proves it flows, then removes them and proves it is
     /// blocked again. The negative control on both sides is the point, because
     /// "it worked" on a host that was already forwarding proves nothing.
+    ///
+    /// `#[ignore]` so a plain `cargo test` reports it IGNORED rather than "ok":
+    /// it used to return early and score a pass while testing nothing, and no
+    /// workflow set the variable. The Test workflow's linux job now runs it for
+    /// real as root with `--ignored`; the env guard stays so a stray
+    /// `--ignored` run on a developer box cannot rewrite its firewall.
     #[test]
+    #[ignore = "needs root + FILAMENT_NETNS_RIG=1"]
     fn forwarding_rules_actually_forward_on_a_real_kernel() {
         if std::env::var("FILAMENT_NETNS_RIG").as_deref() != Ok("1") {
             return;

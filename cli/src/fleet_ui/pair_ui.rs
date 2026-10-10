@@ -117,12 +117,11 @@ pub fn render_inter_user_form(peer_name: &str) -> String {
 
 /// Render the inter-user success message.
 pub fn render_inter_user_success(peer_name: &str, cap: &str, expiry: &str) -> String {
-    let echo = match cap {
-        "shell" | "transfer" | "mount" => {
-            echo_cmd(&format!("tunlion grant {peer_name} {cap} --for {expiry}"))
-        }
-        _ => String::new(),
-    };
+    // This used to echo `tunlion grant <peer> <cap> --for <expiry>`. `grant`
+    // has no --for (or any expiry) flag, so the echoed "equivalent command"
+    // was a usage error, and no grant invocation reproduces a bounded grant.
+    // Echoing nothing is honest; echoing a command that does not parse is not.
+    let echo = String::new();
     format!(
         "{ok} {peer_name} can {cap_label} until {expiry}. It ends on its own; no cleanup needed.\n{echo}",
         ok = ui::paint(Tone::Ok, ui::glyph_ok()),

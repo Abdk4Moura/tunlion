@@ -58,7 +58,7 @@ pub fn render_post_ack_nudge() -> String {
         add = format!(
             "     {} {}  (strongly recommended)",
             ui::paint(Tone::Warn, ui::glyph_extern()),
-            ui::paint(Tone::Dim, "add a second primary:  tunlion pair --fleet")
+            ui::paint(Tone::Dim, "add a second primary:  tunlion add --for device")
         ),
     )
 }
@@ -67,7 +67,7 @@ pub fn render_post_ack_nudge() -> String {
 pub fn render_restore_header() -> String {
     format!(
         "{}",
-        ui::paint(Tone::Brand, "  tunlion restore — recover your identity from your 12 words")
+        ui::paint(Tone::Brand, "  tunlion id recover — recover your identity from your 12 words")
     )
 }
 
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn restore_header() {
         let s = render_restore_header();
-        assert!(s.contains("tunlion restore"), "must contain restore command");
+        assert!(s.contains("tunlion id recover"), "must name the recover command");
         assert!(s.contains("12 words"), "must mention 12 words");
     }
 
@@ -309,6 +309,6 @@ mod tests {
     fn post_ack_nudge() {
         let s = render_post_ack_nudge();
         assert!(s.contains("primary"), "must mention primary");
-        assert!(s.contains("tunlion pair --fleet"), "must suggest fleet pair");
+        assert!(s.contains("tunlion add --for device"), "must suggest enrolling a second device");
     }
 }

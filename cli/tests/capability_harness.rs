@@ -998,31 +998,27 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
 
     // 4. B must hold A's CERT for the revocation gate to bind (cert_revoked_for
     // keys off deviceCert.devicePub). The daemon records it when it resolves A's
-    // identity during the control; if not, record A's REAL cert now.
+    // identity during the control. This used to be PATCHED when missing (A's
+    // cert written into B's devices.json by the test), which meant the test
+    // could pass while the product never recorded the identity it revokes on:
+    // the revocation would then bind only because the test supplied its input.
+    // It is asserted instead, so a product that fails to record A's cert is red
+    // here, by name.
     let b_records = read_devices_json(&h.b_dir);
     let b_has_a_cert = b_records.as_array().unwrap().iter().any(|d| {
         d["name"].as_str() == Some("test-a") && d["deviceCert"]["devicePub"].as_str().is_some()
     });
-    if !b_has_a_cert {
-        let a_cert_val: Value = serde_json::from_str(
-            &std::fs::read_to_string(&a_cert_path).expect("a device cert"),
-        )
-        .expect("parse a device cert");
-        let a_cert = a_cert_val["cert"].clone();
-        assert!(a_cert["devicePub"].as_str().is_some(), "A's device cert has a devicePub");
-        let mut arr: Vec<Value> = read_devices_json(&h.b_dir).as_array().unwrap().clone();
-        for d in arr.iter_mut() {
-            if d["name"].as_str() == Some("test-a") {
-                d["userKey"] = serde_json::json!(a_cert["userPub"].as_str().unwrap_or_default());
-                d["deviceCert"] = a_cert.clone();
-            }
-        }
-        std::fs::write(
-            h.b_dir.join("devices.json"),
-            serde_json::to_string_pretty(&arr).unwrap(),
-        )
-        .expect("write b devices.json with A's cert");
-    }
+    let a_cert_on_disk = std::fs::read_to_string(&a_cert_path).unwrap_or_default();
+    assert!(
+        b_has_a_cert,
+        "B's daemon did not record A's device certificate after the control transfer \
+         resolved A, so a revocation on B has no devicePub to bind to (cert_revoked_for \
+         would be false whatever the product did). The test no longer writes the cert in \
+         for it.\nB devices.json:\n{}\nA device-cert.json:\n{a_cert_on_disk}\ncontrol send:\n{}{}",
+        serde_json::to_string_pretty(&b_records).unwrap_or_default(),
+        ctrl_send.stdout,
+        ctrl_send.stderr
+    );
 
     // 5. Revoke A on B.
     let revoke = Command::new(&bin)
@@ -1246,6 +1242,7 @@ fn two_nodes_pair_each_other() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "cold establish not yet verified on this platform")]
 fn pty_one_shot_exec_smoke() {
     // PTY one-shot exec smoke: starts daemons, pairs them, then runs
     // `tunlion pty <peer> -- echo NONCE` and verifies the echo output.
@@ -1258,13 +1255,9 @@ fn pty_one_shot_exec_smoke() {
     // fresh with known devices, giving the daemon warm link to stabilize
     // before the PTY command. The 3s kill gap + 12s settle was proven
     // effective in earlier CI runs (commit 1213120).
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("pty_one_shot_exec_smoke: skipped on {os} (cold establish not yet verified on this platform)",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    //
+    // Windows/macOS: IGNORED via cfg_attr above, not skipped by an early
+    // return, so the result says "ignored" instead of a false "ok".
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1429,6 +1422,7 @@ fn shell_owner_gate_refuses_real_spawn() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "cold establish not yet verified on this platform")]
 fn shell_daemon_live_pairing_no_restart() {
     // Proves the fix for main.rs:8381 — a `--shell` daemon started with
     // no known devices in a non-interactive context must NOT bail, AND the
@@ -1439,13 +1433,8 @@ fn shell_daemon_live_pairing_no_restart() {
     // that is necessary-not-sufficient: if the 9065 scan were broken,
     // the daemon would stay up but never find the new peer, making the
     // fix worthless. This test proves BOTH.
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("shell_daemon_live_pairing_no_restart: skipped on {os} (cold establish not yet verified on this platform)",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    //
+    // Windows/macOS: IGNORED via cfg_attr above (not an early-return "ok").
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1608,12 +1597,8 @@ fn shell_daemon_live_pairing_no_restart() {
 /// linux + windows, macOS needs real hardware.
 #[cfg(not(target_os = "macos"))]
 #[test]
+#[cfg_attr(windows, ignore = "warm-all first contact not yet verified on Windows")]
 fn warm_all_makes_first_contact_warm() {
-    #[cfg(windows)]
-    {
-        eprintln!("warm_all_makes_first_contact_warm: skipped on Windows");
-        return;
-    }
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -1867,6 +1852,7 @@ fn warm_all_makes_first_contact_warm() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "warm-reuse pty not yet verified on this platform")]
 fn warm_one_shot_pty_reuse() {
     // Proves fix/warm-one-shot-pty: a scripted `pty <peer> -- cmd` reuses the
     // daemon's warm-held link instead of cold-establishing.
@@ -1878,13 +1864,7 @@ fn warm_one_shot_pty_reuse() {
     //
     // Linux-only: macOS hyperkit bridge transport can't reliably complete a
     // QUIC establish. Verified on ubuntu with trace-confirmed warm reuse.
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("warm_one_shot_pty_reuse: skipped on {os} (warm-reuse pty not yet verified)",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    // Windows/macOS: IGNORED via cfg_attr above (not an early-return "ok").
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -2230,6 +2210,7 @@ fn freeze_stall_detector_classification() {
 }
 
 #[test]
+#[cfg_attr(any(windows, target_os = "macos"), ignore = "instant-EOF warm pty not yet verified on this platform")]
 fn warm_one_shot_pty_instant_eof() {
     // Proves fix/warm-oneshot-pty-reuse: one-shot `pty <peer> -- printf ...`
     // with INSTANT stdin-EOF (</dev/null) returns rc=0 with full output.
@@ -2238,13 +2219,7 @@ fn warm_one_shot_pty_instant_eof() {
     // writer, tearing down the pty before output arrived (hang / rc=124).
     // After the fix, the writer waits for the daemon to close the socket
     // (command exit), so output is delivered and the client returns cleanly.
-
-    #[cfg(any(windows, target_os = "macos"))]
-    {
-        eprintln!("warm_one_shot_pty_instant_eof: skipped on {os}",
-            os = if cfg!(windows) { "Windows" } else { "macOS" });
-        return;
-    }
+    // Windows/macOS: IGNORED via cfg_attr above (not an early-return "ok").
 
     let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
