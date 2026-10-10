@@ -25,6 +25,10 @@ fn armed_path() -> PathBuf {
 struct ArmedEntry {
     key_id: String,
     expires: u64,
+    /// The name the owner gave the invitee (`add <name> --out`), if any. Not
+    /// secret, not signed: it decides only what THIS store calls the device
+    /// that enrols with this key.
+    name: Option<String>,
 }
 
 fn load() -> Vec<ArmedEntry> {
@@ -38,7 +42,8 @@ fn load() -> Vec<ArmedEntry> {
         .filter_map(|e| {
             let key_id = e["key_id"].as_str()?.to_string();
             let expires = e["expires"].as_u64()?;
-            Some(ArmedEntry { key_id, expires })
+            let name = e["name"].as_str().map(str::to_string);
+            Some(ArmedEntry { key_id, expires, name })
         })
         .collect()
 }
@@ -46,7 +51,10 @@ fn load() -> Vec<ArmedEntry> {
 fn save(entries: &[ArmedEntry]) {
     let arr: Vec<serde_json::Value> = entries
         .iter()
-        .map(|e| json!({ "key_id": e.key_id, "expires": e.expires }))
+        .map(|e| match &e.name {
+            Some(n) => json!({ "key_id": e.key_id, "expires": e.expires, "name": n }),
+            None => json!({ "key_id": e.key_id, "expires": e.expires }),
+        })
         .collect();
     let Ok(body) = serde_json::to_string_pretty(&arr) else { return };
     // SecretFile::write_str is owner-only (0600) and atomic on POSIX, so the
@@ -57,11 +65,24 @@ fn save(entries: &[ArmedEntry]) {
 /// Record that an auth key is outstanding until `expires_at` (absolute unix
 /// seconds). Dedupes by key_id. The mint writes this directly; the daemon's
 /// per-tick arm-gate reads it.
-pub fn arm(key_id: String, expires_at: u64) {
+pub fn arm(key_id: String, expires_at: u64, name: Option<String>) {
     let mut entries = load();
     entries.retain(|e| e.key_id != key_id);
-    entries.push(ArmedEntry { key_id, expires: expires_at });
+    entries.push(ArmedEntry { key_id, expires: expires_at, name });
     save(&entries);
+}
+
+/// The name the owner chose for whoever enrols with this key, while the key
+/// is outstanding. `add beta --out f` then `join f` used to file the device
+/// under the JOINER's hostname, not "beta": the owner's choice was dropped at
+/// the mint.
+pub fn invitee_name(key_id: &str) -> Option<String> {
+    let now = crate::capability::now_secs();
+    load()
+        .into_iter()
+        .find(|e| e.key_id == key_id && e.expires > now)
+        .and_then(|e| e.name)
+        .filter(|n| !n.trim().is_empty())
 }
 
 /// Drop a key from the armed set (called when it burns, or on explicit disarm).
@@ -82,4 +103,25 @@ pub fn is_armed() -> bool {
         save(&entries);
     }
     !entries.is_empty()
+}
+
+#[cfg(test)]
+mod invitee_name_tests {
+    #[test]
+    fn the_owner_chosen_name_rides_with_its_key_until_expiry() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-armed-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let later = crate::capability::now_secs() + 600;
+        super::arm("aa".repeat(32), later, Some("beta".into()));
+        super::arm("bb".repeat(32), later, None);
+        super::arm("cc".repeat(32), 1, Some("gone".into()));
+        assert_eq!(super::invitee_name(&"aa".repeat(32)).as_deref(), Some("beta"));
+        assert_eq!(super::invitee_name(&"bb".repeat(32)), None, "unnamed invitation");
+        assert_eq!(super::invitee_name(&"cc".repeat(32)), None, "an expired key names nobody");
+        assert_eq!(super::invitee_name(&"dd".repeat(32)), None);
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

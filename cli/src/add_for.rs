@@ -268,7 +268,7 @@ pub(crate) async fn add_for_cmd(
     // no bind race, no platform branch, no control channel. The only thing the
     // mint cannot guarantee is that a RECEIVER is actually running to pick the
     // key up - check that, and offer to start one.
-    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires);
+    crate::armed::arm(hex::encode(inv.enroll_pub), inv.expires, _invitee_name.clone());
     // Make the daemon subscribe the enrollment channel NOW rather than on its next
     // idle tick, so a joiner that arrives within a second (a QR scan, a script) is
     // not left waiting on an empty channel. Measured: ~1.0-1.2 s back-to-back vs
@@ -387,9 +387,7 @@ pub(crate) async fn add_for_cmd(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        ui::say(&format!(
-            "  next: copy it to the other device, then run there:  tunlion join {file_name}"
-        ));
+        ui::say(&join_next_step(&file_name, _invitee_name.as_deref()));
     }
     // Non-interactive (--out or a pipe): no offer was printed above. Warn that a
     // receiver must be running to claim, which is the one thing the file write
@@ -416,4 +414,40 @@ pub(crate) fn receiver_not_running_note(can_install: bool) -> String {
     format!(
         "  note: the always-on receiver is not running; start `{start}` before anyone claims this invitation."
     )
+}
+
+/// The step printed after `add --out`: copy the file, then join with it. When
+/// the owner named the invitee, the join names it too, so both ends call the
+/// device what the owner chose (the joiner otherwise names itself after its
+/// hostname, and that is the name the owner's list showed). The owner's store
+/// uses the chosen name either way (`armed::invitee_name`). Pure.
+pub(crate) fn join_next_step(file_name: &str, invitee: Option<&str>) -> String {
+    let file = if file_name.chars().any(char::is_whitespace) {
+        format!("'{file_name}'")
+    } else {
+        file_name.to_string()
+    };
+    match invitee.filter(|n| !n.chars().any(char::is_whitespace) && !n.is_empty()) {
+        Some(n) => format!(
+            "  next: copy it to the other device, then run there:  tunlion join {file} --name {n}"
+        ),
+        None => format!("  next: copy it to the other device, then run there:  tunlion join {file}"),
+    }
+}
+
+#[cfg(test)]
+mod join_next_step_tests {
+    use super::join_next_step;
+
+    #[test]
+    fn the_join_step_carries_the_name_the_owner_chose() {
+        let named = join_next_step("beta-invite.txt", Some("beta"));
+        assert!(named.ends_with("tunlion join beta-invite.txt --name beta"), "{named}");
+        let plain = join_next_step("invite.txt", None);
+        assert!(plain.ends_with("tunlion join invite.txt"), "{plain}");
+        use clap::Parser;
+        let cmd = &named[named.find("tunlion").unwrap()..];
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
+    }
 }

@@ -553,6 +553,14 @@ pub(crate) async fn send_cmd(
     // displayed from our own local mint when pair-ok arrives.
     let mut send_words = String::new(); // the SPAKE2 password (only when use_code)
     let mut send_nameplate = String::new();
+    // A revoked device is refused before anything waits on it. It used to wait
+    // out the presence window and say "offline ... Is `tunlion up` running
+    // there?", sending the user to check a machine this one has cut off.
+    if let Some((n, _)) = &known_target {
+        if let Some(why) = revoked_send_refusal(n, &devices_records()) {
+            return Err(exit_codes::err(ExitKind::Denied, why));
+        }
+    }
     if let Some((n, sec)) = &known_target {
         ui::say(&format!(
             "  waiting for known device {}",
@@ -2404,4 +2412,54 @@ pub(crate) fn missing_input(path: &str, e: &std::io::Error) -> anyhow::Error {
         ExitKind::Usage,
         format!("cannot send '{path}': {why} (a local file problem; nothing was sent)"),
     )
+}
+
+/// The raw device records (empty when there is no store). Read only.
+fn devices_records() -> Vec<serde_json::Value> {
+    std::fs::read_to_string(crate::devices_store::devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// The refusal for a send to a device this one has revoked, or None. A
+/// revoked device is denied (exit 4), not offline: the remedy is a decision
+/// here, not a check on the other machine. Pure over the records.
+pub(crate) fn revoked_send_refusal(name: &str, records: &[serde_json::Value]) -> Option<String> {
+    let record = records
+        .iter()
+        .find(|d| d["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
+    let revoked = record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
+    revoked.then(|| {
+        format!(
+            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion devices restore {name}`; to drop it: `tunlion devices forget {name}`"
+        )
+    })
+}
+
+#[cfg(test)]
+mod revoked_send_tests {
+    use super::revoked_send_refusal;
+    use serde_json::json;
+
+    #[test]
+    fn a_send_to_a_revoked_device_is_refused_as_revoked() {
+        let records = vec![
+            json!({"name": "p9-b", "certRevoked": true}),
+            json!({"name": "laptop", "principalState": "revoked"}),
+            json!({"name": "desk", "certRevoked": false}),
+        ];
+        let r = revoked_send_refusal("p9-b", &records).expect("revoked is refused");
+        assert!(r.contains("revoked") && !r.contains("offline"), "{r}");
+        assert!(r.contains("tunlion devices restore p9-b"), "{r}");
+        assert!(revoked_send_refusal("LAPTOP", &records).is_some(), "durable revoke, any case");
+        assert_eq!(revoked_send_refusal("desk", &records), None);
+        assert_eq!(revoked_send_refusal("nobody", &records), None);
+        use clap::Parser;
+        for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b"] {
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
+        }
+    }
 }
