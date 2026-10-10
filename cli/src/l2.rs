@@ -1969,13 +1969,9 @@ pub struct ProbeOutcome {
 /// per-phase timings + verdict. Reuses `bring_up_to_known` (role "doctor"), so
 /// the phases/budgets are identical to a real connect, and cleans up BOTH the
 /// link (LinkGuard::close) and the mux (no leaked streams/pumps).
-pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<ProbeOutcome> {
-    establish_probe_within(server, peer, relay, None).await
-}
-
-/// `establish_probe` with the caller's bound. `reach --timeout <s>` passes its
-/// own; it used to apply only with `--until-direct`, so a plain `reach` always
-/// took the full 30 s on an offline peer whatever `--timeout` said.
+///
+/// `timeout_secs` is the caller's bound: `reach --timeout` and
+/// `doctor --timeout` pass theirs (None = FILAMENT_DOCTOR_PROBE_SECS or 30 s).
 pub async fn establish_probe_within(
     server: &str,
     peer: &str,

@@ -136,6 +136,7 @@ pub(crate) fn recover_identity(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
                 "identity": user_key.fingerprint(),
                 "restored": true,
                 "revokedStolenDevices": false,

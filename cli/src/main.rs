@@ -102,6 +102,7 @@ use recv_cmd::recv_cmd;
 mod send_cmd;
 /// `tunlion send --json`: the result object.
 mod send_report;
+mod transfer_history;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;

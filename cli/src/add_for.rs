@@ -343,6 +343,8 @@ pub(crate) async fn add_for_cmd(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "verb": "add",
                 "kind": kind,
                 "ceiling": ceiling,
                 "maxOffline": inv.max_offline,

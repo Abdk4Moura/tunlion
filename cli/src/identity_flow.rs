@@ -405,7 +405,11 @@ pub(crate) async fn init_experience(
             missing.push("--name <device>");
         }
         if !missing.is_empty() {
-            bail!("non-interactive init needs: {}", missing.join(", "));
+            // A usage error (exit 2): the command line is incomplete.
+            return Err(crate::exit_codes::err(
+                crate::exit_codes::ExitKind::Usage,
+                format!("non-interactive init needs: {}", missing.join(", ")),
+            ));
         }
     }
 
@@ -540,7 +544,10 @@ pub(crate) async fn init_experience(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "verb": "init",
                 "identity": user_key.fingerprint(),
+                "role": "owner",
                 "device": device_name,
                 "inbox": inbox,
                 "recoveryExported": true,

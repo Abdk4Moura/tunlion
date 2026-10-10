@@ -62,6 +62,7 @@ EXPECTED_GREEN=(
   "stepped-away sender: held|stepped-away wait"
   "U1: created once|u1-implicit-init"
   "daemon waits for the network|daemon-network-wait"
+  "exit codes: send missing file|exit-codes-blind-run"
 )
 
 # A missing PASS line has three different causes and they want different

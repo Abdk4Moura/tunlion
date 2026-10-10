@@ -38,9 +38,10 @@ pub async fn doctor_cmd(
     repeat: Option<u32>,
     json_out: bool,
     relay: bool,
+    timeout: Option<u64>,
 ) -> Result<()> {
     match device {
-        Some(dev) => probe_mode(server, &dev, watch, repeat, json_out, relay).await,
+        Some(dev) => probe_mode(server, &dev, watch, repeat, json_out, relay, timeout).await,
         None => preflight_mode(server, json_out).await,
     }
 }
@@ -54,13 +55,14 @@ async fn probe_mode(
     repeat: Option<u32>,
     json_out: bool,
     relay: bool,
+    timeout: Option<u64>,
 ) -> Result<()> {
     // Resolve the run count: --repeat wins; else --watch => WATCH_DEFAULT_REPEAT;
     // else a single probe.
     let runs = repeat.filter(|n| *n > 0).unwrap_or(if watch { WATCH_DEFAULT_REPEAT } else { 1 });
 
     if runs == 1 {
-        let outcome = crate::l2::establish_probe(server, device, relay).await?;
+        let outcome = crate::l2::establish_probe_within(server, device, relay, timeout).await?;
         if json_out {
             ui::json_out(&single_json(device, &outcome));
         } else {
@@ -75,7 +77,7 @@ async fn probe_mode(
         if !json_out {
             ui::say(&format!("tunlion doctor: probe {}/{} to '{device}'...", i + 1, runs));
         }
-        let outcome = crate::l2::establish_probe(server, device, relay).await?;
+        let outcome = crate::l2::establish_probe_within(server, device, relay, timeout).await?;
         if !json_out {
             // A compact per-run line so the user sees progress, with its verdict.
             let v = verdict(&outcome);
@@ -320,7 +322,10 @@ fn single_json(device: &str, o: &crate::l2::ProbeOutcome) -> Value {
         "total_ms": o.total_ms,
         "phases": o.timings.iter().map(timing_json).collect::<Vec<_>>(),
         "failed_phase": o.failed_phase.map(|p| p.label()),
-        "error": o.error,
+        // The shared failure object (null when the probe established).
+        "error": (!o.established).then(|| {
+            verb_error(crate::ping::cold_failure_kind(o.error.as_deref()), o.error.as_deref())
+        }),
         "path": o.path.as_ref().map(|p| p.to_json()),
         "verdict": {
             "healthy": v.healthy,
@@ -360,9 +365,13 @@ fn repeat_json(device: &str, outcomes: &[crate::l2::ProbeOutcome]) -> Value {
         }));
     }
     let unhealthy = outcomes.iter().filter(|o| !verdict(o).healthy).count();
+    let error = outcomes.iter().find(|o| !o.established).map(|o| {
+        verb_error(crate::ping::cold_failure_kind(o.error.as_deref()), o.error.as_deref())
+    });
     json!({
         // Every run established, the same rule the exit code applies.
         "ok": established == n,
+        "error": error,
         "kind": "filament-doctor-repeat",
         "device": device,
         "runs": n,
@@ -759,17 +768,14 @@ fn preflight_json(
         Ok(()) => json!({ "configured": true }),
         Err(e) => json!({ "configured": false, "detail": e }),
     };
-    json!({
+    let identity = crate::status_cmd::identity_fields();
+    let mut v = json!({
         // Healthy means the tunlion server answered (the exit code agrees).
         "ok": sig.is_ok(),
-        // Read only: the fingerprint, "joined", or null with no identity yet.
-        "identity": crate::identity_flow::has_identity().then(|| {
-            crate::identity::UserKey::load(&crate::platform::PlatformKeyStore)
-                .ok()
-                .flatten()
-                .map(|k| k.fingerprint())
-                .unwrap_or_else(|| "joined".to_string())
-        }),
+        // Read only, and the same two fields `status --json` carries: the
+        // owner fingerprint (or null) and the role.
+        "identity": identity.0,
+        "role": identity.1,
         "kind": "filament-doctor-preflight",
         "server": server,
         "signaling": sig_json,
@@ -784,7 +790,26 @@ fn preflight_json(
             "worst_phase": history.worst_phase.map(|(p, c)| json!({ "phase": p.label(), "count": c })),
             "spans_with_stall": history.spans_with_stall,
         },
-    })
+    });
+    if let Err(e) = sig {
+        v["error"] = verb_error(ExitKind::Network, Some(e));
+    }
+    v
+}
+
+/// The `error` object every verb's `--json` failure carries:
+/// `{"code","exit","message"}`, plus `detail` with the raw cause when there is
+/// one. `doctor` used to put a bare string here.
+fn verb_error(kind: ExitKind, raw: Option<&str>) -> Value {
+    let message = match kind {
+        ExitKind::Network => exit_codes::NETWORK_LINE.to_string(),
+        _ => raw.unwrap_or("the peer did not answer").to_string(),
+    };
+    let mut e = json!({ "code": kind.token(), "exit": kind.code(), "message": message });
+    if let Some(d) = raw.filter(|d| *d != e["message"].as_str().unwrap_or_default()) {
+        e["detail"] = json!(d);
+    }
+    e
 }
 
 // ----------------------------------------------------------------- helpers ----
@@ -840,6 +865,29 @@ mod tests {
         // One failed run in a --repeat is not healthy.
         let v = repeat_json("laptop", &[up, offline("timed out")]);
         assert_eq!(v["ok"], json!(false));
+    }
+
+    /// A doctor failure carries the same `error` object as every other verb:
+    /// `{"code","exit","message"}`, never a bare string.
+    #[test]
+    fn the_json_error_has_the_shared_shape() {
+        let o = offline("establishment timed out after 30s");
+        let e = &single_json("laptop", &o)["error"];
+        assert_eq!(e["code"], json!("unreachable"));
+        assert_eq!(e["exit"], json!(6));
+        assert_eq!(e["message"], json!("establishment timed out after 30s"));
+        let net = offline("signaling connect to https://x: dns error");
+        let e = &single_json("laptop", &net)["error"];
+        assert_eq!(e["code"], json!("network"));
+        assert_eq!(e["exit"], json!(7));
+        assert_eq!(e["message"], json!(exit_codes::NETWORK_LINE));
+        assert_eq!(e["detail"], json!("signaling connect to https://x: dns error"));
+        let mut up = offline("");
+        up.established = true;
+        up.error = None;
+        assert_eq!(single_json("laptop", &up)["error"], Value::Null);
+        let v = repeat_json("laptop", &[up, o]);
+        assert_eq!(v["error"]["exit"], json!(6));
     }
 
     #[test]

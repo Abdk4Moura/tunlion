@@ -380,6 +380,81 @@ pub(crate) async fn sshd_listening(port: u16) -> bool {
     false
 }
 
+/// Outstanding `reach` liveness probes: nonce -> the waiter. A warm link is
+/// only reported once the PEER answers on it, because a link whose far end
+/// was stopped or killed -9 stays "alive" locally until QUIC's idle timeout
+/// (~22-29 s measured), and reach used to say ok, warm, verified, exit 0 for
+/// that whole window.
+static LIVENESS: std::sync::Mutex<Option<HashMap<u64, tokio::sync::oneshot::Sender<()>>>> =
+    std::sync::Mutex::new(None);
+
+/// The `reach-ping` a daemon sends on a held link; the peer answers with a
+/// `reach-pong` carrying the same `n`. An older peer ignores the unknown type,
+/// so its warm link simply does not confirm and reach falls back to the full
+/// probe, which works with any version.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+pub(crate) fn liveness_ping(n: u64) -> Value {
+    json!({ "type": "reach-ping", "n": n })
+}
+
+/// The answer to a `reach-ping`, echoing its nonce.
+pub(crate) fn liveness_pong(ping: &Value) -> Value {
+    json!({ "type": "reach-pong", "n": ping["n"].clone() })
+}
+
+/// Register a probe; the receiver resolves when its pong arrives.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+pub(crate) fn liveness_register() -> (u64, tokio::sync::oneshot::Receiver<()>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if let Ok(mut m) = LIVENESS.lock() {
+        m.get_or_insert_with(HashMap::new).insert(n, tx);
+    }
+    (n, rx)
+}
+
+/// A `reach-pong` arrived: wake its waiter (an unknown or late nonce is
+/// ignored).
+pub(crate) fn liveness_answered(pong: &Value) {
+    let Some(n) = pong["n"].as_u64() else { return };
+    let tx = LIVENESS.lock().ok().and_then(|mut m| m.as_mut()?.remove(&n));
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
+}
+
+/// Forget a probe that timed out.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+fn liveness_forget(n: u64) {
+    if let Ok(mut m) = LIVENESS.lock() {
+        if let Some(m) = m.as_mut() {
+            m.remove(&n);
+        }
+    }
+}
+
+/// How long a warm link has to answer `reach-ping` (FILAMENT_REACH_PING_MS,
+/// default 1500 ms) before reach treats it as unconfirmed.
+// Called only by the unix control socket's warm ping (no control socket
+// elsewhere), so other targets see it unused.
+#[allow(dead_code)]
+pub(crate) fn liveness_window() -> Duration {
+    let ms = std::env::var("FILAMENT_REACH_PING_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1500);
+    Duration::from_millis(ms)
+}
+
 /// Answer a `tunlion reach`: report the daemon's warm link to `peer` (route,
 /// remote address, RTT, verified name). Synchronous - every fact is local (quinn
 /// already measured the RTT/addr; the route is the link's own label/ICE state), so
@@ -418,7 +493,7 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
     let path = net::describe_path(t.as_ref(), peer_ref.as_deref())
         .await
         .to_json();
-    let reply = json!({
+    let mut reply = json!({
         "ok": true,
         "warm": true,
         "direct": direct,
@@ -428,7 +503,26 @@ async fn handle_warm_ping(conn: &Conn, req: ctl::Req) {
         "verified": link.and_then(|l| l.verified_name.clone()),
         "path": path,
     });
-    req.reply(&reply).await;
+    // Confirm the far end is there before saying so: one reach-ping round
+    // trip, bounded. Spawned, so the event loop never waits on the peer (F8).
+    let (n, answered) = liveness_register();
+    let sent = t.send_control(&liveness_ping(n)).await.is_ok();
+    let window = liveness_window();
+    tokio::spawn(async move {
+        let t0 = Instant::now();
+        let ok = sent && matches!(tokio::time::timeout(window, answered).await, Ok(Ok(())));
+        if ok {
+            reply["alive_ms"] = json!(t0.elapsed().as_millis() as u64);
+            req.reply(&reply).await;
+        } else {
+            liveness_forget(n);
+            ui::debug(&format!(
+                "reach: warm link to '{peer}' did not answer a liveness ping in {}ms",
+                window.as_millis()
+            ));
+            req.reject("warm link did not answer").await;
+        }
+    });
 }
 
 /// Return only links the daemon already holds. This is deliberately passive:
@@ -784,4 +878,37 @@ pub(crate) fn reap_warm_bootstraps(pending: &mut PendingBootstraps) {
         waiters.retain(|(_, deadline)| *deadline > now);
     }
     pending.retain(|_, waiters| !waiters.is_empty());
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    /// A pong echoing the ping's nonce wakes exactly that probe; a stray or
+    /// late pong wakes nothing.
+    #[tokio::test]
+    async fn a_pong_answers_its_own_ping_only() {
+        let (n, rx) = liveness_register();
+        let (m, mut other) = liveness_register();
+        let ping = liveness_ping(n);
+        assert_eq!(ping["type"], json!("reach-ping"));
+        let pong = liveness_pong(&ping);
+        assert_eq!(pong, json!({ "type": "reach-pong", "n": n }));
+        liveness_answered(&pong);
+        assert!(tokio::time::timeout(Duration::from_secs(1), rx).await.is_ok());
+        assert!(other.try_recv().is_err(), "probe {m} must still be waiting");
+        liveness_answered(&json!({ "type": "reach-pong", "n": 999_999_999u64 }));
+        liveness_answered(&json!({ "type": "reach-pong" }));
+        liveness_forget(m);
+        assert!(liveness_window() >= Duration::from_millis(1));
+    }
+
+    /// No answer means no confirmation: the probe times out, it is never
+    /// reported as alive.
+    #[tokio::test]
+    async fn silence_is_not_alive() {
+        let (n, rx) = liveness_register();
+        assert!(tokio::time::timeout(Duration::from_millis(50), rx).await.is_err());
+        liveness_forget(n);
+    }
 }
