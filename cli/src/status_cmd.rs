@@ -101,8 +101,13 @@ pub(crate) fn tour_cmd() -> Result<()> {
 }
 
 /// The running daemon's mesh name table (`dns-names`), when one answers.
+///
+/// Asked of the control socket directly, NOT gated on `daemon_alive`: a daemon
+/// running from a binary with file capabilities (`setcap cap_net_admin`, the
+/// unprivileged kernel-TUN path) is non-dumpable, so its /proc/<pid>/exe is
+/// unreadable and `daemon_alive` reports it as not running. The socket
+/// answering is the evidence that matters here.
 fn mesh_names() -> Option<Value> {
-    daemon_alive()?;
     crate::ctl::dns_request(&json!({ "op": "dns-names" }))
 }
 
