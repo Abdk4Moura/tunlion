@@ -115,10 +115,15 @@ echo "## owner's devices after the re-join: [$names2]"
 echo "payload one" >"$WORK/one.txt"
 outS=$(A send --to p9b "$WORK/one.txt" 2>&1); rcS=$?
 echo "## send to the stale name: rc=$rcS"; echo "$outS" | tail -3 | sed 's/^/    /'
-# The chain is every backticked `tunlion ...` command in the hint, in order.
+# The chain is every backticked `tunlion ...` command in the RE-LINK hint, in
+# order: the sentence that starts where the reply names the successor. The
+# offline question before it ("Is `tunlion up` running there?") is about the
+# other machine, not a step to run here.
 mapfile -t chain < <(printf '%s\n' "$outS" | "$PYV" -c '
 import sys
 text = sys.stdin.read()
+at = text.find("is also paired here")
+text = text[at:] if at >= 0 else ""
 parts = text.split("`")[1::2]
 for p in parts:
     if p.startswith("tunlion "):
