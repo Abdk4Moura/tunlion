@@ -202,6 +202,9 @@ pub async fn reach_until_direct(
             _ = tokio::signal::ctrl_c() => std::process::exit(130),
         }
     }
+    // The answer is exit 5 whatever happens to the output: decide it first, so
+    // a reader that closed the pipe does not turn it into 0.
+    ui::exit_code_on_closed_pipe(5);
     if !json_out {
         let verdict = if saw_link {
             format!("still on relay after {timeout_s}s")

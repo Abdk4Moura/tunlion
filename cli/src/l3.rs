@@ -153,6 +153,21 @@ pub fn ipv6_disabled() -> bool {
 /// Pure so every branch is testable without breaking the host's networking.
 pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
     let e = err.to_ascii_lowercase();
+    // IN THIS ORDER, and only the first cause that applies is advised. A box
+    // with no /dev/net/tun and IPv6 disabled (a hardened container) used to
+    // be told to re-enable IPv6 with sysctl, which would have changed nothing:
+    // the error was "open /dev/net/tun: No such file or directory". The device
+    // is the first thing the kernel plane needs, so its absence is the cause
+    // whatever else is also true; then IPv6; then privilege.
+    if e.contains("tun") && (e.contains("no such file or directory") || e.contains("no such device")) {
+        return format!(
+            "/dev/net/tun does not exist here (a container started without --device /dev/net/tun, \
+             or a kernel without the tun module), so the kernel overlay cannot start. The \
+             userspace overlay is in use instead and needs no setup. For the kernel overlay, \
+             start the container with --device /dev/net/tun, or load the module (`modprobe tun`). \
+             Original error: {err}"
+        );
+    }
     if ipv6_off || e.contains("ipv6 is disabled") {
         return format!(
             "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), and tunlion's \
@@ -165,12 +180,6 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
         return format!(
             "no permission to create a network device: tunlion needs CAP_NET_ADMIN (run as root, \
              or grant the capability on the binary). Original error: {err}"
-        );
-    }
-    if e.contains("no such file or directory") && e.contains("tun") {
-        return format!(
-            "/dev/net/tun is missing: load the tun module (`modprobe tun`) or run somewhere it is \
-             available. Original error: {err}"
         );
     }
     if e.contains("busy") {
@@ -1282,6 +1291,27 @@ mod tests {
     fn the_error_text_alone_is_enough_to_name_ipv6() {
         let d = diagnose_tun_failure("Error: ipv6: IPv6 is disabled on this device.", false);
         assert!(d.contains("IPv6 is disabled"));
+    }
+
+    /// The blind test's container: no /dev/net/tun AND IPv6 disabled. The
+    /// advice must be about the missing device (the actual error) and must not
+    /// send the operator to sysctl or setcap, neither of which would help.
+    #[test]
+    fn a_missing_tun_device_is_the_cause_even_with_ipv6_disabled() {
+        let raw = "open /dev/net/tun: No such file or directory (os error 2)";
+        let d = diagnose_tun_failure(raw, true);
+        assert!(d.contains("/dev/net/tun does not exist"), "{d}");
+        assert!(d.contains("userspace overlay is in use"), "{d}");
+        assert!(d.contains("--device /dev/net/tun"), "{d}");
+        assert!(!d.contains("sysctl") && !d.contains("IPv6 is disabled"), "{d}");
+        assert!(!d.contains("CAP_NET_ADMIN") && !d.contains("setcap"), "{d}");
+        assert!(d.contains(raw), "{d}");
+        // A node present but no driver behind it: the same cause.
+        let nodev = diagnose_tun_failure("open /dev/net/tun: No such device", false);
+        assert!(nodev.contains("/dev/net/tun does not exist"), "{nodev}");
+        // With the device present, IPv6 still outranks privilege.
+        let both = diagnose_tun_failure("TUNSETIFF: Operation not permitted", true);
+        assert!(both.contains("IPv6 is disabled") && !both.contains("CAP_NET_ADMIN"), "{both}");
     }
 
     #[test]

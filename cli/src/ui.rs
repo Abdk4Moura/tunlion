@@ -272,6 +272,66 @@ fn paint_live(line: &str) {
     LIVE.store(true, Ordering::Relaxed);
 }
 
+// ------------------------------------------------------------- broken pipe --
+
+/// A reader that stopped reading is not a failure of this command.
+///
+/// `tunlion status | head -2` exited 101 with a Rust panic: Rust ignores
+/// SIGPIPE, so every write after `head` exits returns EPIPE, and `println!` /
+/// `eprintln!` panic on any write error. Standard tools die quietly there
+/// (SIGPIPE); this does the equivalent for the output macros everywhere at
+/// once: a panic whose cause is a print hitting a closed pipe ends the command
+/// with nothing more on the terminal, and every other panic reports exactly as
+/// before. The process exits with the code the command had ALREADY decided on
+/// (`exit_code_on_closed_pipe`), else 0, as ripgrep does: the consumer asked
+/// for less, and a pipeline under `set -o pipefail` must not fail because
+/// `head` did its job. A command whose answer IS its exit code decides it
+/// before printing: `status` with no daemon exits 11 piped into `head` exactly
+/// as it does unpiped (it exited 0 there, losing the answer a script needed).
+///
+/// SIGPIPE itself stays ignored on purpose. Restoring its default would also
+/// kill the daemon on any write to a peer or a child that went away, which is
+/// exactly the case the ignored signal exists for.
+pub fn exit_quietly_on_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if is_broken_pipe_print(payload) {
+            std::process::exit(CLOSED_PIPE_EXIT.load(Ordering::Relaxed));
+        }
+        previous(info);
+    }));
+}
+
+/// The exit code a closed pipe ends the command with: 0 unless the command
+/// has already decided its answer.
+static CLOSED_PIPE_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Record the exit code this command has decided on, BEFORE it prints, so a
+/// reader that closes the pipe early (`| head -1`) does not turn the answer
+/// into 0. Only for commands whose exit code is the answer; everything else
+/// keeps the default, 0.
+pub fn exit_code_on_closed_pipe(code: i32) {
+    CLOSED_PIPE_EXIT.store(code, Ordering::Relaxed);
+}
+
+/// True for the panic std raises when `print!`/`eprint!` hit a closed pipe:
+/// "failed printing to stdout: Broken pipe (os error 32)". Windows words EPIPE
+/// as "The pipe is being closed. (os error 232)".
+pub fn is_broken_pipe_print(msg: &str) -> bool {
+    msg.starts_with("failed printing to")
+        && (msg.contains("Broken pipe") || msg.contains("os error 32)") || msg.contains("os error 232)"))
+}
+// Deliberately NOT also "any error whose cause is BrokenPipe": a peer socket
+// or a child's stdin closing mid-transfer is a real failure of the command,
+// and exiting 0 on it would report a send that did not happen as a success.
+// Only the print macros' own panic names our stdout or stderr for certain.
+
 /// Permanent line (survives in scrollback); repaints any sticky line below.
 /// The raw emitter, every leveled helper funnels through here once it has
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
@@ -721,5 +781,31 @@ mod verbosity_tests {
 
         // restore default for any later same-process readers.
         VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
+    }
+
+    /// `tunlion status | head -2` exited 101: std panics with exactly this
+    /// text when a print hits a closed pipe. Only that panic is quiet; any
+    /// other panic, including one that merely mentions a pipe, still reports.
+    #[test]
+    fn only_a_print_into_a_closed_pipe_is_a_quiet_exit() {
+        assert!(is_broken_pipe_print("failed printing to stdout: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print("failed printing to stderr: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print(
+            "failed printing to stdout: The pipe is being closed. (os error 232)"
+        ));
+        assert!(!is_broken_pipe_print("failed printing to stdout: No space left on device (os error 28)"));
+        assert!(!is_broken_pipe_print("called `Result::unwrap()` on an `Err` value: Broken pipe"));
+        assert!(!is_broken_pipe_print("index out of bounds"));
+    }
+
+    /// A closed pipe ends the command with the code it had decided on, 0 by
+    /// default: `status | head -1` with no daemon must still exit 11.
+    #[test]
+    fn a_closed_pipe_keeps_the_decided_exit_code() {
+        use std::sync::atomic::Ordering;
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 0, "default: a reader that stopped is not a failure");
+        super::exit_code_on_closed_pipe(11);
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 11);
+        super::exit_code_on_closed_pipe(0);
     }
 }

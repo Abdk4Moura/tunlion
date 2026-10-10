@@ -87,63 +87,72 @@ impl Paths {
         Ok(repaired)
     }
 
-    /// Migrate state from a legacy `$HOME/.config/filament` directory (the
-    /// broken Windows fallback when HOME was unset, which resolved relative to
-    /// the process cwd). Best-effort, safe to call repeatedly.
+    /// Migrate state from a legacy `%USERPROFILE%\.config\filament` directory
+    /// (the broken Windows fallback when HOME was unset) into the platform
+    /// directory. Best-effort, safe to call repeatedly.
     ///
-    /// Two guards, both earned:
-    /// 1. An explicit FILAMENT_CONFIG_DIR override means the caller knows where
-    ///    their config lives; migrating INTO it would copy whatever a
-    ///    cwd-relative ".config/filament" resolves to — the production identity
-    ///    when the shell's cwd is $HOME (issue #149, a key clone). Never
-    ///    migrate under an override.
-    /// 2. The legacy location is pinned to home_dir(), not the process cwd.
-    ///    "./.config/filament" names a different directory in every process;
-    ///    with the default shell cwd of $HOME it was indistinguishable from the
-    ///    live production config, which is exactly what let the override case
-    ///    clone keys. When HOME is unset, home_dir() falls back to ".", which
-    ///    is the original broken-Windows behaviour.
+    /// WHY IT IS THIS NARROW. It used to run on every platform and COPY every
+    /// file. On Linux the "legacy" path, `$HOME/.config/filament`, is simply the
+    /// default config directory, so `XDG_CONFIG_HOME=/some/new/dir tunlion init`
+    /// found the live config there and copied identity.ed25519, overlay.ed25519,
+    /// proxy.token, devices.json, the logs and up.pid into the new directory
+    /// (only subdirectories escaped, because `fs::copy` cannot copy one). init
+    /// then refused with the OLD identity's fingerprint, `up` reported the old
+    /// config's daemon as already running, and `down` there killed it: a key
+    /// clone plus a second config acting on the first one's daemon.
+    ///
+    /// So, see `legacy_migration`: only on Windows, where the two directories
+    /// really are the old and new homes of the same install; never under an
+    /// explicit FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME (the caller chose where
+    /// their config lives, #149); and as a MOVE of the whole directory, never a
+    /// copy, so secrets never exist in two places. A move that fails leaves
+    /// the legacy directory where it was and copies nothing.
     pub fn migrate_legacy() {
-        if std::env::var_os("FILAMENT_CONFIG_DIR").is_some() {
-            return;
-        }
-        let legacy = Self::home_dir().join(".config").join("filament");
-        if !legacy.is_dir() {
-            return;
-        }
+        let overridden = std::env::var_os("FILAMENT_CONFIG_DIR").is_some()
+            || std::env::var_os("XDG_CONFIG_HOME").is_some();
+        let Some(home) = Self::home_dir_known() else { return };
+        let legacy = home.join(".config").join("filament");
         let target = Self::config_dir();
-        if target == legacy || target.exists() {
-            return;
-        }
-        let _ = std::fs::create_dir_all(&target);
-        if let Ok(entries) = std::fs::read_dir(&legacy) {
-            for e in entries.flatten() {
-                let dest = target.join(e.file_name());
-                let _ = std::fs::copy(e.path(), &dest);
+        if let Some((from, to)) = legacy_migration(&legacy, &target, overridden, cfg!(windows)) {
+            if let Some(parent) = to.parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
+            let _ = std::fs::rename(&from, &to);
         }
     }
 
     /// Platform-aware home directory for the current user.
-    /// Unix: `$HOME`. Windows: `%USERPROFILE%`. Falls back to `"."` when unset.
+    /// Unix: `$HOME`, else the password database's home for this uid.
+    /// Windows: `%USERPROFILE%`. Falls back to `"."` when neither says; a
+    /// caller that would PERSIST a path derived from it uses `home_dir_known`.
     pub fn home_dir() -> PathBuf {
+        Self::home_dir_known().unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The home directory, or None when nothing names one. `env -u HOME` (cron,
+    /// a container, a service manager) is not "no home": the password database
+    /// still knows it, and reading it is what `getent passwd` does. Without
+    /// this, `init` wrote `dir ./Tunlion` to the config, a path that names a
+    /// different directory from every working directory the daemon runs in.
+    /// Only an absolute answer counts.
+    pub fn home_dir_known() -> Option<PathBuf> {
         #[cfg(unix)]
         {
             if let Ok(h) = std::env::var("HOME") {
                 if !h.is_empty() {
-                    return PathBuf::from(h);
+                    return Some(PathBuf::from(h));
                 }
             }
+            passwd_home().filter(|p| p.is_absolute())
         }
         #[cfg(windows)]
         {
-            if let Ok(h) = std::env::var("USERPROFILE") {
-                if !h.is_empty() {
-                    return PathBuf::from(h);
-                }
-            }
+            std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()).map(PathBuf::from)
         }
-        PathBuf::from(".")
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
     }
 
     /// Platform-aware shell for PTY sessions. Returns `(argv, can_use_user)`.
@@ -208,6 +217,41 @@ impl Paths {
             "/bin/sh".into()
         }
     }
+}
+
+/// The one legacy move `migrate_legacy` may make, as (from, to), or None.
+/// Pure so every refusal is testable: not on a platform whose legacy path is
+/// its real config dir (everything but Windows), not under an explicit config
+/// location, not onto a directory that already exists, and not a directory
+/// onto itself.
+pub(crate) fn legacy_migration(
+    legacy: &Path,
+    target: &Path,
+    overridden: bool,
+    windows: bool,
+) -> Option<(PathBuf, PathBuf)> {
+    if !windows || overridden || legacy == target || target.exists() || !legacy.is_dir() {
+        return None;
+    }
+    Some((legacy.to_path_buf(), target.to_path_buf()))
+}
+
+/// The home directory the password database records for this effective uid.
+#[cfg(unix)]
+fn passwd_home() -> Option<PathBuf> {
+    use std::ffi::CStr;
+    let uid = unsafe { libc::geteuid() };
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: getpwuid_r writes only into `pwd` and `buf`, both owned here and
+    // sized as passed; `result` is either null or `&pwd`.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_str().ok()?;
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
 fn repair_sensitive_permissions_in(dir: &Path) -> std::io::Result<usize> {
@@ -1344,6 +1388,110 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// The blind-test report, exactly: a populated default config at
+    /// `$HOME/.config/filament`, then `XDG_CONFIG_HOME=<new empty dir>`. The
+    /// new directory received copies of identity.ed25519, overlay.ed25519,
+    /// proxy.token, devices.json and up.pid. Nothing may appear there, and the
+    /// default config must be left exactly as it was.
+    #[test]
+    fn an_xdg_config_home_is_never_filled_from_the_default_config() {
+        let uid = format!(
+            "{}-xdg-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let work = std::env::temp_dir().join(format!("fil-cfg-{uid}"));
+        let home = work.join("home");
+        let legacy = home.join(".config").join("filament");
+        let xdg = work.join("deep").join("new-xdg");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        for f in ["identity.ed25519", "overlay.ed25519", "proxy.token", "devices.json", "up.pid"] {
+            std::fs::write(legacy.join(f), b"the default config's").unwrap();
+        }
+
+        let _guard = crate::tests::lock_test_config();
+        let old_home = std::env::var_os("HOME");
+        let old_override = std::env::var_os("FILAMENT_CONFIG_DIR");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var("FILAMENT_CONFIG_DIR");
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        }
+        Paths::migrate_legacy();
+        let restore = |k: &str, v: Option<std::ffi::OsString>| match v {
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        };
+        restore("HOME", old_home);
+        restore("FILAMENT_CONFIG_DIR", old_override);
+        restore("XDG_CONFIG_HOME", old_xdg);
+
+        let mut copied = Vec::new();
+        let mut stack = vec![xdg.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if e.path().is_dir() {
+                    stack.push(e.path());
+                } else {
+                    copied.push(e.path());
+                }
+            }
+        }
+        assert!(copied.is_empty(), "the new XDG config dir received files: {copied:?}");
+        for f in ["identity.ed25519", "overlay.ed25519", "proxy.token", "devices.json", "up.pid"] {
+            assert!(legacy.join(f).is_file(), "the default config lost {f}");
+        }
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn the_legacy_move_happens_only_on_windows_unoverridden_and_never_onto_a_dir() {
+        let work = std::env::temp_dir().join(format!("fil-legacy-pure-{}", std::process::id()));
+        let legacy = work.join("legacy");
+        let target = work.join("appdata").join("filament");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // The one case that moves: Windows, no override, target absent.
+        assert_eq!(
+            legacy_migration(&legacy, &target, false, true),
+            Some((legacy.clone(), target.clone()))
+        );
+        // Linux and macOS: the "legacy" path is the real config dir.
+        assert_eq!(legacy_migration(&legacy, &target, false, false), None);
+        // An explicit FILAMENT_CONFIG_DIR or XDG_CONFIG_HOME.
+        assert_eq!(legacy_migration(&legacy, &target, true, true), None);
+        // Onto itself, or onto a directory that already exists.
+        assert_eq!(legacy_migration(&legacy, &legacy, false, true), None);
+        std::fs::create_dir_all(&target).unwrap();
+        assert_eq!(legacy_migration(&legacy, &target, false, true), None);
+        // No legacy directory: nothing to move.
+        let _ = std::fs::remove_dir_all(&target);
+        assert_eq!(legacy_migration(&work.join("absent"), &target, false, true), None);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// `env -u HOME`: the home still comes from the password database, and
+    /// whatever answer there is is absolute (never `.`).
+    #[cfg(unix)]
+    #[test]
+    fn with_home_unset_the_home_dir_is_the_password_databases_and_absolute() {
+        let _guard = crate::tests::lock_test_config();
+        let old_home = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        let known = Paths::home_dir_known();
+        let fallback = Paths::home_dir();
+        match old_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert_eq!(known, super::passwd_home().filter(|p| p.is_absolute()));
+        if let Some(h) = known {
+            assert!(h.is_absolute(), "{h:?}");
+            assert_eq!(fallback, h);
+        }
     }
 }
 

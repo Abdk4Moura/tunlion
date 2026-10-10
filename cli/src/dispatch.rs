@@ -766,9 +766,8 @@ pub(crate) async fn async_main() -> Result<()> {
                                 let exp = if identity::now_secs() >= cert.expires {
                                     "EXPIRED".to_string()
                                 } else {
-                                    format!(
-                                        "{}d",
-                                        cert.expires.saturating_sub(identity::now_secs()) / 86400
+                                    crate::device_view::remaining_span(
+                                        cert.expires.saturating_sub(identity::now_secs()),
                                     )
                                 };
                                 println!(
