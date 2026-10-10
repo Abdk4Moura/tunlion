@@ -28,6 +28,8 @@
 #   I  `init` under a read-only config parent: fails, and leaves no orphan
 #      recovery-phrase file for an identity that was never created.
 #   H  `up --detach` with a HOME that does not exist names the path it needed.
+#   X  with 127.0.0.1:1080 held, the daemon's auto SOCKS5 proxy binds another
+#      port and says which, instead of announcing 1080 and binding nothing.
 #
 # D, W, O and T mount small tmpfs filesystems, so they need passwordless sudo
 # (GitHub's ubuntu runners have it). Without it the script REFUSES (exit 2)
@@ -170,6 +172,38 @@ else
   bad "gateP: no daemon pid to stop (gate S setup failed)"
 fi
 env FILAMENT_CONFIG_DIR="$DS" timeout 15 "$BIN" down -y >/dev/null 2>&1
+
+# ===================================================================== GATE X ==
+say "X: the auto SOCKS5 proxy reports the port it actually bound"
+# Hold 127.0.0.1:1080 (another daemon on this box may already hold it, which is
+# the same situation), then start a userspace-L3 daemon whose auto-proxy wants
+# 1080. It used to announce 1080 anyway and bind nothing.
+python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(('127.0.0.1', 1080)); s.listen(4)
+except OSError:
+    pass
+time.sleep(120)
+" >/dev/null 2>&1 &
+pids+=($!)
+sleep 1
+DX="$WORK/cfg-socks"; mkdir -p "$DX"
+env FILAMENT_CONFIG_DIR="$DX" "$BIN" init --name socksy --recovery-file "$WORK/socks-rec.txt" --yes >/dev/null 2>&1
+env FILAMENT_CONFIG_DIR="$DX" "$BIN" set l3-mode userspace >/dev/null 2>&1
+env FILAMENT_CONFIG_DIR="$DX" "$BIN" set auto-proxy on >/dev/null 2>&1
+env FILAMENT_CONFIG_DIR="$DX" timeout 30 "$BIN" --server "$SERVER" up --detach --dir "$WORK/socks-drop" >/dev/null 2>&1
+for _ in $(seq 1 20); do grep -q "SOCKS5 proxy" "$DX/daemon.log" 2>/dev/null && break; sleep 0.5; done
+grep -i "socks5" "$DX/daemon.log" 2>/dev/null | sed 's/^/    /' | head -5
+if grep -qE "started SOCKS5 proxy on 127\.0\.0\.1:10(8[1-9]) \(1080 was taken\)" "$DX/daemon.log" 2>/dev/null \
+   && ! grep -q "SOCKS5 proxy on 127.0.0.1:1080 " "$DX/daemon.log" 2>/dev/null; then
+  ok "gateX: with 1080 held, the auto-proxy says the port it really bound"
+else
+  bad "gateX: auto-proxy port report"
+  tail -15 "$DX/daemon.log" 2>/dev/null
+fi
+FILAMENT_CONFIG_DIR="$DX" timeout 15 "$BIN" down -y >/dev/null 2>&1
 
 # ============================================= transfer fixture (D, W, N) ======
 # Owner A runs a daemon; B joins A's fleet and receives into a tiny disk.
