@@ -57,6 +57,10 @@ pub const MAX_DC_PAYLOAD: usize = 60 * 1024;
 const HIGH_WATER: usize = 4 * 1024 * 1024;
 const LOW_WATER: usize = 1024 * 1024;
 pub const WATCHDOG_SECS: u64 = 15;
+/// How long `DataChannelTransport::flush` waits with bytes still buffered and
+/// NOT ONE of them acknowledged before it declares the peer gone. Progress, not
+/// throughput: any acknowledged byte restarts it (see `flush`).
+pub const DC_FLUSH_STALL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long a DataChannel write may wait while the SCTP association
 /// acknowledges NOTHING before the channel is declared dead.
@@ -780,9 +784,35 @@ impl Transport for DataChannelTransport {
 
     async fn flush(&self) -> Result<()> {
         // Tail-drain only; polling is fine for the final few buffers.
+        //
+        // BOUNDED ON PROGRESS. `buffered_amount` only falls when the peer's SCTP
+        // stack acknowledges (SACK) what we wrote. A peer that exits or is
+        // killed right after reading our last message never acknowledges it,
+        // and nothing closes the association, so the read loop never marks the
+        // channel dead either: an unbounded poll here waited forever. That was
+        // the receiver that kept running after it had the whole verified file
+        // (gate 11c, G-k): its event loop sat in this loop behind the
+        // delivery-ack the sender had already read before exiting. Any drop in
+        // `buffered_amount` restarts the clock, so a slow link that still moves
+        // is never cut off; only a peer that acknowledges nothing at all is.
+        let mut last = self.raw.buffered_amount();
+        let mut deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
         while self.raw.buffered_amount() > 0 {
             if self.is_dead() {
                 return Err(anyhow!("channel closed while flushing"));
+            }
+            let now = self.raw.buffered_amount();
+            if now < last {
+                deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
+            }
+            last = now;
+            if tokio::time::Instant::now() >= deadline {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.drained.notify_waiters();
+                return Err(anyhow!(
+                    "data channel flush got no acknowledgement for {}s, the peer is gone",
+                    DC_FLUSH_STALL.as_secs()
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

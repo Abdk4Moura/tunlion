@@ -59,6 +59,7 @@ EXPECTED_GREEN=(
   "transferred + hash match within ceiling|bulk transfer"
   "active link preserved across same-uid reconnect|flow-preserve (#28)"
   "deferred drop: flowing link survives its peer-left|deferred-drop (#28 trigger)"
+  "quiet-exit fired (peer-left dropped)|quiet-exit (G-k)"
   "stepped-away sender: held|stepped-away wait"
   "U1: created once|u1-implicit-init"
   "daemon waits for the network|daemon-network-wait"
