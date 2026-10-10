@@ -83,7 +83,7 @@ impl Paths {
         let repaired = repair_sensitive_permissions_in(&dir)?;
         // Best-effort stamp: a failure to write it just means the sweep runs
         // once more next time, which is acceptable for a migration.
-        let _ = std::fs::write(&stamp, MIGRATION_VERSION.to_string());
+        let _ = SecretFile::write_str(&stamp, &MIGRATION_VERSION.to_string());
         Ok(repaired)
     }
 
