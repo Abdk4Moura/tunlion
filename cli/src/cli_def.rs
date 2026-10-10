@@ -69,7 +69,7 @@ EXAMPLES
 EXIT CODES
   0    success
   1    any other error
-  2    usage: bad arguments or flags
+  2    usage: bad arguments or flags, or a missing local prerequisite (mount without FUSE)
   3    unknown device, or not paired with this one
   4    denied: refused by the peer, a capability, or the system
   5    reach --until-direct: the link is up but still on a relay

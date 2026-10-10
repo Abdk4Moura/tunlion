@@ -40,7 +40,9 @@ pub(crate) const DAEMON_CONFLICT: i32 = 10;
 pub(crate) enum ExitKind {
     /// Anything not classified below.
     Other,
-    /// Bad arguments, a missing value, flags that cannot go together.
+    /// Bad arguments, a missing value, flags that cannot go together, or a
+    /// missing local prerequisite the user has to set up first (`mount`
+    /// without FUSE): input or environment, never the peer.
     Usage,
     /// No such device, or it is not paired with this one.
     UnknownDevice,
