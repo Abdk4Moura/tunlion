@@ -3464,7 +3464,15 @@ pub(crate) async fn recv_cmd(
                         .unwrap_or(false);
                     if fresh || link_dead {
                         ui::say(&format!("known device '{n}' appeared, connecting"));
-                        devices_touch(n, None, None); // track last_seen; addresses filled on ChannelReady
+                        // NOT a sighting. This is the server's roster, which it
+                        // re-pushes on every (re)subscribe and sync tick, and
+                        // which can still carry a session the device no longer
+                        // has (a reset device, a killed daemon not yet timed
+                        // out). Touching lastSeen here kept a wiped device at
+                        // "last seen just now" while `add`, reading the same
+                        // record a minute later, said "1m ago". lastSeen moves
+                        // only on a link whose peer is demonstrably present
+                        // (daemon_ctl::peer_present, the liveness observation).
                     } else {
                         ui::trace(&format!(
                             "known device '{n}' re-announced (link already up)"

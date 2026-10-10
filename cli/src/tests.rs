@@ -4885,3 +4885,23 @@ fn a_relay_peer_that_went_silent_is_not_present() {
     assert!(peer_present(true, false, None, 1_000));
     assert!(!peer_present(true, false, None, 9_000));
 }
+
+/// One source of truth for "last seen": a server roster announcement is not a
+/// sighting. The `known device appeared` branch touched lastSeen on every
+/// roster re-push, so a reset (wiped) device read "last seen just now" in
+/// `devices` while `add` said "1m ago" from the same record. The only writers
+/// left are the presence observation (peer_present) and an announce received
+/// over a live link.
+#[test]
+fn a_roster_announcement_does_not_refresh_last_seen() {
+    let src = include_str!("recv_cmd.rs");
+    let at = src
+        .find("appeared, connecting\"")
+        .expect("the known-device announcement branch exists");
+    let branch = &src[at..];
+    let branch = &branch[..branch.find("} else {").expect("branch end")];
+    assert!(
+        !branch.contains("devices_touch("),
+        "the roster announcement must not refresh lastSeen:\n{branch}"
+    );
+}
