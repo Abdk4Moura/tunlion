@@ -254,6 +254,11 @@ fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
 /// target; RECV accepts from any link, gated per-link by consent/trust.
 const MAX_LINKS: usize = 16;
 
+/// The longest the event loop waits on a best-effort control send to one link
+/// (the periodic `state` ping, the stall probe). Those sends run inline, so an
+/// unbounded one hands the whole loop to whichever peer stopped acknowledging.
+pub(crate) const CONTROL_PROBE_BUDGET: Duration = Duration::from_secs(2);
+
 /// RESILIENCE state, split out of the `Conn` god-struct so the stall/relay/
 /// warm-standby/upgrade-probe bookkeeping is one named bag, not mixed in with
 /// signaling + protocol state. The pure decisions live in `resilience.rs`.
@@ -2890,12 +2895,21 @@ impl Conn {
     /// a send that returns Ok over a reliable channel is sufficient evidence
     /// the transport itself is up; a dead transport errors or is flagged dead and
     /// returns Err here.
+    ///
+    /// BOUNDED by [`CONTROL_PROBE_BUDGET`]: this runs inline in the event loop,
+    /// and a write to a peer that vanished without closing the association does
+    /// not error, it waits for an acknowledgement that never comes. A probe that
+    /// cannot even be queued within the budget is a link that is not answering.
     pub(crate) async fn link_alive(&self, pid: &str) -> bool {
         match self.transport_of(pid) {
-            Some(t) => t
-                .send_control(&json!({ "type": "ping", "v": 1, "reason": "stall-probe" }))
-                .await
-                .is_ok(),
+            Some(t) => matches!(
+                tokio::time::timeout(
+                    CONTROL_PROBE_BUDGET,
+                    t.send_control(&json!({ "type": "ping", "v": 1, "reason": "stall-probe" })),
+                )
+                .await,
+                Ok(Ok(()))
+            ),
             None => false,
         }
     }
