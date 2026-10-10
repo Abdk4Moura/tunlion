@@ -36,7 +36,7 @@ pub(crate) fn devices_store(name: &str, secret: &str) -> Result<String> {
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
 /// working byte-for-byte, no regression.
 ///
-/// Owner re-pair: the ONLY caller is the owner-run `tunlion pair` ceremony
+/// Owner re-pair: the ONLY caller is the owner-run `tunlion add` ceremony
 /// (pair_cmd.rs), where the local user ran the command and the PAKE confirmed
 /// the peer. That is the owner decision that may re-key an existing record of
 /// the same name, so this passes `allow_reanchor`. A secret that arrives over

@@ -4346,7 +4346,7 @@ fn c1_owner_repair_still_rekeys() {
     let _guard = lock_test_config();
     let dir = td("c1-owner");
     c1_seed(&dir);
-    // The owner-run `tunlion pair` path (devices_store_v2 -> allow_reanchor).
+    // The owner-run `tunlion add` path (devices_store_v2 -> allow_reanchor).
     devices_store_v2("laptop", &"9".repeat(64), &["transfer".to_string()]).unwrap();
     let arr: Vec<Value> =
         serde_json::from_str(&std::fs::read_to_string(dir.join("devices.json")).unwrap()).unwrap();

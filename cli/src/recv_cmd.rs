@@ -876,7 +876,7 @@ pub(crate) async fn recv_cmd(
     // without `v:2`) and then handed a fresh pair secret over a DataChannel
     // whose DTLS fingerprints the signaling server chose, so a malicious
     // server could MITM it and keep the secret. Pairing from the console now
-    // points at `tunlion pair`, which runs the SPAKE2 ceremony.
+    // points at `tunlion add` / `tunlion join`, which run the SPAKE2 ceremony.
     // Receive-side transfer/consent state, grouped out of this function's locals
     // (still a plain local; no handler extraction yet). See `RecvState`.
     let mut st = RecvState {
@@ -7121,7 +7121,7 @@ pub(crate) async fn recv_cmd(
                 } else if daemon && (ans == "pair" || ans == "code" || regex_lite_code(&line)) {
                     // The console no longer pairs in-session: that ceremony
                     // was a v1 code plus a pair secret over a DataChannel the
-                    // signaling server could MITM. `tunlion pair` runs the
+                    // signaling server could MITM. `tunlion add` / `tunlion join` run the
                     // SPAKE2 ceremony, and the running daemon picks the new
                     // device up from the store.
                     ui::say(&ui::paint(
