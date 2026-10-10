@@ -1725,15 +1725,21 @@ pub(crate) async fn async_main() -> Result<()> {
                 // resource id, still found nothing and declined every route.
                 // Only a bare, self-scoped grant can be genuinely redundant.
                 let resource_scoped = cap_resource != "self";
-                if !resource_scoped && ceiling.iter().any(|c| c == &capability) {
-                    bail!(
+                // The same decision the pairing hint asks (`grant_vs_ceiling`),
+                // so a hint can never name a grant this refuses.
+                match crate::pair_cmd::grant_vs_ceiling(
+                    Some(ceiling.as_slice()),
+                    &capability,
+                    resource_scoped,
+                ) {
+                    crate::pair_cmd::GrantVsCeiling::AlreadyCovered => bail!(
                         "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
-                    );
+                    ),
+                    _ => bail!(
+                        "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
+                        ceiling.join(", ")
+                    ),
                 }
-                bail!(
-                    "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
-                    ceiling.join(", ")
-                );
             }
             if user && owner_pk.is_none() {
                 bail!(
