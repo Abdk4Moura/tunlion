@@ -426,6 +426,36 @@ fn repair_sensitive_file(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+// ------------------------------------------------------ termination signal --
+
+/// Wait for a signal that ends the process from outside (SIGTERM, SIGHUP,
+/// SIGQUIT on Unix) and return the conventional exit status for it (128 + n).
+/// Never resolves where there is no such signal to wait for. A caller holding
+/// the terminal in raw mode restores it before exiting: a signal skips every
+/// Drop, so a guard alone would leave the user's shell stair-stepping.
+pub async fn termination_signal() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hup), Ok(mut quit)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::quit()),
+        ) else {
+            return std::future::pending::<i32>().await;
+        };
+        tokio::select! {
+            _ = term.recv() => 143,
+            _ = hup.recv() => 129,
+            _ = quit.recv() => 131,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<i32>().await
+    }
+}
+
 // ------------------------------------------------------------ SecretFile --
 
 // The safe restricted-file writer now lives in the standalone `secret-write`

@@ -388,7 +388,9 @@ pub(crate) fn handle_identity_expose(
         l.identity_cert_expires = Some(deadline);
         l.principal_kind = principal_kind;
     }
-    ui::say(&format!(
+    // The raw signaling id is an internal: -v only. The person already sees
+    // the peer named on the roster line; the proof itself is not news to them.
+    ui::debug(&format!(
         "{} identity proven for peer {}",
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
         pid

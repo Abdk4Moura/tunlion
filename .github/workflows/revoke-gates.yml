@@ -138,7 +138,8 @@ jobs:
             [cli/tests/fleet-cert-gates.sh]=23
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
-            [cli/tests/l2-revoke-gates.sh]=3
+            # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
+            [cli/tests/l2-revoke-gates.sh]=4
             # 4 = gates A/B/C + the setup-grant slot. The grant those gates
             # depend on was never checked and in fact fails for the vouched
             # record; the slot reports it (KNOWN-RED today, counted here).
