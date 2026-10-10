@@ -309,14 +309,8 @@ pub(crate) async fn add_for_cmd(
         // not changed - this call site prints the token separately).
         if ui::qr_fits(token.as_str(), 8) {
             eprintln!("{}", ui::qr(token.as_str()));
-        } else {
-            eprintln!(
-                "  (the QR needs {} rows and this window has {}; the top would be cut off - the code is below)",
-                ui::qr_rows(token.as_str()).unwrap_or(0),
-                crossterm::terminal::size()
-                    .map(|(_, h)| h as usize)
-                    .unwrap_or(0)
-            );
+        } else if let Some(note) = ui::qr_too_tall_note(token.as_str(), 8) {
+            eprintln!("  {note}; the code is below");
         }
         eprintln!("{}", token.as_str());
         eprintln!("  keep this window open so the QR stays on screen; the other device scans it");

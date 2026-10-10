@@ -178,6 +178,19 @@ impl Link {
         self.verified_name.as_deref().unwrap_or(&self.name)
     }
 
+    /// DISPLAY only, never a lookup key: the proven petname, else the petname
+    /// this link is being dialed as (the known-device hypothesis, not yet
+    /// proven), else the broadcast name. Progress lines read "ok <petname>"
+    /// instead of a raw peer id or `user@host` for a device the user named.
+    /// `shown()` stays as it is because last-seen and overlay naming key on
+    /// it, and an unproven hypothesis must not touch a device record.
+    pub(crate) fn label(&self) -> &str {
+        self.verified_name
+            .as_deref()
+            .or(self.expected_secret.as_ref().map(|(n, _)| n.as_str()))
+            .unwrap_or(&self.name)
+    }
+
     /// Admit this link as a delegated (auth-key-enrolled) principal.
     /// Ensures caps are structurally tied to the Proven identity — a Delegated
     /// principal CANNOT exist without its ceiling.
@@ -229,6 +242,15 @@ impl Link {
     }
 }
 
+/// How long a command waits on a known device with NO presence before saying
+/// it may simply be offline (it keeps waiting until its own timeout).
+pub(crate) const OFFLINE_HINT_AFTER: Duration = Duration::from_secs(5);
+
+/// The one-time hint for a known device that has not appeared at all.
+pub(crate) fn offline_hint(peer: &str) -> String {
+    format!("tunlion: {peer} doesn't seem to be online. Is `tunlion up` running there?")
+}
+
 /// C26: per-peer presence for the static status roster.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Presence {
@@ -236,6 +258,31 @@ pub(crate) enum Presence {
     Ready,
     Away,
     Reconnecting,
+}
+
+/// True when a link's label is an identifier rather than a name: the
+/// signaling id or uid it was filed under, or a long run of hex (a key or id
+/// a peer announced in place of a name). Shown to a person only under -v.
+pub(crate) fn label_is_raw_id(label: &str, id: &str, uid: Option<&str>) -> bool {
+    label == id
+        || uid == Some(label)
+        || (label.len() >= 16 && label.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        || looks_like_session_id(label)
+}
+
+/// A signaling session id by its shape: 20 base64url characters mixing upper
+/// case, lower case and digits (`hNZONFIoto2k9bQ9ABGV`). A link can carry one
+/// that is not its own key (the name it was filed under came from an earlier
+/// session), so `label == id` missed it and a person read "ok
+/// hNZONFIoto2k9bQ9ABGV" on the roster line. A device name of exactly that
+/// shape is not a name anyone types. Pure.
+pub(crate) fn looks_like_session_id(label: &str) -> bool {
+    let count = |f: fn(&char) -> bool| label.chars().filter(|c| f(c)).count();
+    label.len() == 20
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && count(char::is_ascii_digit) >= 2
+        && count(char::is_ascii_uppercase) >= 3
+        && count(char::is_ascii_lowercase) >= 3
 }
 
 fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
@@ -3752,21 +3799,41 @@ impl Conn {
         note: &str,
         fallback_name: &str,
     ) -> String {
+        // A link with no name yet is labelled by its raw signaling id. That id
+        // means nothing to a person (a first-time-user test read "ok alpha
+        // ok 3f9c...e1" after `receive <code>`), so it shows only under -v:
+        // the line names the peer it is about, and leaves unnamed others out.
+        let show_raw = ui::enabled(ui::Level::Debug);
         let mut links: Vec<(&String, &Link)> = self.links.iter().collect();
         links.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         let mut parts = Vec::new();
         let mut seen = false;
         for (id, l) in links {
+            let unnamed = label_is_raw_id(l.label(), id, l.uid.as_deref());
             if id == pid {
                 seen = true;
-                parts.push(peer_entry(l.shown(), mark, tone, note));
+                let label = if unnamed && !show_raw && !label_is_raw_id(fallback_name, pid, None) {
+                    fallback_name
+                } else if unnamed && !show_raw {
+                    "the other device"
+                } else {
+                    l.label()
+                };
+                parts.push(peer_entry(label, mark, tone, note));
+            } else if unnamed && !show_raw {
+                continue;
             } else {
                 let (m, t, n) = presence_glyph(l.presence);
-                parts.push(peer_entry(l.shown(), m, t, n));
+                parts.push(peer_entry(l.label(), m, t, n));
             }
         }
         if !seen {
-            parts.push(peer_entry(fallback_name, mark, tone, note));
+            let label = if label_is_raw_id(fallback_name, pid, None) && !show_raw {
+                "the other device"
+            } else {
+                fallback_name
+            };
+            parts.push(peer_entry(label, mark, tone, note));
         }
         format!("  {}", parts.join("   "))
     }
@@ -3837,6 +3904,28 @@ impl Conn {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod raw_label_tests {
+    use super::label_is_raw_id;
+
+    // `receive <code>` printed "ok <raw peer id>": names show, ids do not.
+    #[test]
+    fn ids_are_raw_and_names_are_not() {
+        assert!(label_is_raw_id("Xy3_fAbcQ1", "Xy3_fAbcQ1", None));
+        assert!(label_is_raw_id("u-123", "sid", Some("u-123")));
+        assert!(label_is_raw_id("3f9c0a1be2d4c5f60718293a4b5c6d7e", "sid", None));
+        assert!(!label_is_raw_id("alpha", "sid", None));
+        assert!(!label_is_raw_id("p5-b", "sid", Some("uid")));
+        // A session id that is not this link's key (the tester's "ok hNZONFIoto2k9bQ9ABGV").
+        assert!(label_is_raw_id("hNZONFIoto2k9bQ9ABGV", "other-sid", None));
+        // Names, including long mixed ones, stay names.
+        assert!(!label_is_raw_id("WorkstationAlpha2", "sid", None));
+        assert!(!label_is_raw_id("my-laptop-2024-home", "sid", None));
+        assert!(!label_is_raw_id("buildbox-ci-runner-1", "sid", None));
+        assert!(!label_is_raw_id("cafe", "sid", None)); // short hex is a name
     }
 }
 

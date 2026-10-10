@@ -1436,6 +1436,20 @@ fn is_clean_close(e: &quinn::ReadExactError) -> bool {
     )
 }
 
+/// The link went silent and QUIC's idle timer closed it. A one-shot CLI peer
+/// (`exec`, `send`, `shell -- cmd`) that exits without a QUIC close leaves
+/// exactly this behind on the long-lived side: investigated and harmless, the
+/// liveness logic already treats the link as dead and repairs or drops it. It
+/// is not an alarm, so it is not printed as one.
+fn is_idle_timeout(e: &quinn::ReadExactError) -> bool {
+    matches!(
+        e,
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::TimedOut
+        ))
+    )
+}
+
 fn note_reader_exit(peer_id: &str, primary: bool, reason: &str, frames: u64, dead: bool) {
     let line = format!(
         "l2: link reader exited peer={peer_id} primary={primary} reason={reason} frames={frames} dead={dead}"
@@ -1475,7 +1489,15 @@ fn spawn_reader(
                     // worker). `dead` stays false exactly as the comment above
                     // requires.
                     rx_ended.store(true, std::sync::atomic::Ordering::Relaxed);
-                    note_reader_exit(&peer_id, primary, "finished-early(hdr)", frames, false);
+                    // At a frame boundary this is the peer ending its send half
+                    // on purpose (a one-shot finishing): the normal end, so it
+                    // is debug-level like the clean-close arm below. It printed
+                    // after every successful exec/send at normal verbosity. The
+                    // liveness consequence is unchanged (`rx_ended`, decided by
+                    // `is_dead()`); a FIN mid-frame (`body`) stays loud.
+                    crate::hooks::debug(&format!(
+                        "l2: link reader exited peer={peer_id} primary={primary} reason=finished-early(hdr) frames={frames} dead=false"
+                    ));
                     break;
                 }
                 // A connection WE closed (a one-shot `exec` finishing) or one the
@@ -1488,6 +1510,13 @@ fn spawn_reader(
                     dead.store(true, std::sync::atomic::Ordering::Relaxed);
                     crate::hooks::debug(&format!(
                         "l2: link closed cleanly peer={peer_id} primary={primary} frames={frames} ({e})"
+                    ));
+                    break;
+                }
+                if is_idle_timeout(&e) {
+                    dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::hooks::debug(&format!(
+                        "l2: link idle-timed out peer={peer_id} primary={primary} answerer={answerer} frames={frames} ({e})"
                     ));
                     break;
                 }

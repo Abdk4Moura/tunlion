@@ -357,7 +357,12 @@ pub(crate) fn mesh_enrolment(
 /// detach itself is one portable operation in `platform::spawn_detached`, whose
 /// two arms ship together (#215 was the half-written version: the Windows arm
 /// computed the log path and threw it away).
-pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
+///
+/// `flags` are the serving flags this `up` was given (`--shell`, `--shell-only`,
+/// `--shell-user`, `--i-know`, ...). They are passed to the child: dropping them
+/// is how `up --detach --shell` used to start a daemon that served no shell at
+/// all, and every shell open was then refused with "serving is off".
+pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>, flags: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_path = crate::platform::Paths::config_path("daemon.log");
     let dir_arg: Option<String> = dir.as_deref().and_then(|d| d.to_str()).map(str::to_string);
@@ -366,6 +371,7 @@ pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> 
         args.push("--dir");
         args.push(d);
     }
+    args.extend(flags.iter().map(String::as_str));
     let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
     // Let the child write its pidfile before we return; poll briefly.
     let mut came_up = false;

@@ -613,7 +613,10 @@ pub fn cap_gate_effective(
                 "CAP-INFERRED-GRANT: fleet device dev={} authorized '{action}' via an explicit grant on a {binding:?} (non-Proven) binding. Fleet auto-trust requires Proven; explicit grants are still honored on Inferred pending universal identity-expose. Measured so Proven can be required for grants without silently revoking established devices.",
                 hex::encode(dev),
             ),
-            false,
+            // Debug, not loud: this is a measurement of an ALLOWED request, and
+            // a first-time-user test read it in the daemon log as an error. The
+            // access decision is unchanged; -v still shows the measurement.
+            true,
         );
     }
     // An explicit deny outranks EVERYTHING on this branch, including the

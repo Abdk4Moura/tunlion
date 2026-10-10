@@ -302,10 +302,15 @@ async fn print_cold(server: &str, peer: &str, relay: bool) {
                 ui::paint(Tone::Warn, "○ cold"),
                 ui::paint(Tone::Dim, &format!("no warm link · would connect in ~{}", fmt_ms(o.total_ms)))
             ));
-            ui::say(&format!(
-                "  {}",
-                ui::paint(Tone::Dim, &format!("─ ssh/pty to {peer} would establish a fresh link; run `tunlion up` to keep it warm"))
-            ));
+            // "run `tunlion up`" only when no daemon runs: with one up, the
+            // advice was to start what was already running. A running daemon
+            // just has no link to this peer yet.
+            let advice = if crate::daemon_alive().is_some() {
+                format!("─ ssh/pty to {peer} would establish a fresh link; the running daemon holds no link to it yet")
+            } else {
+                format!("─ ssh/pty to {peer} would establish a fresh link; run `tunlion up` to keep it warm")
+            };
+            ui::say(&format!("  {}", ui::paint(Tone::Dim, &advice)));
         }
         Ok(o) => {
             let phase = o.failed_phase.map(|p| p.label()).unwrap_or("establishing");

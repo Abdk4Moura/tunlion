@@ -10,13 +10,30 @@
 #      nonzero and the reason names the capability.
 #   B  POSITIVE granted — `tunlion shell <peer> -- 'echo HELLO'` returns 0 with
 #      HELLO on stdout.
+#   G  INTERACTIVE clean exit — `tunlion shell boxB` under a pty over the warm
+#      link, `exit 0`: rc 0, no "refused"/"no such session", and the tty modes
+#      after equal the modes before (the terminal is restored).
 #   C  NEIGHBOUR `-- true` — a legitimately fast-exiting remote command stays
 #      exit 0 with no output; it must NOT be reported as a denial.
 #   D  NEGATIVE revoked — after `revoke <peer> shell`, the shell is refused
 #      (nonzero, reason).
-#   E  NEGATIVE acceptor off — peer runs plain `up` (no --shell); the grant is
-#      issued AFTER the daemon is already up (#219 repro order); the initiator
-#      is told the acceptor is not serving, nonzero.
+#   A1 PRECISE no-cap — that refusal names the real cause (no grant there) and
+#      the exact fix to run on the other device (`tunlion grant boxA shell`),
+#      and never claims serving is off (it is on).
+#   E  NEGATIVE acceptor off — peer runs plain `up` (no --shell) with NO shell
+#      grant; the initiator is told the acceptor is not serving, nonzero.
+#   E2 LIVE grant — the grant is issued AFTER the daemon is already up (#219
+#      repro order) and takes effect WITHOUT a restart: the same shell now runs.
+#      (This used to be asserted the other way round, "still refused", which
+#      pinned the very defect: a grant the running daemon never applied.)
+#   F  `up --detach --shell --i-know` while a plain daemon runs: returns at once
+#      (never follows the log), exits 10 (DAEMON_CONFLICT in the exit-code
+#      taxonomy; 3 is "unknown device"), and says the flags were not applied and
+#      the exact restart command, --server included.
+#   F2 `up --detach` with matching settings while it runs: returns at once, 0.
+#   F3 `up --detach --userspace` while it runs with the SAME shell posture: the
+#      daemon reports its launch flags, so the unapplied --userspace is named
+#      (exit 10) instead of passing as "same settings".
 #
 # Topology: side B = acceptor, side A = initiator, reciprocal pair secret
 # (same-owner fleet, not a delegated device) so B trusts A. Gate E restarts the
@@ -87,6 +104,19 @@ else
   bad "gateA: no-cap refusal NOT clean (rc=$rcA)"
 fi
 
+# ==================================================================== GATE A1 ==
+# The SAME refusal, read for what it tells the user: the acceptor IS serving
+# (FILAMENT_L2=1), so "serving is off" would be false; the cause is the missing
+# grant and the fix is one command on boxB, naming boxA as boxB knows it.
+say A1
+if grep -q "tunlion grant boxA shell" "$WORK/A.err" \
+   && ! grep -qi "serving is off" "$WORK/A.err"; then
+  ok "gateA1: no-cap refusal names the grant fix (tunlion grant boxA shell), not 'serving is off'"
+else
+  echo "-- A.err --"; cat "$WORK/A.err"
+  bad "gateA1: no-cap refusal did not name the precise cause and fix"
+fi
+
 # ===================================================================== grant ===
 env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
@@ -129,8 +159,79 @@ else
   bad "gateA2: daemon-mediated one-shot FAILED (rc=$rcA2 out='$OUTA2')"
 fi
 
-# ===================================================================== GATE C ==
-# NEIGHBOUR: `-- true` must stay exit 0, empty, NOT a denial.
+# ===================================================================== GATE G ==
+# INTERACTIVE clean exit. A first-time-user test typed `exit` in an interactive
+# `tunlion shell` over the warm link and got "shell refused by 'boxB': no such
+# session", exit 1, and a terminal left in raw mode (stair-stepping until
+# `stty sane`): the warm bridge cannot tell a clean exit from a drop, so it
+# hands off to a resume-only attach, and the acceptor's "no such session"
+# answer was read as a refusal whose exit path skipped the raw-mode guard.
+# Drive the real thing under a pty: attach, prove the shell runs, `exit 0`.
+# Asserts the CLIENT: rc 0, no refusal text, and the tty's modes after the
+# client exits are exactly the modes before it started (`stty -g` equality).
+say G
+env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA-G.log" 2>&1 &
+GDPID=$!
+sleep 3
+GRES=$("$PYV" - "$BIN" "$SERVER" "$DA" "$WORK/G.out" <<'PYEOF'
+import os, select, subprocess, sys, termios, time
+binp, server, cfg, outp = sys.argv[1:5]
+master, slave = os.openpty()
+before = termios.tcgetattr(slave)
+env = dict(os.environ, FILAMENT_CONFIG_DIR=cfg, FILAMENT_NAME="boxA", TERM="xterm")
+p = subprocess.Popen([binp, "--server", server, "shell", "boxB"],
+                     stdin=slave, stdout=slave, stderr=slave, env=env,
+                     start_new_session=True)
+buf = b""
+def pump(secs, until=None):
+    global buf
+    end = time.time() + secs
+    while time.time() < end:
+        if until is not None and until in buf:
+            return True
+        if p.poll() is not None:
+            r, _, _ = select.select([master], [], [], 0.2)
+            if not r:
+                return until is not None and until in buf
+        r, _, _ = select.select([master], [], [], 0.2)
+        if r:
+            try:
+                buf += os.read(master, 65536)
+            except OSError:
+                return until is not None and until in buf
+    return until is not None and until in buf
+os.write(master, b"echo G-$((40+2))\n")
+attached = pump(40, b"G-42")
+os.write(master, b"exit 0\n")
+rc = None
+end = time.time() + 60
+while time.time() < end:
+    pump(0.5)
+    rc = p.poll()
+    if rc is not None:
+        break
+if rc is None:
+    p.kill()
+    rc = "hung"
+pump(1)
+after = termios.tcgetattr(slave)
+with open(outp, "wb") as f:
+    f.write(buf)
+print("attached=%s rc=%s restored=%s" % (attached, rc, before == after))
+PYEOF
+)
+kill "$GDPID" 2>/dev/null
+wait "$GDPID" 2>/dev/null
+echo "## (interactive exit 0) $GRES"
+if [ "$GRES" = "attached=True rc=0 restored=True" ] \
+   && ! grep -qi "refused\|no such session" "$WORK/G.out"; then
+  ok "gateG: interactive shell left with 'exit 0' exits 0, quietly, and restores the tty"
+else
+  echo "-- G.out --"; cat -v "$WORK/G.out"; tail -5 "$WORK/upA-G.log"
+  bad "gateG: interactive clean exit misreported or left the tty changed ($GRES)"
+fi
+
+
 say C
 OUTC=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'true' 2>"$WORK/C.err" </dev/null)
 rcC=$?
@@ -159,22 +260,93 @@ else
 fi
 
 # ===================================================================== GATE E ==
-# NEGATIVE: acceptor OFF (plain `up`, no --shell), grant issued AFTER the daemon
-# is up (#219 repro order). The initiator is told the acceptor is not serving.
+# NEGATIVE: acceptor OFF (plain `up`, no --shell) and NO shell grant on it (gate D
+# revoked the only one). The initiator is told the acceptor is not serving.
 say E
 kill "${pids[-1]}" 2>/dev/null; sleep 1   # stop the --shell acceptor
 start_acceptor 0                           # plain up
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant2.log" 2>&1
 OUTE=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo X' 2>"$WORK/E.err" </dev/null)
 rcE=$?
 echo "## (acceptor off) rc=$rcE out='$OUTE'"
 # Message is "shell serving is off there..." since the acceptor wording change;
 # match it alongside the older variants.
-if [ "$rcE" != "0" ] && grep -qi "acceptor off\|not serving\|serving is off" "$WORK/E.err"; then
+if [ "$rcE" != "0" ] && ! echo "$OUTE" | grep -q "^X$" \
+   && grep -qi "acceptor off\|not serving\|serving is off" "$WORK/E.err"; then
   ok "gateE: acceptor-off shell REFUSED with 'acceptor off' reason (nonzero)"
 else
   echo "-- E.err --"; cat "$WORK/E.err"; tail -5 "$WORK/up.log"
   bad "gateE: acceptor-off refusal NOT clean (rc=$rcE)"
+fi
+
+# ==================================================================== GATE E2 ==
+# LIVE: grant on the RUNNING plain daemon (#219 repro order), no restart. The
+# grant must apply at once, and the grant command must say no restart is needed.
+say E2
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant2.log" 2>&1
+OUTE2=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo LIVE-GRANT-OK' 2>"$WORK/E2.err" </dev/null)
+rcE2=$?
+echo "## (granted live, no restart) rc=$rcE2 out='$OUTE2'"
+if [ "$rcE2" = "0" ] && echo "$OUTE2" | grep -q "LIVE-GRANT-OK" \
+   && grep -q "no restart needed" "$WORK/grant2.log"; then
+  ok "gateE2: a grant on the running daemon applied without a restart (rc=0, output)"
+else
+  echo "-- grant2.log --"; cat "$WORK/grant2.log"
+  echo "-- E2.err --"; cat "$WORK/E2.err"; tail -5 "$WORK/up.log"
+  bad "gateE2: grant did not apply to the running daemon (rc=$rcE2)"
+fi
+
+# ===================================================================== GATE F ==
+# `up --detach` with DIFFERENT flags while a daemon runs: must not block, must
+# not claim success, must name the restart. The plain daemon above is running.
+# The restart carries --server: without it the restarted daemon would go to the
+# default server.
+say F
+t0=$(date +%s)
+timeout 20 env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" --server "$SERVER" \
+  up --detach --shell --i-know >"$WORK/F.out" 2>&1 </dev/null
+rcF=$?
+tF=$(( $(date +%s) - t0 ))
+echo "## (up --detach --shell over a plain daemon) rc=$rcF in ${tF}s"
+if [ "$rcF" = "10" ] \
+   && grep -q "different settings" "$WORK/F.out" \
+   && grep -qF "tunlion down --yes && tunlion up --detach --server=$SERVER --shell --i-know" "$WORK/F.out" \
+   && ! grep -q "following its log" "$WORK/F.out"; then
+  ok "gateF: up --detach with new flags returned at once (exit 10) and named the restart"
+else
+  echo "-- F.out --"; cat "$WORK/F.out"
+  bad "gateF: up --detach with new flags blocked or misreported (rc=$rcF)"
+fi
+
+# ==================================================================== GATE F2 ==
+say F2
+timeout 20 env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" --server "$SERVER" \
+  up --detach >"$WORK/F2.out" 2>&1 </dev/null
+rcF2=$?
+echo "## (up --detach, same settings) rc=$rcF2"
+if [ "$rcF2" = "0" ] && grep -q "already running" "$WORK/F2.out" \
+   && ! grep -q "following its log" "$WORK/F2.out"; then
+  ok "gateF2: up --detach over a matching daemon returned at once (exit 0)"
+else
+  echo "-- F2.out --"; cat "$WORK/F2.out"
+  bad "gateF2: up --detach over a matching daemon blocked or failed (rc=$rcF2)"
+fi
+
+# ==================================================================== GATE F3 ==
+# The posture gap: a flag other than the shell posture, given over a daemon whose
+# shell posture matches, used to read as "nothing to do" and was dropped.
+say F3
+timeout 20 env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" --server "$SERVER" \
+  up --detach --userspace >"$WORK/F3.out" 2>&1 </dev/null
+rcF3=$?
+echo "## (up --detach --userspace, same shell posture) rc=$rcF3"
+if [ "$rcF3" = "10" ] && grep -q "different settings" "$WORK/F3.out" \
+   && grep -q -- "--userspace (running without it)" "$WORK/F3.out" \
+   && grep -qF "tunlion down --yes && tunlion up --detach --server=$SERVER --userspace" "$WORK/F3.out" \
+   && ! grep -q "nothing to do" "$WORK/F3.out"; then
+  ok "gateF3: up --detach --userspace over a kernel-overlay daemon named the unapplied flag (exit 10)"
+else
+  echo "-- F3.out --"; cat "$WORK/F3.out"
+  bad "gateF3: --userspace over a running daemon was not reported (rc=$rcF3)"
 fi
 
 # ========================================================================= sum =

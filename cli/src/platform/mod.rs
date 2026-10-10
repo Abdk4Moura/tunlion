@@ -300,6 +300,36 @@ fn repair_sensitive_file(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+// ------------------------------------------------------ termination signal --
+
+/// Wait for a signal that ends the process from outside (SIGTERM, SIGHUP,
+/// SIGQUIT on Unix) and return the conventional exit status for it (128 + n).
+/// Never resolves where there is no such signal to wait for. A caller holding
+/// the terminal in raw mode restores it before exiting: a signal skips every
+/// Drop, so a guard alone would leave the user's shell stair-stepping.
+pub async fn termination_signal() -> i32 {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hup), Ok(mut quit)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+            signal(SignalKind::quit()),
+        ) else {
+            return std::future::pending::<i32>().await;
+        };
+        tokio::select! {
+            _ = term.recv() => 143,
+            _ = hup.recv() => 129,
+            _ = quit.recv() => 131,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::future::pending::<i32>().await
+    }
+}
+
 // ------------------------------------------------------------ SecretFile --
 
 // The safe restricted-file writer now lives in the standalone `secret-write`
@@ -901,6 +931,85 @@ pub fn add_firewall_rule(exe: &Path) {
 /// The two arms MUST ship together. #215 was a half-written detach: the
 /// Windows arm computed the log path and then discarded it, so `logs`,
 /// `up`-follows and `--detach` all dead-ended on a file that never appeared.
+/// Whether a terminal clipboard write (OSC 52) can plausibly land somewhere.
+/// macOS and Windows sessions always have a clipboard. On Linux and the BSDs
+/// only a graphical session (X11 or Wayland) has one; a headless box, a
+/// console, or a plain ssh login has none we can know about, so `send` must
+/// not claim "(copied to clipboard)" there.
+pub fn clipboard_reachable() -> bool {
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        true
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+        set("DISPLAY") || set("WAYLAND_DISPLAY")
+    }
+}
+
+/// What a FUSE mount needs before `mount` may say "mounted": the kernel
+/// device and (unless root, which can mount directly) the setuid helper the
+/// `fuser` crate execs. `Err` names the missing piece and how to install it,
+/// per distro. Elsewhere (macOS/Windows have their own stacks) nothing to check.
+pub fn fuse_prerequisites() -> std::result::Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let install = fuse_install_hint();
+        if !Path::new("/dev/fuse").exists() {
+            return Err(format!(
+                "FUSE is not available here: /dev/fuse does not exist. Load the module with `sudo modprobe fuse`{}; inside a container, start it with `--device /dev/fuse --cap-add SYS_ADMIN`.",
+                if install.is_empty() { String::new() } else { format!(" (and install it: `{install}`)") }
+            ));
+        }
+        let root = unsafe { libc::geteuid() } == 0;
+        let helper = ["fusermount3", "fusermount"].iter().any(|h| {
+            std::env::var_os("PATH")
+                .map(|p| std::env::split_paths(&p).any(|d| d.join(h).is_file()))
+                .unwrap_or(false)
+        });
+        if !root && !helper {
+            return Err(format!(
+                "FUSE's mount helper (fusermount3) is not installed, so this user cannot mount. Install it: `{}`",
+                if install.is_empty() { "your distribution's fuse3 package" } else { install }
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+/// The install command for FUSE 3 on this Linux distribution, from the
+/// os-release file (read only). Empty when the distribution is not recognised.
+#[cfg(target_os = "linux")]
+fn fuse_install_hint() -> &'static str {
+    let text = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let field = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(|v| v.trim_matches('"').to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    let ids = format!("{} {}", field("ID="), field("ID_LIKE="));
+    let has = |n: &str| ids.split_whitespace().any(|w| w == n);
+    if has("debian") || has("ubuntu") {
+        "sudo apt install fuse3"
+    } else if has("fedora") || has("rhel") || has("centos") {
+        "sudo dnf install fuse3"
+    } else if has("arch") {
+        "sudo pacman -S fuse3"
+    } else if has("alpine") {
+        "sudo apk add fuse3"
+    } else if has("opensuse") || has("suse") || has("sles") {
+        "sudo zypper install fuse3"
+    } else {
+        ""
+    }
+}
+
 pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::process::Child> {
     if let Some(parent) = log.parent() {
         let _ = std::fs::create_dir_all(parent);

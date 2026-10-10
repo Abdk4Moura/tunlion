@@ -227,7 +227,17 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
                         let reason = v.get("err").and_then(|e| e.as_str()).unwrap_or("closed");
-                        break Err(format!("'{peer}' refused exec: {reason}"));
+                        // The acceptor's code says WHY, and its `as` says what it
+                        // calls us, so the remedy names the right fix and the
+                        // right device (a missing grant is not "serving is off").
+                        let (code, as_name) = crate::refusal::from_frame(&v, "err");
+                        break Err(crate::refusal::explain(
+                            "exec",
+                            peer,
+                            reason,
+                            code,
+                            as_name.as_deref(),
+                        ));
                     }
                 }
                 crate::net::Ev::Chunk(_pid, got, _offset, data) => {

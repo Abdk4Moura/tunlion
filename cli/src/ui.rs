@@ -224,11 +224,16 @@ pub fn link(url: &str, text: &str) -> String {
 
 /// OSC 52: put `s` on the terminal's clipboard (silently unsupported in some
 /// terminals; harmless there). Only on a tty.
-pub fn clipboard(s: &str) {
+/// Offer `s` to the terminal's clipboard (OSC 52). Returns whether it can
+/// plausibly have landed: written to a terminal AND a session with a
+/// clipboard behind it. Callers claim "(copied to clipboard)" only on `true`.
+pub fn clipboard(s: &str) -> bool {
     use base64_mini::enc;
     if caps().tty {
         eprint!("\x1b]52;c;{}\x07", enc(s.as_bytes()));
+        return crate::platform::clipboard_reachable();
     }
+    false
 }
 
 mod base64_mini {
@@ -674,12 +679,23 @@ pub fn qr_or_text(url: &str, rows_used: usize) -> String {
     if qr_fits(url, rows_used) {
         qr(url)
     } else {
-        format!(
-            "  (the QR needs {} rows and this window has {}; the top would be cut off)\n  {url}",
-            qr_rows(url).unwrap_or(0),
-            crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0),
-        )
+        match qr_too_tall_note(url, rows_used) {
+            Some(note) => format!("  {note}\n  {url}"),
+            None => format!("  {url}"),
+        }
     }
+}
+
+/// Why the QR is not drawn, when the reason is the window height. `None` when
+/// no QR could be drawn at all (no unicode, e.g. a plain or dumb terminal) or
+/// the height is unknown: "the QR needs 0 rows and this window has 40" was a
+/// sentence about a QR that never existed.
+pub fn qr_too_tall_note(url: &str, rows_used: usize) -> Option<String> {
+    let rows = qr_rows(url)?;
+    let height = crossterm::terminal::size().ok().map(|(_, h)| h as usize)?;
+    (rows_used + rows > height).then(|| {
+        format!("(the QR needs {rows} rows and this window has {height}; the top would be cut off)")
+    })
 }
 
 #[cfg(test)]

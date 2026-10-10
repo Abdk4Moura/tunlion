@@ -834,6 +834,22 @@ pub(crate) async fn async_main() -> Result<()> {
             if userspace {
                 unsafe { std::env::set_var("FILAMENT_L3_USERSPACE", "1") };
             }
+            // The daemon flags given explicitly, before settings fold in: what
+            // `up` compares against an already-running daemon's report.
+            let launch = crate::up_logs::LaunchAsk {
+                server: (cli.server != DEFAULT_SERVER).then(|| server.clone()),
+                dir: dir.as_ref().map(|d| {
+                    let abs = std::path::absolute(d).unwrap_or_else(|_| d.clone());
+                    abs.to_string_lossy().into_owned()
+                }),
+                relay: cli.relay,
+                no_relay: cli.no_relay,
+                name_as: cli.name_as.clone(),
+                userspace,
+                shell_program: shell_program.clone(),
+                shell_user: shell_user.clone(),
+                no_proxy_fallback,
+            };
             // Flags win; otherwise fall back to persistent settings. Per-peer
             // `shell on` overrides fold into the shell-only allowlist so
             // `tunlion set shell on --peer laptop` unifies with --shell-only.
@@ -865,6 +881,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 i_know,
                 install_system,
                 no_proxy_fallback,
+                launch,
             )
             .await
         }
@@ -1782,11 +1799,20 @@ pub(crate) async fn async_main() -> Result<()> {
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
-                    "OWNER-EQUIVALENT: they can act as you through `tunlion shell --ssh` (their key is installed on first connect)."
+                    "OWNER-EQUIVALENT: they can act as you through `tunlion shell`, `tunlion exec` and `tunlion shell --ssh` (for ssh, their key is installed on first connect)."
                 } else {
                     ""
                 }
             );
+            // Grants are read per open, and the daemon re-reads whether ANY
+            // shell grant exists on every loop turn, so this applies to a running
+            // daemon at once. It used to need a restart that nothing mentioned.
+            if capability == "shell" && crate::daemon_alive().is_some() {
+                ui::say(&ui::paint(
+                    ui::Tone::Dim,
+                    "  the running daemon applies this on the next connection; no restart needed",
+                ));
+            }
             Ok(())
         }
         Cmd::Revoke {
@@ -1936,6 +1962,12 @@ pub(crate) async fn async_main() -> Result<()> {
             } else {
                 println!("revoked '{capability}' from '{device}'.");
             }
+            if capability == "shell" && crate::daemon_alive().is_some() {
+                ui::say(&ui::paint(
+                    ui::Tone::Dim,
+                    "  the running daemon applies this now; no restart needed",
+                ));
+            }
             if let Some(warning) = fleet_certificate_warning(&device) {
                 eprintln!("{warning}");
             }
@@ -2022,6 +2054,13 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
                 require_known_device(&plan.peer)?;
+                // Before any network work, and long before a "mounted." line:
+                // FUSE itself must be usable here. Without this, a missing
+                // /dev/fuse or fusermount3 printed "ok mounted." and then a bare
+                // "No such file or directory (os error 2)".
+                if let Err(why) = crate::platform::fuse_prerequisites() {
+                    bail!("cannot mount here: {why}");
+                }
                 let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;
                 #[cfg(any(
                     target_os = "linux",
