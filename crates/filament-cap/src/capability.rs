@@ -1799,20 +1799,74 @@ pub fn latest_op_version(
         .unwrap_or(0)
 }
 
-/// Is `op` at or below a revoke tombstone for its key? Such an op is a replay of
-/// something the owner already revoked and must not be stored by any path,
-/// including the raw fleet-policy merge, which does not go through
-/// `apply_cap_op`.
+/// The permissions a store entry (or op) speaks for. EMPTY means every
+/// permission of its key: a revoke-all tombstone, or the legacy "grant with no
+/// permissions" spelling of a revoke.
+fn entry_permissions(entry: &Value) -> Vec<String> {
+    entry["permissions"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|p| p.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Do two permission sets name a common (grantor, resource, target, permission)
+/// slot? An empty set covers every slot of the key.
+fn permissions_overlap(a: &[String], b: &[String]) -> bool {
+    a.is_empty() || b.is_empty() || a.iter().any(|p| b.contains(p))
+}
+
+/// Is `op` at or below a revoke tombstone for any permission it carries? Such
+/// an op is a replay of something the owner already revoked and must not be
+/// stored by any path, including the raw fleet-policy merge, which does not go
+/// through `apply_cap_op`.
+///
+/// Per permission: a tombstone for `shell` does not make a grant of `mount`
+/// stale, and a tombstone with no permissions (revoke-all) covers every
+/// permission of its key. An op carrying several permissions is refused if ANY
+/// of them is beaten, because the stored op cannot be split without breaking
+/// its signature, and a revoke errs toward removing access.
 pub fn superseded_by_tombstone(store: &[Value], op: &CapOp) -> bool {
     let (g, t) = (hex::encode(op.grantor), hex::encode(op.target));
     store.iter().any(|e| {
         e.get("type").and_then(|v| v.as_str()) == Some(CAP_TOMBSTONE_TYPE)
             && is_op_entry_for(e, &g, &op.resource, op.target_kind, &t)
+            && permissions_overlap(&entry_permissions(e), &op.permissions)
             && e["version"].as_u64().unwrap_or(u64::MAX) >= op.version
     })
 }
 
 /// Apply a verified capability op to the store.
+///
+/// The store keeps state per PERMISSION, not per key. A key is (grantor,
+/// resource, target); a slot is (key, permission). `tunlion grant X shell`
+/// followed by `tunlion grant X mount` used to leave only `mount`, because one
+/// entry was kept per key and the second grant replaced the first's permission
+/// list. A grant means "also allow this", so:
+///
+/// - A grant carrying P supersedes only what the store holds for P on that key.
+///   Every other permission of the key is untouched, each with its own expiry.
+/// - A revoke carrying P removes and tombstones only P. A revoke with no
+///   permissions (or a grant with none, the older spelling) removes every
+///   permission of the key and leaves one revoke-all tombstone.
+/// - Versions are compared per slot: an op is refused when any entry that
+///   shares a slot with it is at or above its version. That refuses a replayed
+///   grant beaten by a revoke of the same permission (the tombstone keeps the
+///   version), while a grant of a DIFFERENT permission is not a replay of
+///   anything and is applied.
+/// - A revoke-all tombstone survives a later single-permission regrant: the
+///   regrant outranks it for that one permission only, and the tombstone keeps
+///   refusing replays of every other permission it revoked.
+///
+/// The signed op format is unchanged: every writer in the CLI signs exactly one
+/// permission per op, so one stored op is one slot. An older op carrying several
+/// permissions is narrowed in place when a newer op takes some of them; its
+/// remaining permissions keep authorizing locally, and the entry is marked
+/// `narrowed` because its signature no longer covers its permission list (so it
+/// is not relayed as fleet policy).
 pub fn apply_cap_op(
     store: &mut Vec<Value>,
     header: &CapHeader,
@@ -1841,17 +1895,28 @@ pub fn apply_cap_op(
 
     let grantor_hex = hex::encode(op.grantor);
     let target_hex = hex::encode(op.target);
+    let mut op_perms: Vec<String> = Vec::new();
+    for p in &op.permissions {
+        if !op_perms.contains(p) {
+            op_perms.push(p.clone());
+        }
+    }
+    let removes_all = op_perms.is_empty();
+    let is_revoke = op.op == CapOpKind::Revoke || removes_all;
 
-    // EVERY entry for this key, live grant or tombstone, bounds the version. The
-    // first match used to end the scan, so a second entry for the same key (the
-    // bounded-grant writer appends rather than replaces) was never compared.
-    let matching: Vec<usize> = store
+    // EVERY entry sharing a slot with this op, live grant or tombstone, bounds
+    // the version: a second entry for the same slot (the bounded-grant writer
+    // appends, the fleet merge appends) is compared too, not just the first.
+    let overlapping: Vec<usize> = store
         .iter()
         .enumerate()
-        .filter(|(_, e)| is_op_entry_for(e, &grantor_hex, &op.resource, op.target_kind, &target_hex))
+        .filter(|(_, e)| {
+            is_op_entry_for(e, &grantor_hex, &op.resource, op.target_kind, &target_hex)
+                && permissions_overlap(&entry_permissions(e), &op_perms)
+        })
         .map(|(i, _)| i)
         .collect();
-    for &i in &matching {
+    for &i in &overlapping {
         let existing_version = store[i]["version"].as_u64().unwrap_or(0);
         if existing_version >= op.version {
             bail!(
@@ -1861,37 +1926,47 @@ pub fn apply_cap_op(
             );
         }
     }
-    let found_idx = matching.first().copied();
 
-    if op.op == CapOpKind::Revoke || op.permissions.is_empty() {
-        // Keep the version this revoke established as a tombstone in place of
-        // the entries it beat. All of them go: a duplicate live grant left
-        // behind would keep authorizing what was just revoked.
+    // Take this op's permissions out of every older entry that holds them.
+    let mut max_issued_at = op.issued_at;
+    for &i in overlapping.iter().rev() {
+        if let Some(ma) = store[i].get("max_issued_at").and_then(|v| v.as_u64()) {
+            max_issued_at = std::cmp::max(max_issued_at, ma);
+        }
+        let held = entry_permissions(&store[i]);
+        if removes_all {
+            // Every slot of the key is superseded.
+            store.remove(i);
+        } else if held.is_empty() {
+            // An older revoke-all tombstone. This op outranks it for its own
+            // permissions only; it still holds the version for every other
+            // permission it revoked, so it stays.
+        } else {
+            let remaining: Vec<String> =
+                held.into_iter().filter(|p| !op_perms.contains(p)).collect();
+            if remaining.is_empty() {
+                store.remove(i);
+            } else {
+                store[i]["permissions"] = Value::from(remaining);
+                store[i]["narrowed"] = Value::from(true);
+            }
+        }
+    }
+
+    if is_revoke {
+        // Keep the version this revoke established as a tombstone for exactly
+        // the permissions it revoked (every permission when it names none).
         let mut tombstone = op.to_json();
         tombstone["type"] = Value::from(CAP_TOMBSTONE_TYPE);
         tombstone["revoked"] = Value::from(true);
-        for &i in matching.iter().rev() {
-            store.remove(i);
-        }
         store.push(tombstone);
         return Ok(());
     }
 
     let mut json_entry = op.to_json();
     json_entry["type"] = Value::from("cap_grant");
-
-    if let Some(idx) = found_idx {
-        if let Some(ma) = store[idx].get("max_issued_at").and_then(|v| v.as_u64()) {
-            let new_ma = std::cmp::max(ma, op.issued_at);
-            json_entry["max_issued_at"] = Value::from(new_ma);
-        } else {
-            json_entry["max_issued_at"] = Value::from(op.issued_at);
-        }
-        store[idx] = json_entry;
-    } else {
-        json_entry["max_issued_at"] = Value::from(op.issued_at);
-        store.push(json_entry);
-    }
+    json_entry["max_issued_at"] = Value::from(max_issued_at);
+    store.push(json_entry);
     update_ratchet(store, &op.grantor, op.issued_at)?;
     Ok(())
 }
@@ -2445,14 +2520,24 @@ mod tests {
         // Replaying the revoke itself is also at the tombstone's version.
         assert!(apply_cap_op(&mut store, &header, &revoke_v2, now_secs()).is_err());
 
-        // A genuinely newer grant re-grants, replacing the tombstone.
+        // A genuinely newer grant re-grants. The revoke named no permission, so
+        // it revoked EVERY permission of the key: the regrant outranks it for
+        // `shell` only, and the tombstone stays to keep refusing replays of the
+        // rest (a per-permission store cannot let one regrant erase the version
+        // record of permissions it does not name).
         apply_cap_op(&mut store, &header, &grant_v3, now_secs()).unwrap();
         assert!(authorized(&store), "a newer grant (v3) re-grants");
+        let live: Vec<_> = store
+            .iter()
+            .filter(|e| e["type"].as_str() == Some("cap_grant"))
+            .collect();
+        assert_eq!(live.len(), 1, "exactly one live grant: the regrant");
+        assert_eq!(live[0]["version"].as_u64(), Some(v3));
+        let mount_v1 = make_grant(&owner, target, &header.resource, &["mount"], v1, 86400);
+        assert!(superseded_by_tombstone(&store, &mount_v1));
         assert!(
-            !store
-                .iter()
-                .any(|e| e["type"].as_str() == Some(CAP_TOMBSTONE_TYPE)),
-            "the regrant takes the tombstone's place, one entry per key"
+            apply_cap_op(&mut store, &header, &mount_v1, now_secs()).is_err(),
+            "the revoke-all tombstone still refuses an older grant of another permission"
         );
     }
 
@@ -2487,6 +2572,153 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A Revoke op naming specific permissions (what `tunlion revoke X shell`
+    /// signs), as opposed to `make_revoke`, which names none and so revokes all.
+    fn make_revoke_of(
+        owner: &Ed25519KeyPair,
+        target: CapTarget,
+        resource: &str,
+        permissions: &[&str],
+        version: u64,
+    ) -> CapOp {
+        let issued_at = now_secs();
+        let mut op = CapOp {
+            op: CapOpKind::Revoke,
+            grantor: owner_pub(owner),
+            target_kind: target.kind_byte(),
+            target: target.target_bytes(),
+            resource: resource.to_string(),
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            expires: issued_at.saturating_add(86400),
+            issued_at,
+            version,
+            sig: [0u8; 64],
+        };
+        op.sig = sign_cap_op(&op, owner);
+        op
+    }
+
+    fn allows_at(store: &[Value], header: &CapHeader, action: &str, at: u64) -> bool {
+        matches!(
+            evaluate(store, header, &[0xcc; 32], &[0xaa; 32], &header.resource, action, at, None),
+            Decision::Authorized
+        )
+    }
+
+    #[test]
+    fn a_grant_adds_a_permission_instead_of_replacing_the_list() {
+        // `grant X shell` then `grant X mount` used to leave only mount: one
+        // entry per key, and the second grant replaced the first's list.
+        let owner = make_owner();
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &[0x01; 32], &[]);
+        let seed = now_ms();
+        let v1 = hlc_next(0, seed);
+        let v2 = hlc_next(v1, seed);
+        let v3 = hlc_next(v2, seed);
+        let v4 = hlc_next(v3, seed);
+        // Each permission keeps its own expiry: shell for a day, mount for ten
+        // minutes.
+        let shell_v1 = make_grant(&owner, target, &header.resource, &["shell"], v1, 86400);
+        let mount_v2 = make_grant(&owner, target, &header.resource, &["mount"], v2, 600);
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &shell_v1, now_secs()).unwrap();
+        apply_cap_op(&mut store, &header, &mount_v2, now_secs()).unwrap();
+        let now = now_secs();
+        assert!(allows_at(&store, &header, "shell", now), "the first grant survives the second");
+        assert!(allows_at(&store, &header, "mount", now), "the second grant took effect");
+        assert!(!allows_at(&store, &header, "route", now), "nothing else was granted");
+        assert!(allows_at(&store, &header, "shell", now + 1200), "shell keeps its own expiry");
+        assert!(!allows_at(&store, &header, "mount", now + 1200), "mount keeps its own expiry");
+
+        // Revoking shell takes shell only.
+        let revoke_shell_v3 = make_revoke_of(&owner, target, &header.resource, &["shell"], v3);
+        apply_cap_op(&mut store, &header, &revoke_shell_v3, now_secs()).unwrap();
+        assert!(!allows_at(&store, &header, "shell", now_secs()), "shell is revoked");
+        assert!(allows_at(&store, &header, "mount", now_secs()), "revoking shell leaves mount");
+
+        // The tombstone holds shell's version: the old shell grant, still
+        // validly signed and unexpired, is a replay and is refused.
+        assert!(superseded_by_tombstone(&store, &shell_v1));
+        assert!(!superseded_by_tombstone(&store, &mount_v2), "the tombstone is shell's alone");
+        let before = store.clone();
+        assert!(apply_cap_op(&mut store, &header, &shell_v1, now_secs()).is_err());
+        assert_eq!(store, before, "a refused replay must not touch the store");
+        assert!(!allows_at(&store, &header, "shell", now_secs()));
+
+        // A newer shell grant re-adds it, and mount is still there.
+        let shell_v4 = make_grant(&owner, target, &header.resource, &["shell"], v4, 86400);
+        apply_cap_op(&mut store, &header, &shell_v4, now_secs()).unwrap();
+        assert!(allows_at(&store, &header, "shell", now_secs()), "a newer grant re-grants shell");
+        assert!(allows_at(&store, &header, "mount", now_secs()));
+        assert!(
+            !store
+                .iter()
+                .any(|e| e["type"].as_str() == Some(CAP_TOMBSTONE_TYPE)),
+            "the shell regrant replaces the shell tombstone"
+        );
+        // Replaying the revoke is at or below shell's version now.
+        assert!(apply_cap_op(&mut store, &header, &revoke_shell_v3, now_secs()).is_err());
+        assert!(allows_at(&store, &header, "shell", now_secs()));
+    }
+
+    #[test]
+    fn a_regrant_of_the_same_permission_supersedes_only_that_permission() {
+        // Newest version wins per permission: regranting mount with a shorter
+        // expiry replaces mount's entry and leaves shell alone.
+        let owner = make_owner();
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &[0x01; 32], &[]);
+        let seed = now_ms();
+        let v1 = hlc_next(0, seed);
+        let v2 = hlc_next(v1, seed);
+        let v3 = hlc_next(v2, seed);
+        let mut store = init_store(&header);
+        for op in [
+            make_grant(&owner, target, &header.resource, &["shell"], v1, 86400),
+            make_grant(&owner, target, &header.resource, &["mount"], v2, 86400),
+            make_grant(&owner, target, &header.resource, &["mount"], v3, 600),
+        ] {
+            apply_cap_op(&mut store, &header, &op, now_secs()).unwrap();
+        }
+        let live = store
+            .iter()
+            .filter(|e| e["type"].as_str() == Some("cap_grant"))
+            .count();
+        assert_eq!(live, 2, "one live entry per permission");
+        let later = now_secs() + 1200;
+        assert!(!allows_at(&store, &header, "mount", later), "the newer, shorter mount grant wins");
+        assert!(allows_at(&store, &header, "shell", later));
+        // The older mount grant is a rollback now.
+        let mount_v2 = make_grant(&owner, target, &header.resource, &["mount"], v2, 86400);
+        assert!(apply_cap_op(&mut store, &header, &mount_v2, now_secs()).is_err());
+    }
+
+    #[test]
+    fn revoking_one_permission_narrows_an_older_multi_permission_grant() {
+        // No CLI writer signs more than one permission per op, but the op format
+        // allows it, so the store must still revoke exactly one of them.
+        let owner = make_owner();
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &[0x01; 32], &[]);
+        let seed = now_ms();
+        let v1 = hlc_next(0, seed);
+        let v2 = hlc_next(v1, seed);
+        let both = make_grant(&owner, target, &header.resource, &["shell", "mount"], v1, 86400);
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &both, now_secs()).unwrap();
+        assert!(allows_at(&store, &header, "shell", now_secs()));
+        assert!(allows_at(&store, &header, "mount", now_secs()));
+        let revoke = make_revoke_of(&owner, target, &header.resource, &["shell"], v2);
+        apply_cap_op(&mut store, &header, &revoke, now_secs()).unwrap();
+        assert!(!allows_at(&store, &header, "shell", now_secs()));
+        assert!(allows_at(&store, &header, "mount", now_secs()));
+        // Replaying the two-permission grant would bring shell back: refused.
+        assert!(superseded_by_tombstone(&store, &both));
+        assert!(apply_cap_op(&mut store, &header, &both, now_secs()).is_err());
+        assert!(!allows_at(&store, &header, "shell", now_secs()));
     }
 
     #[test]
@@ -3772,12 +4004,30 @@ mod tests {
             v1,
             86400,
         );
-        let narrow = make_grant(&owner, target, &header.resource, &["ssh"], v2, 86400);
+        // A grant ADDS (it no longer replaces the list), so the op that narrows
+        // ["admin","ssh"] to ["ssh"] is a revoke of "admin".
+        let narrow = make_revoke_of(&owner, target, &header.resource, &["admin"], v2);
 
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         let principals = vec![("bob".to_string(), [0xcc; 32], [0xaa; 32])];
+
+        // A grant of ["ssh"] alone is not a narrowing any more: admin is kept,
+        // so the check rightly has nothing to warn about.
+        let regrant_ssh = make_grant(&owner, target, &header.resource, &["ssh"], v2, 86400);
+        let mut after_regrant = store.clone();
+        apply_cap_op(&mut after_regrant, &header, &regrant_ssh, now_secs()).unwrap();
+        assert!(allows_at(&after_regrant, &header, "admin", now_secs()));
+        assert!(check_self_lockout(
+            &store,
+            &header,
+            &regrant_ssh,
+            &principals,
+            &["admin", "ssh", "shell"],
+            now_secs(),
+        )
+        .is_empty());
 
         // Narrowing from ["admin","ssh"] to ["ssh"] loses "admin"
         let warnings = check_self_lockout(
