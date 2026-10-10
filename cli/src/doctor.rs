@@ -120,11 +120,11 @@ fn probe_progress_line(device: &str, secs: u64) -> String {
 /// record can never find, so "presence FAILED" alone sent people to check a
 /// machine that was running fine.
 fn print_reset_hint(device: &str, o: &crate::l2::ProbeOutcome) {
-    if let Some(hint) = reset_hint_for(device, o, &crate::devices_store::devices_load()
+    let names: Vec<String> = crate::devices_store::devices_load()
         .into_iter()
         .map(|(n, _)| n)
-        .collect::<Vec<_>>())
-    {
+        .collect();
+    if let Some(hint) = reset_hint_for(device, o, &names) {
         ui::say(&format!("  {hint}"));
     }
 }
