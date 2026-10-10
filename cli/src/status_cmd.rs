@@ -151,6 +151,13 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
     // to say `"ok": true` with exit 0 for a daemon that was down or frozen,
     // while the same question without `--json` exited 11 or 6.
     let code = status_exit_code(pid_alive.is_some(), responding);
+    // ...and a reader that closes the pipe early (`status | head -1`) must not
+    // turn that answer into 0: the closed-pipe exit is this code (ui.rs).
+    crate::ui::exit_code_on_closed_pipe(code);
+    // The SOCKS proxy runs inside the daemon, so it serves only while the
+    // daemon answers: a frozen daemon's proxy record still names a live pid
+    // and was reported `"proxy": {"running": true}`.
+    let proxy = proxy_if_serving(responding, crate::proxy_state::current());
     if json {
         let pid = pid_alive;
         let exposed: Vec<Value> = expose::load()
@@ -195,7 +202,7 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 // The SOCKS proxy the daemon auto-starts without a TUN: its
                 // address and how to use it (the token's PATH, never the
                 // token), or null when none is running.
-                "proxy": crate::proxy_state::to_json(crate::proxy_state::current().as_ref()),
+                "proxy": crate::proxy_state::to_json(proxy.as_ref()),
             }))?
         );
         return match code {
@@ -277,8 +284,8 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
             ));
         }
     }
-    if let Some(p) = crate::proxy_state::current() {
-        for line in crate::proxy_state::status_lines(&p) {
+    if let Some(p) = &proxy {
+        for line in crate::proxy_state::status_lines(p) {
             ui::say(&line);
         }
     }
@@ -302,6 +309,12 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         0 => Ok(()),
         code => std::process::exit(code),
     }
+}
+
+/// The proxy to report: the recorded one, only while its daemon answers (a
+/// platform that cannot ask, `responding` null, keeps the record). Pure.
+pub(crate) fn proxy_if_serving<T>(responding: Option<bool>, proxy: Option<T>) -> Option<T> {
+    proxy.filter(|_| responding != Some(false))
 }
 
 /// The `error` object `status --json` carries when it exits nonzero, in the
@@ -378,6 +391,16 @@ mod status_exit_tests {
         assert!(!claim(true, true, true), "a down since the spawn: it is stopping");
         assert!(!claim(false, true, false), "the child exited");
         assert!(!claim(true, false, false), "another process holds the pidfile");
+    }
+
+    /// A frozen daemon's proxy is not reported as running.
+    #[test]
+    fn a_proxy_is_reported_only_while_its_daemon_answers() {
+        use super::proxy_if_serving;
+        assert_eq!(proxy_if_serving(Some(false), Some(1080)), None);
+        assert_eq!(proxy_if_serving(Some(true), Some(1080)), Some(1080));
+        assert_eq!(proxy_if_serving(None, Some(1080)), Some(1080));
+        assert_eq!(proxy_if_serving::<u16>(Some(true), None), None);
     }
 
     /// The JSON's `ok` and `error` are the exit code, said again: never

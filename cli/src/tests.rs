@@ -4905,3 +4905,92 @@ fn a_roster_announcement_does_not_refresh_last_seen() {
         "the roster announcement must not refresh lastSeen:\n{branch}"
     );
 }
+
+/// Every re-link chain the CLI prints after a reset, parsed and RUN against a
+/// store holding a live certified record and its re-joined successor. The
+/// hints (reset_hints) and the forget/rename rules (fleet_support) live on
+/// different branches; this is where both are present, which is where the
+/// dead end was: `forget` refused a live certificate for 30 days and `rename`
+/// then said the name was taken.
+#[test]
+fn every_printed_relink_chain_runs_against_a_store() {
+    use clap::Parser;
+    let _guard = lock_test_config();
+    let run = |step: &str, now: u64| -> anyhow::Result<()> {
+        let argv: Vec<&str> = step.split_whitespace().collect();
+        let cli = crate::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
+        match cli.cmd {
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
+                crate::fleet_support::forget_device(&name, now).map(|_| ())
+            }
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Rename { old, new }), .. }) => {
+                crate::fleet_support::rename_device(&old, &new)
+            }
+            // Steps for another machine, or that mint (add/join), are parsed
+            // above; the store-side steps are the ones that dead-ended.
+            _ => Ok(()),
+        }
+    };
+    let fixture = |tag: &str| {
+        let dir = std::env::temp_dir().join(format!(
+            "fil-chain-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+        let now = identity::now_secs();
+        let old = identity::DeviceCert::certify(&uk, [0x61u8; 32], now, 30 * 86_400).unwrap();
+        let new = identity::DeviceCert::certify(&uk, [0x62u8; 32], now, 30 * 86_400).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                { "name": "p9-b",   "secret": "a".repeat(64), "deviceCert": old.to_json() },
+                { "name": "p9-b-2", "secret": "b".repeat(64), "deviceCert": new.to_json() },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        (dir, now, old, new)
+    };
+
+    // send/doctor to the stale name, with a successor: forget, then rename.
+    let (dir, now, old, new) = fixture("succ");
+    let hint = crate::reset_hints::offline_hint("p9-b", Some("p9-b-2"));
+    let steps = crate::reset_hints::hint_commands(&hint);
+    assert!(steps.len() >= 2, "{hint}");
+    for step in &steps {
+        run(step, now).unwrap_or_else(|e| panic!("`{step}` from \"{hint}\" failed: {e}"));
+    }
+    assert_eq!(crate::device_view::device_cert_for("p9-b").unwrap().device_pub, new.device_pub);
+    assert!(crate::device_view::device_cert_for("p9-b-2").is_none());
+    assert!(device_cert_revoked(&old.device_pub), "the forgotten live key stays refused");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // No successor yet, and `add <name>` on a taken name: the forget each
+    // starts with succeeds and frees the name.
+    for hint in [
+        crate::reset_hints::offline_hint("p9-b", None),
+        crate::reset_hints::name_taken_note("p9-b", Some("1m ago")),
+    ] {
+        let (dir, now, old, _) = fixture("free");
+        for step in crate::reset_hints::hint_commands(&hint) {
+            run(&step, now).unwrap_or_else(|e| panic!("`{step}` from \"{hint}\" failed: {e}"));
+        }
+        assert!(crate::device_view::device_cert_for("p9-b").is_none(), "the name is free: {hint}");
+        assert!(device_cert_revoked(&old.device_pub));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The ceiling re-enrolment starts on the owner with a forget of a live
+    // certified device; it must succeed too.
+    let (dir, now, _, _) = fixture("ceiling");
+    let first = crate::refusal::ceiling_steps("alpha", "p9-b")[0].clone();
+    let cmd = &first[first.find("tunlion").unwrap()..];
+    run(cmd, now).unwrap_or_else(|e| panic!("`{cmd}` failed: {e}"));
+    assert!(crate::device_view::device_cert_for("p9-b").is_none());
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}

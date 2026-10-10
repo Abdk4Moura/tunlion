@@ -229,8 +229,13 @@ Rules that go with them:
 - **`status` answers with its exit code.** 0 when the daemon serving this
   config directory answers; 11 when none is running; 6 (`unreachable`) when one
   runs but does not answer on its control socket in time (suspended, wedged).
-  Both used to exit 0, so a script had to parse prose. `status --json` still
-  exits 0: it reports, and `running`/`responding` carry the answer.
+  Both used to exit 0, so a script had to parse prose. `status --json` exits
+  with the same code, and its `"ok"` is `code == 0` with an `error`
+  (`not_running` / `unreachable`, the code, a message) when it is not; the
+  data fields (`running`, `responding`, `suspended`, `proxy`, ...) are all
+  still there. It used to say `"ok": true` with exit 0 for a down or frozen
+  daemon. A closed pipe keeps the code (`status | head -1` exits 11 with no
+  daemon), and `proxy` is reported only while the daemon answers.
 - **`exec` passes the remote command's own status through.** A remote `exit 3`
   is a local 3; tunlion's own failures use the table, so for `exec` alone a
   low code is ambiguous. `1` is still the catch-all for anything unclassified,
