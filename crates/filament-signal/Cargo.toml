@@ -13,6 +13,6 @@ tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 # rustls, deliberately: replacing rust_socketio's hard native-tls dependency is
 # the entire point of this crate. webpki-roots rather than the platform store so
 # the binary is self-contained and does not link system libssl/libcrypto.
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
