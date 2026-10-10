@@ -1995,7 +1995,8 @@ pub async fn establish_probe_within(
     // (the per-candidate rotation already re-races inside bring_up_to_known; this
     // is the outer wall). Generous: a slow-but-real ICE lands around 5s and we
     // want to OBSERVE that, not abort it prematurely. Overridable for the field.
-    let deadline = std::time::Duration::from_secs(doctor_probe_secs(timeout_secs));
+    let probe_secs = doctor_probe_secs(timeout_secs);
+    let deadline = std::time::Duration::from_secs(probe_secs);
 
     match tokio::time::timeout(deadline, bring_up_to_known(server, peer, relay, "doctor")).await {
         Ok(Ok((t, rx, guard, mut diag))) => {
