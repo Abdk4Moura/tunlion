@@ -615,6 +615,40 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 /// without letting an abandoned-but-not-reaped session hoard memory.
 pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 
+/// The TERM the remote shell actually gets.
+///
+/// The client sends ITS terminal's name, and forwarding it verbatim is right only
+/// when this machine has a terminfo entry for it. Modern terminals (kitty,
+/// ghostty, wezterm, ...) use names most servers have never heard of, and then
+/// every curses program degrades or refuses outright -- tmux exits with
+/// "missing or unsuitable terminal: xterm-kitty", so a remote tmux never starts
+/// and mouse events land on the shell prompt as `64;20;10M`. `ssh` appears not
+/// to have this problem only because those terminals' ssh integrations copy
+/// their terminfo to the remote first; this path has no such step. Fall back to
+/// xterm-256color, which every system ships and which supports 256 colours and
+/// mouse tracking.
+///
+/// THE VALUE COMES FROM THE PEER and is used to build a filesystem path below,
+/// so anything that is not a plausible terminal name is replaced before it is
+/// ever joined onto a directory (`../../etc/passwd` must not become a probe).
+pub(crate) fn effective_term(requested: &str) -> String {
+    const FALLBACK: &str = "xterm-256color";
+    let plausible = !requested.is_empty()
+        && requested.len() <= 64
+        && requested
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+        && !requested.starts_with('.');
+    if !plausible {
+        return FALLBACK.to_string();
+    }
+    if crate::platform::terminfo_exists(requested) {
+        requested.to_string()
+    } else {
+        FALLBACK.to_string()
+    }
+}
+
 /// Terminal-mode reset emitted to the client right AFTER a reattach replay.
 /// A TUI that gets cut off mid-run (link drop, then the app dies before it can
 /// emit its own disable) leaves the client terminal stuck in mouse-reporting
@@ -822,14 +856,7 @@ pub async fn spawn_pty_session(
     for a in &argv[1..] {
         cmd.arg(a);
     }
-    cmd.env(
-        "TERM",
-        if term.is_empty() {
-            "xterm-256color"
-        } else {
-            term
-        },
-    );
+    cmd.env("TERM", effective_term(term));
     // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
     // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
     // truecolor fine, so set this to get full-color output (verified: opencode
@@ -2633,22 +2660,30 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// sequences and renders unusable.
 struct RawGuard {
     active: bool,
+    /// The console's original modes, restored exactly on drop. On Windows this
+    /// is what turns on VT input so mouse and special keys reach the remote PTY
+    /// (see platform::ConsoleModes); elsewhere it is a no-op.
+    console: crate::platform::ConsoleModes,
 }
 impl RawGuard {
     fn enable() -> Result<Self> {
+        let console = crate::platform::ConsoleModes::snapshot();
         crossterm::terminal::enable_raw_mode()?;
-        Ok(RawGuard { active: true })
+        console.enable_vt();
+        Ok(RawGuard { active: true, console })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
         if self.active {
             let _ = crossterm::terminal::disable_raw_mode();
+            self.console.restore();
             crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
             eprint!("\r\n");
         }
     }
 }
+
 
 /// Why a single PTY attach ended.
 enum PtyOutcome {
@@ -4499,6 +4534,18 @@ async fn run_ssh(
     }
     let code = spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)?;
     sigwatch.abort();
+    if code == 255 {
+        // 255 is ssh's own failure (connect or auth), never the remote command's.
+        // Without password fallback the commonest cause is now a crisp
+        // "Permission denied (publickey)", so say what it means and what to do.
+        crate::ui::say(&format!(
+            "tunlion: ssh to '{peer}' was refused before a session started. If ssh said \
+             \"Permission denied (publickey)\", that device's sshd does not trust \
+             tunlion's certificates for this user yet: restart `tunlion up` there \
+             (it installs the trust for its own user, no root needed), or drop \
+             --ssh to use the built-in shell, which needs no sshd at all."
+        ));
+    }
     Ok(code)
 }
 
@@ -4521,6 +4568,18 @@ fn spawn_ssh_direct(
         .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
+        // NEVER A PASSWORD. Auth is the certificate this daemon just signed, so
+        // there is no legitimate password path; when the cert is not accepted,
+        // ssh's default is to fall through to a password prompt, which is how
+        // a missing CA trust on the device used to look -- a baffling prompt
+        // nobody could answer. With these, the same failure is an immediate,
+        // explainable "Permission denied (publickey)".
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o")
@@ -4579,6 +4638,18 @@ fn spawn_ssh(
         .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
+        // NEVER A PASSWORD. Auth is the certificate this daemon just signed, so
+        // there is no legitimate password path; when the cert is not accepted,
+        // ssh's default is to fall through to a password prompt, which is how
+        // a missing CA trust on the device used to look -- a baffling prompt
+        // nobody could answer. With these, the same failure is an immediate,
+        // explainable "Permission denied (publickey)".
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o")
@@ -4934,6 +5005,55 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
         Ok(Ok(_)) => Some(true),   // a listener answered (sshd banner)
         Ok(Err(_)) => Some(false), // stream error: treat as unreachable
         Err(_) => None,            // no banner in time: inconclusive, don't block
+    }
+}
+
+#[cfg(test)]
+mod term_tests {
+    use super::effective_term;
+
+    #[test]
+    fn a_term_with_no_terminfo_falls_back_instead_of_breaking_curses_apps() {
+        // Reproduced: TERM=xterm-kitty on a server without that entry made a
+        // remote `tmux` exit with "missing or unsuitable terminal".
+        //
+        // The contract, portably: effective_term keeps a name exactly when the
+        // platform says it has terminfo for it, and otherwise falls back. On
+        // unix an invented name has none (pinned in platform/'s own tests); on
+        // Windows there is no terminfo and every name is kept by design. The
+        // first version asserted the unix outcome everywhere and failed on the
+        // Windows runner, which was the test being wrong, not the code.
+        let name = "definitely-not-a-real-terminal-x9";
+        let want = if crate::platform::terminfo_exists(name) { name } else { "xterm-256color" };
+        assert_eq!(effective_term(name), want);
+        assert_eq!(effective_term(""), "xterm-256color");
+    }
+
+    #[test]
+    fn a_term_this_machine_knows_is_kept() {
+        // Every Linux and macOS CI image ships xterm-256color, and on Windows
+        // (no terminfo) the requested name is always kept.
+        assert_eq!(effective_term("xterm-256color"), "xterm-256color");
+    }
+
+    #[test]
+    fn a_peer_supplied_term_cannot_become_a_path_probe() {
+        // TERM is chosen by the PEER and joined onto terminfo directories, so
+        // anything that is not a plain terminal name is replaced before use.
+        let too_long = "z".repeat(65);
+        let hostile_names: [&str; 8] = [
+            "../../etc/passwd",
+            "..",
+            ".hidden",
+            "a/b",
+            "x\\y",
+            "term\0nul",
+            "has space",
+            too_long.as_str(),
+        ];
+        for hostile in hostile_names {
+            assert_eq!(effective_term(hostile), "xterm-256color", "{hostile:?}");
+        }
     }
 }
 

@@ -105,6 +105,16 @@ pub fn is_configured() -> bool {
 }
 
 const SSHD_CA_MARKER: &str = "# Added by tunlion for SSH certificates (shell --ssh)";
+/// The same marker as written before the rename. It is how this code recognises
+/// its OWN earlier write in sshd_config, so it is on-disk protocol, not prose:
+/// the rebrand changed SSHD_CA_MARKER, the "already configured" check stopped
+/// matching blocks written by an older binary, and every upgraded root daemon
+/// appended a second, identical Match block. Recognise both, forever.
+const SSHD_CA_MARKER_LEGACY: &str = "# Added by filament for SSH certificates (shell --ssh)";
+
+fn has_our_marker(text: &str) -> bool {
+    text.contains(SSHD_CA_MARKER) || text.contains(SSHD_CA_MARKER_LEGACY)
+}
 /// Default location of the CA public key the TrustedUserCAKeys line points at.
 /// (The operator places the daemon's CA pub here out of band.)
 pub const SSHD_CA_PUB_DEFAULT: &str = "/etc/ssh/filament_ca.pub";
@@ -219,8 +229,8 @@ pub fn ensure_sshd_ca(
     let current = std::fs::read_to_string(config_path).map_err(|_| {
         anyhow::anyhow!("sshd_config not found at {}", config_path.display())
     })?;
-    if current.contains(SSHD_CA_MARKER) {
-        crate::ui::say("sshd CA trust already configured");
+    if has_our_marker(&current) {
+        crate::ui::debug("sshd CA trust already configured");
         return Ok(());
     }
     let block = render_sshd_ca_block(ca_pub_path, daemon_user, principals_file);
@@ -273,7 +283,7 @@ pub fn ensure_sshd_ca(
 /// Pure presence check over config text: (TrustedUserCAKeys ours, principals
 /// line ours). Both must carry our marker block to count.
 pub fn sshd_ca_status(config_text: &str) -> (bool, bool) {
-    let ours = config_text.contains(SSHD_CA_MARKER);
+    let ours = has_our_marker(config_text);
     (
         ours && config_text.contains("TrustedUserCAKeys"),
         ours && config_text.contains("AuthorizedPrincipalsFile"),
@@ -281,9 +291,22 @@ pub fn sshd_ca_status(config_text: &str) -> (bool, bool) {
 }
 
 /// Doctor check: both CA lines present in the live sshd_config.
-pub fn check_sshd_ca() -> std::result::Result<(), String> {
+///
+/// Ok carries what trusts the CA. The per-user line in ~/.ssh/authorized_keys
+/// is the primary setup (no root, no sshd reload) and is enough on its own;
+/// doctor used to look only at sshd_config, so it said "unconfigured (run the
+/// CA setup)" on a box where `--ssh` worked, and named no command either way.
+pub fn check_sshd_ca() -> std::result::Result<String, String> {
+    if authkeys_managed::has_ca_trust_line() {
+        return Ok("per-user trust line in ~/.ssh/authorized_keys".to_string());
+    }
     check_sshd_ca_at(Path::new(SSHD_CONFIG_DEFAULT))
+        .map(|()| "TrustedUserCAKeys + principals in sshd_config".to_string())
 }
+
+/// What sets the CA trust up, named as the commands that do it. Only
+/// `tunlion shell --ssh` needs it; plain `tunlion shell` and `exec` do not.
+pub const SSH_CA_SETUP: &str = "only `tunlion shell --ssh` needs it. It is set up when this device starts serving shells: `tunlion grant <device> shell`, or `tunlion up --shell --i-know`; either adds a per-user trust line to ~/.ssh/authorized_keys";
 
 /// Best-effort arming for shell-serving flows (`up --shell`, `grant shell`):
 /// ensure the CA block plus the daemon principals entry. Loud on any
@@ -307,6 +330,40 @@ pub async fn arm_ssh_ca_for_serving() {
         ));
         return;
     }
+    // NO-ROOT TRUST FIRST. Everything below writes under /etc/ssh and so needs
+    // root; a daemon running as a normal user failed there, printed "cert logins
+    // will refuse until applied" into its own log, and stopped. Every `--ssh`
+    // after that presented a valid certificate that sshd had no reason to
+    // trust, and ssh fell back to asking for a PASSWORD -- for a tool whose
+    // whole point is that you never type one.
+    //
+    // OpenSSH has a per-user equivalent that needs neither root nor an sshd
+    // reload: a `cert-authority,principals="<user>"` line in that user's own
+    // authorized_keys, re-read on every login. Proven on a throwaway sshd
+    // before relying on it: without trust a valid cert is refused with
+    // "Permission denied (publickey,password)"; with the line it logs in;
+    // and a cert for a different principal is still refused.
+    let per_user_trust = install_user_ca_trust(&config_dir, &user);
+    match &per_user_trust {
+        // PER-USER TRUST IS SUFFICIENT, SO DO NOT TOUCH /etc/ssh AT ALL.
+        //
+        // The system-wide route below copies THIS daemon's CA over the one
+        // shared file sshd trusts, /etc/ssh/filament_ca.pub, unconditionally.
+        // So any second daemon running as root -- a test, a second instance, a
+        // reinstall with a fresh config -- silently took over root ssh trust
+        // from the first, and broke the first one's --ssh. This happened on a
+        // production box during development: a scratch test daemon replaced
+        // the trusted CA, and sshd trusted a throwaway key for root until it
+        // was found and quarantined. Shared system state written without an
+        // ownership check is the defect; not writing it is the fix whenever
+        // the per-user line, which is scoped to one user and one daemon's
+        // HOME, already does the job.
+        Ok(()) => return,
+        Err(e) => crate::ui::say(&format!(
+            "ssh CA: could not add the per-user trust line ({e}); falling back to the system-wide setup"
+        )),
+    }
+
     // Trust anchor next: copy the daemon CA pub where the Match block
     // points, so -t validates what sshd will actually read. Unwritable:
     // print the manual steps (including this copy) and stop -- the block
@@ -346,20 +403,92 @@ pub async fn arm_ssh_ca_for_serving() {
     }
 }
 
+/// The exact authorized_keys line that makes sshd trust this daemon's CA for
+/// `user` only. Pure, so it is unit-tested byte-exact. The CA pubkey is
+/// validated (single line, known type, base64) before it can reach the file,
+/// and the principal is restricted to a conservative charset because it is
+/// written inside a quoted option.
+pub fn render_user_ca_trust_line(ca_pub: &str, user: &str) -> Result<String> {
+    let key = authkeys_managed::validate_pubkey(ca_pub)?;
+    if user.is_empty()
+        || user.len() > 64
+        || !user.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        anyhow::bail!("refusing to write a principal that is not a plain username: {user:?}");
+    }
+    Ok(format!("cert-authority,principals=\"{user}\" {key}"))
+}
+
+/// Install (idempotently) the per-user CA trust line into the serving user's
+/// authorized_keys, inside tunlion's managed block.
+fn install_user_ca_trust(config_dir: &Path, user: &str) -> Result<()> {
+    let ca_pub_path = crate::ssh_ca::ca_key_path(config_dir).with_extension("pub");
+    let ca_pub = std::fs::read_to_string(&ca_pub_path)
+        .map_err(|e| anyhow::anyhow!("CA public key unreadable at {}: {e}", ca_pub_path.display()))?;
+    let line = render_user_ca_trust_line(&ca_pub, user)?;
+    // Its own markers, not a per-device block: see authkeys_managed::CA_BEGIN.
+    authkeys_managed::install_ca_trust_line(&line)
+}
+
 /// Same against an explicit path (tests use temp files, never the live one).
 pub fn check_sshd_ca_at(path: &Path) -> std::result::Result<(), String> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("sshd config unreadable at {}: {e}", path.display()))?;
+        .map_err(|e| format!("no CA trust (sshd config unreadable at {}: {e}); {SSH_CA_SETUP}", path.display()))?;
     match sshd_ca_status(&text) {
         (true, true) => Ok(()),
-        (false, _) => Err("TrustedUserCAKeys line missing (run the CA setup)".to_string()),
-        (_, false) => Err("AuthorizedPrincipalsFile line missing (run the CA setup)".to_string()),
+        (false, _) => Err(format!("no CA trust (no per-user line, no TrustedUserCAKeys in sshd_config); {SSH_CA_SETUP}")),
+        (_, false) => Err(format!("AuthorizedPrincipalsFile line missing from sshd_config; {SSH_CA_SETUP}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// doctor said "sshd-ca unconfigured (run the CA setup)", a step with no
+    /// command. Every unconfigured verdict now names the commands that set it
+    /// up, and says only `--ssh` needs it.
+    #[test]
+    fn an_unconfigured_ca_names_the_commands_that_configure_it() {
+        let dir = std::env::temp_dir().join(format!("tl-sshd-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("sshd_config");
+        std::fs::write(&cfg, "Port 22\n").unwrap();
+        for e in [
+            check_sshd_ca_at(&cfg).unwrap_err(),
+            check_sshd_ca_at(&dir.join("absent")).unwrap_err(),
+        ] {
+            assert!(!e.contains("run the CA setup"), "{e}");
+            assert!(e.contains("tunlion grant <device> shell"), "{e}");
+            assert!(e.contains("tunlion up --shell"), "{e}");
+            assert!(e.contains("tunlion shell --ssh"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_block_written_before_the_rename_is_recognised() {
+        // The rebrand changed the marker; without this an upgraded root daemon
+        // appended a second, identical Match block.
+        let old = format!("{SSHD_CA_MARKER_LEGACY}\nMatch User root\n    TrustedUserCAKeys /etc/ssh/x.pub\n    AuthorizedPrincipalsFile /etc/ssh/p/root\n");
+        assert!(has_our_marker(&old));
+        assert_eq!(sshd_ca_status(&old), (true, true));
+        assert!(!has_our_marker("Match User root\n    TrustedUserCAKeys /etc/ssh/someone-elses.pub\n"));
+    }
+
+    #[test]
+    fn the_per_user_trust_line_is_scoped_to_one_plain_username() {
+        let ca = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH2u7c8bP1RkQ0n1i3f5l0x9c4m2rWq6v8T7a3YkZpQ1 tunlion-ca";
+        assert_eq!(
+            render_user_ca_trust_line(ca, "kabir").unwrap(),
+            format!("cert-authority,principals=\"kabir\" {ca}")
+        );
+        let too_long = "u".repeat(65);
+        let bad_users: [&str; 5] = ["", "a b", "root\",command=\"x", "x/y", too_long.as_str()];
+        for bad in bad_users {
+            assert!(render_user_ca_trust_line(ca, bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn ca_block_is_a_daemon_user_match_with_both_lines() {

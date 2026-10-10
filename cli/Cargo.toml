@@ -165,6 +165,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
+    # Console modes for the interactive PTY: VT input so mouse and special keys
+    # reach a remote app (see l2.rs win_console). A feature, not a new crate.
+    "Win32_System_Console",
 ] }
 
 [profile.release]

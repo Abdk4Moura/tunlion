@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # `tunlion shell --ssh` via local CA, end to end. Standalone, hermetic,
-# fixture port 8120 ONLY. No system files are touched: the throwaway sshd
+# fixture port 8120 ONLY. No host files are touched: the throwaway sshd
 # listens on 127.0.0.1:9123 (reached through the mesh tunnel because
 # FILAMENT_SSH_PORT overrides the dial port), with temp hostkeys, temp
-# PidFile, temp CA trust. The only host residue is the pre-existing
-# managed-key bootstrap block (removable `# BEGIN/END filament-managed`
-# in root's authorized_keys -- the same residue any `shell --ssh` leaves).
+# PidFile, and B's daemon runs with HOME in the work dir, so the per-user
+# CA trust line it writes lands in a temp authorized_keys that the temp
+# sshd is pointed at (AuthorizedKeysFile). The runner's own
+# ~/.ssh/authorized_keys is never written.
 #
 #   FILAMENT_BIN=/path/to/tunlion ./ssh-ca-gates.sh
 #
@@ -15,6 +16,14 @@
 #      remote command runs, rc=0, exact output.
 #   B  NEGATIVE revoked -- after `revoke <dev> shell`, signing is refused
 #      (nonzero + reason); no new cert issues.
+#   C  WIRING (per-user, the default) -- arming wrote exactly one
+#      `cert-authority,principals="<user>" <daemon CA>` line in B's
+#      authorized_keys AND left the system sshd config, principals dir and
+#      CA anchor untouched. The second half is the regression guard for a
+#      real incident: a second root daemon used to overwrite the one shared
+#      system CA file and take over root's ssh trust.
+#   C2 WIRING (fallback) -- when the per-user line cannot be written, arming
+#      falls back to the system route: Match block + principals + anchor.
 #
 # Topology: side B = signer + sshd host, side A = initiator, reciprocal pair
 # secret (same-owner fleet). B's CA key is MINTED by up/grant arming
@@ -66,6 +75,9 @@ printf '[{"name":"boxA","secret":"%s"}]\n' "$SECRET" > "$DB/devices.json"
 
 A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA)
 B_USER="$(id -un)"
+# B's daemon HOME: where the per-user CA trust line (and any managed key
+# block) is written. The temp sshd reads authorized_keys from here.
+BHOME="$WORK/Bhome"; mkdir -p "$BHOME"
 SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=9123)
 
 # NO hand-provisioned CA key: up/grant arming mints it (CC-4 proves the
@@ -88,13 +100,15 @@ SSHD_PORT=9123
 HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals" FILAMENT_SSH_CA_PUB_ANCHOR="$WORK/hooked-ca.pub")
 ssh-keygen -q -t ed25519 -f "$WORK/hooked-hostkey" -N ""
 chmod 600 "$WORK/hooked-hostkey"
-printf 'Port 9123\nHostKey %s\nListenAddress 127.0.0.1\nPidFile %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPermitRootLogin prohibit-password\nLogLevel VERBOSE\n' "$WORK/hooked-hostkey" "$SSHD/sshd.pid" > "$WORK/hooked-sshd-config"
-env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
+printf 'Port 9123\nHostKey %s\nListenAddress 127.0.0.1\nPidFile %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPermitRootLogin prohibit-password\nLogLevel VERBOSE\nAuthorizedKeysFile %s\n' "$WORK/hooked-hostkey" "$SSHD/sshd.pid" "$BHOME/.ssh/authorized_keys" > "$WORK/hooked-sshd-config"
+# Byte copy of the config as WE wrote it: gate C asserts arming left it alone.
+cp "$WORK/hooked-sshd-config" "$WORK/sshd-config.as-written"
+env FILAMENT_L2=1 HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
   FILAMENT_SSH_HOSTKEY="$WORK/hooked-hostkey.pub" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
-env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 
 # A ~10-minute grant window, seeded AFTER the grant (grant rewrites the
 # device record and would wipe a pre-seeded capExpires -- gate D caught
@@ -119,32 +133,35 @@ pids+=($SSHD_PID)
 sleep 1
 ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED (product config?)"; cat "$SSHD/sshd.log"; tail -3 "$WORK/up.log"; exit 2; }
 
-# The ONLY authorized_keys on the box that matters here is root's (the
-# temp sshd has no AuthorizedKeysFile line at all). Snapshot it: CB-3
-# asserts cert login leaves it byte-identical (no permanent key install).
-AK_FILE="$HOME/.ssh/authorized_keys"
+# The ONLY authorized_keys the temp sshd reads is B's, in $BHOME. Arming has
+# already written its CA trust line there; snapshot it now: gate E asserts
+# cert login leaves it byte-identical (no permanent key install).
+AK_FILE="$BHOME/.ssh/authorized_keys"
 AK_BEFORE="$WORK/ak.before"; AK_AFTER="$WORK/ak.after"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$AK_BEFORE" || : > "$AK_BEFORE"
 
 # ===================================================================== GATE A ==
-# POSITIVE: cert round trip + real sshd login with the cert. No
-# authorized_keys exists anywhere, so rc=0 with output proves cert auth.
+# POSITIVE: cert round trip + real sshd login with the cert. B's
+# authorized_keys holds only the CA trust line (no plain keys), and sshd's
+# own log must name a certificate as the accepted credential.
 say A
 OUTA=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo SSH-CA-OK; id -un' 2>"$WORK/A.err" </dev/null)
 rcA=$?
 echo "## (cert login) rc=$rcA"
 echo "$OUTA" | sed 's/^/##   /'
-if [ "$rcA" = "0" ] && echo "$OUTA" | grep -q "SSH-CA-OK" && echo "$OUTA" | grep -qx "$B_USER"; then
+if [ "$rcA" = "0" ] && echo "$OUTA" | grep -q "SSH-CA-OK" && echo "$OUTA" | grep -qx "$B_USER" \
+   && grep -qE "Accepted publickey for $B_USER .*-CERT " "$SSHD/sshd.log"; then
   ok "gateA: cert login ran a remote command (rc=0, exact output, no installed keys)"
 else
   echo "-- A.err --"; cat "$WORK/A.err"; tail -5 "$WORK/up.log"
+  echo "-- sshd accept lines --"; grep -E "Accepted|Failed|denied" "$SSHD/sshd.log" | tail -3
   bad "gateA: cert login FAILED (rc=$rcA)"
 fi
 
 # ===================================================================== GATE B ==
 # NEGATIVE revoked: same command refused after the grant goes (nonzero).
 say B
-env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
+env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
 OUTB=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo SHOULD-NOT-RUN' 2>"$WORK/B.err" </dev/null)
 rcB=$?
 echo "## (revoked) rc=$rcB out='$OUTB'"
@@ -176,20 +193,54 @@ else
 fi
 
 # ===================================================================== GATE C ==
-# WIRING: up/grant arming wrote the Match block + daemon principals entry
-# through the product writer (temp paths above prove it without touching
-# /etc/ssh).
+# WIRING, per-user (the default): arming wrote exactly the scoped trust line
+# for B's daemon CA into B's own authorized_keys, and wrote NOTHING to the
+# system-wide sshd config, principals dir or CA anchor.
 say C
-if grep -q "Match User $B_USER" "$WORK/hooked-sshd-config" \
-   && grep -q "TrustedUserCAKeys" "$WORK/hooked-sshd-config" \
-   && [ "$(cat "$WORK/hooked-principals/$B_USER" 2>/dev/null)" = "$B_USER" ] \
-   && cmp -s "$DB/ssh/ssh_ca.pub" "$WORK/hooked-ca.pub"; then
-  ok "gateC: arming wrote block + principals + anchor copy (product writer)"
+WANT_LINE="cert-authority,principals=\"$B_USER\" $(head -1 "$DB/ssh/ssh_ca.pub" | awk '{print $1" "$2}')"
+GOT_LINES=$(grep -c '^cert-authority' "$AK_FILE" 2>/dev/null || true)
+if grep -qxF '# BEGIN tunlion-ca-trust' "$AK_FILE" 2>/dev/null \
+   && awk '{print $1" "$2" "$3}' "$AK_FILE" | grep -qxF "$WANT_LINE" \
+   && [ "$GOT_LINES" = "1" ]; then
+  ok "gateC: per-user trust line is exact and scoped to $B_USER (1 line)"
 else
-  echo "-- hooked-sshd-config --"; cat "$WORK/hooked-sshd-config" 2>/dev/null
-  echo "-- hooked-principals --"; ls -la "$WORK/hooked-principals" 2>/dev/null
-  echo "-- anchor vs daemon pub --"; cmp "$DB/ssh/ssh_ca.pub" "$WORK/hooked-ca.pub" 2>&1 | head -2
-  bad "gateC: arming outputs missing"
+  echo "-- want: $WANT_LINE"; echo "-- B authorized_keys --"; cat "$AK_FILE" 2>/dev/null
+  bad "gateC: per-user CA trust line missing or wrong"
+fi
+if cmp -s "$WORK/sshd-config.as-written" "$WORK/hooked-sshd-config" \
+   && [ ! -e "$WORK/hooked-ca.pub" ] && [ ! -e "$WORK/hooked-principals" ]; then
+  ok "gateC1: system sshd config, CA anchor and principals untouched"
+else
+  diff "$WORK/sshd-config.as-written" "$WORK/hooked-sshd-config" | head -8
+  ls -la "$WORK/hooked-ca.pub" "$WORK/hooked-principals" 2>&1 | head -4
+  bad "gateC1: arming wrote system-wide ssh state although per-user trust worked"
+fi
+
+# WIRING, fallback: a separate `up --shell` (arms at start) whose HOME cannot
+# hold ~/.ssh must fall back to the system route through the product writer
+# (its own temp paths, its own CA). HOME is a regular FILE, so creating $HOME/.ssh fails for root
+# too, unlike a permission-based block.
+say C2
+DC="$WORK/C"; mkdir -p "$DC"; : > "$WORK/home-is-a-file"
+# Same valid base as B's (arming runs `sshd -t` on the result).
+cp "$WORK/sshd-config.as-written" "$WORK/c2-sshd-config"
+C2_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/c2-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/c2-principals" FILAMENT_SSH_CA_PUB_ANCHOR="$WORK/c2-ca.pub")
+env FILAMENT_L2=1 HOME="$WORK/home-is-a-file" FILAMENT_CONFIG_DIR="$DC" FILAMENT_NAME=boxC USER="$B_USER" \
+  "${C2_ENV[@]}" "$BIN" up --shell --dir "$WORK/Cdrop" --server "$SERVER" >"$WORK/upC.log" 2>&1 &
+C2_PID=$!; pids+=($C2_PID)
+for _ in $(seq 1 30); do [ -s "$WORK/c2-ca.pub" ] && grep -q TrustedUserCAKeys "$WORK/c2-sshd-config" && break; sleep 0.5; done
+kill "$C2_PID" 2>/dev/null
+if grep -q "Match User $B_USER" "$WORK/c2-sshd-config" \
+   && grep -q "TrustedUserCAKeys" "$WORK/c2-sshd-config" \
+   && [ "$(cat "$WORK/c2-principals/$B_USER" 2>/dev/null)" = "$B_USER" ] \
+   && cmp -s "$DC/ssh/ssh_ca.pub" "$WORK/c2-ca.pub" \
+   && grep -q "falling back to the system-wide setup" "$WORK/upC.log"; then
+  ok "gateC2: per-user write failed, fallback wrote block + principals + anchor and said so"
+else
+  echo "-- c2-sshd-config --"; cat "$WORK/c2-sshd-config" 2>/dev/null
+  echo "-- c2-principals --"; ls -la "$WORK/c2-principals" 2>&1 | head -3
+  echo "-- upC.log --"; grep -i "ssh" "$WORK/upC.log" | head -5
+  bad "gateC2: system-wide fallback did not arm"
 fi
 
 # ===================================================================== GATE E ==
@@ -208,7 +259,7 @@ fi
 # cached bootstrap hits 255, the rebootstrap (cert mode too) retries, ssh
 # fails 255 again -- and STILL nothing is installed. Proves the 255 retry
 # path honors cert-only.
-env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grantE2.log" 2>&1
+env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grantE2.log" 2>&1
 kill "$SSHD_PID" 2>/dev/null; sleep 1
 OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
 rcE2=$?
