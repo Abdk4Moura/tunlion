@@ -60,6 +60,50 @@ pub(crate) fn note_stored(id: &str, stored: &str) {
     }
 }
 
+/// The name the receiver stored a file under, when it differs from the name
+/// offered: only the final path component, never a path on the other
+/// machine. None when they match or the receiver did not say (an older one).
+pub(crate) fn delivered_as(offered: &str, stored: Option<&str>) -> Option<String> {
+    let name = std::path::Path::new(stored?)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())?;
+    (name != offered).then_some(name)
+}
+
+/// The label of the per-file "ok" line: the stored name when it differs,
+/// followed by what was offered, so the line names a file that exists.
+pub(crate) fn summary_label(offered: &str, renamed: Option<&str>) -> String {
+    match renamed {
+        Some(stored) => format!("{stored} (sent as {})", shorten(offered)),
+        None => offered.to_string(),
+    }
+}
+
+/// The per-file confirmation line, naming the stored name whenever it differs.
+pub(crate) fn delivered_line(offered: &str, renamed: Option<&str>) -> String {
+    match renamed {
+        Some(stored) => format!(
+            "    {} delivered as {stored} + verified (whole-file sha256 matched)",
+            shorten(offered)
+        ),
+        None => format!("    {offered} delivered + verified (whole-file sha256 matched)"),
+    }
+}
+
+/// A long offered name, cut for a status line (the stored name is printed in full).
+fn shorten(name: &str) -> String {
+    if name.chars().count() <= 80 {
+        return name.to_string();
+    }
+    let head: String = name.chars().take(40).collect();
+    let tail: String = {
+        let v: Vec<char> = name.chars().collect();
+        v[v.len() - 20..].iter().collect()
+    };
+    format!("{head}...{tail}")
+}
+
 fn stored_for(id: &str) -> Option<String> {
     STORED.lock().ok()?.as_ref()?.get(id).cloned()
 }
@@ -190,6 +234,31 @@ mod tests {
             declined: false,
             stored_name: None,
         }
+    }
+
+    #[test]
+    fn a_renamed_delivery_names_what_landed() {
+        // `--name ../../escape.txt` was stored as escape.txt and reported as
+        // "ok ../../escape.txt".
+        let r = delivered_as("../../escape.txt", Some("escape.txt"));
+        assert_eq!(r.as_deref(), Some("escape.txt"));
+        assert!(delivered_line("../../escape.txt", r.as_deref()).contains("delivered as escape.txt"));
+        assert!(summary_label("../../escape.txt", r.as_deref()).starts_with("escape.txt (sent as"));
+        // A 300-byte name stored as 240 bytes.
+        let long = "y".repeat(300);
+        let stored = format!("/home/b/Tunlion/{}", "y".repeat(240));
+        let r = delivered_as(&long, Some(&stored)).unwrap();
+        assert_eq!(r.len(), 240);
+        let line = delivered_line(&long, Some(&r));
+        assert!(line.contains(&format!("delivered as {r}")), "{line}");
+        assert!(line.len() < 400, "the offered name is shortened: {}", line.len());
+        // A collision on the far side.
+        assert_eq!(delivered_as("a.txt", Some("a (1).txt")).as_deref(), Some("a (1).txt"));
+        // Same name, or an older receiver that does not say: unchanged lines.
+        assert_eq!(delivered_as("a.txt", Some("/x/a.txt")), None);
+        assert_eq!(delivered_as("a.txt", None), None);
+        assert_eq!(delivered_line("a.txt", None), "    a.txt delivered + verified (whole-file sha256 matched)");
+        assert_eq!(summary_label("a.txt", None), "a.txt");
     }
 
     #[test]

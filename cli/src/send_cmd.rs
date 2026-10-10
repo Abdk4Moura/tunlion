@@ -1768,19 +1768,24 @@ pub(crate) async fn send_cmd(
                             // on the far side, so this is the interval the
                             // throughput line is entitled to divide by. Printing
                             // it at `flush()` measured the send buffer filling.
+                            // Name what LANDED: the receiver may store it under
+                            // another name (shortened past its limit, stripped of
+                            // a path, renamed on a collision), and "ok <name>"
+                            // about a name that does not exist there was false.
+                            let renamed = crate::send_report::delivered_as(
+                                &o.name,
+                                v["stored"].as_str(),
+                            );
                             if let Some(t0) = o.stream_started {
                                 ui::transfer_summary(
-                                    &o.name,
+                                    &crate::send_report::summary_label(&o.name, renamed.as_deref()),
                                     o.stream_bytes,
                                     t0.elapsed().as_secs_f64(),
                                 );
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!(
-                                    "    {} delivered + verified (whole-file sha256 matched)",
-                                    o.name
-                                ),
+                                &crate::send_report::delivered_line(&o.name, renamed.as_deref()),
                             ));
                         }
                     }

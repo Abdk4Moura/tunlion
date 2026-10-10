@@ -35,6 +35,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[allow(dead_code)] // `up` (#392) is the user once both have merged
 pub(crate) const DAEMON_CONFLICT: i32 = 10;
 
+/// `status`: no daemon serves this config dir. Not an [`ExitKind`] either:
+/// `status` did its job (it looked), so this is its answer, not its failure.
+/// It exited 0 here, so a script had to parse "not running" out of prose.
+/// A daemon that runs but does not answer in time is `status`'s 6
+/// ([`ExitKind::Unreachable`]: "did not answer in time"). `--json` keeps exit
+/// 0 and reports both in its `running`/`responding` fields.
+pub(crate) const STATUS_NOT_RUNNING: i32 = 11;
+
 /// What kind of failure a command ended in. `code()` is the process exit code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExitKind {
@@ -442,5 +450,13 @@ mod tests {
         );
         let kinds: Vec<i32> = ExitKind::ALL.iter().map(|k| k.code()).collect();
         assert!(!kinds.contains(&DAEMON_CONFLICT), "DAEMON_CONFLICT must not reuse a kind's code");
+        assert!(
+            footer.lines().any(|l| l.trim_start().starts_with(&format!("{STATUS_NOT_RUNNING} "))),
+            "STATUS_NOT_RUNNING (exit {STATUS_NOT_RUNNING}) is missing from the EXIT CODES help section"
+        );
+        assert!(
+            !kinds.contains(&STATUS_NOT_RUNNING) && STATUS_NOT_RUNNING != DAEMON_CONFLICT,
+            "STATUS_NOT_RUNNING must not reuse another code"
+        );
     }
 }

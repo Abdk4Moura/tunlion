@@ -161,7 +161,8 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             crate::identity_flow::NO_IDENTITY_MSG
         ));
     }
-    match daemon_alive() {
+    let running = daemon_alive();
+    match running {
         Some(pid) => ui::say(&format!(
             "  {} up (pid {pid})",
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
@@ -209,6 +210,10 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 ui::say(&format!("    {l}"));
             }
         }
+    }
+    // The answer, as an exit code a script can branch on (it was 0 either way).
+    if running.is_none() {
+        std::process::exit(crate::exit_codes::STATUS_NOT_RUNNING);
     }
     Ok(())
 }
