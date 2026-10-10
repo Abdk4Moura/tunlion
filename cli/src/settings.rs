@@ -445,9 +445,6 @@ fn global_get(store: &str) -> Option<String> {
 
 fn global_put(store: &str, value: &str) -> Result<()> {
     let p = global_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()
@@ -478,7 +475,10 @@ fn global_remove(store: &str) -> Result<bool> {
         .collect();
     let removed = kept.len() != raw.lines().count();
     if removed {
-        std::fs::write(&p, kept.join("\n") + if kept.is_empty() { "" } else { "\n" })?;
+        crate::platform::SecretFile::write_str(
+            &p,
+            &(kept.join("\n") + if kept.is_empty() { "" } else { "\n" }),
+        )?;
     }
     Ok(removed)
 }
@@ -878,17 +878,26 @@ pub fn run_get(
 /// Tell a running daemon a key changed and print whether it applied live. On a
 /// daemon that doesn't answer (or a non-unix host), fall back to the restart hint.
 async fn announce_to_daemon(key: &str, color: bool) {
-    #[cfg(unix)]
-    {
-        match crate::ctl::try_reconfigure(key).await {
-            Some(v) if v["live"].as_bool() == Some(true) => {
-                eprintln!("  {}", ui::paint_when(color, ui::Tone::Ok, "applied to the running daemon"));
-                return;
-            }
-            _ => {}
+    // Callers reach here only with a daemon running. Three outcomes, three
+    // sentences: it applied the change, it answered that a restart is needed,
+    // or it did not answer at all. The last used to read as the second ("takes
+    // effect on next up"), which is a silent fallback over a daemon whose
+    // control socket is gone: the user restarts nothing and nothing changes.
+    // (A platform with no control socket answers `live: false` itself.)
+    let (tone, msg) = match crate::ctl::try_reconfigure(key).await {
+        Some(v) if v["live"].as_bool() == Some(true) => {
+            (ui::Tone::Ok, "applied to the running daemon".to_string())
         }
-    }
-    eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `tunlion up`"));
+        Some(_) => (ui::Tone::Dim, "takes effect on next `tunlion up`".to_string()),
+        None => (
+            ui::Tone::Warn,
+            format!(
+                "NOT applied: the running daemon did not answer on its control socket ({}); restart it to apply: tunlion down && tunlion up",
+                crate::ctl::control_sock_path().display()
+            ),
+        ),
+    };
+    eprintln!("  {}", ui::paint_when(color, tone, &msg));
 }
 
 /// `tunlion set <key> --unset [--peer a,b]`. `peers` empty = clear the global value;

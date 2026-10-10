@@ -51,7 +51,7 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("status_cmd.rs", 1),
         ("mount.rs", 47),
         ("doctor.rs", 41),
-        ("settings.rs", 37),
+        ("settings.rs", 36),
         ("direct.rs", 14),
         // reach now renders every human line through ui:: (the route label is
         // must-see, so ui::critical); the one left is the --until-direct

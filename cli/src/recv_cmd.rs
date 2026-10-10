@@ -995,13 +995,14 @@ pub(crate) async fn recv_cmd(
                     // Linux, 104 on macOS), e.g. a deep FILAMENT_CONFIG_DIR or a
                     // CI/macOS temp directory; found by a first-time-user test
                     // whose sandbox path was 110 bytes.
-                    let path = crate::ctl::control_sock_path();
-                    crate::ui::say(&format!(
-                        "tunlion: control socket unavailable at {} ({} bytes): {e}\n  \
-                         warm links, `tunlion requests` and instant invitations will not work; \
-                         a shorter config directory (FILAMENT_CONFIG_DIR) fixes it",
-                        path.display(),
-                        path.as_os_str().len()
+                    //
+                    // FATAL now, not a log line: the startup below waits on the
+                    // readiness signal this task drops, and stops the daemon with
+                    // this reason. A daemon nobody can talk to is not "up".
+                    crate::ui::critical(&format!(
+                        "tunlion: control socket unavailable: {e}\n  \
+                         without it, `status`, `set`, warm links, `tunlion requests` and \
+                         instant invitations cannot reach this daemon, so it will not start"
                     ));
                 }
             });
@@ -1046,7 +1047,14 @@ pub(crate) async fn recv_cmd(
             // a sibling `mint` that arms right after this line must not race a
             // socket that is not listening yet.
             if let Some(ready) = ctl_ready.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
+                // Ok(Err(_)): the server task ended without ever signalling ready,
+                // i.e. it could not create the socket (it said why, above).
+                if let Ok(Err(_)) = tokio::time::timeout(Duration::from_secs(5), ready).await {
+                    bail!(
+                        "the control socket {} could not be created; the daemon is not starting",
+                        crate::ctl::control_sock_path().display()
+                    );
+                }
             }
             if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
@@ -1354,29 +1362,59 @@ pub(crate) async fn recv_cmd(
                                 let auto_proxy =
                                     settings::get_bool("auto-proxy", None) && !no_proxy_fallback;
                                 if auto_proxy {
-                                    let server = server.to_string();
-                                    tokio::spawn(async move {
-                                        if let Err(e) =
-                                            l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay, false)
+                                    // Bind FIRST, then say what is true. Another daemon
+                                    // (another HOME on this machine) or a hand-started
+                                    // proxy may hold 1080 already.
+                                    let bound = match l2::bind_auto_proxy(1080).await {
+                                        Ok((listener, port)) => match l2::proxy_token() {
+                                            Ok(tok) => Ok((listener, port, tok)),
+                                            Err(e) => Err(format!("cannot create its token: {e}")),
+                                        },
+                                        Err(why) => Err(why),
+                                    };
+                                    match bound {
+                                        Ok((listener, port, tok)) => {
+                                            crate::proxy_state::record("127.0.0.1", port);
+                                            let server = server.to_string();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = l2::proxy_serve(
+                                                    &server,
+                                                    listener,
+                                                    "127.0.0.1",
+                                                    port,
+                                                    0,
+                                                    relay,
+                                                    tok.into(),
+                                                )
                                                 .await
-                                        {
-                                            // Port already in use is expected (user started proxy manually);
-                                            // only log unexpected errors.
-                                            let msg = e.to_string();
-                                            if !msg.contains("already in use") {
-                                                ui::debug(&format!("auto-proxy: {e}"));
+                                                {
+                                                    ui::critical(&format!(
+                                                        "auto-proxy on 127.0.0.1:{port} stopped: {e}"
+                                                    ));
+                                                }
+                                            });
+                                            let note = if port == 1080 {
+                                                String::new()
+                                            } else {
+                                                " (1080 was taken)".to_string()
+                                            };
+                                            ui::say(&format!(
+                                                "  {} started SOCKS5 proxy on 127.0.0.1:{port}{note} (set your tools' proxy to this)",
+                                                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                            ));
+                                            // The proxy opens mesh streams as this owner, so it
+                                            // requires the password in the token file; the
+                                            // proxy's own banner prints how to pass it.
+                                            for line in l2::proxy_usage_lines("127.0.0.1", port) {
+                                                ui::say(&format!("  {line}"));
                                             }
                                         }
-                                    });
-                                    ui::say(&format!(
-                                        "  {} started SOCKS5 proxy on 127.0.0.1:1080 (set your tools' proxy to this)",
-                                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                                    ));
-                                    // The proxy opens mesh streams as this owner, so it
-                                    // requires the password in the token file; the
-                                    // proxy's own banner prints how to pass it.
-                                    for line in l2::proxy_usage_lines("127.0.0.1", 1080) {
-                                        ui::say(&format!("  {line}"));
+                                        Err(why) => ui::say(&ui::paint(
+                                            ui::Tone::Warn,
+                                            &format!(
+                                                "  no SOCKS5 proxy: {why}. To run one on a free port: `tunlion forward <device>:<port> --socks --port <free port>`"
+                                            ),
+                                        )),
                                     }
                                 }
                             } else {
@@ -5202,7 +5240,7 @@ pub(crate) async fn recv_cmd(
                     // AND again inside install_authorized_key (defense in depth).
                     if cert_only {
                         let hostkeys = sshkeys::host_pubkeys();
-                        let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                        let login = platform::current_username().unwrap_or_else(|| "root".into());
                         let ssh_port = v["ssh_port"]
                             .as_u64()
                             .and_then(|n| u16::try_from(n).ok())
@@ -5241,7 +5279,7 @@ pub(crate) async fn recv_cmd(
                     match sshkeys::install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
-                            let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                            let login = platform::current_username().unwrap_or_else(|| "root".into());
                             // Tell the initiator whether an sshd is actually
                             // listening on the port `tunlion shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
@@ -6361,6 +6399,9 @@ pub(crate) async fn recv_cmd(
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() && xfer_deny_reason.is_none() {
                             st.pending.push_back((pid.clone(), v.clone()));
+                            // The sender's no-answer timeout must not fire on a
+                            // person who is still deciding; tell it so.
+                            let _ = t.send_control(&protocol::pending_msg(&id)).await;
                             st.question_open
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             if st.pending.len() == 1 {
@@ -6492,9 +6533,34 @@ pub(crate) async fn recv_cmd(
                                     ack_sid: 0,
                                     last_tick: 0,
                                     bar: ui::Progress::new("(stdout)", size),
+                                    write_err: Arc::new(std::sync::Mutex::new(None)),
                                 },
                             );
                             t.send_control(&protocol::accept_msg(&id, 0)).await?;
+                            continue;
+                        }
+                    }
+                    // Refuse up front what cannot fit. Discovering ENOSPC half way
+                    // through used to read as a CORRUPT file ("checksum still wrong
+                    // after 3 re-fetches") on this side and "the receiver may have
+                    // gotten nothing" on the sender's, when the truth was one line:
+                    // the disk is full. Unknown free space (a platform that cannot
+                    // say) accepts, and a write that then fails is caught below.
+                    let need = size.saturating_sub(offset);
+                    if let Some(free) = platform::free_space(&dir) {
+                        if free < need {
+                            let (token, msg) = crate::recv_files::storage_refusal(
+                                Some(platform::StorageFailure::NoSpace),
+                                &name,
+                                "",
+                                Some(need),
+                                Some(free),
+                            );
+                            ui::critical(&ui::paint(
+                                ui::Tone::Err,
+                                &format!("  refused {name} from {sender_name}: {msg}"),
+                            ));
+                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                             continue;
                         }
                     }
@@ -6518,9 +6584,20 @@ pub(crate) async fn recv_cmd(
                         match safe_resume_part(&part_path).await {
                             Ok(f) => f,
                             Err(e) => {
-                                ui::debug(&format!(
-                                    "{name}: cannot open .part to resume, declining: {e}"
+                                // Typed refusal, never silence: a decline the sender
+                                // never hears about is a sender that waits forever.
+                                let (token, msg) = crate::recv_files::storage_refusal(
+                                    platform::storage_failure(&e),
+                                    &name,
+                                    &e.to_string(),
+                                    None,
+                                    None,
+                                );
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
+                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
                         }
@@ -6534,20 +6611,36 @@ pub(crate) async fn recv_cmd(
                         // not its target); a symlink planted in the gap still trips
                         // O_EXCL and is declined below, not followed.
                         let _ = std::fs::remove_file(&part_path);
-                        if let Err(e) = (PartMeta {
+                        let created = match (PartMeta {
                             size,
                             head: offer_head,
                             full: effective_full.clone(),
                         }
                         .store(&meta_path))
                         {
-                            ui::debug(&format!("{name}: cannot write .part.meta, declining: {e}"));
-                            continue;
-                        }
-                        match safe_create_part(&part_path).await {
+                            Ok(()) => safe_create_part(&part_path).await,
+                            Err(e) => Err(e),
+                        };
+                        match created {
                             Ok(f) => f,
                             Err(e) => {
-                                ui::debug(&format!("{name}: cannot create .part, declining: {e}"));
+                                // The create failed (disk full, a name the filesystem
+                                // refuses, a read-only or unwritable folder). This used
+                                // to be a debug line and a silent `continue`, so the
+                                // sender re-offered forever. Say why, to both ends.
+                                crate::recv_files::discard_partial(&part_path);
+                                let (token, msg) = crate::recv_files::storage_refusal(
+                                    platform::storage_failure(&e),
+                                    &name,
+                                    &e.to_string(),
+                                    None,
+                                    None,
+                                );
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  refused {name} from {sender_name}: {msg}"),
+                                ));
+                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
                         }
@@ -6576,6 +6669,7 @@ pub(crate) async fn recv_cmd(
                             ack_sid: 0,
                             last_tick: 0,
                             bar,
+                            write_err: Arc::new(std::sync::Mutex::new(None)),
                         },
                     );
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
@@ -6624,6 +6718,18 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let id = inc.id.clone();
+                    // A write already failed (disk full, read-only): that is the
+                    // answer, not a checksum mismatch to re-fetch three times.
+                    let failed = inc.write_err.lock().unwrap().clone();
+                    if let Some(wf) = failed {
+                        st.verify_fails.remove(&id);
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                        continue;
+                    }
                     if inc.full.is_some() {
                         let verdict = verify_incoming(&inc).await;
                         match verdict {
@@ -6780,6 +6886,18 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let id = inc.id.clone();
+                    // A write already failed (disk full, read-only): that is the
+                    // answer, not a checksum mismatch to re-fetch three times.
+                    let failed = inc.write_err.lock().unwrap().clone();
+                    if let Some(wf) = failed {
+                        st.verify_fails.remove(&id);
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                        continue;
+                    }
                     if inc.full.is_some() {
                         let verdict = verify_incoming(&inc).await;
                         match verdict {
@@ -6927,6 +7045,27 @@ pub(crate) async fn recv_cmd(
                 // its output dropped as "unknown sid" otherwise, and the
                 // verify then misreports a granted session as refused). The
                 // mux-map miss below still drops anything truly unknown.
+                // A write to this file already failed: stop taking its bytes and
+                // tell the sender why, now, instead of letting it stream the rest
+                // into a disk that cannot hold it.
+                let failed = if l2::is_l2_sid(sid) {
+                    None
+                } else {
+                    st.by_sid
+                        .get(&(pid.clone(), sid))
+                        .and_then(|inc| inc.write_err.lock().unwrap().clone())
+                };
+                if let Some(wf) = failed {
+                    if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        st.verify_fails.remove(&inc.id);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                    }
+                    continue;
+                }
                 if l2::is_l2_sid(sid) {
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.on_frame(sid, data).await;
@@ -6973,6 +7112,7 @@ pub(crate) async fn recv_cmd(
                     let end_seen = Arc::clone(&inc.end_seen);
                     let ranges = Arc::clone(&inc.ranges);
                     let received = Arc::clone(&inc.received);
+                    let write_err = Arc::clone(&inc.write_err);
                     let tx = tx.clone();
                     let pid_c = pid.clone();
                     let data_len = data.len();
@@ -6989,9 +7129,18 @@ pub(crate) async fn recv_cmd(
                         // byte-writing primitive. The primitive returns the fact
                         // now and the decision to report it lives out here.
                         let wrote = pwrite_at(&file, &data, pos);
-                        if let Err(_e) = &wrote {
-                            // Write failed: do NOT record coverage (leaves the gap).
-                            // The whole-file digest will fail and trigger a re-fetch.
+                        if let Err(e) = &wrote {
+                            // Write failed: do NOT record coverage (leaves the gap),
+                            // and record WHY, once. A full disk or a filesystem gone
+                            // read-only fails every later write too, and the event
+                            // loop turns this into a typed refusal instead of three
+                            // re-fetches and a false "corrupt file" verdict.
+                            {
+                                let mut slot = write_err.lock().unwrap();
+                                if slot.is_none() {
+                                    *slot = Some(crate::recv_files::WriteFailure::from_io(e));
+                                }
+                            }
                             dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
                         } else {
                             if let Ok(iters) = &wrote {
@@ -7522,4 +7671,30 @@ mod settle_tests {
         assert!(r.contains("2000"), "reason must name the bound: {r}");
         assert!(r.contains("retry"), "reason must offer the retry: {r}");
     }
+}
+
+/// A write to an incoming file failed. Report it on this side (must-see), drop
+/// the partial, and return the typed refusal (`id`, token, sentence) for the
+/// sender. `need` is what was still to come and `free` what the disk has now,
+/// so a full disk says by how much instead of calling the file corrupt.
+fn refuse_failed_write(
+    inc: IncomingFile,
+    dir: &Path,
+    wf: &crate::recv_files::WriteFailure,
+    from: &str,
+) -> (String, &'static str, String) {
+    let need = inc.size.saturating_sub(inc.received.load(Ordering::Relaxed));
+    let free = platform::free_space(dir);
+    let (token, msg) =
+        crate::recv_files::storage_refusal(wf.kind, &inc.name, &wf.detail, Some(need), free);
+    let from = if from.is_empty() { "the sender" } else { from };
+    ui::critical(&ui::paint(
+        ui::Tone::Err,
+        &format!("  refused {} from {from}: {msg}", inc.name),
+    ));
+    let id = inc.id.clone();
+    let part = inc.part_path.clone();
+    drop(inc);
+    crate::recv_files::discard_partial(&part);
+    (id, token, msg)
 }

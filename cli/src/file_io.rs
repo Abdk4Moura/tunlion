@@ -92,8 +92,18 @@ pub(crate) fn write_owner_only_file(path: &Path, contents: &str) -> Result<()> {
     let mut file = options
         .open(path)
         .with_context(|| format!("create owner-only file {}", path.display()))?;
-    writeln!(file, "{contents}")?;
-    file.sync_all()?;
+    // A failed write must not leave the file behind: create_new means an empty
+    // or truncated leftover blocks the retry ("File exists"), which is how a
+    // full disk turned one failed `add --out` into a second, unrelated error.
+    let written = writeln!(file, "{contents}").and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(anyhow!(
+            "could not write {}: {e} (the partial file was removed)",
+            path.display()
+        ));
+    }
     Ok(())
 }
 

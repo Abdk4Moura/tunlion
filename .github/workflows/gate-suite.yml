@@ -20,6 +20,11 @@
 #                              warm-hold re-dials, no reaps, no stall ladder,
 #                              while the peer runs one-shot commands at it,
 #                              and the control socket stays responsive
+#   hostile-env-gates.sh       full disk, umask 0000, a deep HOME, a stopped
+#                              daemon and concurrent starts behave as stated
+#                              (mounts small tmpfs disks, so it uses sudo)
+#   reenrol-advice-gates.sh    the advice for widening a joined device's ceiling
+#                              is run exactly as printed, and it works
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
 # 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
@@ -61,6 +66,8 @@ on:
       - 'cli/tests/shell-gates.sh'
       - 'cli/tests/whoami-candidate-gates.sh'
       - 'cli/tests/warm-hold-idle-gates.sh'
+      - 'cli/tests/hostile-env-gates.sh'
+      - 'cli/tests/reenrol-advice-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -142,6 +149,8 @@ jobs:
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
+            [cli/tests/hostile-env-gates.sh]=11
+            [cli/tests/reenrol-advice-gates.sh]=3
           )
           # Per-gate bound overrides (seconds); everything else gets 300. The
           # warm-hold idle gate measures a deliberate 180s idle window on top
@@ -165,7 +174,9 @@ jobs:
                    cli/tests/roster-gates.sh \
                    cli/tests/shell-gates.sh \
                    cli/tests/whoami-candidate-gates.sh \
-                   cli/tests/warm-hold-idle-gates.sh; do
+                   cli/tests/warm-hold-idle-gates.sh \
+                   cli/tests/hostile-env-gates.sh \
+                   cli/tests/reenrol-advice-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare

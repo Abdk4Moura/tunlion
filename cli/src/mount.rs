@@ -34,7 +34,7 @@ fn load_profile(name: &str) -> Result<MountProfile> {
 }
 
 fn save_profile(profile: &MountProfile) -> Result<()> {
-    std::fs::create_dir_all(profiles_dir())?;
+    crate::platform::create_private_dir_all(&profiles_dir())?;
     let path = profiles_dir().join(format!("{}.json", profile.name));
     let data = serde_json::to_string_pretty(profile)?;
     // Atomic write: temp file + rename (prevents truncation on ENOSPC/crash)
@@ -110,10 +110,8 @@ fn load_mounts() -> Vec<MountEntry> {
 
 fn save_mounts(mounts: &[MountEntry]) -> Result<()> {
     let path = mounts_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let data = serde_json::to_string_pretty(mounts)?;
+    // Owner-only and atomic (creates the directory 0700 too).
     crate::platform::SecretFile::write_str(&path, &data)?;
     Ok(())
 }

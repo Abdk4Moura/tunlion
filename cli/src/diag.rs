@@ -267,7 +267,7 @@ fn diag_path() -> PathBuf {
 fn write_jsonl(v: &Value) {
     let path = diag_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = crate::platform::create_private_dir_all(dir);
     }
     // Rotate by TRUNCATION: a doctor wants the latest span, not unbounded
     // history. Cheap stat, then start fresh if we are over the cap.

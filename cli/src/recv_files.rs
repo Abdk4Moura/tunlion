@@ -333,6 +333,77 @@ pub(crate) struct IncomingFile {
     /// re-ticking the same value). Not atomic — only accessed from the event loop.
     pub(crate) last_tick: u64,
     pub(crate) bar: ui::Progress,
+    /// The first write that failed on this file (disk full, a filesystem gone
+    /// read-only), recorded by the writer task that hit it. The event loop turns
+    /// it into a typed refusal to the sender. Before this a failed write only
+    /// left a hole, the whole-file digest then failed three times, and the user
+    /// was told the file was CORRUPT when the disk was full.
+    pub(crate) write_err: Arc<std::sync::Mutex<Option<WriteFailure>>>,
+}
+
+/// See `IncomingFile::write_err`.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteFailure {
+    pub(crate) kind: Option<crate::platform::StorageFailure>,
+    pub(crate) detail: String,
+}
+
+impl WriteFailure {
+    pub(crate) fn from_io(e: &std::io::Error) -> Self {
+        WriteFailure { kind: crate::platform::storage_failure(e), detail: e.to_string() }
+    }
+}
+
+/// A refusal's stable wire token and the sentence both ends show, for a file
+/// this receiver cannot store. `need`/`free` are bytes, named when known so
+/// "out of disk space" says by how much.
+pub(crate) fn storage_refusal(
+    kind: Option<crate::platform::StorageFailure>,
+    name: &str,
+    detail: &str,
+    need: Option<u64>,
+    free: Option<u64>,
+) -> (&'static str, String) {
+    use crate::platform::StorageFailure as F;
+    match kind {
+        Some(F::NoSpace) => (
+            "no_space",
+            match (need, free) {
+                (Some(n), Some(f)) => format!(
+                    "receiver is out of disk space for {name} (needs {}, has {})",
+                    human(n),
+                    human(f)
+                ),
+                _ => format!("receiver is out of disk space for {name} ({detail})"),
+            },
+        ),
+        Some(F::NameTooLong) => (
+            "name_too_long",
+            format!("receiver's filesystem refuses the name {name} ({detail})"),
+        ),
+        Some(F::ReadOnly) => (
+            "read_only",
+            format!("receiver's download folder is read-only, cannot save {name} ({detail})"),
+        ),
+        Some(F::Permission) => (
+            "permission",
+            format!("receiver has no permission to write {name} in its download folder ({detail})"),
+        ),
+        None => ("io", format!("receiver could not save {name}: {detail}")),
+    }
+}
+
+/// Remove what a refused file left behind: its `.part` and `.part.meta`. A
+/// refused partial is not resumable (the cause was the disk or the name, not the
+/// link), and on a full disk it is holding the very space that ran out.
+pub(crate) fn discard_partial(part_path: &Path) {
+    let _ = std::fs::remove_file(part_path);
+    let meta = {
+        let mut m = part_path.as_os_str().to_owned();
+        m.push(".meta");
+        PathBuf::from(m)
+    };
+    let _ = std::fs::remove_file(meta);
 }
 
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and

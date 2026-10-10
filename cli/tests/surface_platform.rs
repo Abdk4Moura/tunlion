@@ -81,7 +81,6 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("mount_fuse.rs", 2),
         ("expose.rs", 1),
         ("mount_winfsp.rs", 1),
-        ("settings.rs", 1),
     ])
 }
 

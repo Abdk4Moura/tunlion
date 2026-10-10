@@ -1001,7 +1001,7 @@ pub(crate) async fn async_main() -> Result<()> {
             )
             .await
         }
-        Cmd::Status { json } => status_cmd(json || ui_caps.json),
+        Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
             down_cmd()
@@ -1829,8 +1829,14 @@ pub(crate) async fn async_main() -> Result<()> {
                         "'{capability}' is already granted to '{device}' by its invitation ceiling; no grant is needed"
                     ),
                     _ => bail!(
-                        "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling. Re-invite with {capability} in the invitation:\n  tunlion add --for {device} --allow {capability} --yes",
-                        ceiling.join(", ")
+                        "{capability} is outside {device}'s invitation ceiling ({}). A grant cannot widen a ceiling.\n{}",
+                        ceiling.join(", "),
+                        crate::identity_state::reenrol_steps(
+                            &device,
+                            &crate::display_name(),
+                            &capability,
+                            &ceiling
+                        )
                     ),
                 }
             }

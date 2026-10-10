@@ -288,6 +288,14 @@ pub(crate) async fn up_cmd(
         platform::add_firewall_rule(&exe);
         return Ok(());
     }
+    // A process whose console IS daemon.log (the child `up --detach` spawned)
+    // must never follow that log: every line it read it would append again. That
+    // loop took daemon.log from 0 to 22 MB in under two seconds and filled the
+    // disk when three `up --detach` raced. `detached_child` covers Windows,
+    // which has no inode to compare.
+    let console_log = platform::Paths::config_path("daemon.log");
+    let headless = std::env::var_os(platform::DETACHED_CHILD_ENV).is_some()
+        || platform::stdio_is_file(&console_log);
     if let Some(pid) = daemon_alive() {
         dlog!(
             "[up] already-up: pidfile={:?} pid={pid} cmdline={:?}",
@@ -331,12 +339,17 @@ pub(crate) async fn up_cmd(
             );
             std::process::exit(ALREADY_UP_DIFFERENT_EXIT);
         }
-        if detach {
+        if detach || headless {
             // --detach never blocks: the daemon already serves exactly this.
+            // Nor does the detached child (its console IS daemon.log, so
+            // following the log would feed it back into itself).
             ui::say(&format!(
                 "  {} daemon already running (pid {pid}) with these settings; nothing to do",
                 ui::paint(ui::Tone::Ok, ui::glyph_ok())
             ));
+            if headless && !detach {
+                std::process::exit(UP_LOST_ELECTION_EXIT);
+            }
             return Ok(());
         }
         // #192: `up` twice should not dead-end. The daemon is already serving;
@@ -351,6 +364,40 @@ pub(crate) async fn up_cmd(
         // {config}/daemon.log, return to the shell. The child writes the pidfile
         // and serves detached (survives closing this terminal).
         return detach_up(&daemon_argv).await;
+    }
+    // SINGLE-INSTANCE ELECTION, atomic, before anything is written. The pidfile
+    // check above is read-then-write: N concurrent starts all read "nobody" and
+    // all proceed. The lock is held for this daemon's whole life (the guard
+    // lives until `up_cmd` returns) and the kernel drops it if we die.
+    let lock_path = platform::Paths::config_path("up.lock");
+    let _instance = match platform::InstanceLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            let pid = wait_for_winner_pid();
+            if headless {
+                // The losing child of a concurrent `up --detach`: its parent turns
+                // this exit into "already running".
+                already_running(pid);
+                std::process::exit(UP_LOST_ELECTION_EXIT);
+            }
+            ui::say(&format!(
+                "  daemon already running{}; following its log (ctrl-c to detach)",
+                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            ));
+            return logs_cmd(true, 20).await;
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "cannot take the daemon lock {} (is the config directory writable?)",
+                lock_path.display()
+            )));
+        }
+    };
+    // A write that died part way (a full disk, a kill) leaves `<file>.tmp.<pid>`
+    // behind; nothing else ever removes them.
+    let swept = platform::sweep_stale_temp_files(&crate::settings::config_dir());
+    if swept > 0 {
+        ui::debug(&format!("removed {swept} stale temporary file(s) from the config directory"));
     }
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
@@ -869,6 +916,15 @@ pub(crate) fn log_source(running_under_service_manager: bool, console_log_exists
 /// with -f.
 pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
     let console = crate::platform::Paths::config_path("daemon.log");
+    // Never follow the file our own output goes to: each line read would be
+    // written straight back, and the log grows until the disk is full.
+    if follow && crate::platform::stdio_is_file(&console) {
+        ui::say(&format!(
+            "  not following {}: this process's own output goes there",
+            console.display()
+        ));
+        return Ok(());
+    }
     let managed = daemon_alive().and_then(|pid| service_manager_for_pid(pid).map(|m| (pid, m)));
     let source = log_source(managed.is_some(), console.exists());
 
@@ -1264,4 +1320,32 @@ mod patient_connect_tests {
         assert_eq!(secs, vec![1, 2, 4, 8, 16, 30, 30, 30, 30]);
         assert_eq!(signaling_backoff(u32::MAX), Duration::from_secs(30), "never overflows");
     }
+}
+
+/// Exit status of an `up` that lost the single-instance election while its
+/// console is daemon.log, i.e. the background child of `up --detach`. Internal
+/// to `up --detach`, which reads it as "a daemon is already running" and itself
+/// exits 0 (an `up --detach` asks for a running daemon, and one is running).
+pub(crate) const UP_LOST_ELECTION_EXIT: i32 = 11;
+
+/// Say that a daemon is already running and nothing was started.
+pub(crate) fn already_running(pid: Option<u32>) {
+    ui::say(&format!(
+        "  {} daemon already running{}; nothing to do",
+        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+        pid.map(|p| format!(" (pid {p})")).unwrap_or_else(|| " (starting)".to_string())
+    ));
+}
+
+/// The pid of the daemon that won the election, once it has written its
+/// pidfile. The winner takes the lock first and writes the pidfile a moment
+/// later, so a loser waits briefly rather than reporting no pid.
+pub(crate) fn wait_for_winner_pid() -> Option<u32> {
+    for _ in 0..20 {
+        if let Some(pid) = daemon_alive() {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
 }

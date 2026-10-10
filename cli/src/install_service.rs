@@ -34,9 +34,7 @@ use anyhow::bail;
 pub(crate) fn install_system_service(argv: &[String]) -> Result<()> {
     let exe_path = std::env::current_exe()?;
     let exe = exe_path.display().to_string();
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "root".into());
+    let user = crate::platform::current_username().unwrap_or_else(|| "root".into());
     let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"));
 
     let exec_start = crate::platform::systemd_exec_start(&exe_path, argv);

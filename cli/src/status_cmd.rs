@@ -124,9 +124,20 @@ pub(crate) fn owner_fingerprint(user_pub: &[u8; 32]) -> String {
     hex::encode(user_pub).chars().take(8).collect()
 }
 
-pub(crate) fn status_cmd(json: bool) -> Result<()> {
+/// How long `status` waits for the daemon to answer on its control socket.
+const STATUS_PROBE: Duration = Duration::from_millis(1500);
+
+pub(crate) async fn status_cmd(json: bool) -> Result<()> {
+    // A live pid is not a working daemon. Ask it something, briefly: a stopped
+    // (SIGSTOP) or wedged daemon, or one whose control socket could not be
+    // created, keeps its pid and used to be reported "up".
+    let pid_alive = daemon_alive();
+    let responding = match pid_alive {
+        Some(_) => crate::ctl::daemon_responds(STATUS_PROBE).await,
+        None => Some(false),
+    };
     if json {
-        let pid = daemon_alive();
+        let pid = pid_alive;
         let exposed: Vec<Value> = expose::load()
             .iter()
             .map(|b| json!({ "port": b.port, "target": b.target, "peers": b.peers.clone().unwrap_or_default() }))
@@ -141,6 +152,9 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 "verb": "status",
                 "running": pid.is_some(),
                 "pid": pid,
+                // false: a process holds the pidfile but does not answer on its
+                // control socket. null: this platform cannot ask.
+                "responding": responding,
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
@@ -164,7 +178,13 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             crate::identity_flow::NO_IDENTITY_MSG
         ));
     }
-    match daemon_alive() {
+    match pid_alive {
+        Some(pid) if responding == Some(false) => ui::say(&format!(
+            "  {} running but not responding (pid {pid}): it did not answer on its control socket ({}) within {}s. It may be stopped (SIGSTOP) or wedged; `tunlion down` then `tunlion up` restarts it",
+            ui::paint(ui::Tone::Err, ui::glyph_err()),
+            crate::ctl::control_sock_path().display(),
+            STATUS_PROBE.as_secs_f32()
+        )),
         Some(pid) => ui::say(&format!(
             "  {} up (pid {pid})",
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
@@ -443,6 +463,23 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     // daemon.log is appended to, so remember where THIS run's output starts:
     // a failure report must quote this daemon, not the last one.
     let log_start = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    // Elect before spawning: if a daemon holds the lock, there is nothing to
+    // start. (The children elect again, atomically, for the race this check
+    // cannot see: two `up --detach` that both pass it at the same instant.)
+    let lock_path = crate::platform::Paths::config_path("up.lock");
+    match crate::platform::InstanceLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => drop(lock),
+        Ok(None) => {
+            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "cannot take the daemon lock {} (is the config directory writable?)",
+                lock_path.display()
+            )));
+        }
+    }
     let mut child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
     let pid = child.id();
     // "ok daemon detached" used to mean only "a pidfile appeared", and `up`
@@ -479,6 +516,12 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     };
     let tail = log_tail_since(&log_path, log_start, DETACH_LOG_LINES);
     match outcome {
+        // Another `up` won the single-instance election at the same instant: a
+        // daemon is running, which is what was asked for.
+        DetachOutcome::Exited(Some(code)) if code == crate::up_logs::UP_LOST_ELECTION_EXIT => {
+            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
+            Ok(())
+        }
         DetachOutcome::Ready => {
             ui::say(&format!(
                 "  {} daemon detached and serving (pid {pid}, pidfile at {}) - output: {}",

@@ -43,10 +43,7 @@ pub fn load() -> Vec<Binding> {
 
 fn save(bindings: &[Binding]) -> Result<()> {
     let p = expose_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    // Atomic replace so a concurrent daemon read never sees a half-written file.
+    // Atomic replace (SecretFile also creates the directory, owner-only) so a concurrent daemon read never sees a half-written file.
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(bindings)?)?;
     Ok(())
 }
