@@ -116,7 +116,7 @@ jobs:
           # gates while leaving them indistinguishable from unwired ones. Wiring
           # that a machine cannot see is the thing #249 exists to catch.
           declare -A EXPECT=(
-            [cli/tests/ssh-ca-gates.sh]=6
+            [cli/tests/ssh-ca-gates.sh]=8
             [cli/tests/exec-gates.sh]=13
             [cli/tests/sync-gates.sh]=17
             # 23 = 22 gate slots + the RECON (post-restart link re-establishment)
