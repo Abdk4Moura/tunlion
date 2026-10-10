@@ -381,7 +381,8 @@ mod tests {
         assert_eq!(classify(&unknown_cap).code(), 2);
         let route = crate::capability::parse_grant_spec("route", &[0u8; 32])
             .map_err(crate::dispatch::grant_usage)
-            .unwrap_err();
+            .err()
+            .expect("route without a prefix must not parse");
         assert_eq!(classify(&route), ExitKind::Usage);
         let missing = crate::send_cmd::missing_input(
             "nope.txt",
