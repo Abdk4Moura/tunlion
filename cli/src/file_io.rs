@@ -58,7 +58,12 @@ pub(crate) fn remove_pidfile() {
 /// The daemon is serving. Best-effort: a missing marker only makes
 /// `up --detach` report "not ready yet", never a false success.
 pub(crate) fn mark_daemon_ready() {
-    let _ = std::fs::write(ready_marker(), format!("{}\n", std::process::id()));
+    // Owner-only like the rest of the config dir: `fs::write` let `umask 0000`
+    // make it 0666, and anyone could then point `up --detach` at another pid.
+    let _ = crate::platform::SecretFile::write_str(
+        &ready_marker(),
+        &format!("{}\n", std::process::id()),
+    );
 }
 
 /// The pid recorded in the ready marker, if any.
