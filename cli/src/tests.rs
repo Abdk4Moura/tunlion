@@ -3913,3 +3913,47 @@ fn tour_screen_never_mints_an_identity() {
         "tour_cmd no longer reads the identity at all, so this test has drifted from the source"
     );
 }
+
+// ------------------------------------------------------- peer presence (F4) --
+
+/// Blind test F4: `devices` showed a SIGSTOPped, then wiped, peer as "online
+/// (last seen just now)". A relay link's `idle_ms` is stamped by our own
+/// keepalive writes, which keep succeeding with nobody listening, so it never
+/// grew. Presence is judged on what the PEER last sent.
+#[test]
+fn a_relay_peer_that_went_silent_is_not_present() {
+    use crate::daemon_ctl::peer_present;
+    // Relay, the peer's keepalive heard 2 s ago: present.
+    assert!(peer_present(true, false, Some(2_000), 0));
+    // The defect: our writes keep idle at 0, but the peer has been silent 30 s.
+    assert!(!peer_present(true, false, Some(30_000), 0));
+    // A dead transport is never present, whatever the stamps say.
+    assert!(!peer_present(false, false, Some(0), 0));
+    // Direct QUIC tracks no heard time and is judged by its own liveness,
+    // which its 21 s idle timeout flips.
+    assert!(peer_present(true, true, None, u64::MAX));
+    assert!(!peer_present(false, true, None, 0));
+    // A transport that tracks neither keeps the old relay idle rule.
+    assert!(peer_present(true, false, None, 1_000));
+    assert!(!peer_present(true, false, None, 9_000));
+}
+
+/// One source of truth for "last seen": a server roster announcement is not a
+/// sighting. The `known device appeared` branch touched lastSeen on every
+/// roster re-push, so a reset (wiped) device read "last seen just now" in
+/// `devices` while `add` said "1m ago" from the same record. The only writers
+/// left are the presence observation (peer_present) and an announce received
+/// over a live link.
+#[test]
+fn a_roster_announcement_does_not_refresh_last_seen() {
+    let src = include_str!("recv_cmd.rs");
+    let at = src
+        .find("known device '{n}' appeared, connecting\"")
+        .expect("the known-device announcement branch exists");
+    let branch = &src[at..];
+    let branch = &branch[..branch.find("} else {").expect("branch end")];
+    assert!(
+        !branch.contains("devices_touch("),
+        "the roster announcement must not refresh lastSeen:\n{branch}"
+    );
+}

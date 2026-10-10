@@ -2462,7 +2462,15 @@ pub(crate) async fn recv_cmd(
             let live: Vec<String> = conn
                 .links
                 .iter()
-                .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+                // Present, not merely open: a relay link to a stopped or wiped
+                // peer stays `is_alive()` while our own keepalive writes keep
+                // succeeding, and touching it here kept that device "last seen
+                // just now" forever. See daemon_ctl::peer_present.
+                .filter(|(_, l)| {
+                    l.transport.as_ref().is_some_and(|t| {
+                        crate::daemon_ctl::peer_present(t.is_alive(), l.direct, t.heard_ms(), t.idle_ms())
+                    })
+                })
                 .map(|(_, l)| l.shown().to_string())
                 .collect();
             for who in live {
@@ -2984,6 +2992,11 @@ pub(crate) async fn recv_cmd(
         }
 
         match ev {
+            // A sid left a channel we watch: forget it from the roster so
+            // warm-hold never dials a departed instance (see on_known_peer_left).
+            Ev::KnownPeerLeft(v) => {
+                conn.on_known_peer_left(&v);
+            }
             // A warm-reuse open found this held link black-holing new streams
             // (zombie: alive at QUIC, dead for data). Drop it so the proactive
             // re-connect forms a fresh, healthy held link and warm-reuse goes
@@ -3166,6 +3179,9 @@ pub(crate) async fn recv_cmd(
                             &name,
                         ));
                     }
+                    // The roster itself: a sid absent from two digests is gone
+                    // even when its known-peer-left was lost.
+                    conn.prune_roster_absent(&channel_present, &present);
                 }
             }
             // C29: a code minted in-session (`pair` typed into up).
@@ -3273,7 +3289,15 @@ pub(crate) async fn recv_cmd(
                         .unwrap_or(false);
                     if fresh || link_dead {
                         ui::say(&format!("known device '{n}' appeared, connecting"));
-                        devices_touch(n, None, None); // track last_seen; addresses filled on ChannelReady
+                        // NOT a sighting. This is the server's roster, which it
+                        // re-pushes on every (re)subscribe and sync tick, and
+                        // which can still carry a session the device no longer
+                        // has (a reset device, a killed daemon not yet timed
+                        // out). Touching lastSeen here kept a wiped device at
+                        // "last seen just now" while `add`, reading the same
+                        // record a minute later, said "1m ago". lastSeen moves
+                        // only on a link whose peer is demonstrably present
+                        // (daemon_ctl::peer_present, the liveness observation).
                     } else {
                         ui::trace(&format!(
                             "known device '{n}' re-announced (link already up)"
@@ -7205,8 +7229,18 @@ pub(crate) async fn recv_cmd(
                     }
                 }
             }
-            Ev::GraceExpired(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
+            // RetryLink: the stuck-link ladder's scheduled retry came due (the
+            // backoff runs on a timer task, never on this loop). Its exhausted
+            // outcome is the same as a lost link's, so it shares the handling.
+            ev @ (Ev::GraceExpired(..) | Ev::RetryLink(..)) => {
+                let exhausted = match ev {
+                    Ev::GraceExpired(pid, generation) => {
+                        conn.on_stuck(&pid, generation, "lost").await?
+                    }
+                    Ev::RetryLink(pid, generation) => conn.on_retry_due(&pid, generation).await?,
+                    _ => false,
+                };
+                if exhausted && paired && !keep_open {
                     sweep_completed_streams(
                         &mut st.by_sid,
                         &conn,
