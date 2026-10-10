@@ -1176,11 +1176,12 @@ pub(crate) async fn async_main() -> Result<()> {
                     // gives (exit 9), not an empty list with exit 0 beside a
                     // `status` that exits nonzero. A keyless device that
                     // paired by code still lists its devices, with the hint.
-                    if crate::identity_flow::devices_has_nothing_to_list(
+                    let nothing_to_list = crate::identity_flow::devices_has_nothing_to_list(
                         crate::identity_flow::has_identity(),
                         crate::device_view::device_entries(None).len(),
-                    ) {
-                        return Err(crate::identity_flow::no_identity(json || ui_caps.json));
+                    );
+                    if nothing_to_list && (json || ui_caps.json) {
+                        return Err(crate::identity_flow::no_identity(true));
                     }
                     if json || ui_caps.json {
                         let online =
@@ -1240,6 +1241,13 @@ pub(crate) async fn async_main() -> Result<()> {
                         // get one, and nothing is minted by looking.
                         if !crate::identity_flow::has_identity() {
                             ui::say(&format!("  {}", crate::identity_flow::NO_IDENTITY_MSG));
+                        }
+                        // The screen keeps its shape (the empty list on
+                        // stdout, the hint above); the exit says why.
+                        if nothing_to_list {
+                            return Err(crate::exit_codes::reported(
+                                crate::exit_codes::ExitKind::NoIdentity,
+                            ));
                         }
                     }
                 }
