@@ -868,7 +868,7 @@ pub(crate) async fn async_main() -> Result<()> {
             )
             .await
         }
-        Cmd::Status { json } => status_cmd(json || ui_caps.json),
+        Cmd::Status { json } => status_cmd(json || ui_caps.json).await,
         Cmd::Down => {
             ui_caps.confirm("shut down the daemon")?;
             down_cmd()

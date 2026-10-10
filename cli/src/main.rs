@@ -679,9 +679,6 @@ fn config_get(key: &str) -> Option<String> {
 
 fn config_set(key: &str, value: &str) -> Result<()> {
     let p = config_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()
@@ -689,7 +686,9 @@ fn config_set(key: &str, value: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{key} {value}"));
-    std::fs::write(&p, lines.join("\n") + "\n")?;
+    // Owner-only (0600) in an owner-only directory, whatever the umask, and
+    // atomic. A plain `fs::write` here created `config` 0666 under umask 0000.
+    crate::platform::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))?;
     Ok(())
 }
 

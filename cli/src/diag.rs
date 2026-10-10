@@ -267,13 +267,15 @@ fn diag_path() -> PathBuf {
 fn write_jsonl(v: &Value) {
     let path = diag_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        let _ = crate::platform::create_private_dir_all(dir);
     }
     // Rotate by TRUNCATION: a doctor wants the latest span, not unbounded
     // history. Cheap stat, then start fresh if we are over the cap.
     let over = std::fs::metadata(&path).map(|m| m.len() > MAX_JSONL_BYTES).unwrap_or(false);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true);
+    // diag.jsonl is on the sensitive list; never create it world-readable.
+    crate::platform::owner_only_mode(&mut opts);
     if over {
         opts.truncate(true);
     } else {

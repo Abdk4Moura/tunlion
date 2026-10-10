@@ -299,7 +299,7 @@ pub(crate) fn issue_signed_bounded_grant(
 pub(crate) fn devices_remove(name: &str) -> Result<()> {
     let p = devices_path();
     if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::platform::create_private_dir_all(dir)?;
     }
     // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
     // addedAt). The old tuple round-trip rewrote every survivor as bare

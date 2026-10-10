@@ -349,12 +349,10 @@ impl DevicesFileLock {
     /// The same exclusive lock on an arbitrary sidecar (the identity mint in
     /// `identity_flow::ensure_user_key_inner` uses `identity.lock`).
     pub fn acquire_at(path: &Path) -> anyhow::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        owner_only_mode(&mut opts);
+        let file = opts.open(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -891,6 +889,9 @@ pub fn add_firewall_rule(exe: &Path) {
         .output();
 }
 
+/// Set in the environment of the daemon `spawn_detached` starts. See `up_cmd`.
+pub const DETACHED_CHILD_ENV: &str = "TUNLION_DETACHED_CHILD";
+
 /// Spawn `exe` with `args` detached from this process's terminal, its stdout
 /// and stderr appended to `log`. One portable operation with two arms, written
 /// together: the unix arm detaches with `setsid`, the Windows arm with
@@ -902,15 +903,29 @@ pub fn add_firewall_rule(exe: &Path) {
 /// Windows arm computed the log path and then discarded it, so `logs`,
 /// `up`-follows and `--detach` all dead-ended on a file that never appeared.
 pub fn spawn_detached(exe: &Path, args: &[&str], log: &Path) -> Result<std::process::Child> {
+    // Name the path in every failure: a HOME that does not exist used to print
+    // only "No such file or directory (os error 2)", which names nothing.
     if let Some(parent) = log.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        create_private_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!("cannot create the config directory {}: {e}", parent.display())
+        })?;
     }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let log_file = opts
+        .open(log)
+        .map_err(|e| anyhow::anyhow!("cannot open the daemon log {}: {e}", log.display()))?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(args);
+    // Marks the child as the detached daemon, whose console is `log`: it must
+    // never follow that log (see up_cmd). Windows needs this; unix also
+    // compares the inode.
+    cmd.env(DETACHED_CHILD_ENV, "1");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::from(log_file.try_clone()?));
     cmd.stderr(std::process::Stdio::from(log_file));
@@ -1441,5 +1456,603 @@ pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
     {
         let _ = (target, link);
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no symlink support on this platform"))
+    }
+}
+
+// ------------------------------------------------------- private state dirs --
+
+/// Create `dir` and every missing parent owner-only (0700), whatever the umask.
+///
+/// `create_dir_all` asks for 0777 and lets the umask decide, so under `umask
+/// 0000` the config directory and `identity/` came out world-writable: anyone on
+/// the machine could swap the files in them. Every directory that holds tunlion
+/// state is created through here instead. The mode is set explicitly after the
+/// create because a umask can still strip bits from a DirBuilder mode. A
+/// directory that already existed is left alone: its mode is the user's choice,
+/// and `repair_sensitive_permissions` is the path that reports on legacy modes.
+/// Windows: the profile ACL is already owner-only, so a plain create is right.
+pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Walk up to the deepest existing ancestor, then create downwards, so
+        // each directory WE create is tightened and nothing pre-existing is.
+        let mut missing = Vec::new();
+        let mut cur = Some(dir);
+        while let Some(p) = cur {
+            if p.as_os_str().is_empty() || p.exists() {
+                break;
+            }
+            missing.push(p.to_path_buf());
+            cur = p.parent();
+        }
+        for p in missing.iter().rev() {
+            match std::fs::DirBuilder::new().mode(0o700).create(p) {
+                Ok(()) => tighten_new_dir(p),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && p.is_dir() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+// ------------------------------------------------------------ InstanceLock --
+
+/// The daemon's single-instance election: an exclusive lock on `{config}/up.lock`,
+/// taken WITHOUT blocking and held for the daemon's whole life.
+///
+/// The pidfile cannot elect anything. Three `up --detach` started together all
+/// read "no pidfile", all spawned a daemon, and the two losers then found the
+/// winner's pidfile and settled into "following its log" with their own stdout
+/// pointed INTO that log, so every line they read they appended again: daemon.log
+/// went from 0 to 22 MB in under two seconds and filled the home directory. A lock
+/// is atomic where read-then-write is not, and the kernel releases it when the
+/// holder dies, so a crashed daemon never leaves a stale election behind.
+///
+/// Unix: `flock(LOCK_EX | LOCK_NB)`. Windows: `LockFileEx` with
+/// `LOCKFILE_FAIL_IMMEDIATELY`. The descriptor is close-on-exec (std opens every
+/// file that way), so a shell or helper the daemon spawns does not inherit the
+/// lock and keep it after the daemon is gone.
+pub struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    /// `Ok(Some(lock))`: this process won and holds it until the guard drops (or
+    /// the process exits). `Ok(None)`: another live process holds it.
+    pub fn try_acquire(path: &Path) -> std::io::Result<Option<InstanceLock>> {
+        if let Some(parent) = path.parent() {
+            create_private_dir_all(parent)?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+            };
+            let handle = file.as_raw_handle() as HANDLE;
+            let mut overlapped =
+                std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+            let ok = unsafe {
+                LockFileEx(
+                    handle,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    overlapped.as_mut_ptr(),
+                )
+            };
+            if ok == 0 {
+                let e = std::io::Error::last_os_error();
+                // ERROR_LOCK_VIOLATION: someone else holds it.
+                if e.raw_os_error() == Some(33) {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
+        }
+        Ok(Some(InstanceLock { _file: file }))
+    }
+}
+
+/// Make `opts` create the file owner-only (0600), whatever the umask. A no-op
+/// on Windows, where the profile ACL already restricts it.
+pub fn owner_only_mode(opts: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = opts;
+    }
+}
+
+/// True when this process's stdout or stderr IS the file at `path` (same device
+/// and inode). A detached daemon's console is daemon.log, so a process whose
+/// output already goes there must never follow that log: every line it read it
+/// would write back, which is the feedback loop that filled a disk.
+/// Windows has no inode to compare; it returns false there, and the detached
+/// child is recognised by the marker its parent sets instead (see `up_cmd`).
+pub fn stdio_is_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        for fd in [1, 2] {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } == 0
+                && st.st_dev as u64 == meta.dev()
+                && st.st_ino as u64 == meta.ino()
+            {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+// --------------------------------------------------------------- disk space --
+
+/// Bytes available to this (unprivileged) user on the filesystem holding `dir`,
+/// or `None` when the platform cannot say. Used to refuse a transfer that cannot
+/// fit BEFORE accepting it, instead of discovering ENOSPC half way through and
+/// reporting it as a checksum failure.
+pub fn free_space(dir: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let unit = if st.f_frsize as u64 > 0 { st.f_frsize as u64 } else { st.f_bsize as u64 };
+        Some((st.f_bavail as u64).saturating_mul(unit))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut avail: u64 = 0;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut avail,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { None } else { Some(avail) }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// A local storage failure a receiver reports to the sender as a typed refusal
+/// instead of going silent. See `storage_failure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFailure {
+    NoSpace,
+    NameTooLong,
+    ReadOnly,
+    Permission,
+}
+
+/// Classify an io error as a storage failure, or `None` for anything else.
+pub fn storage_failure(e: &std::io::Error) -> Option<StorageFailure> {
+    #[cfg(unix)]
+    {
+        match e.raw_os_error() {
+            Some(libc::ENOSPC) | Some(libc::EDQUOT) => return Some(StorageFailure::NoSpace),
+            Some(libc::ENAMETOOLONG) => return Some(StorageFailure::NameTooLong),
+            Some(libc::EROFS) => return Some(StorageFailure::ReadOnly),
+            Some(libc::EACCES) | Some(libc::EPERM) => return Some(StorageFailure::Permission),
+            _ => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL, ERROR_FILENAME_EXCED_RANGE,
+        // ERROR_WRITE_PROTECT, ERROR_ACCESS_DENIED.
+        match e.raw_os_error() {
+            Some(112) | Some(39) => return Some(StorageFailure::NoSpace),
+            Some(206) => return Some(StorageFailure::NameTooLong),
+            Some(19) => return Some(StorageFailure::ReadOnly),
+            Some(5) => return Some(StorageFailure::Permission),
+            _ => {}
+        }
+    }
+    // The kind, for an error that was re-wrapped on its way here and lost its
+    // OS code (safe_create_part adds context that way).
+    match e.kind() {
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+            Some(StorageFailure::NoSpace)
+        }
+        std::io::ErrorKind::InvalidFilename => Some(StorageFailure::NameTooLong),
+        std::io::ErrorKind::ReadOnlyFilesystem => Some(StorageFailure::ReadOnly),
+        std::io::ErrorKind::PermissionDenied => Some(StorageFailure::Permission),
+        _ => None,
+    }
+}
+
+// ----------------------------------------------------------- control socket --
+
+/// The longest control-socket path we bind. `sun_path` holds 108 bytes on
+/// Linux and 104 on macOS, NUL included; the margin keeps us clear of both.
+pub const SOCKET_PATH_MAX: usize = 100;
+
+/// Where the control socket lives: `preferred` (in the config directory) when it
+/// fits in `sun_path`, otherwise a short per-user directory, `$XDG_RUNTIME_DIR/
+/// tunlion-<uid>/` or `/tmp/tunlion-<uid>/`, with a name derived from the config
+/// directory so two configs never share a socket.
+///
+/// A deep HOME used to leave the daemon with no socket at all while `up` and
+/// `status` reported "ok"; only daemon.log said "control socket unavailable".
+/// The daemon and every client compute this the same way, so they meet.
+///
+/// A short directory that exists but is not private to this user (another
+/// owner, writable by others, a symlink) is never used: `preferred` comes back
+/// instead, which cannot bind, so the daemon fails loudly rather than serve or
+/// be reached through a directory someone else controls.
+pub fn control_socket_path(preferred: &Path, config_dir: &Path) -> PathBuf {
+    if preferred.as_os_str().len() < SOCKET_PATH_MAX {
+        return preferred.to_path_buf();
+    }
+    #[cfg(unix)]
+    {
+        let key = config_dir_key(config_dir);
+        let uid = unsafe { libc::geteuid() };
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Some(x) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            if x.is_absolute() && x.is_dir() {
+                bases.push(x);
+            }
+        }
+        bases.push(PathBuf::from("/tmp"));
+        for base in bases {
+            let dir = base.join(format!("tunlion-{uid}"));
+            let sock = dir.join(format!("{key}.sock"));
+            if sock.as_os_str().len() >= SOCKET_PATH_MAX {
+                continue;
+            }
+            if dir.exists() && private_dir_check(&dir).is_err() {
+                continue;
+            }
+            return sock;
+        }
+        preferred.to_path_buf()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config_dir;
+        preferred.to_path_buf()
+    }
+}
+
+/// Prepare the directory a socket is about to be bound in: create it 0700 when
+/// missing, then insist it is a real directory owned by this user that nobody
+/// else can write. A directory of ours that is group- or world-writable (a
+/// config dir made under `umask 0000` by an older build) is tightened rather
+/// than refused; one owned by someone else is refused.
+pub fn prepare_socket_dir(sock: &Path) -> std::io::Result<()> {
+    let Some(dir) = sock.parent() else {
+        return Ok(());
+    };
+    create_private_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::symlink_metadata(dir)?;
+        let uid = unsafe { libc::geteuid() };
+        if meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        private_dir_check(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(())
+    }
+}
+
+/// Err unless `dir` is a directory (not a symlink) owned by this user and not
+/// writable by group or others.
+#[cfg(unix)]
+fn private_dir_check(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    let uid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory owned by this user (owner uid {}, mode {:o}); refusing to put the control socket there",
+                dir.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A short stable name for a config directory (FNV-1a over its path bytes).
+#[cfg(unix)]
+fn config_dir_key(dir: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in dir.as_os_str().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+// ------------------------------------------------------------ serving user --
+
+/// The login name of the user this process runs as, from the password database
+/// (`getpwuid_r(geteuid())`), falling back to `$USER` / `$LOGNAME`. The
+/// environment is the fallback, not the source: a daemon started from cron, a
+/// container or `env -i` has no `$USER`, and the ssh CA refused to arm with
+/// "cannot determine serving user" while `getent passwd` knew the answer.
+/// Windows: `%USERNAME%`.
+pub fn current_username() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; 4096];
+        let rc = unsafe {
+            libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+        };
+        if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
+            let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+                .to_string_lossy()
+                .into_owned();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+        std::env::var("USER")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("LOGNAME").ok().filter(|s| !s.is_empty()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("USERNAME").ok().filter(|s| !s.is_empty())
+    }
+}
+
+// ------------------------------------------------------- stale temp files --
+
+/// Remove `<file>.tmp.<pid>` leftovers of the atomic writer in `dir` whose
+/// writing process is gone. A write that died part way (ENOSPC, a kill) used to
+/// leave them forever: config.tmp.*, armed.json.tmp.*, devices.json.tmp.*.
+/// Called when the daemon starts. Returns how many were removed.
+pub fn sweep_stale_temp_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let me = std::process::id();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = stale_temp_pid(&name.to_string_lossy()) else {
+            continue;
+        };
+        if pid == me || process_exe_path(pid).is_some() {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// The writer pid in an atomic-writer temp name (`<file>.tmp.<pid>`), if it is one.
+pub fn stale_temp_pid(name: &str) -> Option<u32> {
+    let (stem, pid) = name.rsplit_once(".tmp.")?;
+    if stem.is_empty() || pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+#[cfg(test)]
+mod hostile_env_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tl-hostile-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn the_instance_lock_elects_exactly_one_holder() {
+        let d = scratch("lock");
+        let path = d.join("cfg").join("up.lock");
+        let first = InstanceLock::try_acquire(&path).unwrap();
+        assert!(first.is_some(), "the first taker wins");
+        // A second open file description conflicts even inside one process,
+        // which is exactly the concurrent-`up` race.
+        assert!(InstanceLock::try_acquire(&path).unwrap().is_none(), "a second taker loses");
+        drop(first);
+        assert!(
+            InstanceLock::try_acquire(&path).unwrap().is_some(),
+            "released on drop, so a dead daemon never blocks the next one"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn private_dirs_are_owner_only_whatever_the_umask() {
+        let d = scratch("dirs");
+        let deep = d.join("a").join("b").join("identity");
+        create_private_dir_all(&deep).unwrap();
+        assert!(deep.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [d.join("a"), d.join("a").join("b"), deep.clone()] {
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{} is {mode:o}", p.display());
+            }
+        }
+        // Idempotent on an existing directory.
+        create_private_dir_all(&deep).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_secret_file_and_its_new_directory_are_owner_only() {
+        let d = scratch("secret");
+        let f = d.join("identity").join("device-cert.json");
+        SecretFile::write_str(&f, "{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fm = std::fs::metadata(&f).unwrap().permissions().mode() & 0o777;
+            let dm = std::fs::metadata(f.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+            assert_eq!((fm, dm), (0o600, 0o700));
+        }
+        // No temp left behind by a successful write.
+        let leftovers: Vec<_> = std::fs::read_dir(f.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn stale_temp_files_of_dead_writers_are_swept_and_live_ones_kept() {
+        assert_eq!(stale_temp_pid("config.tmp.1234"), Some(1234));
+        assert_eq!(stale_temp_pid("devices.json.tmp.99"), Some(99));
+        assert_eq!(stale_temp_pid("config.tmp."), None);
+        assert_eq!(stale_temp_pid(".tmp.12"), None);
+        assert_eq!(stale_temp_pid("notes.tmp.txt"), None);
+        assert_eq!(stale_temp_pid("config"), None);
+        let d = scratch("sweep");
+        std::fs::create_dir_all(&d).unwrap();
+        // A pid that cannot be running: above any real pid_max.
+        let dead = d.join("config.tmp.4194999");
+        let mine = d.join(format!("armed.json.tmp.{}", std::process::id()));
+        let unrelated = d.join("config");
+        for p in [&dead, &mine, &unrelated] {
+            std::fs::write(p, "x").unwrap();
+        }
+        assert_eq!(sweep_stale_temp_files(&d), 1);
+        assert!(!dead.exists(), "a dead writer's temp is removed");
+        assert!(mine.exists(), "a live writer's temp is never touched");
+        assert!(unrelated.exists(), "only temp names are candidates");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn storage_failures_are_classified_for_the_typed_refusal() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(storage_failure(&Error::from(ErrorKind::StorageFull)), Some(StorageFailure::NoSpace));
+        assert_eq!(storage_failure(&Error::from(ErrorKind::QuotaExceeded)), Some(StorageFailure::NoSpace));
+        assert_eq!(storage_failure(&Error::from(ErrorKind::InvalidFilename)), Some(StorageFailure::NameTooLong));
+        assert_eq!(storage_failure(&Error::from(ErrorKind::ReadOnlyFilesystem)), Some(StorageFailure::ReadOnly));
+        assert_eq!(storage_failure(&Error::from(ErrorKind::PermissionDenied)), Some(StorageFailure::Permission));
+        assert_eq!(storage_failure(&Error::from(ErrorKind::ConnectionReset)), None);
+        #[cfg(unix)]
+        {
+            assert_eq!(storage_failure(&Error::from_raw_os_error(libc::ENOSPC)), Some(StorageFailure::NoSpace));
+            assert_eq!(
+                storage_failure(&Error::from_raw_os_error(libc::ENAMETOOLONG)),
+                Some(StorageFailure::NameTooLong)
+            );
+            // Re-wrapped with context the OS code is gone, but the kind survives.
+            let wrapped = Error::new(Error::from_raw_os_error(libc::ENOSPC).kind(), "safe create .part: x");
+            assert_eq!(storage_failure(&wrapped), Some(StorageFailure::NoSpace));
+        }
+    }
+
+    #[test]
+    fn free_space_is_known_for_a_real_directory() {
+        let d = std::env::temp_dir();
+        assert!(free_space(&d).is_some(), "no free-space answer for {}", d.display());
+    }
+
+    #[test]
+    fn a_plain_file_is_not_our_console() {
+        let d = scratch("stdio");
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("daemon.log");
+        std::fs::write(&f, "x").unwrap();
+        assert!(!stdio_is_file(&f));
+        assert!(!stdio_is_file(&d.join("missing.log")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_serving_user_resolves_from_the_password_database() {
+        // The CI runner account always has a passwd entry; $USER is not consulted
+        // first, so an unset $USER cannot make this None.
+        let name = current_username();
+        assert!(name.as_deref().is_some_and(|n| !n.is_empty()), "{name:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_dir_owned_by_us_and_writable_by_others_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("sockdir");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();
+        prepare_socket_dir(&d.join("control.sock")).unwrap();
+        let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

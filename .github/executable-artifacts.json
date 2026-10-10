@@ -75,6 +75,17 @@
       ]
     },
     {
+      "path": "cli/tests/hostile-env-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/hostile-env-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/gates-ratchet.sh",
       "disposition": "required",
       "entrypoint": "bash cli/tests/gates-ratchet.sh <gates-output.log>",

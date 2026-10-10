@@ -842,7 +842,14 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
     }
     let path = dns_cache_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if !dir.is_dir() {
+            let _ = std::fs::create_dir_all(dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     let mut doc = std::fs::read_to_string(&path)
         .ok()
@@ -851,7 +858,19 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
         .unwrap_or_else(|| json!({}));
     let ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
     doc[host] = json!(ips);
-    let _ = std::fs::write(&path, doc.to_string());
+    // Owner-only whatever the umask: this sits in the config directory, and a
+    // world-writable cache lets anyone point the next connect elsewhere.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(doc.to_string().as_bytes());
+    }
 }
 
 /// Resolve `host:port` to connect targets, immune to a cold-resolver stall.

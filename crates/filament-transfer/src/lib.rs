@@ -95,8 +95,41 @@ pub fn safe_incoming_name(raw: &str) -> String {
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         "file.bin".to_string()
     } else {
-        cleaned
+        fit_name(&cleaned, MAX_INCOMING_NAME_BYTES)
     }
+}
+
+/// The longest name, in bytes, a receiver creates for an incoming file.
+///
+/// 255 is the per-component limit on ext4, APFS, tmpfs and (counted in UTF-16
+/// units, which a UTF-8 byte count never undercounts) NTFS. The margin leaves
+/// room for the `.part.meta` sidecar and a `.NNN` collision suffix. A sender
+/// could offer a 250-character name and the receiver failed the create with
+/// ENAMETOOLONG and said nothing, so the sender waited forever.
+pub const MAX_INCOMING_NAME_BYTES: usize = 240;
+
+/// Shorten `name` to at most `max` bytes, keeping its extension and never
+/// splitting a character. A name that already fits is returned unchanged.
+pub fn fit_name(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    // The extension is the last `.suffix` when it is short and is not the whole
+    // name (a leading dot is a hidden file, not an extension).
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i <= 32 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let mut cut = max.saturating_sub(ext.len()).min(stem.len());
+    while cut > 0 && !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = stem[..cut].to_string();
+    if out.is_empty() {
+        out.push_str("file");
+    }
+    out.push_str(ext);
+    out
 }
 
 /// Record `[pos, pos+len)` into a sorted set of disjoint intervals, merging
@@ -350,6 +383,33 @@ mod tests {
         assert_eq!(safe_incoming_name(".."), "file.bin");
         assert_eq!(safe_incoming_name("."), "file.bin");
         assert_eq!(safe_incoming_name(""), "file.bin");
+    }
+
+    #[test]
+    fn an_overlong_name_is_shortened_keeping_its_extension() {
+        let long = format!("{}.tar.gz", "a".repeat(250));
+        let fit = safe_incoming_name(&long);
+        assert!(fit.len() <= MAX_INCOMING_NAME_BYTES, "{} bytes", fit.len());
+        assert!(fit.ends_with(".gz"), "{fit}");
+        assert!(fit.starts_with("aaaa"), "{fit}");
+        // A name that fits is untouched.
+        assert_eq!(safe_incoming_name("report.pdf"), "report.pdf");
+        // No extension: plain truncation.
+        let bare = "b".repeat(300);
+        assert_eq!(safe_incoming_name(&bare).len(), MAX_INCOMING_NAME_BYTES);
+    }
+
+    #[test]
+    fn shortening_never_splits_a_character() {
+        // 3-byte characters: a byte cut at the limit would land mid-character.
+        let long = format!("{}.txt", "\u{20ac}".repeat(120));
+        let fit = fit_name(&long, 100);
+        assert!(fit.len() <= 100);
+        assert!(fit.ends_with(".txt"));
+        assert!(fit.trim_end_matches(".txt").chars().all(|c| c == '\u{20ac}'));
+        // A hidden file's leading dot is not an extension.
+        let hidden = format!(".{}", "c".repeat(300));
+        assert_eq!(fit_name(&hidden, 50).len(), 50);
     }
 
     // --- positional write -------------------------------------------------

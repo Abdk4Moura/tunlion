@@ -100,9 +100,20 @@ pub(crate) fn tour_cmd() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn status_cmd(json: bool) -> Result<()> {
+/// How long `status` waits for the daemon to answer on its control socket.
+const STATUS_PROBE: Duration = Duration::from_millis(1500);
+
+pub(crate) async fn status_cmd(json: bool) -> Result<()> {
+    // A live pid is not a working daemon. Ask it something, briefly: a stopped
+    // (SIGSTOP) or wedged daemon, or one whose control socket could not be
+    // created, keeps its pid and used to be reported "up".
+    let pid_alive = daemon_alive();
+    let responding = match pid_alive {
+        Some(_) => crate::ctl::daemon_responds(STATUS_PROBE).await,
+        None => Some(false),
+    };
     if json {
-        let pid = daemon_alive();
+        let pid = pid_alive;
         let exposed: Vec<Value> = expose::load()
             .iter()
             .map(|b| json!({ "port": b.port, "target": b.target, "peers": b.peers.clone().unwrap_or_default() }))
@@ -116,6 +127,9 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             serde_json::to_string_pretty(&json!({
                 "running": pid.is_some(),
                 "pid": pid,
+                // false: a process holds the pidfile but does not answer on its
+                // control socket. null: this platform cannot ask.
+                "responding": responding,
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
@@ -123,7 +137,13 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    match daemon_alive() {
+    match pid_alive {
+        Some(pid) if responding == Some(false) => ui::say(&format!(
+            "  {} running but not responding (pid {pid}): it did not answer on its control socket ({}) within {}s. It may be stopped (SIGSTOP) or wedged; `tunlion down` then `tunlion up` restarts it",
+            ui::paint(ui::Tone::Err, ui::glyph_err()),
+            crate::ctl::control_sock_path().display(),
+            STATUS_PROBE.as_secs_f32()
+        )),
         Some(pid) => ui::say(&format!(
             "  {} up (pid {pid})",
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
@@ -366,30 +386,74 @@ pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> 
         args.push("--dir");
         args.push(d);
     }
-    let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
-    // Let the child write its pidfile before we return; poll briefly.
-    let mut came_up = false;
+    // Elect before spawning: if a daemon holds the lock, there is nothing to
+    // start. (The children elect again, atomically, for the race this check
+    // cannot see: two `up --detach` that both pass it at the same instant.)
+    let lock_path = crate::platform::Paths::config_path("up.lock");
+    match crate::platform::InstanceLock::try_acquire(&lock_path) {
+        Ok(Some(lock)) => drop(lock),
+        Ok(None) => {
+            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "cannot take the daemon lock {} (is the config directory writable?)",
+                lock_path.display()
+            )));
+        }
+    }
+    let mut child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
+    let pid = child.id();
+    // Wait for THIS child to become the daemon (its pid in the pidfile), or to
+    // exit. "Some daemon is alive" is not enough: with a concurrent start, the
+    // daemon alive may be another one, and claiming this one detached was false.
+    let mut outcome = None;
     for _ in 0..50 {
-        if daemon_alive().is_some() {
-            came_up = true;
+        if let Ok(Some(status)) = child.try_wait() {
+            outcome = Some(Err(status.code()));
+            break;
+        }
+        if daemon_alive() == Some(pid) {
+            outcome = Some(Ok(()));
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = child;
-    if came_up {
-        ui::say(&format!(
-            "  {} daemon detached (pidfile at {}) - output: {}",
-            ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-            pidfile().display(),
+    match outcome {
+        // Re-check before claiming anything: a `down` racing this start can stop
+        // the daemon between the poll above and the sentence below.
+        Some(Ok(())) if child.try_wait().ok().flatten().is_none() && daemon_alive() == Some(pid) => {
+            ui::say(&format!(
+                "  {} daemon detached (pid {pid}, pidfile at {}) - output: {}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                pidfile().display(),
+                log_path.display()
+            ));
+            Ok(())
+        }
+        Some(Ok(())) => Err(anyhow!(
+            "the daemon (pid {pid}) stopped right after starting; see {}",
             log_path.display()
-        ));
-    } else {
-        ui::say(&format!(
-            "  {} spawned the daemon but it did not come up within 5s - output: {}",
-            ui::paint(ui::Tone::Warn, "!"),
+        )),
+        Some(Err(Some(code))) if code == crate::up_logs::UP_LOST_ELECTION_EXIT => {
+            // Another `up` won the election at the same instant: a daemon is
+            // running, which is what was asked for.
+            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
+            Ok(())
+        }
+        Some(Err(code)) => Err(anyhow!(
+            "the daemon exited during startup ({}); its output is in {}",
+            code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed by a signal".into()),
             log_path.display()
-        ));
+        )),
+        None => {
+            ui::say(&format!(
+                "  {} spawned the daemon (pid {pid}) but it did not come up within 5s - output: {}",
+                ui::paint(ui::Tone::Warn, "!"),
+                log_path.display()
+            ));
+            Ok(())
+        }
     }
-    Ok(())
 }

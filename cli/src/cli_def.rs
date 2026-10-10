@@ -159,6 +159,12 @@ pub(crate) enum Cmd {
     },
     // ── Share ───────────────────────────────────────────────────────
     /// Send files or directories to a peer (browser or CLI).
+    ///
+    /// Exit status: 0 when every file was delivered and verified; 4 when the
+    /// receiver refused a file it cannot store (out of disk space, a name its
+    /// filesystem refuses, no permission), with its reason printed; 6 when the
+    /// receiver neither accepted nor refused an offer within 60s
+    /// (FILAMENT_SEND_STALL_SECS changes the bound, 0 disables it); 1 otherwise.
     #[command(next_help_heading = "Share")]
     Send {
         /// Files or directories to send; '-' reads stdin
@@ -323,7 +329,9 @@ pub(crate) enum Cmd {
         /// Run the daemon detached from this terminal (background). For
         /// machines without a service manager, this is the middle between
         /// attached-now and service-forever; the daemon survives closing the
-        /// terminal. Its output goes to {config}/daemon.log.
+        /// terminal. Its output goes to {config}/daemon.log. Exactly one daemon
+        /// runs per config directory: when one is already running (or another
+        /// `up --detach` starts it at the same moment) this says so and exits 0.
         #[arg(long)]
         detach: bool,
         /// With --install: install a SYSTEM service (root, one-time sudo) that gets
