@@ -305,8 +305,11 @@ pub(crate) async fn next_ev(
     if let Some(since) = conn.rejoin.waiting_rejoin {
         if since.elapsed() > conn.rejoin.rejoin_window {
             ui::clear_sticky();
+            // "unreachable" is what the exit-code taxonomy classifies on (6):
+            // the peer is gone, which is not the same failure as a refusal or a
+            // network outage on this side, and a script must be able to tell.
             bail!(
-                "peer did not come back within {}s (partial state kept for resume)",
+                "peer unreachable: disconnected and did not come back within {}s (partial state kept for resume)",
                 conn.rejoin.rejoin_window.as_secs()
             );
         }

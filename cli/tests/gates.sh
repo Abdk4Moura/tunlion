@@ -90,6 +90,38 @@ wait_for_exit() {
   wait "$pid" 2>/dev/null
   return 124
 }
+# Wait for a process that MUST exit, but never without bound. gate 2 used a
+# bare `wait` on its sender, and when the sender wedged the whole job sat there
+# until the 90-minute ceiling cancelled it, with nothing in the log to say what
+# the process was doing. On the deadline, capture what it is blocked on (state,
+# wait channel per thread, sockets, the tail of its logs) and only then kill it,
+# so a wedge fails THIS gate loudly and the gates after it still run.
+# Returns the exit code, or 124 when it had to be killed.
+bounded_wait() {  # $1 = pid, $2 = seconds, $3 = label, rest = logs to show
+  local p="$1" secs="$2" label="$3" i t f
+  shift 3
+  for i in $(seq 1 $((secs * 2))); do
+    kill -0 "$p" 2>/dev/null || { wait "$p" 2>/dev/null; return $?; }
+    sleep 0.5
+  done
+  echo "===== WEDGE: $label, pid $p still running after ${secs}s"
+  ps -o pid,stat,etimes,wchan:24,args -p "$p" 2>/dev/null | sed 's/^/    /'
+  for t in /proc/"$p"/task/*; do
+    [ -d "$t" ] && printf '    thread %s %s\n' "${t##*/}" "$(cat "$t/wchan" 2>/dev/null)"
+  done | head -20
+  ss -tunap 2>/dev/null | grep -E "pid=$p[,)]" | sed 's/^/    /' | head -20
+  for f in "$@"; do
+    echo "  [${f##*/}]"
+    tail -n 30 "$f" 2>/dev/null | sed 's/^/    /'
+  done
+  # Say so when it was already on its way out: past the bound is still past the
+  # bound, but "exited while being captured" is a slow path, not a hang.
+  kill -0 "$p" 2>/dev/null || echo "  (it exited while the state above was being captured)"
+  echo "===== END WEDGE"
+  kill -9 "$p" 2>/dev/null
+  wait "$p" 2>/dev/null
+  return 124
+}
 # L1-a: a `send --word <phrase>` now mints its OWN numeric nameplate (the phrase
 # is only the SPAKE2 password), so the receiver must claim the FULL minted code,
 # not the spoken phrase. CODE_WORD is a valid 2-word phrase (clears the >=2-word
@@ -253,11 +285,81 @@ sleep 2
 # offset); -v only makes the proof visible.
 timeout 180 "$BIN" -v receive -y --dir "$D" --server "$SERVER" >"$WORK/g2-recv2.log" 2>&1
 RC2=$?
-wait $SP; RCS=$?
-if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
+# BOUNDED. This was a bare `wait $SP`, and a sender whose event loop had parked
+# on its dead receiver never exited, so the job hung until it was cancelled at
+# 90 minutes (ten cancelled Gates Core runs on 2026-10-09/10, every one in this
+# gate). The replacement receiver has already finished or timed out here; a
+# sender still running a minute later is wedged.
+bounded_wait $SP 60 "kill-resume sender" "$WORK/g2-send.log" "$WORK/g2-recv2.log"; RCS=$?
+if [ $RCS -eq 124 ]; then
+  bad "kill-resume: sender still running 60s after the replacement receiver finished (wedged, state above)"
+elif [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
    && grep -q "resuming at" "$WORK/g2-recv2.log"; then
   ok "kill-resume: replacement receiver resumed, hash matches"
 else bad "kill-resume"; tail -n 4 "$WORK/g2-send.log" "$WORK/g2-recv2.log"; fi
+
+# --------------------------------------------------------------- gate 2b ----
+# The half of gate 2 that was never asserted: the receiver is killed mid-transfer
+# and NOTHING replaces it. The sender must notice within a bounded time and exit
+# nonzero saying the peer is gone, instead of waiting forever. A receiver killed
+# with SIGKILL never closes its SCTP association, so every write the sender then
+# makes waits for an acknowledgement that cannot come; before the fix one such
+# write parked the sender's whole event loop for the life of the process.
+say "2b: dead receiver: killed mid-transfer, nothing replaces it, the sender gives up honestly"
+D="$WORK/g2b"; mkdir -p "$D"
+# FILAMENT_ADOPT_ACTIVE_MS holds the dead link in the sender's link table for
+# 15s after the kill (it is dropped once idle that long), which guarantees the
+# sender's 10s `state` ping is written to the dead channel at least once. That
+# write is exactly what parked the event loop forever; at the default 3s the
+# ping only landed in the window by chance, which is why the hang was
+# intermittent. Pinning it makes this gate fail every time the bug is present.
+FILAMENT_ADOPT_ACTIVE_MS=15000 FILAMENT_REJOIN_SECS=10 \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/g2b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/g2b-send.log") || { bad "dead receiver (no code minted)"; tail -n 3 "$WORK/g2b-send.log"; }
+"$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g2b-recv.log" 2>&1 &
+R1=$!; pids+=($R1)
+for _ in $(seq 1 60); do
+  sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+G2BSZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+# SIGKILL, not kill_tree, for the reason gate 2 gives: the premise is an abrupt
+# death, and SIGTERM lets the receiver close cleanly.
+kill -9 $R1 2>/dev/null; wait $R1 2>/dev/null
+T0=$(date +%s)
+# Two honest ways out, and the bound has to cover the slower one. Measured in
+# CI: the rejoin path (15s until the dead link is dropped, then the 10s window)
+# exits in 25-26s; the reconnect path (five attempts at the dead peer, then
+# "lost the receiving peer") took about 90s. 150s is the wedge line.
+bounded_wait $SP 150 "dead-receiver sender" "$WORK/g2b-send.log"; RCS=$?
+T1=$(date +%s)
+# With the exit-code taxonomy present, "the peer is gone" is 6 (unreachable);
+# a build without it can only promise nonzero.
+WANT_RC=nonzero
+"$BIN" --help 2>&1 | grep -q "EXIT CODES" && WANT_RC=6
+if [ "$G2BSZ" -eq 0 ]; then
+  bad "dead receiver: the receiver wrote nothing before it was killed, so nothing was mid-transfer"
+elif [ $RCS -eq 124 ]; then
+  bad "dead receiver: sender still running 150s after its receiver was killed (wedged, state above)"
+elif [ $RCS -eq 0 ]; then
+  bad "dead receiver: sender exited 0 though its receiver died at ${G2BSZ} of $((80 * 1024 * 1024)) bytes"
+elif [ "$WANT_RC" = 6 ] && [ $RCS -ne 6 ]; then
+  bad "dead receiver: sender exited $RCS, not 6 (unreachable)"; tail -n 3 "$WORK/g2b-send.log"
+elif ! grep -qE "unreachable|lost the receiving peer|no usable path" "$WORK/g2b-send.log"; then
+  bad "dead receiver: sender exited $RCS without saying the peer is gone"; tail -n 3 "$WORK/g2b-send.log"
+elif grep -q "waiting up to" "$WORK/g2b-send.log" && ! grep -q "waiting up to 10s" "$WORK/g2b-send.log"; then
+  # The wait it announces must be the one it enforces (FILAMENT_REJOIN_SECS=10
+  # here); it printed 120s while waiting 45s, and gave up after ~15s.
+  bad "dead receiver: the sender announced a wait it does not enforce"; grep "waiting up to" "$WORK/g2b-send.log"
+elif grep -q "the other device  disconnected" "$WORK/g2b-send.log"; then
+  bad "dead receiver: the disconnect line printed an empty name"; grep "disconnected" "$WORK/g2b-send.log"
+elif grep -q "did not come back within" "$WORK/g2b-send.log" && ! grep -q "new code" "$WORK/g2b-send.log"; then
+  bad "dead receiver: a code send gave up without saying the code is used up and a new send is needed"; tail -n 2 "$WORK/g2b-send.log"
+else
+  ok "dead receiver: sender gave up in $((T1 - T0))s, exit $RCS, said the peer is gone"
+fi
 
 # ---------------------------------------------------------------- gate 3 ----
 say "3: corruption guard — same name+size, different content restarts (C7)"
@@ -647,6 +749,46 @@ if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
    && ! grep -q "listening in room" "$WORK/g14-up.log"; then
   ok "daemon: verified identity, room-less, received + hash match"
 else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
+
+# --------------------------------------------------------------- gate 14b ---
+say "14b: a daemon receiver SIGKILLed mid-transfer and restarted 4s later: the sender picks it up and finishes"
+# The blind run: the sender ignored the replacement daemon and failed with exit 8
+# after 26 s ("delivery not confirmed"), because its delivery-ack wait ran out
+# while the receiver was away, and a re-run was needed to resume. Reuses gate
+# 14's pairing (DA sends to boxB, whose daemon runs on DB). NOT in the ratchet
+# yet: gate 14 itself (and 7, `send --to`) is red on the CI runner, so this
+# gate's premise fails there before the behaviour it checks is reached
+# (measured: the daemon received 0 bytes). Ratchet it with gate 14.
+DD2="$WORK/g14bdrop"; mkdir -p "$DD2"
+FILAMENT_CONFIG_DIR="$DB" "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up1.log" 2>&1 &
+UP1=$!; pids+=($UP1); sleep 3
+FILAMENT_TEST_TRANSFER_STALL_MS=10 FILAMENT_CONFIG_DIR="$DA" \
+  "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+for _ in $(seq 1 120); do
+  sz=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((4 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+G14BSZ=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
+# No timeout wrapper on the daemon, so SIGKILL reaches the real process.
+kill -9 $UP1 2>/dev/null; wait $UP1 2>/dev/null
+sleep 4
+FILAMENT_CONFIG_DIR="$DB" timeout 150 "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up2.log" 2>&1 &
+UP2=$!; pids+=($UP2)
+T0=$(date +%s)
+bounded_wait $SP 120 "daemon-restart sender" "$WORK/g14b-send.log" "$WORK/g14b-up2.log"; RCS=$?
+T1=$(date +%s)
+kill_tree $UP2
+echo "  killed the daemon at ${G14BSZ} bytes; sender exit $RCS $((T1 - T0))s after the restart"
+if [ "$G14BSZ" -eq 0 ]; then
+  bad "daemon-restart: the daemon received nothing before it was killed, so nothing was mid-transfer"
+elif [ $RCS -eq 0 ] && [ "$(hashof "$DD2/big.bin" 2>/dev/null)" = "$H_BIG" ] \
+   && ! grep -q "120s" "$WORK/g14b-send.log"; then
+  ok "daemon-restart: the sender picked up the restarted daemon and delivered, hash matches"
+else
+  bad "daemon-restart"; tail -n 5 "$WORK/g14b-send.log" "$WORK/g14b-up2.log"
+fi
 
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"
