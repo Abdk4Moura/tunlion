@@ -755,7 +755,10 @@ say "14b: a daemon receiver SIGKILLed mid-transfer and restarted 4s later: the s
 # The blind run: the sender ignored the replacement daemon and failed with exit 8
 # after 26 s ("delivery not confirmed"), because its delivery-ack wait ran out
 # while the receiver was away, and a re-run was needed to resume. Reuses gate
-# 14's pairing (DA sends to boxB, whose daemon runs on DB).
+# 14's pairing (DA sends to boxB, whose daemon runs on DB). NOT in the ratchet
+# yet: gate 14 itself (and 7, `send --to`) is red on the CI runner, so this
+# gate's premise fails there before the behaviour it checks is reached
+# (measured: the daemon received 0 bytes). Ratchet it with gate 14.
 DD2="$WORK/g14bdrop"; mkdir -p "$DD2"
 FILAMENT_CONFIG_DIR="$DB" "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up1.log" 2>&1 &
 UP1=$!; pids+=($UP1); sleep 3

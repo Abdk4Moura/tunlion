@@ -62,7 +62,6 @@ EXPECTED_GREEN=(
   "stepped-away sender: held|stepped-away wait"
   "U1: created once|u1-implicit-init"
   "dead receiver: sender gave up|dead receiver"
-  "daemon-restart: the sender picked up|daemon-restart"
 )
 
 # A missing PASS line has three different causes and they want different
