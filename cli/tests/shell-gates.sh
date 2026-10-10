@@ -24,9 +24,13 @@
 #      (This used to be asserted the other way round, "still refused", which
 #      pinned the very defect: a grant the running daemon never applied.)
 #   F  `up --detach --shell --i-know` while a plain daemon runs: returns at once
-#      (never follows the log), exits 3, and says the flags were not applied and
-#      the exact restart command.
+#      (never follows the log), exits 10 (DAEMON_CONFLICT in the exit-code
+#      taxonomy; 3 is "unknown device"), and says the flags were not applied and
+#      the exact restart command, --server included.
 #   F2 `up --detach` with matching settings while it runs: returns at once, 0.
+#   F3 `up --detach --userspace` while it runs with the SAME shell posture: the
+#      daemon reports its launch flags, so the unapplied --userspace is named
+#      (exit 10) instead of passing as "same settings".
 #
 # Topology: side B = acceptor, side A = initiator, reciprocal pair secret
 # (same-owner fleet, not a delegated device) so B trusts A. Gate E restarts the
@@ -229,11 +233,11 @@ timeout 20 env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" --server "$SE
 rcF=$?
 tF=$(( $(date +%s) - t0 ))
 echo "## (up --detach --shell over a plain daemon) rc=$rcF in ${tF}s"
-if [ "$rcF" = "3" ] \
+if [ "$rcF" = "10" ] \
    && grep -q "different settings" "$WORK/F.out" \
    && grep -qF "tunlion down --yes && tunlion up --detach --server=$SERVER --shell --i-know" "$WORK/F.out" \
    && ! grep -q "following its log" "$WORK/F.out"; then
-  ok "gateF: up --detach with new flags returned at once (exit 3) and named the restart"
+  ok "gateF: up --detach with new flags returned at once (exit 10) and named the restart"
 else
   echo "-- F.out --"; cat "$WORK/F.out"
   bad "gateF: up --detach with new flags blocked or misreported (rc=$rcF)"
@@ -251,6 +255,24 @@ if [ "$rcF2" = "0" ] && grep -q "already running" "$WORK/F2.out" \
 else
   echo "-- F2.out --"; cat "$WORK/F2.out"
   bad "gateF2: up --detach over a matching daemon blocked or failed (rc=$rcF2)"
+fi
+
+# ==================================================================== GATE F3 ==
+# The posture gap: a flag other than the shell posture, given over a daemon whose
+# shell posture matches, used to read as "nothing to do" and was dropped.
+say F3
+timeout 20 env FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB "$BIN" --server "$SERVER" \
+  up --detach --userspace >"$WORK/F3.out" 2>&1 </dev/null
+rcF3=$?
+echo "## (up --detach --userspace, same shell posture) rc=$rcF3"
+if [ "$rcF3" = "10" ] && grep -q "different settings" "$WORK/F3.out" \
+   && grep -q -- "--userspace (running without it)" "$WORK/F3.out" \
+   && grep -qF "tunlion down --yes && tunlion up --detach --server=$SERVER --userspace" "$WORK/F3.out" \
+   && ! grep -q "nothing to do" "$WORK/F3.out"; then
+  ok "gateF3: up --detach --userspace over a kernel-overlay daemon named the unapplied flag (exit 10)"
+else
+  echo "-- F3.out --"; cat "$WORK/F3.out"
+  bad "gateF3: --userspace over a running daemon was not reported (rc=$rcF3)"
 fi
 
 # ========================================================================= sum =

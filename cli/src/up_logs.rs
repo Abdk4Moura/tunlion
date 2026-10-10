@@ -163,6 +163,9 @@ pub(crate) async fn up_cmd(
         install_system: install_system_flag,
     } = mode;
     let daemon_argv = daemon.daemon_argv();
+    // The daemon flags given explicitly (#391's raw `DaemonOpts`, before
+    // settings fold in): what `up` compares against a running daemon's report.
+    let launch = LaunchAsk::from_daemon_opts(daemon, server);
     let shell_enabled = shell || shell_only.is_some();
     let shell_config = settings::get_str("shell-program", None);
     let can_use_user =
@@ -295,14 +298,11 @@ pub(crate) async fn up_cmd(
         // posture comes from launch flags that never touch the settings file,
         // so only the daemon can say what it is serving.
         let running = crate::ctl::try_cap_status().await;
-        let verdict = already_up_verdict(
-            &shell_policy,
-            running.as_ref(),
-            // Only flags that can come from the command line alone: relay and
-            // shell-user also fold in from settings, which the running daemon
-            // read too, so counting them would refuse every second `up`.
-            dir.is_some() || no_proxy_fallback,
-        );
+        // Every other flag the daemon reports (its `launch` object) is compared
+        // too: `--userspace`, `--no-relay`, `--name-as`, `--shell-program` and
+        // the rest used to pass as "same settings" whenever the shell posture
+        // matched, and were silently not applied.
+        let verdict = already_up_verdict(&shell_policy, &launch, running.as_ref());
         if verdict != AlreadyUp::Same {
             // Never follow the log here: that blocked forever and silently
             // dropped the flags, so `up --detach --shell` looked like it worked
@@ -317,6 +317,10 @@ pub(crate) async fn up_cmd(
                     "it is serving shells to {}, and this `up` asked for {}. Your flags were NOT applied.",
                     describe_running(st),
                     describe_policy(&shell_policy)
+                ),
+                (AlreadyUp::LaunchDiffers(diffs), _) => format!(
+                    "this `up` asked for {}. Your flags were NOT applied.",
+                    diffs.join(", ")
                 ),
                 _ => "it did not report its settings, so the flags you gave may not be in effect. Your flags were NOT applied.".to_string(),
             };
@@ -466,7 +470,12 @@ pub(crate) async fn up_cmd(
 /// Exit status when `up` finds a daemon already running with settings other
 /// than the ones asked for: distinct from a plain failure (1) so a script can
 /// tell "nothing changed, restart to apply" apart from "up broke".
-pub(crate) const ALREADY_UP_DIFFERENT_EXIT: i32 = 3;
+///
+/// 10 is `DAEMON_CONFLICT` in the exit-code taxonomy (cli/src/exit_codes.rs,
+/// #393), where 3 already means "unknown device". It is a literal here only
+/// because this branch predates exit_codes.rs; once both have merged, switch
+/// it to `exit_codes::DAEMON_CONFLICT`.
+pub(crate) const ALREADY_UP_DIFFERENT_EXIT: i32 = 10;
 
 /// What `up` should do about a daemon that is already running.
 #[derive(Debug, PartialEq, Eq)]
@@ -475,21 +484,136 @@ pub(crate) enum AlreadyUp {
     Same,
     /// It reported a different shell posture.
     Differs,
+    /// It reported launch settings other than the flags given; each entry
+    /// names one flag and what the daemon is actually running with.
+    LaunchDiffers(Vec<String>),
     /// It did not report, and flags it cannot confirm were given.
     Unknown,
 }
 
+/// The daemon flags (other than the shell posture) this `up` was EXPLICITLY
+/// given, in the effective form the daemon reports them in `cap-status`'s
+/// `launch` object. Only what was asked is compared: a plain second `up` must
+/// still find a daemon started with extras to be "the same" (#192), the way
+/// it did before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LaunchAsk {
+    /// `--server` / FILAMENT_SERVER when it is not the default.
+    pub(crate) server: Option<String>,
+    /// `--dir`, made absolute (the daemon reports its absolute drop dir).
+    pub(crate) dir: Option<String>,
+    pub(crate) relay: bool,
+    pub(crate) no_relay: bool,
+    pub(crate) name_as: Option<String>,
+    pub(crate) userspace: bool,
+    pub(crate) shell_program: Option<String>,
+    pub(crate) shell_user: Option<String>,
+    pub(crate) no_proxy_fallback: bool,
+}
+
+impl LaunchAsk {
+    fn any(&self) -> bool {
+        *self != LaunchAsk::default()
+    }
+
+    /// Asked-for flags the running daemon's `launch` report does not match,
+    /// as `--flag value (running: what it uses)`.
+    fn differences(&self, rep: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let s = |k: &str| rep[k].as_str().map(str::to_string);
+        let mut cmp = |flag: &str, asked: &Option<String>, running: Option<String>| {
+            if let Some(a) = asked {
+                if running.as_deref() != Some(a.as_str()) {
+                    let r = running.unwrap_or_else(|| "none".into());
+                    out.push(format!("{flag} {a} (running: {r})"));
+                }
+            }
+        };
+        cmp("--server", &self.server, s("server"));
+        cmp("--dir", &self.dir, s("dir"));
+        cmp("--name-as", &self.name_as, s("name"));
+        cmp("--shell-program", &self.shell_program, s("shell_program"));
+        cmp("--shell-user", &self.shell_user, s("shell_user"));
+        for (flag, asked, key) in [
+            ("--relay", self.relay, "relay"),
+            ("--no-relay", self.no_relay, "no_relay"),
+            ("--userspace", self.userspace, "userspace"),
+            ("--no-proxy-fallback", self.no_proxy_fallback, "no_proxy_fallback"),
+        ] {
+            if asked && rep[key].as_bool() != Some(true) {
+                out.push(format!("{flag} (running without it)"));
+            }
+        }
+        out
+    }
+
+    /// The ask for a parsed `up`: its raw daemon flags, with `--server` in the
+    /// effective form (config, trailing `/` trimmed) the daemon reports.
+    pub(crate) fn from_daemon_opts(o: &DaemonOpts, server: &str) -> LaunchAsk {
+        LaunchAsk {
+            server: o.server.as_ref().map(|_| server.to_string()),
+            dir: o.dir.as_ref().map(|d| {
+                let abs = std::path::absolute(d).unwrap_or_else(|_| d.clone());
+                abs.to_string_lossy().into_owned()
+            }),
+            relay: o.relay,
+            no_relay: o.no_relay,
+            name_as: o.name_as.clone(),
+            userspace: o.userspace,
+            shell_program: o.shell_program.clone(),
+            shell_user: o.shell_user.clone(),
+            no_proxy_fallback: o.no_proxy_fallback,
+        }
+    }
+    }
+}
+
+/// What a running daemon reports about how it was launched, for `cap-status`
+/// (`launch`). Every value is the EFFECTIVE one (flag, env or settings), the
+/// same form `LaunchAsk` is compared in. `dir` and `shell_user` are the live
+/// values (`tunlion set` can change both without a restart).
+// Only the unix control socket serves `cap-status`; on other platforms the
+// sole caller is compiled out, which is not a reason to fork this function.
+#[allow(dead_code)]
+pub(crate) fn launch_report(
+    server: &str,
+    dir: &std::path::Path,
+    relay: bool,
+    shell_user: Option<&str>,
+    no_proxy_fallback: bool,
+) -> serde_json::Value {
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    // Same resolution order as `platform::Paths::shell_argv` minus the
+    // per-call flag the daemon never has: FILAMENT_SHELL, then the setting.
+    let shell_program = std::env::var("FILAMENT_SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings::get_str("shell-program", None));
+    serde_json::json!({
+        "server": server,
+        "dir": dir.to_string_lossy(),
+        "relay": relay,
+        "no_relay": crate::NO_RELAY.load(std::sync::atomic::Ordering::Relaxed),
+        "name": crate::display_name(),
+        "userspace": std::env::var("FILAMENT_L3_USERSPACE").as_deref() == Ok("1"),
+        "shell_program": shell_program,
+        "shell_user": shell_user,
+        "no_proxy_fallback": no_proxy_fallback,
+    })
+}
+
 /// Compare the asked-for posture with what the running daemon reports via
-/// `cap-status` (`shell_policy` label + `shell_auto` names). `other_flags`:
-/// flags given that the daemon cannot report back (`--dir`,
-/// `--no-proxy-fallback`); those cannot be confirmed, so they count as a change.
+/// `cap-status`: the shell posture (`shell_policy` label + `shell_auto`
+/// names), then every other flag that was given against its `launch` object.
+/// A daemon that reports no `launch` (an older build) cannot confirm those
+/// flags, so giving any of them counts as a change.
 pub(crate) fn already_up_verdict(
     asked: &ShellPolicy,
+    launch: &LaunchAsk,
     running: Option<&serde_json::Value>,
-    other_flags: bool,
 ) -> AlreadyUp {
     let Some(st) = running else {
-        return if asked.enables_l2() || other_flags {
+        return if asked.enables_l2() || launch.any() {
             AlreadyUp::Unknown
         } else {
             AlreadyUp::Same
@@ -504,10 +628,17 @@ pub(crate) fn already_up_verdict(
     if label != asked.label() || (label == "only" && auto != asked.auto_names()) {
         return AlreadyUp::Differs;
     }
-    if other_flags {
-        AlreadyUp::Unknown
-    } else {
+    if !launch.any() {
+        return AlreadyUp::Same;
+    }
+    if !st["launch"].is_object() {
+        return AlreadyUp::Unknown;
+    }
+    let diffs = launch.differences(&st["launch"]);
+    if diffs.is_empty() {
         AlreadyUp::Same
+    } else {
+        AlreadyUp::LaunchDiffers(diffs)
     }
 }
 
@@ -564,31 +695,123 @@ mod already_up_tests {
 
     #[test]
     fn a_different_posture_is_reported_not_followed() {
+        let none = LaunchAsk::default();
         let running = json!({"shell_policy": "granted", "shell_auto": []});
         assert_eq!(
-            already_up_verdict(&ShellPolicy::All, Some(&running), false),
+            already_up_verdict(&ShellPolicy::All, &none, Some(&running)),
             AlreadyUp::Differs
         );
         assert_eq!(
-            already_up_verdict(&ShellPolicy::Granted, Some(&running), false),
+            already_up_verdict(&ShellPolicy::Granted, &none, Some(&running)),
             AlreadyUp::Same
         );
         let only = json!({"shell_policy": "only", "shell_auto": ["b", "a"]});
         let asked = ShellPolicy::Only(["a".to_string(), "b".to_string()].into_iter().collect());
-        assert_eq!(already_up_verdict(&asked, Some(&only), false), AlreadyUp::Same);
+        assert_eq!(already_up_verdict(&asked, &none, Some(&only)), AlreadyUp::Same);
         let other = ShellPolicy::Only(["a".to_string()].into_iter().collect());
-        assert_eq!(already_up_verdict(&other, Some(&only), false), AlreadyUp::Differs);
+        assert_eq!(already_up_verdict(&other, &none, Some(&only)), AlreadyUp::Differs);
     }
 
     #[test]
     fn unconfirmable_flags_are_never_silently_dropped() {
+        // A daemon that reports its shell posture but no `launch` object (an
+        // older build) cannot confirm a flag that was given.
         let running = json!({"shell_policy": "granted", "shell_auto": []});
+        let npf = LaunchAsk { no_proxy_fallback: true, ..LaunchAsk::default() };
         assert_eq!(
-            already_up_verdict(&ShellPolicy::Granted, Some(&running), true),
+            already_up_verdict(&ShellPolicy::Granted, &npf, Some(&running)),
             AlreadyUp::Unknown
         );
-        assert_eq!(already_up_verdict(&ShellPolicy::All, None, false), AlreadyUp::Unknown);
-        assert_eq!(already_up_verdict(&ShellPolicy::Granted, None, false), AlreadyUp::Same);
+        let none = LaunchAsk::default();
+        assert_eq!(already_up_verdict(&ShellPolicy::All, &none, None), AlreadyUp::Unknown);
+        assert_eq!(already_up_verdict(&ShellPolicy::Granted, &none, None), AlreadyUp::Same);
+        // No answer at all, with a non-shell flag given: still unconfirmable.
+        let us = LaunchAsk { userspace: true, ..LaunchAsk::default() };
+        assert_eq!(already_up_verdict(&ShellPolicy::Granted, &us, None), AlreadyUp::Unknown);
+    }
+
+    /// The posture gap: `--userspace`, `--no-relay`, `--name-as`,
+    /// `--shell-program` (and every other flag the daemon reports) given to
+    /// `up` over a daemon whose shell posture matches used to read as "same
+    /// settings" and were dropped. Each one, given and not in effect, is now
+    /// a difference that names the flag; each one in effect is not.
+    #[test]
+    fn every_reported_launch_flag_is_compared() {
+        let report = json!({
+            "server": "https://sig.example",
+            "dir": "/srv/drop",
+            "relay": false,
+            "no_relay": false,
+            "name": "boxB",
+            "userspace": false,
+            "shell_program": null,
+            "shell_user": null,
+            "no_proxy_fallback": false,
+        });
+        let running = json!({"shell_policy": "granted", "shell_auto": [], "launch": report});
+        let d = LaunchAsk::default;
+        let cases: Vec<(LaunchAsk, &str)> = vec![
+            (LaunchAsk { userspace: true, ..d() }, "--userspace"),
+            (LaunchAsk { no_relay: true, ..d() }, "--no-relay"),
+            (LaunchAsk { relay: true, ..d() }, "--relay"),
+            (LaunchAsk { name_as: Some("laptop".into()), ..d() }, "--name-as"),
+            (LaunchAsk { shell_program: Some("zsh".into()), ..d() }, "--shell-program"),
+            (LaunchAsk { shell_user: Some("guest".into()), ..d() }, "--shell-user"),
+            (LaunchAsk { no_proxy_fallback: true, ..d() }, "--no-proxy-fallback"),
+            (LaunchAsk { server: Some("https://other.example".into()), ..d() }, "--server"),
+            (LaunchAsk { dir: Some("/elsewhere".into()), ..d() }, "--dir"),
+        ];
+        for (ask, flag) in cases {
+            match already_up_verdict(&ShellPolicy::Granted, &ask, Some(&running)) {
+                AlreadyUp::LaunchDiffers(diffs) => {
+                    assert!(diffs.iter().any(|x| x.starts_with(flag)), "{flag}: {diffs:?}")
+                }
+                v => panic!("{flag} given and not in effect, but the verdict was {v:?}"),
+            }
+        }
+        // The same flags, already in effect on the daemon: nothing to apply.
+        let on = json!({"shell_policy": "granted", "shell_auto": [], "launch": {
+            "server": "https://sig.example", "dir": "/srv/drop", "relay": true,
+            "no_relay": true, "name": "laptop", "userspace": true,
+            "shell_program": "zsh", "shell_user": "guest", "no_proxy_fallback": true,
+        }});
+        let all = LaunchAsk {
+            server: Some("https://sig.example".into()),
+            dir: Some("/srv/drop".into()),
+            relay: true,
+            no_relay: true,
+            name_as: Some("laptop".into()),
+            userspace: true,
+            shell_program: Some("zsh".into()),
+            shell_user: Some("guest".into()),
+            no_proxy_fallback: true,
+        };
+        assert_eq!(already_up_verdict(&ShellPolicy::Granted, &all, Some(&on)), AlreadyUp::Same);
+        // Nothing asked: a plain second `up` is still "the same" (#192).
+        assert_eq!(
+            already_up_verdict(&ShellPolicy::Granted, &d(), Some(&running)),
+            AlreadyUp::Same
+        );
+    }
+
+    /// The daemon's report and the comparison use the same keys: a report
+    /// built by `launch_report` confirms an ask for exactly what it reports.
+    #[test]
+    fn the_launch_report_answers_the_ask_it_describes() {
+        let dir = std::path::absolute("drop-for-the-report-test").unwrap();
+        let rep = launch_report("https://sig.example", &dir, false, Some("guest"), true);
+        let ask = LaunchAsk {
+            server: Some("https://sig.example".into()),
+            dir: Some(dir.to_string_lossy().into_owned()),
+            shell_user: Some("guest".into()),
+            no_proxy_fallback: true,
+            ..LaunchAsk::default()
+        };
+        let running = json!({"shell_policy": "granted", "shell_auto": [], "launch": rep});
+        assert_eq!(
+            already_up_verdict(&ShellPolicy::Granted, &ask, Some(&running)),
+            AlreadyUp::Same
+        );
     }
 
     /// Both halves of the suggested restart are commands the CLI accepts.
@@ -822,6 +1045,29 @@ mod tests {
     fn opts_of(argv: &[&str]) -> DaemonOpts {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
         DaemonOpts::from_cli(&parse(&argv)).expect("an `up` command")
+    }
+
+    /// The ask `up` compares against a running daemon comes from the same raw
+    /// flags as the daemon argv: each daemon flag lands in its `LaunchAsk`
+    /// field, and an `up` with none of them asks for nothing (#192).
+    #[test]
+    fn the_launch_ask_carries_every_compared_daemon_flag() {
+        let o = opts_of(&[
+            "--server", "https://sig.example", "--no-relay", "--name-as", "laptop",
+            "up", "--userspace", "--dir", "/srv/drop", "--shell-program", "zsh",
+            "--shell-user", "guest", "--no-proxy-fallback",
+        ]);
+        let a = LaunchAsk::from_daemon_opts(&o, "https://sig.example");
+        assert_eq!(a.server.as_deref(), Some("https://sig.example"));
+        assert!(a.dir.as_deref().is_some_and(|d| d.ends_with("drop")), "{:?}", a.dir);
+        assert!(a.no_relay && a.userspace && a.no_proxy_fallback && !a.relay);
+        assert_eq!(a.name_as.as_deref(), Some("laptop"));
+        assert_eq!(a.shell_program.as_deref(), Some("zsh"));
+        assert_eq!(a.shell_user.as_deref(), Some("guest"));
+        let relay = LaunchAsk::from_daemon_opts(&opts_of(&["--relay", "up"]), crate::DEFAULT_SERVER);
+        assert!(relay.relay);
+        let plain = LaunchAsk::from_daemon_opts(&opts_of(&["up", "--shell", "--i-know"]), crate::DEFAULT_SERVER);
+        assert_eq!(plain, LaunchAsk::default(), "the shell posture is compared separately");
     }
 
     /// Every `up` flag survives the trip into the daemon argv and back: parse
