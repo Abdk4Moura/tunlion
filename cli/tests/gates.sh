@@ -349,6 +349,14 @@ elif [ "$WANT_RC" = 6 ] && [ $RCS -ne 6 ]; then
   bad "dead receiver: sender exited $RCS, not 6 (unreachable)"; tail -n 3 "$WORK/g2b-send.log"
 elif ! grep -qE "unreachable|lost the receiving peer|no usable path" "$WORK/g2b-send.log"; then
   bad "dead receiver: sender exited $RCS without saying the peer is gone"; tail -n 3 "$WORK/g2b-send.log"
+elif grep -q "waiting up to" "$WORK/g2b-send.log" && ! grep -q "waiting up to 10s" "$WORK/g2b-send.log"; then
+  # The wait it announces must be the one it enforces (FILAMENT_REJOIN_SECS=10
+  # here); it printed 120s while waiting 45s, and gave up after ~15s.
+  bad "dead receiver: the sender announced a wait it does not enforce"; grep "waiting up to" "$WORK/g2b-send.log"
+elif grep -q "the other device  disconnected" "$WORK/g2b-send.log"; then
+  bad "dead receiver: the disconnect line printed an empty name"; grep "disconnected" "$WORK/g2b-send.log"
+elif grep -q "did not come back within" "$WORK/g2b-send.log" && ! grep -q "new code" "$WORK/g2b-send.log"; then
+  bad "dead receiver: a code send gave up without saying the code is used up and a new send is needed"; tail -n 2 "$WORK/g2b-send.log"
 else
   ok "dead receiver: sender gave up in $((T1 - T0))s, exit $RCS, said the peer is gone"
 fi
@@ -741,6 +749,43 @@ if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
    && ! grep -q "listening in room" "$WORK/g14-up.log"; then
   ok "daemon: verified identity, room-less, received + hash match"
 else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
+
+# --------------------------------------------------------------- gate 14b ---
+say "14b: a daemon receiver SIGKILLed mid-transfer and restarted 4s later: the sender picks it up and finishes"
+# The blind run: the sender ignored the replacement daemon and failed with exit 8
+# after 26 s ("delivery not confirmed"), because its delivery-ack wait ran out
+# while the receiver was away, and a re-run was needed to resume. Reuses gate
+# 14's pairing (DA sends to boxB, whose daemon runs on DB).
+DD2="$WORK/g14bdrop"; mkdir -p "$DD2"
+FILAMENT_CONFIG_DIR="$DB" "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up1.log" 2>&1 &
+UP1=$!; pids+=($UP1); sleep 3
+FILAMENT_TEST_TRANSFER_STALL_MS=10 FILAMENT_CONFIG_DIR="$DA" \
+  "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14b-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+for _ in $(seq 1 120); do
+  sz=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((4 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+G14BSZ=$(stat -c %s "$DD2/big.bin.part" 2>/dev/null || echo 0)
+# No timeout wrapper on the daemon, so SIGKILL reaches the real process.
+kill -9 $UP1 2>/dev/null; wait $UP1 2>/dev/null
+sleep 4
+FILAMENT_CONFIG_DIR="$DB" timeout 150 "$BIN" up --dir "$DD2" --server "$SERVER" >"$WORK/g14b-up2.log" 2>&1 &
+UP2=$!; pids+=($UP2)
+T0=$(date +%s)
+bounded_wait $SP 120 "daemon-restart sender" "$WORK/g14b-send.log" "$WORK/g14b-up2.log"; RCS=$?
+T1=$(date +%s)
+kill_tree $UP2
+echo "  killed the daemon at ${G14BSZ} bytes; sender exit $RCS $((T1 - T0))s after the restart"
+if [ "$G14BSZ" -eq 0 ]; then
+  bad "daemon-restart: the daemon received nothing before it was killed, so nothing was mid-transfer"
+elif [ $RCS -eq 0 ] && [ "$(hashof "$DD2/big.bin" 2>/dev/null)" = "$H_BIG" ] \
+   && ! grep -q "120s" "$WORK/g14b-send.log"; then
+  ok "daemon-restart: the sender picked up the restarted daemon and delivered, hash matches"
+else
+  bad "daemon-restart"; tail -n 5 "$WORK/g14b-send.log" "$WORK/g14b-up2.log"
+fi
 
 # --------------------------------------------------------------- gate 15 ----
 say "15: paired recv holds the line when the sender vanishes (C21)"

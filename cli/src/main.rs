@@ -100,6 +100,8 @@ mod recv_cmd;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
+/// What `send` says, and how long it waits, when its receiver goes away.
+mod send_liveness;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;
