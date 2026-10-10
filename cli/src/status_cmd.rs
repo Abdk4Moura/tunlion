@@ -209,12 +209,31 @@ pub(crate) fn delegated_device_state(
     } else {
         (secs / 86400, "d")
     };
-    let clock_label = match clock {
-        DeadlineClock::CertExpiry => "cert expires",
-        DeadlineClock::AbsoluteStop => "stop time",
-        DeadlineClock::LivenessBudget => "offline budget",
-    };
-    Some((format!("{n}{unit} left ({clock_label})"), ui::Tone::Dim))
+    Some((deadline_text(clock, &format!("{n}{unit}")), ui::Tone::Dim))
+}
+
+/// The countdown for the clock that binds, worded like the owner-device rows
+/// ("cert expires in 90d"), so the same fact reads the same on every row: it
+/// was "30d left (cert expires)" here and "expires in 90d" there. Pure.
+pub(crate) fn deadline_text(clock: DeadlineClock, span: &str) -> String {
+    match clock {
+        DeadlineClock::CertExpiry => format!("cert expires in {span}"),
+        DeadlineClock::AbsoluteStop => format!("access stops in {span}"),
+        DeadlineClock::LivenessBudget => format!("offline budget ends in {span}"),
+    }
+}
+
+#[cfg(test)]
+mod deadline_text_tests {
+    use super::deadline_text;
+    use crate::DeadlineClock;
+
+    #[test]
+    fn every_clock_reads_as_what_ends_and_when() {
+        assert_eq!(deadline_text(DeadlineClock::CertExpiry, "30d"), "cert expires in 30d");
+        assert_eq!(deadline_text(DeadlineClock::AbsoluteStop, "5d"), "access stops in 5d");
+        assert_eq!(deadline_text(DeadlineClock::LivenessBudget, "2d"), "offline budget ends in 2d");
+    }
 }
 
 /// CLI handler for `tunlion requests`
