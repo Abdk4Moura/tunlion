@@ -367,6 +367,77 @@ fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
     result
 }
 
+/// Why `init` must not run here, or None when it may.
+///
+/// Init MINTS an identity. It used to look only for the owner key
+/// (`identity.ed25519`), and a JOINED device has none: it holds a device
+/// certificate (`identity/device-cert.json`) signed by someone else's key. So a
+/// scripted `init --name x --recovery-file f -y` on a joined device, daemon
+/// running, printed "identity created ... Setup complete", made the device an
+/// owner of a new identity and filed its real owner under "other people". It
+/// was never a path-resolution split: both files resolve through the same
+/// `Paths::config_path`. The check looked at half of what "an identity" is.
+///
+/// Replacing an identity is a separate, explicit, destructive act (`reset`),
+/// and `-y` is not consent to it: it only answers init's own prompts. A
+/// running daemon is refused too, the way `reset` refuses one, because it holds
+/// the keys init would write. Pure, so every arm is tested.
+pub(crate) fn init_refusal(
+    daemon_pid: Option<u32>,
+    owner_fp: Option<String>,
+    joined_owner_fp: Option<String>,
+) -> Option<String> {
+    let start_over = "To start over on this device: `tunlion down`, then `tunlion reset` (it wipes this device's identity and pairings), then `tunlion init`";
+    if let Some(fp) = owner_fp {
+        return Some(format!(
+            "this device already has identity {fp}, and init never replaces one; see `tunlion id`. {start_over}"
+        ));
+    }
+    if let Some(fp) = joined_owner_fp {
+        return Some(format!(
+            "this device already joined identity {fp} (it holds a device certificate from that owner), and init never replaces an identity; see `tunlion id`. {start_over}"
+        ));
+    }
+    if let Some(pid) = daemon_pid {
+        return Some(format!(
+            "the tunlion daemon is running (pid {pid}); run `tunlion down` first, then `tunlion init`"
+        ));
+    }
+    None
+}
+
+/// `devices` on a device with no identity and nothing stored answers like `id`
+/// (exit 9, `no_identity`): there is no list to show, so exit 0 with an empty
+/// screen said "fine" where `status` and `id` said "not set up". A keyless
+/// device that paired by code has records, and lists them. Pure.
+pub(crate) fn devices_has_nothing_to_list(has_identity: bool, entries: usize) -> bool {
+    !has_identity && entries == 0
+}
+
+/// The owner fingerprint a joined device's certificate names, when the device
+/// holds one. Presence decides, not validity: an expired certificate, or one
+/// whose device key no longer matches, is still an identity init must not
+/// silently write over. An unreadable one is reported as "unknown".
+fn joined_owner_fingerprint() -> Option<String> {
+    let path = local_device_cert_path();
+    if !path.exists() {
+        return None;
+    }
+    let fp = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .and_then(|v| identity::DeviceCert::from_json(&v["cert"]))
+        .map(|c| owner_fingerprint_of(&c.user_pub))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(fp)
+}
+
+/// The 8-hex fingerprint of an owner public key, as `UserKey::fingerprint`
+/// and `id` render it. Pure.
+pub(crate) fn owner_fingerprint_of(user_pub: &[u8; 32]) -> String {
+    hex::encode(user_pub).chars().take(8).collect()
+}
+
 pub(crate) async fn init_experience(
     caps: &UiCapability,
     server: &str,
@@ -379,15 +450,17 @@ pub(crate) async fn init_experience(
     no_background: bool,
 ) -> Result<()> {
     let store = crate::platform::PlatformKeyStore;
+    // Refusals first, before any flag check: init never replaces an identity.
+    if let Some(why) = init_refusal(
+        crate::daemon_alive(),
+        identity::UserKey::load(&store)?.map(|k| k.fingerprint()),
+        joined_owner_fingerprint(),
+    ) {
+        bail!("{why}");
+    }
     if caps.json && background {
         bail!(
             "init --json cannot install a service without mixing service output; run `tunlion up --install` separately"
-        );
-    }
-    if let Some(existing) = identity::UserKey::load(&store)? {
-        bail!(
-            "this device already has identity {}; see `tunlion id`",
-            existing.fingerprint()
         );
     }
     // Non-interactive init names EVERYTHING it needs in one message, so a
@@ -881,5 +954,38 @@ mod first_run_tests {
         let arm = arm.split("\n        Cmd::").next().unwrap_or(arm);
         assert!(!arm.contains("ensure_user_key"), "`tunlion id` must not create an identity");
         assert!(arm.contains("no_identity("), "`tunlion id` answers no_identity instead");
+    }
+}
+
+#[cfg(test)]
+mod init_refusal_tests {
+    use super::init_refusal;
+
+    #[test]
+    fn init_never_replaces_an_owner_or_a_joined_identity() {
+        let owner = init_refusal(None, Some("6a8879a3".into()), None).expect("owner refused");
+        assert!(owner.contains("6a8879a3") && owner.contains("tunlion reset"), "{owner}");
+        // The finding: a JOINED device has no owner key, only a certificate.
+        let joined = init_refusal(None, None, Some("ecf89133".into())).expect("joined refused");
+        assert!(joined.contains("ecf89133") && joined.contains("joined"), "{joined}");
+        assert!(joined.contains("tunlion down") && joined.contains("tunlion reset"), "{joined}");
+        // An identity outranks the daemon in the message: it is the reason.
+        let both = init_refusal(Some(42), None, Some("ecf89133".into())).unwrap();
+        assert!(both.contains("ecf89133"), "{both}");
+    }
+
+    #[test]
+    fn init_refuses_while_a_daemon_runs_like_reset() {
+        let r = init_refusal(Some(2830), None, None).expect("daemon refused");
+        assert!(r.contains("2830") && r.contains("tunlion down"), "{r}");
+        assert_eq!(init_refusal(None, None, None), None, "a fresh device may init");
+    }
+
+    #[test]
+    fn devices_with_no_identity_and_nothing_stored_is_no_identity() {
+        use super::devices_has_nothing_to_list as nothing;
+        assert!(nothing(false, 0), "keyless and empty answers like `id` (exit 9)");
+        assert!(!nothing(false, 2), "a keyless device that paired by code lists them");
+        assert!(!nothing(true, 0), "an identity with no devices is an empty list, exit 0");
     }
 }

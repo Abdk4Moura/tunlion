@@ -1172,6 +1172,16 @@ pub(crate) async fn async_main() -> Result<()> {
             match action {
                 None => {
                     let all = devices_load();
+                    // Nothing to list and no identity: the same answer `id`
+                    // gives (exit 9), not an empty list with exit 0 beside a
+                    // `status` that exits nonzero. A keyless device that
+                    // paired by code still lists its devices, with the hint.
+                    if crate::identity_flow::devices_has_nothing_to_list(
+                        crate::identity_flow::has_identity(),
+                        crate::device_view::device_entries(None).len(),
+                    ) {
+                        return Err(crate::identity_flow::no_identity(json || ui_caps.json));
+                    }
                     if json || ui_caps.json {
                         let online =
                             devices_online(all.iter().map(|(n, _)| n.clone()).collect()).await;

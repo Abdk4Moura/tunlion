@@ -62,11 +62,17 @@ async fn probe_mode(
     let runs = repeat.filter(|n| *n > 0).unwrap_or(if watch { WATCH_DEFAULT_REPEAT } else { 1 });
 
     if runs == 1 {
+        // Say what is happening before the wait: a probe to an offline or reset
+        // device sat silent for its whole 30 s bound, then printed FAILED.
+        if !json_out {
+            ui::say(&probe_progress_line(device, crate::l2::doctor_probe_secs(timeout)));
+        }
         let outcome = crate::l2::establish_probe_within(server, device, relay, timeout).await?;
         if json_out {
             ui::json_out(&single_json(device, &outcome));
         } else {
             print_ladder(device, &outcome);
+            print_reset_hint(device, &outcome);
         }
         return probe_result(std::slice::from_ref(&outcome));
     }
@@ -95,8 +101,42 @@ async fn probe_mode(
         ui::json_out(&repeat_json(device, &outcomes));
     } else {
         print_distribution(device, &outcomes);
+        if let Some(failed) = outcomes.iter().find(|o| !o.established) {
+            print_reset_hint(device, failed);
+        }
     }
     probe_result(&outcomes)
+}
+
+/// The line doctor prints before a probe: who, and the longest it will wait.
+fn probe_progress_line(device: &str, secs: u64) -> String {
+    format!(
+        "tunlion doctor: probing '{device}' (signaling, presence, establishing; gives up after {secs}s)..."
+    )
+}
+
+/// A probe that never saw the device on the server gets the same reset hint
+/// `send` gives: a device that was reset runs `up` under a NEW key the old
+/// record can never find, so "presence FAILED" alone sent people to check a
+/// machine that was running fine.
+fn print_reset_hint(device: &str, o: &crate::l2::ProbeOutcome) {
+    if let Some(hint) = reset_hint_for(device, o, &crate::devices_store::devices_load()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect::<Vec<_>>())
+    {
+        ui::say(&format!("  {hint}"));
+    }
+}
+
+/// Pure half of `print_reset_hint`: the hint when the probe died before the
+/// device appeared (signaling up, presence never satisfied), else None.
+fn reset_hint_for(device: &str, o: &crate::l2::ProbeOutcome, names: &[String]) -> Option<String> {
+    if o.established || o.failed_phase != Some(Phase::Presence) {
+        return None;
+    }
+    let successor = crate::reset_hints::successor_of(device, names.iter().map(String::as_str));
+    Some(crate::reset_hints::offline_hint(device, successor.as_deref()))
 }
 
 /// The process result for a set of probes. `doctor <device>` used to exit 0
@@ -847,6 +887,23 @@ mod tests {
             error: Some(error.to_string()),
             path: None,
         }
+    }
+
+    /// A probe that never saw the device names the reset possibility and, when
+    /// the device re-paired under a suffixed name, the successor; a probe that
+    /// failed later (it was present) or succeeded says nothing about resets.
+    #[test]
+    fn a_presence_failure_carries_the_reset_hint() {
+        let names = vec!["p9-b".to_string(), "p9-b-2".to_string()];
+        let o = offline("establishment timed out after 30s");
+        let hint = reset_hint_for("p9-b", &o, &names).expect("presence failure hints");
+        assert!(hint.contains("p9-b-2") && hint.contains("tunlion devices forget p9-b"), "{hint}");
+        let alone = reset_hint_for("p9-b", &o, &["p9-b".to_string()]).unwrap();
+        assert!(alone.contains("reset"), "{alone}");
+        let mut later = offline("l2 open refused");
+        later.failed_phase = Some(Phase::L2Open);
+        assert_eq!(reset_hint_for("p9-b", &later, &names), None);
+        assert!(probe_progress_line("p9-b", 30).contains("30s"));
     }
 
     /// The reported defect: `doctor <offline> --json` said ok and exited 0.

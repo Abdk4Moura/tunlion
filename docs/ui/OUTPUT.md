@@ -223,8 +223,15 @@ Rules that go with them:
 - **A command that only looks never creates an identity.** On a keyless
   device `id` answers `no identity yet; run ...` and exits 9 (`--json`:
   `"identity": null`). `status --json` and `doctor --json` report
-  `"identity": null` and keep their own exit rules; `status` and `devices`
-  print the same one-line hint.
+  `"identity": null` and keep their own exit rules; `status` prints the same
+  one-line hint. `devices` with no identity and nothing stored answers like
+  `id` (exit 9, the failure envelope under `--json`); a keyless device that
+  paired by code lists those devices, prints the hint, and exits 0.
+- **`init` never replaces an identity.** On a device that holds the owner key,
+  or a device certificate from joining someone else's identity, `init`
+  refuses (exit 1) and names `tunlion down` then `tunlion reset`; `-y` answers
+  init's own prompts and is not consent to replace an identity. It also
+  refuses while a daemon runs, like `reset`.
 - **`identity` is always the owner fingerprint or null**, on every verb that
   reports it (`id`, `init`, `status`, `doctor`). Whether this device holds the
   owner key or joined someone else's is a separate field, `role`: `"owner"`,
