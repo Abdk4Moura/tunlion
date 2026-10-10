@@ -71,6 +71,16 @@ jobs:
 
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          # The Actions cache backend can refuse service ("Egress is over the
+          # account limit"), and with RUSTC_WRAPPER=sccache every compile then
+          # fails. A slower uncached build beats a red job that tested nothing.
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -116,19 +126,25 @@ jobs:
           # gates while leaving them indistinguishable from unwired ones. Wiring
           # that a machine cannot see is the thing #249 exists to catch.
           declare -A EXPECT=(
-            [cli/tests/ssh-ca-gates.sh]=6
-            [cli/tests/exec-gates.sh]=13
+            [cli/tests/ssh-ca-gates.sh]=8
+            [cli/tests/exec-gates.sh]=14
             [cli/tests/sync-gates.sh]=17
-            # 23 = 22 gate slots + the RECON (post-restart link re-establishment)
-            # verdict. AUTH-A keeps its slot while it is KNOWN-RED: the count
-            # below includes KNOWN-RED lines, so a tracked failure can never make
-            # the total look short and can never be silently dropped.
+            # 23 gate slots (FORGET-REFUSED, from #385, is the 23rd). This was 24 while gateRECON existed, but RECON read
+            # AUTH-A's own exec result and printed a second PASS for it, so one
+            # observation counted twice; it was removed and its honest-vs-silent
+            # classification moved into AUTH-A's failure message. A gate that is
+            # KNOWN-RED keeps its slot: the count below includes KNOWN-RED lines,
+            # so a tracked failure can never make the total look short.
             [cli/tests/fleet-cert-gates.sh]=23
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
-            [cli/tests/l2-revoke-gates.sh]=3
-            [cli/tests/shell-posture-gates.sh]=3
-            [cli/tests/forward-refusal-gates.sh]=5
+            # 4: gate C (the revoked forward exits 4 and says why) joined A, A2, B.
+            [cli/tests/l2-revoke-gates.sh]=4
+            # 4 = gates A/B/C + the setup-grant slot. The grant those gates
+            # depend on was never checked and in fact fails for the vouched
+            # record; the slot reports it (KNOWN-RED today, counted here).
+            [cli/tests/shell-posture-gates.sh]=4
+            [cli/tests/forward-refusal-gates.sh]=6
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
@@ -155,12 +171,20 @@ jobs:
             # failing status while suppressing errexit; `|| true` on the
             # count does the same for grep's exit 1 on zero matches.
             code=0
-            out="$(bash "$g" 2>&1)" || code=$?
+            # A PER-GATE BOUND, the same one gate-suite.yml carries. Without it
+            # one hanging gate consumed the whole job budget and hid every
+            # revocation gate after it in the loop, and the job died at its
+            # timeout naming nothing. The slowest script here (fleet-cert) runs
+            # in about 90s, so 300s is generous and still leaves the later
+            # gates time to run after a hang.
+            out="$(timeout 300 bash "$g" 2>&1)" || code=$?
             echo "$out"
             echo "::endgroup::"
             got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
             want=${EXPECT[$g]}
-            if [ "$code" -ne 0 ]; then
+            if [ "$code" -eq 124 ]; then
+              echo "::error::$g HUNG: killed by the 300s per-gate timeout, so the output above is partial and every gate after it in this suite still ran"; rc=1
+            elif [ "$code" -ne 0 ]; then
               echo "::error::$g exited $code"; rc=1
             elif [ "$got" -ne "$want" ]; then
               echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1

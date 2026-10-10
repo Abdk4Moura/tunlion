@@ -98,6 +98,96 @@ pub(crate) fn invitation_not_a_code_msg() -> String {
         .to_string()
 }
 
+/// The default enrolment ceiling for a device added over a spoken code when
+/// `--allow` was not given: the same transfer+mount the invitation path gives a
+/// device. Shell is owner-equivalent and stays a deliberate `--allow ...shell`,
+/// because pairing alone never yields a shell.
+pub(crate) fn default_device_ceiling() -> Vec<String> {
+    vec!["transfer".to_string(), "mount".to_string()]
+}
+
+/// `--expires` for the spoken-code path, parsed and bounded exactly like the
+/// invitation path (`add --out`). `enrols` is false for a pairing that issues
+/// no certificate (a person, or an ordinary pair): there is nothing for the
+/// value to bound, so it is refused rather than silently ignored.
+pub(crate) fn code_enrolment_ttl(expires: Option<&str>, enrols: bool) -> Result<Option<u64>> {
+    let Some(raw) = expires else {
+        return Ok(None);
+    };
+    if !enrols {
+        bail!(
+            "--expires bounds an invitation or an enrolment certificate, and this pairing issues neither. Use `--out <file>` for a bounded invitation, or `--for device` to enrol one of your devices."
+        );
+    }
+    let ttl = crate::file_io::parse_mint_ttl(raw)?;
+    if ttl == 0 || ttl > 30 * 24 * 3600 {
+        bail!("invitations must expire between 1 second and 30 days");
+    }
+    Ok(Some(ttl))
+}
+
+/// What `tunlion grant <device> <capability>` does about a device's enrolment
+/// ceiling. Only a DELEGATED device has one (`principal_ceiling_for` is None
+/// for every other record), and for it a grant can neither widen the ceiling
+/// nor add what it already holds. `grant` decides with this, and the pairing
+/// hint below asks the same question, so the hint cannot name a command that
+/// `grant` would then refuse.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantVsCeiling {
+    /// No ceiling binds this device: proceed.
+    Proceed,
+    /// The ceiling already holds it; a bare grant would add nothing.
+    AlreadyCovered,
+    /// Outside the ceiling (or resource-scoped under one): only a new
+    /// invitation carrying it can add it.
+    OutsideCeiling,
+}
+
+pub(crate) fn grant_vs_ceiling(
+    ceiling: Option<&[String]>,
+    capability: &str,
+    resource_scoped: bool,
+) -> GrantVsCeiling {
+    match ceiling {
+        None => GrantVsCeiling::Proceed,
+        Some(c) if !resource_scoped && c.iter().any(|x| x == capability) => {
+            GrantVsCeiling::AlreadyCovered
+        }
+        Some(_) => GrantVsCeiling::OutsideCeiling,
+    }
+}
+
+/// The one line printed after enrolling a device without shell: how to give it
+/// one, as a command that parses AND that `grant` accepts for this device.
+/// `caps` is what the enrolment recorded; `ceiling` is what binds it
+/// (`principal_ceiling_for`): None for an owner's own device, which takes a
+/// plain `grant` (a first-time-user test was told to re-add a device that
+/// `tunlion grant p5-b shell` served at once). Only a delegated device whose
+/// ceiling excludes shell is sent to a new invitation.
+pub(crate) fn shell_not_granted_hint(
+    name: &str,
+    caps: &[String],
+    ceiling: Option<&[String]>,
+) -> Option<String> {
+    if caps.iter().any(|c| c == "shell") {
+        return None;
+    }
+    match grant_vs_ceiling(ceiling, "shell", false) {
+        GrantVsCeiling::AlreadyCovered => None,
+        GrantVsCeiling::Proceed => Some(format!(
+            "shell was not granted; to allow a terminal later:  tunlion grant {name} shell"
+        )),
+        GrantVsCeiling::OutsideCeiling => {
+            let mut allow: Vec<String> = ceiling.unwrap_or(caps).to_vec();
+            allow.push("shell".to_string());
+            let allow = allow.join(",");
+            Some(format!(
+                "shell was not granted, and a grant cannot widen this device's ceiling; to allow a terminal later, re-add it with shell:  tunlion add {name} --allow {allow}"
+            ))
+        }
+    }
+}
+
 /// `internal` means: issue the peer an owner-signed certificate and admit it to
 /// this mesh. `posture` is the ceiling to grant it, empty meaning the
 /// same-person default. Both are decided by the operator at the moment of
@@ -110,6 +200,10 @@ pub(crate) async fn pair_cmd(
     relay: bool,
     internal: bool,
     posture: Vec<String>,
+    // `--expires`, already parsed and bounded (`code_enrolment_ttl`): the
+    // lifetime of the certificate an `internal` pairing issues. None keeps the
+    // default certificate lifetime.
+    enrol_ttl: Option<u64>,
     // `add <name>` on a terminal: the person has said who, and nothing else is
     // worth asking before the code is on screen. Skips the guided "choose words"
     // entry (Enter there only ever meant "generate them") and puts the file
@@ -242,7 +336,8 @@ pub(crate) async fn pair_cmd(
             // the server rejects it, and the user is told "codes burn after one
             // use" about a token that was never claimed, with a remedy
             // (`re-run tunlion add`) that mints a code and cannot help.
-            if c.starts_with("filament-invite:") {
+            // PROTOCOL LITERAL: frozen, do not rename (shared constant).
+            if c.starts_with(crate::file_io::INVITE_PREFIX) {
                 bail!("{}", invitation_not_a_code_msg());
             }
             // Claimer: normalize the typed code, split, send ONLY the nameplate.
@@ -338,6 +433,9 @@ pub(crate) async fn pair_cmd(
     // `add --internal` reporting success on the owner side while the device stayed
     // EXTERNAL.
     let mut enrol_settled = false;
+    // Set when the owner's enrol-grant was persisted: this device JOINED the
+    // owner's mesh, so the peer is not someone else's device after all.
+    let mut joined_mesh = false;
     let mut enrol_deadline: Option<Instant> = None;
     let mut sent_identity: bool = false;
     let mut identity_exchange_window: Option<std::time::Instant> = None;
@@ -564,6 +662,12 @@ pub(crate) async fn pair_cmd(
                                         "enrol: could not record the certificate: {e}"
                                     ));
                                 }
+                                let ceiling = crate::principal_ceiling_for(&n);
+                                if let Some(hint) =
+                                    shell_not_granted_hint(&n, caps, ceiling.as_deref())
+                                {
+                                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {hint}")));
+                                }
                             }
                         } else {
                             // #23: atomic (secret,cert) together in ONE write, not separate writes.
@@ -585,6 +689,20 @@ pub(crate) async fn pair_cmd(
                             .context("atomic store secret+cert")?;
                             // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor
                             store_provisional_identity(&n, pcert).context("store provisional")?;
+                        }
+                        // A pairing between two DIFFERENT identities files the peer
+                        // as EXTERNAL (someone else's, time-boxed, deny-by-default).
+                        // That used to happen silently, even for `add <device>`,
+                        // which reads as "make it one of mine". Say so, on both
+                        // ends, and name the real path to one identity.
+                        if !same_person
+                            && !joined_mesh
+                            && issued_cert.is_none()
+                            && peer_identity_cert.is_some()
+                        {
+                            let (headline, detail, steps) =
+                                external_pairing_notice(&n, &display_name(), internal);
+                            ui::caution(&headline, Some(detail.as_str()), &steps);
                         }
                         if same_person {
                             ui::say(&fleet_ui::pair_ui::render_same_person_success(&n));
@@ -620,7 +738,7 @@ pub(crate) async fn pair_cmd(
         if let Some(dl) = ceremony_deadline {
             if Instant::now() > dl {
                 bail!(
-                    "the other device disconnected before setup finished; make sure both run `tunlion add` at the same time, then try again"
+                    "the other device disconnected before setup finished; keep `tunlion add` running on one device while the other runs `tunlion join <code>`, then try again"
                 );
             }
         }
@@ -949,20 +1067,19 @@ pub(crate) async fn pair_cmd(
                                                 });
                                             if let Some(dpub) = dpub {
                                                 // The posture the operator chose. Empty means the
-                                                // same-person convenience; anything given is the
-                                                // ceiling verbatim, so a device added deliberately
-                                                // without shell does not get shell.
+                                                // documented device default (transfer+mount, the
+                                                // same as `add --out`); anything given is the
+                                                // ceiling verbatim. Shell is never implied.
                                                 let caps: Vec<String> = if posture.is_empty() {
-                                                    vec![
-                                                        "transfer".to_string(),
-                                                        "mount".to_string(),
-                                                        "shell".to_string(),
-                                                    ]
+                                                    default_device_ceiling()
                                                 } else {
                                                     posture.clone()
                                                 };
-                                                let expires = identity::now_secs()
-                                                    .saturating_add(identity::CERT_TTL_SECS);
+                                                // `--expires` when given, the default
+                                                // certificate lifetime otherwise.
+                                                let expires = identity::now_secs().saturating_add(
+                                                    enrol_ttl.unwrap_or(identity::CERT_TTL_SECS),
+                                                );
                                                 match mesh_enrolment(
                                                     &owner_key, dpub, &caps, expires, true,
                                                 ) {
@@ -1037,7 +1154,9 @@ pub(crate) async fn pair_cmd(
                                         if let Ok(grant) = serde_json::from_slice::<Value>(&pt) {
                                             enrol_settled = true;
                                             match persist_mesh_grant(&grant) {
-                                                Ok(()) => ui::say(&format!(
+                                                Ok(()) => {
+                                                    joined_mesh = true;
+                                                    ui::say(&format!(
                                                     "  {} joined {}'s mesh",
                                                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                                     ui::paint(
@@ -1046,7 +1165,8 @@ pub(crate) async fn pair_cmd(
                                                             .as_str()
                                                             .unwrap_or("the owner")
                                                     )
-                                                )),
+                                                ));
+                                                }
                                                 Err(e) => ui::say(&ui::paint(
                                                     ui::Tone::Warn,
                                                     &format!(
@@ -1185,10 +1305,12 @@ pub(crate) async fn pair_cmd(
                     }
                     None => continue,
                 };
+                // The petname when one is settled (`add <name>`, `--name`): the
+                // name the user chose, not the peer's broadcast `user@host`.
                 ui::say(&format!(
                     "  {} {}",
                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                    ui::paint(ui::Tone::Bold, &display)
+                    ui::paint(ui::Tone::Bold, petname.as_deref().unwrap_or(&display))
                 ));
                 peer = Some((pid.clone(), display.clone()));
                 let _ = &t; // transport not used on the v2 path (no secret over DC)
@@ -1250,6 +1372,9 @@ pub(crate) async fn pair_cmd(
             Ev::GraceExpired(pid, g) => {
                 conn.on_stuck(&pid, g, "lost").await?;
             }
+            Ev::RetryLink(pid, g) => {
+                conn.on_retry_due(&pid, g).await?;
+            }
             Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
             Ev::PeerLeft(v) => {
                 // A faster, friendlier signal than the ceremony budget when it
@@ -1261,13 +1386,157 @@ pub(crate) async fn pair_cmd(
                     .map(|l| l.name.clone());
                 conn.on_peer_left(&v);
                 let n = gone.unwrap_or_else(|| "the other device".into());
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    &format!("  {n} disconnected, waiting briefly in case it reconnects..."),
+                // Debug only. In a SUCCESSFUL pairing the other side leaves on
+                // purpose: its one-shot join connection hands off to its daemon,
+                // and a first-time-user test saw this line twice right before
+                // "paired". When the leave is real, the ceremony deadline says
+                // so in plain words ("the other device disconnected before setup
+                // finished"), so nothing is lost at normal verbosity.
+                ui::debug(&format!(
+                    "  {n} disconnected, waiting briefly in case it reconnects..."
                 ));
             }
             Ev::Interrupted => bail!("interrupted"),
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod promise_tests {
+    use super::*;
+
+    // `add <device>` over a spoken code: --allow omitted must mean the
+    // documented transfer+mount, never shell ("pairing alone never yields a
+    // shell", `grant` help).
+    #[test]
+    fn code_path_default_ceiling_has_no_shell() {
+        let caps = default_device_ceiling();
+        assert_eq!(caps, vec!["transfer", "mount"]);
+        assert!(!caps.iter().any(|c| c == "shell"));
+    }
+
+    // --expires reaches the enrolment, parsed and bounded like `add --out`.
+    #[test]
+    fn code_path_expires_is_parsed_and_bounded() {
+        assert_eq!(code_enrolment_ttl(None, true).unwrap(), None);
+        assert_eq!(code_enrolment_ttl(Some("2h"), true).unwrap(), Some(7200));
+        assert_eq!(
+            code_enrolment_ttl(Some("30d"), true).unwrap(),
+            Some(30 * 24 * 3600)
+        );
+        assert!(code_enrolment_ttl(Some("31d"), true).is_err());
+        assert!(code_enrolment_ttl(Some("0"), true).is_err());
+        assert!(code_enrolment_ttl(Some("soon"), true).is_err());
+        // A pairing that issues no certificate refuses the flag, not ignores it.
+        assert!(code_enrolment_ttl(Some("2h"), false).is_err());
+        assert_eq!(code_enrolment_ttl(None, false).unwrap(), None);
+    }
+
+    // The printed remedy must be a command that parses AND one `grant` would
+    // carry out for that device: a plain grant for a device no ceiling binds,
+    // a re-add (keeping the ceiling, adding shell) only where the ceiling
+    // truly excludes shell.
+    #[test]
+    fn the_suggested_shell_command_parses_and_grant_accepts_it() {
+        use clap::Parser;
+        let parse = |hint: &str, verb: &str| -> Vec<String> {
+            let start = hint.find(verb).expect("the hint names a command");
+            let cmd = hint[start..].trim();
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            assert!(
+                crate::Cli::try_parse_from(&argv).is_ok(),
+                "suggested command does not parse: {cmd}"
+            );
+            argv
+        };
+        let caps = default_device_ceiling();
+
+        // An owner's own device: no ceiling binds it, so `grant` proceeds and
+        // the hint says exactly that command.
+        let hint = shell_not_granted_hint("p5-b", &caps, None).expect("a hint is printed");
+        let argv = parse(&hint, "tunlion grant");
+        assert_eq!(argv, ["tunlion", "grant", "p5-b", "shell"]);
+        assert_eq!(grant_vs_ceiling(None, "shell", false), GrantVsCeiling::Proceed);
+
+        // A delegated device whose ceiling excludes shell: `grant` refuses,
+        // so the hint is the re-add, and it keeps the ceiling it had.
+        let hint = shell_not_granted_hint("laptop", &caps, Some(caps.as_slice())).expect("a hint");
+        assert!(!hint.contains("tunlion grant"), "{hint}");
+        let argv = parse(&hint, "tunlion add");
+        assert_eq!(argv.last().map(String::as_str), Some("transfer,mount,shell"));
+        assert_eq!(
+            grant_vs_ceiling(Some(caps.as_slice()), "shell", false),
+            GrantVsCeiling::OutsideCeiling
+        );
+
+        // Shell already there, by the enrolment or by the ceiling: no hint.
+        let with_shell = vec!["transfer".to_string(), "shell".to_string()];
+        assert!(shell_not_granted_hint("laptop", &with_shell, None).is_none());
+        assert!(shell_not_granted_hint("laptop", &caps, Some(with_shell.as_slice())).is_none());
+    }
+}
+
+/// What to say when a pairing filed the peer as EXTERNAL because the two
+/// devices already hold DIFFERENT identities. `asked_to_own` is `add <device>`
+/// (`--internal`): the operator meant "one of mine", so the steps make the PEER
+/// join this identity; otherwise they make THIS device join the peer's.
+/// Every step is a command the CLI accepts (pinned by the test below).
+pub(crate) fn external_pairing_notice(
+    peer: &str,
+    me: &str,
+    asked_to_own: bool,
+) -> (String, String, Vec<String>) {
+    let peer_w = crate::refusal::word(peer);
+    let me_w = crate::refusal::word(me);
+    let headline = format!("'{peer}' was filed as EXTERNAL, not as one of your devices");
+    let detail = if asked_to_own {
+        format!(
+            "'{peer}' already has its own identity, different from this device's, so pairing could not make it yours. External devices are someone else's: time-boxed and deny-by-default."
+        )
+    } else {
+        format!(
+            "'{peer}' and this device have different identities, so each is EXTERNAL to the other: time-boxed and deny-by-default."
+        )
+    };
+    let steps = if asked_to_own {
+        vec![
+            format!("if '{peer}' is yours, on '{peer}' run: tunlion down --yes && tunlion reset"),
+            format!("then here: tunlion devices forget {peer_w} && tunlion add {peer_w} (and do what it prints on '{peer}')"),
+        ]
+    } else {
+        vec![
+            format!("if this device should be one of '{peer}'s, run here: tunlion down --yes && tunlion reset"),
+            format!("then on '{peer}': tunlion add {me_w} (and do what it prints here)"),
+        ]
+    };
+    (headline, detail, steps)
+}
+
+#[cfg(test)]
+mod external_notice_tests {
+    use super::external_pairing_notice;
+
+    /// The commands in the steps parse, so a copy-paste never meets clap's
+    /// "unexpected argument".
+    #[test]
+    fn the_steps_name_commands_that_parse() {
+        use clap::Parser;
+        for own in [true, false] {
+            let (headline, _, steps) = external_pairing_notice("p1-b", "p1-a", own);
+            assert!(headline.contains("EXTERNAL"), "{headline}");
+            for step in steps {
+                let Some(start) = step.find("tunlion ") else { continue };
+                let tail = &step[start..];
+                let tail = tail.split(" (").next().unwrap_or(tail);
+                for cmd in tail.split(" && ") {
+                    let argv: Vec<&str> = cmd.split_whitespace().collect();
+                    assert!(
+                        crate::Cli::try_parse_from(&argv).is_ok(),
+                        "does not parse: {cmd}"
+                    );
+                }
+            }
         }
     }
 }

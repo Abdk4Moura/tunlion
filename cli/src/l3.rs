@@ -140,6 +140,31 @@ pub fn ipv6_disabled() -> bool {
         || read("/proc/sys/net/ipv6/conf/default/disable_ipv6")
 }
 
+/// What stops the kernel overlay on this machine before any privilege
+/// question arises, most fundamental first, or None. Pure: `dev_present` is
+/// whether /dev/net/tun exists, `ipv6_off` whether IPv6 is disabled. Only the
+/// first cause is named, so only an advice that can work is given.
+pub fn kernel_overlay_blocker(dev_present: bool, ipv6_off: bool) -> Option<String> {
+    if !dev_present {
+        return Some(
+            "/dev/net/tun does not exist here (a container started without --device /dev/net/tun, \
+             or a kernel without the tun module), so the userspace overlay is used and needs no \
+             setup; a capability grant would not change that"
+                .to_string(),
+        );
+    }
+    if ipv6_off {
+        return Some(
+            "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), so the kernel \
+             overlay cannot hold its address and the userspace overlay is used. To use the kernel \
+             overlay, re-enable it: sysctl -w net.ipv6.conf.all.disable_ipv6=0 \
+             net.ipv6.conf.default.disable_ipv6=0"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Turn a kernel-TUN failure into the thing the operator has to change.
 ///
 /// WHY THIS EXISTS. The fallback message used to quote the failed command and
@@ -153,6 +178,21 @@ pub fn ipv6_disabled() -> bool {
 /// Pure so every branch is testable without breaking the host's networking.
 pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
     let e = err.to_ascii_lowercase();
+    // IN THIS ORDER, and only the first cause that applies is advised. A box
+    // with no /dev/net/tun and IPv6 disabled (a hardened container) used to
+    // be told to re-enable IPv6 with sysctl, which would have changed nothing:
+    // the error was "open /dev/net/tun: No such file or directory". The device
+    // is the first thing the kernel plane needs, so its absence is the cause
+    // whatever else is also true; then IPv6; then privilege.
+    if e.contains("tun") && (e.contains("no such file or directory") || e.contains("no such device")) {
+        return format!(
+            "/dev/net/tun does not exist here (a container started without --device /dev/net/tun, \
+             or a kernel without the tun module), so the kernel overlay cannot start. The \
+             userspace overlay is in use instead and needs no setup. For the kernel overlay, \
+             start the container with --device /dev/net/tun, or load the module (`modprobe tun`). \
+             Original error: {err}"
+        );
+    }
     if ipv6_off || e.contains("ipv6 is disabled") {
         return format!(
             "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), and tunlion's \
@@ -165,12 +205,6 @@ pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
         return format!(
             "no permission to create a network device: tunlion needs CAP_NET_ADMIN (run as root, \
              or grant the capability on the binary). Original error: {err}"
-        );
-    }
-    if e.contains("no such file or directory") && e.contains("tun") {
-        return format!(
-            "/dev/net/tun is missing: load the tun module (`modprobe tun`) or run somewhere it is \
-             available. Original error: {err}"
         );
     }
     if e.contains("busy") {
@@ -937,22 +971,35 @@ fn open_kernel(
     Ok(tun)
 }
 
-const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by tunlion; edits here are overwritten)";
+// PROTOCOL LITERAL: frozen, do not rename. The /etc/hosts block markers
+// released builds wrote; the BEGIN line is matched by its prefix on rewrite.
+const HOSTS_BEGIN: &str = "# BEGIN filament-mesh (managed by filament; edits here are overwritten)";
 const HOSTS_END: &str = "# END filament-mesh";
 
-/// Get this machine's hostname for MagicDNS.
+/// This machine's short hostname (MagicDNS, the `init` name suggestion, the
+/// forward-to-self check). Asks the OS (`platform::os_hostname`) instead of
+/// reading /etc/hostname, which macOS does not have, so every Mac was "cli".
 pub fn hostname() -> String {
-    // #183.1: /etc/hostname is UNIX-only; Windows provides COMPUTERNAME.
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into())
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
+}
+
+/// `Kabir-MacBook.local` -> `kabir-macbook`: the first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label. Falls back to "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mut label = String::new();
+    for c in first.chars() {
+        let c = c.to_ascii_lowercase();
+        let c = if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' };
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
     }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into())
-    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
 }
 
 /// The OS hosts file for MagicDNS. Unix: /etc/hosts. Windows: the drivers\etc\hosts
@@ -1284,6 +1331,40 @@ mod tests {
         assert!(d.contains("IPv6 is disabled"));
     }
 
+    /// `init` in a container with no /dev/net/tun and IPv6 off advised
+    /// `sudo setcap`. The blocker names the device first, then IPv6, and with
+    /// both present there is no blocker (privilege is a separate question).
+    #[test]
+    fn the_kernel_overlay_blocker_names_the_first_real_cause() {
+        let no_dev = kernel_overlay_blocker(false, true).unwrap();
+        assert!(no_dev.contains("/dev/net/tun does not exist"), "{no_dev}");
+        assert!(!no_dev.contains("sysctl") && !no_dev.contains("setcap"), "{no_dev}");
+        let v6 = kernel_overlay_blocker(true, true).unwrap();
+        assert!(v6.contains("IPv6 is disabled") && v6.contains("disable_ipv6=0"), "{v6}");
+        assert_eq!(kernel_overlay_blocker(true, false), None);
+    }
+
+    /// The blind test's container: no /dev/net/tun AND IPv6 disabled. The
+    /// advice must be about the missing device (the actual error) and must not
+    /// send the operator to sysctl or setcap, neither of which would help.
+    #[test]
+    fn a_missing_tun_device_is_the_cause_even_with_ipv6_disabled() {
+        let raw = "open /dev/net/tun: No such file or directory (os error 2)";
+        let d = diagnose_tun_failure(raw, true);
+        assert!(d.contains("/dev/net/tun does not exist"), "{d}");
+        assert!(d.contains("userspace overlay is in use"), "{d}");
+        assert!(d.contains("--device /dev/net/tun"), "{d}");
+        assert!(!d.contains("sysctl") && !d.contains("IPv6 is disabled"), "{d}");
+        assert!(!d.contains("CAP_NET_ADMIN") && !d.contains("setcap"), "{d}");
+        assert!(d.contains(raw), "{d}");
+        // A node present but no driver behind it: the same cause.
+        let nodev = diagnose_tun_failure("open /dev/net/tun: No such device", false);
+        assert!(nodev.contains("/dev/net/tun does not exist"), "{nodev}");
+        // With the device present, IPv6 still outranks privilege.
+        let both = diagnose_tun_failure("TUNSETIFF: Operation not permitted", true);
+        assert!(both.contains("IPv6 is disabled") && !both.contains("CAP_NET_ADMIN"), "{both}");
+    }
+
     #[test]
     fn privilege_and_module_and_busy_each_name_their_own_fix() {
         assert!(
@@ -1307,7 +1388,7 @@ mod tests {
         let raw = "something nobody has seen before";
         assert_eq!(diagnose_tun_failure(raw, false), raw);
     }
-    use super::{diagnose_tun_failure, dest_ip, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
+    use super::{diagnose_tun_failure, dest_ip, kernel_overlay_blocker, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
@@ -1329,6 +1410,26 @@ mod tests {
         let cleared = render_hosts(&again, &[]);
         assert!(!cleared.contains("filament-mesh"));
         assert!(cleared.contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn hostname_is_the_short_os_label() {
+        use super::short_host_label as l;
+        assert_eq!(l("laptop"), "laptop");
+        assert_eq!(l("Kabir-MacBook-Pro.local"), "kabir-macbook-pro");
+        assert_eq!(l("vps3584156.trouble-free.net"), "vps3584156");
+        assert_eq!(l("DESKTOP-7Q2K1"), "desktop-7q2k1");
+        assert_eq!(l("my_box  two"), "my-box-two");
+        assert_eq!(l("-edge-"), "edge");
+        assert_eq!(l(""), "device");
+        assert_eq!(l("...."), "device");
+        assert_eq!(l(&"a".repeat(80)).len(), 63);
+        // The OS answers, so the name is the machine's, never the old
+        // /etc/hostname fallback constant.
+        let os = crate::platform::os_hostname();
+        assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+        assert_eq!(super::hostname(), l(os.as_deref().unwrap()));
+        assert_ne!(super::hostname(), "cli");
     }
 
     #[test]

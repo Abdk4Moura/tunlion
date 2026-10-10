@@ -165,6 +165,10 @@ pub const DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// ALPN, distinguishes our QUIC app; both ends must agree.
 const ALPN: &[u8] = b"filament-direct/1";
+// PROTOCOL LITERAL: frozen, do not rename (ALPN above, and these two):
+// both ends of a direct link derive and check these exact bytes.
+const TRANSPORT_KEY_INFO: &[u8] = b"filament-direct-transport-v1";
+const KEYING_MATERIAL_LABEL: &[u8] = b"filament-direct-auth";
 
 /// Max app payload per send_frame on the direct-QUIC path. QUIC streams are
 /// byte-streams with no datagram cap, so larger frames just mean fewer
@@ -208,7 +212,7 @@ pub fn transport_key(secret: &str) -> [u8; 32] {
     // Extract: PRK = HMAC(salt=0, ikm=secret)
     let prk = hmac_sha256_raw(&[0u8; 32], secret.as_bytes());
     // Expand: T(1) = HMAC(PRK, info || 0x01)
-    let mut info = b"filament-direct-transport-v1".to_vec();
+    let mut info = TRANSPORT_KEY_INFO.to_vec();
     info.push(0x01);
     hmac_sha256_raw(&prk, &info)
 }
@@ -839,7 +843,7 @@ pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
 /// would have to forward cannot validate against its own peer's binding.
 fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
-    conn.export_keying_material(&mut out, b"filament-direct-auth", b"")
+    conn.export_keying_material(&mut out, KEYING_MATERIAL_LABEL, b"")
         .map_err(|e| anyhow!("export_keying_material failed: {e:?}"))?;
     Ok(out)
 }
@@ -1436,6 +1440,20 @@ fn is_clean_close(e: &quinn::ReadExactError) -> bool {
     )
 }
 
+/// The link went silent and QUIC's idle timer closed it. A one-shot CLI peer
+/// (`exec`, `send`, `shell -- cmd`) that exits without a QUIC close leaves
+/// exactly this behind on the long-lived side: investigated and harmless, the
+/// liveness logic already treats the link as dead and repairs or drops it. It
+/// is not an alarm, so it is not printed as one.
+fn is_idle_timeout(e: &quinn::ReadExactError) -> bool {
+    matches!(
+        e,
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::TimedOut
+        ))
+    )
+}
+
 fn note_reader_exit(peer_id: &str, primary: bool, reason: &str, frames: u64, dead: bool) {
     let line = format!(
         "l2: link reader exited peer={peer_id} primary={primary} reason={reason} frames={frames} dead={dead}"
@@ -1475,7 +1493,15 @@ fn spawn_reader(
                     // worker). `dead` stays false exactly as the comment above
                     // requires.
                     rx_ended.store(true, std::sync::atomic::Ordering::Relaxed);
-                    note_reader_exit(&peer_id, primary, "finished-early(hdr)", frames, false);
+                    // At a frame boundary this is the peer ending its send half
+                    // on purpose (a one-shot finishing): the normal end, so it
+                    // is debug-level like the clean-close arm below. It printed
+                    // after every successful exec/send at normal verbosity. The
+                    // liveness consequence is unchanged (`rx_ended`, decided by
+                    // `is_dead()`); a FIN mid-frame (`body`) stays loud.
+                    crate::hooks::debug(&format!(
+                        "l2: link reader exited peer={peer_id} primary={primary} reason=finished-early(hdr) frames={frames} dead=false"
+                    ));
                     break;
                 }
                 // A connection WE closed (a one-shot `exec` finishing) or one the
@@ -1488,6 +1514,13 @@ fn spawn_reader(
                     dead.store(true, std::sync::atomic::Ordering::Relaxed);
                     crate::hooks::debug(&format!(
                         "l2: link closed cleanly peer={peer_id} primary={primary} frames={frames} ({e})"
+                    ));
+                    break;
+                }
+                if is_idle_timeout(&e) {
+                    dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::hooks::debug(&format!(
+                        "l2: link idle-timed out peer={peer_id} primary={primary} answerer={answerer} frames={frames} ({e})"
                     ));
                     break;
                 }
@@ -2348,5 +2381,31 @@ mod tests {
                 "a peer-observed address must not be reported as server-asserted, got: {adopted:?}"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn direct_transport_domains_are_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("ALPN", super::ALPN,
+             "195dae237f2fe31aadabf20426cc7eba0b7f31afd6fc60793fa1afbf5c3949bc"),
+            ("TRANSPORT_KEY_INFO", super::TRANSPORT_KEY_INFO,
+             "8c62d12559ddea5e15363a835dcdea0213f91a0f7c6f3101004c9da5b3e31f31"),
+            ("KEYING_MATERIAL_LABEL", super::KEYING_MATERIAL_LABEL,
+             "18c02b845cdc4d9ecb86d1636555b26c1083a4c10f848d77bf022a9fec2df844"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
+        }
     }
 }

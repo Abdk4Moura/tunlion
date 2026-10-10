@@ -421,6 +421,7 @@ pub(crate) fn devices_caps_cmd(name: Option<&str>, json: bool) -> Result<()> {
     };
     if name.is_some() && selected.is_empty() {
         let message = format!("no device named '{}', see `tunlion devices`", name.unwrap_or(""));
+        crate::ui::exit_code_on_closed_pipe(3);
         if json {
             println!(
                 "{}",

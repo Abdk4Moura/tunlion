@@ -36,6 +36,42 @@ pub(crate) fn any_shell_grant_at(path: &Path) -> bool {
     !shell_grant_names_at(path).is_empty()
 }
 
+/// `any_shell_grant`, re-read whenever devices.json changes.
+///
+/// The daemon used to evaluate `any_shell_grant()` ONCE, at startup, into its
+/// `l2_enabled` switch. So on a plain `up`, `tunlion grant <dev> shell` wrote a
+/// grant the running daemon could never act on: every open was refused with
+/// "shell serving is off there" (true of the stale switch, false of the
+/// config) until someone restarted the daemon, and nothing said a restart was
+/// needed. The receive loop now asks this on every iteration, so a grant (or
+/// the revoke of the last one) takes effect on the next open. Keyed on the
+/// file's mtime and length, the same cross-process invalidation the cap-store
+/// cache uses, so the hot loop pays one stat, not a parse.
+pub(crate) fn any_shell_grant_live() -> bool {
+    use std::sync::Mutex;
+    type Key = (PathBuf, Option<std::time::SystemTime>, u64);
+    static CACHE: Mutex<Option<(Key, bool)>> = Mutex::new(None);
+    let path = devices_path();
+    let meta = std::fs::metadata(&path).ok();
+    let key: Key = (
+        path.clone(),
+        meta.as_ref().and_then(|m| m.modified().ok()),
+        meta.as_ref().map(|m| m.len()).unwrap_or(0),
+    );
+    if let Ok(c) = CACHE.lock() {
+        if let Some((k, v)) = c.as_ref() {
+            if *k == key {
+                return *v;
+            }
+        }
+    }
+    let v = any_shell_grant_at(&path);
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((key, v));
+    }
+    v
+}
+
 pub(crate) fn shell_grant_names() -> Vec<String> {
     shell_grant_names_at(&devices_path())
 }
@@ -70,23 +106,52 @@ pub(crate) fn daemon_running() -> bool {
 }
 
 pub(crate) fn daemon_alive() -> Option<u32> {
-    let raw = std::fs::read_to_string(pidfile()).ok()?;
-    let mut lines = raw.lines();
-    let pid: u32 = lines.next()?.trim().parse().ok()?;
-    // The executable the daemon recorded when it wrote the pidfile. A pidfile
-    // from before this fix records only the pid; the daemon and this CLI are
-    // the same installed binary, so fall back to our own executable.
-    let recorded = lines
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    let expected = recorded.or_else(|| std::env::current_exe().ok())?;
-    // Identify the process by its executable path, never by matching a name.
-    // process_exe_path returns None for a dead or recycled pid, which is
-    // exactly the case the pidfile alone cannot detect.
-    let live = platform::process_exe_path(pid)?;
-    same_executable(&live, &expected).then_some(pid)
+    daemon_alive_in(&pidfile(), &platform::Paths::config_path("up.lock"))
+}
+
+/// The daemon serving the config dir whose pidfile and instance lock are
+/// these, or None. SCOPED TO THAT CONFIG DIR: the pid must be the process the
+/// kernel says holds THIS dir's `up.lock`. A pidfile alone is a claim anyone
+/// can copy (a config dir copied or migrated with its `up.pid` made `up`,
+/// `status` and `down` act on ANOTHER config's daemon), and reading
+/// `/proc/<pid>/exe` fails for a daemon whose binary carries a file capability
+/// (it is not dumpable), so a healthy kernel-TUN daemon read as dead.
+///
+/// Where the platform cannot name the lock holder (no /proc/locks, or a lock
+/// file from before the lock existed), the executable check stands in: the
+/// recorded executable must be what the live pid runs.
+pub(crate) fn daemon_alive_in(pidfile: &Path, lock: &Path) -> Option<u32> {
+    let raw = std::fs::read_to_string(pidfile).ok()?;
+    // `up.pid` is the pid alone; the executable the daemon recorded is in
+    // `up.exe` beside it. A daemon started by an older build wrote both into
+    // `up.pid` (pid, then path), so that second line is still honoured, and it
+    // wins over an `up.exe` that may be left from another run.
+    let (pid, legacy_exe) = crate::file_io::parse_pidfile(&raw)?;
+    match platform::instance_lock_holder(lock) {
+        // Held by the process the pidfile names: that is this config's daemon.
+        platform::LockHolder::Held(Some(holder)) => (holder == pid).then_some(pid),
+        // Nobody holds this config's lock, so no daemon serves it, whatever
+        // the pidfile says and whatever process now has that pid.
+        platform::LockHolder::Free => None,
+        // Held, holder unnamed; or the platform cannot say. The executable
+        // check, as before.
+        platform::LockHolder::Held(None) | platform::LockHolder::Unknown => {
+            let recorded = legacy_exe.or_else(|| {
+                std::fs::read_to_string(pidfile.with_file_name("up.exe"))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+            });
+            // With neither, the daemon and this CLI are the same installed
+            // binary.
+            let expected = recorded.or_else(|| std::env::current_exe().ok())?;
+            // Identify the process by its executable path, never by matching
+            // a name. None for a dead or recycled pid.
+            let live = platform::process_exe_path(pid)?;
+            same_executable(&live, &expected).then_some(pid)
+        }
+    }
 }
 
 /// The argv for a web-shell PTY.
@@ -126,12 +191,31 @@ pub(crate) fn require_shell_owner_ack(
         );
     }
     if shell_enabled && shell_user.is_none() && !i_know {
-        bail!(
-            "serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{} Pass --shell-user or --i-know to continue.",
-            shell_root_note()
-        );
+        bail!("{}", owner_shell_refusal(!shell_root_note().is_empty()));
     }
     Ok(())
+}
+
+/// The refusal for serving a shell as the owner without saying so. One plain
+/// sentence of risk, then `--i-know` as the explicit choice it is. The gate
+/// itself is unchanged; only the words are. For a non-root user `--i-know` is
+/// the only way to serve a shell at all (`--shell-user` needs root for
+/// runuser), so it is presented as the path, not buried as an override.
+pub(crate) fn owner_shell_refusal(is_root: bool) -> String {
+    let risk = "A shell served this way runs as you, so any device you let in gets the owner's authority: it can do anything you can, including use your tunlion keys to act as you.";
+    if is_root {
+        format!(
+            "{risk} This process is root, so that means the whole machine.\n\
+             To serve it anyway, say so explicitly:  tunlion up --shell --i-know\n\
+             Safer: drop shells to a separate account:  tunlion up --shell --shell-user <account>"
+        )
+    } else {
+        format!(
+            "{risk}\n\
+             If that is what you want, say so explicitly:  tunlion up --shell --i-know\n\
+             (or allow single devices instead of all of them:  tunlion grant <device> shell)"
+        )
+    }
 }
 
 pub(crate) fn service_manager_for_cgroup(cg: &str) -> Option<ServiceManager> {

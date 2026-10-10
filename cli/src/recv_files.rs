@@ -45,18 +45,60 @@ pub(crate) fn full_hash(path: &Path) -> Option<String> {
     Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Where a received `name` lands in `dir` without replacing anything already
+/// there: `name` itself when free, else `stem (1).ext`, `stem (2).ext`, ...
+///
+/// The counter goes BEFORE the extension. It used to be appended after it
+/// (`report.pdf.1`), which nothing opens as a PDF and which a file manager
+/// shows as an unknown type. A compound archive extension stays whole
+/// (`backup (1).tar.gz`). The result never exceeds the 255-byte name limit:
+/// the stem is shortened (on a character boundary) to make room for the
+/// counter, so a name already at the limit still gets a free slot rather than
+/// an ENAMETOOLONG.
 pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
         return candidate;
     }
     for i in 1..1000 {
-        let c = dir.join(format!("{name}.{i}"));
+        let c = dir.join(numbered_name(name, &format!(" ({i})")));
         if !c.exists() {
             return c;
         }
     }
-    dir.join(format!("{name}.dup"))
+    dir.join(numbered_name(name, " (dup)"))
+}
+
+/// The longest file name we create, in bytes (NAME_MAX on Linux and macOS).
+const NAME_LIMIT: usize = 255;
+
+/// `name` with `tag` inserted between its stem and its extension, the stem
+/// shortened if the whole would pass NAME_LIMIT. Pure.
+pub(crate) fn numbered_name(name: &str, tag: &str) -> String {
+    let (stem, ext) = split_extension(name);
+    let room = NAME_LIMIT.saturating_sub(tag.len() + ext.len());
+    let mut cut = stem.len().min(room);
+    while cut > 0 && !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{tag}{ext}", &stem[..cut])
+}
+
+/// (stem, extension-with-dot). A leading dot is part of the stem (`.bashrc`
+/// has no extension), a trailing dot is not an extension, and `.tar.<x>` is
+/// kept together.
+fn split_extension(name: &str) -> (&str, &str) {
+    let Some(dot) = name.rfind('.') else { return (name, "") };
+    if dot == 0 || dot + 1 == name.len() {
+        return (name, "");
+    }
+    let lower = name.to_ascii_lowercase();
+    if let Some(tar) = lower[..dot].rfind(".tar") {
+        if tar > 0 && tar + 4 == dot {
+            return (&name[..tar], &name[tar..]);
+        }
+    }
+    (&name[..dot], &name[dot..])
 }
 
 /// Create a FRESH .part file. Uses RESOLVE_BENEATH on Linux (TOCTOU-safe,
@@ -85,6 +127,9 @@ pub(crate) async fn safe_create_part(path: &std::path::Path) -> std::io::Result<
             rel,
             (libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY) as i32,
             true,
+            // Owner-only from creation: a partial is not yet a delivered file
+            // and the download dir may be readable by others.
+            0o600,
         )
         .map_err(|e| std::io::Error::new(e.kind(), format!("safe create .part: {e}")))
         .map(|f| tokio::fs::File::from_std(f))
@@ -96,6 +141,7 @@ pub(crate) async fn safe_create_part(path: &std::path::Path) -> std::io::Result<
         tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .await
@@ -127,6 +173,7 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
             rel,
             libc::O_WRONLY | libc::O_NONBLOCK as i32,
             true,
+            0,
         )
         .map_err(|e| std::io::Error::new(e.kind(), format!("safe resume .part: {e}")))?;
         // Verify what we opened is a regular file (not FIFO, device, etc.)
@@ -140,6 +187,8 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
                 ),
             ));
         }
+        // A partial left by an older build may be group/world readable.
+        let _ = crate::platform::restrict_open_file(&file);
         Ok(tokio::fs::File::from_std(file))
     }
     // Non-Linux Unix: open with O_NOFOLLOW, then fstat the opened fd
@@ -165,7 +214,9 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
                 ),
             ));
         }
-        Ok(file)
+        let file = file.into_std().await;
+        let _ = crate::platform::restrict_open_file(&file);
+        Ok(tokio::fs::File::from_std(file))
     }
 }
 
@@ -257,7 +308,33 @@ pub(crate) async fn safe_resume_part(path: &std::path::Path) -> std::io::Result<
         ));
     }
 
-    Ok(file)
+    // Portable tighten-through-the-handle (a no-op on this platform, where
+    // the file takes the directory's ACL); kept so every resume does it.
+    let file = file.into_std().await;
+    let _ = crate::platform::restrict_open_file(&file);
+    Ok(tokio::fs::File::from_std(file))
+}
+
+/// Transfer id -> the final name a finished file was stored under, read once
+/// by the delivery-ack that follows.
+static STORED: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+fn note_stored(id: &str, name: &str) {
+    if let Ok(mut m) = STORED.lock() {
+        m.get_or_insert_with(Default::default).insert(id.to_string(), name.to_string());
+    }
+}
+
+/// The delivery-ack for transfer `id`, carrying the name it was stored under
+/// when this side knows it. `stored` is additive: an older sender ignores it.
+pub(crate) fn delivery_ack(id: &str, sid: u32) -> serde_json::Value {
+    let mut m = crate::protocol::delivery_ack_msg(id, sid);
+    let stored = STORED.lock().ok().and_then(|mut s| s.as_mut()?.remove(id));
+    if let Some(name) = stored {
+        m["stored"] = serde_json::json!(name);
+    }
+    m
 }
 
 pub(crate) struct IncomingFile {
@@ -298,6 +375,273 @@ pub(crate) struct IncomingFile {
     /// re-ticking the same value). Not atomic — only accessed from the event loop.
     pub(crate) last_tick: u64,
     pub(crate) bar: ui::Progress,
+    /// The first write that failed on this file (disk full, a filesystem gone
+    /// read-only), recorded by the writer task that hit it. The event loop turns
+    /// it into a typed refusal to the sender. Before this a failed write only
+    /// left a hole, the whole-file digest then failed three times, and the user
+    /// was told the file was CORRUPT when the disk was full.
+    pub(crate) write_err: Arc<std::sync::Mutex<Option<WriteFailure>>>,
+    /// `receive -o -`: the in-order writer to stdout. `None` for a file.
+    pub(crate) stdout: Option<Arc<std::sync::Mutex<StdoutSink<std::fs::File>>>>,
+}
+
+/// See `IncomingFile::write_err`.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteFailure {
+    pub(crate) kind: Option<crate::platform::StorageFailure>,
+    pub(crate) detail: String,
+}
+
+impl WriteFailure {
+    pub(crate) fn from_io(e: &std::io::Error) -> Self {
+        WriteFailure { kind: crate::platform::storage_failure(e), detail: e.to_string() }
+    }
+}
+
+/// A refusal's stable wire token and the sentence both ends show, for a file
+/// this receiver cannot store. `need`/`free` are bytes, named when known so
+/// "out of disk space" says by how much.
+pub(crate) fn storage_refusal(
+    kind: Option<crate::platform::StorageFailure>,
+    name: &str,
+    detail: &str,
+    need: Option<u64>,
+    free: Option<u64>,
+) -> (&'static str, String) {
+    use crate::platform::StorageFailure as F;
+    match kind {
+        Some(F::NoSpace) => (
+            "no_space",
+            match (need, free) {
+                (Some(n), Some(f)) => format!(
+                    "receiver is out of disk space for {name} (needs {}, has {})",
+                    human(n),
+                    human(f)
+                ),
+                _ => format!("receiver is out of disk space for {name} ({detail})"),
+            },
+        ),
+        Some(F::NameTooLong) => (
+            "name_too_long",
+            format!("receiver's filesystem refuses the name {name} ({detail})"),
+        ),
+        Some(F::ReadOnly) => (
+            "read_only",
+            format!("receiver's download folder is read-only, cannot save {name} ({detail})"),
+        ),
+        Some(F::Permission) => (
+            "permission",
+            format!("receiver has no permission to write {name} in its download folder ({detail})"),
+        ),
+        None => ("io", format!("receiver could not save {name}: {detail}")),
+    }
+}
+
+/// The inbox a daemon serves can be deleted while it runs; every file sent
+/// after that was refused "receiver could not save notes.txt: No such file or
+/// directory (os error 2)". Recreate it (owner-only, as it was made at start)
+/// before a file is accepted. `Ok(true)` when it had to be recreated.
+pub(crate) fn ensure_inbox(dir: &Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    crate::platform::create_private_dir_all(dir)?;
+    // Something other than a directory (a file) can sit at the path; creating
+    // "succeeds" around it without making a directory.
+    if !dir.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "something that is not a directory is in its place",
+        ));
+    }
+    Ok(true)
+}
+
+/// The typed refusal for an inbox that is missing and cannot be recreated
+/// (its parent is read-only, a file sits where it should be).
+pub(crate) fn inbox_refusal(dir: &Path, name: &str, e: &std::io::Error) -> (&'static str, String) {
+    (
+        "inbox_missing",
+        format!(
+            "receiver's inbox {} is missing and could not be recreated, so it cannot save {name} ({e})",
+            dir.display()
+        ),
+    )
+}
+
+/// What `status` and `doctor` say about an inbox, when something is wrong with
+/// it. `None` when it is a directory.
+pub(crate) fn inbox_problem(dir: &Path) -> Option<String> {
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some(format!(
+            "inbox {} is not a directory: files sent here are refused until it is",
+            dir.display()
+        )),
+        Err(_) => Some(format!(
+            "inbox {} is missing: the daemon recreates it when the next file arrives (or create it: mkdir -p {})",
+            dir.display(),
+            dir.display()
+        )),
+    }
+}
+
+/// Where the running daemon keeps its inbox, beside its pidfile: `status` and
+/// `doctor` check that directory, which `up --dir` may have set.
+pub(crate) fn daemon_inbox_marker() -> PathBuf {
+    crate::pidfile().with_file_name("up.inbox")
+}
+
+/// The inbox to check: the running daemon's, else the configured one.
+pub(crate) fn inbox_to_check(daemon_running: bool) -> PathBuf {
+    daemon_running
+        .then(|| std::fs::read_to_string(daemon_inbox_marker()).ok())
+        .flatten()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| crate::drop_dir(None))
+}
+
+/// Remove what a refused file left behind: its `.part` and `.part.meta`. A
+/// refused partial is not resumable (the cause was the disk or the name, not the
+/// link), and on a full disk it is holding the very space that ran out.
+pub(crate) fn discard_partial(part_path: &Path) {
+    let _ = std::fs::remove_file(part_path);
+    let meta = {
+        let mut m = part_path.as_os_str().to_owned();
+        m.push(".meta");
+        PathBuf::from(m)
+    };
+    let _ = std::fs::remove_file(meta);
+}
+
+/// How many bytes `-o -` may hold back while it waits for an earlier gap to
+/// arrive. The receiver asks the sender for one in-order stream, so the only
+/// reordering left is between concurrent writer tasks; this bounds what an
+/// older sender that still splits the file across links can make it hold.
+pub(crate) const STDOUT_REORDER_LIMIT: usize = 64 * 1024 * 1024;
+
+/// `receive -o -` into a pipe. A pipe cannot seek, so positional writes (what a
+/// `.part` file gets) fail with ESPIPE: every `-o - | reader` used to end in
+/// "Invalid seek (os error 29)". This writes strictly in order, holding a chunk
+/// that arrives early until the bytes before it have been written, and hashes
+/// what it writes, so the stream can still be verified against the sender's
+/// whole-file digest (and acked) although it can never be re-read.
+pub(crate) struct StdoutSink<W: std::io::Write> {
+    out: W,
+    next: u64,
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
+    pending_bytes: usize,
+    hasher: Sha256,
+}
+
+impl<W: std::io::Write> StdoutSink<W> {
+    pub(crate) fn new(out: W) -> Self {
+        StdoutSink {
+            out,
+            next: 0,
+            pending: Default::default(),
+            pending_bytes: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// Bytes written to the output so far (always a contiguous prefix).
+    pub(crate) fn written(&self) -> u64 {
+        self.next
+    }
+
+    /// Hex SHA-256 of everything written so far.
+    pub(crate) fn digest(&self) -> String {
+        self.hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn emit(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.out.write_all(data)?;
+        self.hasher.update(data);
+        self.next += data.len() as u64;
+        Ok(())
+    }
+
+    /// Accept `data` at absolute offset `pos`. Bytes already written are
+    /// skipped (a re-sent range), bytes ahead of a gap are held, and anything
+    /// that closes a gap is written together with what it unblocks.
+    pub(crate) fn put(&mut self, pos: u64, data: &[u8]) -> std::io::Result<()> {
+        let end = pos + data.len() as u64;
+        if end <= self.next {
+            return Ok(()); // all of it is already out
+        }
+        if pos > self.next {
+            if self.pending_bytes + data.len() > STDOUT_REORDER_LIMIT {
+                return Err(std::io::Error::other(format!(
+                    "data arrived {} ahead of the stream written to stdout; more than {} would have to be held",
+                    crate::human(pos - self.next),
+                    crate::human(STDOUT_REORDER_LIMIT as u64)
+                )));
+            }
+            self.pending_bytes += data.len();
+            if let Some(old) = self.pending.insert(pos, data.to_vec()) {
+                self.pending_bytes -= old.len();
+            }
+            return Ok(());
+        }
+        let skip = (self.next - pos) as usize;
+        self.emit(&data[skip..])?;
+        loop {
+            let Some(p) = self.pending.keys().next().copied() else {
+                break;
+            };
+            if p > self.next {
+                break;
+            }
+            let chunk = self.pending.remove(&p).unwrap_or_default();
+            self.pending_bytes -= chunk.len();
+            let end = p + chunk.len() as u64;
+            if end > self.next {
+                let skip = (self.next - p) as usize;
+                self.emit(&chunk[skip..])?;
+            }
+        }
+        self.out.flush()
+    }
+
+    /// The verdict once the sender said the stream ended: every byte out, and
+    /// (when the sender offered one) the digest of what was written matches.
+    pub(crate) fn verdict(&self, size: u64, full: Option<&str>) -> std::result::Result<(), String> {
+        if self.next != size {
+            return Err(format!(
+                "the stream to stdout ended after {} of {}",
+                crate::human(self.next),
+                crate::human(size)
+            ));
+        }
+        match full {
+            Some(want) if want != self.digest() => Err(
+                "the bytes written to stdout do not match the sender's whole-file SHA-256 \
+                 (they cannot be re-fetched: stdout cannot be rewound)"
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// One positional chunk into a `-o -` sink, shaped like `pwrite_at` (the count
+/// is write iterations, always 1 here) so the writer task treats both alike.
+pub(crate) fn stdout_put(
+    sink: &std::sync::Mutex<StdoutSink<std::fs::File>>,
+    pos: u64,
+    data: &[u8],
+) -> std::io::Result<u32> {
+    let mut s = sink
+        .lock()
+        .map_err(|_| std::io::Error::other("stdout writer poisoned"))?;
+    s.put(pos, data).map(|()| 1)
 }
 
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
@@ -401,6 +745,12 @@ pub(crate) async fn finalize_incoming(
         let _ = f.sync_all();
     })
     .await;
+    // The partial was assembled owner-only; the delivered file gets the mode
+    // an ordinary create would have given it, set through the handle (never a
+    // path someone could swap for a symlink) before it is renamed into place.
+    if !inc.part_path.as_os_str().is_empty() {
+        let _ = crate::platform::publish_received_file(&inc.file);
+    }
     drop(inc.file);
     let final_path = unique_path(dir, rename_to.unwrap_or(&inc.name));
     if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
@@ -451,13 +801,26 @@ pub(crate) async fn finalize_incoming(
             }
         }
     }
+    // The receiver's half of the structured history (both modes), and the
+    // stored name its delivery-ack reports back to the sender.
+    let stored_name = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    note_stored(&inc.id, &stored_name);
+    crate::transfer_history::append(&[crate::transfer_history::Record {
+        time: crate::transfer_history::now_secs(),
+        direction: "in",
+        peer: (!from_name.is_empty()).then(|| from_name.to_string()),
+        file: inc.name.clone(),
+        stored: Some(shown.clone()),
+        bytes: recvd,
+        sha256: inc.full.clone(),
+        ok,
+    }]);
     if daemon {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(up_log())
-        {
+        if let Ok(mut f) = crate::platform::open_private_log(&up_log(), false) {
             let _ = writeln!(
                 f,
                 "{}  {}  {}  from {}",
@@ -474,6 +837,111 @@ pub(crate) async fn finalize_incoming(
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+    use super::numbered_name;
+
+    fn mode_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("filament-test-partmode-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A fresh `.part` is owner-only from the create itself: the bytes of a
+    /// download in progress are not readable by other accounts.
+    #[tokio::test]
+    async fn fresh_part_is_owner_only() {
+        let d = mode_dir("fresh");
+        let p = d.join("data.bin.part");
+        drop(super::safe_create_part(&p).await.unwrap());
+        if let Some(m) = crate::platform::file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a fresh .part must be 0600, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Resuming a partial an older build left group/world readable tightens it.
+    #[tokio::test]
+    async fn resumed_part_is_tightened_to_owner_only() {
+        let d = mode_dir("resume");
+        let p = d.join("data.bin.part");
+        let f = std::fs::File::create(&p).unwrap();
+        crate::platform::fs_at::set_mode_via_handle(&f, 0o666).unwrap();
+        drop(f);
+        drop(super::safe_resume_part(&p).await.unwrap());
+        if let Some(m) = crate::platform::file_mode(&p) {
+            assert_eq!(m & 0o777, 0o600, "a resumed .part must be 0600, got {m:o}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The inbox deleted under a running daemon: the next offer recreates it
+    /// (status and doctor say it is missing until then); one that cannot be
+    /// recreated is a typed refusal naming the inbox, not a bare ENOENT.
+    #[test]
+    fn a_deleted_inbox_is_recreated_or_refused_by_name() {
+        let base = std::env::temp_dir().join(format!("tunlion-inbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let inbox = base.join("Tunlion");
+        assert!(super::inbox_problem(&inbox).unwrap().contains("is missing"));
+        assert!(super::ensure_inbox(&inbox).unwrap(), "recreated");
+        assert!(inbox.is_dir());
+        assert_eq!(super::inbox_problem(&inbox), None);
+        assert!(!super::ensure_inbox(&inbox).unwrap(), "already there: nothing to do");
+        // A file where the inbox should be cannot be turned into one.
+        let blocked = base.join("blocked");
+        std::fs::write(&blocked, b"x").unwrap();
+        assert!(super::inbox_problem(&blocked).unwrap().contains("not a directory"));
+        let e = super::ensure_inbox(&blocked).unwrap_err();
+        let (token, msg) = super::inbox_refusal(&blocked, "notes.txt", &e);
+        assert_eq!(token, "inbox_missing");
+        assert!(msg.contains(&blocked.display().to_string()) && msg.contains("notes.txt"), "{msg}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A writer that refuses to seek, like a pipe: `-o -` must never need to.
+    struct Pipe(Vec<u8>);
+    impl std::io::Write for Pipe {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            // Short writes, as a slow pipe gives them.
+            let n = b.len().min(7);
+            self.0.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `receive -o - | slow-reader`: chunks arriving out of order, re-sent and
+    /// overlapping still come out as exactly the original bytes, in order, and
+    /// the digest of what was written is the whole-file digest.
+    #[test]
+    fn stdout_sink_writes_in_order_without_seeking() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut s = super::StdoutSink::new(Pipe(Vec::new()));
+        // Second half first, then a duplicate of an early range, then the rest.
+        s.put(5_000, &data[5_000..]).unwrap();
+        assert_eq!(s.written(), 0, "nothing past a gap may be written");
+        s.put(0, &data[..3_000]).unwrap();
+        s.put(1_000, &data[1_000..2_000]).unwrap(); // already out: skipped
+        s.put(2_500, &data[2_500..5_000]).unwrap(); // overlaps what is out
+        assert_eq!(s.written(), 10_000);
+        assert_eq!(s.out.0, data, "byte-exact and in order");
+        assert_eq!(s.digest(), sha256_hex(&data));
+        assert_eq!(s.verdict(10_000, Some(&sha256_hex(&data))), Ok(()));
+        assert!(s.verdict(10_000, Some("00")).unwrap_err().contains("SHA-256"));
+        assert!(s.verdict(20_000, None).unwrap_err().contains("ended after"));
+    }
+
+    /// An early chunk is held only up to the bound, never without limit.
+    #[test]
+    fn stdout_sink_bounds_what_it_holds() {
+        let mut s = super::StdoutSink::new(Pipe(Vec::new()));
+        let big = vec![0u8; super::STDOUT_REORDER_LIMIT];
+        s.put(1, &big).unwrap();
+        let e = s.put(1 + big.len() as u64, &[1u8]).unwrap_err();
+        assert!(e.to_string().contains("ahead of the stream"), "{e}");
+    }
 
     #[test]
     fn full_hash_whole_file_integrity() {
@@ -521,9 +989,35 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt"));
         std::fs::write(dir.join("f.txt"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.1"));
-        std::fs::write(dir.join("f.txt.1"), b"x").unwrap();
-        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.2"));
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (1).txt"));
+        std::fs::write(dir.join("f (1).txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f (2).txt"));
+        // A name at the 255-byte limit still gets a free slot, at the limit,
+        // with its extension intact (the report: "...xxx.txt.1", 257 bytes).
+        let long = format!("{}.txt", "x".repeat(251));
+        assert_eq!(long.len(), 255);
+        std::fs::write(dir.join(&long), b"x").unwrap();
+        let next = unique_path(&dir, &long);
+        let got = next.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(got.ends_with(" (1).txt"), "{got}");
+        assert!(got.len() <= 255, "{} bytes", got.len());
+        std::fs::write(&next, b"x").unwrap();
+        assert!(!dir.join(&long).with_extension("txt.1").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_collision_counter_goes_before_the_extension() {
+        assert_eq!(numbered_name("report.pdf", " (1)"), "report (1).pdf");
+        assert_eq!(numbered_name("backup.tar.gz", " (3)"), "backup (3).tar.gz");
+        assert_eq!(numbered_name("Backup.TAR.XZ", " (1)"), "Backup (1).TAR.XZ");
+        assert_eq!(numbered_name(".bashrc", " (1)"), ".bashrc (1)");
+        assert_eq!(numbered_name("noext", " (2)"), "noext (2)");
+        assert_eq!(numbered_name("trailing.", " (1)"), "trailing. (1)");
+        assert_eq!(numbered_name(".tar.gz", " (1)"), ".tar (1).gz");
+        // Multi-byte stems are cut on a character boundary, never mid-char.
+        let wide = format!("{}.txt", "\u{e9}".repeat(200));
+        let out = numbered_name(&wide, " (1)");
+        assert!(out.len() <= 255 && out.ends_with(" (1).txt"), "{}", out.len());
     }
 }

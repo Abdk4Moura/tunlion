@@ -545,6 +545,25 @@ fn shell_owner_ack_is_required_without_user_drop() {
     assert!(require_shell_owner_ack(false, None, false, false).is_ok());
 }
 
+/// The refusal states the risk once and offers `--i-know` as the explicit
+/// choice, as a command the CLI accepts. Both postures, since a non-root user
+/// has no other way to serve a shell.
+#[test]
+fn owner_shell_refusal_offers_i_know_as_a_parseable_choice() {
+    use clap::Parser;
+    for root in [false, true] {
+        let msg = crate::shell_support::owner_shell_refusal(root);
+        assert!(msg.contains("owner's authority"), "{msg}");
+        let line = msg
+            .lines()
+            .find(|l| l.contains("--i-know"))
+            .expect("names --i-know");
+        let cmd = line[line.find("tunlion ").unwrap()..].trim();
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {cmd}");
+    }
+}
+
 #[test]
 fn shell_user_unsupported_requires_owner_ack() {
     let denied = require_shell_owner_ack(true, Some("alice"), false, false)
@@ -1166,17 +1185,34 @@ fn forget_and_store_preserve_other_devices_caps() {
     assert!(device_caps_at(&p, "dupe").is_none(), "dupe should be gone");
 
     // Storing a NEW pairing must also preserve 'shellbox''s caps.
-    devices_store("newpeer", &sec).unwrap();
+    // (Its own secret: a secret another record already holds is now refused,
+    // since two records answering one pair-proof make identity order-dependent.)
+    devices_store("newpeer", &"d".repeat(64)).unwrap();
+    assert!(
+        devices_store("dupe-again", &sec).is_err(),
+        "a secret shellbox already holds must not be stored a second time"
+    );
     assert!(
         device_allows_at(&p, "shellbox", "shell"),
         "store wiped a survivor's shell cap"
     );
-    // And re-storing an existing name keeps its caps (only the secret rotates).
-    devices_store("shellbox", &"c".repeat(64)).unwrap();
+    // A network-supplied secret under an existing name must NOT re-key that
+    // record (it used to rotate the secret in place and keep the caps, which
+    // handed the record's grants to whoever sent the secret). It becomes a
+    // NEW, capless record, and the original keeps both its caps and secret.
+    let stored = devices_store("shellbox", &"c".repeat(64)).unwrap();
+    assert_eq!(stored, "shellbox-2", "a clashing name is suffixed, never overwritten");
     assert!(
         device_allows_at(&p, "shellbox", "shell"),
         "re-store dropped the device's own caps"
     );
+    assert!(
+        !device_allows_at(&p, "shellbox-2", "shell"),
+        "the new record must not inherit the existing device's grants"
+    );
+    let arr: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let orig = arr.iter().find(|d| d["name"] == "shellbox").unwrap();
+    assert_eq!(orig["secret"].as_str(), Some(sec.as_str()), "original secret untouched");
 
     unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
@@ -2244,6 +2280,240 @@ fn a_device_with_no_identity_is_offered_both_ways_in() {
     );
 }
 
+/// Every product source under cli/src, recursively, as (path relative to the
+/// crate, text).
+///
+/// The printed-hint scanners used to read a hand-picked list of nine files and
+/// `continue` past any they could not read. As the CLI was split into modules,
+/// most hint strings moved into files nobody scanned (dispatch.rs, settings.rs,
+/// recv_cmd.rs, status_cmd.rs, up_logs.rs, pair_cmd.rs, add_for.rs,
+/// runtime_support.rs, ...), and a renamed file would have shrunk the scan
+/// silently. Walking the tree covers a new module on arrival, and every read
+/// is `expect`ed so an unreadable file fails instead of vanishing.
+///
+/// Test code is not product output: this file (tests.rs) is skipped, and in
+/// every other file a `#[cfg(test)] mod ... { ... }` block is blanked, kept as
+/// empty lines so reported line numbers stay true.
+fn product_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let rd = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+        for entry in rd {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|x| x == "rs") {
+                continue;
+            }
+            let rel = format!(
+                "src/{}",
+                path.strip_prefix(&root)
+                    .expect("walked path is under src/")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            if rel == "src/tests.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {rel}: {e}"));
+            out.push((rel, blank_test_modules(&text)));
+        }
+    }
+    out.sort();
+    assert!(
+        out.len() >= 50,
+        "found only {} source files under src/; the walk is broken and every \
+         scan built on it would pass vacuously",
+        out.len()
+    );
+    out
+}
+
+/// Blank the lines of each `#[cfg(test)] mod name { ... }` block (rustfmt puts
+/// the closing brace at the `mod` line's indent), keeping the line count.
+fn blank_test_modules(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut keep = vec![true; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "#[cfg(test)]" {
+            let mut j = i + 1;
+            while j < lines.len()
+                && (lines[j].trim().is_empty() || lines[j].trim_start().starts_with("#["))
+            {
+                j += 1;
+            }
+            if j < lines.len() {
+                let m = lines[j];
+                let t = m.trim_start();
+                let is_mod = t.starts_with("mod ")
+                    || t.starts_with("pub mod ")
+                    || t.starts_with("pub(crate) mod ");
+                if is_mod && m.trim_end().ends_with('{') {
+                    let close = format!("{}}}", &m[..m.len() - t.len()]);
+                    let mut k = j + 1;
+                    while k < lines.len() && lines[k].trim_end() != close {
+                        k += 1;
+                    }
+                    let end = (k + 1).min(lines.len());
+                    for flag in &mut keep[i..end] {
+                        *flag = false;
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    lines
+        .iter()
+        .zip(keep)
+        .map(|(l, k)| if k { *l } else { "" })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Replace every `open ... close` span in `s` with `with`.
+fn replace_spans(s: &str, open: char, close: char, with: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(a) = rest.find(open) {
+        let Some(b) = rest[a + open.len_utf8()..].find(close) else {
+            break;
+        };
+        out.push_str(&rest[..a]);
+        out.push_str(with);
+        rest = &rest[a + open.len_utf8() + b + close.len_utf8()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn printed_hints_parse_as_typed() {
+    // The two scanners below each check ONE property of a printed hint: that
+    // its verb exists, and that it carries the subcommand's required flags.
+    // Neither asks the question a user asks, which is whether the command as
+    // printed parses. `tunlion requests --notify ...`, `tunlion grant <peer>
+    // <cap> --for <expiry>`, `mount ... --read-only` and the `forward <lport>
+    // <peer> <rport>` permission-denied retry all passed both and were usage
+    // errors when typed. This extracts every printed `tunlion <verb> ...` from
+    // the product sources and hands it to clap.
+    //
+    // Extraction: a hint starts at "tunlion " and ends at the first delimiter
+    // that closes an inline command in our prose (a backtick or quote, an
+    // escape, two spaces before a description column, " / " or ", " between
+    // alternatives, ": " after a label, ")" or " (" around an aside, " - " or
+    // an em dash before a description, " to "/" then " joining a sentence).
+    //
+    // What it substitutes, and what it skips, so the coverage is honest:
+    //   - `{...}` interpolations and `<...>` placeholders are replaced with
+    //     the sample value "1", which every positional and flag value in the
+    //     CLI accepts (names, paths, ports, request ids, durations).
+    //   - `[...]` optional parts are dropped: an optional part may be omitted.
+    //   - hints containing "..." are skipped (an elided command cannot be
+    //     typed as shown).
+    //   - hints whose first word is not a clap verb are skipped; that is
+    //     `printed_hints_name_verbs_that_exist`'s question, and it is also how
+    //     prose such as "tunlion needs CAP_NET_ADMIN" and the bare-send form
+    //     `tunlion <file>` (rewritten before clap) stay out.
+    //   - a bare `tunlion <verb>` with nothing after it is skipped: it names
+    //     the verb ("rsync is required for `tunlion backup`") rather than
+    //     telling anyone to type it alone, and its existence is checked by
+    //     the verb test.
+    use clap::{CommandFactory, Parser};
+    let cmd = Cli::command();
+    let verbs: std::collections::HashSet<String> = cmd
+        .get_subcommands()
+        .flat_map(|sc| {
+            let mut v = vec![sc.get_name().to_string()];
+            v.extend(sc.get_all_aliases().map(str::to_string));
+            v
+        })
+        .collect();
+
+    const STOPS: [&str; 18] = [
+        "`", "'", "\"", "\\", "  ", " / ", " && ", ", ", ": ", "; ", ". ", ")", " (",
+        " \u{b7}", " \u{2014}", " - ", " to ", " then ",
+    ];
+
+    let mut bad = Vec::new();
+    let mut checked = 0usize;
+    for (rel, text) in product_sources() {
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for (i, _) in line.match_indices("tunlion ") {
+                // "tunlion" inside a longer word or a path is not a command.
+                if line[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || "_-/.".contains(c))
+                {
+                    continue;
+                }
+                let rest = &line[i + "tunlion ".len()..];
+                let end = STOPS
+                    .iter()
+                    .filter_map(|s| rest.find(s))
+                    .min()
+                    .unwrap_or(rest.len());
+                let hint = &rest[..end];
+                if hint.contains("...") {
+                    continue;
+                }
+                let hint = replace_spans(hint, '[', ']', " ");
+                let hint = replace_spans(&hint, '{', '}', "1");
+                let hint = replace_spans(&hint, '<', '>', "1");
+                let mut toks: Vec<String> = hint.split_whitespace().map(str::to_string).collect();
+                while let Some(last) = toks.last_mut() {
+                    let trimmed = last.trim_end_matches(['.', ':', ',', ';']).to_string();
+                    if trimmed.is_empty() {
+                        toks.pop();
+                    } else {
+                        *last = trimmed;
+                        break;
+                    }
+                }
+                if toks.len() < 2 || !verbs.contains(&toks[0]) {
+                    continue;
+                }
+                let mut argv = vec!["tunlion".to_string()];
+                argv.extend(toks.iter().cloned());
+                checked += 1;
+                if let Err(e) = Cli::try_parse_from(&argv) {
+                    let first = e.to_string();
+                    let first = first.lines().next().unwrap_or("");
+                    bad.push(format!(
+                        "  {rel}:{}: `{}` does not parse ({first})\n    {}",
+                        n + 1,
+                        argv.join(" "),
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 50,
+        "parsed only {checked} printed hints; the extraction drifted from the \
+         source and this test no longer proves anything"
+    );
+    assert!(
+        bad.is_empty(),
+        "printed hints that clap rejects when typed as shown:\n{}",
+        bad.join("\n")
+    );
+}
+
 #[test]
 fn printed_hints_carry_every_required_flag() {
     // #227: `tunlion requests` printed `[ tunlion requests approve 1 ]`.
@@ -2284,22 +2554,8 @@ fn printed_hints_carry_every_required_flag() {
         }
     }
 
-    let manifest = env!("CARGO_MANIFEST_DIR");
     let mut bad = Vec::new();
-    for rel in [
-        "src/main.rs",
-        "src/mount.rs",
-        "src/l2.rs",
-        "src/ui.rs",
-        "src/daemon_ctl.rs",
-        "src/recv_files.rs",
-        "src/fleet_ui/devices.rs",
-        "src/fleet_ui/requests.rs",
-        "src/fleet_ui/mint.rs",
-    ] {
-        let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else {
-            continue;
-        };
+    for (rel, text) in product_sources() {
         for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
             if t.starts_with("//") {
@@ -2336,8 +2592,6 @@ fn printed_hints_carry_every_required_flag() {
     );
 }
 
-#[test]
-#[test]
 #[test]
 fn hooks_that_nothing_calls() {
     // A hook with no call site is not dead code, it is a DISCONNECTED
@@ -2422,7 +2676,6 @@ fn hooks_that_nothing_calls() {
 }
 
 #[test]
-#[test]
 fn petname_collision_ignores_case() {
     // `Laptop` and `laptop` used to become two devices: the collision check
     // was an exact compare while `devices_name_taken` (unused) implemented
@@ -2459,6 +2712,14 @@ fn petname_collision_ignores_case() {
     );
 }
 
+// This test, `help_banner_names_commands_that_exist` and
+// `printed_hints_name_verbs_that_exist` had lost their `#[test]` attributes:
+// the attributes had drifted up onto `hooks_that_nothing_calls` (three of
+// them), `petname_collision_ignores_case` (two) and
+// `ephemeral_enrolment_never_carries_the_fleet_meeting_point` (two), the
+// shape a bad conflict resolution leaves. So three tests compiled as plain
+// functions and ran nowhere while the suite reported green.
+#[test]
 fn upgrade_never_promotes_a_link_to_owner() {
     // Regression test for the escalation fixed in the relay->direct cutover.
     // `adopt_direct_transport` hardcoded `(true, OwnerDevice)`, so ANY link
@@ -2504,6 +2765,7 @@ fn upgrade_never_promotes_a_link_to_owner() {
     assert_eq!(gone.1, PrincipalKind::OwnerDevice);
 }
 
+#[test]
 fn help_banner_names_commands_that_exist() {
     // The banner printed `ephemeral mint`, a verb deleted when minting
     // collapsed into `add --for runner`. A user reading --help typed it and
@@ -2629,6 +2891,7 @@ fn help_banner_names_commands_that_exist() {
     );
 }
 
+#[test]
 fn printed_hints_name_verbs_that_exist() {
     // #229, and the reason this test exists rather than a fifth point fix:
     // `tunlion unmount` was printed after every successful mount and has
@@ -2659,28 +2922,26 @@ fn printed_hints_name_verbs_that_exist() {
     // test once and gets added deliberately, which is the point: the cost of
     // adding a word is a moment's thought about whether it is prose or an
     // instruction.
+    //
+    // The second row arrived with the whole-tree scan: "tunlion needs
+    // CAP_NET_ADMIN", "only one tunlion per host", "tunlion has no service
+    // protocol", "start tunlion with `tunlion up`", "enable --now tunlion
+    // failed", "# Added by tunlion for L3 overlay access". Each was read and
+    // is prose about the program, not an instruction.
+    // Third row, from integrating #386..#393 under this whole-tree scan: "the
+    // tunlion server" (#393's network message), "let tunlion create a virtual
+    // network interface" (#393), "the tunlion proxy requires it" (#388),
+    // "use your tunlion keys" (#392). Each was read; each is prose.
     for prose in [
         "daemon", "state", "mounts", "was", "from", "video", "identity",
+        "needs", "per", "has", "with", "failed", "for",
+        "server", "create", "proxy", "keys",
     ] {
         valid.insert(prose.into());
     }
 
-    let manifest = env!("CARGO_MANIFEST_DIR");
     let mut bad = Vec::new();
-    for rel in [
-        "src/main.rs",
-        "src/mount.rs",
-        "src/l2.rs",
-        "src/ui.rs",
-        "src/daemon_ctl.rs",
-        "src/recv_files.rs",
-        "src/fleet_ui/devices.rs",
-        "src/fleet_ui/requests.rs",
-        "src/fleet_ui/mint.rs",
-    ] {
-        let Ok(text) = std::fs::read_to_string(format!("{manifest}/{rel}")) else {
-            continue;
-        };
+    for (rel, text) in product_sources() {
         for (n, line) in text.lines().enumerate() {
             let t = line.trim_start();
             // Comments explain history ("replaces `tunlion unmount`") and
@@ -2957,20 +3218,8 @@ fn internal_subcommand_invocations_name_real_verbs() {
             v
         })
         .collect();
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let sources = [
-        "src/main.rs",
-        "src/mount.rs",
-        "src/backup.rs",
-        "src/l2.rs",
-        "src/daemon_ctl.rs",
-        "src/recv_files.rs",
-    ];
     let mut checked = 0usize;
-    for f in sources {
-        let Ok(text) = std::fs::read_to_string(format!("{manifest}/{f}")) else {
-            continue;
-        };
+    for (f, text) in product_sources() {
         for line in text.lines() {
             let bytes = line.as_bytes();
             let mut i = 0usize;
@@ -3034,7 +3283,6 @@ impl identity::KeyStore for ScratchStore {
 // Written BEFORE the pairing path could issue anything, so they constrain
 // the implementation rather than describe it.
 
-#[test]
 #[test]
 fn ephemeral_enrolment_never_carries_the_fleet_meeting_point() {
     // fleet_rv is standing membership. A borrower holds a certificate for one
@@ -3362,7 +3610,7 @@ fn consent_enqueue_skips_unidentified() {
 fn consent_enqueue_dedup_same_peer_cap_pending() {
     // add_pending_request has no dedup itself; dedup lives in enqueue_if_requestable.
     // Test the dedup logic directly: check-before-insert on in-flight requests.
-    let mut reqs = vec![PendingRequest {
+    let reqs = vec![PendingRequest {
         id: 1,
         peer: "alice".into(),
         capability: "shell".into(),
@@ -3742,6 +3990,153 @@ fn capability_revoke_warning_only_live_same_owner_cert() {
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x33; 32], 150).is_none());
     assert!(fleet_certificate_warning_for("laptop", &cert, [0x22; 32], 200).is_none());
 }
+// `devices forget` on a device holding a live fleet certificate used to print
+// "it can no longer find or auto-connect to this machine" while fleet-hello
+// re-admitted it (no record means "not revoked"). It then REFUSED, which made
+// the name unusable for the certificate's life. Now the key is revoked apart
+// from the record, so forget both cuts the device off and frees the name.
+#[test]
+fn forget_of_a_live_fleet_certificate_revokes_the_key_and_says_so() {
+    use crate::fleet_support::{ForgetVerdict, forget_report, forget_verdict};
+    let cert = identity::DeviceCert::from_json(&serde_json::json!({
+        "devicePub": hex::encode([0x11u8; 32]),
+        "userPub": hex::encode([0x22u8; 32]),
+        "expires": 100 + 3 * 86_400,
+        "issued": 100,
+        "sig": hex::encode([0u8; 64]),
+    }))
+    .unwrap();
+    let owner = Some([0x22u8; 32]);
+
+    let live = forget_verdict(Some(&cert), false, owner, 100);
+    assert_eq!(live, ForgetVerdict::RevokeThenRemove { days_left: 3 });
+    let msg = forget_report("laptop", &live);
+    assert!(msg.contains("revoked its fleet certificate") && msg.contains("3 more day(s)"), "{msg}");
+    assert!(!msg.contains("can no longer find"), "a live certificate must not be reported as plain removal: {msg}");
+
+    let revoked = forget_verdict(Some(&cert), true, owner, 100);
+    assert_eq!(revoked, ForgetVerdict::KeepRevocationThenRemove { days_left: 3 });
+    assert!(forget_report("laptop", &revoked).contains("revocation stays in force"));
+
+    // Plain removal when no live certificate from us exists.
+    assert_eq!(forget_verdict(None, false, owner, 100), ForgetVerdict::Remove);
+    assert_eq!(forget_verdict(Some(&cert), false, Some([0x33; 32]), 100), ForgetVerdict::Remove);
+    assert_eq!(forget_verdict(Some(&cert), false, None, 100), ForgetVerdict::Remove);
+    assert_eq!(
+        forget_verdict(Some(&cert), false, owner, 100 + 3 * 86_400),
+        ForgetVerdict::Remove
+    );
+}
+
+/// A key revocation is in force until its certificate expires, matches by key
+/// and never by name, and an unreadable key list fails closed.
+#[test]
+fn key_revocations_match_by_key_until_the_certificate_expires() {
+    use crate::fleet_support::{key_revocation_in_force, load_key_revocations_at};
+    let k = [0x11u8; 32];
+    let entries = vec![serde_json::json!({
+        "devicePub": hex::encode(k), "certExpires": 500, "name": "laptop"
+    })];
+    assert!(key_revocation_in_force(&entries, &k, 100));
+    assert!(!key_revocation_in_force(&entries, &k, 500), "ends when the certificate does");
+    assert!(!key_revocation_in_force(&entries, &[0x12u8; 32], 100), "another key is not revoked");
+    let dir = std::env::temp_dir().join(format!("fil-keyrev-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("revoked-keys.json");
+    assert_eq!(load_key_revocations_at(&p), Ok(Vec::new()), "absent is empty, not revoked");
+    std::fs::write(&p, b"{not json").unwrap();
+    assert!(load_key_revocations_at(&p).is_err(), "corrupt fails closed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The re-link chain a reset device's owner is told to run, executed as
+/// printed against a store: a live certified record and its re-joined
+/// successor. Every step parses, every step succeeds, the name ends up on the
+/// new key, and the old key stays refused.
+#[test]
+fn the_relink_chain_runs_against_a_store_and_keeps_the_old_key_revoked() {
+    use clap::Parser;
+    let _guard = lock_test_config();
+    let dir = std::env::temp_dir().join(format!(
+        "fil-relink-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+    let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+    let now = identity::now_secs();
+    let old = identity::DeviceCert::certify(&uk, [0x51u8; 32], now, 30 * 86_400).unwrap();
+    let new = identity::DeviceCert::certify(&uk, [0x52u8; 32], now, 30 * 86_400).unwrap();
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&serde_json::json!([
+            { "name": "p9-b",   "secret": "a".repeat(64), "deviceCert": old.to_json() },
+            { "name": "p9-b-2", "secret": "b".repeat(64), "deviceCert": new.to_json() },
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!device_cert_revoked(&old.device_pub));
+
+    // The chain, exactly as the hints print it.
+    let chain = ["tunlion devices forget p9-b", "tunlion devices rename p9-b-2 p9-b"];
+    for step in chain {
+        let argv: Vec<&str> = step.split_whitespace().collect();
+        let cli = crate::Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
+        let result = match cli.cmd {
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
+                crate::fleet_support::forget_device(&name, now).map(|_| ())
+            }
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Rename { old, new }), .. }) => {
+                crate::fleet_support::rename_device(&old, &new)
+            }
+            _ => panic!("`{step}` is not a devices forget/rename"),
+        };
+        result.unwrap_or_else(|e| panic!("`{step}` failed: {e}"));
+    }
+
+    let named = crate::device_view::device_cert_for("p9-b").expect("p9-b exists again");
+    assert_eq!(named.device_pub, new.device_pub, "the name now belongs to the re-joined key");
+    assert!(crate::device_view::device_cert_for("p9-b-2").is_none());
+    assert!(device_cert_revoked(&old.device_pub), "the forgotten live key stays refused");
+    assert!(!device_cert_revoked(&new.device_pub), "the re-joined key is not");
+
+    // A revoked record is forgettable too, and keeps its revocation.
+    crate::set_device_cert_revoked("p9-b", true).unwrap();
+    crate::fleet_support::forget_device("p9-b", now).expect("a revoked record can be forgotten");
+    assert!(device_cert_revoked(&new.device_pub), "its revocation outlives the record");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// `down` printed "stopped" and deleted the pidfile even when `kill` failed (a
+// daemon started with sudo), hiding a running daemon from status and reset.
+// The kill result now decides: failure is reported and the pidfile kept.
+#[test]
+fn down_reports_a_failed_kill_instead_of_stopped() {
+    // A real failing exit status, portably: libtest rejects an unknown flag.
+    let failed = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--definitely-not-a-libtest-flag")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!failed.success());
+    let why = kill_failure(4242, &failed).expect("a failed kill is reported");
+    assert!(why.contains("pid 4242"), "{why}");
+    assert!(why.contains("still running"), "{why}");
+    assert!(why.contains("pidfile is kept"), "{why}");
+    assert!(!why.contains("stopped (pid"), "{why}");
+    let ok = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--list", "--exact", "no-such-test-name"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    assert!(kill_failure(4242, &ok).is_none());
+}
 // --- Windows reparse-point hardening tests (#43) ---
 // The resume/open tests use a file symlink to prove that the write cannot be
 // redirected outside the download directory. The create test remains a
@@ -3912,4 +4307,690 @@ fn tour_screen_never_mints_an_identity() {
         body.contains("UserKey::load"),
         "tour_cmd no longer reads the identity at all, so this test has drifted from the source"
     );
+}
+
+#[test]
+fn the_default_device_name_is_the_short_hostname() {
+    use crate::short_host_label as l;
+    assert_eq!(l("laptop"), "laptop");
+    assert_eq!(l("Kabir-MacBook-Pro.local"), "kabir-macbook-pro");
+    assert_eq!(l("vps3584156.trouble-free.net"), "vps3584156");
+    assert_eq!(l("DESKTOP-7Q2K1"), "desktop-7q2k1");
+    // Characters a `.mesh` label cannot carry become single dashes, never
+    // leading or trailing ones.
+    assert_eq!(l("my_box  two"), "my-box-two");
+    assert_eq!(l("-edge-"), "edge");
+    // Nothing usable left: a stable word, never an empty name.
+    assert_eq!(l(""), "device");
+    assert_eq!(l("...."), "device");
+    assert_eq!(l("___"), "device");
+    // A DNS label is at most 63 bytes.
+    assert_eq!(l(&"a".repeat(80)).len(), 63);
+}
+
+#[test]
+fn the_default_device_name_comes_from_the_os_not_a_constant() {
+    // The old unix path read /etc/hostname, which macOS does not have, so every
+    // Mac was called "cli". The OS call must return the real name.
+    let os = crate::platform::os_hostname();
+    assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+    let name = crate::default_display_name();
+    assert_ne!(name, "cli");
+    assert!(!name.contains('@'), "the default must not carry the user: {name}");
+}
+
+// --- C1: the writer refuses to re-key an existing record ----------------------
+//
+// pair-intro / pair-keep used to call devices_store(name, secret), which updated
+// an existing record's secret IN PLACE and kept its caps, deviceCert and userKey:
+// any peer that could send a secret under an existing name inherited that
+// device's grants. The refusal lives in the writer, in the same lock cycle.
+
+fn c1_seed(dir: &std::path::Path) -> String {
+    let before = serde_json::to_string(&serde_json::json!([{
+        "name": "laptop",
+        "secret": "a".repeat(64),
+        "v": 2,
+        "caps": ["transfer", "shell", "mount"],
+    }]))
+    .unwrap();
+    std::fs::write(dir.join("devices.json"), &before).unwrap();
+    before
+}
+
+#[test]
+fn c1_secret_only_write_to_existing_name_is_refused() {
+    let _guard = lock_test_config();
+    let dir = td("c1-refuse");
+    let before = c1_seed(&dir);
+    for alias in ["laptop", "laptop ", "laptop\u{7}"] {
+        let res = crate::devices_store::devices_upsert_atomic(
+            alias,
+            Some(&"e".repeat(64)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(res.is_err(), "secret-only re-key via '{alias}' must be refused");
+        let after = std::fs::read_to_string(dir.join("devices.json")).unwrap();
+        assert_eq!(after, before, "the existing record must be byte-identical");
+    }
+    // Writing back the SAME secret is not a re-key.
+    assert!(
+        crate::devices_store::devices_upsert_atomic(
+            "laptop",
+            Some(&"a".repeat(64)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn c1_new_name_is_accepted() {
+    let _guard = lock_test_config();
+    let dir = td("c1-new");
+    c1_seed(&dir);
+    let stored = crate::devices_store::devices_upsert_atomic(
+        "phone",
+        Some(&"f".repeat(64)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(stored, "phone");
+    assert!(!device_allows_at(&dir.join("devices.json"), "phone", "shell"));
+}
+
+#[test]
+fn c1_owner_repair_still_rekeys() {
+    let _guard = lock_test_config();
+    let dir = td("c1-owner");
+    c1_seed(&dir);
+    // The owner-run `tunlion add` path (devices_store_v2 -> allow_reanchor).
+    devices_store_v2("laptop", &"9".repeat(64), &["transfer".to_string()]).unwrap();
+    let arr: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("devices.json")).unwrap()).unwrap();
+    assert_eq!(arr.len(), 1, "re-pair updates in place, no duplicate");
+    assert_eq!(arr[0]["secret"].as_str(), Some("9".repeat(64).as_str()));
+}
+
+#[test]
+fn c1_network_secret_lands_in_a_new_record() {
+    let mut arr: Vec<Value> = serde_json::from_str(&format!(
+        r#"[{{"name":"Laptop","secret":"{}","caps":["transfer","shell"]}}]"#,
+        "a".repeat(64)
+    ))
+    .unwrap();
+    let stored = crate::devices_store::insert_new_peer_record(
+        &mut arr,
+        "laptop",
+        &"b".repeat(64),
+        Some("hub"),
+    )
+    .unwrap();
+    assert_eq!(stored, "laptop-2", "case-insensitive clash is suffixed");
+    assert_eq!(arr[0]["secret"].as_str(), Some("a".repeat(64).as_str()));
+    assert_eq!(arr[1]["introducedBy"].as_str(), Some("hub"));
+    assert!(arr[1].get("caps").is_none(), "no grants carried over");
+    // A secret any record already holds is refused.
+    assert!(
+        crate::devices_store::insert_new_peer_record(&mut arr, "x", &"a".repeat(64), None)
+            .is_err()
+    );
+}
+
+// --- Grant target: a per-device grant names the DEVICE key --------------------
+
+/// Two devices of MY fleet (both certified by my user key), with the owner key
+/// on disk, so the real writers and the real gate inputs run.
+fn fleet_pair_fixture(tag: &str) -> (std::path::PathBuf, identity::UserKey, identity::DeviceCert, identity::DeviceCert) {
+    let dir = td(tag);
+    let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+    let now = identity::now_secs();
+    let laptop = identity::DeviceCert::certify(&uk, [0x11u8; 32], now, 86400).unwrap();
+    let desktop = identity::DeviceCert::certify(&uk, [0x22u8; 32], now, 86400).unwrap();
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&json!([
+            {"name": "laptop", "secret": "a".repeat(64), "v": 2, "caps": ["transfer"],
+             "userKey": hex::encode(uk.public_key_bytes()), "deviceCert": laptop.to_json()},
+            {"name": "desktop", "secret": "b".repeat(64), "v": 2, "caps": ["transfer"],
+             "userKey": hex::encode(uk.public_key_bytes()), "deviceCert": desktop.to_json()},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    (dir, uk, laptop, desktop)
+}
+
+/// `has_explicit_grant` as the authoritative gate computes it (no owner shortcut).
+fn explicit_shell(dir: &std::path::Path, c: &identity::DeviceCert) -> bool {
+    crate::capability::cap_fleet_inputs(
+        dir,
+        "self",
+        "shell",
+        Some(&c.device_pub),
+        Some(&c.user_pub),
+        None,
+    )
+    .1
+}
+
+fn apply_and_save(dir: &std::path::Path, ops: &[crate::capability::CapOp]) {
+    let mut store = crate::capability::load_cap_store(dir);
+    let hdr = store
+        .iter()
+        .find(|e| e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self"))
+        .and_then(crate::capability::CapHeader::from_json)
+        .expect("self header");
+    for op in ops {
+        crate::capability::apply_cap_op(&mut store, &hdr, op, crate::capability::now_secs()).unwrap();
+    }
+    crate::capability::save_and_list_revoked(&store, dir).unwrap();
+}
+
+#[test]
+fn grant_to_one_fleet_device_does_not_authorize_its_sibling() {
+    let _guard = lock_test_config();
+    let (dir, _uk, laptop, desktop) = fleet_pair_fixture("grant-dev-target");
+    let expires = crate::capability::now_secs() + 3600;
+    assert!(crate::device_caps::issue_signed_bounded_grant("laptop", "shell", expires).unwrap());
+
+    // The op names laptop's DEVICE key, not the user key both devices share.
+    let store = crate::capability::load_cap_store(&dir);
+    let grant = store
+        .iter()
+        .find(|e| e["type"].as_str() == Some("cap_grant"))
+        .expect("grant stored");
+    assert_eq!(grant["targetKind"].as_u64(), Some(0x01));
+    assert_eq!(grant["target"].as_str(), Some(hex::encode(laptop.device_pub).as_str()));
+
+    assert!(explicit_shell(&dir, &laptop), "the granted device holds shell");
+    assert!(
+        !explicit_shell(&dir, &desktop),
+        "granting laptop must not grant its same-owner sibling"
+    );
+    let revoked = crate::capability::devices_with_shell_revoked(&dir);
+    assert!(revoked.contains(&"desktop".to_string()));
+    assert!(!revoked.contains(&"laptop".to_string()));
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn revoking_one_fleet_device_leaves_its_sibling_granted() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, desktop) = fleet_pair_fixture("revoke-dev-target");
+    let expires = crate::capability::now_secs() + 3600;
+    assert!(crate::device_caps::issue_signed_bounded_grant("laptop", "shell", expires).unwrap());
+    assert!(crate::device_caps::issue_signed_bounded_grant("desktop", "shell", expires).unwrap());
+    assert!(explicit_shell(&dir, &laptop) && explicit_shell(&dir, &desktop));
+
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    assert!(!also_user_wide, "no user-wide grant exists here");
+    assert_eq!(ops.len(), 1);
+    apply_and_save(&dir, &ops);
+
+    assert!(!explicit_shell(&dir, &laptop), "laptop's grant is revoked");
+    assert!(explicit_shell(&dir, &desktop), "revoking laptop must leave desktop untouched");
+
+    // Regrant after the revoke lands above the tombstone instead of being
+    // refused by it.
+    let store = crate::capability::load_cap_store(&dir);
+    let regrant = crate::device_caps::sign_next_cap_op(
+        &store,
+        &uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::Device.target(&laptop),
+        "self",
+        vec!["shell".to_string()],
+        expires,
+    );
+    apply_and_save(&dir, &[regrant]);
+    assert!(explicit_shell(&dir, &laptop), "a newer grant re-grants");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn user_wide_grant_is_explicit_and_a_device_revoke_takes_it() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, desktop) = fleet_pair_fixture("grant-user-wide");
+    let mut store = crate::capability::load_cap_store(&dir);
+    crate::device_caps::ensure_self_header(&mut store, &uk).unwrap();
+    crate::capability::save_and_list_revoked(&store, &dir).unwrap();
+    // `grant laptop shell --user`: the documented per-person wildcard.
+    let user_wide = crate::device_caps::sign_next_cap_op(
+        &store,
+        &uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::User.target(&laptop),
+        "self",
+        vec!["shell".to_string()],
+        crate::capability::now_secs() + 3600,
+    );
+    assert_eq!(user_wide.target_kind, 0x00);
+    apply_and_save(&dir, &[user_wide]);
+    assert!(explicit_shell(&dir, &laptop) && explicit_shell(&dir, &desktop));
+
+    // A per-device revoke must not report success while the user-wide grant
+    // keeps laptop authorized: it takes the user-wide grant too, and says so.
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    assert!(also_user_wide);
+    assert_eq!(ops.len(), 2);
+    apply_and_save(&dir, &ops);
+    assert!(!explicit_shell(&dir, &laptop), "revoke must actually bite");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fleet_merge_refuses_a_grant_beaten_by_a_local_tombstone() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, _desktop) = fleet_pair_fixture("merge-tombstone");
+    // This device trusts the owner through its own header.
+    assert!(crate::fleet::my_owner_pub().is_some());
+    let mut store = crate::capability::load_cap_store(&dir);
+    crate::device_caps::ensure_self_header(&mut store, &uk).unwrap();
+    crate::capability::save_and_list_revoked(&store, &dir).unwrap();
+    let grant = crate::device_caps::sign_next_cap_op(
+        &store,
+        &uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::Device.target(&laptop),
+        "self",
+        vec!["shell".to_string()],
+        crate::capability::now_secs() + 3600,
+    );
+    let mut grant_json = grant.to_json();
+    grant_json["type"] = json!("cap_grant");
+    apply_and_save(&dir, &[grant]);
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, _) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    apply_and_save(&dir, &ops);
+    // The tombstone is not handed out as fleet policy.
+    assert!(
+        crate::owner_signed_cap_ops()
+            .iter()
+            .all(|e| e["type"].as_str() != Some(crate::capability::CAP_TOMBSTONE_TYPE))
+    );
+    // A peer relaying the OLD (still validly signed) grant cannot restore it.
+    assert_eq!(crate::merge_owner_cap_ops(&[grant_json]), 0);
+    assert!(!explicit_shell(&dir, &laptop));
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- Join must not re-key a record that is not provably the owner -------------
+
+#[test]
+fn join_leaves_a_certless_record_named_like_the_owner_untouched() {
+    let now = identity::now_secs();
+    let owner_cert = cert_for(0x41, 0x42, now + 86400);
+    for (label, record) in [
+        (
+            "secret-only",
+            json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
+                   "caps": ["transfer", "shell"], "deniedCaps": []}),
+        ),
+        (
+            "vouched",
+            json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
+                   "caps": ["transfer", "shell"], "introducedBy": "hub",
+                   "userKey": hex::encode([0x41u8; 32])}),
+        ),
+    ] {
+        let mut arr = vec![record.clone()];
+        let stored = crate::devices_store::place_joined_owner(
+            &mut arr,
+            "owner",
+            &"c".repeat(64),
+            &owner_cert,
+            &["transfer".to_string()],
+            identity::IntroScope::Device.to_byte(),
+        )
+        .unwrap();
+        assert_eq!(arr[0], record, "{label}: the existing record must be untouched");
+        assert_eq!(stored, "owner-2", "{label}: the owner lands in a new record");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[1]["deviceCert"]["devicePub"].as_str(),
+            Some(hex::encode(owner_cert.device_pub).as_str())
+        );
+        assert_eq!(arr[1]["secret"].as_str(), Some("c".repeat(64).as_str()));
+        assert_eq!(arr[1]["caps"], json!(["transfer"]), "{label}: no grants carried over");
+    }
+}
+
+#[test]
+fn join_updates_only_the_record_pinned_to_the_owner_key() {
+    let now = identity::now_secs();
+    let owner_cert = cert_for(0x41, 0x42, now + 86400);
+    // Re-join: the record pinned to the same device key is updated in place,
+    // whatever it is called now.
+    let mut arr = vec![json!({"name": "renamed", "secret": "a".repeat(64), "v": 2,
+                              "deviceCert": owner_cert.to_json()})];
+    let stored = crate::devices_store::place_joined_owner(
+        &mut arr,
+        "owner",
+        &"d".repeat(64),
+        &owner_cert,
+        &["transfer".to_string()],
+        identity::IntroScope::Device.to_byte(),
+    )
+    .unwrap();
+    assert_eq!(stored, "renamed");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["secret"].as_str(), Some("d".repeat(64).as_str()));
+
+    // A record under the owner's name pinned to a DIFFERENT key is refused.
+    let other = cert_for(0x41, 0x43, now + 86400);
+    let mut arr = vec![json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
+                              "deviceCert": other.to_json()})];
+    let before = arr.clone();
+    assert!(
+        crate::devices_store::place_joined_owner(
+            &mut arr,
+            "owner",
+            &"d".repeat(64),
+            &owner_cert,
+            &["transfer".to_string()],
+            identity::IntroScope::Device.to_byte(),
+        )
+        .is_err()
+    );
+    assert_eq!(arr, before);
+}
+
+// ------------------------------------------------- hostile-environment fixes --
+
+#[test]
+fn a_typed_refusal_reaches_the_sender_in_the_receivers_words() {
+    use crate::send_cmd::refusal_text;
+    // A refusal: the reason token marks it, the sentence is shown.
+    let v = protocol::refuse_msg("id1", "no_space", "receiver is out of disk space for a.bin (needs 3.0 MB, has 2.0 MB)");
+    assert_eq!(
+        refusal_text(&v).as_deref(),
+        Some("receiver is out of disk space for a.bin (needs 3.0 MB, has 2.0 MB)")
+    );
+    // A plain decline is a person saying no, not a refusal.
+    assert_eq!(refusal_text(&protocol::decline_msg("id1")), None);
+    // Peer-supplied text is bounded and has no control characters.
+    let hostile = protocol::refuse_msg("id1", "io", &format!("bad\x1b[2Jthing{}", "x".repeat(1000)));
+    let shown = refusal_text(&hostile).unwrap();
+    assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
+    assert!(shown.chars().count() <= 300);
+    // A reason with no sentence still says something true.
+    let bare = serde_json::json!({ "type": "file-decline", "id": "x", "reason": "io" });
+    assert!(refusal_text(&bare).is_some());
+}
+
+#[test]
+fn a_full_disk_is_named_with_both_sizes_never_called_corruption() {
+    let (token, msg) = crate::recv_files::storage_refusal(
+        Some(platform::StorageFailure::NoSpace),
+        "big.iso",
+        "",
+        Some(3 * 1024 * 1024),
+        Some(2 * 1024 * 1024),
+    );
+    assert_eq!(token, "no_space");
+    assert!(msg.contains("out of disk space"), "{msg}");
+    assert!(msg.contains("needs") && msg.contains("has"), "{msg}");
+    assert!(!msg.contains("checksum") && !msg.contains("corrupt"), "{msg}");
+    let (token, msg) = crate::recv_files::storage_refusal(
+        Some(platform::StorageFailure::NameTooLong),
+        "x.bin",
+        "File name too long (os error 36)",
+        None,
+        None,
+    );
+    assert_eq!(token, "name_too_long");
+    assert!(msg.contains("refuses the name"), "{msg}");
+    let (token, _) = crate::recv_files::storage_refusal(None, "x", "boom", None, None);
+    assert_eq!(token, "io");
+}
+
+#[test]
+fn the_no_peer_hint_names_who_we_were_waiting_for() {
+    use crate::send_cmd::no_peer_hint;
+    // CLI to CLI: a device is another tunlion, never "the page".
+    let to_dev = no_peer_hint(Some("laptop"), false, None);
+    assert!(to_dev.contains("'laptop'") && to_dev.contains("tunlion up"), "{to_dev}");
+    assert!(!to_dev.contains("page"), "{to_dev}");
+    // Only a code can be opened in a browser.
+    let code = no_peer_hint(None, true, None);
+    assert!(code.contains("code"), "{code}");
+    let room = no_peer_hint(None, false, Some("r1"));
+    assert!(room.contains("'r1'"), "{room}");
+    assert!(!no_peer_hint(None, false, None).contains("page"));
+}
+
+#[test]
+fn a_detached_up_never_follows_its_own_log() {
+    // Source pin, because the race this guards needs a real fork to exercise
+    // (cli/tests/hostile-env-gates.sh runs it): up_cmd decides "headless" from
+    // the console being daemon.log or the detach marker, and a headless loser
+    // exits instead of following the log it is writing into.
+    // A Windows checkout has CRLF line endings; the shape below is about LF.
+    let src = include_str!("up_logs.rs").replace("\r\n", "\n");
+    let body = &src[src.find("pub(crate) async fn up_cmd").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    assert!(body.contains("stdio_is_file(&console_log)"), "headless must compare the console with daemon.log");
+    assert!(body.contains("InstanceLock::try_acquire"), "the election must be the lock, not the pidfile");
+    let lock_at = body.find("InstanceLock::try_acquire").unwrap();
+    let pid_at = body.find("write_pidfile()").unwrap();
+    assert!(lock_at < pid_at, "the lock must be taken before the pidfile is written");
+    let logs = &src[src.find("pub(crate) async fn logs_cmd").unwrap()..];
+    assert!(logs.contains("stdio_is_file(&console)"), "logs -f must refuse to follow its own output file");
+}
+
+/// `exec bravo -- hostname` said "exec denied by bravo" about a decision this
+/// device made from bravo's recorded ceiling, without asking bravo. The text
+/// says where it was decided and carries the re-enrolment that widens it.
+#[test]
+fn a_local_ceiling_refusal_says_it_was_decided_here_and_how_to_widen_it() {
+    let caps = vec!["transfer".to_string(), "mount".to_string()];
+    let m = crate::identity_state::ceiling_refusal_here("exec", "bravo", "shell", &caps);
+    assert!(m.starts_with("exec refused here, before contacting bravo"), "{m}");
+    assert!(!m.contains("denied by bravo"), "{m}");
+    assert!(m.contains("(transfer, mount)") && m.contains("does not include shell"), "{m}");
+    assert!(m.contains("tunlion add --for bravo --allow transfer,mount,shell"), "{m}");
+    assert!(m.contains("tunlion reset -y") && m.contains("tunlion join --invite-file bravo-invite.txt"), "{m}");
+    let mount = crate::identity_state::ceiling_refusal_here("mount", "bravo", "mount", &["transfer".to_string()]);
+    assert!(mount.contains("--allow transfer,mount"), "{mount}");
+}
+
+#[test]
+fn the_reenrolment_advice_is_complete_and_keeps_the_ceiling() {
+    let s = crate::identity_state::reenrol_steps(
+        "delta",
+        "alpha",
+        "shell",
+        &["transfer".to_string(), "mount".to_string()],
+    );
+    for must in [
+        "on alpha:",
+        "tunlion devices forget delta",
+        "tunlion add --for delta --allow transfer,mount,shell --out delta-invite.txt",
+        "on delta:",
+        "tunlion down",
+        "tunlion reset -y",
+        "tunlion join --invite-file delta-invite.txt --name delta",
+    ] {
+        assert!(s.contains(must), "missing {must:?} in:\n{s}");
+    }
+    // The order is the order they must run in.
+    let at = |needle: &str| s.find(needle).unwrap();
+    assert!(at("devices forget") < at("add --for") && at("add --for") < at("reset -y"));
+    assert!(at("reset -y") < at("join --invite-file"));
+    // A capability already in the ceiling is not listed twice.
+    let again = crate::identity_state::reenrol_steps("d", "o", "mount", &["mount".to_string()]);
+    assert!(again.contains("--allow mount --out"), "{again}");
+}
+
+// ------------------------------------------------------- peer presence (F4) --
+
+/// Blind test F4: `devices` showed a SIGSTOPped, then wiped, peer as "online
+/// (last seen just now)". A relay link's `idle_ms` is stamped by our own
+/// keepalive writes, which keep succeeding with nobody listening, so it never
+/// grew. Presence is judged on what the PEER last sent.
+#[test]
+fn a_relay_peer_that_went_silent_is_not_present() {
+    use crate::daemon_ctl::peer_present;
+    // Relay, the peer's keepalive heard 2 s ago: present.
+    assert!(peer_present(true, false, Some(2_000), 0));
+    // The defect: our writes keep idle at 0, but the peer has been silent 30 s.
+    assert!(!peer_present(true, false, Some(30_000), 0));
+    // A dead transport is never present, whatever the stamps say.
+    assert!(!peer_present(false, false, Some(0), 0));
+    // Direct QUIC tracks no heard time and is judged by its own liveness,
+    // which its 21 s idle timeout flips.
+    assert!(peer_present(true, true, None, u64::MAX));
+    assert!(!peer_present(false, true, None, 0));
+    // A transport that tracks neither keeps the old relay idle rule.
+    assert!(peer_present(true, false, None, 1_000));
+    assert!(!peer_present(true, false, None, 9_000));
+}
+
+/// One source of truth for "last seen": a server roster announcement is not a
+/// sighting. The `known device appeared` branch touched lastSeen on every
+/// roster re-push, so a reset (wiped) device read "last seen just now" in
+/// `devices` while `add` said "1m ago" from the same record. The only writers
+/// left are the presence observation (peer_present) and an announce received
+/// over a live link.
+#[test]
+fn a_roster_announcement_does_not_refresh_last_seen() {
+    let src = include_str!("recv_cmd.rs");
+    let at = src
+        .find("known device '{n}' appeared, connecting\"")
+        .expect("the known-device announcement branch exists");
+    let branch = &src[at..];
+    let branch = &branch[..branch.find("} else {").expect("branch end")];
+    assert!(
+        !branch.contains("devices_touch("),
+        "the roster announcement must not refresh lastSeen:\n{branch}"
+    );
+}
+
+/// Every re-link chain the CLI prints after a reset, parsed and RUN against a
+/// store holding a live certified record and its re-joined successor. The
+/// hints (reset_hints) and the forget/rename rules (fleet_support) live on
+/// different branches; this is where both are present, which is where the
+/// dead end was: `forget` refused a live certificate for 30 days and `rename`
+/// then said the name was taken.
+#[test]
+fn every_printed_relink_chain_runs_against_a_store() {
+    use clap::Parser;
+    let _guard = lock_test_config();
+    let run = |step: &str, now: u64| -> anyhow::Result<()> {
+        let argv: Vec<&str> = step.split_whitespace().collect();
+        let cli = crate::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("`{step}` does not parse: {e}"));
+        match cli.cmd {
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Forget { name }), .. }) => {
+                crate::fleet_support::forget_device(&name, now).map(|_| ())
+            }
+            Some(crate::Cmd::Devices { action: Some(crate::DevicesAction::Rename { old, new }), .. }) => {
+                crate::fleet_support::rename_device(&old, &new)
+            }
+            // Steps for another machine, or that mint (add/join), are parsed
+            // above; the store-side steps are the ones that dead-ended.
+            _ => Ok(()),
+        }
+    };
+    let fixture = |tag: &str| {
+        let dir = std::env::temp_dir().join(format!(
+            "fil-chain-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+        let now = identity::now_secs();
+        let old = identity::DeviceCert::certify(&uk, [0x61u8; 32], now, 30 * 86_400).unwrap();
+        let new = identity::DeviceCert::certify(&uk, [0x62u8; 32], now, 30 * 86_400).unwrap();
+        std::fs::write(
+            dir.join("devices.json"),
+            serde_json::to_string(&serde_json::json!([
+                { "name": "p9-b",   "secret": "a".repeat(64), "deviceCert": old.to_json() },
+                { "name": "p9-b-2", "secret": "b".repeat(64), "deviceCert": new.to_json() },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        (dir, now, old, new)
+    };
+
+    // send/doctor to the stale name, with a successor: forget, then rename.
+    let (dir, now, old, new) = fixture("succ");
+    let hint = crate::reset_hints::offline_hint("p9-b", Some("p9-b-2"));
+    let steps = crate::reset_hints::hint_commands(&hint);
+    assert!(steps.len() >= 2, "{hint}");
+    for step in &steps {
+        run(step, now).unwrap_or_else(|e| panic!("`{step}` from \"{hint}\" failed: {e}"));
+    }
+    assert_eq!(crate::device_view::device_cert_for("p9-b").unwrap().device_pub, new.device_pub);
+    assert!(crate::device_view::device_cert_for("p9-b-2").is_none());
+    assert!(device_cert_revoked(&old.device_pub), "the forgotten live key stays refused");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // No successor yet, and `add <name>` on a taken name: the forget each
+    // starts with succeeds and frees the name.
+    for hint in [
+        crate::reset_hints::offline_hint("p9-b", None),
+        crate::reset_hints::name_taken_note("p9-b", Some("1m ago")),
+    ] {
+        let (dir, now, old, _) = fixture("free");
+        for step in crate::reset_hints::hint_commands(&hint) {
+            run(&step, now).unwrap_or_else(|e| panic!("`{step}` from \"{hint}\" failed: {e}"));
+        }
+        assert!(crate::device_view::device_cert_for("p9-b").is_none(), "the name is free: {hint}");
+        assert!(device_cert_revoked(&old.device_pub));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The ceiling re-enrolment starts on the owner with a forget of a live
+    // certified device; it must succeed too.
+    let (dir, now, _, _) = fixture("ceiling");
+    let first = crate::refusal::ceiling_steps("alpha", "p9-b")[0].clone();
+    let cmd = &first[first.find("tunlion").unwrap()..];
+    run(cmd, now).unwrap_or_else(|e| panic!("`{cmd}` failed: {e}"));
+    assert!(crate::device_view::device_cert_for("p9-b").is_none());
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
 }

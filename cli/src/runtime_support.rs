@@ -129,13 +129,17 @@ pub(crate) fn recover_identity(
         bail!("non-interactive recovery requires --words-file <path> or --words-fd <fd>");
     });
     let user_key =
-        identity::UserKey::restore(&crate::platform::PlatformKeyStore, phrase.as_str().trim())?;
+        identity::UserKey::restore(
+            &crate::platform::PlatformKeyStore,
+            crate::identity_flow::recovery_words(phrase.as_str()),
+        )?;
     certify_local_device(&user_key, &display_name())?;
     ensure_self_genesis_header(&crate::settings::config_dir(), &user_key);
     if caps.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
+                "ok": true,
                 "identity": user_key.fingerprint(),
                 "restored": true,
                 "revokedStolenDevices": false,
@@ -272,19 +276,19 @@ pub(crate) fn resolve_for_kind(
 
 pub(crate) fn stop_managed_service(pid: u32) -> bool {
     // Only stop through the manager when THIS daemon is actually the managed
-    // unit's process, AND the right manager. `systemctl stop tunlion` stops
+    // unit's process, AND the right manager. `systemctl stop filament` stops
     // the named unit even when down targets a DIFFERENT daemon (a detached
     // foreground `up` on another config), which killed another machine's
     // service during development. Two units share the name here, so the cgroup
     // scope decides which manager.
     match service_manager_for_pid(pid) {
         Some(ServiceManager::SystemdSystem) => std::process::Command::new("systemctl")
-            .args(["stop", "tunlion"])
+            .args(["stop", crate::platform::SYSTEMD_UNIT])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
         Some(ServiceManager::SystemdUser) => std::process::Command::new("systemctl")
-            .args(["--user", "stop", "tunlion"])
+            .args(["--user", "stop", crate::platform::SYSTEMD_UNIT])
             .status()
             .map(|s| s.success())
             .unwrap_or(false),
@@ -305,8 +309,11 @@ pub(crate) async fn next_ev(
     if let Some(since) = conn.rejoin.waiting_rejoin {
         if since.elapsed() > conn.rejoin.rejoin_window {
             ui::clear_sticky();
+            // "unreachable" is what the exit-code taxonomy classifies on (6):
+            // the peer is gone, which is not the same failure as a refusal or a
+            // network outage on this side, and a script must be able to tell.
             bail!(
-                "peer did not come back within {}s (partial state kept for resume)",
+                "peer unreachable: disconnected and did not come back within {}s (partial state kept for resume)",
                 conn.rejoin.rejoin_window.as_secs()
             );
         }

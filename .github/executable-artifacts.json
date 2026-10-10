@@ -20,6 +20,17 @@
       ]
     },
     {
+      "path": "cli/tests/config-scope-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/config-scope-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/devices-write-race-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/devices-write-race-gates.sh",
@@ -34,6 +45,17 @@
       "path": "cli/tests/exec-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/exec-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/identity-relink-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/identity-relink-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -67,6 +89,39 @@
       "path": "cli/tests/forward-refusal-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/forward-refusal-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/hostile-env-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/hostile-env-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/daemon-stop-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/daemon-stop-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/reenrol-advice-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/reenrol-advice-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -200,8 +255,10 @@
         "cli/tests/l2-revoke-gates.sh",
         "cli/tests/mount-revoke-gates.sh",
         "cli/tests/pty-revoke-gates.sh",
+        "cli/tests/reenrol-advice-gates.sh",
         "cli/tests/roster-gates.sh",
-        "cli/tests/shell-posture-gates.sh"
+        "cli/tests/shell-posture-gates.sh",
+        "cli/tests/warm-hold-idle-gates.sh"
       ]
     },
     {
@@ -325,6 +382,17 @@
       ]
     },
     {
+      "path": "cli/tests/signaling-freeze-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/signaling-freeze-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/ssh-ca-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/ssh-ca-gates.sh",
@@ -356,6 +424,17 @@
       "path": "cli/tests/transport-gates.sh",
       "disposition": "required",
       "entrypoint": "bash cli/tests/transport-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
+      "path": "cli/tests/warm-hold-idle-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/warm-hold-idle-gates.sh",
       "matrix": [
         {
           "platform": "linux",
@@ -564,7 +643,34 @@
         "macos",
         "windows"
       ],
-      "behavior": "Returns success after reporting that cold establish is unverified."
+      "behavior": "Ignored on macOS and Windows: cold establish is not yet verified there, so the test does not run."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "shell_daemon_live_pairing_no_restart",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "behavior": "Ignored on macOS and Windows: cold establish is not yet verified there, so the test does not run."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "warm_all_makes_first_contact_warm",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "behavior": "Compiled out on macOS (hyperkit runner cannot complete a QUIC establish) and ignored on Windows, so it runs on Linux only."
+    },
+    {
+      "path": "cli/tests/capability_harness.rs",
+      "test": "warm_one_shot_pty_reuse",
+      "platforms": [
+        "macos",
+        "windows"
+      ],
+      "behavior": "Ignored on macOS and Windows: warm-reuse pty is not yet verified there, so the test does not run."
     },
     {
       "path": "cli/tests/capability_harness.rs",
@@ -573,7 +679,7 @@
         "macos",
         "windows"
       ],
-      "behavior": "Returns success after reporting a platform skip."
+      "behavior": "Ignored on macOS and Windows: instant-EOF warm pty is not yet verified there, so the test does not run."
     }
   ]
 }

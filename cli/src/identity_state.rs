@@ -120,9 +120,14 @@ pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
     store
         .into_iter()
         .filter(|e| {
-            crate::capability::CapOp::from_json(e)
-                .map(|op| op.grantor == owner)
-                .unwrap_or(false)
+            // A revoke tombstone parses as an op too, but it is a LOCAL version
+            // record, not policy to hand out: a receiver merges by appending,
+            // so a relayed tombstone would sit beside the grant it should have
+            // beaten and change nothing.
+            e.get("type").and_then(|v| v.as_str()) != Some(crate::capability::CAP_TOMBSTONE_TYPE)
+                && crate::capability::CapOp::from_json(e)
+                    .map(|op| op.grantor == owner)
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -147,6 +152,13 @@ pub(crate) fn merge_owner_cap_ops(ops: &[Value]) -> usize {
             continue;
         };
         if op.grantor != owner || op.verify(&owner, now).is_err() {
+            continue;
+        }
+        // An op at or below a local revoke tombstone is a replay of something
+        // this device already saw revoked. Owner-signed is not enough: the
+        // signature on the old grant is still valid, which is exactly why the
+        // tombstone keeps the version it beat.
+        if crate::capability::superseded_by_tombstone(&store, &op) {
             continue;
         }
         let dup = store.iter().any(|e| e == v);
@@ -204,15 +216,24 @@ pub(crate) fn require_known_device(name: &str) -> Result<()> {
     if known.iter().any(|n| n == name) {
         return Ok(());
     }
+    // Classified, not left to the text: an unknown device is exit 3 for every
+    // verb that asks (exit_codes::ExitKind::UnknownDevice).
+    use crate::exit_codes::{ExitKind, err};
     if known.is_empty() {
-        bail!(
-            "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
-        );
+        return Err(err(
+            ExitKind::UnknownDevice,
+            format!(
+                "no device named '{name}'. You have not paired any devices yet: `tunlion add` to pair one"
+            ),
+        ));
     }
-    bail!(
-        "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
-        known.join(", ")
-    )
+    Err(err(
+        ExitKind::UnknownDevice,
+        format!(
+            "no device named '{name}'. Known devices: {}\n  tunlion devices   to see them\n  tunlion add       to pair a new one",
+            known.join(", ")
+        ),
+    ))
 }
 
 /// #157 call-site derivation for the gate's `cert_revoked` input. A peer with
@@ -312,6 +333,53 @@ pub(crate) fn certify_local_device(
     )
     .with_context(|| format!("write local device certificate to {}", path.display()))?;
     Ok(cert)
+}
+
+/// The one supported way to give a joined device a capability its invitation
+/// ceiling does not include: enrol it again with the capability in a fresh
+/// invitation. A grant cannot widen a ceiling, and a joined device refuses a
+/// second invitation while it holds the first ("already joined an identity"),
+/// so the advice that used to be printed here (`add --for <dev> --allow shell`
+/// alone) dead-ended on the device. These are the steps that work, in order,
+/// with the machine each one runs on; `cli/tests/reenrol-advice-gates.sh`
+/// follows them end to end.
+///
+/// `ceiling` is the device's current ceiling: `--allow` REPLACES the default
+/// ceiling, so what it already had is carried over rather than lost.
+pub(crate) fn reenrol_steps(device: &str, owner: &str, capability: &str, ceiling: &[String]) -> String {
+    let mut caps: Vec<String> = ceiling.to_vec();
+    if !caps.iter().any(|c| c == capability) {
+        caps.push(capability.to_string());
+    }
+    let caps = caps.join(",");
+    let invite = format!("{device}-invite.txt");
+    let on_owner = format!("on {owner}:");
+    let on_device = format!("on {device}:");
+    let w = on_owner.len().max(on_device.len());
+    let pad = " ".repeat(w);
+    format!(
+        "To give {device} {capability}, enrol it again with {capability} in its invitation:\n  \
+         {on_owner:<w$}  tunlion devices forget {device}\n  \
+         {pad}  tunlion add --for {device} --allow {caps} --out {invite}\n  \
+         {on_device:<w$}  tunlion down\n  \
+         {pad}  tunlion reset -y\n  \
+         {pad}  tunlion join --invite-file {invite} --name {device}\n  \
+         (reset clears {device}'s local tunlion state; it rejoins under the same name)"
+    )
+}
+
+/// The refusal for `shell`, `exec` or `mount` to a device whose enrolment
+/// ceiling (recorded HERE, from its invitation) excludes the capability. The
+/// decision is made locally before anything is sent, so the words say so: it
+/// used to read "exec denied by bravo", and bravo was never asked. The remedy
+/// is the re-enrolment that works (`reenrol_steps`), not a grant, which cannot
+/// widen a ceiling.
+pub(crate) fn ceiling_refusal_here(verb: &str, peer: &str, capability: &str, ceiling: &[String]) -> String {
+    format!(
+        "{verb} refused here, before contacting {peer}: {peer} joined with an invitation ceiling of ({}), which does not include {capability}, so it cannot serve {verb}. Nothing was sent.\n{}",
+        ceiling.join(", "),
+        reenrol_steps(peer, &crate::display_name(), capability, ceiling)
+    )
 }
 
 /// The persisted capability ceiling of a device record, when that record is a

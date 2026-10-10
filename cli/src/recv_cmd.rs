@@ -14,6 +14,7 @@
 //! (`anyhow::Context` for `.with_context`, `std::io::IsTerminal` for `.is_terminal`) are
 //! imported; the rest travel inside the body's own function-local `use`s.
 use crate::dlog;
+use crate::signaling_health;
 #[cfg(l3)]
 use crate::l3;
 #[cfg(l3)]
@@ -30,7 +31,7 @@ use crate::{
     flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
     handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
     interactive_requested, is_self_uid, issue_proven_challenge_and_hold,
-    issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_nonce,
+    issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_fingerprints, link_nonce,
     load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
     mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
     mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding, overlay,
@@ -52,6 +53,7 @@ use crate::{
     warm_link_for,
 };
 use anyhow::{Context, Result, bail};
+use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -67,6 +69,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// How long the event loop waits, after writing a delivery-ack, for the peer to
+/// acknowledge it at the transport. Short on purpose: the ack is already queued
+/// and is delivered without this wait; it only lets a live peer take it before
+/// the loop moves on, and a peer that will never acknowledge must not hold the
+/// receiver (and its exit) hostage.
+const ACK_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 
 /// A shell-class open parked while its link's possession proof is in flight
 /// (settle-then-evaluate). The link is identified by pid AND the device key
@@ -424,9 +433,10 @@ async fn handle_forward_open(
             .as_deref()
             .unwrap_or("device not granted shell");
         ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
-        let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
-                .await;
+        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+        let mut close = json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" });
+        crate::refusal::Refusal::new(crate::refusal::Code::NotGranted, who).annotate(&mut close);
+        let _ = t.send_control(&close).await;
     } else {
         // Opt-in gateway: if the target is non-loopback, allow it
         // only when the operator's l2-allow.json lists it for this
@@ -508,9 +518,9 @@ async fn handle_pty_open(
     // no output. Say so, so the initiator errors instead of waiting.
     if !l2_enabled {
         let sid = l2::wire_sid(&v).unwrap_or(0);
-        let _ = t
-                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `tunlion up --shell` on that device" }))
-                .await;
+        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+        let refusal = crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
     // wire_sid rejects a missing OR out-of-range sid instead of
@@ -558,10 +568,30 @@ async fn handle_pty_open(
         // produced and then thrown away before it crossed the wire,
         // so the initiator read an empty success instead of the
         // refusal. The fallback stays coarse on purpose.
-        let reason = cap_reason.unwrap_or_else(|| "shell capability not granted".to_string());
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
-            .await;
+        // With a precise code and our name for the peer, so its remedy is
+        // the one that applies (a missing grant is not "serving is off").
+        let refusal = crate::refusal::Refusal::from_shell_gate(
+            gate_inputs.cert_revoked,
+            gate_inputs.denied,
+            cap_reason.as_deref(),
+            dev.clone(),
+        );
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
+        return;
+    }
+    // A configured user drop (`--shell-user`, or `set shell-user` applied
+    // live) needs root for runuser. Without it the spawn "succeeds" into a
+    // shell that dies at once with runuser's own complaint; refuse up front
+    // and say which setting is the problem. `shell_argv(..).1` is false where
+    // the platform ignores --shell-user entirely (nothing to drop to there).
+    if shell_user.is_some()
+        && crate::shell_root_note().is_empty()
+        && shell_argv(None, shell_user.as_deref()).1
+    {
+        let refusal =
+            crate::refusal::Refusal::new(crate::refusal::Code::UserDropUnavailable, dev.clone());
+        ui::say(&format!("l2: pty refused: {}", refusal.reason));
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     }
     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
@@ -643,7 +673,7 @@ async fn handle_pty_open(
     // cleanly rather than getting a surprise re-login.
     if resume {
         let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "no such session" }))
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": l2::NO_SUCH_SESSION }))
             .await;
         return;
     }
@@ -830,27 +860,41 @@ pub(crate) async fn recv_cmd(
     // (`recv` vs `pair`) decides whether the agreed secret is discarded or kept.
     // So `recv` no longer redirects a 4-digit code away (the old width-based
     // hint is obsolete); any well-formed code is a valid claim here.
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Owner-only: peers write here (platform::create_inbox_dir).
+    crate::platform::create_inbox_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     // P2 (GAP-2): `mut` so the long-lived acceptor's outer reconnect loop can
     // swap in a freshly-dialed signaling client after a drop (see below). The
     // short-lived `recv`/`send` paths never reconnect, they re-invoke fresh,
     // so this is only exercised by the daemon (`up`/`up --dir`).
-    let mut sio = net::connect_signaling(server, tx.clone()).await?;
+    // The daemon waits for the network instead of exiting (see
+    // `connect_signaling_patiently`); a one-shot receive still fails fast.
+    let mut sio = if daemon {
+        crate::up_logs::connect_signaling_patiently(server, tx.clone()).await?
+    } else {
+        net::connect_signaling(server, tx.clone()).await?
+    };
 
     let mut paired = code.is_some();
+    // Set when the sender cancels a transfer because it could not read its own
+    // source (`file-cancel`). A one-shot receive then ends saying so, instead of
+    // holding the line for a sender that has already given up.
+    let mut sender_cancelled: Option<String> = None;
+    // For the give-up message: a code works once, so "re-run with the code"
+    // can never resume anything, and only the partials THIS receive started
+    // are ours to report (or to clean up when they hold nothing).
+    let code_claimed = code.is_some();
+    let mut session_parts: Vec<crate::transfer_truth::SessionPart> = Vec::new();
     // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
-    // C29: an in-session pairing ceremony (daemon mode): typed code or a
-    // minted one, exactly ONE side hands over a fresh secret (creator
-    // initiates; a claimer waits 3 s for the creator, then takes over,
-    // browsers never initiate). Some(true) = we minted; Some(false) = we
-    // claimed; None = no ceremony pending.
-    let mut ceremony: Option<bool> = None;
-    let mut ceremony_pid: Option<String> = None;
-    let mut ceremony_secret = fresh_secret();
+    // C29's in-session pairing ceremony (a code typed into, or minted by, the
+    // interactive `up` console) is GONE. It claimed a v1 code (`pair-claim`
+    // without `v:2`) and then handed a fresh pair secret over a DataChannel
+    // whose DTLS fingerprints the signaling server chose, so a malicious
+    // server could MITM it and keep the secret. Pairing from the console now
+    // points at `tunlion add` / `tunlion join`, which run the SPAKE2 ceremony.
     // Receive-side transfer/consent state, grouped out of this function's locals
     // (still a plain local; no handler extraction yet). See `RecvState`.
     let mut st = RecvState {
@@ -968,13 +1012,14 @@ pub(crate) async fn recv_cmd(
                     // Linux, 104 on macOS), e.g. a deep FILAMENT_CONFIG_DIR or a
                     // CI/macOS temp directory; found by a first-time-user test
                     // whose sandbox path was 110 bytes.
-                    let path = crate::ctl::control_sock_path();
-                    crate::ui::say(&format!(
-                        "tunlion: control socket unavailable at {} ({} bytes): {e}\n  \
-                         warm links, `tunlion requests` and instant invitations will not work; \
-                         a shorter config directory (FILAMENT_CONFIG_DIR) fixes it",
-                        path.display(),
-                        path.as_os_str().len()
+                    //
+                    // FATAL now, not a log line: the startup below waits on the
+                    // readiness signal this task drops, and stops the daemon with
+                    // this reason. A daemon nobody can talk to is not "up".
+                    crate::ui::critical(&format!(
+                        "tunlion: control socket unavailable: {e}\n  \
+                         without it, `status`, `set`, warm links, `tunlion requests` and \
+                         instant invitations cannot reach this daemon, so it will not start"
                     ));
                 }
             });
@@ -1019,7 +1064,14 @@ pub(crate) async fn recv_cmd(
             // a sibling `mint` that arms right after this line must not race a
             // socket that is not listening yet.
             if let Some(ready) = ctl_ready.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
+                // Ok(Err(_)): the server task ended without ever signalling ready,
+                // i.e. it could not create the socket (it said why, above).
+                if let Ok(Err(_)) = tokio::time::timeout(Duration::from_secs(5), ready).await {
+                    bail!(
+                        "the control socket {} could not be created; the daemon is not starting",
+                        crate::ctl::control_sock_path().display()
+                    );
+                }
             }
             if crate::armed::is_armed() {
                 ui::debug("enrollment armed: ephemeral devices may enroll");
@@ -1117,11 +1169,15 @@ pub(crate) async fn recv_cmd(
     // `tunlion grant <dev> shell` works on a plain `up` without restarting with a
     // flag, matching what the grant command tells the user). The per-device gate
     // below still denies every non-granted device, so this never widens access.
-    let l2_enabled = shell_policy.enables_l2()
+    // The launch posture (`--shell`/`--shell-only`, FILAMENT_L2) is fixed for
+    // the daemon's life: it is what `--i-know` was checked against, so a live
+    // `set shell on` must not widen it past that gate. The GRANT half is not
+    // fixed: it is recomputed at the top of every loop iteration below.
+    let l2_launch = shell_policy.enables_l2()
         || std::env::var("FILAMENT_L2")
             .map(|v| v == "1")
-            .unwrap_or(false)
-        || any_shell_grant();
+            .unwrap_or(false);
+    let mut l2_enabled = l2_launch || any_shell_grant();
 
     let mut conn = Conn::for_command(
         server,
@@ -1323,27 +1379,60 @@ pub(crate) async fn recv_cmd(
                                 let auto_proxy =
                                     settings::get_bool("auto-proxy", None) && !no_proxy_fallback;
                                 if auto_proxy {
-                                    let server = server.to_string();
-                                    tokio::spawn(async move {
-                                        if let Err(e) =
-                                            l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay)
+                                    // Bind FIRST, then say what is true. Another daemon
+                                    // (another HOME on this machine) or a hand-started
+                                    // proxy may hold 1080 already.
+                                    let bound = match l2::bind_auto_proxy(1080).await {
+                                        Ok((listener, port)) => match l2::proxy_token() {
+                                            Ok(tok) => Ok((listener, port, tok)),
+                                            Err(e) => Err(format!("cannot create its token: {e}")),
+                                        },
+                                        Err(why) => Err(why),
+                                    };
+                                    match bound {
+                                        Ok((listener, port, tok)) => {
+                                            crate::proxy_state::record("127.0.0.1", port);
+                                            let server = server.to_string();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = l2::proxy_serve(
+                                                    &server,
+                                                    listener,
+                                                    "127.0.0.1",
+                                                    port,
+                                                    0,
+                                                    relay,
+                                                    tok.into(),
+                                                )
                                                 .await
-                                        {
-                                            // Port already in use is expected (user started proxy manually);
-                                            // only log unexpected errors.
-                                            let msg = e.to_string();
-                                            if !msg.contains("already in use") {
-                                                ui::debug(&format!("auto-proxy: {e}"));
+                                                {
+                                                    ui::critical(&format!(
+                                                        "auto-proxy on 127.0.0.1:{port} stopped: {e}"
+                                                    ));
+                                                }
+                                            });
+                                            let note = if port == 1080 {
+                                                String::new()
+                                            } else {
+                                                " (1080 was taken)".to_string()
+                                            };
+                                            ui::say(&format!(
+                                                "  {} started SOCKS5 proxy on 127.0.0.1:{port}{note} (set your tools' proxy to this)",
+                                                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                            ));
+                                            // The proxy opens mesh streams as this owner, so it
+                                            // requires the password in the token file; the
+                                            // proxy's own banner prints how to pass it.
+                                            for line in l2::proxy_usage_lines("127.0.0.1", port) {
+                                                ui::say(&format!("  {line}"));
                                             }
                                         }
-                                    });
-                                    ui::say(&format!(
-                                        "  {} started SOCKS5 proxy on 127.0.0.1:1080 (set your tools' proxy to this)",
-                                        ui::paint(ui::Tone::Ok, ui::glyph_ok())
-                                    ));
-                                    ui::say(&format!(
-                                        "    e.g.  curl --socks5-hostname 127.0.0.1:1080 http://<peer>.mesh:8080/"
-                                    ));
+                                        Err(why) => ui::say(&ui::paint(
+                                            ui::Tone::Warn,
+                                            &format!(
+                                                "  no SOCKS5 proxy: {why}. To run one on a free port: `tunlion forward <device>:<port> --socks --port <free port>`"
+                                            ),
+                                        )),
+                                    }
                                 }
                             } else {
                                 // Kernel mode is dual-stack: show the v4 address too
@@ -1597,7 +1686,18 @@ pub(crate) async fn recv_cmd(
     let mut signaling_down_since: Option<Instant> = None;
     let mut reconnect_attempt: u32 = 0;
     let mut last_reconnect_try = Instant::now();
-    let mut probed_silence = false; // fired one forced sync before declaring down
+    let mut reconnect_wait = Duration::ZERO;
+    // When the current connection came up (None while down). The ladder only
+    // restarts after a connection that stayed up signaling_health::STABLE_AFTER.
+    let mut signaling_up_since: Option<Instant> = Some(Instant::now());
+    let mut down_reason = String::new();
+    // When the forced `sync` probe went out (None: no probe outstanding).
+    let mut probed_silence: Option<Instant> = None;
+    // Repeated reconnect lines are collapsed, not written once per cycle.
+    let mut signaling_log = signaling_health::LogCollapse::default();
+    if signaling_self_heal {
+        signaling_health::note_serving();
+    }
     let mut last_watchdog = Instant::now();
     // Link self-heal cadence (the multi-minute-outage fix, #3). A transport that
     // died past the QUIC idle timeout lingers in `links` as a zombie and SUPPRESSES
@@ -1629,6 +1729,8 @@ pub(crate) async fn recv_cmd(
     if daemon {
         sdnotify::ready();
         sdnotify::status("up - serving");
+        // The same edge for `up --detach`, which has no systemd to tell it.
+        crate::file_io::mark_daemon_ready();
     }
 
     // Restore mounts that were marked with auto_restore.
@@ -1637,6 +1739,10 @@ pub(crate) async fn recv_cmd(
     }
 
     loop {
+        // Live posture: a `tunlion grant <dev> shell` (or the revoke of the last
+        // shell grant) applies to the RUNNING daemon on the next open. Computed once at startup, it silently required a
+        // restart and refused every granted device with "shell serving is off".
+        l2_enabled = l2_launch || crate::shell_support::any_shell_grant_live();
         // systemd liveness watchdog: ping on a throttle (well under WatchdogSec).
         // If this loop WEDGES on an await, the pings stop and systemd restarts us
         // - the backstop for the stall that also freezes the reconnect code.
@@ -1651,6 +1757,43 @@ pub(crate) async fn recv_cmd(
         // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
+        }
+        if !daemon && !keep_open && st.by_sid.is_empty() {
+            if let Some(what) = sender_cancelled.take() {
+                ui::clear_sticky();
+                let _ = tokio::time::timeout(Duration::from_secs(1), sio.disconnect()).await;
+                bail!(
+                    "the sender cancelled the transfer because it could not read its file ({what}); \
+                     nothing of it was kept here{}",
+                    if st.completed > 0 {
+                        format!(" ({} other file(s) were received)", st.completed)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+        // A one-shot receive whose sender left and did not come back ends here,
+        // saying what is actually on disk and how it can actually continue.
+        // The shared rejoin expiry in `next_ev` said "partial state kept for
+        // resume" whether or not anything was kept, and "re-run `receive
+        // <code>`" for a code that already burned.
+        if !daemon {
+            if let Some(since) = conn.rejoin.waiting_rejoin {
+                if since.elapsed() > conn.rejoin.rejoin_window {
+                    ui::clear_sticky();
+                    let why = format!(
+                        "the sender is unreachable: it disconnected and did not come back within {}s",
+                        conn.rejoin.rejoin_window.as_secs()
+                    );
+                    bail!(crate::transfer_truth::sender_gone_message(
+                        &why,
+                        &crate::transfer_truth::kept_partials(&session_parts),
+                        &dir,
+                        code_claimed,
+                    ));
+                }
+            }
         }
         let ev = tokio::select! {
             biased;
@@ -1772,12 +1915,27 @@ pub(crate) async fn recv_cmd(
                                 },
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
+                                // The signaling link as the serving loop sees it, so
+                                // `status` and `doctor` can tell a daemon that answers
+                                // here but is off the server (or keeps dropping) from a
+                                // healthy one. See signaling_health.
+                                "signaling": signaling_health::snapshot_json(),
                                 "summary": counts.summary(),
                                 // #244: the LIVE shell posture. `revoke <dev> shell`
                                 // reads this so it can say when the shell it just
                                 // revoked is still being handed out by the policy.
                                 "shell_policy": shell_policy.label(),
                                 "shell_auto": shell_policy.auto_names(),
+                                // Every other daemon flag, so `up` over this
+                                // daemon can tell whether the flags it was
+                                // given are already in effect.
+                                "launch": crate::up_logs::launch_report(
+                                    server,
+                                    &dir,
+                                    relay,
+                                    shell_user.as_deref(),
+                                    no_proxy_fallback,
+                                ),
                             })).await;
                         } else if matches!(&req.kind, ctl::ReqKind::ListWarm) {
                             handle_list_warm(&conn, req).await;
@@ -2116,6 +2274,7 @@ pub(crate) async fn recv_cmd(
                             mux,
                             &p.v,
                             &shell_policy,
+                            &shell_user,
                             &mut parked_opens,
                         )
                         .await;
@@ -2267,10 +2426,27 @@ pub(crate) async fn recv_cmd(
             // (1) Liveness accounting. Any inbound signaling event proves the
             // socket is alive; a successful `sync` ack (Ev::Synced) is the
             // strongest signal (the server answered). The fast-path close/error
-            // callback marks the link down immediately.
+            // callback marks the link down immediately, but ONLY for the
+            // current connection: a close of one this loop already replaced is
+            // history (see signaling_health, defect 1). Acting on it is what
+            // turned one late close into an endless reconnect storm.
+            //
+            // An inbound event no longer resets the backoff ladder: the new
+            // connection's own `welcome` did, so the ladder could never climb
+            // (defect 2). Only a connection that stays up STABLE_AFTER does.
             let mut saw_down = false;
             match &ev {
-                Some(Ev::SignalingDown(_)) => saw_down = true,
+                Some(Ev::SignalingDown(reason, closed)) => {
+                    if signaling_health::close_is_current(*closed, sio.id()) {
+                        saw_down = true;
+                        down_reason = reason.clone();
+                    } else {
+                        ui::debug(&format!(
+                            "  signaling: ignoring the close of replaced connection {closed} ({reason}); current is {}",
+                            sio.id()
+                        ));
+                    }
+                }
                 Some(
                     Ev::Welcome(_)
                     | Ev::Synced(_)
@@ -2287,9 +2463,7 @@ pub(crate) async fn recv_cmd(
                     | Ev::PairError(_),
                 ) => {
                     last_signaling = Instant::now();
-                    signaling_down_since = None;
-                    probed_silence = false;
-                    reconnect_attempt = 0;
+                    probed_silence = None;
                 }
                 _ => {}
             }
@@ -2298,110 +2472,138 @@ pub(crate) async fn recv_cmd(
             // fires no close callback, so we watch the inbound gap. Once it
             // exceeds the threshold, fire ONE forced `sync` (the heartbeat); if
             // the socket is alive the server's `synced` ack lands within a tick
-            // and resets the gap. If a second threshold passes with still no
-            // event, the socket is dead, declare it down.
+            // and resets the gap. If the probe then goes unanswered for its own
+            // window, the socket is dead, declare it down.
+            //
+            // The probe's window is measured from when it was SENT. It used to
+            // be judged on the inbound gap alone, so after a freeze longer than
+            // twice the threshold the very next loop iteration declared the link
+            // dead before the probe could be answered, and re-dialed while the
+            // old socket's close was still in flight (the storm's seed).
             let silence = net::signaling_silence_ms();
             let silent_ms = last_signaling.elapsed().as_millis() as u64;
             if signaling_down_since.is_none() {
+                let mut declare: Option<String> = None;
                 if saw_down {
-                    signaling_down_since = Some(Instant::now());
-                    last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
-                    // Visible (not just debug): a node dropping off signaling was
-                    // previously silent until it bit someone. Surface it + reflect
-                    // it in `systemctl status` so it's diagnosable at a glance.
-                    ui::say(&ui::paint(
-                        ui::Tone::Warn,
-                        "signaling link closed, reconnecting...",
-                    ));
-                    sdnotify::status("signaling down - reconnecting");
+                    declare = Some(format!("closed ({down_reason})"));
                 } else if silent_ms >= silence {
-                    if !probed_silence {
-                        // Heartbeat probe: an ACK'd `sync` round-trip, the only
-                        // liveness signal that works for a room-less idle
-                        // acceptor. `sess.tick()` can't serve here: it returns
-                        // early when there is no room (the `up` case) AND when
-                        // the session is already confirmed-fresh, so on a quiet
-                        // link it emitted nothing and the watchdog falsely
-                        // reconnected every ~30 s, churning presence. The server
-                        // acks `sync` unconditionally; the ack wakes the loop as
-                        // Ev::SignalingAlive, which resets the gap below.
-                        probed_silence = true;
-                        net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
-                    } else if silent_ms >= silence.saturating_mul(2) {
-                        signaling_down_since = Some(Instant::now());
-                        last_reconnect_try = Instant::now() - Duration::from_secs(60);
-                        // Visible: a silent (half-open) signaling link is the exact
-                        // way a node falls off presence without anyone noticing.
-                        ui::say(&ui::paint(
-                            ui::Tone::Warn,
-                            &format!("signaling silent for {silent_ms}ms, reconnecting..."),
-                        ));
-                        sdnotify::status("signaling silent - reconnecting");
+                    match probed_silence {
+                        None => {
+                            // Heartbeat probe: an ACK'd `sync` round-trip, the only
+                            // liveness signal that works for a room-less idle
+                            // acceptor. `sess.tick()` can't serve here: it returns
+                            // early when there is no room (the `up` case) AND when
+                            // the session is already confirmed-fresh, so on a quiet
+                            // link it emitted nothing and the watchdog falsely
+                            // reconnected every ~30 s, churning presence. The server
+                            // acks `sync` unconditionally; the ack wakes the loop as
+                            // Ev::SignalingAlive, which resets the gap below.
+                            probed_silence = Some(Instant::now());
+                            net::heartbeat(&sio, sess.heartbeat_payload(), tx.clone()).await;
+                        }
+                        Some(sent)
+                            if silent_ms >= silence.saturating_mul(2)
+                                && sent.elapsed() >= signaling_health::PROBE_WINDOW =>
+                        {
+                            declare = Some(format!("silent for {}s", silent_ms / 1000));
+                        }
+                        Some(_) => {}
                     }
+                }
+                if let Some(why) = declare {
+                    let now = Instant::now();
+                    signaling_down_since = Some(now);
+                    // The ladder restarts only if the link that just went down
+                    // had been up long enough to count as stable.
+                    reconnect_attempt = signaling_health::attempt_after_close(
+                        reconnect_attempt,
+                        signaling_up_since.map(|t| now.saturating_duration_since(t)),
+                    );
+                    signaling_up_since = None;
+                    reconnect_wait = signaling_health::reconnect_delay(
+                        reconnect_attempt,
+                        signaling_health::jitter_unit(),
+                    );
+                    last_reconnect_try = now;
+                    signaling_health::note_down(&why);
+                    // Visible (not just debug): a node dropping off signaling was
+                    // previously silent until it bit someone. Collapsed, so a
+                    // link that keeps dropping cannot fill the disk with it.
+                    if let Some(line) = signaling_log.admit(
+                        "down",
+                        &format!("signaling link {why}, reconnecting..."),
+                        now,
+                    ) {
+                        ui::say(&ui::paint(ui::Tone::Warn, &line));
+                    }
+                    sdnotify::status("signaling down - reconnecting");
                 }
             }
 
-            // (3) Re-dial with backoff + jitter. Idempotent: a fresh `welcome`
-            // re-asserts room + channel subscriptions through the C30 session
-            // (sess.invalidate forces it next tick). Live DATA links are NOT torn
-            // down, they ride independent WebRTC/QUIC transports and keep
-            // flowing across the cosmetic signaling reconnect (the #28 contract).
-            if let Some(down_at) = signaling_down_since {
-                // backoff: 0.5s, 1s, 2s, 4s ... capped at 8s, +/-25% jitter.
-                let base = 500u64
-                    .saturating_mul(1 << reconnect_attempt.min(4))
-                    .min(8_000);
-                let jitter = (down_at.elapsed().as_nanos() as u64 % (base / 2 + 1)) as i64
-                    - (base as i64 / 4);
-                let backoff = Duration::from_millis((base as i64 + jitter).max(100) as u64);
-                if last_reconnect_try.elapsed() >= backoff {
-                    last_reconnect_try = Instant::now();
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    let _ = sio.disconnect().await; // drop the dead client (no-op if already gone)
-                    match net::reconnect_signaling(server, tx.clone()).await {
-                        Ok(new_sio) => {
-                            sio = new_sio;
-                            conn.sio = sio.clone();
-                            // C30: a fresh sid voids everything the server held,
-                            // re-assert room + channels on the next tick. Re-fire
-                            // the fast-path join/subscribe immediately too.
-                            sess.invalidate();
-                            if let Some(room) = sess.room.clone() {
-                                sess.emit(
-                                    &sio,
-                                    "join",
-                                    json!({ "room": room, "name": display_name(), "uid": my_uid }),
-                                )
+            // (3) Re-dial with bounded, jittered backoff. Idempotent: a fresh
+            // `welcome` re-asserts room + channel subscriptions through the C30
+            // session (sess.invalidate forces it next tick). Live DATA links are
+            // NOT torn down, they ride independent WebRTC/QUIC transports and
+            // keep flowing across the cosmetic signaling reconnect (the #28
+            // contract).
+            if signaling_down_since.is_some() && last_reconnect_try.elapsed() >= reconnect_wait {
+                last_reconnect_try = Instant::now();
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                reconnect_wait = signaling_health::reconnect_delay(
+                    reconnect_attempt,
+                    signaling_health::jitter_unit(),
+                );
+                // Drop the old client (no-op if already gone). Its close, when
+                // it lands, carries the old id and is ignored above.
+                let _ = sio.disconnect().await;
+                match net::reconnect_signaling(server, tx.clone()).await {
+                    Ok(new_sio) => {
+                        sio = new_sio;
+                        conn.sio = sio.clone();
+                        // C30: a fresh sid voids everything the server held,
+                        // re-assert room + channels on the next tick. Re-fire
+                        // the fast-path join/subscribe immediately too.
+                        sess.invalidate();
+                        if let Some(room) = sess.room.clone() {
+                            sess.emit(
+                                &sio,
+                                "join",
+                                json!({ "room": room, "name": display_name(), "uid": my_uid }),
+                            )
+                            .await;
+                        }
+                        if !sess.channels.is_empty() {
+                            let chans = sess.channels.clone();
+                            sess.emit(&sio, "subscribe", json!({ "channels": chans }))
                                 .await;
-                            }
-                            if !sess.channels.is_empty() {
-                                let chans = sess.channels.clone();
-                                sess.emit(&sio, "subscribe", json!({ "channels": chans }))
-                                    .await;
-                            }
-                            sess.tick(&sio).await;
-                            // optimistic: a clean connect proves reachability; let
-                            // the welcome confirm it (which resets the counters).
-                            last_signaling = Instant::now();
-                            signaling_down_since = None;
-                            probed_silence = false;
-                            // Visible: pairs with the "reconnecting..." line so the
-                            // recovery is observable end to end.
-                            ui::say(&ui::paint(
-                                ui::Tone::Ok,
-                                "signaling reconnected, re-announcing presence",
-                            ));
-                            sdnotify::status("up - serving");
                         }
-                        Err(e) => {
-                            // DEBUG, resilience internal (signaling reconnect retry).
-                            ui::debug(&ui::paint(
-                                ui::Tone::Dim,
-                                &format!(
-                                    "  signaling reconnect failed ({e}), retrying with backoff"
-                                ),
-                            ));
+                        sess.tick(&sio).await;
+                        // optimistic: a clean connect proves reachability.
+                        last_signaling = Instant::now();
+                        signaling_down_since = None;
+                        signaling_up_since = Some(Instant::now());
+                        probed_silence = None;
+                        signaling_health::note_redialed();
+                        // Visible: pairs with the "reconnecting..." line so the
+                        // recovery is observable end to end. Collapsed with it.
+                        if let Some(line) = signaling_log.admit(
+                            "up",
+                            "signaling reconnected, re-announcing presence",
+                            Instant::now(),
+                        ) {
+                            ui::say(&ui::paint(ui::Tone::Ok, &line));
                         }
+                        sdnotify::status("up - serving");
+                    }
+                    Err(e) => {
+                        // DEBUG, resilience internal (signaling reconnect retry).
+                        ui::debug(&ui::paint(
+                            ui::Tone::Dim,
+                            &format!(
+                                "  signaling reconnect failed ({e}), retrying in {}ms",
+                                reconnect_wait.as_millis()
+                            ),
+                        ));
                     }
                 }
             }
@@ -2462,7 +2664,15 @@ pub(crate) async fn recv_cmd(
             let live: Vec<String> = conn
                 .links
                 .iter()
-                .filter(|(_, l)| l.transport.as_ref().is_some_and(|t| t.is_alive()))
+                // Present, not merely open: a relay link to a stopped or wiped
+                // peer stays `is_alive()` while our own keepalive writes keep
+                // succeeding, and touching it here kept that device "last seen
+                // just now" forever. See daemon_ctl::peer_present.
+                .filter(|(_, l)| {
+                    l.transport.as_ref().is_some_and(|t| {
+                        crate::daemon_ctl::peer_present(t.is_alive(), l.direct, t.heard_ms(), t.idle_ms())
+                    })
+                })
                 .map(|(_, l)| l.shown().to_string())
                 .collect();
             for who in live {
@@ -2984,6 +3194,11 @@ pub(crate) async fn recv_cmd(
         }
 
         match ev {
+            // A sid left a channel we watch: forget it from the roster so
+            // warm-hold never dials a departed instance (see on_known_peer_left).
+            Ev::KnownPeerLeft(v) => {
+                conn.on_known_peer_left(&v);
+            }
             // A warm-reuse open found this held link black-holing new streams
             // (zombie: alive at QUIC, dead for data). Drop it so the proactive
             // re-connect forms a fresh, healthy held link and warm-reuse goes
@@ -3104,13 +3319,15 @@ pub(crate) async fn recv_cmd(
                         channel_digest_absent.remove(&pid);
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         conn.drop_link(&pid);
-                        ui::say(&conn.roster(
-                            &pid,
-                            "○",
-                            ui::Tone::Dim,
-                            "left (channel digest reconcile), still listening",
-                            &name,
-                        ));
+                        // A stale duplicate of a peer that is still linked is
+                        // housekeeping, not a departure: it printed "ok alpha
+                        // ○ alpha left (channel digest reconcile), still listening", one
+                        // peer both present and gone, with an internal reason.
+                        if crate::conn::departure_is_news(&name, conn.links.values().map(|l| l.name.as_str())) {
+                            ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left, still listening", &name));
+                        } else {
+                            ui::debug(&format!("dropped a stale duplicate link to '{name}' (channel digest reconcile)"));
+                        }
                     }
                     let peers = roster.peers;
                     digest_alone = peers.is_empty();
@@ -3158,14 +3375,19 @@ pub(crate) async fn recv_cmd(
                         digest_absent.remove(&pid);
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         conn.drop_link(&pid);
-                        ui::say(&conn.roster(
-                            &pid,
-                            "○",
-                            ui::Tone::Dim,
-                            "left (digest reconcile), still listening",
-                            &name,
-                        ));
+                        // A stale duplicate of a peer that is still linked is
+                        // housekeeping, not a departure: it printed "ok alpha
+                        // ○ alpha left (digest reconcile), still listening", one
+                        // peer both present and gone, with an internal reason.
+                        if crate::conn::departure_is_news(&name, conn.links.values().map(|l| l.name.as_str())) {
+                            ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left, still listening", &name));
+                        } else {
+                            ui::debug(&format!("dropped a stale duplicate link to '{name}' (digest reconcile)"));
+                        }
                     }
+                    // The roster itself: a sid absent from two digests is gone
+                    // even when its known-peer-left was lost.
+                    conn.prune_roster_absent(&channel_present, &present);
                 }
             }
             // C29: a code minted in-session (`pair` typed into up).
@@ -3273,7 +3495,15 @@ pub(crate) async fn recv_cmd(
                         .unwrap_or(false);
                     if fresh || link_dead {
                         ui::say(&format!("known device '{n}' appeared, connecting"));
-                        devices_touch(n, None, None); // track last_seen; addresses filled on ChannelReady
+                        // NOT a sighting. This is the server's roster, which it
+                        // re-pushes on every (re)subscribe and sync tick, and
+                        // which can still carry a session the device no longer
+                        // has (a reset device, a killed daemon not yet timed
+                        // out). Touching lastSeen here kept a wiped device at
+                        // "last seen just now" while `add`, reading the same
+                        // record a minute later, said "1m ago". lastSeen moves
+                        // only on a link whose peer is demonstrably present
+                        // (daemon_ctl::peer_present, the liveness observation).
                     } else {
                         ui::trace(&format!(
                             "known device '{n}' re-announced (link already up)"
@@ -3796,6 +4026,8 @@ pub(crate) async fn recv_cmd(
                             .and_then(|l| l.expected_secret.as_ref().map(|(n, _)| n.clone())),
                     ));
                 }
+                // H1: a DataChannel's binding folds in its DTLS fingerprints.
+                let link_fps = link_fingerprints(&conn, &pid).await;
                 if !fleet_verified.contains(&pid)
                     && fleet::rv().is_some()
                     && (fleet_pending.contains(&pid) || fleet_shaped_link(&conn, &pid))
@@ -3803,7 +4035,7 @@ pub(crate) async fn recv_cmd(
                     // Mark it, so the L3 gate and the drop-cleanup track this link
                     // even when it arrived via warm-hold rather than presence.
                     fleet_pending.insert(pid.clone());
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         match fleet::make_hello(&cb, &display_name()) {
                             Ok(hello) => {
                                 fleet_greeted.insert(pid.clone());
@@ -3815,12 +4047,12 @@ pub(crate) async fn recv_cmd(
                 }
                 #[cfg(l3)]
                 if let Some(l3) = l3.as_ref() {
-                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                    if let Some(cb) = out_binding(&t, &pid, &bind_theirs, link_fps.as_ref()) {
                         if let Some(ann) = l3.make_announce(&cb) {
                             let _ = t.send_control(&ann.to_json()).await;
                         }
                     }
-                    if let Some(cb) = in_binding(&t, &pid, &bind_ours) {
+                    if let Some(cb) = in_binding(&t, &pid, &bind_ours, link_fps.as_ref()) {
                         if let Some(pending) = l3_seen.get(&pid) {
                             if let Ok(ip) = pending.verify(&cb) {
                                 // Seq check AFTER verify, never before, so an
@@ -3855,7 +4087,7 @@ pub(crate) async fn recv_cmd(
                     ui::say(&format!(
                         "  {} {}",
                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.shown())
+                        ui::paint(ui::Tone::Bold, l.label())
                     ));
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
@@ -3960,48 +4192,6 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
-                // C29: an in-session pairing, exactly one side hands over a
-                // secret; consent (pair-keep-ack / our store) completes it.
-                // Only links that aren't ALREADY known are candidates.
-                // "No pair secret" USED to mean "a peer we have never met", which
-                // is what makes a link a candidate for the in-session ceremony.
-                // Fleet auto-mesh broke that: a sibling whose direct dial fell
-                // back to WebRTC also has no pair secret, and it would consume the
-                // code the human just typed, handing the ceremony secret to a
-                // device we already know and leaving the intended one unpaired.
-                // A fleet peer is never a pairing candidate.
-                let fresh_link = conn
-                    .link(&pid)
-                    .map(|l| l.expected_secret.is_none())
-                    .unwrap_or(false)
-                    && !fleet_pending.contains(&pid)
-                    && !fleet_verified.contains(&pid);
-                if fresh_link {
-                    match ceremony {
-                        Some(true) => {
-                            // we minted the code, initiate now
-                            ceremony = None;
-                            ceremony_pid = Some(pid.clone());
-                            t.send_control(
-                                &json!({ "type": "pair-keep", "secret": ceremony_secret }),
-                            )
-                            .await
-                            .ok();
-                        }
-                        Some(false) => {
-                            // we claimed, give a CLI creator 3 s to initiate
-                            // (browsers never do), then take over.
-                            let tx = tx.clone();
-                            let pid = pid.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(3)).await;
-                                let _ =
-                                    tx.send(Ev::Control(pid, json!({ "type": "__pair_fallback" })));
-                            });
-                        }
-                        None => {}
-                    }
-                }
             }
             Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str()) {
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
@@ -4028,7 +4218,10 @@ pub(crate) async fn recv_cmd(
                         Some(Ok(nonce)) if nonce.len() >= 16 => {
                             bind_theirs.insert(pid.clone(), nonce);
                             if let Some(t) = conn.transport_of(&pid) {
-                                if let Some(cb) = out_binding(&t, &pid, &bind_theirs) {
+                                let link_fps = link_fingerprints(&conn, &pid).await;
+                                if let Some(cb) =
+                                    out_binding(&t, &pid, &bind_theirs, link_fps.as_ref())
+                                {
                                     #[cfg(l3)]
                                     if let Some(l3) = l3.as_ref() {
                                         if let Some(ann) = l3.make_announce(&cb) {
@@ -4065,9 +4258,10 @@ pub(crate) async fn recv_cmd(
                 // owner key, and both naming the same device key. Anything less
                 // and the link stays unverified, so it never gains a route.
                 Some(fleet::HELLO) => {
+                    let link_fps = link_fingerprints(&conn, &pid).await;
                     let cb = conn
                         .transport_of(&pid)
-                        .and_then(|t| in_binding(&t, &pid, &bind_ours));
+                        .and_then(|t| in_binding(&t, &pid, &bind_ours, link_fps.as_ref()));
                     let owner = fleet::my_owner_pub();
                     match (cb, owner) {
                         (Some(cb), Some(owner)) => {
@@ -4347,8 +4541,10 @@ pub(crate) async fn recv_cmd(
                             l3_seen.insert(pid.clone(), ann.clone());
                             // Try to process immediately if transport is available.
                             if let Some(l3) = l3.as_ref() {
+                                let link_fps = link_fingerprints(&conn, &pid).await;
                                 match conn.transport_of(&pid).and_then(|t| {
-                                    in_binding(&t, &pid, &bind_ours).map(|cb| (t, cb))
+                                    in_binding(&t, &pid, &bind_ours, link_fps.as_ref())
+                                        .map(|cb| (t, cb))
                                 }) {
                                     Some((t, cb)) => match ann.verify(&cb) {
                                         Ok(ip) => {
@@ -4832,13 +5028,18 @@ pub(crate) async fn recv_cmd(
                             dpub.as_slice().try_into().map(|a: &[u8; 32]| *a),
                             sig.as_slice().try_into().map(|a: &[u8; 64]| *a),
                         ) {
-                            if crate::identity::verify_possession_sig(
-                                &dpub_arr,
-                                msg.as_bytes(),
-                                &sig_arr,
-                            )
-                            .is_ok()
+                            // The message must be EXACTLY the depart text for
+                            // this key (rebuilt here, never trusted from the
+                            // wire); a valid signature over anything else is a
+                            // different statement and must not lapse the device.
+                            if let Err(why) =
+                                crate::membership::verify_depart(&dpub_arr, msg, &sig_arr)
                             {
+                                ui::say(&format!(
+                                    "{} refused a depart request from {pid}: {why}",
+                                    ui::paint(ui::Tone::Warn, "!")
+                                ));
+                            } else {
                                 if let Some(name) = mark_lapsed_now(&dpub_arr) {
                                     ui::say(&format!(
                                         "{} {name} departed; slot freed immediately",
@@ -4895,6 +5096,15 @@ pub(crate) async fn recv_cmd(
                 // healthy link was dropped as a zombie and replaced by a cold one.
                 // Same defect as the `l2-close` guard in handle_forward_open, one
                 // arm away; the mux only acts on an ack for a sid it opened.
+                // `reach` liveness: answer a peer's ping on this link, and wake
+                // our own waiting probe when its pong comes back. Not gated on
+                // L2: it opens nothing and only proves this end is here.
+                Some("reach-ping") => {
+                    if let Some(t) = conn.transport_of(&pid) {
+                        let _ = t.send_control(&crate::daemon_ctl::liveness_pong(&v)).await;
+                    }
+                }
+                Some("reach-pong") => crate::daemon_ctl::liveness_answered(&v),
                 Some("l2-open-ack") => {
                     if let Some(sid) = l2::wire_sid(&v) {
                         if let Some(mux) = l2_muxes.get(&pid) {
@@ -4976,28 +5186,22 @@ pub(crate) async fn recv_cmd(
                 // (#206), so the client gets a clean, immediate, explained close
                 // instead of a hang.
                 Some("l2-open") if !l2_enabled => {
-                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "l2-close",
-                                "sid": sid,
-                                "err": crate::capability::TUNNEL_OFF_REASON,
-                            }))
-                            .await;
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
+                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::TunnelOff, who);
+                        let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
                 }
                 // exec-open when serving is off: refuse loudly like l2-open, so
                 // the caller errors instead of hanging on a silent drop.
                 Some("exec-open") if !l2_enabled => {
-                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "l2-close",
-                                "sid": sid,
-                                "err": crate::capability::SHELL_OFF_REASON,
-                            }))
-                            .await;
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), l2::wire_sid(&v)) {
+                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                        let _ = t.send_control(&refusal.close_frame(sid)).await;
                     }
                     continue;
                 }
@@ -5018,12 +5222,15 @@ pub(crate) async fn recv_cmd(
                 #[cfg(unix)]
                 Some("shell-bootstrap") if !l2_enabled => {
                     if let Some(t) = conn.transport_of(&pid) {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "shell-bootstrap-deny",
-                                "reason": crate::capability::SHELL_OFF_REASON,
-                            }))
-                            .await;
+                        let who = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                        let refusal =
+                            crate::refusal::Refusal::new(crate::refusal::Code::ShellOff, who);
+                        let mut f = json!({
+                            "type": "shell-bootstrap-deny",
+                            "reason": refusal.reason,
+                        });
+                        refusal.annotate(&mut f);
+                        let _ = t.send_control(&f).await;
                     }
                     continue;
                 }
@@ -5132,12 +5339,21 @@ pub(crate) async fn recv_cmd(
                             granted.deny_reason("no shell cap / untrusted")
                         ));
                         enqueue_if_requestable(who, "shell");
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "shell-bootstrap-deny",
-                                "reason": "shell capability not granted"
-                            }))
-                            .await;
+                        let cap_reason = granted.deny_reason("");
+                        let refusal = crate::refusal::Refusal::from_shell_gate(
+                            false,
+                            dev.as_deref()
+                                .map(|n| device_capability_denied(n, "shell"))
+                                .unwrap_or(false),
+                            (!cap_reason.is_empty()).then_some(cap_reason),
+                            dev.clone(),
+                        );
+                        let mut f = json!({
+                            "type": "shell-bootstrap-deny",
+                            "reason": refusal.reason,
+                        });
+                        refusal.annotate(&mut f);
+                        let _ = t.send_control(&f).await;
                         continue;
                     }
                     let device = dev.unwrap();
@@ -5157,7 +5373,7 @@ pub(crate) async fn recv_cmd(
                     // AND again inside install_authorized_key (defense in depth).
                     if cert_only {
                         let hostkeys = sshkeys::host_pubkeys();
-                        let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                        let login = platform::current_username().unwrap_or_else(|| "root".into());
                         let ssh_port = v["ssh_port"]
                             .as_u64()
                             .and_then(|n| u16::try_from(n).ok())
@@ -5196,7 +5412,7 @@ pub(crate) async fn recv_cmd(
                     match sshkeys::install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
-                            let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                            let login = platform::current_username().unwrap_or_else(|| "root".into());
                             // Tell the initiator whether an sshd is actually
                             // listening on the port `tunlion shell --ssh` will dial here,
                             // so it can fail fast with a clear message instead of
@@ -5269,6 +5485,7 @@ pub(crate) async fn recv_cmd(
                         mux,
                         &v,
                         &shell_policy,
+                        &shell_user,
                         &mut parked_opens,
                     )
                     .await;
@@ -5341,13 +5558,21 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    // Decode the requested root up front: the fleet mount scope
-                    // (read-only, within the share root) is decided at the gate.
+                    // Decode the requested root up front and CONFINE it to the
+                    // share root (mount_gate.rs): a relative root resolves
+                    // against the share root, and anything that lands outside
+                    // it (`/`, `..`, a symlink out) is refused below in BOTH
+                    // modes. The peer names a path; only the owner's `share`
+                    // setting decides what is servable.
                     let root_encoded = v["root"].as_str().unwrap_or(".");
-                    let root_path = mount_proto::path_decode(root_encoded)
+                    let requested_root = mount_proto::path_decode(root_encoded)
                         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let within_share =
-                        crate::path_within_canonical(&crate::fleet_share_root(), &root_path);
+                    let confined_root = crate::mount_gate::confine_mount_root(
+                        &crate::fleet_share_root(),
+                        &requested_root,
+                    );
+                    let within_share = confined_root.is_some();
+                    let verified = conn.link(&pid).and_then(|l| l.verified_name.clone());
                     // Capability layer for mount evaluated unconditionally (shadow
                     // samples the legacy-allowed population); legacy (trusted) stands
                     // in shadow, cap gates under FILAMENT_CAP_AUTHORITATIVE.
@@ -5403,10 +5628,28 @@ pub(crate) async fn recv_cmd(
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
-                        // No deny list is consulted on the mount path today;
-                        // false preserves that exactly.
-                        let d = crate::capability::cap_gate_effective(
+                        // The legacy input, which IS the verdict in shadow mode:
+                        // a trusted link is not enough, the device must hold
+                        // `mount` (record grant or owner-signed grant) and carry
+                        // no recorded deny. Before this it was `trusted` alone,
+                        // so a transfer-only device got a read-write mount.
+                        let (record_grants, denied) = verified
+                            .as_deref()
+                            .map(|n| {
+                                (
+                                    device_allows(n, crate::capability::CAP_MOUNT),
+                                    device_capability_denied(n, crate::capability::CAP_MOUNT),
+                                )
+                            })
+                            .unwrap_or((false, false));
+                        let legacy_ok = crate::mount_gate::mount_legacy_allowed(
                             trusted,
+                            record_grants,
+                            has_grant,
+                            denied,
+                        );
+                        let d = crate::capability::cap_gate_effective(
+                            legacy_ok,
                             &outcome,
                             crate::capability::CAP_MOUNT,
                             "self",
@@ -5419,7 +5662,7 @@ pub(crate) async fn recv_cmd(
                             mount_scoped_default,
                             has_grant,
                             cert_revoked,
-                            false,
+                            denied,
                             false,
                         );
                         (d, read_only)
@@ -5441,6 +5684,16 @@ pub(crate) async fn recv_cmd(
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: mount capability required" })).await;
                         continue;
                     }
+                    let Some(root_path) = confined_root else {
+                        let who = verified.clone().unwrap_or_else(|| "<unverified>".into());
+                        ui::say(&format!(
+                            "mount: refused for '{who}': {} is outside the share root {} (set `share` in the config to serve another directory)",
+                            requested_root.display(),
+                            crate::fleet_share_root().display()
+                        ));
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: path is outside the share root" })).await;
+                        continue;
+                    };
                     let mut caps = mount_proto::mount_caps_for_root(&root_path);
                     // A read-only fleet share advertises zero writable size so a
                     // well-behaved client sees it is read-only; the server also
@@ -5562,38 +5815,46 @@ pub(crate) async fn recv_cmd(
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
-                        let kept = if let Some(name) = &remember {
-                            devices_store(name, &sec)?;
-                            ui::say(&format!(
-                                "remembered this device as '{name}', future sends auto-accept after proof"
-                            ));
-                            true
-                        } else if ceremony == Some(false) {
-                            // C29: we typed their code into this session, the
-                            // creator initiated first; that's our ceremony.
-                            ceremony = None;
-                            let n = conn
-                                .link(&pid)
-                                .map(|l| l.name.clone())
-                                .unwrap_or_else(|| "device".into());
-                            devices_store(&n, &sec)?;
-                            devices.push((n.clone(), sec.clone()));
-                            sess.channels.push(channel_of(&sec)); // C30: desire grows; session repairs
-                            sess.touch();
-                            sio.emit("subscribe", json!({ "channels": [channel_of(&sec)] }))
-                                .await
-                                .ok();
-                            ui::say(&format!(
-                                "  {} {} mutually remembered, rename anytime: tunlion devices rename {n} <new>",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                                ui::paint(ui::Tone::Bold, &n),
-                            ));
-                            true
-                        } else {
-                            ui::say(
-                                "(sender offered to be remembered; re-run with --remember <name> to keep it)",
-                            );
-                            false
+                        // A secret is remembered ONLY from the peer whose code
+                        // ceremony confirmed on this receive: `--remember` means
+                        // "remember the device I typed the code from", so the
+                        // SPAKE2-bound peer is the only one it can name. Any other
+                        // link (a room peer, a second candidate, a link whose DTLS
+                        // the signaling server chose) is refused. And the secret
+                        // always lands in a NEW record: a peer can never re-key
+                        // an existing device by naming it.
+                        let ceremony_peer = recv_code_path
+                            && recv_pake_done
+                            && conn.is_bound_active_peer(&pid);
+                        let kept = match (&remember, ceremony_peer) {
+                            (Some(name), true) => match devices_store(name, &sec) {
+                                Ok(stored) => {
+                                    ui::say(&format!(
+                                        "remembered this device as '{stored}', future sends auto-accept after proof"
+                                    ));
+                                    true
+                                }
+                                Err(e) => {
+                                    ui::say(&ui::paint(
+                                        ui::Tone::Warn,
+                                        &format!("  not remembered: {e}"),
+                                    ));
+                                    false
+                                }
+                            },
+                            (Some(_), false) => {
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Warn,
+                                    "ignored a remember offer from a peer that is not this code's sender",
+                                ));
+                                false
+                            }
+                            (None, _) => {
+                                ui::say(
+                                    "(sender offered to be remembered; re-run with --remember <name> to keep it)",
+                                );
+                                false
+                            }
                         };
                         // C27: answer either way, a declined sender discards
                         // its half instead of waving at a dead meeting point.
@@ -5601,57 +5862,6 @@ pub(crate) async fn recv_cmd(
                             t.send_control(&json!({ "type": "pair-keep-ack", "ok": kept }))
                                 .await
                                 .ok();
-                        }
-                    }
-                }
-                // C29: claimer fallback, the creator never initiated
-                // (browsers don't); hand over OUR secret instead.
-                Some("__pair_fallback") => {
-                    if ceremony == Some(false) {
-                        ceremony = None;
-                        ceremony_pid = Some(pid.clone());
-                        if let Some(t) = conn.transport_of(&pid) {
-                            t.send_control(
-                                &json!({ "type": "pair-keep", "secret": ceremony_secret }),
-                            )
-                            .await
-                            .ok();
-                        }
-                    }
-                }
-                // C29: their answer to OUR in-session remember offer.
-                Some("pair-keep-ack") => {
-                    if ceremony_pid.as_deref() == Some(pid.as_str()) {
-                        ceremony_pid = None;
-                        let n = conn
-                            .link(&pid)
-                            .map(|l| l.name.clone())
-                            .unwrap_or_else(|| "device".into());
-                        if v["ok"].as_bool() == Some(false) {
-                            ui::say(&conn.roster(
-                                &pid,
-                                ui::glyph_err(),
-                                ui::Tone::Warn,
-                                "declined to be remembered, nothing stored",
-                                &n,
-                            ));
-                        } else {
-                            devices_store(&n, &ceremony_secret)?;
-                            devices.push((n.clone(), ceremony_secret.clone()));
-                            sess.channels.push(channel_of(&ceremony_secret)); // C30
-                            sess.touch();
-                            sio.emit(
-                                "subscribe",
-                                json!({ "channels": [channel_of(&ceremony_secret)] }),
-                            )
-                            .await
-                            .ok();
-                            ceremony_secret = fresh_secret(); // never reuse across devices
-                            ui::say(&format!(
-                                "  {} {} mutually remembered, rename anytime: tunlion devices rename {n} <new>",
-                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                                ui::paint(ui::Tone::Bold, &n),
-                            ));
                         }
                     }
                 }
@@ -5750,13 +5960,49 @@ pub(crate) async fn recv_cmd(
                 }
                 Some("pair-intro") => {
                     // C19/C20: only a fingerprint-verified known device may
-                    // vouch new trust into this store.
+                    // vouch new trust into this store. "Verified" means the
+                    // link resolved to one of OUR records by its pair secret
+                    // (`verified_name`), and that record was paired directly:
+                    // a device that was itself introduced cannot introduce in
+                    // turn, so a vouch is always one hop from a device the
+                    // owner paired. The vouched secret always becomes a NEW
+                    // record (suffixed on a name clash, refused if any record
+                    // already holds that secret): a hub can never re-key an
+                    // existing device and inherit its grants by naming it.
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     let iname = v["name"].as_str().unwrap_or_default().to_string();
                     let isec = v["secret"].as_str().unwrap_or_default().to_string();
                     let hub = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                    if trusted && isec.len() == 64 && !iname.is_empty() {
-                        devices_store(&iname, &isec)?;
+                    let hub_record = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    let may_vouch = trusted
+                        && hub_record
+                            .as_deref()
+                            .is_some_and(|h| !crate::devices_store::device_was_introduced(h));
+                    let stored = if may_vouch && isec.len() == 64 && !iname.is_empty() {
+                        match crate::devices_store::devices_store_new(
+                            &iname,
+                            &isec,
+                            hub_record.as_deref(),
+                        ) {
+                            Ok(stored) => Some(stored),
+                            Err(e) => {
+                                ui::say(&ui::paint(
+                                    ui::Tone::Warn,
+                                    &format!("  ignored pair-intro from {hub}: {e}"),
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        if !may_vouch {
+                            ui::say(&ui::paint(
+                                ui::Tone::Warn,
+                                &format!("  ignored pair-intro from unverified peer {hub}"),
+                            ));
+                        }
+                        None
+                    };
+                    if let Some(iname) = stored {
                         devices.push((iname.clone(), isec.clone()));
                         sess.channels.push(channel_of(&isec)); // C30
                         sess.touch();
@@ -5789,11 +6035,6 @@ pub(crate) async fn recv_cmd(
                                 let _ = t.send_control(&challenge).await;
                             }
                         }
-                    } else {
-                        ui::say(&ui::paint(
-                            ui::Tone::Warn,
-                            &format!("  ignored pair-intro from unverified peer {hub}"),
-                        ));
                     }
                 }
                 Some("identity-nonce-challenge") => {
@@ -5930,7 +6171,11 @@ pub(crate) async fn recv_cmd(
                                                                                 l.identity_binding = crate::capability::BindingStrength::Proven;
                                                                                 l.identity_cert_expires = Some(cert.expires);
                                                                             }
-                                                                            ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), pid));
+                                                                            // The peer by name, not its raw signaling id.
+                                                                            let who = conn.link(&pid).map(|l| l.label().to_string()).unwrap_or_else(|| pid.to_string());
+                                                                            let line = format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), who);
+                                                                            // A raw id is an internal: -v only.
+                                                                            if who.as_str() == &pid[..] { ui::debug(&line) } else { ui::say(&line) }
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
                     }
@@ -6287,6 +6532,9 @@ pub(crate) async fn recv_cmd(
                     if !ok {
                         if !daemon && std::io::stdin().is_terminal() && xfer_deny_reason.is_none() {
                             st.pending.push_back((pid.clone(), v.clone()));
+                            // The sender's no-answer timeout must not fire on a
+                            // person who is still deciding; tell it so.
+                            let _ = t.send_control(&protocol::pending_msg(&id)).await;
                             st.question_open
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                             if st.pending.len() == 1 {
@@ -6399,6 +6647,15 @@ pub(crate) async fn recv_cmd(
                         }
                         #[cfg(unix)]
                         {
+                            let out = out.into_std().await;
+                            // A pipe cannot seek, so stdout gets an in-order
+                            // writer (StdoutSink) instead of positional writes,
+                            // which failed every `-o - | reader` with ESPIPE. It
+                            // hashes what it writes, so the stream is verified
+                            // against the offered digest and acked like a file.
+                            let sink = Arc::new(std::sync::Mutex::new(
+                                crate::recv_files::StdoutSink::new(out.try_clone()?),
+                            ));
                             st.by_sid.insert(
                                 (pid.clone(), sid),
                                 IncomingFile {
@@ -6407,20 +6664,68 @@ pub(crate) async fn recv_cmd(
                                     size,
                                     received: Arc::new(AtomicU64::new(0)),
                                     ranges: Arc::new(std::sync::Mutex::new(vec![])),
-                                    file: Arc::new(out.into_std().await),
+                                    file: Arc::new(out),
                                     part_path: PathBuf::new(),
-                                    // Pipe mode streams to a fd we can't re-read, so we
-                                    // can't recompute the digest, no verify, no ack
-                                    // (the sender's bounded fallback covers it).
-                                    full: None,
+                                    full: offer_full.clone(),
                                     inflight: Arc::new(AtomicI64::new(0)),
                                     end_seen: Arc::new(AtomicBool::new(false)),
                                     ack_sid: 0,
                                     last_tick: 0,
                                     bar: ui::Progress::new("(stdout)", size),
+                                    write_err: Arc::new(std::sync::Mutex::new(None)),
+                                    stdout: Some(sink),
                                 },
                             );
-                            t.send_control(&protocol::accept_msg(&id, 0)).await?;
+                            // Ask for ONE in-order stream: split across parallel
+                            // links, the second half would have to be held in
+                            // memory until the first had been written. An older
+                            // sender ignores this and the sink holds a bounded
+                            // amount instead. Stdout cannot resume, so offset 0.
+                            let mut accept = protocol::accept_msg(&id, 0);
+                            accept["sequential"] = json!(true);
+                            t.send_control(&accept).await?;
+                            continue;
+                        }
+                    }
+                    // The inbox may have been deleted while this ran: recreate it,
+                    // or refuse with that reason (not "No such file or directory").
+                    match crate::recv_files::ensure_inbox(&dir) {
+                        Ok(true) => ui::say(&ui::paint(
+                            ui::Tone::Warn,
+                            &format!("  the inbox {} was missing; recreated it", dir.display()),
+                        )),
+                        Ok(false) => {}
+                        Err(e) => {
+                            let (token, msg) = crate::recv_files::inbox_refusal(&dir, &name, &e);
+                            ui::critical(&ui::paint(
+                                ui::Tone::Err,
+                                &format!("  refused {name} from {sender_name}: {msg}"),
+                            ));
+                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            continue;
+                        }
+                    }
+                    // Refuse up front what cannot fit. Discovering ENOSPC half way
+                    // through used to read as a CORRUPT file ("checksum still wrong
+                    // after 3 re-fetches") on this side and "the receiver may have
+                    // gotten nothing" on the sender's, when the truth was one line:
+                    // the disk is full. Unknown free space (a platform that cannot
+                    // say) accepts, and a write that then fails is caught below.
+                    let need = size.saturating_sub(offset);
+                    if let Some(free) = platform::free_space(&dir) {
+                        if free < need {
+                            let (token, msg) = crate::recv_files::storage_refusal(
+                                Some(platform::StorageFailure::NoSpace),
+                                &name,
+                                "",
+                                Some(need),
+                                Some(free),
+                            );
+                            ui::critical(&ui::paint(
+                                ui::Tone::Err,
+                                &format!("  refused {name} from {sender_name}: {msg}"),
+                            ));
+                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                             continue;
                         }
                     }
@@ -6444,9 +6749,20 @@ pub(crate) async fn recv_cmd(
                         match safe_resume_part(&part_path).await {
                             Ok(f) => f,
                             Err(e) => {
-                                ui::debug(&format!(
-                                    "{name}: cannot open .part to resume, declining: {e}"
+                                // Typed refusal, never silence: a decline the sender
+                                // never hears about is a sender that waits forever.
+                                let (token, msg) = crate::recv_files::storage_refusal(
+                                    platform::storage_failure(&e),
+                                    &name,
+                                    &e.to_string(),
+                                    None,
+                                    None,
+                                );
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  refused {name} from {sender_name}: {msg}"),
                                 ));
+                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
                         }
@@ -6460,25 +6776,42 @@ pub(crate) async fn recv_cmd(
                         // not its target); a symlink planted in the gap still trips
                         // O_EXCL and is declined below, not followed.
                         let _ = std::fs::remove_file(&part_path);
-                        if let Err(e) = (PartMeta {
+                        let created = match (PartMeta {
                             size,
                             head: offer_head,
                             full: effective_full.clone(),
                         }
                         .store(&meta_path))
                         {
-                            ui::debug(&format!("{name}: cannot write .part.meta, declining: {e}"));
-                            continue;
-                        }
-                        match safe_create_part(&part_path).await {
+                            Ok(()) => safe_create_part(&part_path).await,
+                            Err(e) => Err(e),
+                        };
+                        match created {
                             Ok(f) => f,
                             Err(e) => {
-                                ui::debug(&format!("{name}: cannot create .part, declining: {e}"));
+                                // The create failed (disk full, a name the filesystem
+                                // refuses, a read-only or unwritable folder). This used
+                                // to be a debug line and a silent `continue`, so the
+                                // sender re-offered forever. Say why, to both ends.
+                                crate::recv_files::discard_partial(&part_path);
+                                let (token, msg) = crate::recv_files::storage_refusal(
+                                    platform::storage_failure(&e),
+                                    &name,
+                                    &e.to_string(),
+                                    None,
+                                    None,
+                                );
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  refused {name} from {sender_name}: {msg}"),
+                                ));
+                                t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
                                 continue;
                             }
                         }
                     };
                     let bar = ui::Progress::new(&name, size);
+                    crate::transfer_truth::note_part(&mut session_parts, &name, &part_path, size);
                     let file = Arc::new(file.into_std().await);
                     let received = Arc::new(AtomicU64::new(offset));
                     let ranges = Arc::new(std::sync::Mutex::new(if offset > 0 {
@@ -6502,9 +6835,66 @@ pub(crate) async fn recv_cmd(
                             ack_sid: 0,
                             last_tick: 0,
                             bar,
+                            write_err: Arc::new(std::sync::Mutex::new(None)),
+                            stdout: None,
                         },
                     );
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
+                }
+                // The sender could not read its own source part way through: the
+                // partial here can never be completed from it, so it is removed,
+                // never kept as junk (`unread`, `unread.part`, `unread.part.meta`
+                // were left behind before this message existed).
+                Some("file-cancel") => {
+                    let id = v["id"].as_str().unwrap_or_default().to_string();
+                    let reason: String = v["reason"]
+                        .as_str()
+                        .unwrap_or("the sender cancelled it")
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(300)
+                        .collect();
+                    let keys: Vec<(String, u32)> = st
+                        .by_sid
+                        .iter()
+                        .filter(|((p, _), inc)| *p == pid && inc.id == id)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    let remove_part = |part: &Path| {
+                        let _ = std::fs::remove_file(part);
+                        let mut meta = part.as_os_str().to_owned();
+                        meta.push(".meta");
+                        let _ = std::fs::remove_file(PathBuf::from(meta));
+                    };
+                    // The stream may already be parked (the sender's leave can
+                    // land first and flush it out of the table), so the partial
+                    // is also found by the name it was offered under.
+                    let mut names: Vec<String> = Vec::new();
+                    for k in keys {
+                        if let Some(inc) = st.by_sid.remove(&k) {
+                            if !to_stdout {
+                                remove_part(inc.part_path.as_path());
+                            }
+                            names.push(inc.name.clone());
+                        }
+                    }
+                    if names.is_empty() && !to_stdout {
+                        if let Some(raw) = v["name"].as_str() {
+                            let name = safe_incoming_name(raw);
+                            let part = dir.join(format!("{name}.part"));
+                            if part.is_file() {
+                                remove_part(part.as_path());
+                                names.push(name);
+                            }
+                        }
+                    }
+                    for name in names {
+                        ui::critical(&ui::paint(
+                            ui::Tone::Warn,
+                            &format!("  {name}: the sender cancelled it ({reason}); its partial was removed"),
+                        ));
+                        sender_cancelled = Some(format!("{name}: {reason}"));
+                    }
                 }
                 Some("file-end") => {
                     // Test hook (gate 18 standalone repro): drop the file-end
@@ -6546,10 +6936,23 @@ pub(crate) async fn recv_cmd(
                     })
                     .await;
                     if to_stdout {
+                        stdout_delivered(&inc, &conn, &pid, sid).await?;
                         st.completed += 1;
                         continue;
                     }
                     let id = inc.id.clone();
+                    // A write already failed (disk full, read-only): that is the
+                    // answer, not a checksum mismatch to re-fetch three times.
+                    let failed = inc.write_err.lock().unwrap().clone();
+                    if let Some(wf) = failed {
+                        st.verify_fails.remove(&id);
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                        continue;
+                    }
                     if inc.full.is_some() {
                         let verdict = verify_incoming(&inc).await;
                         match verdict {
@@ -6606,9 +7009,19 @@ pub(crate) async fn recv_cmd(
                                         ));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
-                                            .send_control(&protocol::delivery_ack_msg(&id, sid))
+                                            .send_control(&crate::recv_files::delivery_ack(&id, sid))
                                             .await;
-                                        let _ = t.flush().await;
+                                        // BOUNDED: this runs inline in the event
+                                        // loop. The ack is already queued and goes
+                                        // out on its own; the flush only waits for
+                                        // the peer to acknowledge it, and a sender
+                                        // that reads the ack and exits never does.
+                                        // Unbounded, that parked the whole loop, so
+                                        // the receiver never saw the peer-left that
+                                        // ends it and held the finished file until
+                                        // its timeout (gate 11c, G-k).
+                                        let _ = tokio::time::timeout(ACK_FLUSH_BUDGET, t.flush())
+                                            .await;
                                         ui::say(&ui::paint(
                                             ui::Tone::Dim,
                                             &format!(
@@ -6702,10 +7115,23 @@ pub(crate) async fn recv_cmd(
                 };
                 if let Some(mut inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                     if to_stdout {
+                        stdout_delivered(&inc, &conn, &pid, ack_sid).await?;
                         st.completed += 1;
                         continue;
                     }
                     let id = inc.id.clone();
+                    // A write already failed (disk full, read-only): that is the
+                    // answer, not a checksum mismatch to re-fetch three times.
+                    let failed = inc.write_err.lock().unwrap().clone();
+                    if let Some(wf) = failed {
+                        st.verify_fails.remove(&id);
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                        continue;
+                    }
                     if inc.full.is_some() {
                         let verdict = verify_incoming(&inc).await;
                         match verdict {
@@ -6762,7 +7188,7 @@ pub(crate) async fn recv_cmd(
                                         ));
                                     } else if let Some(t) = conn.transport_of(&pid) {
                                         let _ = t
-                                            .send_control(&protocol::delivery_ack_msg(&id, ack_sid))
+                                            .send_control(&crate::recv_files::delivery_ack(&id, ack_sid))
                                             .await;
                                         ui::say(&ui::paint(
                                             ui::Tone::Dim,
@@ -6853,6 +7279,27 @@ pub(crate) async fn recv_cmd(
                 // its output dropped as "unknown sid" otherwise, and the
                 // verify then misreports a granted session as refused). The
                 // mux-map miss below still drops anything truly unknown.
+                // A write to this file already failed: stop taking its bytes and
+                // tell the sender why, now, instead of letting it stream the rest
+                // into a disk that cannot hold it.
+                let failed = if l2::is_l2_sid(sid) {
+                    None
+                } else {
+                    st.by_sid
+                        .get(&(pid.clone(), sid))
+                        .and_then(|inc| inc.write_err.lock().unwrap().clone())
+                };
+                if let Some(wf) = failed {
+                    if let Some(inc) = st.by_sid.remove(&(pid.clone(), sid)) {
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        st.verify_fails.remove(&inc.id);
+                        let (fid, token, msg) = refuse_failed_write(inc, &dir, &wf, &from);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let _ = t.send_control(&protocol::refuse_msg(&fid, token, &msg)).await;
+                        }
+                    }
+                    continue;
+                }
                 if l2::is_l2_sid(sid) {
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.on_frame(sid, data).await;
@@ -6878,12 +7325,29 @@ pub(crate) async fn recv_cmd(
                             continue;
                         }
                     };
+                    // The peer chose both the offset and the length. Nothing it
+                    // writes may land past the size it offered (a sparse file of
+                    // any size is otherwise one frame away), and the coverage
+                    // list must stay bounded (every disjoint chunk adds a range).
+                    if !chunk_fits_offer(pos, data.len(), inc.size)
+                        || inc.ranges.lock().map(|r| r.len()).unwrap_or(usize::MAX)
+                            >= MAX_RECV_RANGES
+                    {
+                        ui::debug(&format!(
+                            "  refusing chunk for sid {sid} from {pid}: {} bytes at {pos} is outside the offered {} bytes or too fragmented",
+                            data.len(),
+                            inc.size
+                        ));
+                        continue;
+                    }
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
+                    let stdout_sink = inc.stdout.clone();
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
                     let ranges = Arc::clone(&inc.ranges);
                     let received = Arc::clone(&inc.received);
+                    let write_err = Arc::clone(&inc.write_err);
                     let tx = tx.clone();
                     let pid_c = pid.clone();
                     let data_len = data.len();
@@ -6899,10 +7363,23 @@ pub(crate) async fn recv_cmd(
                         // print that itself, which put terminal output inside the
                         // byte-writing primitive. The primitive returns the fact
                         // now and the decision to report it lives out here.
-                        let wrote = pwrite_at(&file, &data, pos);
-                        if let Err(_e) = &wrote {
-                            // Write failed: do NOT record coverage (leaves the gap).
-                            // The whole-file digest will fail and trigger a re-fetch.
+                        // `-o -` writes in order instead: stdout may be a pipe.
+                        let wrote = match &stdout_sink {
+                            Some(sink) => crate::recv_files::stdout_put(sink, pos, &data),
+                            None => pwrite_at(&file, &data, pos),
+                        };
+                        if let Err(e) = &wrote {
+                            // Write failed: do NOT record coverage (leaves the gap),
+                            // and record WHY, once. A full disk or a filesystem gone
+                            // read-only fails every later write too, and the event
+                            // loop turns this into a typed refusal instead of three
+                            // re-fetches and a false "corrupt file" verdict.
+                            {
+                                let mut slot = write_err.lock().unwrap();
+                                if slot.is_none() {
+                                    *slot = Some(crate::recv_files::WriteFailure::from_io(e));
+                                }
+                            }
                             dlog!("[recv] pwrite_at FAILED at pos={pos} len={data_len}: {e}");
                         } else {
                             if let Ok(iters) = &wrote {
@@ -6988,7 +7465,10 @@ pub(crate) async fn recv_cmd(
                         ui::clear_sticky();
                         ui::say(&ui::paint(
                             ui::Tone::Dim,
-                            &format!("  declined {}", qv["name"].as_str().unwrap_or("file")),
+                            &format!(
+                                "  declined {}",
+                                safe_incoming_name(qv["name"].as_str().unwrap_or("file"))
+                            ),
                         ));
                         if let Some(t) = conn.transport_of(&qpid) {
                             t.send_control(&protocol::decline_msg(
@@ -7048,12 +7528,17 @@ pub(crate) async fn recv_cmd(
                             &format!("  no device named '{n}' (try `devices`)"),
                         ));
                     }
+                } else if daemon && (ans == "pair" || ans == "code" || regex_lite_code(&line)) {
+                    // The console no longer pairs in-session: that ceremony
+                    // was a v1 code plus a pair secret over a DataChannel the
+                    // signaling server could MITM. `tunlion add` / `tunlion join` run the
+                    // SPAKE2 ceremony, and the running daemon picks the new
+                    // device up from the store.
+                    ui::say(&ui::paint(
+                        ui::Tone::Dim,
+                        "  to pair a device, run `tunlion add <device>` in another terminal (the other side runs `tunlion join <code>`)",
+                    ));
                 } else if ans == "pair" || ans == "code" {
-                    // C29: mint a code; whoever claims it gets the remember
-                    // ceremony on connect (we created it, so WE initiate).
-                    if daemon {
-                        ceremony = Some(true);
-                    }
                     sio.emit("pair-create", json!({})).await.ok();
                 } else if regex_lite_code(&line) {
                     if claim_in_flight {
@@ -7068,9 +7553,6 @@ pub(crate) async fn recv_cmd(
                         ));
                         paired = true;
                         claim_in_flight = true;
-                        if daemon {
-                            ceremony = Some(false); // C29: in a session, pairing means remembering
-                        }
                         sio.emit("pair-claim", json!({ "code": line.to_lowercase() }))
                             .await
                             .ok();
@@ -7198,15 +7680,29 @@ pub(crate) async fn recv_cmd(
                     )
                     .await?;
                     if st.completed == 0 {
-                        bail!(
-                            "lost the sender after {} attempts; the partial is kept, re-run `tunlion receive <code>` to resume",
-                            MAX_ATTEMPTS
-                        );
+                        bail!(crate::transfer_truth::sender_gone_message(
+                            &format!(
+                                "the sender is unreachable: the connection to it failed {MAX_ATTEMPTS} times"
+                            ),
+                            &crate::transfer_truth::kept_partials(&session_parts),
+                            &dir,
+                            code_claimed,
+                        ));
                     }
                 }
             }
-            Ev::GraceExpired(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
+            // RetryLink: the stuck-link ladder's scheduled retry came due (the
+            // backoff runs on a timer task, never on this loop). Its exhausted
+            // outcome is the same as a lost link's, so it shares the handling.
+            ev @ (Ev::GraceExpired(..) | Ev::RetryLink(..)) => {
+                let exhausted = match ev {
+                    Ev::GraceExpired(pid, generation) => {
+                        conn.on_stuck(&pid, generation, "lost").await?
+                    }
+                    Ev::RetryLink(pid, generation) => conn.on_retry_due(&pid, generation).await?,
+                    _ => false,
+                };
+                if exhausted && paired && !keep_open {
                     sweep_completed_streams(
                         &mut st.by_sid,
                         &conn,
@@ -7218,10 +7714,14 @@ pub(crate) async fn recv_cmd(
                     )
                     .await?;
                     if st.completed == 0 {
-                        bail!(
-                            "lost the sender after {} attempts; the partial is kept, re-run `tunlion receive <code>` to resume",
-                            MAX_ATTEMPTS
-                        );
+                        bail!(crate::transfer_truth::sender_gone_message(
+                            &format!(
+                                "the sender is unreachable: the connection to it failed {MAX_ATTEMPTS} times"
+                            ),
+                            &crate::transfer_truth::kept_partials(&session_parts),
+                            &dir,
+                            code_claimed,
+                        ));
                     }
                 }
             }
@@ -7265,6 +7765,8 @@ pub(crate) async fn recv_cmd(
                     .as_str()
                     .and_then(|p| conn.link(p))
                     .map(|l| l.name.clone());
+                let left_pid = v["id"].as_str().unwrap_or_default().to_string();
+                let left_mid_transfer = st.by_sid.keys().any(|(p, _)| *p == left_pid);
                 if conn.on_peer_left(&v) {
                     let secs = conn.rejoin.rejoin_window.as_secs();
                     if !st.by_sid.is_empty() {
@@ -7315,10 +7817,62 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
+                // The sender of a one-shot receive left mid-transfer and its link
+                // is gone, but it was not the ACTIVE link, so no rejoin window
+                // opened and nothing bounded the wait: the receive then sat
+                // through the whole reconnect ladder against a dead process (a
+                // SIGKILLed sender measured ~96 s) before giving up. Open the
+                // same bounded window the active case gets.
+                if !daemon
+                    && paired
+                    && !keep_open
+                    && left_mid_transfer
+                    && !conn.links.contains_key(&left_pid)
+                    && conn.rejoin.waiting_rejoin.is_none()
+                {
+                    conn.rejoin.rejoin_window = crate::rejoin_unwarned();
+                    conn.rejoin.waiting_rejoin = Some(Instant::now());
+                    ui::say(&ui::paint(
+                        ui::Tone::Dim,
+                        &format!(
+                            "  sender disconnected mid-transfer, waiting up to {}s",
+                            conn.rejoin.rejoin_window.as_secs()
+                        ),
+                    ));
+                    flush_inflight(&mut st.by_sid).await;
+                }
             }
             _ => {}
         }
     }
+}
+
+/// `receive -o -`: the sender said the stream ended. Every byte written in
+/// order and the digest of what was written matching the offered one is a
+/// delivery like a file's, and is acked the same way, so the sender can report
+/// it verified. Anything else ends the receive with the reason: the bytes are
+/// already out and stdout cannot be rewound to re-fetch them.
+async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) -> Result<()> {
+    let Some(sink) = &inc.stdout else {
+        return Ok(());
+    };
+    let (verdict, written) = {
+        let s = sink
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the stdout writer for {} failed", inc.name))?;
+        (s.verdict(inc.size, inc.full.as_deref()), s.written())
+    };
+    if let Err(why) = verdict {
+        bail!("{}: {why}", inc.name);
+    }
+    inc.bar.done(written);
+    if inc.full.is_some() {
+        if let Some(t) = conn.transport_of(pid) {
+            let _ = t.send_control(&protocol::delivery_ack_msg(&inc.id, sid)).await;
+            let _ = t.flush().await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7418,4 +7972,30 @@ mod settle_tests {
         assert!(r.contains("2000"), "reason must name the bound: {r}");
         assert!(r.contains("retry"), "reason must offer the retry: {r}");
     }
+}
+
+/// A write to an incoming file failed. Report it on this side (must-see), drop
+/// the partial, and return the typed refusal (`id`, token, sentence) for the
+/// sender. `need` is what was still to come and `free` what the disk has now,
+/// so a full disk says by how much instead of calling the file corrupt.
+fn refuse_failed_write(
+    inc: IncomingFile,
+    dir: &Path,
+    wf: &crate::recv_files::WriteFailure,
+    from: &str,
+) -> (String, &'static str, String) {
+    let need = inc.size.saturating_sub(inc.received.load(Ordering::Relaxed));
+    let free = platform::free_space(dir);
+    let (token, msg) =
+        crate::recv_files::storage_refusal(wf.kind, &inc.name, &wf.detail, Some(need), free);
+    let from = if from.is_empty() { "the sender" } else { from };
+    ui::critical(&ui::paint(
+        ui::Tone::Err,
+        &format!("  refused {} from {from}: {msg}", inc.name),
+    ));
+    let id = inc.id.clone();
+    let part = inc.part_path.clone();
+    drop(inc);
+    crate::recv_files::discard_partial(&part);
+    (id, token, msg)
 }

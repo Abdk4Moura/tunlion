@@ -21,6 +21,35 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// PROTOCOL LITERAL: frozen, do not rename. The exact bytes a departing device
+/// signs; released builds send and must be recognised by exactly this text.
+pub(crate) const DEPART_MSG_PREFIX: &str = "filament-depart:v1:";
+
+/// The one message a depart request may carry for `device_pub`.
+pub(crate) fn depart_message(device_pub: &[u8; 32]) -> String {
+    format!("{DEPART_MSG_PREFIX}{}", hex::encode(device_pub))
+}
+
+/// Accept a depart request only when `msg` is EXACTLY the depart message for
+/// `device_pub` and `sig` is that key's signature over it.
+///
+/// Verifying the signature over whatever text the sender supplied was not
+/// enough: the same device key signs other things (pairing and enrollment
+/// possession proofs), so any of those signatures, replayed with its own text
+/// as `msg`, passed the check and marked the device lapsed. The expected text
+/// is rebuilt from the key, never taken from the wire.
+pub(crate) fn verify_depart(
+    device_pub: &[u8; 32],
+    msg: &str,
+    sig: &[u8; 64],
+) -> std::result::Result<(), &'static str> {
+    if msg != depart_message(device_pub) {
+        return Err("message is not the depart message for that device key");
+    }
+    crate::identity::verify_possession_sig(device_pub, msg.as_bytes(), sig)
+        .map_err(|_| "signature does not verify for that device key")
+}
+
 /// Advisory end-of-life verb for a joined device: tell the owner to free the
 /// slot NOW instead of paying out the whole offline budget. NEVER load-bearing:
 /// a crash, a power cut, or a hostile device sends nothing, and the budget is
@@ -33,7 +62,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
         );
     };
     let device_pub = crate::overlay::overlay_pubkey_bytes()?;
-    let msg = format!("filament-depart:v1:{}", hex::encode(device_pub));
+    let msg = depart_message(&device_pub);
     let sig = crate::overlay::overlay_sign_possession(msg.as_bytes())?;
 
     let my_uid = mk_uid("d");
@@ -150,7 +179,7 @@ pub(crate) async fn depart_cmd(server: &str, relay: bool) -> Result<()> {
                     acked = true;
                 }
             }
-            Ev::SignalingDown(reason) => {
+            Ev::SignalingDown(reason, _) => {
                 ui::debug(&format!("depart: signaling down: {reason}"));
                 break;
             }
@@ -252,13 +281,17 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             upgrade_probe: HashMap::new(),
             iface_snapshot: Vec::new(),
         },
-        direct_ok: direct::direct_enabled(),
+        // --relay: never direct (see `direct_permitted`).
+        direct_ok: crate::conn::direct_permitted(relay, direct::direct_enabled()),
         local_port: None,
         local_listener: None,
         direct_endpoint: None,
         warm_hold: WarmHold::default(),
         worker_port_tx: HashMap::new(),
         roster_pushed: None,
+        stuck_retry: HashMap::new(),
+        ice_cache: crate::conn::SharedIceCache::default(),
+        roster_absent: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -490,6 +523,9 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             Ev::GraceExpired(pid, g) => {
                 conn.on_stuck(&pid, g, "lost").await?;
             }
+            Ev::RetryLink(pid, g) => {
+                conn.on_retry_due(&pid, g).await?;
+            }
             Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
             Ev::PeerLeft(v) => {
                 conn.on_peer_left(&v);
@@ -497,5 +533,80 @@ pub(crate) async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -
             Ev::Interrupted => bail!("interrupted"),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod depart_tests {
+    use super::*;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    fn keypair() -> (Ed25519KeyPair, [u8; 32]) {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut public = [0u8; 32];
+        public.copy_from_slice(kp.public_key().as_ref());
+        (kp, public)
+    }
+
+    fn sign(kp: &Ed25519KeyPair, msg: &[u8]) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out.copy_from_slice(kp.sign(msg).as_ref());
+        out
+    }
+
+    #[test]
+    fn the_genuine_depart_message_is_accepted() {
+        let (kp, public) = keypair();
+        let msg = depart_message(&public);
+        assert!(verify_depart(&public, &msg, &sign(&kp, msg.as_bytes())).is_ok());
+    }
+
+    #[test]
+    fn a_valid_signature_over_a_different_message_is_refused() {
+        // A pairing possession proof: genuinely signed by the same device key,
+        // but it is not a depart request and must never lapse the device.
+        let (kp, public) = keypair();
+        let other = crate::identity::possession_msg(
+            0x01, &[7u8; 32], 0, &[1u8; 32], &[2u8; 32], &public, &[0u8; 32],
+        );
+        let sig = sign(&kp, &other);
+        assert!(crate::identity::verify_possession_sig(&public, &other, &sig).is_ok());
+        let as_text = String::from_utf8_lossy(&other).into_owned();
+        assert!(verify_depart(&public, &as_text, &sig).is_err());
+
+        // Any other text signed by the key: refused too.
+        let text = "anything else";
+        assert!(verify_depart(&public, text, &sign(&kp, text.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn a_depart_message_for_another_device_is_refused() {
+        let (kp, public) = keypair();
+        let (_, someone_else) = keypair();
+        let msg = depart_message(&someone_else);
+        assert!(verify_depart(&public, &msg, &sign(&kp, msg.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn the_right_message_with_a_forged_signature_is_refused() {
+        let (_, public) = keypair();
+        let (forger, _) = keypair();
+        let msg = depart_message(&public);
+        assert!(verify_depart(&public, &msg, &sign(&forger, msg.as_bytes())).is_err());
+    }
+
+    /// The wire text is frozen: pinned by the SHA-256 of the original prefix
+    /// (`printf '%s' 'filament-depart:v1:' | sha256sum`).
+    #[test]
+    fn depart_prefix_is_frozen() {
+        use sha2::{Digest, Sha256};
+        let got: String = Sha256::digest(DEPART_MSG_PREFIX.as_bytes())
+            .as_slice()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, "b59cb8b9e3d1a4568b95bab79e2be9f372c253114234923719f296dc6ca24274");
     }
 }

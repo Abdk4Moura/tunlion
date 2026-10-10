@@ -10,7 +10,6 @@
 use crate::DEFAULT_SERVER;
 use crate::MAX_ATTEMPTS;
 use crate::PakeInbound;
-use crate::REJOIN_WINDOW;
 use crate::SendOutcome;
 use crate::channel_of;
 use crate::codeentry;
@@ -51,12 +50,13 @@ use crate::session;
 use crate::shutdown;
 use crate::test_hooks;
 use crate::ui;
+use crate::exit_codes::{self, ExitKind};
 use anyhow::{Context, Result, anyhow, bail};
 use filament_transfer::Outgoing;
 use filament_transport::direct;
 use filament_transport::net;
 use net::{Ev, Transport};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -75,6 +75,7 @@ pub(crate) async fn send_cmd(
     name: Option<String>,
     relay: bool,
     remember: Option<String>,
+    timeout: Option<u64>,
 ) -> Result<()> {
     let opened_flow = interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
@@ -99,9 +100,10 @@ pub(crate) async fn send_cmd(
     }
     if paths.is_empty() {
         if !interactive_allowed() {
-            bail!(
-                "nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin"
-            );
+            return Err(exit_codes::err(
+                ExitKind::Usage,
+                "nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin",
+            ));
         }
         let path = prompt_line("  What do you want to send? ")?;
         if path.is_empty() {
@@ -132,7 +134,9 @@ pub(crate) async fn send_cmd(
                     }
                     paths[0] = again;
                 }
-                Err(e) => bail!("cannot send '{first}': {e}"),
+                // The local input is wrong, not the peer: a usage error (exit
+                // 2), and nothing has been contacted yet.
+                Err(e) => return Err(missing_input(&first, &e)),
             }
         }
     }
@@ -234,13 +238,20 @@ pub(crate) async fn send_cmd(
     let single = paths.len() == 1;
     let my_uid = mk_uid("s");
     let mut outgoing: Vec<Outgoing> = Vec::new();
+    // `send -` and directory sends stage a copy before offering it. That copy
+    // is the user's data, so it goes in a private (0700, fresh, random) dir
+    // created exclusively, never a predictable name in the shared temp dir
+    // where another local user could read it or pre-plant a symlink. The guard
+    // removes the dir on every exit from this function, not only on success.
+    let mut spool_dir: Option<SpoolDir> = None;
     for (i, p) in paths.iter().enumerate() {
         let sid = (i + 1) as u32;
         let id = format!("{}-{}", my_uid, sid);
         if p == "-" {
-            let spool = std::env::temp_dir().join(format!("filament-stdin-{}", std::process::id()));
-            let mut f = std::fs::File::create(&spool)?;
-            let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
+            let spool = SpoolDir::path_in(&mut spool_dir, "stdin")?;
+            let mut f = SpoolDir::create(&spool)?;
+            let n = spool_copy(&mut std::io::stdin().lock(), &mut f)
+                .map_err(|(written, e)| spool_error("stdin", &spool, written, e))?;
             drop(f);
             let head = head_hash(&spool);
             let full = full_hash(&spool);
@@ -267,7 +278,7 @@ pub(crate) async fn send_cmd(
             });
         } else {
             let path = PathBuf::from(p);
-            let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
+            let meta = std::fs::metadata(&path).map_err(|e| missing_input(p, &e))?;
             if meta.is_dir() {
                 if name.is_some() && single {
                     ui::say(&ui::paint(
@@ -279,17 +290,16 @@ pub(crate) async fn send_cmd(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "dir".into());
-                let spool = std::env::temp_dir().join(format!(
-                    "filament-tar-{}-{}.tar",
-                    std::process::id(),
-                    i
-                ));
+                let spool = SpoolDir::path_in(&mut spool_dir, &format!("tar-{i}.tar"))?;
                 ui::say(&format!("packing {p} -> {dirname}.tar ..."));
                 {
-                    let f = std::fs::File::create(&spool)?;
+                    let f = SpoolDir::create(&spool)?;
                     let mut b = tar::Builder::new(f);
-                    b.append_dir_all(&dirname, &path)?;
-                    b.finish()?;
+                    let packed = b.append_dir_all(&dirname, &path).and_then(|()| b.finish());
+                    if let Err(e) = packed {
+                        let written = std::fs::metadata(&spool).map(|m| m.len()).unwrap_or(0);
+                        return Err(spool_error(&format!("the directory {p}"), &spool, written, e));
+                    }
                 }
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
@@ -319,8 +329,13 @@ pub(crate) async fn send_cmd(
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| p.clone())
                 });
+                // Read the whole source NOW, before anything is offered: a file
+                // that cannot be read (mode 000) used to be offered with no
+                // digest, and the send then blamed the network ("lost the
+                // receiving peer"), stalled, or reported a 0-byte "ok". A FIFO
+                // or a device never ends, so it hung here, silently.
+                let full = Some(crate::send_source::source_digest(p, &meta)?);
                 let head = head_hash(&path);
-                let full = full_hash(&path);
                 outgoing.push(Outgoing {
                     id,
                     sid,
@@ -377,6 +392,9 @@ pub(crate) async fn send_cmd(
         }
     }
 
+    // What "nobody connected" means depends on who we were waiting for. Only a
+    // code can be opened in a browser; a device name is another tunlion.
+    let peer_hint = no_peer_hint(to.as_deref(), use_code, room.as_deref());
     let room = match room {
         Some(r) => r,
         None => net::fetch_auto_room(server).await?,
@@ -548,6 +566,25 @@ pub(crate) async fn send_cmd(
     // displayed from our own local mint when pair-ok arrives.
     let mut send_words = String::new(); // the SPAKE2 password (only when use_code)
     let mut send_nameplate = String::new();
+    // A revoked device is refused before anything waits on it. It used to wait
+    // out the presence window and say "offline ... Is `tunlion up` running
+    // there?", sending the user to check a machine this one has cut off.
+    if let Some((n, _)) = &known_target {
+        if let Some(why) = revoked_send_refusal(n, &devices_records()) {
+            return Err(exit_codes::err(ExitKind::Denied, why));
+        }
+    }
+    // A connect span for `doctor`'s history (local JSONL only, no telemetry
+    // POST). Closed as `up` when the channel to the target opens; any other
+    // way out of this function records it as failed (SendSpan's Drop).
+    let mut send_span = SendSpan(
+        known_target
+            .as_ref()
+            .map(|(_, sec)| crate::diag::Attempt::new_local(&crate::diag::peer_hash_from_secret(sec), "send")),
+    );
+    if let Some(a) = send_span.0.as_mut() {
+        a.enter(crate::diag::Phase::Presence);
+    }
     if let Some((n, sec)) = &known_target {
         ui::say(&format!(
             "  waiting for known device {}",
@@ -656,6 +693,7 @@ pub(crate) async fn send_cmd(
             let _ = tx.send(Ev::Interrupted);
         });
     }
+    crate::send_report::record(&outgoing);
     let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
     let started = Instant::now();
     let claim_deadline = Duration::from_secs(600);
@@ -665,16 +703,26 @@ pub(crate) async fn send_cmd(
     // FIRST live data channel (ChannelReady); once a channel is up, a long
     // legitimate transfer is never interrupted by this. Overridable / disablable
     // (0 = off) via FILAMENT_SEND_TIMEOUT.
-    let establish_deadline = std::env::var("FILAMENT_SEND_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(60));
+    // `--timeout` wins over FILAMENT_SEND_TIMEOUT, which stays as the fallback.
+    let establish_deadline = establish_window(
+        timeout,
+        std::env::var("FILAMENT_SEND_TIMEOUT").ok().as_deref(),
+    );
+    // A known device that has shown NO presence on the server is offline, and
+    // waiting the whole establishment window for it only delays the answer.
+    // Fail with exit 6 after this short, bounded wait instead. Disabled with
+    // the window (0 = wait without limit).
+    let offline_after = offline_window(
+        establish_deadline,
+        std::env::var("FILAMENT_SEND_OFFLINE_SECS").ok().as_deref(),
+    );
     let mut established = false;
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
     let mut saw_known_peer: HashSet<String> = HashSet::new();
+    // Once, when a known target has shown no presence for a few seconds.
+    let mut offline_hinted = false;
     // P4 (delivery-ack window): when every transfer's bytes have been `sent` but
     // the whole-file `delivery-ack` hasn't landed, we wait up to this bound for
     // the ack. CRITICAL (silent-data-loss fix): elapsing this window does NOT mean
@@ -695,10 +743,64 @@ pub(crate) async fn send_cmd(
     // control message, on a healthy link it returns within a round-trip.
     let ack_reprobe = Duration::from_secs(5);
     let mut sent_all_at: Option<Instant> = None;
+    // Transfer id -> why its SOURCE could not be read mid-stream. Filled by the
+    // streaming task, read when its TransferFailed arrives: a local read
+    // failure ends the send (and cancels on the receiver), it is never treated
+    // as an interrupted link to resume.
+    let source_failed: Arc<std::sync::Mutex<HashMap<String, String>>> = Arc::new(Default::default());
     let mut ack_reprobed = false; // re-sent file-end once for the no-ack window?
     let mut reprobed_at: Option<Instant> = None;
+    // Typed refusals from the receiver (disk full, a name its filesystem
+    // refuses, no permission), in its own words. Any of these ends the send with
+    // ExitKind::Denied rather than as a plain decline.
+    let mut refused: Vec<String> = Vec::new();
+    // The no-answer bound. An offer the receiver neither accepts nor refuses is
+    // a receiver that cannot answer (an older build that hit a write error says
+    // nothing at all), and the send used to wait for it forever. The clock runs
+    // only while an offer is outstanding, restarts on every answer, and stops
+    // while the receiver reports a person deciding (`file-pending`). Overridable
+    // with FILAMENT_SEND_STALL_SECS (0 disables).
+    let answer_wait = std::env::var("FILAMENT_SEND_STALL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(SEND_ANSWER_WAIT);
+    let mut answer_clock: Option<Instant> = None;
+    let mut receiver_asking = false;
+    // The receiver the unfinished files were last offered to (its signaling id).
+    let mut offered_to: Option<String> = None;
 
     loop {
+        // No answer to an outstanding offer within the bound: fail, and say what
+        // is most likely true, instead of waiting on silence forever.
+        if !answer_wait.is_zero() && !receiver_asking {
+            if let Some(since) = answer_clock {
+                if since.elapsed() >= answer_wait {
+                    let waiting: Vec<String> = outgoing
+                        .lock()
+                        .await
+                        .iter()
+                        .filter(|o| !o.done && !o.accepted_once)
+                        .map(|o| o.name.clone())
+                        .collect();
+                    if !waiting.is_empty() {
+                        ui::clear_sticky();
+                        ui::critical(&ui::paint(
+                            ui::Tone::Err,
+                            &format!(
+                                "  the receiver neither accepted nor refused {} in {}s; it may be unable to save it (a full disk, a name its filesystem refuses). Its log says why: `tunlion logs` there. (FILAMENT_SEND_STALL_SECS changes this bound, 0 disables it.)",
+                                waiting.join(", "),
+                                answer_wait.as_secs()
+                            ),
+                        ));
+                        let _ = sio.disconnect().await;
+                        // Said above; exit as "did not answer in time".
+                        return Err(exit_codes::reported(ExitKind::Unreachable));
+                    }
+                    answer_clock = None;
+                }
+            }
+        }
         // Bug 6: no data channel has come up within the establishment window,
         // an ICE wedge or a peer that claimed the code but never connected. Fail
         // honestly instead of spinning forever. A non-zero deadline only; a live
@@ -706,11 +808,56 @@ pub(crate) async fn send_cmd(
         if !established && !establish_deadline.is_zero() && started.elapsed() >= establish_deadline
         {
             ui::clear_sticky();
-            bail!(
-                "no peer connected within {}s, is a receiver running / the page open? \
-                 (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
-                establish_deadline.as_secs()
-            );
+            return Err(exit_codes::err(
+                ExitKind::Unreachable,
+                format!(
+                    "no peer connected within {}s: {peer_hint} \
+                     (--timeout <secs> to change, 0 to wait without limit)",
+                    establish_deadline.as_secs()
+                ),
+            ));
+        }
+        if let (Some((n, _)), Some(after)) = (&known_target, offline_after) {
+            if !established && saw_known_peer.is_empty() && started.elapsed() >= after {
+                ui::clear_sticky();
+                // A reset device runs `up` as a NEW key the old record can
+                // never find, so "is up running there?" alone was useless. Say
+                // so, and if it already re-paired under a suffixed name, name it.
+                let names: Vec<String> = devices_load().into_iter().map(|(name, _)| name).collect();
+                let successor =
+                    crate::reset_hints::successor_of(n, names.iter().map(String::as_str));
+                return Err(exit_codes::err(
+                    ExitKind::Unreachable,
+                    offline_message_with(n, after, successor.as_deref()),
+                ));
+            }
+        }
+        // A known device that never appears is usually one whose daemon is not
+        // running. Say so once, then keep waiting until the timeout.
+        if let Some((n, _)) = &known_target {
+            if !offline_hinted
+                && !established
+                && saw_known_peer.is_empty()
+                && started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER
+            {
+                offline_hinted = true;
+                ui::clear_sticky();
+                ui::say(&crate::conn::offline_hint(n));
+            }
+        }
+        // The receiver left and did not come back within the window this send
+        // announced: end here, saying so and saying what can work. The shared
+        // expiry in `next_ev` claimed "partial state kept for resume", which
+        // the sender cannot know, and offered nothing for a burned code.
+        if let Some(since) = conn.rejoin.waiting_rejoin {
+            if since.elapsed() > conn.rejoin.rejoin_window {
+                ui::clear_sticky();
+                let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                bail!(crate::send_liveness::receiver_gone_message(
+                    conn.rejoin.rejoin_window.as_secs(),
+                    use_code && known_target.is_none(),
+                ));
+            }
         }
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.rejoin.waiting_rejoin.is_none() {
@@ -815,14 +962,24 @@ pub(crate) async fn send_cmd(
             last_state_ping = Instant::now();
             for l in conn.links.values() {
                 if let Some(t) = &l.transport {
-                    let _ = t
-                        .send_control(&json!({
+                    // BOUNDED, as the receiver's identical loop already is. A
+                    // data-channel write to a receiver that was killed mid-transfer
+                    // never returns (the SCTP send queue is full and nothing will
+                    // ever acknowledge it), and this runs inline in the event loop:
+                    // unbounded, it parked the whole sender, which then never saw
+                    // the peer leave, never opened the rejoin window and never
+                    // answered the replacement receiver (gate 2 hung CI for 85
+                    // minutes at a time). The ping is best-effort; cap it.
+                    let _ = tokio::time::timeout(
+                        crate::conn::CONTROL_PROBE_BUDGET,
+                        t.send_control(&json!({
                             "type": "state", "v": 1,
                             "transfers": {},
                             "trusted": l.trusted,
                             "away": false,
-                        }))
-                        .await;
+                        })),
+                    )
+                    .await;
                 }
             }
         }
@@ -953,12 +1110,14 @@ pub(crate) async fn send_cmd(
                 } else {
                     server.to_string()
                 };
-                ui::clipboard(&full);
+                // Claim the copy only where a clipboard can exist: on a headless
+                // box or over a plain ssh login the OSC 52 write lands nowhere.
+                let copied = ui::clipboard(&full);
                 ui::say("");
                 ui::say(&format!(
                     "  code   {}   {}",
                     ui::paint(ui::Tone::Brand, &full),
-                    ui::paint(ui::Tone::Dim, "(copied to clipboard)")
+                    ui::paint(ui::Tone::Dim, if copied { "(copied to clipboard)" } else { "" })
                 ));
                 ui::say(&format!(
                     "         {}",
@@ -1235,6 +1394,13 @@ pub(crate) async fn send_cmd(
                 // Bug 6: a live channel to the active peer disarms the
                 // establishment timeout, the rest of the transfer is unbounded.
                 established = true;
+                if let Some(a) = send_span.0.as_mut().filter(|a| !a.finished()) {
+                    let direct = conn.link(&pid).is_some_and(|l| l.direct);
+                    a.up(
+                        if direct { "direct" } else { "relayed" },
+                        if direct { "direct-quic" } else { "datachannel" },
+                    );
+                }
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 // Fleet target: present our certificate and demand theirs before
                 // anything is offered. Fails closed, including on a transport with
@@ -1260,7 +1426,7 @@ pub(crate) async fn send_cmd(
                     ui::say(&format!(
                         "  {} {}",
                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.shown())
+                        ui::paint(ui::Tone::Bold, l.label())
                     ));
                     let is_direct = l.direct;
                     let direct_route = l.direct_route;
@@ -1351,6 +1517,25 @@ pub(crate) async fn send_cmd(
                             ));
                         }
                     }
+                    // Everything unfinished is offered again below, so it will be
+                    // streamed again from the receiver's offset: its delivery-ack
+                    // wait starts over, instead of inheriting a window that ran
+                    // out while the previous receiver was gone (which failed a
+                    // send to a daemon restarted within seconds). Only for a NEW
+                    // receiver: the same one re-announcing its link may still be
+                    // verifying what it has, and then ignores the re-offer.
+                    if offered_to.as_deref().is_some_and(|prev| prev != pid) {
+                        {
+                            let mut out = outgoing.lock().await;
+                            for o in out.iter_mut().filter(|o| !o.done) {
+                                o.sent = false;
+                            }
+                        }
+                        sent_all_at = None;
+                        ack_reprobed = false;
+                        reprobed_at = None;
+                    }
+                    offered_to = Some(pid.clone());
                     // (Re-)offer everything unfinished; resume:true after a
                     // prior accept so receivers continue from their partial.
                     // (The `--code` path offers later, post-PAKE; this is the
@@ -1369,6 +1554,9 @@ pub(crate) async fn send_cmd(
                             o.accepted_once,
                         );
                         t.send_control(&offer).await?;
+                        if answer_clock.is_none() {
+                            answer_clock = Some(Instant::now());
+                        }
                     }
                 }
             }
@@ -1386,7 +1574,15 @@ pub(crate) async fn send_cmd(
                 Some("l3-nonce") | Some(fleet::HELLO)
                     if fleet_target && !fleet_sess.proved(&pid) =>
                 {
-                    let exporter = conn.transport_of(&pid).and_then(|t| t.channel_binding());
+                    let tr = conn.transport_of(&pid);
+                    let exporter = tr.as_ref().and_then(|t| t.channel_binding());
+                    // H1: with no exporter, the nonce is bound to this link's
+                    // DTLS fingerprints (same rule as the daemon's in/out_binding).
+                    let link_fps = crate::link_fingerprints(&conn, &pid).await;
+                    let bind = |n: &[u8]| {
+                        tr.as_ref()
+                            .and_then(|t| crate::nonce_binding(t, link_fps.as_ref(), n))
+                    };
                     let outcome = fleet_sess.on_control(
                         &pid,
                         &v,
@@ -1397,6 +1593,7 @@ pub(crate) async fn send_cmd(
                         link_nonce,
                         |cb| fleet::make_hello(cb, &display_name()),
                         |pubk| device_name_for_pub(pubk),
+                        bind,
                     );
                     match outcome {
                         fleet_session::Outcome::Ignored => {}
@@ -1651,6 +1848,8 @@ pub(crate) async fn send_cmd(
                     }
                 }
                 Some("file-accept") => {
+                    answer_clock = Some(Instant::now());
+                    receiver_asking = false;
                     let Some(t) = conn.transport() else { continue };
                     // Build transport list: primary + any parallel QUIC workers.
                     let workers = conn
@@ -1658,7 +1857,12 @@ pub(crate) async fn send_cmd(
                         .map(|l| l.workers.clone())
                         .unwrap_or_default();
                     let mut transports = vec![t];
-                    transports.extend(workers);
+                    // A receiver writing to a stream (`receive -o -`, a pipe)
+                    // asks for one in-order stream; splitting the file across
+                    // parallel links would make it hold the later ranges.
+                    if !crate::transfer_truth::accept_is_sequential(&v) {
+                        transports.extend(workers);
+                    }
                     let offset = v["offset"].as_u64().unwrap_or(0);
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     {
@@ -1679,6 +1883,7 @@ pub(crate) async fn send_cmd(
                     // #28 test hook: the active peer's sid, so the streamer can
                     // synthesize a peer-left for it mid-flight (see stream_one).
                     let active_sid = conn.active.clone();
+                    let source_failed = source_failed.clone();
                     tokio::spawn(async move {
                         match stream_one(
                             out,
@@ -1696,7 +1901,13 @@ pub(crate) async fn send_cmd(
                             }
                             Err(e) => {
                                 // C10: surface through the loop; the transfer
-                                // stays pending and re-offers on reconnect.
+                                // stays pending and re-offers on reconnect,
+                                // unless the SOURCE failed (recorded here).
+                                if let Some(why) = crate::send_source::as_source_read(&e) {
+                                    if let Ok(mut m) = source_failed.lock() {
+                                        m.insert(id.clone(), why);
+                                    }
+                                }
                                 let _ = tx2.send(Ev::TransferFailed {
                                     id,
                                     err: e.to_string(),
@@ -1706,13 +1917,35 @@ pub(crate) async fn send_cmd(
                     });
                 }
                 Some("file-decline") => {
+                    answer_clock = Some(Instant::now());
+                    receiver_asking = false;
                     let id = v["id"].as_str().unwrap_or_default();
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        ui::say(&format!("declined: {}", o.name));
+                        // A refusal carries the receiver's reason: say it, in its
+                        // words, instead of a bare "declined" that reads as a person
+                        // saying no.
+                        match refusal_text(&v) {
+                            Some(why) => {
+                                ui::critical(&ui::paint(
+                                    ui::Tone::Err,
+                                    &format!("  {} not delivered: {why}", o.name),
+                                ));
+                                if !o.done {
+                                    refused.push(format!("{}: {why}", o.name));
+                                }
+                            }
+                            None => ui::say(&format!("declined: {}", o.name)),
+                        }
                         o.declined = true;
                         o.done = true;
                     }
+                }
+                // The receiver parked the offer for a person's yes/no; silence
+                // from here on is someone deciding, so the no-answer clock stops.
+                Some("file-pending") => {
+                    receiver_asking = true;
+                    answer_clock = Some(Instant::now());
                 }
                 // P4 (delivery-ack): the receiver computed the whole-file sha256
                 // of every byte it received and it MATCHED our offered digest,
@@ -1721,7 +1954,13 @@ pub(crate) async fn send_cmd(
                 // it). This closes the loop the runner had to fake above the
                 // transport: the sender deterministically KNOWS it landed whole.
                 Some("delivery-ack") => {
+                    answer_clock = Some(Instant::now());
                     let id = v["id"].as_str().unwrap_or_default();
+                    // Additive: a receiver that reports the name it stored the
+                    // file under says so here; an older one omits it.
+                    if let Some(stored) = v["stored"].as_str() {
+                        crate::send_report::note_stored(id, stored);
+                    }
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
                         if !o.acked {
@@ -1731,26 +1970,66 @@ pub(crate) async fn send_cmd(
                             // on the far side, so this is the interval the
                             // throughput line is entitled to divide by. Printing
                             // it at `flush()` measured the send buffer filling.
+                            // Name what LANDED: the receiver may store it under
+                            // another name (shortened past its limit, stripped of
+                            // a path, renamed on a collision), and "ok <name>"
+                            // about a name that does not exist there was false.
+                            let renamed = crate::send_report::delivered_as(
+                                &o.name,
+                                v["stored"].as_str(),
+                            );
                             if let Some(t0) = o.stream_started {
                                 ui::transfer_summary(
-                                    &o.name,
+                                    &crate::send_report::summary_label(&o.name, renamed.as_deref()),
                                     o.stream_bytes,
                                     t0.elapsed().as_secs_f64(),
                                 );
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!(
-                                    "    {} delivered + verified (whole-file sha256 matched)",
-                                    o.name
-                                ),
+                                &crate::send_report::delivered_line(&o.name, renamed.as_deref()),
                             ));
                         }
                     }
+                    // Keep the report current per file, so a send that fails
+                    // later still reports (and records) what did land.
+                    crate::send_report::record(&out);
                 }
                 _ => {}
             },
             Ev::TransferFailed { id, err } => {
+                let local = source_failed.lock().ok().and_then(|mut m| m.remove(&id));
+                if let Some(why) = local {
+                    // The source stopped being readable. Tell the receiver to
+                    // discard what it has (its partial can never be completed
+                    // from this source), then end as a local problem: exit 2,
+                    // never "lost the peer", never a resume that cannot work.
+                    let (sid, offered) = outgoing
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|o| o.id == id)
+                        .map(|o| (o.sid, o.name.clone()))
+                        .unwrap_or_default();
+                    if let Some(t) = conn.transport() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            t.send_control(&crate::send_source::cancel_msg(&id, sid, &offered, &why)),
+                        )
+                        .await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), t.flush()).await;
+                    }
+                    ui::clear_sticky();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
+                    return Err(exit_codes::err(
+                        ExitKind::Usage,
+                        format!(
+                            "{why}. The transfer was cancelled and the receiver told to discard \
+                             its partial (a local file problem; re-running cannot help until the \
+                             file is readable)"
+                        ),
+                    ));
+                }
                 let out = outgoing.lock().await;
                 let name = out
                     .iter()
@@ -1865,6 +2144,14 @@ pub(crate) async fn send_cmd(
                     );
                 }
             }
+            Ev::RetryLink(pid, generation) => {
+                if conn.on_retry_due(&pid, generation).await? {
+                    bail!(
+                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
+                        MAX_ATTEMPTS
+                    );
+                }
+            }
             Ev::GraceExpired(pid, generation) => {
                 if conn.on_stuck(&pid, generation, "lost").await? {
                     bail!(
@@ -1882,21 +2169,17 @@ pub(crate) async fn send_cmd(
                 if conn.on_peer_left(&v) {
                     let all_done = outgoing.lock().await.iter().all(|o| o.done);
                     if !all_done {
-                        let secs = REJOIN_WINDOW.as_secs();
-                        let gid = v["id"].as_str().unwrap_or_default();
-                        match gone {
-                            Some(n) => ui::say(&conn.roster(
-                                gid,
-                                "○",
-                                ui::Tone::Dim,
-                                &format!("disconnected, waiting up to {secs}s"),
-                                &n,
-                            )),
-                            // DEBUG, resilience internal (peer-disconnect wait).
-                            None => ui::debug(&format!(
-                                "peer disconnected, waiting up to {secs}s for them to come back"
-                            )),
-                        }
+                        // The window `on_peer_left` just opened is the one the
+                        // loop enforces; REJOIN_WINDOW (120 s) was printed while
+                        // the unannounced wait was 45 s. And a plain sentence,
+                        // not a roster entry: with no name the entry read as an
+                        // empty name ("the other device  disconnected").
+                        let secs = conn.rejoin.rejoin_window.as_secs();
+                        let by_code = use_code && known_target.is_none();
+                        ui::say(&ui::paint(
+                            ui::Tone::Dim,
+                            &crate::send_liveness::disconnect_line(gone.as_deref(), secs, by_code),
+                        ));
                     }
                 }
             }
@@ -1933,7 +2216,16 @@ pub(crate) async fn send_cmd(
                         .unwrap_or(false);
                     // Only act once a window has elapsed: the first ack_wait, or
                     // (after a re-probe) the shorter ack_reprobe window.
-                    if (!ack_reprobed && window_elapsed) || (ack_reprobed && reprobe_elapsed) {
+                    // Not while a rejoin window is open: the receiver left and may
+                    // come back (a restarted daemon, a reconnecting receiver),
+                    // and the window has its own bounded, honest ending. Giving
+                    // up on the ack first is what ended a send ~15 s into a
+                    // "waiting up to 120s", and what made a send ignore a
+                    // replacement daemon that was up 4 s after the kill.
+                    let rejoin_open = conn.rejoin.waiting_rejoin.is_some();
+                    if !rejoin_open
+                        && ((!ack_reprobed && window_elapsed) || (ack_reprobed && reprobe_elapsed))
+                    {
                         // A live transport attached is the "link alive" signal
                         // (mirrors the browser's data-channel-open check). A
                         // black-hole that QUIC hasn't noticed still reports a
@@ -1987,12 +2279,15 @@ pub(crate) async fn send_cmd(
                 // Do NOT claim success: the receiver may have gotten nothing. Fail
                 // honestly. The on-disk source is untouched and the outgoing entry
                 // is preserved for resume; a fresh `send`/reconnect re-offers it.
-                let names: Vec<String> = {
+                let (names, confirmed): (Vec<String>, usize) = {
                     let out = outgoing.lock().await;
-                    out.iter()
-                        .filter(|o| !o.done)
-                        .map(|o| o.name.clone())
-                        .collect()
+                    (
+                        out.iter()
+                            .filter(|o| !o.done)
+                            .map(|o| o.name.clone())
+                            .collect(),
+                        out.iter().filter(|o| o.done && !o.declined).count(),
+                    )
                 };
                 for name in &names {
                     ui::critical(&ui::paint(
@@ -2003,10 +2298,24 @@ pub(crate) async fn send_cmd(
                     ));
                 }
                 let _ = sio.disconnect().await;
-                bail!(
-                    "delivery not confirmed: {} file(s) sent but never delivery-acked by the receiver (treating as unconfirmed, not delivered)",
-                    names.len().max(1)
-                );
+                // No whole-file ack came back. With NOTHING confirmed this is the
+                // receiver gone or not answering (exit 6, unreachable): exit 8
+                // means "some moved, some did not", which a single unconfirmed
+                // file is not. Some confirmed and some not is that partial (8).
+                // The source is untouched either way.
+                let kind = crate::send_source::unconfirmed_kind(confirmed, names.len().max(1));
+                let msg = if kind == ExitKind::Partial {
+                    format!(
+                        "delivery not confirmed: {confirmed} file(s) confirmed, {} sent but never delivery-acked by the receiver (treating those as not delivered)",
+                        names.len().max(1)
+                    )
+                } else {
+                    format!(
+                        "delivery not confirmed: the receiver is unreachable or stopped answering, and acknowledged none of the {} file(s) sent; nothing is confirmed delivered",
+                        names.len().max(1)
+                    )
+                };
+                return Err(exit_codes::err(kind, msg));
             }
         }
         // Exit when every transfer reached a terminal state (`done` = acked, or the
@@ -2033,6 +2342,7 @@ pub(crate) async fn send_cmd(
                 }
                 let completed = out.iter().filter(|o| o.done && !o.declined).count();
                 let declined = out.iter().filter(|o| o.declined).count();
+                crate::send_report::record(&out);
                 match send_outcome(completed, declined) {
                     SendOutcome::Complete { .. } => ui::say("done."),
                     SendOutcome::Declined {
@@ -2052,15 +2362,135 @@ pub(crate) async fn send_cmd(
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let _ = sio.disconnect().await;
+                if !refused.is_empty() {
+                    ui::critical(&format!(
+                        "send failed: the receiver could not store {} file(s):\n  {}",
+                        refused.len(),
+                        refused.join("\n  ")
+                    ));
+                    // Said above; the receiver refused it, so exit as denied.
+                    return Err(exit_codes::reported(ExitKind::Denied));
+                }
                 match send_outcome(completed, declined) {
                     SendOutcome::Complete { .. } => return Ok(()),
                     SendOutcome::Declined {
                         completed,
                         declined,
-                    } => bail!("send incomplete: {completed} delivered, {declined} declined"),
+                    } => {
+                        return Err(crate::send_report::incomplete(completed, declined));
+                    }
                 }
             }
         }
+    }
+}
+
+/// Copy `from` into the spool file, returning the bytes written, or the bytes
+/// written so far with the error: a full spool is reported with how far it got.
+fn spool_copy(
+    from: &mut impl std::io::Read,
+    to: &mut impl std::io::Write,
+) -> std::result::Result<u64, (u64, std::io::Error)> {
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err((written, e)),
+        };
+        to.write_all(&buf[..n]).map_err(|e| (written, e))?;
+        written += n as u64;
+    }
+    to.flush().map_err(|e| (written, e))?;
+    Ok(written)
+}
+
+/// The error for staging `what` into the spool file `spool`. A send of stdin
+/// is STAGED IN FULL before anything is offered, because the offer carries the
+/// whole file's size and SHA-256 (the receiver checks both, and resumes by
+/// them); it cannot be streamed. So a 30 MB `head -c ... | tunlion send -`
+/// on a 16 MB /tmp failed in 23 ms with only "No space left on device (os
+/// error 28)", which named neither the disk that filled nor why it was used.
+/// This names both and the fix: TMPDIR on a disk with room.
+fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Error) -> anyhow::Error {
+    let dir = spool.parent().unwrap_or(spool);
+    let full = matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    );
+    if !full {
+        return anyhow::Error::new(e).context(format!(
+            "could not stage {what} for sending in the local temp spool at {}",
+            dir.display()
+        ));
+    }
+    anyhow::anyhow!(
+        "could not stage {what} for sending: the local temp spool at {} ran out of space after {} ({e}). \
+         It is staged in full before it is offered, because the offer carries its size and SHA-256, \
+         so the temp directory needs room for all of it. Point TMPDIR at a directory on a disk with \
+         room, for example:  TMPDIR=/var/tmp tunlion send - ...  (or send a file path instead of stdin, \
+         which is read in place and needs no staging)",
+        dir.display(),
+        crate::human(written)
+    )
+}
+
+/// The error for a spool directory that cannot be created at all. Following
+/// the advice above on a read-only root (`TMPDIR=/var/tmp`) or with a TMPDIR
+/// that does not exist gave only "Read-only file system (os error 30)" or
+/// "No such file or directory (os error 2)", naming neither TMPDIR nor the
+/// path. `base` is where the spool was to go, `tmpdir` the variable as set.
+fn spool_dir_error(base: &std::path::Path, tmpdir: Option<&str>, e: anyhow::Error) -> anyhow::Error {
+    let source = match tmpdir {
+        Some(v) => format!("TMPDIR={v}"),
+        None => "TMPDIR is not set, so the system default".to_string(),
+    };
+    anyhow::anyhow!(
+        "could not create the local temp spool for sending in {} ({source}): {e:#}. `send -` and \
+         directory sends stage a copy there before offering it; set TMPDIR to an existing, \
+         writable directory with room (or send a file path, which is read in place and needs no \
+         staging)",
+        base.display()
+    )
+}
+
+/// Private staging directory for `send -` and directory sends, removed with
+/// everything in it when dropped. Created lazily so a plain-file send makes
+/// nothing on disk.
+struct SpoolDir(PathBuf);
+
+impl SpoolDir {
+    /// A path for `name` inside the (lazily created) private spool dir.
+    fn path_in(slot: &mut Option<SpoolDir>, name: &str) -> Result<PathBuf> {
+        if slot.is_none() {
+            let dir = crate::ssh_ca::secure_tempdir("send-spool").map_err(|e| {
+                spool_dir_error(
+                    &std::env::temp_dir(),
+                    std::env::var_os("TMPDIR").as_deref().map(|v| v.to_string_lossy()).as_deref(),
+                    e,
+                )
+            })?;
+            *slot = Some(SpoolDir(dir));
+        }
+        Ok(slot.as_ref().map(|d| d.0.join(name)).unwrap_or_default())
+    }
+
+    /// Create a staging file exclusively: an existing entry (including a
+    /// symlink) is an error, never something to write through.
+    fn create(path: &std::path::Path) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create staging file {}", path.display()))
+    }
+}
+
+impl Drop for SpoolDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -2082,12 +2512,10 @@ async fn stream_one(
         (o.sid, o.name.clone(), o.size, o.path.clone())
     };
     if offset > 0 {
-        // DEBUG, resilience internal (transfer resuming from a saved offset).
-        ui::debug(&format!(
-            "{name}: resuming at {} ({:.0}%)",
-            human(offset),
-            offset as f64 / size.max(1) as f64 * 100.0
-        ));
+        // Said at the default level: a re-run that picks up a kept partial
+        // used to look exactly like a fresh send, so nobody could tell that
+        // the resume they were told to run had actually resumed.
+        ui::say(&crate::transfer_truth::resume_line(&name, offset, size));
     }
     // #28 deterministic test hook: once we cross this byte offset, synthesize a
     // peer-left for the ACTIVE peer WITHOUT touching the data channel, exactly
@@ -2136,8 +2564,16 @@ async fn stream_one(
         handles.push(tokio::spawn(async move {
             let trace =
                 cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
-            let mut f = tokio::fs::File::open(&path).await?;
-            f.seek(SeekFrom::Start(start)).await?;
+            // Every local file operation below maps its failure to a SourceRead:
+            // the source stopped being readable (a permission changed, a disk
+            // failed, the file was truncated), which no reconnect can repair.
+            use crate::send_source::source_read;
+            let mut f = tokio::fs::File::open(&path)
+                .await
+                .map_err(|e| source_read(&path, e))?;
+            f.seek(SeekFrom::Start(start))
+                .await
+                .map_err(|e| source_read(&path, e))?;
             let mut pos = start;
             // Double-buffer with tracing + batching
             let mut buf_a = vec![0u8; chunk];
@@ -2155,10 +2591,14 @@ async fn stream_one(
             } else {
                 None
             };
-            let mut cur_n = f.read(&mut buf_a[..first_want]).await?;
+            let mut cur_n = f
+                .read(&mut buf_a[..first_want])
+                .await
+                .map_err(|e| source_read(&path, e))?;
             let _first_read_us = t_first_read.map(|t| t.elapsed().as_micros()).unwrap_or(0);
             if cur_n == 0 {
-                return Ok(());
+                // End of file where the offer promised more bytes.
+                return Err(source_read(&path, format!("it ended at {pos} bytes, shorter than offered")));
             }
 
             while pos < end {
@@ -2173,16 +2613,24 @@ async fn stream_one(
                 // Fire the NEXT read (into the alternate buffer) BEFORE sending.
                 let next_want = std::cmp::min(chunk as u64, end - (pos + cur_n as u64)) as usize;
                 let next_read = if next_want > 0 {
-                    let mut f2 = tokio::fs::File::open(&path).await?;
-                    f2.seek(SeekFrom::Start(pos + cur_n as u64)).await?;
+                    let mut f2 = tokio::fs::File::open(&path)
+                        .await
+                        .map_err(|e| source_read(&path, e))?;
+                    f2.seek(SeekFrom::Start(pos + cur_n as u64))
+                        .await
+                        .map_err(|e| source_read(&path, e))?;
                     let alt_buf = if using_buf_a {
                         std::mem::replace(&mut buf_b, vec![0u8; chunk])
                     } else {
                         std::mem::replace(&mut buf_a, vec![0u8; chunk])
                     };
+                    let read_path = path.clone();
                     Some(tokio::spawn(async move {
                         let mut buf = alt_buf;
-                        let n = f2.read(&mut buf[..next_want]).await?;
+                        let n = f2
+                            .read(&mut buf[..next_want])
+                            .await
+                            .map_err(|e| source_read(&read_path, e))?;
                         Ok::<(Vec<u8>, usize), anyhow::Error>((buf, n))
                     }))
                 } else {
@@ -2249,7 +2697,13 @@ async fn stream_one(
                             using_buf_a = !using_buf_a;
                             cur_n = n;
                             if cur_n == 0 {
-                                break;
+                                // A read-ahead is only fired while bytes remain
+                                // in this range, so EOF here is a source that
+                                // got shorter than the size it was offered at.
+                                return Err(source_read(
+                                    &path,
+                                    format!("it ended at {pos} bytes, shorter than offered"),
+                                ));
                             }
                         }
                         Ok(Err(e)) => return Err(e.into()),
@@ -2298,4 +2752,232 @@ async fn stream_one(
         }
     }
     Ok(())
+}
+
+/// The establishment window: `--timeout` first, then FILAMENT_SEND_TIMEOUT,
+/// then 60 s. Zero means "wait without limit". Pure.
+pub(crate) fn establish_window(flag: Option<u64>, env: Option<&str>) -> Duration {
+    let secs = flag
+        .or_else(|| env.and_then(|v| v.trim().parse::<u64>().ok()))
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// How long a known device may show no presence at all before `send` calls it
+/// offline: 10 s (FILAMENT_SEND_OFFLINE_SECS overrides), never longer than the
+/// establishment window, and `None` when that window is unlimited. Pure.
+pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<Duration> {
+    if establish.is_zero() {
+        return None;
+    }
+    let secs = env
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10);
+    Some(Duration::from_secs(secs).min(establish))
+}
+
+/// The answer for a known device that never appeared. Pure.
+pub(crate) fn offline_message(peer: &str, after: Duration) -> String {
+    offline_message_with(peer, after, None)
+}
+
+/// [`offline_message`], naming `successor` when a newer record looks like the
+/// same machine re-paired after a reset (see reset_hints). Pure.
+pub(crate) fn offline_message_with(peer: &str, after: Duration, successor: Option<&str>) -> String {
+    format!(
+        "{peer} is offline: it did not appear on the tunlion server within {}s. \
+         Is `tunlion up` running there? {} Nothing was sent.",
+        after.as_secs(),
+        crate::reset_hints::offline_hint(peer, successor)
+    )
+}
+
+/// A path to send that cannot be read: a usage error (exit 2) about the local
+/// input, never a statement about the peer.
+pub(crate) fn missing_input(path: &str, e: &std::io::Error) -> anyhow::Error {
+    let why = if e.kind() == std::io::ErrorKind::NotFound {
+        "no such file or directory".to_string()
+    } else {
+        e.to_string()
+    };
+    exit_codes::err(
+        ExitKind::Usage,
+        format!("cannot send '{path}': {why} (a local file problem; nothing was sent)"),
+    )
+}
+
+/// How long an offer may go unanswered before the send fails. Long enough for
+/// any receiver that is working; a person deciding stops the clock entirely.
+const SEND_ANSWER_WAIT: Duration = Duration::from_secs(60);
+
+/// The receiver's reason, for a `file-decline` that carries one (a typed
+/// refusal); `None` for a plain decline (a person said no).
+pub(crate) fn refusal_text(v: &Value) -> Option<String> {
+    v.get("reason").and_then(Value::as_str)?;
+    let error = v
+        .get("error")
+        .and_then(Value::as_str)
+        .filter(|e| !e.trim().is_empty())
+        .unwrap_or("the receiver could not store it");
+    // Bounded: the text is peer-supplied and goes to a terminal.
+    let clean: String = error.chars().filter(|c| !c.is_control()).take(300).collect();
+    Some(clean)
+}
+
+/// What to check when nobody connected, worded for who we were waiting for.
+/// A device name is another tunlion; only a code can be opened in a browser.
+pub(crate) fn no_peer_hint(to: Option<&str>, use_code: bool, room: Option<&str>) -> String {
+    match (to, use_code, room) {
+        (Some(dev), _, _) => format!("is '{dev}' online, with `tunlion up` running there?"),
+        (None, true, _) => {
+            "has the receiver entered the code (`tunlion receive <code>`, or the code in a browser)?"
+                .to_string()
+        }
+        (None, false, Some(r)) => format!("is a receiver waiting in room '{r}'?"),
+        _ => "is a receiver running on this network?".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod spool_tests {
+    use super::{spool_copy, spool_dir_error, spool_error};
+
+    /// A writer that fills after `room` bytes, like a 16 MB /tmp.
+    struct Small {
+        room: usize,
+        got: usize,
+    }
+    impl std::io::Write for Small {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.got >= self.room {
+                return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            let n = b.len().min(self.room - self.got);
+            self.got += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `head -c 30000000 /dev/zero | tunlion send -` on a 16 MB /tmp: the
+    /// error names the spool directory, how far it got, why stdin is staged,
+    /// and TMPDIR. It used to be "No space left on device (os error 28)".
+    #[test]
+    fn a_full_spool_names_the_directory_the_reason_and_tmpdir() {
+        let mut input = std::io::Read::take(std::io::repeat(0), 30_000_000);
+        let mut out = Small { room: 16 * 1024 * 1024, got: 0 };
+        let (written, e) = spool_copy(&mut input, &mut out).unwrap_err();
+        assert!(written <= 16 * 1024 * 1024 && written > 15 * 1024 * 1024, "{written}");
+        let spool = std::path::Path::new("/tmp/fil-send-spool-1/stdin");
+        let msg = format!("{:#}", spool_error("stdin", spool, written, e));
+        assert!(msg.contains("/tmp/fil-send-spool-1"), "{msg}");
+        assert!(msg.contains("ran out of space after"), "{msg}");
+        assert!(msg.contains("TMPDIR="), "{msg}");
+        assert!(msg.contains("SHA-256"), "{msg}");
+        // Anything else is reported as itself, with the spool named.
+        let other = format!(
+            "{:#}",
+            spool_error("stdin", spool, 0, std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        );
+        assert!(other.contains("could not stage stdin") && !other.contains("TMPDIR="), "{other}");
+    }
+
+    /// `TMPDIR=/var/tmp tunlion send -` on a read-only root, and a TMPDIR that
+    /// does not exist: the message names TMPDIR, its value and the directory,
+    /// with the OS's reason, instead of a bare "(os error 30)".
+    #[test]
+    fn a_spool_that_cannot_be_created_names_tmpdir_and_the_path() {
+        let ro = std::io::Error::from_raw_os_error(30);
+        let m = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/var/tmp"), Some("/var/tmp"), ro.into())
+        );
+        assert!(m.contains("TMPDIR=/var/tmp") && m.contains("in /var/tmp"), "{m}");
+        assert!(m.contains("os error 30"), "the OS's reason stays: {m}");
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let m = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/nonexist"), Some("/nonexist"), missing.into())
+        );
+        assert!(m.contains("TMPDIR=/nonexist") && m.contains("existing, writable directory"), "{m}");
+        let unset = format!(
+            "{:#}",
+            spool_dir_error(std::path::Path::new("/tmp"), None, anyhow::anyhow!("x"))
+        );
+        assert!(unset.contains("TMPDIR is not set"), "{unset}");
+    }
+
+    #[test]
+    fn a_spool_copy_that_fits_copies_everything() {
+        let mut input = std::io::Read::take(std::io::repeat(7), 1_000_000);
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(spool_copy(&mut input, &mut out).unwrap(), 1_000_000);
+        assert_eq!(out.len(), 1_000_000);
+    }
+}
+
+/// The raw device records (empty when there is no store). Read only.
+fn devices_records() -> Vec<serde_json::Value> {
+    std::fs::read_to_string(crate::devices_store::devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// The refusal for a send to a device this one has revoked, or None. A
+/// revoked device is denied (exit 4), not offline: the remedy is a decision
+/// here, not a check on the other machine. Pure over the records.
+pub(crate) fn revoked_send_refusal(name: &str, records: &[serde_json::Value]) -> Option<String> {
+    let record = records
+        .iter()
+        .find(|d| d["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)))?;
+    let revoked = record["certRevoked"].as_bool() == Some(true)
+        || record["principalState"].as_str() == Some(crate::PRINCIPAL_STATE_REVOKED);
+    revoked.then(|| {
+        format!(
+            "'{name}' is revoked on this device, so nothing is sent to it. To let it back in: `tunlion devices restore {name}`; to drop it: `tunlion devices forget {name}`"
+        )
+    })
+}
+
+#[cfg(test)]
+mod revoked_send_tests {
+    use super::revoked_send_refusal;
+    use serde_json::json;
+
+    #[test]
+    fn a_send_to_a_revoked_device_is_refused_as_revoked() {
+        let records = vec![
+            json!({"name": "p9-b", "certRevoked": true}),
+            json!({"name": "laptop", "principalState": "revoked"}),
+            json!({"name": "desk", "certRevoked": false}),
+        ];
+        let r = revoked_send_refusal("p9-b", &records).expect("revoked is refused");
+        assert!(r.contains("revoked") && !r.contains("offline"), "{r}");
+        assert!(r.contains("tunlion devices restore p9-b"), "{r}");
+        assert!(revoked_send_refusal("LAPTOP", &records).is_some(), "durable revoke, any case");
+        assert_eq!(revoked_send_refusal("desk", &records), None);
+        assert_eq!(revoked_send_refusal("nobody", &records), None);
+        use clap::Parser;
+        for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b"] {
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
+        }
+    }
+}
+
+/// The connect span of one `send` to a known device. A send that returns
+/// before its channel opened (offline, timed out, refused) records `fail`
+/// when this drops, so `doctor`'s history counts it.
+struct SendSpan(Option<crate::diag::Attempt>);
+
+impl Drop for SendSpan {
+    fn drop(&mut self) {
+        if let Some(a) = self.0.as_mut().filter(|a| !a.finished()) {
+            a.fail("send ended before a channel to the device opened");
+        }
+    }
 }

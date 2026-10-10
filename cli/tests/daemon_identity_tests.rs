@@ -110,6 +110,23 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn sleeper");
+    //
+    // `up.pid` holds the pid ALONE (so `kill $(cat up.pid)` works) and the
+    // executable lives in `up.exe`. Check that format, then the legacy
+    // two-line one an older daemon still running across an upgrade wrote.
+    let daemon_pidfile = std::fs::read_to_string(cfg.join("up.pid")).unwrap_or_default();
+    assert_eq!(
+        daemon_pidfile.lines().count(),
+        1,
+        "up.pid must hold the pid alone, got {daemon_pidfile:?}"
+    );
+    std::fs::write(cfg.join("up.pid"), format!("{}\n", sleeper.id())).unwrap();
+    std::fs::write(cfg.join("up.exe"), format!("{}\n", real_bin())).unwrap();
+    let v = status_json(&cfg);
+    assert_eq!(
+        v["running"], false,
+        "an unrelated live pid must not be reported as the daemon"
+    );
     std::fs::write(
         cfg.join("up.pid"),
         format!("{}\n{}\n", sleeper.id(), real_bin()),
@@ -118,7 +135,7 @@ fn daemon_is_found_by_executable_and_an_unrelated_pid_is_rejected() {
     let v = status_json(&cfg);
     assert_eq!(
         v["running"], false,
-        "an unrelated live pid must not be reported as the daemon"
+        "an unrelated live pid must not be reported as the daemon (legacy pidfile)"
     );
 
     // Cleanup.

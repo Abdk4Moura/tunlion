@@ -36,8 +36,41 @@ const PREFIX_LEN: u8 = 48;
 
 /// Domain-separation tags so a hash/signature here can never be mistaken for one
 /// from another tunlion protocol (or a future overlay version).
+// PROTOCOL LITERAL: frozen, do not rename (overlay address derivation).
 const ADDR_DOMAIN: &[u8] = b"filament/overlay-addr/v1\0";
 const BIND_DOMAIN: &[u8] = b"filament/overlay-bind/v1\0";
+const DTLS_BIND_LABEL: &[u8] = b"filament/dtls-link-binding/v1\0";
+
+/// The channel binding for a link with NO RFC-5705 exporter (a WebRTC
+/// DataChannel): `SHA-256(label || len||fp_lo || len||fp_hi || nonce)`.
+///
+/// A bare nonce is not a binding. It is fresh, but nothing ties it to THIS
+/// DTLS session, so a party sitting in two WebRTC sessions (A-M and M-B) can
+/// hand A's challenge nonce to B, relay B's signed `fleet-hello` back, and be
+/// admitted by A as B. The two DTLS certificate fingerprints are what identify
+/// the session end to end, exactly as `pair-proof` binds them: a relay
+/// terminates DTLS on each leg, so each leg has a DIFFERENT fingerprint pair
+/// and a binding computed on one leg never verifies on the other. The nonce is
+/// kept for freshness, because the fingerprint pair alone is stable across
+/// reconnects between the same two peers (docs/design-l3-over-relay.md).
+///
+/// The fingerprints are sorted, so both ends (which see them as local/remote
+/// in opposite order) compute the same bytes. They are trimmed and uppercased
+/// the same way `pair-proof` normalizes them, and length-prefixed so no two
+/// pairs can concatenate to the same bytes.
+pub fn dtls_channel_binding(fp_a: &str, fp_b: &str, nonce: &[u8]) -> Vec<u8> {
+    let a = fp_a.trim().to_ascii_uppercase();
+    let b = fp_b.trim().to_ascii_uppercase();
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = Sha256::new();
+    h.update(DTLS_BIND_LABEL);
+    h.update((lo.len() as u32).to_be_bytes());
+    h.update(lo.as_bytes());
+    h.update((hi.len() as u32).to_be_bytes());
+    h.update(hi.as_bytes());
+    h.update(nonce);
+    h.finalize().to_vec()
+}
 
 /// The overlay prefix as a `<addr>/48` string for route installation.
 pub fn prefix_cidr() -> String {
@@ -79,6 +112,7 @@ const V4_PREFIX_LEN: u8 = 15;
 /// Low 17 bits = the host part of a `/15`.
 const V4_HOST_MASK: u32 = 0x0001_FFFF;
 /// Domain tag for the v4 host derivation, distinct from the v6 addr tag.
+// PROTOCOL LITERAL: frozen, do not rename.
 const ADDR_V4_DOMAIN: &[u8] = b"filament/overlay-v4-addr/v1\0";
 
 /// The v4 overlay prefix as a CIDR string for route installation.
@@ -140,8 +174,23 @@ pub fn next_announce_seq_at(path: &std::path::Path) -> u64 {
     // Best-effort persist. If this fails we still return a value the receiver
     // will accept for this session; the next restart falls back to the branch
     // above rather than to zero.
-    let _ = std::fs::write(path, next.to_string());
+    let _ = write_owner_only(path, next.to_string().as_bytes());
     next
+}
+
+/// Write `data` to `path` owner-only (0600 on unix) whatever the umask. The
+/// counter sits in the config directory, and `fs::write` let `umask 0000` make
+/// it world-writable, so anyone could wind it forward and lock this node out.
+fn write_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(data)
 }
 
 /// Is `seq` fresh, given the highest previously accepted value from that
@@ -253,6 +302,7 @@ fn bind_message(addr: &Ipv6Addr, seq: u64, cb: &[u8]) -> Vec<u8> {
 /// an older peer computing the digest without a routes field would fail to
 /// verify a newer peer's announce and interop would break on upgrade. A second
 /// signature over a second domain leaves the first untouched.
+// PROTOCOL LITERAL: frozen, do not rename.
 const ROUTES_DOMAIN: &[u8] = b"filament-l3-routes-v1";
 
 /// Bytes signed to authenticate an advertised route set.
@@ -731,6 +781,78 @@ mod tests {
         for len in [0usize, 1, 2, 3, 31, 32, 64, 100] {
             let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
             assert_eq!(unb64(&b64(&data)).unwrap(), data, "len {len}");
+        }
+    }
+
+    const FP_A: &str = "SHA-256 AA:BB:CC";
+    const FP_M1: &str = "SHA-256 11:22:33";
+    const FP_M2: &str = "SHA-256 44:55:66";
+    const FP_B: &str = "SHA-256 DD:EE:FF";
+
+    #[test]
+    fn dtls_binding_is_symmetric_and_normalized() {
+        let n = [7u8; 32];
+        // Each end sees (local, remote) in the opposite order.
+        assert_eq!(dtls_channel_binding(FP_A, FP_M1, &n), dtls_channel_binding(FP_M1, FP_A, &n));
+        assert_eq!(
+            dtls_channel_binding(" sha-256 aa:bb:cc ", FP_M1, &n),
+            dtls_channel_binding(FP_A, FP_M1, &n),
+            "normalized like pair-proof (trimmed, uppercased)"
+        );
+    }
+
+    /// The relay attack: M sits in two WebRTC sessions, A-M and M-B, hands A's
+    /// nonce to B and relays B's signed hello back to A. B signed over ITS
+    /// session's fingerprints; A verifies over its own, so it must not verify.
+    #[test]
+    fn binding_for_one_fingerprint_pair_does_not_verify_under_another() {
+        let nonce_from_a = [9u8; 32];
+        let b_signs_over = dtls_channel_binding(FP_M2, FP_B, &nonce_from_a);
+        let a_verifies_over = dtls_channel_binding(FP_A, FP_M1, &nonce_from_a);
+        assert_ne!(b_signs_over, a_verifies_over);
+
+        let b = ident();
+        let ann = b.announce(1, &b_signs_over);
+        assert!(ann.verify(&b_signs_over).is_ok(), "honest same-session verify");
+        assert!(ann.verify(&a_verifies_over).is_err(), "relayed across sessions must fail");
+        // And the nonce still matters: the same session on a NEW link (same
+        // fingerprints after a reconnect) gets a fresh binding.
+        assert_ne!(
+            dtls_channel_binding(FP_A, FP_M1, &[1u8; 32]),
+            dtls_channel_binding(FP_A, FP_M1, &[2u8; 32])
+        );
+        // Length-prefixed: shifting bytes between the two fingerprints changes it.
+        assert_ne!(
+            dtls_channel_binding("AB", "C", &[0u8; 16]),
+            dtls_channel_binding("A", "BC", &[0u8; 16])
+        );
+    }
+}
+
+#[cfg(test)]
+mod frozen_protocol_literals {
+    /// FROZEN PROTOCOL CONSTANTS: these must never be renamed.
+    ///
+    /// Each digest was computed from the ORIGINAL (pre-rename) literal with
+    /// `printf '%s' '<literal>' | sha256sum` (a trailing `\0` is part of the
+    /// bytes). A digest cannot be satisfied by a find-and-replace: if a rename
+    /// touches one of these literals this test fails, and the literal is what
+    /// must be put back.
+    #[test]
+    fn overlay_domains_are_frozen() {
+        use sha2::{Digest, Sha256};
+        for (name, bytes, digest) in [
+            ("ADDR_DOMAIN", super::ADDR_DOMAIN,
+             "80a30f44af893716e5de95f43203de443d8135aac7dea0aaf65576e806fc60e2"),
+            ("BIND_DOMAIN", super::BIND_DOMAIN,
+             "3c634f3ec1526142423bc93de8d42e68cf465c8547f5934a6dd043aac2b0d825"),
+            ("ADDR_V4_DOMAIN", super::ADDR_V4_DOMAIN,
+             "4456c390f77130c4f8994ab3e5c0f3f7d871a8379001906b87fdf7dbbaf9a5aa"),
+            ("ROUTES_DOMAIN", super::ROUTES_DOMAIN,
+             "2db1d93638a4a10000e02d1fdb8d9d6f5aee7f26633769aacbf0a60315450850"),
+        ] {
+            let got: String = Sha256::digest(bytes).as_slice().iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got, digest, "frozen protocol literal {name} changed");
         }
     }
 }

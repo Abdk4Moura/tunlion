@@ -183,6 +183,63 @@ fn is_executable(p: &std::path::Path) -> bool {
     p.is_file()
 }
 
+/// How one exec is spawned: the resolved program, its args, and the account
+/// it runs as (None = the daemon user, only when no `--shell-user` is set).
+#[derive(Debug)]
+pub(crate) struct ExecSpawnPlan {
+    pub(crate) program: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) run_as: Option<String>,
+}
+
+/// Decide how to spawn an exec. With `--shell-user` set, the command runs as
+/// that account through the PTY path's own drop (`Paths::exec_as_user_argv`,
+/// runuser on Unix); where that drop does not exist, or its tool cannot be
+/// found, the exec is REFUSED with the reason rather than run as the daemon
+/// user. `program` is argv[0] already resolved on the daemon PATH.
+pub(crate) fn exec_spawn_plan(
+    program: &std::path::Path,
+    args: &[String],
+    shell_user: Option<&str>,
+) -> Result<ExecSpawnPlan, String> {
+    let Some(user) = shell_user else {
+        return Ok(ExecSpawnPlan {
+            program: program.to_path_buf(),
+            args: args.to_vec(),
+            run_as: None,
+        });
+    };
+    let argv =
+        crate::platform::Paths::exec_as_user_argv(&program.to_string_lossy(), args, Some(user))?;
+    let (head, rest) = argv
+        .split_first()
+        .ok_or_else(|| "exec refused: empty spawn argv".to_string())?;
+    // The drop tool resolves on the daemon PATH like argv[0] does: the child
+    // env is cleared, so a bare name would otherwise search no PATH at all.
+    let wrapper = resolve_in_path(head).ok_or_else(|| {
+        format!(
+            "exec refused: --shell-user {user} is set but `{head}` was not found on the daemon PATH, and running the command as the daemon user would ignore that setting"
+        )
+    })?;
+    Ok(ExecSpawnPlan {
+        program: wrapper,
+        args: rest.to_vec(),
+        run_as: Some(user.to_string()),
+    })
+}
+
+/// Starting directory when the initiator names none: the daemon user's home,
+/// or for a dropped exec the target account's home (what its login shell
+/// would get), falling back to `/` when that account has no usable home.
+fn default_exec_cwd(run_as: Option<&str>) -> PathBuf {
+    match run_as {
+        None => crate::platform::Paths::home_dir(),
+        Some(user) => crate::platform::Paths::home_of_user(user)
+            .filter(|h| h.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/")),
+    }
+}
+
 /// Pure exit-status mapping, split out so it is unit-testable without spawning:
 /// a clean exit keeps its raw code, signal death becomes 128+signal (the shell
 /// convention: 137 SIGKILL, 143 SIGTERM), and no information at all becomes
@@ -252,16 +309,26 @@ pub(crate) async fn authorize_exec(
     conn: &mut Conn,
     pid: &str,
     shell_policy: &crate::ShellPolicy,
-) -> Result<String, String> {
+) -> Result<String, crate::refusal::Refusal> {
     let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
         conn,
         pid,
         shell_policy,
         crate::capability::CAP_SHELL,
     );
+    // The refusal carries a precise code and the name this device files the
+    // peer under, so the initiator can print the one remedy that applies (a
+    // missing grant used to be indistinguishable from serving being off).
     crate::shell_gate::exec_gate_decision(&inputs)
-        .map(|()| dev.unwrap_or_else(|| pid.to_string()))
-        .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
+        .map(|()| dev.clone().unwrap_or_else(|| pid.to_string()))
+        .map_err(|r| {
+            crate::refusal::Refusal::from_shell_gate(
+                inputs.cert_revoked,
+                inputs.denied,
+                r.as_deref(),
+                dev.clone(),
+            )
+        })
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login
@@ -291,6 +358,7 @@ pub(crate) async fn serve_exec(
     req: ExecOpen,
     stdin_rx: mpsc::Receiver<Option<bytes::Bytes>>,
     authz: ExecSessionAuthz,
+    shell_user: Option<String>,
 ) {
     // stderr rides the initiator-allocated `err_sid` from the open frame
     // (same value the initiator registered before sending): allocating a
@@ -314,7 +382,21 @@ pub(crate) async fn serve_exec(
             .await;
         return;
     }
-    let cwd = req.cwd.unwrap_or_else(crate::platform::Paths::home_dir);
+    // --shell-user: the same account drop the PTY gets, or no exec at all.
+    // Never the daemon user when an operator configured a lesser one.
+    let plan = match exec_spawn_plan(&program, &req.argv[1..], shell_user.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => {
+            crate::ui::say(&format!("l2: {reason}"));
+            let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
+                .await;
+            return;
+        }
+    };
+    let cwd = req
+        .cwd
+        .unwrap_or_else(|| default_exec_cwd(plan.run_as.as_deref()));
     if !cwd.is_dir() {
         // Fail closed: a requested directory that does not exist refuses
         // rather than silently running somewhere else.
@@ -323,8 +405,8 @@ pub(crate) async fn serve_exec(
             .await;
         return;
     }
-    let mut child = match tokio::process::Command::new(&program)
-        .args(&req.argv[1..])
+    let mut child = match tokio::process::Command::new(&plan.program)
+        .args(&plan.args)
         .current_dir(&cwd)
         .env_clear()
         .envs(build_env(&req.env))
@@ -594,6 +676,7 @@ pub(crate) async fn handle_exec_open(
     mux: Arc<l2::Mux>,
     v: &Value,
     shell_policy: &crate::ShellPolicy,
+    shell_user: &Option<String>,
     parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     let Some(req) = parse_exec_open(v) else {
@@ -605,7 +688,8 @@ pub(crate) async fn handle_exec_open(
     if !l2::is_l2_sid(sid) {
         return;
     }
-    if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
+    if let Err(refusal) = authorize_exec(conn, pid, shell_policy).await {
+        let reason = refusal.reason.clone();
         // Settle-then-evaluate: the verdict above may rest on stale
         // (unproven) identity. Park for re-drive on proof when the deny
         // is attributable to it; otherwise the live verdict stands.
@@ -629,9 +713,7 @@ pub(crate) async fn handle_exec_open(
         // no-op by design.
         let who = conn.link(pid).and_then(|l| l.verified_name.clone());
         crate::enqueue_if_requestable(who.as_deref().unwrap_or("<unverified>"), "shell");
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
-            .await;
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     };
     // H-1 (DoS): refuse over the per-link stream cap BEFORE spawning, same as
@@ -686,7 +768,7 @@ pub(crate) async fn handle_exec_open(
         policy_allows,
         admitted_via_ceiling: covered && !has_grant_now,
     };
-    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz));
+    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz, shell_user.clone()));
 }
 
 #[cfg(test)]
@@ -763,6 +845,39 @@ mod tests {
         assert!(parse_exec_open(&json!({"argv": many})).is_none());
         let big = "x".repeat(40 * 1024);
         assert!(parse_exec_open(&json!({"argv": ["ok", big]})).is_none());
+    }
+
+    // --shell-user must reach exec. Without a user the spawn is the direct
+    // argv as the daemon user; with one, the plan either runs as that user
+    // through the drop tool or refuses. It never quietly spawns the bare
+    // program as the daemon user.
+    #[test]
+    fn exec_spawn_plan_uses_the_configured_shell_user() {
+        let prog = std::path::Path::new("/usr/bin/id");
+        let args = vec!["-un".to_string()];
+        let direct = exec_spawn_plan(prog, &args, None).expect("no user: direct");
+        assert_eq!(direct.program, PathBuf::from("/usr/bin/id"));
+        assert_eq!(direct.args, args);
+        assert_eq!(direct.run_as, None);
+
+        match exec_spawn_plan(prog, &args, Some("nobody")) {
+            Ok(plan) => {
+                assert_eq!(plan.run_as.as_deref(), Some("nobody"));
+                assert_ne!(
+                    plan.program,
+                    PathBuf::from("/usr/bin/id"),
+                    "spawned as the daemon user"
+                );
+                assert!(plan.args.iter().any(|a| a == "nobody"), "{:?}", plan.args);
+                assert!(
+                    plan.args
+                        .ends_with(&["/usr/bin/id".to_string(), "-un".to_string()]),
+                    "{:?}",
+                    plan.args
+                );
+            }
+            Err(reason) => assert!(reason.contains("--shell-user nobody"), "{reason}"),
+        }
     }
 
     #[test]

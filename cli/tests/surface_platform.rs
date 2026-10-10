@@ -63,20 +63,24 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // and flattening it loses data. Not a target.
         // mount_proto read 48 against a 47 budget on 2026-09-13 with no code
         // change behind it; set to the measured count rather than paid down.
-        ("mount_proto.rs", 48),
+        // 48 -> 39: the metadata ops moved their platform split into
+        // platform::fs_at (stat/readlink/readdir/uid/gid/create flags/mode).
+        ("mount_proto.rs", 39),
         // 39 -> 40 for the warm-pty verdict enum sharing its fn's gate.
-        ("l2.rs", 40),
+        // 40 -> 39 measured on the integration of #378..#394.
+        ("l2.rs", 39),
         // Should approach zero as the armed set stops needing IPC at all.
         ("ctl.rs", 6),
         ("tun/mod.rs", 6),
         ("sdnotify.rs", 5),
-        ("l3.rs", 4),
+        // 4 -> 2: hostname() asks platform::os_hostname instead of carrying
+        // its own unix/windows split.
+        ("l3.rs", 2),
         ("ping.rs", 3),
         ("mount.rs", 2),
         ("mount_fuse.rs", 2),
         ("expose.rs", 1),
         ("mount_winfsp.rs", 1),
-        ("settings.rs", 1),
     ])
 }
 

@@ -1,5 +1,6 @@
-//! Typed, discoverable persistent settings: the backing for `tunlion set`,
-//! `tunlion get`, and `tunlion unset`.
+//! Typed, discoverable persistent settings: the backing for `tunlion set`
+//! (list all), `tunlion set <key>` (read one), `tunlion set <key> <value>`
+//! (write one) and `tunlion set <key> --unset` (reset one).
 //!
 //! Design follows the evidence on world-class CLI config surfaces (clig.dev,
 //! the 12-factor CLI doc, and how git/gh/aws actually behave), chosen over the
@@ -106,7 +107,7 @@ pub fn registry() -> &'static [Setting] {
             aliases: &["dir"],
             store: "dir",
             kind: Kind::Path,
-            default: "~/Tunlion",
+            default: "~/Filament if it exists, else ~/Tunlion",
             scope: ScopeKind::GlobalOnly,
             env: None,
             daemon: true,
@@ -250,7 +251,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: true,
-            help: "Accept seamless `tunlion ssh` from paired devices (per-peer with --peer)",
+            help: "Accept seamless `tunlion shell` from paired devices (per-peer with --peer)",
         },
         Setting {
             key: "shell-user",
@@ -344,7 +345,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOnly,
             env: Some("FILAMENT_AUTO_PROXY"),
             daemon: true,
-            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on port 1080 so native tools reach <peer>.mesh. Turn off with `tunlion set auto-proxy off`.",
+            help: "When kernel TUN is unavailable, auto-start a SOCKS5 proxy on 127.0.0.1:1080 so native tools reach <peer>.mesh. It requires a username/password (the password is in proxy.token in the config dir, owner-only). Turn off with `tunlion set auto-proxy off`.",
         },
         Setting {
             key: "verbosity",
@@ -444,9 +445,6 @@ fn global_get(store: &str) -> Option<String> {
 
 fn global_put(store: &str, value: &str) -> Result<()> {
     let p = global_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()
@@ -477,7 +475,10 @@ fn global_remove(store: &str) -> Result<bool> {
         .collect();
     let removed = kept.len() != raw.lines().count();
     if removed {
-        std::fs::write(&p, kept.join("\n") + if kept.is_empty() { "" } else { "\n" })?;
+        crate::platform::SecretFile::write_str(
+            &p,
+            &(kept.join("\n") + if kept.is_empty() { "" } else { "\n" }),
+        )?;
     }
     Ok(removed)
 }
@@ -741,8 +742,40 @@ fn require_peer_known(device: &str) -> Result<()> {
     }
 }
 
+/// The ONE encoder from a canonical value to what a key's store holds.
+///
+/// avoid/only share the "interfaces" store as `{"m": mode, "i": items}`, and
+/// prefer is `{"o": order, "s": "soft"|"hard"}`; those JSON forms are the only
+/// ones the transport's candidate filter parses (`parse_membership` in
+/// filament-transport's direct.rs). Every writer goes through here. Before it
+/// existed, `set` stored the raw CSV, the flag path built the JSON and then
+/// threw it away (it was only ever printed by --dry-run), and the interactive
+/// picker stored raw CSV too, so `set avoid wl1` was accepted, echoed, and
+/// ignored by every connection.
+fn encode_for_store(s: &Setting, canonical: &str, hard: bool) -> String {
+    match s.store {
+        "interfaces" => {
+            let mode = match s.key {
+                "only" => "only",
+                _ => "avoid",
+            };
+            json!({"m": mode, "i": canonical}).to_string()
+        }
+        "prefer" => {
+            let strength = if hard { "hard" } else { "soft" };
+            json!({"o": canonical, "s": strength}).to_string()
+        }
+        _ => canonical.to_string(),
+    }
+}
+
 /// Set one key (strictly imperative + partial: only this key changes).
 pub fn set(key: &str, value: &str, peer: Option<&str>) -> Result<Change> {
+    set_with(key, value, peer, false)
+}
+
+/// `set`, with the prefer strength (`--hard`) that only `prefer` stores.
+pub fn set_with(key: &str, value: &str, peer: Option<&str>, hard: bool) -> Result<Change> {
     let s = lookup(key)?;
     if let Some(p) = peer {
         if s.scope == ScopeKind::GlobalOnly {
@@ -751,6 +784,7 @@ pub fn set(key: &str, value: &str, peer: Option<&str>) -> Result<Change> {
         require_peer_known(p)?;
     }
     let new = canonicalize(s, value)?;
+    let stored = encode_for_store(s, &new, hard);
     let scope_str = peer.map(|p| format!("peer:{p}")).unwrap_or_else(|| "global".into());
     let old = resolve(s, peer).0;
     match peer {
@@ -758,11 +792,11 @@ pub fn set(key: &str, value: &str, peer: Option<&str>) -> Result<Change> {
             let mut m = peer_load();
             let entry = m.entry(p.to_string()).or_insert_with(|| json!({}));
             if let Some(obj) = entry.as_object_mut() {
-                obj.insert(s.store.to_string(), json!(new));
+                obj.insert(s.store.to_string(), json!(stored));
             }
             peer_save(&m)?;
         }
-        None => global_put(s.store, &new)?,
+        None => global_put(s.store, &stored)?,
     }
     Ok(Change { key: s.key, old, new, scope: scope_str, daemon: s.daemon })
 }
@@ -800,7 +834,7 @@ fn lookup(key: &str) -> Result<&'static Setting> {
 
 // ----------------------------------------------------------- CLI handlers --
 
-/// `tunlion get <key> [--show-origin] [--default <v>] [--json] [--peer <d>]`
+/// Read one value: `tunlion set <key> [--json] [--peer <d>]` when not at a terminal.
 pub fn run_get(
     key: &str,
     peer: Option<&str>,
@@ -816,8 +850,9 @@ pub fn run_get(
     if value.is_empty() {
         if let Some(d) = default {
             value = d.to_string();
-        } else {
-            // Empty effective value (e.g. unset name fallback failed) → exit 1.
+        } else if !json_out {
+            // Empty effective value → exit 1 with nothing on stdout, like
+            // `git config <key>`. JSON still answers (with an empty value).
             std::process::exit(1);
         }
     }
@@ -843,20 +878,29 @@ pub fn run_get(
 /// Tell a running daemon a key changed and print whether it applied live. On a
 /// daemon that doesn't answer (or a non-unix host), fall back to the restart hint.
 async fn announce_to_daemon(key: &str, color: bool) {
-    #[cfg(unix)]
-    {
-        match crate::ctl::try_reconfigure(key).await {
-            Some(v) if v["live"].as_bool() == Some(true) => {
-                eprintln!("  {}", ui::paint_when(color, ui::Tone::Ok, "applied to the running daemon"));
-                return;
-            }
-            _ => {}
+    // Callers reach here only with a daemon running. Three outcomes, three
+    // sentences: it applied the change, it answered that a restart is needed,
+    // or it did not answer at all. The last used to read as the second ("takes
+    // effect on next up"), which is a silent fallback over a daemon whose
+    // control socket is gone: the user restarts nothing and nothing changes.
+    // (A platform with no control socket answers `live: false` itself.)
+    let (tone, msg) = match crate::ctl::try_reconfigure(key).await {
+        Some(v) if v["live"].as_bool() == Some(true) => {
+            (ui::Tone::Ok, "applied to the running daemon".to_string())
         }
-    }
-    eprintln!("  {}", ui::paint_when(color, ui::Tone::Dim, "takes effect on next `tunlion up`"));
+        Some(_) => (ui::Tone::Dim, "takes effect on next `tunlion up`".to_string()),
+        None => (
+            ui::Tone::Warn,
+            format!(
+                "NOT applied: the running daemon did not answer on its control socket ({}); restart it to apply: tunlion down && tunlion up",
+                crate::ctl::control_sock_path().display()
+            ),
+        ),
+    };
+    eprintln!("  {}", ui::paint_when(color, tone, &msg));
 }
 
-/// `tunlion unset <key> [--peer a,b]`. `peers` empty = clear the global value;
+/// `tunlion set <key> --unset [--peer a,b]`. `peers` empty = clear the global value;
 /// one or more = remove each device's per-peer override.
 pub async fn run_unset(key: &str, peers: &[String]) -> Result<()> {
     let s = lookup(key)?;
@@ -884,8 +928,13 @@ pub async fn run_unset(key: &str, peers: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `tunlion set` with key+value, or no args (readout), or --reset.
+/// `tunlion set` with key+value, or no args (readout), or --reset/--unset.
 /// `peers` empty = global; one or more = a per-peer override applied to each.
+///
+/// `--reset` with a key resets that key only (the same as `--unset`); bare
+/// `--reset` resets every setting. It used to reset EVERYTHING even when a
+/// key was named, so `tunlion set relay --reset` (the help's own example)
+/// wiped the drop dir, the server and every per-device override too.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_set(
     key: Option<&str>,
@@ -893,29 +942,63 @@ pub async fn run_set(
     peers: &[String],
     dry_run: bool,
     reset: bool,
+    unset_key: bool,
     hard: bool,
+    soft: bool,
     yes: bool,
     json_out: bool,
 ) -> Result<()> {
-    if reset {
+    if (hard || soft) && key.and_then(find).map(|s| s.key) != Some("prefer") {
+        bail!("--hard/--soft set the strength of `prefer` only");
+    }
+    if reset && key.is_none() {
         return run_reset(dry_run, yes);
+    }
+    if reset || unset_key {
+        let Some(k) = key else {
+            bail!("name the setting to reset: tunlion set <key> --unset   reset all: tunlion set --reset");
+        };
+        if value.is_some() {
+            bail!("--unset/--reset take a key, not a value: tunlion set {k} --unset");
+        }
+        if dry_run {
+            let s = lookup(k)?;
+            let targets: Vec<Option<&str>> = if peers.is_empty() {
+                vec![None]
+            } else {
+                peers.iter().map(|p| Some(p.as_str())).collect()
+            };
+            for tgt in targets {
+                let scope = tgt.map(|p| format!("peer:{p}")).unwrap_or_else(|| "global".into());
+                ui::say(&format!("would reset {} (currently {}, {scope})", s.key, resolve(s, tgt).0));
+            }
+            return Ok(());
+        }
+        return run_unset(k, peers).await;
     }
     match (key, value) {
         (None, _) => readout(json_out),
         (Some(k), None) => {
-            // `set <key>` with no value.
+            // `set <key>` with no value READS it, as the help says: the bare
+            // value on stdout for a pipe or a command substitution, JSON with
+            // --json. This used to print "needs a value" and exit 2 whenever
+            // stdout was not a terminal, so the documented read only worked
+            // where nobody could capture it. A terminal still gets the editor
+            // (a picker for interface lists, the value plus help otherwise).
             let s = lookup(k)?;
-            let tty = std::io::stdout().is_terminal();
-            if json_out {
-                let aff = build_affordance(s);
-                crate::interact::render_json_steer(&aff);
-            } else if tty {
-                render_missing_interactive(s);
+            let peer = match peers {
+                [] => None,
+                [one] => Some(one.as_str()),
+                _ => bail!("read one device's value at a time: tunlion set {} --peer <device>", s.key),
+            };
+            let interactive = std::io::stdout().is_terminal()
+                && std::io::stdin().is_terminal()
+                && !crate::NO_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+            if !json_out && interactive && peer.is_none() {
+                render_missing_interactive(s)
             } else {
-                let aff = build_affordance(s);
-                crate::interact::render_steer(&aff);
+                run_get(s.key, peer, false, None, json_out)
             }
-            Ok(())
         }
         (Some(k), Some(v)) => {
             let s = lookup(k)?;
@@ -924,22 +1007,9 @@ pub async fn run_set(
             }
             // Validate the value once (fail fast before writing anything), and
             // every target device, so a typo in peer 2 never half-applies peer 1.
-            let raw = canonicalize(s, v)?;
-            // Membership refactor: avoid/only share one store. Encode as JSON
-            // so the file carries the mode alongside the items.
-            let new = if s.store == "interfaces" {
-                let mode = match s.key {
-                    "avoid" => "avoid",
-                    "only" | "include" => "only",
-                    _ => "avoid",
-                };
-                json!({"m": mode, "i": raw}).to_string()
-            } else if s.store == "prefer" {
-                let strength = if hard { "hard" } else { "soft" };
-                json!({"o": raw, "s": strength}).to_string()
-            } else {
-                raw
-            };
+            // What is STORED is decided by `encode_for_store` inside `set_with`.
+            let new = canonicalize(s, v)?;
+            let strength_note = if s.key == "prefer" && hard { " (hard)" } else { "" };
             for p in peers {
                 require_peer_known(p)?;
             }
@@ -956,7 +1026,7 @@ pub async fn run_set(
                     let old = resolve(s, tgt).0;
                     let scope_str = tgt.map(|p| format!("peer:{p}")).unwrap_or_else(|| "global".into());
                     eprintln!(
-                        "would set {} {} {} ({}) {}",
+                        "would set {} {} {} ({}) {}{strength_note}",
                         s.key,
                         ui::paint_when(color, ui::Tone::Dim, &old),
                         ui::paint_when(color, ui::Tone::Dim, ui::glyph_arrow()),
@@ -965,12 +1035,12 @@ pub async fn run_set(
                     );
                     continue;
                 }
-                let c = set(k, v, tgt)?;
-                if c.old == c.new {
+                let c = set_with(k, v, tgt, hard)?;
+                if c.old == c.new && s.key != "prefer" {
                     eprintln!("{} already {} ({})", c.key, c.new, c.scope);
                 } else {
                     eprintln!(
-                        "{} {}: {} {} {} ({})",
+                        "{} {}: {} {} {}{strength_note} ({})",
                         ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()),
                         c.key,
                         ui::paint_when(color, ui::Tone::Dim, &c.old),
@@ -1050,20 +1120,28 @@ fn run_reset(dry_run: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// No-args readout. TTY: aligned colored table. Pipe: tab-separated rows.
-/// `--json`: complete structured array (global rows + per-peer overrides).
-/// Build an Affordance when `tunlion set <key>` is given without a value.
-/// Renders interactively (TTY), as steer (non-TTY), or as JSON (--json).
-fn render_missing_interactive(s: &Setting) {
+/// Store what an interactive editor chose for a List key. The SAME writer as
+/// `tunlion set <key> <value> [--hard]` (`set_with`, which encodes through
+/// `encode_for_store`), so a value picked in the checklist and the same value
+/// typed as an argument are stored byte-for-byte alike.
+fn store_interactive_choice(s: &Setting, chosen: &str, hard: bool) -> Result<Change> {
+    set_with(s.key, chosen, None, hard)
+}
+
+/// `tunlion set <key>` at a terminal: an editor for interface lists (checklist
+/// for avoid/only, reorderable list for prefer), else the value and its help.
+/// A failed write is an error, never a printed success.
+fn render_missing_interactive(s: &Setting) -> Result<()> {
     let (cur_val, origin) = resolve(s, None);
     let subtitle = if cur_val.is_empty() {
         format!("(currently unset) [{}]", origin.label())
     } else {
         format!("currently: {}  [{}]", cur_val, origin.label())
     };
+    let color = ui::stdout_color();
     match s.kind {
         Kind::List => {
-            let is_membership = s.key == "avoid" || s.key == "only" || s.key == "include";
+            let is_membership = s.key == "avoid" || s.key == "only";
             let aff = build_affordance_with_current(s, &cur_val);
             let opts = aff.options.unwrap_or_default();
 
@@ -1074,21 +1152,26 @@ fn render_missing_interactive(s: &Setting) {
                         if chosen.is_empty() {
                             eprintln!("{} cancelled (nothing selected)", s.key);
                         } else {
-                            let _ = set(s.key, &chosen, None);
-                            let color = ui::stdout_color();
-                            eprintln!("{} {}: {} {} {} (global)", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), chosen);
+                            let c = store_interactive_choice(s, &chosen, false)?;
+                            eprintln!("{} {}: {} {} {} ({})", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), c.new, c.scope);
                         }
                     }
                     None => eprintln!("{} cancelled", s.key),
                 }
             } else {
-                // Arrangement (prefer): reorderable list
-                match crate::interact::interactive_reorder(&aff.command, &subtitle, &opts, crate::interact::Strength::Soft) {
+                // Arrangement (prefer): reorderable list, starting from the
+                // strength that is stored now.
+                let start = if prefer_strength(None) == "hard" {
+                    crate::interact::Strength::Hard
+                } else {
+                    crate::interact::Strength::Soft
+                };
+                match crate::interact::interactive_reorder(&aff.command, &subtitle, &opts, start) {
                     Some((ordered, strength)) => {
-                        let _ = set(s.key, &ordered, None);
-                        let color = ui::stdout_color();
-                        let s_label = if strength == crate::interact::Strength::Hard { " (hard)" } else { "" };
-                        eprintln!("{} {}: {} {} {}{s_label} (global)", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), ordered);
+                        let hard = strength == crate::interact::Strength::Hard;
+                        let c = store_interactive_choice(s, &ordered, hard)?;
+                        let s_label = if hard { " (hard)" } else { "" };
+                        eprintln!("{} {}: {} {} {}{s_label} ({})", ui::paint_when(color, ui::Tone::Ok, ui::glyph_ok()), s.key, ui::paint_when(color, ui::Tone::Dim, &cur_val), ui::glyph_arrow(), c.new, c.scope);
                     }
                     None => eprintln!("{} cancelled", s.key),
                 }
@@ -1096,7 +1179,6 @@ fn render_missing_interactive(s: &Setting) {
         }
         _ => {
             // Non-List: show current value + help
-            let color = ui::stdout_color();
             println!("{} {} = {}  ({})", s.key, ui::paint_when(color, ui::Tone::Dim, &origin.label()), cur_val, s.help);
             match s.kind {
                 Kind::Bool => println!("  on / off  (example: tunlion set {} on)", s.key),
@@ -1105,32 +1187,14 @@ fn render_missing_interactive(s: &Setting) {
                 _ => {}
             }
             println!();
-            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: tunlion set <key> <value> [--peer <peer>]"));
+            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset   reset all: tunlion set --reset"));
         }
     }
-}
-
-
-
-// `render_missing_steer` / `render_missing_json` lived here. They were exact
-// duplicates of the inline json/plain branches of `set <key>` with no value, so
-// the nudge always DID render and these were leftovers, not a disconnected
-// affordance. Deleted after checking the branch that supersedes them.
-fn build_affordance(s: &Setting) -> crate::interact::Affordance {
-    let (cur_val, _) = resolve(s, None);
-    build_affordance_with_current(s, &cur_val)
+    Ok(())
 }
 
 fn build_affordance_with_current(s: &Setting, cur_val: &str) -> crate::interact::Affordance {
     let command = format!("set {}", s.key);
-    let (needs, example) = match s.kind {
-        Kind::Bool => ("on / off".into(), format!("tunlion set {} on", s.key)),
-        Kind::Enum(vals) => (vals.join(" / "), format!("tunlion set {} {}", s.key, vals[0])),
-        Kind::List => ("interface name, group, or CIDR".into(), format!("tunlion set {} wl1", s.key)),
-        Kind::Str => ("a value".into(), format!("tunlion set {} <value>", s.key)),
-        Kind::Path => ("a path".into(), format!("tunlion set {} ~/Downloads", s.key)),
-    };
-
     let options = if matches!(s.kind, Kind::List) {
         let ifaces = crate::interact::enumerate_interfaces();
         if ifaces.is_empty() {
@@ -1153,10 +1217,9 @@ fn build_affordance_with_current(s: &Setting, cur_val: &str) -> crate::interact:
         None
     };
 
-    crate::interact::Affordance { command, needs, example, options, options_label: "interfaces".into() }
+    crate::interact::Affordance { command, options }
 }
 
-// Remove old functions
 /// When avoid and prefer overlap, the latest set wins. Remove the overlapping
 /// items from the OTHER key so the two lists stay consistent.
 fn fix_overlap(key: &str, value: &str, peer: Option<&str>, color: bool) {
@@ -1173,11 +1236,17 @@ fn fix_overlap(key: &str, value: &str, peer: Option<&str>, color: bool) {
             other_parts.retain(|p| !parts.contains(p));
             if other_parts.len() < original_len {
                 if other_parts.is_empty() {
-                    // All items removed — clear the key entirely
-                    let _ = global_remove(other_key);
+                    // All items removed: clear the key entirely. Through
+                    // `unset`, which knows the key's STORE ("interfaces" for
+                    // avoid) and scope; `global_remove(other_key)` named the
+                    // key, not the store, and removed nothing.
+                    let _ = unset(other_key, peer);
                 } else {
                     let new_val = other_parts.join(",");
-                    let _ = set(other_key, &new_val, peer);
+                    // Keep prefer's strength: re-setting it must not quietly
+                    // turn a `--hard` preference soft.
+                    let hard = other_key == "prefer" && prefer_strength(peer) == "hard";
+                    let _ = set_with(other_key, &new_val, peer, hard);
                 }
                 let removed: Vec<&&str> = parts.iter().filter(|p| other_val.split(',').any(|o| o.trim() == **p)).collect();
                 let removed_str: Vec<&str> = removed.iter().map(|r| **r).collect();
@@ -1192,6 +1261,30 @@ fn fix_overlap(key: &str, value: &str, peer: Option<&str>, color: bool) {
     }
 }
 
+/// Every per-device override as (device, setting, value as `resolve` shows
+/// it). A store shared by two keys (avoid/only) yields a row only for the key
+/// its stored mode belongs to.
+fn peer_overrides(peers: &serde_json::Map<String, Value>) -> Vec<(String, &'static Setting, String)> {
+    let mut out = Vec::new();
+    for (dev, kv) in peers {
+        let Some(obj) = kv.as_object() else { continue };
+        for s in registry() {
+            if let Some(raw) = obj.get(s.store).and_then(|v| v.as_str()) {
+                let shown = decode_store_value(s, raw.to_string());
+                if s.store == "interfaces" && shown.is_empty() {
+                    continue;
+                }
+                out.push((dev.clone(), s, shown));
+            }
+        }
+    }
+    out
+}
+
+/// No-args readout. TTY: aligned colored table. Pipe: tab-separated rows.
+/// `--json`: complete structured array (global rows + per-peer overrides).
+/// Per-peer values are shown decoded (the same view `resolve` gives), not as
+/// the JSON the interfaces/prefer stores hold.
 fn readout(json_out: bool) -> Result<()> {
     let peers = peer_load();
 
@@ -1204,17 +1297,11 @@ fn readout(json_out: bool) -> Result<()> {
                 "origin": o.label(), "default": effective_default(s), "daemon": s.daemon, "help": s.help,
             }));
         }
-        for (dev, kv) in &peers {
-            if let Some(obj) = kv.as_object() {
-                for (store, val) in obj {
-                    if let Some(s) = registry().iter().find(|s| s.store == store) {
-                        rows.push(json!({
-                            "key": s.key, "value": val, "scope": format!("peer:{dev}"),
-                            "origin": format!("peer:{dev}"), "default": effective_default(s), "daemon": s.daemon,
-                        }));
-                    }
-                }
-            }
+        for (dev, s, val) in peer_overrides(&peers) {
+            rows.push(json!({
+                "key": s.key, "value": val, "scope": format!("peer:{dev}"),
+                "origin": format!("peer:{dev}"), "default": effective_default(s), "daemon": s.daemon,
+            }));
         }
         println!("{}", serde_json::to_string_pretty(&json!(rows))?);
         return Ok(());
@@ -1231,14 +1318,8 @@ fn readout(json_out: bool) -> Result<()> {
             let val = if v.is_empty() { "(none)".to_string() } else { v };
             println!("{}\t{}\tglobal\t{}", s.key, val, short_help(s));
         }
-        for (dev, kv) in &peers {
-            if let Some(obj) = kv.as_object() {
-                for (store, val) in obj {
-                    if let Some(s) = registry().iter().find(|r| r.store == store) {
-                        println!("{}\t{}\tpeer:{dev}\t{}", s.key, val.as_str().unwrap_or_default(), short_help(s));
-                    }
-                }
-            }
+        for (dev, s, val) in peer_overrides(&peers) {
+            println!("{}\t{}\tpeer:{dev}\t{}", s.key, val, short_help(s));
         }
         return Ok(());
     }
@@ -1262,20 +1343,17 @@ fn readout(json_out: bool) -> Result<()> {
         rows.push((s.key.into(), val, where_, help, is_default, false, String::new()));
 
         // Collect per-peer overrides for this setting
-        for (dev, kv) in &peers {
-            if let Some(obj) = kv.as_object() {
-                if let Some(pv) = obj.get(s.store) {
-                    let pval = pv.as_str().unwrap_or_default().to_string();
-                    peer_rows.push((
-                        s.key.into(),
-                        pval,
-                        "peer".into(),
-                        String::new(),
-                        false,
-                        true,
-                        dev.clone(),
-                    ));
-                }
+        for (dev, ps, pval) in peer_overrides(&peers) {
+            if ps.key == s.key {
+                peer_rows.push((
+                    s.key.into(),
+                    pval,
+                    "peer".into(),
+                    String::new(),
+                    false,
+                    true,
+                    dev,
+                ));
             }
         }
     }
@@ -1310,7 +1388,7 @@ fn readout(json_out: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset: tunlion unset <key>")
+        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset   reset all: tunlion set --reset")
     );
     Ok(())
 }
@@ -1374,10 +1452,29 @@ pub fn extract_archive(path: &Path, into: &Path) -> Result<usize> {
         if written > max_files || total > max_bytes {
             bail!("archive exceeds extract limits ({written} files / {total} bytes); extract it manually");
         }
+        // Where unpack_in puts it, for the mode below (it strips any `..` and
+        // leading `/`, and refuses what would leave `into`).
+        let rel = e.path().ok().map(|p| p.into_owned());
+        let executable = e.header().mode().map(|m| m & 0o111 != 0).unwrap_or(false);
         // unpack_in refuses to write outside `into` (returns Ok(false) on a
         // crafted `..`/absolute path); that is our zip-slip guard.
         match e.unpack_in(into) {
-            Ok(true) => written += 1,
+            Ok(true) => {
+                written += 1;
+                // An extracted entry takes the mode a received file takes
+                // (0644, or 0755 for a directory or an executable, under the
+                // umask), never the SENDER's: tar kept the archive's bits, so
+                // a file that was 0600 on the sender landed 0600 here while
+                // every plain received file was 0644.
+                if let Some(rel) = rel.as_deref() {
+                    let landed = into.join(rel);
+                    if et.is_dir() {
+                        let _ = crate::platform::publish_received_path(&landed, true);
+                    } else if et.is_file() {
+                        let _ = crate::platform::publish_received_path(&landed, executable);
+                    }
+                }
+            }
             Ok(false) => skipped += 1,
             Err(_) => skipped += 1,
         }
@@ -1589,14 +1686,53 @@ mod tests {
         });
     }
 
+    /// Received files were "sometimes 644 and sometimes 600": auto-extract
+    /// kept the SENDER's modes from the archive, while every plain received
+    /// file got 0644 under the umask. Extracted entries now get exactly what a
+    /// received file gets (0755 for a directory or an executable).
+    #[test]
+    fn extracted_entries_take_the_received_file_mode_not_the_senders() {
+        with_tmp_cfg(|| {
+            let src = config_dir().join("modes.tar");
+            {
+                let mut b = tar::Builder::new(std::fs::File::create(&src).unwrap());
+                for (name, mode) in [("pkg/secret.txt", 0o600u32), ("pkg/run.sh", 0o750)] {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(3);
+                    h.set_mode(mode);
+                    h.set_cksum();
+                    b.append_data(&mut h, name, &b"abc"[..]).unwrap();
+                }
+                b.finish().unwrap();
+            }
+            let into = config_dir().join("x");
+            assert_eq!(extract_archive(&src, &into).unwrap(), 2);
+            // What this process's umask makes of a plain create, for reference.
+            let probe = config_dir().join("probe");
+            std::fs::File::create(&probe).unwrap();
+            std::fs::create_dir(config_dir().join("probe.d")).unwrap();
+            let (Some(plain), Some(dir)) = (
+                crate::platform::file_mode(&probe),
+                crate::platform::file_mode(&config_dir().join("probe.d")),
+            ) else {
+                return; // no POSIX modes on this platform
+            };
+            let received = plain & 0o644;
+            let secret = crate::platform::file_mode(&into.join("pkg/secret.txt")).unwrap();
+            let run = crate::platform::file_mode(&into.join("pkg/run.sh")).unwrap();
+            assert_eq!(secret & 0o777, received, "got {secret:o}");
+            assert_eq!(run & 0o777, received | (dir & 0o111), "got {run:o}");
+        });
+    }
+
     #[test]
     fn avoid_resolve_matches_what_was_set() {
         with_tmp_cfg(|| {
             let devs = config_dir().join("devices.json");
             std::fs::write(&devs, r#"[{"name":"laptop","secret":"x"}]"#).unwrap();
 
-            // Low-level set writes raw; the membership JSON wrapping happens in run_set.
-            // Here we write the JSON directly so resolve can decode it.
+            // The stored membership form, written directly so this pins the
+            // DECODE half; the encode half is interactive_and_flag_paths_store_identical_values.
             global_put("interfaces", r#"{"m":"avoid","i":"tailscale0,lo"}"#).unwrap();
             let resolved = resolve(find("avoid").unwrap(), None).0;
             assert_eq!(resolved, "tailscale0,lo");
@@ -1630,5 +1766,94 @@ mod tests {
             assert_eq!(resolve(find("avoid").unwrap(), None).0, "",
                 "avoid cleared when prefer claims the only item");
         });
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(f)
+    }
+
+    /// The picker at a terminal and `tunlion set <key> <value>` store the same
+    /// bytes, and those bytes are the JSON form the transport parses. Before
+    /// one encoder existed, both stored raw CSV, which the transport's
+    /// `parse_membership` reads as "no membership rule": avoid/only were
+    /// accepted, echoed, and ignored, and `--hard` was never stored.
+    #[test]
+    fn interactive_and_flag_paths_store_identical_values() {
+        for (key, value, hard) in [
+            ("avoid", "wl1,tailscale0", false),
+            ("only", "eth0", false),
+            ("include", "eth0,wl1", false),
+            ("prefer", "wl1,eth0", true),
+            ("prefer", "tailscale0", false),
+        ] {
+            let s = find(key).unwrap();
+            let via_flags = with_tmp_cfg(|| {
+                block_on(run_set(Some(key), Some(value), &[], false, false, false, hard, false, false, false))
+                    .unwrap();
+                (global_get(s.store).unwrap(), resolve(s, None).0, prefer_strength(None))
+            });
+            let via_picker = with_tmp_cfg(|| {
+                store_interactive_choice(s, value, hard).unwrap();
+                (global_get(s.store).unwrap(), resolve(s, None).0, prefer_strength(None))
+            });
+            assert_eq!(via_flags, via_picker, "{key}: the two paths stored different values");
+            let (stored, shown, strength) = via_flags;
+            assert_eq!(shown, value, "{key}: reads back as what was set");
+            let v: Value = serde_json::from_str(&stored)
+                .unwrap_or_else(|_| panic!("{key}: stored {stored:?} is not the JSON the transport parses"));
+            if s.store == "interfaces" {
+                assert_eq!(v["m"].as_str(), Some(s.key), "{key}: membership mode");
+                assert_eq!(v["i"].as_str(), Some(value), "{key}: membership items");
+            } else {
+                assert_eq!(v["o"].as_str(), Some(value), "prefer order");
+                assert_eq!(strength, if hard { "hard" } else { "soft" }, "prefer strength is stored");
+            }
+        }
+    }
+
+    #[test]
+    fn hard_and_soft_are_refused_for_keys_other_than_prefer() {
+        with_tmp_cfg(|| {
+            let err = block_on(run_set(Some("avoid"), Some("wl1"), &[], false, false, false, true, false, false, false))
+                .unwrap_err();
+            assert!(err.to_string().contains("prefer"), "{err}");
+            assert!(global_get("interfaces").is_none(), "a refused set writes nothing");
+        });
+    }
+
+    /// `set <key> --reset` resets THAT key. It used to reset every setting,
+    /// which is not what the help's `tunlion set relay --reset` example said.
+    #[test]
+    fn reset_with_a_key_resets_only_that_key() {
+        with_tmp_cfg(|| {
+            set("relay", "always", None).unwrap();
+            set("auto-extract", "on", None).unwrap();
+            block_on(run_set(Some("relay"), None, &[], false, true, false, false, false, false, false)).unwrap();
+            let (relay, origin) = resolve(find("relay").unwrap(), None);
+            assert_eq!(relay, "auto");
+            assert!(matches!(origin, Origin::Default));
+            assert!(get_bool("auto-extract", None), "an unnamed key was reset too");
+            // --unset is the same single-key reset.
+            block_on(run_set(Some("auto-extract"), None, &[], false, false, true, false, false, false, false)).unwrap();
+            assert!(!get_bool("auto-extract", None));
+        });
+    }
+
+    #[test]
+    fn set_unset_and_reset_parse_as_documented() {
+        use clap::Parser;
+        let parse = |a: &[&str]| crate::Cli::try_parse_from(std::iter::once("tunlion").chain(a.iter().copied()));
+        assert!(parse(&["set", "relay", "--unset"]).is_ok());
+        assert!(parse(&["set", "relay", "--reset"]).is_ok());
+        assert!(parse(&["set", "--reset", "--yes"]).is_ok(), "the global --yes reaches set");
+        assert!(parse(&["set", "--unset"]).is_err(), "--unset needs a key");
+        assert!(parse(&["set", "relay", "always", "--unset"]).is_err());
+        assert!(parse(&["set", "prefer", "wl1", "--hard"]).is_ok());
+        let cli = parse(&["set", "--reset", "--yes", "--json"]).unwrap();
+        assert!(cli.yes && cli.json, "set no longer shadows the global --yes/--json");
     }
 }

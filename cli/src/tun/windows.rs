@@ -31,8 +31,9 @@ impl KernelTun {
     /// pumping. Needs Administrator + wintun.dll.
     pub fn open(name: &str, cidr: &str, mtu: u32) -> Result<KernelTun> {
         let wintun = load_wintun().context("load wintun.dll (bundle it beside tunlion.exe)")?;
+        // PROTOCOL LITERAL: frozen, do not rename (wintun tunnel type of released builds).
         let adapter = wintun::Adapter::open(&wintun, name)
-            .or_else(|_| wintun::Adapter::create(&wintun, name, "Tunlion", None))
+            .or_else(|_| wintun::Adapter::create(&wintun, name, "Filament", None))
             .map_err(|e| {
                 anyhow::anyhow!(
                     "create Wintun adapter '{name}': {e}. L3 on Windows needs Administrator and wintun.dll."
@@ -223,6 +224,18 @@ pub fn add_addr(cidr: &str, dev: &str) -> Result<()> {
 pub fn ensure_net_admin_for_l3() -> bool {
     eprintln!("  L3 on Windows needs Administrator and wintun.dll beside tunlion.exe.");
     true
+}
+
+/// No one-time grant exists on Windows (Wintun needs an elevated daemon), so
+/// there is nothing to offer at `init`.
+pub fn l3_grant_pending() -> Option<String> {
+    None
+}
+
+/// Nothing on Windows blocks the kernel overlay in a way a grant could not
+/// address; the daemon's own privilege decides it.
+pub fn l3_blocker() -> Option<String> {
+    None
 }
 
 /// The Windows daemon runs elevated (Wintun requires it), so the hosts file is

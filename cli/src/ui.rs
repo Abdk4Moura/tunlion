@@ -224,11 +224,16 @@ pub fn link(url: &str, text: &str) -> String {
 
 /// OSC 52: put `s` on the terminal's clipboard (silently unsupported in some
 /// terminals; harmless there). Only on a tty.
-pub fn clipboard(s: &str) {
+/// Offer `s` to the terminal's clipboard (OSC 52). Returns whether it can
+/// plausibly have landed: written to a terminal AND a session with a
+/// clipboard behind it. Callers claim "(copied to clipboard)" only on `true`.
+pub fn clipboard(s: &str) -> bool {
     use base64_mini::enc;
     if caps().tty {
         eprint!("\x1b]52;c;{}\x07", enc(s.as_bytes()));
+        return crate::platform::clipboard_reachable();
     }
+    false
 }
 
 mod base64_mini {
@@ -272,6 +277,66 @@ fn paint_live(line: &str) {
     LIVE.store(true, Ordering::Relaxed);
 }
 
+// ------------------------------------------------------------- broken pipe --
+
+/// A reader that stopped reading is not a failure of this command.
+///
+/// `tunlion status | head -2` exited 101 with a Rust panic: Rust ignores
+/// SIGPIPE, so every write after `head` exits returns EPIPE, and `println!` /
+/// `eprintln!` panic on any write error. Standard tools die quietly there
+/// (SIGPIPE); this does the equivalent for the output macros everywhere at
+/// once: a panic whose cause is a print hitting a closed pipe ends the command
+/// with nothing more on the terminal, and every other panic reports exactly as
+/// before. The process exits with the code the command had ALREADY decided on
+/// (`exit_code_on_closed_pipe`), else 0, as ripgrep does: the consumer asked
+/// for less, and a pipeline under `set -o pipefail` must not fail because
+/// `head` did its job. A command whose answer IS its exit code decides it
+/// before printing: `status` with no daemon exits 11 piped into `head` exactly
+/// as it does unpiped (it exited 0 there, losing the answer a script needed).
+///
+/// SIGPIPE itself stays ignored on purpose. Restoring its default would also
+/// kill the daemon on any write to a peer or a child that went away, which is
+/// exactly the case the ignored signal exists for.
+pub fn exit_quietly_on_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if is_broken_pipe_print(payload) {
+            std::process::exit(CLOSED_PIPE_EXIT.load(Ordering::Relaxed));
+        }
+        previous(info);
+    }));
+}
+
+/// The exit code a closed pipe ends the command with: 0 unless the command
+/// has already decided its answer.
+static CLOSED_PIPE_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Record the exit code this command has decided on, BEFORE it prints, so a
+/// reader that closes the pipe early (`| head -1`) does not turn the answer
+/// into 0. Only for commands whose exit code is the answer; everything else
+/// keeps the default, 0.
+pub fn exit_code_on_closed_pipe(code: i32) {
+    CLOSED_PIPE_EXIT.store(code, Ordering::Relaxed);
+}
+
+/// True for the panic std raises when `print!`/`eprint!` hit a closed pipe:
+/// "failed printing to stdout: Broken pipe (os error 32)". Windows words EPIPE
+/// as "The pipe is being closed. (os error 232)".
+pub fn is_broken_pipe_print(msg: &str) -> bool {
+    msg.starts_with("failed printing to")
+        && (msg.contains("Broken pipe") || msg.contains("os error 32)") || msg.contains("os error 232)"))
+}
+// Deliberately NOT also "any error whose cause is BrokenPipe": a peer socket
+// or a child's stdin closing mid-transfer is a real failure of the command,
+// and exiting 0 on it would report a send that did not happen as a success.
+// Only the print macros' own panic names our stdout or stderr for certain.
+
 /// Permanent line (survives in scrollback); repaints any sticky line below.
 /// The raw emitter, every leveled helper funnels through here once it has
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
@@ -295,6 +360,16 @@ pub fn say(line: &str) {
     if enabled(Level::Info) {
         emit(line);
     }
+}
+
+/// One machine-readable JSON document on STDOUT, a line of its own. The
+/// `--json` result and failure envelopes go through here rather than a bare
+/// print so stdout carries exactly what a script parses and nothing else; it
+/// is never verbosity-gated, because a `-q` script still needs its answer.
+pub fn json_out(v: &serde_json::Value) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{v}");
+    let _ = out.flush();
 }
 
 /// CRITICAL level: the value-prop + must-see lines, the route label, the relay
@@ -674,12 +749,23 @@ pub fn qr_or_text(url: &str, rows_used: usize) -> String {
     if qr_fits(url, rows_used) {
         qr(url)
     } else {
-        format!(
-            "  (the QR needs {} rows and this window has {}; the top would be cut off)\n  {url}",
-            qr_rows(url).unwrap_or(0),
-            crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(0),
-        )
+        match qr_too_tall_note(url, rows_used) {
+            Some(note) => format!("  {note}\n  {url}"),
+            None => format!("  {url}"),
+        }
     }
+}
+
+/// Why the QR is not drawn, when the reason is the window height. `None` when
+/// no QR could be drawn at all (no unicode, e.g. a plain or dumb terminal) or
+/// the height is unknown: "the QR needs 0 rows and this window has 40" was a
+/// sentence about a QR that never existed.
+pub fn qr_too_tall_note(url: &str, rows_used: usize) -> Option<String> {
+    let rows = qr_rows(url)?;
+    let height = crossterm::terminal::size().ok().map(|(_, h)| h as usize)?;
+    (rows_used + rows > height).then(|| {
+        format!("(the QR needs {rows} rows and this window has {height}; the top would be cut off)")
+    })
 }
 
 #[cfg(test)]
@@ -721,5 +807,47 @@ mod verbosity_tests {
 
         // restore default for any later same-process readers.
         VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
+    }
+
+    /// `tunlion status | head -2` exited 101: std panics with exactly this
+    /// text when a print hits a closed pipe. Only that panic is quiet; any
+    /// other panic, including one that merely mentions a pipe, still reports.
+    #[test]
+    fn only_a_print_into_a_closed_pipe_is_a_quiet_exit() {
+        assert!(is_broken_pipe_print("failed printing to stdout: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print("failed printing to stderr: Broken pipe (os error 32)"));
+        assert!(is_broken_pipe_print(
+            "failed printing to stdout: The pipe is being closed. (os error 232)"
+        ));
+        assert!(!is_broken_pipe_print("failed printing to stdout: No space left on device (os error 28)"));
+        assert!(!is_broken_pipe_print("called `Result::unwrap()` on an `Err` value: Broken pipe"));
+        assert!(!is_broken_pipe_print("index out of bounds"));
+    }
+
+    /// A closed pipe ends the command with the code it had decided on, 0 by
+    /// default: `status | head -1` with no daemon must still exit 11.
+    #[test]
+    fn a_closed_pipe_keeps_the_decided_exit_code() {
+        use std::sync::atomic::Ordering;
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 0, "default: a reader that stopped is not a failure");
+        super::exit_code_on_closed_pipe(11);
+        assert_eq!(super::CLOSED_PIPE_EXIT.load(Ordering::Relaxed), 11);
+        super::exit_code_on_closed_pipe(0);
+    }
+}
+
+#[cfg(test)]
+mod transfer_units {
+    /// Transfer sizes and rates divide by 1024, so they carry the binary
+    /// labels. "1.0 MB" for 1048576 bytes was a decimal label on a binary
+    /// number.
+    #[test]
+    fn human_labels_match_the_1024_divisor() {
+        assert_eq!(crate::human(512), "512 B");
+        assert_eq!(crate::human(1024), "1.0 KiB");
+        assert_eq!(crate::human(1536), "1.5 KiB");
+        assert_eq!(crate::human(1024 * 1024), "1.0 MiB");
+        assert_eq!(crate::human(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(crate::human(2 * 1024u64.pow(4)), "2.0 TiB");
     }
 }

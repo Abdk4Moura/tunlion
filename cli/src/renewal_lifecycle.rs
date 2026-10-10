@@ -417,6 +417,18 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 .link(&pid)
                 .map(|link| link.name.clone())
                 .unwrap_or_else(|| "joined-device".to_string());
+            // The owner named this invitee when minting (`add beta --out f`):
+            // that choice wins over the name the joiner proposes (its
+            // hostname, unless `join --name` said otherwise). The usual rules
+            // below still apply to it: a name another key holds is suffixed.
+            if let Some(chosen) = crate::armed::invitee_name(&hex::encode(enroll_pub)) {
+                if chosen != requested_name {
+                    ui::say(&format!(
+                        "  a device that calls itself '{requested_name}' joined with the invitation you made for '{chosen}'; it is listed as '{chosen}'"
+                    ));
+                }
+                requested_name = chosen;
+            }
             // A device re-joining with its own device_pub meets its prior record.
             // LAPSED revives (a network accident): keep the name for continuity,
             // and the delegated write below OVERWRITES the whole bounding set
@@ -424,6 +436,21 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // decision, not an accident: refuse, and tell the owner only
             // `devices restore` undoes it.
             let prior = devices_find_by_device_pub(&device_pub);
+            // A key revoked and then forgotten has no record left to refuse
+            // it, so a fresh invitation would have re-admitted the very key
+            // the owner cut off. The key list keeps that decision.
+            if prior.is_none()
+                && crate::fleet_support::device_key_revoked(&device_pub, identity::now_secs())
+            {
+                ui::debug(&format!("enroll response refused: device {pid} holds a revoked key"));
+                let _ = t
+                    .send_control(&json!({
+                        "type": "identity-auth-key-enroll-error",
+                        "reason": "this device key was revoked by the owner; run `tunlion reset` on this device for a new key, then join again"
+                    }))
+                    .await;
+                return;
+            }
             if let Some(prior_record) = &prior {
                 if let Some(reason) = enrollment_refusal(prior_record) {
                     ui::debug(&format!(
@@ -460,6 +487,15 @@ pub(crate) async fn handle_auth_key_enroll_response(
                 while crate::devices_store::name_pinned_by_other(&candidate, &hex) && n < 1000 {
                     candidate = format!("{base}-{n}");
                     n += 1;
+                }
+                // The suffix is the security rule (a new key never takes over
+                // another key's name). Say it out loud, with the way back, so a
+                // reset device does not sit beside its stale self forever.
+                if candidate != base {
+                    ui::say(&format!(
+                        "  {} a new device asked to be called {base}, a name another key holds, so it was stored as {candidate}. If {base} was reset and this is the same machine: `tunlion devices forget {base}` then `tunlion devices rename {candidate} {base}`.",
+                        ui::paint(ui::Tone::Warn, "!")
+                    ));
                 }
             }
             let requested_name = candidate;

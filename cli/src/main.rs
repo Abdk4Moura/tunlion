@@ -51,9 +51,10 @@ mod holepunch;
 pub(crate) use filament_id as identity;
 mod interact;
 mod l2;
+mod proxy_state;
 mod mount;
 mod mount_proto;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos")))]
 mod mount_fuse;
 #[cfg(all(target_os = "windows", feature = "mount-windows"))]
 mod mount_winfsp;
@@ -71,6 +72,14 @@ mod pake_ceremony;
 mod ping;
 mod roster;
 mod sdnotify;
+/// Stopping the daemon for real, and naming who holds its election.
+mod daemon_stop;
+/// What status and doctor say about the running daemon beyond a live pid.
+mod daemon_health;
+/// The daemon's signaling link: re-dial policy, log collapse, reported health.
+mod signaling_health;
+/// What to say when a paired device was reset and came back under a new key.
+mod reset_hints;
 // The wire vocabulary and its pure decisions now live in their own crate. Kept
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;
@@ -100,6 +109,16 @@ mod recv_cmd;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
+/// `tunlion send`'s source checks: refuse what cannot be read before offering.
+mod send_source;
+/// `tunlion send --json`: the result object.
+mod send_report;
+mod transfer_history;
+/// What `send` says, and how long it waits, when its receiver goes away.
+mod send_liveness;
+/// What a transfer says about itself when it resumes, streams or loses its
+/// peer: the pure decisions and sentences, kept testable.
+mod transfer_truth;
 /// The CLI dispatch table.
 mod dispatch;
 use dispatch::async_main;
@@ -115,6 +134,8 @@ mod device_perms;
 pub(crate) use device_view::{devices_store, devices_store_v2, device_cert_for, device_cert_valid_for, device_record_exists, device_name_for_pub, device_cert_revoked, devices_find_by_device_pub, devices_sweep_lapsed, devices_touch, devices_info, device_countdown, device_entries};
 #[cfg(test)]
 pub(crate) use device_view::devices_touch_at;
+/// The pure `mount-open` decision inputs (capability + share-root confinement).
+mod mount_gate;
 /// Mount planning/implementation and reset.
 mod mount_cmd;
 pub(crate) use mount_cmd::{reset_cmd, resolve_mount_plan};
@@ -159,6 +180,8 @@ mod shell_support;
 pub(crate) use shell_support::{any_shell_grant, daemon_alive, daemon_running, require_shell_owner_ack, service_manager_for_pid, shell_argv, shell_grant_names, shell_root_note};
 /// The single shell gate shared by pty-open and exec-open.
 mod shell_gate;
+/// Precise shell-class refusal codes and the remedy each one implies.
+mod refusal;
 #[cfg(test)]
 pub(crate) use shell_support::service_manager_for_cgroup;
 /// Hashing, time and randomness primitives.
@@ -273,12 +296,20 @@ use zeroize::Zeroizing;
 // files). Loop until the whole buffer lands; return Err on a real failure so the caller
 // can react instead of silently dropping bytes.
 
+/// How long a peer that vanished WITHOUT announcing it (no `brb`) is waited
+/// for. 25 s, the bound a sender already gives a receiver that was killed
+/// mid-transfer: a signaling blip reconnects well inside it, and a process that
+/// was killed is not coming back, so waiting longer only delays the honest
+/// answer (a receiver whose sender was SIGKILLed used to wait ~96 s). A peer
+/// that said `brb` gets its declared window instead (see `on_peer_left`).
+pub(crate) const REJOIN_UNWARNED_DEFAULT: Duration = Duration::from_secs(25);
+
 fn rejoin_unwarned() -> Duration {
     std::env::var("FILAMENT_REJOIN_SECS") // test knob (gate 15)
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(45))
+        .unwrap_or(REJOIN_UNWARNED_DEFAULT)
 }
 
 /// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
@@ -550,7 +581,9 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
         return;
     }
     *shown = true;
-    ui::say(&ui::paint(
+    // Debug-level: this names a BROWSER setting (chrome://flags), and the
+    // terminal-to-terminal case it fired in at normal verbosity has no browser.
+    ui::debug(&ui::paint(
         ui::Tone::Dim,
         "  still can't connect, if both ends are on the SAME machine, a browser's \
          mDNS (.local) ICE candidates can block this; try a different network path, \
@@ -560,6 +593,8 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
 
 /// The clap command surface.
 mod cli_def;
+/// The documented exit codes and the one place a failure is reported.
+mod exit_codes;
 pub(crate) use cli_def::{Cli, Cmd, DevicesAction, EphemeralAction, IdAction};
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
@@ -679,9 +714,6 @@ fn config_get(key: &str) -> Option<String> {
 
 fn config_set(key: &str, value: &str) -> Result<()> {
     let p = config_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
     let mut lines: Vec<String> = std::fs::read_to_string(&p)
         .unwrap_or_default()
         .lines()
@@ -689,7 +721,9 @@ fn config_set(key: &str, value: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{key} {value}"));
-    std::fs::write(&p, lines.join("\n") + "\n")?;
+    // Owner-only (0600) in an owner-only directory, whatever the umask, and
+    // atomic. A plain `fs::write` here created `config` 0666 under umask 0000.
+    crate::platform::SecretFile::write_str(&p, &(lines.join("\n") + "\n"))?;
     Ok(())
 }
 
@@ -703,31 +737,44 @@ pub(crate) fn display_name() -> String {
     default_display_name()
 }
 
-/// The computed display name when nothing is configured (user@host). Kept
-/// separate so the settings readout can show the true default.
+/// The computed display name when nothing is configured: the short hostname
+/// (`laptop`, not `kabir@laptop.home.lan`). Kept separate so the settings
+/// readout can show the true default.
 pub(crate) fn default_display_name() -> String {
-    // #183.1: USER and /etc/hostname are UNIX-only. On Windows the platform
-    // provides USERNAME and COMPUTERNAME and no /etc/hostname, so the unix
-    // read would offer every device the literal name "cli".
-    #[cfg(not(target_os = "windows"))]
-    {
-        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
-        let host = std::fs::read_to_string("/etc/hostname")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "cli".into());
-        format!("{user}@{host}")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-        let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "cli".into());
-        format!("{user}@{host}")
-    }
+    short_host_label(&crate::platform::os_hostname().unwrap_or_default())
 }
 
+/// `Kabir-MacBook.local` -> `kabir-macbook`. The first DNS label, lowercased,
+/// with anything outside [a-z0-9-] turned into `-`, so the name works as a
+/// `<name>.mesh` label and reads the same on every peer. Falls back to
+/// "device" when nothing usable is left.
+pub(crate) fn short_host_label(host: &str) -> String {
+    let first = host.trim().split('.').next().unwrap_or("");
+    let mapped: String = first
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }
+        })
+        .collect();
+    let mut label = String::new();
+    for c in mapped.chars() {
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
+    }
+    let label: String = label.trim_end_matches('-').chars().take(63).collect();
+    let label = label.trim_end_matches('-').to_string();
+    if label.is_empty() { "device".to_string() } else { label }
+}
 
 pub(crate) fn human(bytes: u64) -> String {
-    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Byte counts and rates for all transfer output, in binary units: the
+    // divisor is 1024, so the labels are the IEC ones. They used to say
+    // KB/MB/GB over the same divisor, which reads as decimal and understated
+    // every size and rate (by about 7% at the GB scale).
     let mut v = bytes as f64;
     let mut i = 0;
     while v >= 1024.0 && i < U.len() - 1 {
@@ -754,8 +801,22 @@ impl PartMeta {
         }
         raw.trim().parse::<u64>().ok().map(|size| PartMeta { size, head: None, full: None })
     }
+    /// Write the sidecar WITHOUT following a symlink at `path`: the download
+    /// dir may be writable by others, and `std::fs::write` through a planted
+    /// `x.part.meta -> ~/.bashrc` would overwrite the link's target. Unlink
+    /// first (removes a link, never its target), then create exclusively, so a
+    /// link re-planted in between makes this fail instead of writing through.
+    /// Created owner-only (0600) regardless of umask: it names the file, its
+    /// size and digests, and sits in a download dir others may read.
     fn store(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, json!({ "size": self.size, "head": self.head, "full": self.full }).to_string())
+        use std::io::Write;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut f = crate::platform::create_new_private(path)?;
+        f.write_all(json!({ "size": self.size, "head": self.head, "full": self.full }).to_string().as_bytes())
     }
 }
 
@@ -823,22 +884,61 @@ fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
 /// the nonce the PEER chose: they will verify against what they sent. `None`
 /// means the challenge has not completed yet and the caller must simply wait,
 /// which is why every send site is inside an `if let`.
+///
+/// `fps` are this link's DTLS fingerprints (`link_fingerprints`); on a
+/// DataChannel the nonce is folded together with them (`nonce_binding`).
 fn out_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     theirs: &HashMap<String, Vec<u8>>,
+    fps: Option<&(String, String)>,
 ) -> Option<Vec<u8>> {
-    t.channel_binding().or_else(|| theirs.get(pid).cloned())
+    t.channel_binding()
+        .or_else(|| theirs.get(pid).and_then(|n| nonce_binding(t, fps, n)))
 }
 
 /// The binding to VERIFY an incoming `l3-announce` / `fleet-hello` against: our
-/// own exporter value, or the nonce WE chose and sent to that peer.
+/// own exporter value, or the nonce WE chose and sent to that peer (bound to
+/// the DTLS fingerprints on a DataChannel).
 fn in_binding(
     t: &Arc<dyn Transport>,
     pid: &str,
     ours: &HashMap<String, Vec<u8>>,
+    fps: Option<&(String, String)>,
 ) -> Option<Vec<u8>> {
-    t.channel_binding().or_else(|| ours.get(pid).cloned())
+    t.channel_binding()
+        .or_else(|| ours.get(pid).and_then(|n| nonce_binding(t, fps, n)))
+}
+
+/// Turn a link-challenge nonce into the channel binding for a transport with
+/// no RFC-5705 exporter.
+///
+/// A WebRTC DataChannel: `dtls_channel_binding(fps, nonce)`. A bare nonce there
+/// let a party in two WebRTC sessions relay a sibling's challenge and response
+/// and be admitted as that sibling; the fingerprint pair is what differs
+/// between the two legs (pair-proof binds them for the same reason). `None`
+/// while the fingerprints are unknown: the caller waits, it never falls back
+/// to the bare nonce.
+///
+/// Any other exporter-less transport (the same-host `local-tcp` link) has no
+/// DTLS session to bind to and keeps the bare nonce, as before.
+fn nonce_binding(
+    t: &Arc<dyn Transport>,
+    fps: Option<&(String, String)>,
+    nonce: &[u8],
+) -> Option<Vec<u8>> {
+    if t.as_any().is::<net::DataChannelTransport>() {
+        let (a, b) = fps?;
+        Some(overlay::dtls_channel_binding(a, b, nonce))
+    } else {
+        Some(nonce.to_vec())
+    }
+}
+
+/// This link's DTLS fingerprints (ours, theirs), when it has a WebRTC peer.
+async fn link_fingerprints(conn: &conn::Conn, pid: &str) -> Option<(String, String)> {
+    let peer = conn.link(pid)?.peer.clone()?;
+    peer.fingerprints().await
 }
 
 
@@ -957,6 +1057,7 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 
 pub(crate) fn channel_of(secret: &str) -> String {
     let mut h = Sha256::new();
+    // PROTOCOL LITERAL: frozen, do not rename (rendezvous channel derivation).
     h.update(b"filament-pair:");
     h.update(secret.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
@@ -973,6 +1074,7 @@ pub(crate) fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str
     let (f_lo, f_hi) = if fp1 < fp2 { (fp1, fp2) } else { (fp2, fp1) };
     hmac_sha256(
         secret.as_bytes(),
+        // PROTOCOL LITERAL: frozen, do not rename (pair proof domain).
         format!("filament-proof2:{prover_uid}|{lo}|{hi}|{f_lo}|{f_hi}").as_bytes(),
     )
 }
@@ -984,10 +1086,44 @@ fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
     flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(default_drop_dir)
 }
 
-/// The built-in drop directory when nothing is configured (~/Tunlion). Shared
-/// with the settings readout so it shows the true default.
+/// The built-in drop directory when nothing is configured. Shared with the
+/// settings readout so it shows the true default.
 pub(crate) fn default_drop_dir() -> PathBuf {
-    platform::Paths::home_dir().join("Tunlion")
+    drop_dir_under(&platform::Paths::home_dir())
+}
+
+/// `~/Filament` when it already exists, else `~/Tunlion`.
+///
+/// PROTOCOL LITERAL: frozen, do not rename. `~/Filament` is where every
+/// released build saved received files. An existing user who upgrades must
+/// keep receiving into the folder they already know, not into a new empty
+/// one; only a machine that never had it gets the new name.
+fn drop_dir_under(home: &Path) -> PathBuf {
+    let legacy = home.join("Filament");
+    if legacy.is_dir() {
+        legacy
+    } else {
+        home.join("Tunlion")
+    }
+}
+
+#[cfg(test)]
+mod drop_dir_tests {
+    use super::drop_dir_under;
+
+    #[test]
+    fn existing_filament_folder_wins_else_tunlion() {
+        let home = std::env::temp_dir().join(format!("drop-dir-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Tunlion"));
+        std::fs::create_dir(home.join("Filament")).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Filament"));
+        // Both present: the one released builds used still wins.
+        std::fs::create_dir(home.join("Tunlion")).unwrap();
+        assert_eq!(drop_dir_under(&home), home.join("Filament"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 
@@ -1429,9 +1565,28 @@ fn load_delegation(path: &std::path::Path) -> Result<crate::ephemeral::Invitatio
 
 
 
+/// The refusal for a `kill` that did not succeed, or None when it did.
+fn kill_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    Some(format!(
+        "could not stop the daemon (pid {pid}): `kill` failed ({status}), so it is still running. \
+         It is probably owned by another user, for example started with sudo; stop it as that user \
+         (`sudo tunlion down`). The pidfile is kept so `tunlion status` and `tunlion reset` still see it."
+    ))
+}
+
 fn down_cmd() -> Result<()> {
-    match daemon_alive() {
+    // The pidfile names the daemon; a daemon whose pidfile is gone (an older
+    // `down` deleted it while the process lived on) is still found through the
+    // pid it recorded in the election lock it holds.
+    match daemon_alive().or_else(daemon_stop::orphaned_lock_holder) {
         Some(pid) => {
+            // Taken BEFORE signalling, so the wait below can tell this daemon
+            // from an unrelated process that later reuses its pid.
+            let exe = platform::process_exe_path(pid);
+            daemon_stop::mark_down(pid);
             // #191: a managed service restarts a killed process. systemd's
             // Restart=always reacts to an UNEXPECTED exit; a manual
             // `systemctl stop` is authoritative and is not restarted. So stop
@@ -1439,10 +1594,25 @@ fn down_cmd() -> Result<()> {
             // when no manager owns the daemon (a foreground `up`, or a
             // non-service-managed box).
             if !stop_managed_service(pid) {
-                std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                let status = std::process::Command::new("kill").arg(pid.to_string()).status()?;
+                // A failed kill leaves the daemon running. Saying "stopped" and
+                // deleting the pidfile would hide it from `status` and `reset`
+                // while it keeps serving, so keep the pidfile and say why.
+                if let Some(why) = kill_failure(pid, &status) {
+                    bail!("{why}");
+                }
             }
+            // Stopped means GONE. A suspended daemon cannot act on SIGTERM and a
+            // busy one may take a moment; "stopped" used to be printed 6 ms
+            // after the signal while the process lived on, holding the lock the
+            // next `up` then lost to. Wait (bounded), resume, then kill.
+            let how = daemon_stop::await_exit(pid, exe.as_deref())?;
             let _ = std::fs::remove_file(pidfile());
-            ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            ui::say(&format!(
+                "  {} stopped (pid {pid}){}",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                how.note()
+            ));
             Ok(())
         }
         None => {
@@ -1466,18 +1636,16 @@ fn down_cmd() -> Result<()> {
 // <device>` blocks it installed in ~/.ssh/authorized_keys. It NEVER touches the
 // user's real ssh keys or any authorized_keys lines outside those blocks.
 
-/// Remove `path` if present, pushing a human line into `wiped`. Files and
-/// directories both handled; a missing path is silently skipped (idempotent).
-fn reset_remove(path: &std::path::Path, label: &str, wiped: &mut Vec<String>) {
-    let removed = if path.is_dir() {
-        std::fs::remove_dir_all(path).is_ok()
-    } else if path.exists() {
-        std::fs::remove_file(path).is_ok()
-    } else {
-        false
-    };
-    if removed {
-        wiped.push(format!("{label}  ({})", path.display()));
+/// Remove `path` if present: Ok(true) removed, Ok(false) absent (idempotent),
+/// Err when it exists and could not be removed. The error is the caller's to
+/// report: swallowing it is how `reset` used to print "clean slate" over state
+/// it had failed to delete. A symlink is removed, never followed.
+fn reset_remove(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path).map(|()| true),
+        Ok(_) => std::fs::remove_file(path).map(|()| true),
     }
 }
 
@@ -1674,17 +1842,30 @@ fn install_transport_hooks() {
 }
 
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
     // Build the runtime AFTER deciding how much of one is needed. This is the
     // only reason `main` is not `#[tokio::main]`: that macro picks the runtime
     // before anything can look at the command.
+    ui::exit_quietly_on_broken_pipe();
     let first = std::env::args().nth(1);
     let rt = if is_light_command(first.as_deref()) {
-        tokio::runtime::Builder::new_current_thread().enable_all().build()?
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
     } else {
-        tokio::runtime::Builder::new_multi_thread().enable_all().build()?
+        tokio::runtime::Builder::new_multi_thread().enable_all().build()
     };
-    rt.block_on(async_main())
+    let result = match rt {
+        Ok(rt) => rt.block_on(async_main()),
+        Err(e) => Err(e.into()),
+    };
+    // Every failure leaves through here: one report, in the form the caller
+    // asked for, with a code from the documented taxonomy (exit_codes.rs).
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let code = exit_codes::report(&e);
+            std::process::ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+    }
 }
 
 
@@ -1845,6 +2026,9 @@ fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
 
 fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
     let sender = if sender.is_empty() { "unknown peer" } else { sender };
+    // The offered name is the peer's raw string: show it the way it would be
+    // saved (no separators, controls, or bidi overrides), never verbatim.
+    let name = safe_incoming_name(name);
     let hint = if paired { " [paired]" } else { "" };
     format!(
         "  {}{} offers {} ({}), accept? [y/N] ",
@@ -1859,3 +2043,6 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 
 #[cfg(test)]
 mod tests;
+/// Security decisions the mutation probe found unpinned.
+#[cfg(test)]
+mod security_pins_tests;

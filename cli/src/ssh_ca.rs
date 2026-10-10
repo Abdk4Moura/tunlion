@@ -73,8 +73,9 @@ pub(crate) fn validity_interval(ttl_secs: u64) -> String {
 }
 
 /// Grant-expiry bound (relative seconds) from both stores: the legacy
-/// device capExpires.shell for the name, plus fleet cap_grant ops for the
-/// peer's user key. Most restrictive wins; absent everywhere means
+/// device capExpires.shell for the name, plus fleet cap_grant ops naming the
+/// peer's user key (target kind 0x00) or its device key (0x01, what a
+/// per-device `grant` now signs). Most restrictive wins; absent everywhere means
 /// unexpiring (None). Expired clamps to 0 via saturating_sub, which the
 /// validity clamp then refuses. `now_secs` is a parameter (not read) so
 /// tests pin time instead of racing it.
@@ -82,6 +83,7 @@ pub(crate) fn grant_expiry_secs(
     config_dir: &std::path::Path,
     device_name: &str,
     user_pub: Option<[u8; 32]>,
+    device_pub: Option<[u8; 32]>,
     now_secs: u64,
 ) -> Option<u64> {
     let mut best: Option<u64> = None;
@@ -97,27 +99,38 @@ pub(crate) fn grant_expiry_secs(
             }
         }
     }
-    if let Some(up) = user_pub {
-        let key = hex::encode(up);
-        // Highest-version row per grantor (dispatch.rs:1624 pattern): newer
-        // ops supersede, so an expired v1 must not shadow a live v2 (and a
-        // revoked-then-regranted pair resolves to the live row, because
-        // revokes remove rows outright). Across grantors the tightest wins.
-        let mut latest: std::collections::HashMap<&str, &serde_json::Value> =
+    let user_key = user_pub.map(hex::encode);
+    let device_key = device_pub.map(hex::encode);
+    if user_key.is_some() || device_key.is_some() {
+        // Highest-version row per (grantor, target kind) (dispatch.rs:1624
+        // pattern): newer ops supersede, so an expired v1 must not shadow a
+        // live v2 (and a revoked-then-regranted pair resolves to the live row,
+        // because a revoke leaves a tombstone, which is not a `cap_grant`).
+        // Across grantors and target kinds the tightest wins.
+        let mut latest: std::collections::HashMap<(&str, u64), &serde_json::Value> =
             std::collections::HashMap::new();
         let store = crate::capability::load_cap_store(config_dir);
         for e in store.iter().filter(|e| {
+            let wanted = match e["targetKind"].as_u64().unwrap_or(0) {
+                0x00 => user_key.as_deref(),
+                0x01 => device_key.as_deref(),
+                _ => None,
+            };
             e["type"].as_str() == Some("cap_grant")
                 && e["resource"].as_str() == Some("self")
                 && e["permissions"].as_array().is_some_and(|p| {
                     p.iter().any(|c| c.as_str() == Some("shell"))
                 })
-                && e["target"].as_str() == Some(&key)
+                && wanted.is_some()
+                && e["target"].as_str() == wanted
         }) {
-            let g = e["grantor"].as_str().unwrap_or("");
+            let g = (
+                e["grantor"].as_str().unwrap_or(""),
+                e["targetKind"].as_u64().unwrap_or(0),
+            );
             let v = e["version"].as_u64().unwrap_or(0);
             let cur = latest
-                .get(g)
+                .get(&g)
                 .and_then(|c| c["version"].as_u64())
                 .unwrap_or(0);
             if v >= cur {
@@ -288,11 +301,10 @@ pub(crate) fn load_issued(config_dir: &std::path::Path, now_secs: u64) -> Vec<Is
         // Atomic like every other ledger write: a torn prune must not eat
         // live rows (best-effort here -- a failed prune just retries next
         // load; issuance itself already landed).
+        // SecretFile, like record_issuance: a plain write-and-rename here
+        // replaced the 0600 ledger with a umask-default (0644) file.
         if let Ok(text) = serde_json::to_string(&v) {
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
-            }
+            let _ = crate::platform::SecretFile::write_str(&p, &text);
         }
     }
     v
@@ -374,7 +386,7 @@ pub(crate) async fn ensure_ca_key_with(
         return Ok(key);
     }
     if let Some(dir) = key.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::platform::create_private_dir_all(dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -405,6 +417,13 @@ pub(crate) async fn ensure_ca_key_with(
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+        // ssh-keygen creates the .pub under the umask, which made it 0666 under
+        // `umask 0000`: anyone could swap the CA public key sshd is told to
+        // trust. Only this user and root (sshd) need to read it.
+        let _ = std::fs::set_permissions(
+            key.with_extension("pub"),
+            std::fs::Permissions::from_mode(0o600),
+        );
     }
     Ok(key)
 }
@@ -434,7 +453,10 @@ pub(crate) fn daemon_username_from(
 /// Resolve the serving user for signing (thin wrapper over the pure core).
 pub(crate) fn daemon_username() -> Option<String> {
     let su = crate::settings::get_str("shell-user", None);
-    daemon_username_from(su.as_deref(), std::env::var("USER").ok().as_deref())
+    // The password database, not $USER: a daemon started without a login
+    // environment (cron, a container, `env -i`) has no $USER, and arming then
+    // failed with "cannot determine serving user" on a machine that knew.
+    daemon_username_from(su.as_deref(), crate::platform::current_username().as_deref())
 }
 
 /// Single-name check shared by every place a name enters sshd config (Match
@@ -591,16 +613,16 @@ pub(crate) async fn handle_ssh_sign(
             return;
         }
     };
-    let peer_user = {
+    let (peer_device, peer_user) = {
         let az = crate::peer_authz(conn, pid);
-        let (_, iusr, _, _, _, _) = az.parts();
-        iusr.copied()
+        let (idev, iusr, _, _, _, _) = az.parts();
+        (idev.copied(), iusr.copied())
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let grant_remaining = grant_expiry_secs(&config_dir, &verified, peer_user, now);
+    let grant_remaining = grant_expiry_secs(&config_dir, &verified, peer_user, peer_device, now);
     let ttl = match clamp_validity_secs(grant_remaining, req.ttl_secs, setting_ttl) {
         Ok(s) => s,
         Err(e) => {
@@ -1001,14 +1023,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let now = 1_800_000_000u64;
         // Absent everywhere: unexpiring.
-        assert_eq!(grant_expiry_secs(&dir, "boxA", None, now), None);
+        assert_eq!(grant_expiry_secs(&dir, "boxA", None, None, now), None);
         // Legacy device store: 10-minute shell grant.
         std::fs::write(
             dir.join("devices.json"),
             r#"[{"name":"boxA","secret":"x","caps":["shell"],"capExpires":{"shell":1800000600}}]"#,
         )
         .unwrap();
-        let got = grant_expiry_secs(&dir, "boxA", None, now).expect("legacy expiry");
+        let got = grant_expiry_secs(&dir, "boxA", None, None, now).expect("legacy expiry");
         assert!(got <= 600 && got >= 590, "10-min grant clamps ttl, got {got}");
         // Fleet cap store with a tighter 5-minute shell grant for the peer key.
         let upub = [0x77u8; 32];
@@ -1025,8 +1047,30 @@ mod tests {
         )
         .unwrap();
         // Expired v1 must NOT shadow live v2: highest version per grantor wins.
-        let got = grant_expiry_secs(&dir, "boxA", Some(upub), now).expect("fleet expiry");
+        let got = grant_expiry_secs(&dir, "boxA", Some(upub), None, now).expect("fleet expiry");
         assert!(got <= 300 && got >= 290, "v2 window wins over expired v1, got {got}");
+        // A per-device grant names the DEVICE key (target kind 0x01). Its
+        // window must bound the cert too, and only for that device key.
+        let dpub = [0x55u8; 32];
+        let dev_row = format!(
+            r#"{{"type":"cap_grant","grantor":"{grantor}","version":3,"resource":"self","permissions":["shell"],"targetKind":1,"target":"{}","expires":{}}}"#,
+            hex::encode(dpub),
+            now + 120
+        );
+        std::fs::write(
+            dir.join("caps.json"),
+            format!("[{0},{1}]", row(2, now + 300), dev_row),
+        )
+        .unwrap();
+        let got = grant_expiry_secs(&dir, "boxA", Some(upub), Some(dpub), now)
+            .expect("device-targeted expiry");
+        assert!(got <= 120 && got >= 110, "device grant window is read, got {got}");
+        let other = grant_expiry_secs(&dir, "boxA", Some(upub), Some([0x56u8; 32]), now)
+            .expect("user-wide expiry only");
+        assert!(
+            other <= 300 && other >= 290,
+            "another device's grant must not bound this one, got {other}"
+        );
         // Expired clamps to zero (the validity clamp then refuses).
         std::fs::write(
             dir.join("devices.json"),
@@ -1034,7 +1078,7 @@ mod tests {
         )
         .unwrap();
         let _ = std::fs::remove_file(dir.join("caps.json"));
-        assert_eq!(grant_expiry_secs(&dir, "boxA", None, now), Some(0));
+        assert_eq!(grant_expiry_secs(&dir, "boxA", None, None, now), Some(0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

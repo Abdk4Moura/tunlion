@@ -615,6 +615,40 @@ async fn serve_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 /// without letting an abandoned-but-not-reaped session hoard memory.
 pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
 
+/// The TERM the remote shell actually gets.
+///
+/// The client sends ITS terminal's name, and forwarding it verbatim is right only
+/// when this machine has a terminfo entry for it. Modern terminals (kitty,
+/// ghostty, wezterm, ...) use names most servers have never heard of, and then
+/// every curses program degrades or refuses outright -- tmux exits with
+/// "missing or unsuitable terminal: xterm-kitty", so a remote tmux never starts
+/// and mouse events land on the shell prompt as `64;20;10M`. `ssh` appears not
+/// to have this problem only because those terminals' ssh integrations copy
+/// their terminfo to the remote first; this path has no such step. Fall back to
+/// xterm-256color, which every system ships and which supports 256 colours and
+/// mouse tracking.
+///
+/// THE VALUE COMES FROM THE PEER and is used to build a filesystem path below,
+/// so anything that is not a plausible terminal name is replaced before it is
+/// ever joined onto a directory (`../../etc/passwd` must not become a probe).
+pub(crate) fn effective_term(requested: &str) -> String {
+    const FALLBACK: &str = "xterm-256color";
+    let plausible = !requested.is_empty()
+        && requested.len() <= 64
+        && requested
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+'))
+        && !requested.starts_with('.');
+    if !plausible {
+        return FALLBACK.to_string();
+    }
+    if crate::platform::terminfo_exists(requested) {
+        requested.to_string()
+    } else {
+        FALLBACK.to_string()
+    }
+}
+
 /// Terminal-mode reset emitted to the client right AFTER a reattach replay.
 /// A TUI that gets cut off mid-run (link drop, then the app dies before it can
 /// emit its own disable) leaves the client terminal stuck in mouse-reporting
@@ -822,14 +856,7 @@ pub async fn spawn_pty_session(
     for a in &argv[1..] {
         cmd.arg(a);
     }
-    cmd.env(
-        "TERM",
-        if term.is_empty() {
-            "xterm-256color"
-        } else {
-            term
-        },
-    );
+    cmd.env("TERM", effective_term(term));
     // Advertise 24-bit color. opentui-based TUIs (e.g. opencode) downgrade to a
     // 256-color palette when COLORTERM is unset; the web-shell xterm.js renders
     // truecolor fine, so set this to get full-color output (verified: opencode
@@ -1524,6 +1551,20 @@ pub(crate) async fn bring_up_to_known(
     let connect_started = tokio::time::Instant::now();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(7));
     heartbeat.tick().await; // consume the immediate first tick
+    // A known device whose daemon is not running never answers, and this loop
+    // used to say only "still reaching" until the timeout. Once nothing has
+    // answered for a few seconds, say the likely cause ONCE, and keep waiting
+    // (it may still come up). "Answered" is a signal FROM a candidate, not its
+    // presence: a daemon stopped without a clean leave stays on the roster as
+    // a ghost for a while, and a fleet channel carries siblings that are not
+    // the target. Keyed on presence, the first-time-user test saw `exec` and
+    // `shell` against a stopped daemon print "still reaching ... (35s)" with
+    // no hint at all, while `send` named the cause. A live acceptor offers its
+    // transport the instant it sees us, well inside the hint delay.
+    let mut heard_from_peer = false;
+    let mut offline_hinted = false;
+    let mut offline_check = tokio::time::interval(Duration::from_millis(500));
+    offline_check.tick().await;
 
     loop {
         // One candidate at a time: start the next attempt whenever idle.
@@ -1576,7 +1617,11 @@ pub(crate) async fn bring_up_to_known(
                 // hyperkit CI), the L2 establish skips direct-quic entirely and
                 // uses WebRTC (srflx / relay candidates), exercising the relay
                 // fallback path.
-                if !direct_racing && crate::direct::direct_enabled() {
+                // --relay: no offer at all, it would carry our host/public
+                // candidates to the peer (`direct_permitted`).
+                if !direct_racing
+                    && crate::conn::direct_permitted(relay, crate::direct::direct_enabled())
+                {
                     if endpoint.is_none() {
                         match crate::direct::bind_endpoint() {
                             Ok((ep, port)) => {
@@ -1624,6 +1669,15 @@ pub(crate) async fn bring_up_to_known(
                         "tunlion: still reaching '{peer_name}'... ({}s)",
                         connect_started.elapsed().as_secs()
                     ));
+                }
+                continue;
+            }
+            _ = offline_check.tick(), if !offline_hinted && !heard_from_peer => {
+                if connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER {
+                    offline_hinted = true;
+                    if role != "doctor" && !silent {
+                        crate::ui::say(&crate::conn::offline_hint(peer_name));
+                    }
                 }
                 continue;
             }
@@ -1693,6 +1747,7 @@ pub(crate) async fn bring_up_to_known(
                 queue.push_back((pid, v["uid"].as_str().map(|s| s.to_string()), true));
             }
             Ev::Signal(v) => {
+                heard_from_peer = true;
                 let data = v["data"].clone();
                 // Item 3: a relayed `transport-offer` carries the peer's direct
                 // candidates. Do NOT hand it to the WebRTC `Peer`; instead consume
@@ -1702,6 +1757,11 @@ pub(crate) async fn bring_up_to_known(
                 // so the DirectTransport's reader funnels Chunk/Control/PcState to
                 // the rx the caller hands to `pump_initiator`.
                 if data["type"].as_str() == Some("transport-offer") {
+                    // --relay hides our address from the peer: dialing its
+                    // direct candidates would hand it our IP as the source.
+                    if !crate::conn::direct_permitted(relay, true) {
+                        continue;
+                    }
                     if direct_racing {
                         continue; // already racing the first offer; ignore re-sends
                     }
@@ -1969,16 +2029,33 @@ pub struct ProbeOutcome {
 /// per-phase timings + verdict. Reuses `bring_up_to_known` (role "doctor"), so
 /// the phases/budgets are identical to a real connect, and cleans up BOTH the
 /// link (LinkGuard::close) and the mux (no leaked streams/pumps).
-pub async fn establish_probe(server: &str, peer: &str, relay: bool) -> Result<ProbeOutcome> {
+///
+/// `timeout_secs` is the caller's bound: `reach --timeout` and
+/// `doctor --timeout` pass theirs (None = FILAMENT_DOCTOR_PROBE_SECS or 30 s).
+/// The outer bound of one `doctor <device>` probe, in seconds: `--timeout`,
+/// else FILAMENT_DOCTOR_PROBE_SECS, else 30. Doctor announces it before it
+/// starts, so the wait is never a silent one.
+pub(crate) fn doctor_probe_secs(timeout_secs: Option<u64>) -> u64 {
+    timeout_secs.filter(|n| *n > 0).unwrap_or_else(|| {
+        std::env::var("FILAMENT_DOCTOR_PROBE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(30)
+    })
+}
+
+pub async fn establish_probe_within(
+    server: &str,
+    peer: &str,
+    relay: bool,
+    timeout_secs: Option<u64>,
+) -> Result<ProbeOutcome> {
     // Overall safety bound so a wedged candidate cannot hang the probe forever
     // (the per-candidate rotation already re-races inside bring_up_to_known; this
     // is the outer wall). Generous: a slow-but-real ICE lands around 5s and we
     // want to OBSERVE that, not abort it prematurely. Overridable for the field.
-    let probe_secs: u64 = std::env::var("FILAMENT_DOCTOR_PROBE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(30);
+    let probe_secs = doctor_probe_secs(timeout_secs);
     let deadline = std::time::Duration::from_secs(probe_secs);
 
     match tokio::time::timeout(deadline, bring_up_to_known(server, peer, relay, "doctor")).await {
@@ -2153,7 +2230,6 @@ pub(crate) fn warm_verify_window() -> std::time::Duration {
 /// than handing the client a dead connection (which would stall until ITS own
 /// timeout - the 25s ssh ConnectTimeout we measured). Verifying first means the
 /// fallback is immediate and the client never sends bytes into a black hole.
-#[cfg(unix)]
 async fn verify_first_frame(
     mux: &Arc<Mux>,
     sid: u32,
@@ -2182,15 +2258,197 @@ async fn verify_first_frame(
 /// Open an L2 stream over a warm link and CONFIRM the peer responds before the
 /// caller commits the client. Returns (sid, first_frame, remaining_rx) once the
 /// first inbound frame lands. `Err` on a zombie link (see `verify_first_frame`).
-#[cfg(unix)]
+/// Production goes through `open_stream_verified_reason` (the daemon must tell a
+/// refusal from a zombie); this flattening of it is what the zombie tests pin.
+#[cfg(all(unix, test))]
 pub(crate) async fn open_stream_verified(
     mux: &Arc<Mux>,
     rport: u16,
     verify: std::time::Duration,
 ) -> Result<(u32, PipeItem, mpsc::Receiver<PipeItem>)> {
-    let (sid, rx) = open_stream(mux, rport).await?;
-    let (first, rx) = verify_first_frame(mux, sid, rx, verify).await?;
-    Ok((sid, first, rx))
+    match open_stream_verified_reason(mux, rport, verify).await {
+        WarmOpen::Opened(sid, first, rx) => Ok((sid, first, rx)),
+        WarmOpen::Refused(reason) => Err(anyhow!("warm stream refused: {reason}")),
+        WarmOpen::Dead(e) => Err(e),
+    }
+}
+
+/// `open_stream_verified`, but a REFUSAL stays a refusal. The plain version maps
+/// a peer's `l2-close{err}` to the same error as a zombie link, so the daemon
+/// dropped a healthy warm link every time a forward was refused, and the client
+/// fell to a cold path that refused again with nothing on its terminal.
+pub(crate) enum WarmOpen {
+    Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
+    Refused(String),
+    Dead(anyhow::Error),
+}
+
+pub(crate) async fn open_stream_verified_reason(
+    mux: &Arc<Mux>,
+    rport: u16,
+    verify: std::time::Duration,
+) -> WarmOpen {
+    let (sid, rx) = match open_stream(mux, rport).await {
+        Ok(v) => v,
+        Err(e) => return WarmOpen::Dead(e),
+    };
+    match verify_first_frame(mux, sid, rx, verify).await {
+        Ok((first, rx)) => WarmOpen::Opened(sid, first, rx),
+        // on_close records the reason BEFORE it closes the pipe the verify
+        // reads, so a refusal is always visible here.
+        Err(e) => match mux.take_close_err(sid).await {
+            Some(reason) => WarmOpen::Refused(reason),
+            None => WarmOpen::Dead(e),
+        },
+    }
+}
+
+/// What the peer said to one probe open of `rport`, before `forward` says ready.
+pub(crate) enum ForwardProbe {
+    Accepted,
+    Refused(String),
+    Silent,
+}
+
+/// Ask the peer to open `rport` once and close it again, so `forward` can tell
+/// the user the truth BEFORE it claims to be ready: it used to print "ready"
+/// having asked nothing, and the first client got an empty reply while the
+/// refusal went to a log. Costs one connect+close on the peer's target port.
+async fn probe_forward(mux: &Arc<Mux>, rport: u16) -> ForwardProbe {
+    let Ok((sid, mut rx)) = open_stream(mux, rport).await else {
+        return ForwardProbe::Silent;
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(8), rx.recv()).await;
+    match outcome {
+        // The ack's liveness marker, or a server-speaks-first banner: open.
+        Ok(Some(_)) => {
+            mux.drop_stream(sid).await;
+            let _ = mux
+                .transport
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            ForwardProbe::Accepted
+        }
+        Ok(None) => match mux.take_close_err(sid).await {
+            Some(reason) => ForwardProbe::Refused(reason),
+            None => ForwardProbe::Silent,
+        },
+        Err(_) => {
+            mux.drop_stream(sid).await;
+            let _ = mux
+                .transport
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            ForwardProbe::Silent
+        }
+    }
+}
+
+/// How `forward` should treat one refusal from the peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardRefusal {
+    /// The peer's POLICY says no (tunnels off, no grant, revoked grant or
+    /// certificate, ceiling, untrusted device): every later connection will be
+    /// refused the same way, so retrying is pointless and a supervisor must be
+    /// told.
+    Policy,
+    /// The peer is willing, but nothing accepts on the target port there. A
+    /// service may start later, so the forward keeps running.
+    NothingListening,
+    /// Anything else (the acceptor's stream cap, another dial error): this
+    /// connection failed; the forward keeps running and retries as before.
+    Transient,
+}
+
+/// Classify a refusal reason as carried in `l2-close{err}`. Policy is decided
+/// by the canonical reasons `refusal::code_from_reason` recognizes, plus the
+/// acceptor's bare "denied" for an untrusted device. A closed target port is
+/// recognized by the OS dial error ("Connection refused" on unix, "actively
+/// refused it" on Windows).
+pub(crate) fn classify_forward_refusal(reason: &str) -> ForwardRefusal {
+    let r = reason.trim();
+    if crate::refusal::code_from_reason(r).is_some() || r == "denied" {
+        return ForwardRefusal::Policy;
+    }
+    if r.to_ascii_lowercase().contains("refused") {
+        return ForwardRefusal::NothingListening;
+    }
+    ForwardRefusal::Transient
+}
+
+/// Exit status of a running `forward` that the peer stopped allowing (grant or
+/// certificate revoked, tunnels turned off): distinct from a plain failure (1)
+/// so a supervisor can tell "denied, a restart will not help" from "broke".
+///
+/// 4 is `exit_codes::ExitKind::Denied` in the exit-code taxonomy
+/// (cli/src/exit_codes.rs, #393). It is a literal here only because this branch
+/// predates exit_codes.rs; once both have merged, switch it to that constant.
+pub(crate) const FORWARD_DENIED_EXIT: i32 = 4;
+
+/// What the startup probe learned about the target, for the "ready" line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardTarget {
+    /// The peer accepted the probe (or gave no conclusive answer).
+    Open,
+    /// The peer is willing, but nothing listens on the target port yet.
+    NothingListening,
+}
+
+/// The word that opens the "ready" line, carrying the target's state so a
+/// warning printed above it is not contradicted by a bare "ready" below it.
+pub(crate) fn forward_ready_word(rport: u16, target: ForwardTarget) -> String {
+    match target {
+        ForwardTarget::Open => "ready".to_string(),
+        ForwardTarget::NothingListening => {
+            format!("ready (nothing is listening on {rport} there yet)")
+        }
+    }
+}
+
+/// The final line a forward prints when the peer's policy stops it.
+pub(crate) fn forward_denied_line(peer: &str, rport: u16, reason: &str) -> String {
+    format!(
+        "tunlion: forward to {peer}:{rport} stopped: {peer} no longer allows it ({reason}); not listening any more (exit {FORWARD_DENIED_EXIT})"
+    )
+}
+
+/// The remedy lines for a policy refusal, when the reason carries a known code.
+fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<String>)> {
+    let code = crate::refusal::code_from_reason(reason)?;
+    let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
+    Some(crate::refusal::remedy(code, peer, &me))
+}
+
+/// Act on a probe verdict: a POLICY refusal (the peer will refuse every
+/// connection: tunnels off, no grant, revoked) ends the forward now with the
+/// reason and its remedy; a refusal of the target port itself (nothing
+/// listening there yet) is a warning, since a service may start later.
+fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<ForwardTarget> {
+    match probe {
+        ForwardProbe::Accepted | ForwardProbe::Silent => Ok(ForwardTarget::Open),
+        ForwardProbe::Refused(reason) => match classify_forward_refusal(&reason) {
+            ForwardRefusal::Policy => {
+                let fix = match forward_refusal_fix(peer, &reason) {
+                    Some((text, Some(c))) => format!("\n  {text}\n    {c}"),
+                    Some((text, None)) => format!("\n  {text}"),
+                    None => String::new(),
+                };
+                bail!("tunlion: {peer}:{rport} refused the connection: {reason}{fix}");
+            }
+            ForwardRefusal::NothingListening => {
+                crate::ui::critical(&format!(
+                    "tunlion: {peer}:{rport} refused a test connection: {reason}. Nothing is accepting on port {rport} there right now; connections will fail until something listens on it."
+                ));
+                Ok(ForwardTarget::NothingListening)
+            }
+            ForwardRefusal::Transient => {
+                crate::ui::critical(&format!(
+                    "tunlion: {peer}:{rport} refused a test connection: {reason}. The forward stays up; connections may fail until that clears."
+                ));
+                Ok(ForwardTarget::Open)
+            }
+        },
+    }
 }
 
 /// Bridge a verified warm stream to the client `sock`, replaying the already-read
@@ -2512,7 +2770,7 @@ pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
 
 #[cfg(not(unix))]
 pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("tunlion forward needs the local daemon's control socket (unix only)")
+    bail!("tunlion: `forward` needs the local daemon's control socket (unix only)")
 }
 
 /// `tunlion netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
@@ -2633,22 +2891,35 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// sequences and renders unusable.
 struct RawGuard {
     active: bool,
+    /// The console's original modes, restored exactly on drop. On Windows this
+    /// is what turns on VT input so mouse and special keys reach the remote PTY
+    /// (see platform::ConsoleModes); elsewhere it is a no-op.
+    console: crate::platform::ConsoleModes,
 }
 impl RawGuard {
     fn enable() -> Result<Self> {
+        let console = crate::platform::ConsoleModes::snapshot();
         crossterm::terminal::enable_raw_mode()?;
-        Ok(RawGuard { active: true })
+        console.enable_vt();
+        Ok(RawGuard { active: true, console })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
         if self.active {
             let _ = crossterm::terminal::disable_raw_mode();
+            self.console.restore();
             crossterm::execute!(std::io::stderr(), crossterm::cursor::Show).ok();
             eprint!("\r\n");
         }
     }
 }
+
+/// The acceptor's answer to a RESUME-only attach whose session is gone: the
+/// shell exited while we were away (or on the warm path, which cannot tell a
+/// clean exit from a drop, see `pty_cmd`). It is the normal end of a session,
+/// never a refusal. The wire string is fixed: older acceptors send exactly it.
+pub(crate) const NO_SUCH_SESSION: &str = "no such session";
 
 /// Why a single PTY attach ended.
 enum PtyOutcome {
@@ -2967,6 +3238,12 @@ async fn pty_attach_once(
     }
     pump.abort();
     match close_reason {
+        // A resume that finds no session is the shell having exited: the
+        // common case is `exit` in a shell opened over the warm link, which
+        // hands off to this resume-only attach. Reported as a refusal it
+        // printed "shell refused ... no such session", exited 1, and left the
+        // terminal raw. It is a clean end.
+        Some(reason) if resume && reason.trim() == NO_SUCH_SESSION => Ok(PtyOutcome::Exited),
         // A mid-session denial (revoke): nonzero with the reason, never a clean
         // exit that would carry a `&&` pipeline forward (#223).
         Some(reason) => Ok(PtyOutcome::Refused(reason)),
@@ -3001,9 +3278,10 @@ async fn try_warm_pty(
     let sock = match crate::ctl::try_pty_reason(peer, session, cols, rows, term, cmd).await {
         Ok(sock) => sock,
         Err(Some(reason)) if reason.starts_with("refused:") => {
+            let why = reason.trim_start_matches("refused:").trim();
             return Some(Err(anyhow!(
                 "{}",
-                reason.trim_start_matches("refused:").trim()
+                crate::refusal::explain("a shell", peer, why, None, None)
             )));
         }
         Err(_) => return None, // no warm path; the cold path is the right answer
@@ -3072,6 +3350,16 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // attach, AFTER its status lines, so they don't staircase), persists across
     // reconnects, and is restored on every exit path by this guard's Drop.
     let mut raw: Option<RawGuard> = None;
+    // The guard's Drop does not run on `process::exit` (every exit below drops
+    // it first) nor on a signal from outside: SIGTERM, or
+    // SIGHUP when the terminal goes away. Restore the terminal for those too.
+    if interactive {
+        tokio::spawn(async {
+            let code = crate::platform::termination_signal().await;
+            let _ = crossterm::terminal::disable_raw_mode();
+            std::process::exit(code);
+        });
+    }
 
     // ONE fd0 reader for the whole invocation, shared across the warm bridge and
     // every cold reattach. tokio's stdin singleton can't be cancelled, so a
@@ -3168,43 +3456,42 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
         {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Refused(reason)) => {
+                // Cooked mode first: the message must not stair-step, and the
+                // exit below skips the guard's Drop.
+                drop(raw.take());
                 // The peer is up and said no. Nonzero with the reason; never a
                 // false success that would carry a `&&` pipeline forward.
-                // The remedy depends on WHICH refusal: a revoked certificate is
-                // not repaired by a grant, so the hint must not say "grant".
-                let hint = if reason == crate::capability::REVOKED_REASON {
-                    format!(
-                        "the peer's certificate was revoked; restore it with {}",
+                // The remedy depends on WHICH refusal, and the acceptor's reason
+                // says which: a revoked certificate is not repaired by a grant,
+                // a ceiling cannot be widened by one, and a missing grant is not
+                // "serving is off". `refusal` maps each to its one fix, naming
+                // this device the way the peer knows it.
+                let hint = match crate::refusal::code_from_reason(&reason) {
+                    Some(code) => {
+                        let me = crate::refusal::name_from_reason(&reason)
+                            .unwrap_or_else(crate::display_name);
+                        let (text, cmd) = crate::refusal::remedy(code, peer, &me);
+                        match cmd {
+                            Some(c) => format!(
+                                "{text} {}",
+                                crate::ui::paint(crate::ui::Tone::Brand, &c)
+                            ),
+                            None => text,
+                        }
+                    }
+                    None => format!(
+                        "if this device should have a shell there, on '{peer}' run: {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            "tunlion devices restore <this-device>"
+                            &format!("tunlion grant {} shell", crate::display_name())
                         )
-                    )
-                } else if reason == crate::capability::CEILING_REASON {
-                    // A grant cannot widen an enrolment ceiling, and `tunlion
-                    // grant` says so when you run it. Prescribing it here sent
-                    // the owner to a command that refuses, and the refusal named
-                    // the real fix. Name it here instead, one step earlier.
-                    format!(
-                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
-                        crate::ui::paint(
-                            crate::ui::Tone::Brand,
-                            "tunlion add --for <this-device> --allow shell"
-                        )
-                    )
-                } else {
-                    format!(
-                        "grant shell on the peer: {}",
-                        crate::ui::paint(
-                            crate::ui::Tone::Brand,
-                            &format!("tunlion grant <this-device> shell")
-                        )
-                    )
+                    ),
                 };
                 crate::ui::problem(&format!("shell refused by '{peer}'"), &reason, &[hint]);
                 std::process::exit(1);
             }
             Ok(PtyOutcome::Unconfirmed(reason)) => {
+                drop(raw.take());
                 // We could not establish that the peer opened a shell. Say the
                 // weaker true sentence rather than a confident wrong one.
                 crate::ui::problem(
@@ -3231,6 +3518,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // warm session just ended, a failed reattach should RETRY (the mesh
                 // may be mid-repair) until the reaper window, not bail.
                 if !ever_connected && !warm_ended {
+                    drop(raw.take());
                     // A REFUSAL is not a reachability failure, and saying it is
                     // sends the user to `ping`/`doctor` to debug a healthy link.
                     // The peer answers an unauthorized open with an l2-close
@@ -3302,7 +3590,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                             ),
                         ],
                     );
-                    std::process::exit(1);
+                    // 6 = unreachable in the exit-code taxonomy (#393's
+                    // exit_codes::ExitKind::Unreachable), the code `exec` and
+                    // `send` give for the same "it did not answer" outcome.
+                    std::process::exit(6);
                 }
                 // A reconnect attempt failed. Keep trying until the acceptor would
                 // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);
@@ -3400,20 +3691,29 @@ struct ForwardActivity {
     /// would otherwise repeat the same line per connection, and a reason
     /// printed twenty times reads as a storm rather than an explanation.
     refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A POLICY refusal (revoked, not granted, tunnels off) is final: every later
+    /// connection would be refused the same way. The connection task reports it
+    /// here and the accept loop ends the process with the denied exit code, so a
+    /// supervisor sees the forward stop instead of a listener that resets every
+    /// client forever while the reason goes only to the log.
+    denied: tokio::sync::mpsc::UnboundedSender<String>,
     peer: String,
     rport: u16,
 }
 
 impl ForwardActivity {
-    fn new(peer: &str, rport: u16) -> Self {
-        Self {
+    fn new(peer: &str, rport: u16) -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (denied, denied_rx) = tokio::sync::mpsc::unbounded_channel();
+        let me = Self {
             active: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            denied,
             peer: peer.to_string(),
             rport,
-        }
+        };
+        (me, denied_rx)
     }
     fn line(&self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3432,6 +3732,7 @@ impl ForwardActivity {
             total: self.total.clone(),
             first: self.first.clone(),
             refused: self.refused.clone(),
+            denied: self.denied.clone(),
             peer: self.peer.clone(),
             rport: self.rport,
         }
@@ -3445,15 +3746,35 @@ impl ForwardActivity {
     /// never did. pty already reads it via `take_close_err`. So this is wiring a
     /// channel that existed, not building one, which is the correction the
     /// reviewer made to my first description of this work.
+    ///
+    /// Reported for EVERY refused connection, on stderr at the level `-q` keeps:
+    /// a client that gets an empty reply needs the reason each time, not only
+    /// the first. The remedy (when the reason has one) is printed once.
+    ///
+    /// A POLICY refusal is different in kind: the forward cannot work again
+    /// until the owner changes something, so its remedy is always printed and
+    /// the accept loop is told to end the process (`FORWARD_DENIED_EXIT`).
+    /// Anything else (nothing listening on the port, a transient failure) keeps
+    /// the forward up, exactly as before.
     fn refused_once(&self, reason: &str) {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.refused.swap(true, Relaxed) {
-            return;
-        }
         crate::ui::critical(&format!(
             "tunlion: {}:{} refused the connection: {reason}",
             self.peer, self.rport
         ));
+        let policy = classify_forward_refusal(reason) == ForwardRefusal::Policy;
+        if self.refused.swap(true, Relaxed) && !policy {
+            return;
+        }
+        if let Some((text, cmd)) = forward_refusal_fix(&self.peer, reason) {
+            crate::ui::critical(&format!("  {text}"));
+            if let Some(c) = cmd {
+                crate::ui::critical(&format!("    {c}"));
+            }
+        }
+        if policy {
+            let _ = self.denied.send(reason.trim().to_string());
+        }
     }
 
     /// Register a newly accepted connection; the returned guard decrements on drop.
@@ -3570,7 +3891,7 @@ pub async fn forward_cmd(
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             bail!(
                 "tunlion: cannot bind 127.0.0.1:{lport}: permission denied. Local ports below \
-                 1024 need root; pick a higher local port (e.g. `tunlion forward 8{lport:0>3} {peer} {rport}`) \
+                 1024 need root; pick a higher local port (e.g. `tunlion forward {peer}:{rport} --lport 8{lport:0>3}`) \
                  or run with sudo."
             );
         }
@@ -3604,11 +3925,20 @@ pub async fn forward_cmd(
         // hold a live warm link (then connections really are instant) or none yet
         // (then it opens on the first connection) - saying "ready, instant" in the
         // second case is what left the user unsure whether it was forwarding.
+        // Ask once through the daemon, so a refusal ends the forward here with
+        // its reason instead of reaching the first client as an empty reply.
+        let target = match crate::ctl::forward_probe(peer, rport).await {
+            Some(Err(reason)) => {
+                forward_probe_verdict(peer, rport, ForwardProbe::Refused(reason))?
+            }
+            Some(Ok(())) | None => ForwardTarget::Open,
+        };
         match crate::ctl::try_ping(peer).await {
             Some(facts) => {
                 let route = facts["route"].as_str().unwrap_or("link");
                 crate::ui::say(&format!(
-                    "tunlion: ready - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})"
+                    "tunlion: {} - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})",
+                    forward_ready_word(rport, target)
                 ));
             }
             None => {
@@ -3633,17 +3963,35 @@ pub async fn forward_cmd(
                 );
             }
         }
+        // ...and ask the peer once, so "ready" also means "it will forward".
+        let first = rx.borrow().clone();
+        let target = match first {
+            Some(m) => forward_probe_verdict(peer, rport, probe_forward(&m, rport).await)?,
+            None => ForwardTarget::Open,
+        };
         crate::ui::say(&format!(
-            "tunlion: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})"
+            "tunlion: {}, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})",
+            forward_ready_word(rport, target)
         ));
         Some(rx)
     };
 
-    let activity = ForwardActivity::new(peer, rport);
+    let (activity, mut denied_rx) = ForwardActivity::new(peer, rport);
     loop {
         // A transient accept error (e.g. EMFILE/ENFILE under fd pressure) must NOT
         // tear down the listener; back off briefly and keep serving.
-        let sock = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            // A connection task saw a POLICY refusal (revoked, not granted,
+            // tunnels off). The forward can never work again without the owner,
+            // so stop listening and exit with the denied code instead of
+            // resetting every later client. Transport errors never reach here.
+            Some(reason) = denied_rx.recv() => {
+                crate::ui::critical(&forward_denied_line(peer, rport, &reason));
+                std::process::exit(FORWARD_DENIED_EXIT);
+            }
+        };
+        let sock = match accepted {
             Ok((s, _)) => s,
             Err(e) => {
                 crate::ui::status(&format!("tunlion: accept paused ({e}), retrying..."));
@@ -3656,13 +4004,23 @@ pub async fn forward_cmd(
         // per connection so it is used whenever the daemon holds a warm link.
         #[cfg(unix)]
         if warm {
-            if let Some(usock) = crate::ctl::try_open(peer, rport).await {
-                let guard = activity.begin();
-                tokio::spawn(async move {
-                    let _guard = guard; // decrements + refreshes the activity line on close
-                    let _ = bridge_streams(sock, usock).await;
-                });
-                continue;
+            match crate::ctl::try_open_reason(peer, rport).await {
+                Ok(usock) => {
+                    let guard = activity.begin();
+                    tokio::spawn(async move {
+                        let _guard = guard; // decrements + refreshes the activity line on close
+                        let _ = bridge_streams(sock, usock).await;
+                    });
+                    continue;
+                }
+                // The PEER said no: say so on this terminal, for this connection,
+                // and drop it. A cold retry would only be refused again.
+                Err(Some(reason)) if reason.starts_with("refused:") => {
+                    activity.refused_once(reason.trim_start_matches("refused:").trim());
+                    drop(sock);
+                    continue;
+                }
+                Err(_) => {}
             }
             // Warm miss (the daemon has no live link to the peer right now): fall
             // through to a cold link instead of dropping the connection. The cold
@@ -3697,6 +4055,83 @@ pub async fn forward_cmd(
     }
 }
 
+/// File (in the config dir, owner-only) holding the local proxy's password.
+pub(crate) fn proxy_token_path() -> std::path::PathBuf {
+    crate::platform::Paths::config_path("proxy.token")
+}
+
+/// The local proxy's password: a random 256-bit token, created on first use
+/// and stored owner-only (0600 / owner ACL) so only this user can read it.
+/// The proxy opens mesh streams AS THE OWNER, so a listener on 127.0.0.1 with
+/// no auth handed that authority to every local account on the machine.
+pub(crate) fn proxy_token() -> Result<String> {
+    let path = proxy_token_path();
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim();
+        if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(t.to_string());
+        }
+    }
+    let mut buf = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buf)
+        .map_err(|_| anyhow!("no system randomness for the proxy token"))?;
+    let token = hex::encode(buf);
+    if let Some(dir) = path.parent() {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            crate::platform::tighten_new_dir(dir);
+        }
+    }
+    crate::platform::SecretFile::write_str(&path, &token)?;
+    // Two proxies starting at once could both mint; whichever landed on disk
+    // is the one a user will `cat`, so serve that.
+    Ok(std::fs::read_to_string(&path)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| t.len() == 64)
+        .unwrap_or(token))
+}
+
+/// Username the proxy prints. Only the password is checked; the name is there
+/// because SOCKS5 user/pass and HTTP Basic both carry one.
+pub(crate) const PROXY_USER: &str = "tunlion";
+
+/// Length-checked, constant-time comparison of a presented password.
+fn proxy_password_ok(presented: &[u8], token: &str) -> bool {
+    let want = token.as_bytes();
+    if presented.len() != want.len() {
+        return false;
+    }
+    presented.iter().zip(want).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// How to use the proxy, with the password read from its file at use time
+/// (never printed: `up` output lands in log files).
+pub(crate) fn proxy_usage_lines(bind: &str, port: u16) -> Vec<String> {
+    let tok = proxy_token_path();
+    vec![
+        format!(
+            "  auth: username/password required (user `{PROXY_USER}`, password in {}, owner-only)",
+            tok.display()
+        ),
+        format!(
+            "  e.g.  curl -x \"socks5h://{PROXY_USER}:$(cat '{}')@{bind}:{port}\" http://<peer>.mesh:8080/",
+            tok.display()
+        ),
+    ]
+}
+
+/// True for an address that only this machine can reach.
+fn bind_is_loopback(bind: &str) -> bool {
+    bind.eq_ignore_ascii_case("localhost")
+        || bind
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
 /// `tunlion proxy`: a local SOCKS5 proxy that reaches mesh peers by name with NO
 /// TUN and NO privilege (Tailscale's userspace-networking model). A SOCKS5 CONNECT
 /// to `<peer>.mesh:<port>` opens an L2 stream to that peer's `localhost:<port>` over
@@ -3712,7 +4147,26 @@ pub async fn proxy_cmd(
     port: u16,
     http_port: u16,
     relay: bool,
+    allow_remote: bool,
 ) -> Result<()> {
+    // A non-loopback bind exposes "open a stream as the owner" (and a plain
+    // open relay to anywhere) to the network, guarded only by the token. Make
+    // that a deliberate choice, and say so loudly when it is made.
+    if !bind_is_loopback(bind) {
+        if !allow_remote {
+            bail!(
+                "tunlion: refusing to bind the proxy to {bind}: anyone who can reach it and learns the token can open mesh streams as you and relay traffic through this machine. Use the default 127.0.0.1, or pass --allow-remote if you really mean it."
+            );
+        }
+        crate::ui::critical(&crate::ui::paint(
+            crate::ui::Tone::Warn,
+            &format!(
+                "WARNING: proxy bound to {bind} (--allow-remote): reachable from the network; the token in {} is the only thing between it and your mesh",
+                proxy_token_path().display()
+            ),
+        ));
+    }
+    let token: Arc<str> = proxy_token()?.into();
     let listener = match TcpListener::bind((bind, port)).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -3724,16 +4178,52 @@ pub async fn proxy_cmd(
             );
         }
     };
+    // `status`, `addr` and `expose` read this to say where the proxy is and how
+    // to use it; daemon.log was the only place that said so.
+    crate::proxy_state::record(bind, port);
     crate::ui::say(&format!(
         "tunlion: SOCKS5 proxy on {bind}:{port} (no TUN, no sudo)"
     ));
+    proxy_serve(server, listener, bind, port, http_port, relay, token).await
+}
+
+/// Bind the daemon's automatic SOCKS5 proxy on loopback: `first`, else the next
+/// free port in a small window. The listener is returned BOUND, so whatever the
+/// caller then prints about it is true. It used to print "started SOCKS5 proxy
+/// on 127.0.0.1:1080" and bind afterwards in the background, so a second daemon
+/// announced a port the first one held, and its own proxy never existed.
+pub async fn bind_auto_proxy(first: u16) -> std::result::Result<(TcpListener, u16), String> {
+    let mut last = String::new();
+    for port in first..first.saturating_add(10) {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => return Ok((l, port)),
+            Err(e) => last = format!("127.0.0.1:{port}: {e}"),
+        }
+    }
+    Err(format!(
+        "ports {first}-{} are all taken (last: {last})",
+        first.saturating_add(9)
+    ))
+}
+
+/// Serve the SOCKS5 proxy (and the optional HTTP CONNECT proxy) on an already
+/// bound listener. `port` is the SOCKS port the listener holds.
+pub async fn proxy_serve(
+    server: &str,
+    listener: TcpListener,
+    bind: &str,
+    port: u16,
+    http_port: u16,
+    relay: bool,
+    token: Arc<str>,
+) -> Result<()> {
     crate::ui::say(&format!(
         "  point apps here; {}.mesh rides the mesh, everything else connects directly",
         "<peer>"
     ));
-    crate::ui::say(&format!(
-        "  e.g.  curl --socks5-hostname {bind}:{port} http://<peer>.mesh:8080/"
-    ));
+    for line in proxy_usage_lines(bind, port) {
+        crate::ui::say(&line);
+    }
     #[cfg(unix)]
     if !crate::ctl::daemon_present().await {
         crate::ui::say(&crate::ui::paint(
@@ -3763,13 +4253,15 @@ pub async fn proxy_cmd(
             "tunlion: HTTP CONNECT proxy on {bind}:{http_port}"
         ));
         crate::ui::say(&format!(
-            "  PAC file: http://127.0.0.1:{http_port}/proxy.pac"
+            "  PAC file: http://127.0.0.1:{http_port}/proxy.pac (browsers ask for the same user/password)"
         ));
         crate::ui::say(&format!(
-            "  e.g.  curl -x http://127.0.0.1:{http_port} https://<peer>.mesh"
+            "  e.g.  curl -x \"http://{PROXY_USER}:$(cat '{}')@127.0.0.1:{http_port}\" https://<peer>.mesh",
+            proxy_token_path().display()
         ));
         let cold_http = cold.clone();
         let server_http = server.to_string();
+        let token_http = token.clone();
         tokio::spawn(async move {
             loop {
                 let sock = match http_listener.accept().await {
@@ -3783,9 +4275,9 @@ pub async fn proxy_cmd(
                     }
                 };
                 let _ = sock.set_nodelay(true);
-                let (server, cold) = (server_http.clone(), cold_http.clone());
+                let (server, cold, token) = (server_http.clone(), cold_http.clone(), token_http.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = handle_http(sock, &server, port, relay, cold).await {
+                    if let Err(e) = handle_http(sock, &server, port, http_port, relay, cold, &token).await {
                         crate::ui::debug(&format!("tunlion: HTTP proxy connection ended: {e}"));
                     }
                 });
@@ -3802,9 +4294,9 @@ pub async fn proxy_cmd(
             }
         };
         let _ = sock.set_nodelay(true);
-        let (server, cold) = (server.to_string(), cold.clone());
+        let (server, cold, token) = (server.to_string(), cold.clone(), token.clone());
         tokio::spawn(async move {
-            if let Err(e) = handle_socks(sock, &server, relay, cold).await {
+            if let Err(e) = handle_socks(sock, &server, relay, cold, &token).await {
                 crate::ui::debug(&format!("tunlion: proxy connection ended: {e}"));
             }
         });
@@ -3817,16 +4309,11 @@ async fn socks_reply(sock: &mut TcpStream, code: u8) -> std::io::Result<()> {
         .await
 }
 
-/// Handle one SOCKS5 client: no-auth handshake, parse the CONNECT target, then
-/// route `<peer>.mesh:<port>` over tunlion (warm-first, cold fallback) or dial any
-/// other host directly. Errors here only affect this one connection.
-async fn handle_socks(
-    mut sock: TcpStream,
-    server: &str,
-    relay: bool,
-    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
-) -> Result<()> {
-    // Greeting: VER, NMETHODS, METHODS...; we only offer no-auth (0x00).
+/// SOCKS5 greeting + RFC 1929 username/password sub-negotiation. Only method
+/// 0x02 is accepted: a client offering no-auth alone gets 0xFF (no acceptable
+/// method) and is closed. Returns Ok(()) only for the right password.
+async fn socks_authenticate<S: AsyncRead + AsyncWrite + Unpin>(sock: &mut S, token: &str) -> Result<()> {
+    // Greeting: VER, NMETHODS, METHODS...
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await?;
     if greet[0] != 0x05 {
@@ -3834,7 +4321,43 @@ async fn handle_socks(
     }
     let mut methods = vec![0u8; greet[1] as usize];
     sock.read_exact(&mut methods).await?;
-    sock.write_all(&[0x05, 0x00]).await?;
+    if !methods.contains(&0x02) {
+        sock.write_all(&[0x05, 0xFF]).await?;
+        bail!("SOCKS5 client offered no username/password auth; the tunlion proxy requires it");
+    }
+    sock.write_all(&[0x05, 0x02]).await?;
+    // RFC 1929: VER(1)=0x01, ULEN, UNAME, PLEN, PASSWD.
+    let mut hdr = [0u8; 2];
+    sock.read_exact(&mut hdr).await?;
+    if hdr[0] != 0x01 {
+        bail!("bad SOCKS5 auth version");
+    }
+    let mut user = vec![0u8; hdr[1] as usize];
+    sock.read_exact(&mut user).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut pass).await?;
+    if !proxy_password_ok(&pass, token) {
+        sock.write_all(&[0x01, 0x01]).await?;
+        bail!("SOCKS5 auth failed");
+    }
+    sock.write_all(&[0x01, 0x00]).await?;
+    Ok(())
+}
+
+/// Handle one SOCKS5 client: username/password handshake, parse the CONNECT
+/// target, then route `<peer>.mesh:<port>` over tunlion (warm-first, cold
+/// fallback) or dial any other host directly. Errors here only affect this one
+/// connection.
+async fn handle_socks(
+    mut sock: TcpStream,
+    server: &str,
+    relay: bool,
+    cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+    token: &str,
+) -> Result<()> {
+    socks_authenticate(&mut sock, token).await?;
 
     // Request: VER, CMD, RSV, ATYP, ADDR, PORT.
     let mut req = [0u8; 4];
@@ -3938,8 +4461,10 @@ async fn handle_http(
     mut sock: TcpStream,
     server: &str,
     socks_port: u16,
+    http_port: u16,
     relay: bool,
     cold: Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Arc<Mux>>>>>>,
+    token: &str,
 ) -> Result<()> {
     // Read the HTTP request line + headers until empty line.
     let mut buf = Vec::new();
@@ -3964,6 +4489,20 @@ async fn handle_http(
     let path = parts.next().unwrap_or("");
 
     if method.eq_ignore_ascii_case("CONNECT") {
+        // Same authority as the SOCKS side, so the same password: HTTP Basic
+        // in Proxy-Authorization. A browser answers the 407 with a prompt.
+        if !http_proxy_auth_ok(&request, token) {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                      Proxy-Authenticate: Basic realm=\"tunlion\"\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .await;
+            return Ok(());
+        }
         // HTTP CONNECT proxy: CONNECT host:port HTTP/1.1
         let host_port = path;
         let (host, dport) = if let Some(colon) = host_port.rfind(':') {
@@ -4031,11 +4570,13 @@ async fn handle_http(
             }
         }
     } else if path == "/proxy.pac" || path == "/wpad.dat" {
-        // Serve PAC file for browser/OS proxy config.
+        // Serve PAC file for browser/OS proxy config. The PAC itself holds no
+        // secret. Browsers cannot authenticate to SOCKS5, so the HTTP CONNECT
+        // proxy (which they can, via the Basic prompt) comes first.
         let pac = format!(
             r#"function FindProxyForURL(url, host) {{
     if (dnsDomainIs(host, ".mesh") || shExpMatch(host, "*.mesh")) {{
-        return "SOCKS5 127.0.0.1:{socks_port}; DIRECT";
+        return "PROXY 127.0.0.1:{http_port}; SOCKS5 127.0.0.1:{socks_port}; DIRECT";
     }}
     return "DIRECT";
 }}
@@ -4062,6 +4603,32 @@ async fn handle_http(
         let _ = sock.write_all(response.as_bytes()).await;
         Ok(())
     }
+}
+
+/// Whether the raw request head carries `Proxy-Authorization: Basic` with the
+/// proxy password (any username).
+fn http_proxy_auth_ok(request: &str, token: &str) -> bool {
+    use base64::Engine;
+    for line in request.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        if !name.trim().eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        let mut parts = value.trim().splitn(2, ' ');
+        let (Some(scheme), Some(cred)) = (parts.next(), parts.next()) else { continue };
+        if !scheme.eq_ignore_ascii_case("basic") {
+            continue;
+        }
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(cred.trim()) else { continue };
+        let pass = match raw.iter().position(|&b| b == b':') {
+            Some(i) => &raw[i + 1..],
+            None => continue,
+        };
+        if proxy_password_ok(pass, token) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Serve one accepted forward connection over the managed cold link, tolerant of
@@ -4333,6 +4900,15 @@ async fn shell_bootstrap(
                     let why = v["reason"]
                         .as_str()
                         .unwrap_or("shell capability not granted");
+                    // A peer of this build says exactly why (`code`) and what it
+                    // calls us (`as`); one remedy per cause, never two.
+                    let (code, as_name) = crate::refusal::from_frame(&v, "reason");
+                    if code.is_some() {
+                        break Err(anyhow!(
+                            "{}",
+                            crate::refusal::explain("a shell", peer, why, code, as_name.as_deref())
+                        ));
+                    }
                     // Same trap as the non-ssh path: a grant cannot widen an
                     // enrolment ceiling, so do not prescribe one when the
                     // ceiling is the reason.
@@ -4344,7 +4920,13 @@ async fn shell_bootstrap(
                     // carries its own fix gets no second one bolted on.
                     let fix = if why == crate::capability::CEILING_REASON {
                         format!(
-                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: `tunlion add --for <this-device> --allow shell` on '{peer}'."
+                            " shell is outside this device's invitation ceiling, and a grant cannot widen one. {}",
+                            crate::identity_state::reenrol_steps(
+                                &crate::display_name(),
+                                &peer,
+                                "shell",
+                                &[]
+                            )
                         )
                     } else if why == crate::capability::SHELL_OFF_REASON {
                         String::new()
@@ -4499,6 +5081,18 @@ async fn run_ssh(
     }
     let code = spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)?;
     sigwatch.abort();
+    if code == 255 {
+        // 255 is ssh's own failure (connect or auth), never the remote command's.
+        // Without password fallback the commonest cause is now a crisp
+        // "Permission denied (publickey)", so say what it means and what to do.
+        crate::ui::say(&format!(
+            "tunlion: ssh to '{peer}' was refused before a session started. If ssh said \
+             \"Permission denied (publickey)\", that device's sshd does not trust \
+             tunlion's certificates for this user yet: restart `tunlion up` there \
+             (it installs the trust for its own user, no root needed), or drop \
+             --ssh to use the built-in shell, which needs no sshd at all."
+        ));
+    }
     Ok(code)
 }
 
@@ -4521,6 +5115,18 @@ fn spawn_ssh_direct(
         .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
+        // NEVER A PASSWORD. Auth is the certificate this daemon just signed, so
+        // there is no legitimate password path; when the cert is not accepted,
+        // ssh's default is to fall through to a password prompt, which is how
+        // a missing CA trust on the device used to look -- a baffling prompt
+        // nobody could answer. With these, the same failure is an immediate,
+        // explainable "Permission denied (publickey)".
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o")
@@ -4579,6 +5185,18 @@ fn spawn_ssh(
         .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
+        // NEVER A PASSWORD. Auth is the certificate this daemon just signed, so
+        // there is no legitimate password path; when the cert is not accepted,
+        // ssh's default is to fall through to a password prompt, which is how
+        // a missing CA trust on the device used to look -- a baffling prompt
+        // nobody could answer. With these, the same failure is an immediate,
+        // explainable "Permission denied (publickey)".
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o")
@@ -4672,13 +5290,35 @@ pub(crate) struct PeerSshInfo {
 
 /// Ensure our managed key is installed on the peer and host keys are pinned.
 /// Returns `PeerSshInfo` with everything needed to spawn sshfs/rsync/ssh.
+// PROTOCOL LITERAL: frozen, do not rename. `filament-<peer>` is the host alias
+// written into the managed known_hosts / bootstrap pin store; released builds
+// wrote it and look it up by exactly this spelling, so a renamed prefix makes
+// every pinned peer look unpinned (and re-bootstraps or prompts).
+const SSH_HOST_ALIAS_PREFIX: &str = "filament-";
+/// Read only, never written: the prefix an unreleased build wrote for a short
+/// while after the rename. Still recognised when mapping an alias to its peer.
+const SSH_HOST_ALIAS_PREFIX_RENAMED: &str = "tunlion-";
+
+/// The host alias for `peer` (always the frozen `filament-` spelling).
+fn ssh_host_alias(peer: &str) -> String {
+    format!("{SSH_HOST_ALIAS_PREFIX}{peer}")
+}
+
+/// The peer name inside a host alias, accepting both spellings.
+#[allow(dead_code)] // only the Linux L3 path reads it outside tests
+fn peer_from_ssh_host_alias(host: &str) -> &str {
+    host.strip_prefix(SSH_HOST_ALIAS_PREFIX)
+        .or_else(|| host.strip_prefix(SSH_HOST_ALIAS_PREFIX_RENAMED))
+        .unwrap_or(host)
+}
+
 pub(crate) async fn ensure_peer_bootstrap(
     server: &str,
     peer: &str,
     relay: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let _host = format!("tunlion-{peer}");
+    let _host = ssh_host_alias(peer);
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -4697,7 +5337,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
     cert_only: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("tunlion-{peer}");
+    let host = ssh_host_alias(peer);
 
     let cached = if crate::sshkeys::host_pinned(&host) {
         crate::sshkeys::bootstrap_cache_get(peer)
@@ -4729,7 +5369,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
 /// Invalidate bootstrap cache and re-bootstrap a peer (for retry after exit 255).
 pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool, cert_only: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
-    let host = format!("tunlion-{peer}");
+    let host = ssh_host_alias(peer);
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -4800,7 +5440,7 @@ pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
 /// Build the L3 direct destination for sshfs/rsync (login@peer.mesh).
 #[cfg(target_os = "linux")]
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
-    let peer = info.host.strip_prefix("tunlion-").unwrap_or(&info.host);
+    let peer = peer_from_ssh_host_alias(&info.host);
     let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
 
     // Retry with increasing timeouts (like run_ssh does with revive+poll).
@@ -4934,6 +5574,127 @@ async fn probe_sshd_warm(peer: &str, rport: u16) -> Option<bool> {
         Ok(Ok(_)) => Some(true),   // a listener answered (sshd banner)
         Ok(Err(_)) => Some(false), // stream error: treat as unreachable
         Err(_) => None,            // no banner in time: inconclusive, don't block
+    }
+}
+
+#[cfg(test)]
+mod term_tests {
+    use super::effective_term;
+
+    #[test]
+    fn a_term_with_no_terminfo_falls_back_instead_of_breaking_curses_apps() {
+        // Reproduced: TERM=xterm-kitty on a server without that entry made a
+        // remote `tmux` exit with "missing or unsuitable terminal".
+        //
+        // The contract, portably: effective_term keeps a name exactly when the
+        // platform says it has terminfo for it, and otherwise falls back. On
+        // unix an invented name has none (pinned in platform/'s own tests); on
+        // Windows there is no terminfo and every name is kept by design. The
+        // first version asserted the unix outcome everywhere and failed on the
+        // Windows runner, which was the test being wrong, not the code.
+        let name = "definitely-not-a-real-terminal-x9";
+        let want = if crate::platform::terminfo_exists(name) { name } else { "xterm-256color" };
+        assert_eq!(effective_term(name), want);
+        assert_eq!(effective_term(""), "xterm-256color");
+    }
+
+    #[test]
+    fn a_term_this_machine_knows_is_kept() {
+        // Every Linux and macOS CI image ships xterm-256color, and on Windows
+        // (no terminfo) the requested name is always kept.
+        assert_eq!(effective_term("xterm-256color"), "xterm-256color");
+    }
+
+    #[test]
+    fn a_peer_supplied_term_cannot_become_a_path_probe() {
+        // TERM is chosen by the PEER and joined onto terminfo directories, so
+        // anything that is not a plain terminal name is replaced before use.
+        let too_long = "z".repeat(65);
+        let hostile_names: [&str; 8] = [
+            "../../etc/passwd",
+            "..",
+            ".hidden",
+            "a/b",
+            "x\\y",
+            "term\0nul",
+            "has space",
+            too_long.as_str(),
+        ];
+        for hostile in hostile_names {
+            assert_eq!(effective_term(hostile), "xterm-256color", "{hostile:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_auth_tests {
+    use super::*;
+
+    const TOKEN: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    async fn run_handshake(client_bytes: Vec<u8>) -> (Result<()>, Vec<u8>) {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(&client_bytes).await.unwrap();
+        let res = socks_authenticate(&mut server, TOKEN).await;
+        drop(server);
+        let mut out = Vec::new();
+        let _ = client.read_to_end(&mut out).await;
+        (res, out)
+    }
+
+    fn userpass(user: &[u8], pass: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x05, 0x01, 0x02, 0x01, user.len() as u8];
+        v.extend_from_slice(user);
+        v.push(pass.len() as u8);
+        v.extend_from_slice(pass);
+        v
+    }
+
+    #[tokio::test]
+    async fn socks_no_auth_client_is_refused() {
+        let (res, out) = run_handshake(vec![0x05, 0x01, 0x00]).await;
+        assert!(res.is_err(), "a no-auth-only client must not get through");
+        assert_eq!(out, [0x05, 0xFF], "answered with no acceptable method");
+    }
+
+    #[tokio::test]
+    async fn socks_wrong_password_is_refused() {
+        let (res, out) = run_handshake(userpass(b"tunlion", b"not-the-token")).await;
+        assert!(res.is_err());
+        assert_eq!(out, [0x05, 0x02, 0x01, 0x01]);
+        let mut near = TOKEN.as_bytes().to_vec();
+        near[63] = b'0';
+        let (res, _) = run_handshake(userpass(b"tunlion", &near)).await;
+        assert!(res.is_err(), "one byte off is still wrong");
+    }
+
+    #[tokio::test]
+    async fn socks_right_password_is_accepted() {
+        let (res, out) = run_handshake(userpass(b"tunlion", TOKEN.as_bytes())).await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(out, [0x05, 0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn http_basic_auth_is_checked() {
+        use base64::Engine;
+        let good = base64::engine::general_purpose::STANDARD.encode(format!("tunlion:{TOKEN}"));
+        let bad = base64::engine::general_purpose::STANDARD.encode("tunlion:nope");
+        let req = |h: &str| format!("CONNECT a.mesh:80 HTTP/1.1\r\nHost: a.mesh:80\r\n{h}\r\n");
+        assert!(http_proxy_auth_ok(&req(&format!("Proxy-Authorization: Basic {good}\r\n")), TOKEN));
+        assert!(http_proxy_auth_ok(&req(&format!("proxy-authorization: basic {good}\r\n")), TOKEN));
+        assert!(!http_proxy_auth_ok(&req(&format!("Proxy-Authorization: Basic {bad}\r\n")), TOKEN));
+        assert!(!http_proxy_auth_ok(&req(""), TOKEN), "no header, no entry");
+    }
+
+    #[test]
+    fn only_loopback_binds_are_local() {
+        for b in ["127.0.0.1", "::1", "[::1]", "localhost", "127.0.0.2"] {
+            assert!(bind_is_loopback(b), "{b}");
+        }
+        for b in ["0.0.0.0", "::", "192.168.1.5", "example.com"] {
+            assert!(!bind_is_loopback(b), "{b}");
+        }
     }
 }
 
@@ -5780,5 +6541,148 @@ mod h1_tests {
         mux.on_frame(sid, Bytes::new()).await;
         drop(client);
         s.await.expect("serve task panicked");
+    }
+}
+
+#[cfg(test)]
+mod ssh_host_alias_tests {
+    use super::*;
+
+    /// The alias is on-disk format shared with released builds: pinned by the
+    /// SHA-256 of the original prefix (`printf '%s' '<prefix>' | sha256sum`),
+    /// which a find-and-replace cannot keep in step.
+    #[test]
+    fn writer_uses_the_frozen_prefix() {
+        use sha2::{Digest, Sha256};
+        let got: String = Sha256::digest(SSH_HOST_ALIAS_PREFIX.as_bytes())
+            .as_slice()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(got, "a9b2366d5c35fecae4becd94bbbdcd150323114f356d1404517649b7dbf3cab4");
+        assert_eq!(ssh_host_alias("laptop"), format!("{SSH_HOST_ALIAS_PREFIX}laptop"));
+    }
+
+    #[test]
+    fn reader_accepts_both_spellings() {
+        assert_eq!(peer_from_ssh_host_alias(&ssh_host_alias("laptop")), "laptop");
+        assert_eq!(peer_from_ssh_host_alias("tunlion-laptop"), "laptop");
+        assert_eq!(peer_from_ssh_host_alias("laptop"), "laptop");
+    }
+}
+
+#[cfg(test)]
+mod forward_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn policy_refusals_are_classified_as_policy() {
+        for reason in [
+            crate::capability::REVOKED_REASON,
+            crate::capability::TUNNEL_OFF_REASON,
+            crate::capability::SHELL_OFF_REASON,
+            crate::capability::CEILING_REASON,
+            "not authorized: device lacks shell grant",
+            "shell not granted to 'bravo' here",
+            "shell revoked for 'bravo' here",
+            "device revoked",
+            "denied",
+        ] {
+            assert_eq!(
+                classify_forward_refusal(reason),
+                ForwardRefusal::Policy,
+                "{reason:?} must end the forward"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_target_port_is_not_policy() {
+        for reason in [
+            "Connection refused (os error 111)",
+            "No connection could be made because the target machine actively refused it. (os error 10061)",
+        ] {
+            assert_eq!(
+                classify_forward_refusal(reason),
+                ForwardRefusal::NothingListening,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_and_capacity_failures_keep_retrying() {
+        for reason in [
+            "too many streams",
+            "sid in use",
+            "stream input flooded (consumer stalled)",
+            "Connection reset by peer (os error 104)",
+            "timed out",
+        ] {
+            assert_eq!(
+                classify_forward_refusal(reason),
+                ForwardRefusal::Transient,
+                "{reason:?} must not stop the forward"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_line_says_when_nothing_listens() {
+        assert_eq!(forward_ready_word(8000, ForwardTarget::Open), "ready");
+        assert_eq!(
+            forward_ready_word(8000, ForwardTarget::NothingListening),
+            "ready (nothing is listening on 8000 there yet)"
+        );
+    }
+
+    #[test]
+    fn a_nothing_listening_probe_reports_that_state() {
+        let t = forward_probe_verdict(
+            "bravo",
+            39998,
+            ForwardProbe::Refused("Connection refused (os error 111)".into()),
+        )
+        .expect("a closed port must not end the forward");
+        assert_eq!(t, ForwardTarget::NothingListening);
+        assert_eq!(
+            forward_probe_verdict("bravo", 39998, ForwardProbe::Accepted).unwrap(),
+            ForwardTarget::Open
+        );
+    }
+
+    #[test]
+    fn a_policy_probe_ends_the_forward_with_the_reason() {
+        let e = forward_probe_verdict(
+            "bravo",
+            8000,
+            ForwardProbe::Refused(crate::capability::TUNNEL_OFF_REASON.into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("refused the connection"), "{e}");
+        assert!(e.contains("tunnelling is off"), "{e}");
+    }
+
+    #[test]
+    fn denied_line_names_the_reason_and_the_exit_code() {
+        assert_eq!(FORWARD_DENIED_EXIT, 4);
+        let l = forward_denied_line("bravo", 8000, "access revoked");
+        assert!(l.contains("access revoked"), "{l}");
+        assert!(l.contains("exit 4"), "{l}");
+        assert!(l.contains("bravo:8000"), "{l}");
+    }
+
+    #[test]
+    fn only_a_policy_refusal_signals_the_accept_loop() {
+        let (act, mut rx) = ForwardActivity::new("bravo", 8000);
+        act.refused_once("Connection refused (os error 111)");
+        act.refused_once("too many streams");
+        assert!(
+            rx.try_recv().is_err(),
+            "a non-policy refusal must not stop the forward"
+        );
+        act.handle().refused_once(crate::capability::REVOKED_REASON);
+        assert_eq!(rx.try_recv().unwrap(), crate::capability::REVOKED_REASON);
     }
 }

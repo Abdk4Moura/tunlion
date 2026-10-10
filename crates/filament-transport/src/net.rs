@@ -57,6 +57,28 @@ pub const MAX_DC_PAYLOAD: usize = 60 * 1024;
 const HIGH_WATER: usize = 4 * 1024 * 1024;
 const LOW_WATER: usize = 1024 * 1024;
 pub const WATCHDOG_SECS: u64 = 15;
+/// How long `DataChannelTransport::flush` waits with bytes still buffered and
+/// NOT ONE of them acknowledged before it declares the peer gone. Progress, not
+/// throughput: any acknowledged byte restarts it (see `flush`).
+pub const DC_FLUSH_STALL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a DataChannel write may wait while the SCTP association
+/// acknowledges NOTHING before the channel is declared dead.
+///
+/// A write does not return until the association takes the message, and the
+/// association only takes more once the peer acknowledges what is already
+/// queued (webrtc-sctp's pending queue is a 128 KiB semaphore whose permits come
+/// back only on SACK). A peer that was SIGKILLed never acknowledges again, and
+/// nothing closes that semaphore when the association dies, so an unbounded
+/// write parks for the life of the process. Measured in CI (gate 2, kill-resume):
+/// the sender's event loop parked inside its periodic `state` control send for
+/// 330 s and only the job timeout ended it.
+///
+/// The rule is on PROGRESS, never on throughput: any acknowledged byte (a drop
+/// in `buffered_amount`) restarts the clock, so a slow link that still moves is
+/// never cut off. 15 s with zero acknowledged bytes is well past the 6 s stall
+/// threshold the transfer ladder already acts on.
+pub const DC_WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// P0 (GAP-1): default no-progress threshold (ms) for the bytes-moved stall
 /// watchdog. An in-flight transfer whose link's `idle_ms()` exceeds this, while
@@ -330,6 +352,13 @@ pub enum Ev {
     TransferStalled(String, u64),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
+    /// The retry ladder's backoff for (peer sid, generation of the stuck
+    /// attempt) has elapsed. `on_stuck` used to SLEEP the backoff (1,2,4,8s)
+    /// inline, which froze the whole event loop: control requests waited up to
+    /// 4s and peer exec stalled. It now schedules this event from a timer task
+    /// and returns at once; the handler re-validates the generation, so a
+    /// retry for a link that was replaced or recovered meanwhile is ignored.
+    RetryLink(String, u32),
     /// P2 (GAP-2): the signaling socket reported a clean close/error (the
     /// socket.io `close`/`error` callbacks). A FAST-PATH hint that the link is
     /// gone, the long-lived acceptor's outer reconnect loop re-dials signaling
@@ -337,8 +366,14 @@ pub enum Ev {
     /// protocol error; a hard TCP sever (the flaky-proxy case) produces NO
     /// callback at all, so the silence watchdog (`signaling_silence_ms`) is the
     /// authoritative trigger and this is purely an accelerant.
-    #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
-    SignalingDown(String),
+    ///
+    /// The `u64` is the id of the connection that ended
+    /// (`filament_signal::Client::id`). Every connection a re-dialing daemon
+    /// opens shares one event channel, so a close can arrive after the loop has
+    /// already replaced that connection; only a close whose id matches the
+    /// CURRENT client means the link is down. Acting on a stale one tore down
+    /// each fresh connection in turn: the post-SIGSTOP reconnect storm.
+    SignalingDown(String, u64),
     /// Warm-reuse opened a stream over this held link and it black-holed (no
     /// response within the verify window) - the link is a zombie (alive at the
     /// QUIC layer but dead for new streams). The loop drops it so the daemon
@@ -404,6 +439,17 @@ pub trait Transport: Send + Sync {
         }
         let idle_ms = self.idle_ms();
         (idle_ms != u64::MAX).then_some(idle_ms)
+    }
+    /// Milliseconds since the PEER last sent us anything at all (data, control,
+    /// or its keepalive), or `None` when this transport does not track it.
+    ///
+    /// Not `idle_ms`: that is stamped when OUR writes succeed too, and the relay
+    /// keepalive writes every 5 s whether or not anyone is listening, so a relay
+    /// link to a stopped or wiped peer kept `idle_ms` near zero forever and was
+    /// shown as "online (last seen just now)". A healthy relay peer sends its own
+    /// keepalive every 5 s, so silence here past a few seconds means it is gone.
+    fn heard_ms(&self) -> Option<u64> {
+        None
     }
     /// Best-effort liveness: `false` if the underlying connection is known closed.
     /// Default `true` (untracked transports are assumed live). Warm-link reuse
@@ -552,6 +598,9 @@ pub struct DataChannelTransport {
     // signaling reconnect must not supersede a link whose data channel, which
     // is independent of the socket, is still flowing.
     last_activity: Arc<std::sync::atomic::AtomicU64>,
+    // Monotonic ms-stamp of the last message the PEER sent, of any kind (see
+    // `Transport::heard_ms`). Never stamped by our own writes.
+    last_heard: Arc<std::sync::atomic::AtomicU64>,
     // Flips true the first time a DATA frame moves in either direction. Backs the
     // before-first-byte establishment grace (a link awaiting its first chunk over
     // a high-RTT relay is establishing, not stalled).
@@ -572,6 +621,51 @@ impl DataChannelTransport {
     fn is_dead(&self) -> bool {
         self.dead.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Mark the channel dead and wake every sender parked on it.
+    fn declare_dead(&self) {
+        self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.drained.notify_waiters();
+    }
+
+    /// Wait for `ready` (a write, or the backpressure condition), but never past
+    /// [`DC_WRITE_STALL`] without the association acknowledging a byte, and
+    /// never past the channel's death. Polls once a second so progress (a drop
+    /// in `buffered_amount`) can extend the deadline.
+    async fn bounded<T>(
+        &self,
+        what: &str,
+        ready: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        tokio::pin!(ready);
+        let mut last = self.raw.buffered_amount();
+        let mut deadline = tokio::time::Instant::now() + DC_WRITE_STALL;
+        loop {
+            if self.is_dead() {
+                return Err(anyhow!("channel closed"));
+            }
+            // Created before the select, so a death notified while we wait is
+            // never missed (notify_waiters reaches every Notified that exists).
+            let died = self.drained.notified();
+            tokio::select! {
+                r = &mut ready => return r,
+                _ = died => continue,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+            let now = self.raw.buffered_amount();
+            if now < last {
+                deadline = tokio::time::Instant::now() + DC_WRITE_STALL;
+            }
+            last = now;
+            if tokio::time::Instant::now() >= deadline {
+                self.declare_dead();
+                return Err(anyhow!(
+                    "data channel {what} got no acknowledgement for {}s, the peer is gone",
+                    DC_WRITE_STALL.as_secs()
+                ));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -580,10 +674,12 @@ impl Transport for DataChannelTransport {
         if self.is_dead() {
             return Err(anyhow!("channel closed"));
         }
-        self.raw
-            .write_data_channel(&Bytes::from(msg.to_string()), true)
-            .await?;
-        Ok(())
+        let data = Bytes::from(msg.to_string());
+        self.bounded("control write", async {
+            self.raw.write_data_channel(&data, true).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
     }
 
     async fn send_frame(&self, sid: u32, offset: u64, payload: &[u8]) -> Result<()> {
@@ -598,27 +694,40 @@ impl Transport for DataChannelTransport {
         // notification instead of sleep-polling. Re-check after registering
         // to close the notify race. The read loop notifies on death, so a
         // sender parked on a dying channel wakes up and errors out.
+        //
+        // Both waits below are bounded by `bounded` (DC_WRITE_STALL with no
+        // acknowledged byte): a peer that died without closing the association
+        // never drains the buffer and never notifies, and an unbounded park
+        // here is a sender that never learns its receiver is gone.
         let t_bp = if trace { Some(std::time::Instant::now()) } else { None };
-        let mut waited = false;
-        loop {
-            if self.is_dead() {
-                return Err(anyhow!("channel closed"));
-            }
-            if self.raw.buffered_amount() <= HIGH_WATER {
-                break;
-            }
-            waited = true;
-            let notified = self.drained.notified();
-            if self.raw.buffered_amount() <= HIGH_WATER {
-                break;
-            }
-            notified.await;
+        let waited = self.raw.buffered_amount() > HIGH_WATER;
+        let _ = &waited; // read only by the trace line below
+        if waited {
+            self.bounded("backpressure", async {
+                loop {
+                    if self.is_dead() {
+                        return Err::<(), anyhow::Error>(anyhow!("channel closed"));
+                    }
+                    if self.raw.buffered_amount() <= HIGH_WATER {
+                        return Ok(());
+                    }
+                    let notified = self.drained.notified();
+                    if self.raw.buffered_amount() <= HIGH_WATER {
+                        return Ok(());
+                    }
+                    notified.await;
+                }
+            })
+            .await?;
         }
         let bp_us = t_bp.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let t_write = if trace { Some(std::time::Instant::now()) } else { None };
-        self.raw
-            .write_data_channel(&Bytes::from(framed), false)
-            .await?;
+        let framed = Bytes::from(framed);
+        self.bounded("write", async {
+            self.raw.write_data_channel(&framed, false).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
         let write_us = t_write.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         if trace {
             static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -675,9 +784,35 @@ impl Transport for DataChannelTransport {
 
     async fn flush(&self) -> Result<()> {
         // Tail-drain only; polling is fine for the final few buffers.
+        //
+        // BOUNDED ON PROGRESS. `buffered_amount` only falls when the peer's SCTP
+        // stack acknowledges (SACK) what we wrote. A peer that exits or is
+        // killed right after reading our last message never acknowledges it,
+        // and nothing closes the association, so the read loop never marks the
+        // channel dead either: an unbounded poll here waited forever. That was
+        // the receiver that kept running after it had the whole verified file
+        // (gate 11c, G-k): its event loop sat in this loop behind the
+        // delivery-ack the sender had already read before exiting. Any drop in
+        // `buffered_amount` restarts the clock, so a slow link that still moves
+        // is never cut off; only a peer that acknowledges nothing at all is.
+        let mut last = self.raw.buffered_amount();
+        let mut deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
         while self.raw.buffered_amount() > 0 {
             if self.is_dead() {
                 return Err(anyhow!("channel closed while flushing"));
+            }
+            let now = self.raw.buffered_amount();
+            if now < last {
+                deadline = tokio::time::Instant::now() + DC_FLUSH_STALL;
+            }
+            last = now;
+            if tokio::time::Instant::now() >= deadline {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.drained.notify_waiters();
+                return Err(anyhow!(
+                    "data channel flush got no acknowledgement for {}s, the peer is gone",
+                    DC_FLUSH_STALL.as_secs()
+                ));
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -686,6 +821,13 @@ impl Transport for DataChannelTransport {
 
     fn max_payload(&self) -> usize {
         MAX_DC_PAYLOAD
+    }
+
+    fn heard_ms(&self) -> Option<u64> {
+        if self.is_dead() {
+            return Some(u64::MAX);
+        }
+        Some(now_ms().saturating_sub(self.last_heard.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
     fn idle_ms(&self) -> u64 {
@@ -842,7 +984,14 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
     }
     let path = dns_cache_path();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if !dir.is_dir() {
+            let _ = std::fs::create_dir_all(dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
     }
     let mut doc = std::fs::read_to_string(&path)
         .ok()
@@ -851,7 +1000,19 @@ fn write_cached_addrs(host: &str, addrs: &[SocketAddr]) {
         .unwrap_or_else(|| json!({}));
     let ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
     doc[host] = json!(ips);
-    let _ = std::fs::write(&path, doc.to_string());
+    // Owner-only whatever the umask: this sits in the config directory, and a
+    // world-writable cache lets anyone point the next connect elsewhere.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(doc.to_string().as_bytes());
+    }
 }
 
 /// Resolve `host:port` to connect targets, immune to a cold-resolver stall.
@@ -1052,7 +1213,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         tokio::spawn(async move {
             while let Some(msg) = raw_rx.recv().await {
                 let ev = match msg {
-                    filament_signal::Incoming::Down(reason) => Ev::SignalingDown(reason),
+                    filament_signal::Incoming::Down { conn, reason } => Ev::SignalingDown(reason, conn),
                     filament_signal::Incoming::Event { name, data } => match name.as_str() {
                         "welcome" => Ev::Welcome(data),
                         "peer-joined" => Ev::PeerJoined(data),
@@ -1194,7 +1355,10 @@ pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, pee
     }
     ensure_ascii_session_id(my_id)?;
     ensure_ascii_session_id(peer_id)?;
-    eprintln!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
+    // Debug builds only: at the default verbosity this printed one line per
+    // decision into a user's `receive` (five of them before a failure message).
+    let _ = (source, peer_present);
+    dlog!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
     Ok(match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,
@@ -1898,6 +2062,8 @@ async fn wire_channel(
             // Seed activity at open so a link mid-handshake (no bytes yet) is
             // never falsely treated as idle/supersedable (#28 guard).
             let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+            // Seeded at open too: a link that just came up has just heard its peer.
+            let last_heard = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
             let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // L3-over-relay queues, created BEFORE the read loop so the reader
             // owns the inbound sender and the transport owns the receiver.
@@ -1925,12 +2091,19 @@ async fn wire_channel(
                 let dead = dead.clone();
                 let drained = drained.clone();
                 let last_activity = last_activity.clone();
+                let last_heard = last_heard.clone();
                 let first_data = first_data.clone();
                 let peer_id = peer_id.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
-                        match raw.read_data_channel(&mut buf).await {
+                        let read = raw.read_data_channel(&mut buf).await;
+                        if matches!(read, Ok((n, _)) if n > 0) {
+                            // Anything the peer sent, its keepalive included,
+                            // proves it is there (Transport::heard_ms).
+                            last_heard.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        match read {
                             Ok((0, _)) | Err(_) => {
                                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                                 drained.notify_waiters(); // wake parked senders
@@ -2001,8 +2174,13 @@ async fn wire_channel(
                             if dead_k.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
                             }
-                            if raw_k.write_data_channel(&frame, true).await.is_err() {
-                                break;
+                            // Bounded: on a peer that died without closing the
+                            // association this write never returns (see
+                            // DC_WRITE_STALL), and a parked keepalive is a task
+                            // that outlives its link.
+                            match tokio::time::timeout(DC_WRITE_STALL, raw_k.write_data_channel(&frame, true)).await {
+                                Ok(Ok(_)) => {}
+                                _ => break,
                             }
                             act_k.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         }
@@ -2034,7 +2212,7 @@ async fn wire_channel(
                 }
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport {
-                        raw, drained, dead, last_activity, first_data, answerer: polite,
+                        raw, drained, dead, last_activity, last_heard, first_data, answerer: polite,
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });

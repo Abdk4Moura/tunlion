@@ -25,7 +25,7 @@ impl SecretFile {
     pub fn write(path: impl AsRef<Path>, data: &[u8]) -> io::Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
         SecretFile::write_raw(path, data)?;
         SecretFile::restrict(path)?;
@@ -63,7 +63,10 @@ impl SecretFile {
     fn write_raw(path: &Path, data: &[u8]) -> io::Result<()> {
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         let temp = dir.join(format!("{}.tmp.{}", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id()));
-        // Write to temp file
+        // Write to temp file. ANY failure from here on removes the temp: a write
+        // that hit ENOSPC used to leave `config.tmp.<pid>` (and the same for
+        // armed.json, devices.json) behind forever, eating the very space whose
+        // absence caused the failure.
         {
             let mut opts = std::fs::OpenOptions::new();
             opts.write(true).create(true).truncate(true);
@@ -72,9 +75,14 @@ impl SecretFile {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(0o600);
             }
-            let mut f = opts.open(&temp)?;
-            f.write_all(data)?;
-            f.sync_all()?;
+            let written = opts.open(&temp).and_then(|mut f| {
+                f.write_all(data)?;
+                f.sync_all()
+            });
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e);
+            }
         }
         // Atomic rename over original.
         //
@@ -113,6 +121,44 @@ impl SecretFile {
             }
         }
         Ok(())
+    }
+}
+
+/// Create `dir` and any missing parents owner-only (0700) regardless of the
+/// umask. `create_dir_all` lets the umask decide, so under `umask 0000` the
+/// directory holding a secret came out world-writable, and anyone could replace
+/// the file inside it. Directories that already exist are left as they are.
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut missing = Vec::new();
+        let mut cur = Some(dir);
+        while let Some(p) = cur {
+            if p.as_os_str().is_empty() || p.exists() {
+                break;
+            }
+            missing.push(p.to_path_buf());
+            cur = p.parent();
+        }
+        for p in missing.iter().rev() {
+            match std::fs::DirBuilder::new().mode(0o700).create(p) {
+                Ok(()) => {
+                    // A umask can strip bits from the requested mode; say it outright.
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && p.is_dir() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
     }
 }
 

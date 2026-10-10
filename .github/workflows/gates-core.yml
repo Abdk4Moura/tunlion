@@ -74,6 +74,16 @@ jobs:
         run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
 
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          # The Actions cache backend can refuse service ("Egress is over the
+          # account limit"), and with RUSTC_WRAPPER=sccache every compile then
+          # fails. A slower uncached build beats a red job that tested nothing.
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
       # No step-level sccache env here on purpose: it is set at WORKFLOW level
       # above. A per-step copy is what caused the 1h30m timeouts, because it made
       # step scoping look sufficient while `tests/gates.sh` built release
