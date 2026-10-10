@@ -355,6 +355,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The sidecar names the file, its size and digests, and sits in a
+    /// download dir others may read: it is created owner-only (0600) whatever
+    /// the umask, and a looser leftover is replaced rather than reused.
+    #[test]
+    fn part_meta_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("filament-test-meta-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("z.part.meta");
+        std::fs::write(&p, "1").unwrap();
+        PartMeta { size: 9, head: Some("ab".into()), full: Some("cd".into()) }.store(&p).unwrap();
+        if let Some(mode) = crate::platform::file_mode(&p) {
+            assert_eq!(mode & 0o777, 0o600, ".part.meta must be 0600, got {mode:o}");
+        }
+        assert_eq!(PartMeta::load(&p).unwrap().size, 9);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A `.part.meta` planted as a symlink must not redirect the sidecar write
     /// onto the link's target.
     #[test]

@@ -288,7 +288,7 @@ pub(crate) async fn apply_reconfigure(
             let nd = settings::get_str("drop-dir", None)
                 .map(PathBuf::from)
                 .unwrap_or_else(default_drop_dir);
-            let _ = std::fs::create_dir_all(&nd);
+            let _ = crate::platform::create_inbox_dir(&nd);
             *dir = nd;
             true
         }
