@@ -165,6 +165,13 @@ pub(crate) const RESET_STATE: &[(&str, &str)] = &[
     ("up.ready", "daemon readiness marker"),
     ("up.lock", "daemon single-instance lock"),
     ("proxy.token", "local proxy token"),
+    // What the local proxy and the transfer history record. `reset` called the
+    // machine a clean slate while both survived it: proxy.json names the
+    // proxy's address and user, transfers.json every file sent or received,
+    // with peers and digests.
+    ("proxy.json", "local proxy record"),
+    ("transfers.json", "transfer history"),
+    ("down.marker", "last `tunlion down` marker"),
     ("control.sock", "daemon control socket"),
     ("mount-profiles", "saved mount profiles"),
     // Managed ssh material (private key, known_hosts pins, bootstrap cache, the
@@ -482,6 +489,8 @@ mod reset_tests {
             "up.ready",
             "up.lock",
             "proxy.token",
+            "proxy.json",
+            "transfers.json",
             "control.sock",
             "identity",
             "devices.json",
