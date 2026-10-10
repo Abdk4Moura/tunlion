@@ -202,6 +202,7 @@ test holds to the help text.
 | 8 | `partial` | some files moved and some did not (`send`, `sync`) |
 | 9 | `no_identity` | this device has no identity yet: `tunlion init`, or `tunlion join <invitation>` |
 | 10 | | `up`: a daemon is already running with different settings; nothing was applied, and the message names the restart (`DAEMON_CONFLICT`) |
+| 11 | | `status`: no daemon is running for this config directory (`STATUS_NOT_RUNNING`) |
 | 130 | | interrupted |
 
 Rules that go with them:
@@ -210,6 +211,11 @@ Rules that go with them:
   `devices --caps`, `reach --until-direct`), because gates assert them. `sync`
   moved its unreachable from 5 to 6 and its partial from 7 to 8, so one number
   means one thing across every verb.
+- **`status` answers with its exit code.** 0 when the daemon serving this
+  config directory answers; 11 when none is running; 6 (`unreachable`) when one
+  runs but does not answer on its control socket in time (suspended, wedged).
+  Both used to exit 0, so a script had to parse prose. `status --json` still
+  exits 0: it reports, and `running`/`responding` carry the answer.
 - **`exec` passes the remote command's own status through.** A remote `exit 3`
   is a local 3; tunlion's own failures use the table, so for `exec` alone a
   low code is ambiguous. `1` is still the catch-all for anything unclassified,

@@ -786,7 +786,16 @@ pub(crate) async fn send_cmd(
         if let (Some((n, _)), Some(after)) = (&known_target, offline_after) {
             if !established && saw_known_peer.is_empty() && started.elapsed() >= after {
                 ui::clear_sticky();
-                return Err(exit_codes::err(ExitKind::Unreachable, offline_message(n, after)));
+                // A reset device runs `up` as a NEW key the old record can
+                // never find, so "is up running there?" alone was useless. Say
+                // so, and if it already re-paired under a suffixed name, name it.
+                let names: Vec<String> = devices_load().into_iter().map(|(name, _)| name).collect();
+                let successor =
+                    crate::reset_hints::successor_of(n, names.iter().map(String::as_str));
+                return Err(exit_codes::err(
+                    ExitKind::Unreachable,
+                    offline_message_with(n, after, successor.as_deref()),
+                ));
             }
         }
         // A known device that never appears is usually one whose daemon is not
@@ -1865,19 +1874,24 @@ pub(crate) async fn send_cmd(
                             // on the far side, so this is the interval the
                             // throughput line is entitled to divide by. Printing
                             // it at `flush()` measured the send buffer filling.
+                            // Name what LANDED: the receiver may store it under
+                            // another name (shortened past its limit, stripped of
+                            // a path, renamed on a collision), and "ok <name>"
+                            // about a name that does not exist there was false.
+                            let renamed = crate::send_report::delivered_as(
+                                &o.name,
+                                v["stored"].as_str(),
+                            );
                             if let Some(t0) = o.stream_started {
                                 ui::transfer_summary(
-                                    &o.name,
+                                    &crate::send_report::summary_label(&o.name, renamed.as_deref()),
                                     o.stream_bytes,
                                     t0.elapsed().as_secs_f64(),
                                 );
                             }
                             ui::say(&ui::paint(
                                 ui::Tone::Dim,
-                                &format!(
-                                    "    {} delivered + verified (whole-file sha256 matched)",
-                                    o.name
-                                ),
+                                &crate::send_report::delivered_line(&o.name, renamed.as_deref()),
                             ));
                         }
                     }
@@ -2518,10 +2532,17 @@ pub(crate) fn offline_window(establish: Duration, env: Option<&str>) -> Option<D
 
 /// The answer for a known device that never appeared. Pure.
 pub(crate) fn offline_message(peer: &str, after: Duration) -> String {
+    offline_message_with(peer, after, None)
+}
+
+/// [`offline_message`], naming `successor` when a newer record looks like the
+/// same machine re-paired after a reset (see reset_hints). Pure.
+pub(crate) fn offline_message_with(peer: &str, after: Duration, successor: Option<&str>) -> String {
     format!(
         "{peer} is offline: it did not appear on the tunlion server within {}s. \
-         Is `tunlion up` running there? Nothing was sent.",
-        after.as_secs()
+         Is `tunlion up` running there? {} Nothing was sent.",
+        after.as_secs(),
+        crate::reset_hints::offline_hint(peer, successor)
     )
 }
 

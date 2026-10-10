@@ -140,6 +140,31 @@ pub fn ipv6_disabled() -> bool {
         || read("/proc/sys/net/ipv6/conf/default/disable_ipv6")
 }
 
+/// What stops the kernel overlay on this machine before any privilege
+/// question arises, most fundamental first, or None. Pure: `dev_present` is
+/// whether /dev/net/tun exists, `ipv6_off` whether IPv6 is disabled. Only the
+/// first cause is named, so only an advice that can work is given.
+pub fn kernel_overlay_blocker(dev_present: bool, ipv6_off: bool) -> Option<String> {
+    if !dev_present {
+        return Some(
+            "/dev/net/tun does not exist here (a container started without --device /dev/net/tun, \
+             or a kernel without the tun module), so the userspace overlay is used and needs no \
+             setup; a capability grant would not change that"
+                .to_string(),
+        );
+    }
+    if ipv6_off {
+        return Some(
+            "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), so the kernel \
+             overlay cannot hold its address and the userspace overlay is used. To use the kernel \
+             overlay, re-enable it: sysctl -w net.ipv6.conf.all.disable_ipv6=0 \
+             net.ipv6.conf.default.disable_ipv6=0"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Turn a kernel-TUN failure into the thing the operator has to change.
 ///
 /// WHY THIS EXISTS. The fallback message used to quote the failed command and
@@ -1297,6 +1322,19 @@ mod tests {
         assert!(d.contains("IPv6 is disabled"));
     }
 
+    /// `init` in a container with no /dev/net/tun and IPv6 off advised
+    /// `sudo setcap`. The blocker names the device first, then IPv6, and with
+    /// both present there is no blocker (privilege is a separate question).
+    #[test]
+    fn the_kernel_overlay_blocker_names_the_first_real_cause() {
+        let no_dev = kernel_overlay_blocker(false, true).unwrap();
+        assert!(no_dev.contains("/dev/net/tun does not exist"), "{no_dev}");
+        assert!(!no_dev.contains("sysctl") && !no_dev.contains("setcap"), "{no_dev}");
+        let v6 = kernel_overlay_blocker(true, true).unwrap();
+        assert!(v6.contains("IPv6 is disabled") && v6.contains("disable_ipv6=0"), "{v6}");
+        assert_eq!(kernel_overlay_blocker(true, false), None);
+    }
+
     #[test]
     fn privilege_and_module_and_busy_each_name_their_own_fix() {
         assert!(
@@ -1320,7 +1358,7 @@ mod tests {
         let raw = "something nobody has seen before";
         assert_eq!(diagnose_tun_failure(raw, false), raw);
     }
-    use super::{diagnose_tun_failure, dest_ip, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
+    use super::{diagnose_tun_failure, dest_ip, kernel_overlay_blocker, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 

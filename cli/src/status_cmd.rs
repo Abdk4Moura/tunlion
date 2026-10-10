@@ -298,7 +298,7 @@ pub(crate) fn status_exit_code(running: bool, responding: Option<bool>) -> i32 {
 
 /// No daemon serves this config dir. A status-only code (like `up`'s 10),
 /// listed under EXIT CODES in `tunlion --help`.
-pub(crate) const STATUS_NOT_RUNNING: i32 = 11;
+pub(crate) const STATUS_NOT_RUNNING: i32 = crate::exit_codes::STATUS_NOT_RUNNING;
 /// A daemon runs but did not answer in time: the taxonomy's 6, `unreachable`
 /// ("did not answer in time"), so one number keeps one meaning across verbs.
 pub(crate) const STATUS_NOT_RESPONDING: i32 = 6;

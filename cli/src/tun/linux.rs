@@ -147,6 +147,16 @@ pub fn l3_grant_pending() -> Option<String> {
     }
 }
 
+/// Why the kernel overlay cannot run on this machine whatever is granted, or
+/// None. Checked before any grant is offered: a container without
+/// /dev/net/tun was told to `setcap`, which cannot help there.
+pub fn l3_blocker() -> Option<String> {
+    crate::l3::kernel_overlay_blocker(
+        std::path::Path::new("/dev/net/tun").exists(),
+        crate::l3::ipv6_disabled(),
+    )
+}
+
 /// Make L3 work for a non-root daemon with as few steps as possible: if we lack
 /// CAP_NET_ADMIN and we're at a terminal, run the one-time `setcap` now (a single
 /// sudo prompt) so a later `tunlion up` just works; otherwise print the exact

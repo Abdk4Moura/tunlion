@@ -628,6 +628,15 @@ fn offer_l3_grant(caps: &UiCapability) {
     if !l3_on || userspace {
         return;
     }
+    // Something no grant can fix comes first: in a container without
+    // /dev/net/tun, `init` advised `sudo setcap ...`, which cannot help there.
+    if let Some(why) = crate::tun::l3_blocker() {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            &format!("  Virtual network interface: not available here: {why}."),
+        ));
+        return;
+    }
     // None: nothing is missing (already granted, or a platform where no
     // one-time grant applies), so there is nothing to ask.
     let Some(later) = crate::tun::l3_grant_pending() else {

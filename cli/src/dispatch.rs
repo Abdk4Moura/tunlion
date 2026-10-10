@@ -189,6 +189,31 @@ async fn devices_online(names: Vec<String>) -> std::collections::HashSet<String>
         .collect()
 }
 
+/// The daemon's warm-link reply with only the links whose device answered a
+/// liveness ping just now (bounded, in parallel; never establishes anything).
+/// `None` stays `None`: no daemon means the rows assert nothing (#217).
+async fn answering_links(warm: Option<Value>) -> Option<Value> {
+    let mut warm = warm?;
+    let names: Vec<String> = crate::warm_device_names(Some(&warm)).into_iter().collect();
+    let live: std::collections::HashSet<String> = futures_util::future::join_all(
+        names
+            .into_iter()
+            .map(|n| async move { ctl::try_ping(&n).await.is_some().then_some(n) }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect();
+    if let Some(links) = warm.get_mut("links").and_then(Value::as_array_mut) {
+        links.retain(|l| {
+            l["name"]
+                .as_str()
+                .is_some_and(|n| live.iter().any(|x| x.eq_ignore_ascii_case(n)))
+        });
+    }
+    Some(warm)
+}
+
 /// A grant spec that does not parse (an unknown capability, `route` without a
 /// prefix, a resource on a self-scoped capability) is a usage error, exit 2:
 /// the command line is wrong, nothing was refused.
@@ -1264,7 +1289,12 @@ pub(crate) async fn async_main() -> Result<()> {
                             .collect();
                         println!("{}", serde_json::to_string_pretty(&arr)?);
                     } else {
-                        let warm = ctl::try_list_warm().await;
+                        // "online" on this screen means what it means in
+                        // --json: the device answered a liveness ping on the
+                        // held link just now. A held link alone showed a
+                        // SIGSTOPped, stopped or wiped peer as "online (last
+                        // seen just now)" while every send to it failed.
+                        let warm = answering_links(ctl::try_list_warm().await).await;
                         let pending = ctl::try_list_pending().await;
                         let now = identity::now_secs();
                         // Honest roster heading: show the epoch and when it was

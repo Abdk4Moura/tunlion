@@ -93,6 +93,24 @@ pub(crate) async fn add_for_cmd(
     // invitation so the owner can name the invitee up front. The literals
     // keep working for scripts.
     let (kind, _invitee_name) = resolve_for_kind(caps, for_)?;
+    // A name already held by a paired device cannot pass to the new key this
+    // invitation enrols (it is stored as `<name>-2`), which is how a reset
+    // device came back as a second record beside its stale self. Say so now,
+    // while forgetting the old record first is still one command.
+    if let Some(name) = _invitee_name.as_deref() {
+        if crate::device_view::device_record_exists(name) {
+            let now = crate::identity::now_secs();
+            let seen = crate::device_view::devices_info(name)
+                .map(|(t, _, _)| t)
+                .filter(|t| *t > 0)
+                .map(|t| crate::reset_hints::ago(now.saturating_sub(t)));
+            ui::say(&format!(
+                "  {} {}",
+                ui::paint(ui::Tone::Warn, "!"),
+                crate::reset_hints::name_taken_note(name, seen.as_deref())
+            ));
+        }
+    }
     // The ergonomic gap behind "I want to shell into my own devices": shell has
     // to be in the invitation ceiling, because a grant cannot widen one later
     // (#226, which now refuses honestly instead of pretending). So the only way

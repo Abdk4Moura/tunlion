@@ -262,6 +262,12 @@ pub fn l3_grant_pending() -> Option<String> {
     None
 }
 
+/// Nothing on macOS blocks the kernel overlay in a way a grant could not
+/// address; the daemon's own privilege decides it.
+pub fn l3_blocker() -> Option<String> {
+    None
+}
+
 /// The macOS daemon runs as root (utun requires it), so /etc/hosts is already
 /// writable for MagicDNS. Nothing to grant.
 pub fn ensure_hosts_writable() {}
