@@ -246,7 +246,8 @@ Rules that go with them:
   `"identity": null` and keep their own exit rules; `status` prints the same
   one-line hint. `devices` with no identity and nothing stored answers like
   `id` (exit 9, the failure envelope under `--json`); a keyless device that
-  paired by code lists those devices, prints the hint, and exits 0.
+  paired by code lists those devices, prints the hint, and exits 0. (Human
+  output with nothing stored still shows the empty list on stdout.)
 - **`init` never replaces an identity.** On a device that holds the owner key,
   or a device certificate from joining someone else's identity, `init`
   refuses (exit 1) and names `tunlion down` then `tunlion reset`; `-y` answers
