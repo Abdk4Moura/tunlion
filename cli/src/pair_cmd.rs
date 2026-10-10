@@ -126,19 +126,66 @@ pub(crate) fn code_enrolment_ttl(expires: Option<&str>, enrols: bool) -> Result<
     Ok(Some(ttl))
 }
 
+/// What `tunlion grant <device> <capability>` does about a device's enrolment
+/// ceiling. Only a DELEGATED device has one (`principal_ceiling_for` is None
+/// for every other record), and for it a grant can neither widen the ceiling
+/// nor add what it already holds. `grant` decides with this, and the pairing
+/// hint below asks the same question, so the hint cannot name a command that
+/// `grant` would then refuse.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantVsCeiling {
+    /// No ceiling binds this device: proceed.
+    Proceed,
+    /// The ceiling already holds it; a bare grant would add nothing.
+    AlreadyCovered,
+    /// Outside the ceiling (or resource-scoped under one): only a new
+    /// invitation carrying it can add it.
+    OutsideCeiling,
+}
+
+pub(crate) fn grant_vs_ceiling(
+    ceiling: Option<&[String]>,
+    capability: &str,
+    resource_scoped: bool,
+) -> GrantVsCeiling {
+    match ceiling {
+        None => GrantVsCeiling::Proceed,
+        Some(c) if !resource_scoped && c.iter().any(|x| x == capability) => {
+            GrantVsCeiling::AlreadyCovered
+        }
+        Some(_) => GrantVsCeiling::OutsideCeiling,
+    }
+}
+
 /// The one line printed after enrolling a device without shell: how to give it
-/// one. A grant cannot widen an enrolment ceiling, so the remedy is a new
-/// invitation carrying shell, and the command must be one that parses.
-pub(crate) fn shell_not_granted_hint(name: &str, caps: &[String]) -> Option<String> {
+/// one, as a command that parses AND that `grant` accepts for this device.
+/// `caps` is what the enrolment recorded; `ceiling` is what binds it
+/// (`principal_ceiling_for`): None for an owner's own device, which takes a
+/// plain `grant` (a first-time-user test was told to re-add a device that
+/// `tunlion grant p5-b shell` served at once). Only a delegated device whose
+/// ceiling excludes shell is sent to a new invitation.
+pub(crate) fn shell_not_granted_hint(
+    name: &str,
+    caps: &[String],
+    ceiling: Option<&[String]>,
+) -> Option<String> {
     if caps.iter().any(|c| c == "shell") {
         return None;
     }
-    let mut allow: Vec<String> = caps.to_vec();
-    allow.push("shell".to_string());
-    Some(format!(
-        "shell was not granted; to allow a terminal later, re-add it with shell in its ceiling:  tunlion add {name} --allow {}",
-        allow.join(",")
-    ))
+    match grant_vs_ceiling(ceiling, "shell", false) {
+        GrantVsCeiling::AlreadyCovered => None,
+        GrantVsCeiling::Proceed => Some(format!(
+            "shell was not granted; to allow a terminal later:  tunlion grant {name} shell"
+        )),
+        GrantVsCeiling::OutsideCeiling => {
+            let mut allow: Vec<String> = ceiling.unwrap_or(caps).to_vec();
+            allow.push("shell".to_string());
+            let allow = allow.join(",");
+            Some(format!(
+                "shell was not granted, and a grant cannot widen this device's ceiling; to allow a terminal later, re-add it with shell:  tunlion add {name} --allow {allow}"
+            ))
+        }
+    }
 }
 
 /// `internal` means: issue the peer an owner-signed certificate and admit it to
@@ -611,7 +658,10 @@ pub(crate) async fn pair_cmd(
                                         "enrol: could not record the certificate: {e}"
                                     ));
                                 }
-                                if let Some(hint) = shell_not_granted_hint(&n, caps) {
+                                let ceiling = crate::principal_ceiling_for(&n);
+                                if let Some(hint) =
+                                    shell_not_granted_hint(&n, caps, ceiling.as_deref())
+                                {
                                     ui::say(&ui::paint(ui::Tone::Dim, &format!("  {hint}")));
                                 }
                             }
@@ -1352,23 +1402,46 @@ mod promise_tests {
         assert_eq!(code_enrolment_ttl(None, false).unwrap(), None);
     }
 
-    // The printed remedy must be a command that parses, and must keep the
-    // device's existing ceiling while adding shell.
+    // The printed remedy must be a command that parses AND one `grant` would
+    // carry out for that device: a plain grant for a device no ceiling binds,
+    // a re-add (keeping the ceiling, adding shell) only where the ceiling
+    // truly excludes shell.
     #[test]
-    fn the_suggested_shell_command_parses() {
+    fn the_suggested_shell_command_parses_and_grant_accepts_it() {
         use clap::Parser;
-        let hint = shell_not_granted_hint("laptop", &default_device_ceiling())
-            .expect("no shell granted: a hint is printed");
-        let start = hint.find("tunlion add").expect("the hint names a command");
-        let cmd = hint[start..].trim();
-        let argv: Vec<&str> = cmd.split_whitespace().collect();
-        assert!(
-            crate::Cli::try_parse_from(&argv).is_ok(),
-            "suggested command does not parse: {cmd}"
+        let parse = |hint: &str, verb: &str| -> Vec<String> {
+            let start = hint.find(verb).expect("the hint names a command");
+            let cmd = hint[start..].trim();
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            assert!(
+                crate::Cli::try_parse_from(&argv).is_ok(),
+                "suggested command does not parse: {cmd}"
+            );
+            argv
+        };
+        let caps = default_device_ceiling();
+
+        // An owner's own device: no ceiling binds it, so `grant` proceeds and
+        // the hint says exactly that command.
+        let hint = shell_not_granted_hint("p5-b", &caps, None).expect("a hint is printed");
+        let argv = parse(&hint, "tunlion grant");
+        assert_eq!(argv, ["tunlion", "grant", "p5-b", "shell"]);
+        assert_eq!(grant_vs_ceiling(None, "shell", false), GrantVsCeiling::Proceed);
+
+        // A delegated device whose ceiling excludes shell: `grant` refuses,
+        // so the hint is the re-add, and it keeps the ceiling it had.
+        let hint = shell_not_granted_hint("laptop", &caps, Some(caps.as_slice())).expect("a hint");
+        assert!(!hint.contains("tunlion grant"), "{hint}");
+        let argv = parse(&hint, "tunlion add");
+        assert_eq!(argv.last().map(String::as_str), Some("transfer,mount,shell"));
+        assert_eq!(
+            grant_vs_ceiling(Some(caps.as_slice()), "shell", false),
+            GrantVsCeiling::OutsideCeiling
         );
-        assert!(cmd.ends_with("--allow transfer,mount,shell"), "{cmd}");
-        // Shell already granted: nothing to suggest.
+
+        // Shell already there, by the enrolment or by the ceiling: no hint.
         let with_shell = vec!["transfer".to_string(), "shell".to_string()];
-        assert!(shell_not_granted_hint("laptop", &with_shell).is_none());
+        assert!(shell_not_granted_hint("laptop", &with_shell, None).is_none());
+        assert!(shell_not_granted_hint("laptop", &caps, Some(with_shell.as_slice())).is_none());
     }
 }
