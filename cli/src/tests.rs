@@ -4246,6 +4246,163 @@ fn fleet_merge_refuses_a_grant_beaten_by_a_local_tombstone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- A grant ADDS a permission; a revoke takes only the one it names ----------
+
+/// `has_explicit_grant` for any action, as the authoritative fleet gate
+/// computes it (no owner shortcut).
+fn explicit_cap(dir: &std::path::Path, c: &identity::DeviceCert, action: &str) -> bool {
+    crate::capability::cap_fleet_inputs(
+        dir,
+        "self",
+        action,
+        Some(&c.device_pub),
+        Some(&c.user_pub),
+        None,
+    )
+    .1
+}
+
+/// The op `tunlion grant <device> <cap>` signs: next version, device scope.
+fn device_grant_op(
+    store: &[serde_json::Value],
+    uk: &identity::UserKey,
+    c: &identity::DeviceCert,
+    cap: &str,
+) -> crate::capability::CapOp {
+    crate::device_caps::sign_next_cap_op(
+        store,
+        uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::Device.target(c),
+        "self",
+        vec![cap.to_string()],
+        crate::capability::now_secs() + 3600,
+    )
+}
+
+#[test]
+fn grant_shell_then_mount_leaves_both_and_revoke_takes_one() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, _desktop) = fleet_pair_fixture("grant-adds");
+    let mut store = crate::capability::load_cap_store(&dir);
+    crate::device_caps::ensure_self_header(&mut store, &uk).unwrap();
+    crate::capability::save_and_list_revoked(&store, &dir).unwrap();
+
+    let shell = device_grant_op(&crate::capability::load_cap_store(&dir), &uk, &laptop, "shell");
+    let mut shell_json = shell.to_json();
+    shell_json["type"] = json!("cap_grant");
+    apply_and_save(&dir, &[shell]);
+    let mount = device_grant_op(&crate::capability::load_cap_store(&dir), &uk, &laptop, "mount");
+    apply_and_save(&dir, &[mount]);
+    assert!(explicit_cap(&dir, &laptop, "shell"), "granting mount must not take shell");
+    assert!(explicit_cap(&dir, &laptop, "mount"));
+
+    // `revoke laptop shell` takes shell and only shell.
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, _) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    apply_and_save(&dir, &ops);
+    assert!(!explicit_cap(&dir, &laptop, "shell"), "shell is revoked");
+    assert!(explicit_cap(&dir, &laptop, "mount"), "revoking shell leaves mount");
+    assert!(crate::capability::devices_with_shell_revoked(&dir).contains(&"laptop".to_string()));
+
+    // Replaying the old shell grant is refused by both ingest paths.
+    let mut store = crate::capability::load_cap_store(&dir);
+    let hdr = store
+        .iter()
+        .find(|e| e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self"))
+        .and_then(crate::capability::CapHeader::from_json)
+        .unwrap();
+    let old = crate::capability::CapOp::from_json(&shell_json).unwrap();
+    assert!(
+        crate::capability::apply_cap_op(&mut store, &hdr, &old, crate::capability::now_secs())
+            .is_err()
+    );
+    assert_eq!(crate::merge_owner_cap_ops(&[shell_json]), 0);
+    assert!(!explicit_cap(&dir, &laptop, "shell"));
+
+    // A newer shell grant re-adds it beside mount.
+    let regrant = device_grant_op(&crate::capability::load_cap_store(&dir), &uk, &laptop, "shell");
+    apply_and_save(&dir, &[regrant]);
+    assert!(explicit_cap(&dir, &laptop, "shell"), "a newer grant re-grants");
+    assert!(explicit_cap(&dir, &laptop, "mount"));
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fleet_merge_of_two_devices_grants_keeps_both_permissions() {
+    // Two owner devices grant the same target concurrently, each from the same
+    // snapshot of the store: one shell, one mount. Neither may cost the other.
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, _desktop) = fleet_pair_fixture("merge-two-grants");
+    let mut store = crate::capability::load_cap_store(&dir);
+    crate::device_caps::ensure_self_header(&mut store, &uk).unwrap();
+    crate::capability::save_and_list_revoked(&store, &dir).unwrap();
+    let snapshot = crate::capability::load_cap_store(&dir);
+    let here = device_grant_op(&snapshot, &uk, &laptop, "shell");
+    let there = device_grant_op(&snapshot, &uk, &laptop, "mount");
+    let mut there_json = there.to_json();
+    there_json["type"] = json!("cap_grant");
+
+    apply_and_save(&dir, &[here]);
+    assert_eq!(crate::merge_owner_cap_ops(&[there_json.clone()]), 1);
+    assert!(explicit_cap(&dir, &laptop, "shell"), "the local grant survives the merge");
+    assert!(explicit_cap(&dir, &laptop, "mount"), "the merged grant took effect");
+    // What this device relays carries both.
+    let relayed = crate::owner_signed_cap_ops();
+    for cap in ["shell", "mount"] {
+        assert!(
+            relayed.iter().any(|e| e["permissions"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|c| c.as_str() == Some(cap)))),
+            "{cap} is relayed"
+        );
+    }
+    // Merging the same op again is idempotent.
+    assert_eq!(crate::merge_owner_cap_ops(&[there_json]), 0);
+
+    // A later local revoke of shell still leaves the merged mount.
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, _) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    apply_and_save(&dir, &ops);
+    assert!(!explicit_cap(&dir, &laptop, "shell"));
+    assert!(explicit_cap(&dir, &laptop, "mount"));
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_device_caps_grant_adds_and_revoke_takes_one() {
+    // The shadow-mode store (devices.json `caps`) already unions; pin it.
+    let _guard = lock_test_config();
+    let (dir, _uk, _laptop, _desktop) = fleet_pair_fixture("legacy-grant-adds");
+    let path = dir.join("devices.json");
+    crate::device_caps::device_set_cap("laptop", "shell", true, None).unwrap();
+    crate::device_caps::device_set_cap("laptop", "mount", true, None).unwrap();
+    let caps = crate::device_caps::device_caps_at(&path, "laptop").unwrap();
+    for cap in ["transfer", "shell", "mount"] {
+        assert!(caps.iter().any(|c| c == cap), "{cap} held after both grants: {caps:?}");
+    }
+    crate::device_caps::device_set_cap("laptop", "shell", false, None).unwrap();
+    let caps = crate::device_caps::device_caps_at(&path, "laptop").unwrap();
+    assert!(!caps.iter().any(|c| c == "shell"), "shell revoked: {caps:?}");
+    assert!(caps.iter().any(|c| c == "mount"), "revoking shell leaves mount: {caps:?}");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- Join must not re-key a record that is not provably the owner -------------
 
 #[test]
