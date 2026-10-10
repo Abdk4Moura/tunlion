@@ -671,8 +671,15 @@ impl Invitation {
         b
     }
 
-    /// Parse a TOKEN (fields + seed + sig). Derives the public key from the
-    /// seed and verifies the signature; returns None on any failure.
+    /// Parse a TOKEN (fields + seed + sig) and derive the public key from the
+    /// seed. Returns None on a malformed encoding.
+    ///
+    /// This does NOT verify the signature: parsing cannot, because the owner
+    /// public key it binds to is not in the token (only its fingerprint is).
+    /// The owner side checks the presented payload with `verify_against_owner`
+    /// before honouring any field; the joining side holds no owner key and
+    /// binds the owner through the join acknowledgement's certificates, which
+    /// must match the token's issuer fingerprint.
     pub fn from_token(raw: &[u8]) -> Option<Self> {
         let fixed = inv_field_fixed_len();
         if raw.len() < fixed + 32 + 64 {
@@ -713,7 +720,11 @@ impl Invitation {
     }
 
     /// Parse a PAYLOAD (fields + pub + sig). The verifier learns only the
-    /// public key; no seed is present. Verifies the signature.
+    /// public key; no seed is present. Returns None on a malformed encoding.
+    ///
+    /// Like `from_token`, this does NOT verify the signature; the owner key is
+    /// not in the payload. Callers must run `verify_against_owner` before
+    /// trusting any field.
     pub fn from_payload(raw: &[u8]) -> Option<Self> {
         let fixed = inv_field_fixed_len();
         if raw.len() < fixed + 32 + 64 {

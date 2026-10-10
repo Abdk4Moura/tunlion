@@ -313,6 +313,94 @@ pub(crate) fn insert_new_peer_record(
     Ok(stored)
 }
 
+/// Pure core of `devices_store_joined_owner`: record the fleet owner a join
+/// acknowledgement certified, without re-keying anything that is not provably
+/// that owner.
+///
+/// Join used to write under the invitation's owner name with `allow_reanchor`,
+/// guarded only by `name_pinned_by_other`, which sees records that carry a
+/// certificate. A secret-only or vouched record that happened to share the
+/// owner's name had no certificate to compare, so the join rewrote its secret
+/// and attached the owner's certificate in place: the record kept its `caps`,
+/// `deniedCaps` and every name-keyed grant, and the owner's identity inherited
+/// them. `allow_reanchor` also skipped `refuse_unowned_rewrite`, so nothing else
+/// stopped it.
+///
+/// Only a record already pinned to the owner's DEVICE key is the same device,
+/// and only that one is updated in place (a re-join). A record pinned to a
+/// different key under the owner's name is refused, as before. Everything else,
+/// certless records included, is someone else's: the owner lands in a NEW
+/// record under a free (suffixed) name and the existing one is untouched.
+/// `joined_owner_record` finds the owner by certificate, never by name, so the
+/// suffix changes nothing downstream.
+pub(crate) fn place_joined_owner(
+    arr: &mut Vec<Value>,
+    owner_name: &str,
+    secret: &str,
+    owner_cert: &identity::DeviceCert,
+    caps: &[String],
+    scope: u8,
+) -> Result<String> {
+    let incoming = hex::encode(owner_cert.device_pub);
+    let pinned_to = |d: &Value| d["deviceCert"]["devicePub"].as_str().map(str::to_string);
+    if let Some(same) = arr
+        .iter()
+        .find(|d| pinned_to(d).as_deref() == Some(incoming.as_str()))
+        .and_then(|d| d["name"].as_str().map(str::to_string))
+    {
+        return Ok(upsert_peer_record(
+            arr,
+            &same,
+            Some(secret),
+            Some(owner_cert),
+            Some(caps),
+            Some(scope),
+            None,
+            None,
+        ));
+    }
+    if arr
+        .iter()
+        .any(|d| d["name"].as_str() == Some(owner_name) && pinned_to(d).is_some())
+    {
+        anyhow::bail!(
+            "already have a different fleet owner recorded as '{owner_name}': forget it first, then join"
+        );
+    }
+    if arr.iter().any(|d| d["secret"].as_str() == Some(secret)) {
+        anyhow::bail!("refusing to store a pair secret another device record already holds");
+    }
+    let free = free_device_name(arr, owner_name);
+    Ok(upsert_peer_record(
+        arr,
+        &free,
+        Some(secret),
+        Some(owner_cert),
+        Some(caps),
+        Some(scope),
+        None,
+        None,
+    ))
+}
+
+/// Record the fleet owner after a join. See `place_joined_owner`. Same lock
+/// cycle as every other store write, so the decision and the write cannot be
+/// separated by a concurrent writer.
+pub(crate) fn devices_store_joined_owner(
+    owner_name: &str,
+    secret: &str,
+    owner_cert: &identity::DeviceCert,
+    caps: &[String],
+    scope: u8,
+) -> Result<String> {
+    let clean = sanitize_device_name(owner_name);
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).context("create config dir")?;
+    }
+    with_devices_mut(|arr| place_joined_owner(arr, &clean, secret, owner_cert, caps, scope))
+}
+
 /// Store a pair secret handed to us over the NETWORK (`pair-keep`,
 /// `pair-intro`) as a NEW record and return the name it landed under. Never
 /// re-keys an existing record, whatever name the peer asked for: a peer that

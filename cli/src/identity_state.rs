@@ -120,9 +120,14 @@ pub(crate) fn owner_signed_cap_ops() -> Vec<Value> {
     store
         .into_iter()
         .filter(|e| {
-            crate::capability::CapOp::from_json(e)
-                .map(|op| op.grantor == owner)
-                .unwrap_or(false)
+            // A revoke tombstone parses as an op too, but it is a LOCAL version
+            // record, not policy to hand out: a receiver merges by appending,
+            // so a relayed tombstone would sit beside the grant it should have
+            // beaten and change nothing.
+            e.get("type").and_then(|v| v.as_str()) != Some(crate::capability::CAP_TOMBSTONE_TYPE)
+                && crate::capability::CapOp::from_json(e)
+                    .map(|op| op.grantor == owner)
+                    .unwrap_or(false)
         })
         .collect()
 }
@@ -147,6 +152,13 @@ pub(crate) fn merge_owner_cap_ops(ops: &[Value]) -> usize {
             continue;
         };
         if op.grantor != owner || op.verify(&owner, now).is_err() {
+            continue;
+        }
+        // An op at or below a local revoke tombstone is a replay of something
+        // this device already saw revoked. Owner-signed is not enough: the
+        // signature on the old grant is still valid, which is exactly why the
+        // tombstone keeps the version it beat.
+        if crate::capability::superseded_by_tombstone(&store, &op) {
             continue;
         }
         let dup = store.iter().any(|e| e == v);
