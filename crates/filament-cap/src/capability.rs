@@ -4004,12 +4004,30 @@ mod tests {
             v1,
             86400,
         );
-        let narrow = make_grant(&owner, target, &header.resource, &["ssh"], v2, 86400);
+        // A grant ADDS (it no longer replaces the list), so the op that narrows
+        // ["admin","ssh"] to ["ssh"] is a revoke of "admin".
+        let narrow = make_revoke_of(&owner, target, &header.resource, &["admin"], v2);
 
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         let principals = vec![("bob".to_string(), [0xcc; 32], [0xaa; 32])];
+
+        // A grant of ["ssh"] alone is not a narrowing any more: admin is kept,
+        // so the check rightly has nothing to warn about.
+        let regrant_ssh = make_grant(&owner, target, &header.resource, &["ssh"], v2, 86400);
+        let mut after_regrant = store.clone();
+        apply_cap_op(&mut after_regrant, &header, &regrant_ssh, now_secs()).unwrap();
+        assert!(allows_at(&after_regrant, &header, "admin", now_secs()));
+        assert!(check_self_lockout(
+            &store,
+            &header,
+            &regrant_ssh,
+            &principals,
+            &["admin", "ssh", "shell"],
+            now_secs(),
+        )
+        .is_empty());
 
         // Narrowing from ["admin","ssh"] to ["ssh"] loses "admin"
         let warnings = check_self_lockout(
