@@ -70,7 +70,9 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("ctl.rs", 6),
         ("tun/mod.rs", 6),
         ("sdnotify.rs", 5),
-        ("l3.rs", 4),
+        // 4 -> 2: hostname() asks platform::os_hostname instead of carrying
+        // its own unix/windows split.
+        ("l3.rs", 2),
         ("ping.rs", 3),
         ("mount.rs", 2),
         ("mount_fuse.rs", 2),

@@ -32,7 +32,6 @@ use crate::ui;
 use crate::up_log;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Bare-command tour: what tunlion is, the current state, and the two or three
@@ -258,27 +257,34 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
             let reply = crate::ctl::try_approve_request(id, &allow, expires).await;
             match reply {
                 Some(v) => {
-                    if let Some(peer) = v.get("peer").and_then(|v| v.as_str()) {
-                        if let Some(cap) = v.get("capability").and_then(|v| v.as_str()) {
-                            if let Some(granted_expires) = v.get("expires").and_then(|v| v.as_u64())
-                            {
-                                let expiry = format_approval_expiry(granted_expires);
-                                ui::say(&fleet_ui::requests::render_approve_success(
-                                    peer, cap, &expiry,
-                                ));
-                            } else {
-                                ui::say(&format!(
-                                    "  {} approval succeeded but the grant expiry was missing",
-                                    ui::paint(ui::Tone::Err, ui::glyph_err()),
-                                ));
-                            }
+                    let peer = v.get("peer").and_then(|v| v.as_str());
+                    let cap = v.get("capability").and_then(|v| v.as_str());
+                    let granted = v.get("expires").and_then(|v| v.as_u64());
+                    match (peer, cap, granted) {
+                        (Some(peer), Some(cap), Some(granted_expires)) => {
+                            let expiry = format_approval_expiry(granted_expires);
+                            ui::say(&fleet_ui::requests::render_approve_success(
+                                peer, cap, &expiry,
+                            ));
+                        }
+                        // The daemon said ok but the reply does not say what
+                        // was granted to whom, or until when. Printing nothing
+                        // and exiting 0 read as success with no evidence.
+                        _ => {
+                            return Err(anyhow!(
+                                "the daemon accepted request {id} but its reply is missing {}; \
+                                 check `tunlion devices --caps` for what was granted",
+                                [("peer", peer.is_none()), ("capability", cap.is_none()), ("expiry", granted.is_none())]
+                                    .iter()
+                                    .filter(|(_, missing)| *missing)
+                                    .map(|(f, _)| *f)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
                         }
                     }
                 }
-                None => ui::say(&format!(
-                    "  {} request {id} not found or daemon not running",
-                    ui::paint(ui::Tone::Warn, "x")
-                )),
+                None => return Err(request_reply_missing(id, "approve")),
             }
         }
         Some(RequestsAction::Deny { id }) => {
@@ -295,14 +301,25 @@ pub(crate) async fn requests_cmd(action: Option<RequestsAction>) -> Result<()> {
                         ));
                     }
                 }
-                None => ui::say(&format!(
-                    "  {} request {id} not found or daemon not running",
-                    ui::paint(ui::Tone::Warn, "x")
-                )),
+                None => return Err(request_reply_missing(id, "deny")),
             }
         }
     }
     Ok(())
+}
+
+/// Why an approve/deny got no ok reply, as an error (nonzero exit). The two
+/// causes are told apart, because one is fixed by `tunlion up` and the other
+/// by picking an id from `tunlion requests`.
+fn request_reply_missing(id: u64, verb: &str) -> anyhow::Error {
+    match daemon_alive() {
+        None => anyhow!(
+            "could not {verb} request {id}: the daemon is not running (pending requests live in the daemon; start it with `tunlion up`)"
+        ),
+        Some(pid) => anyhow!(
+            "could not {verb} request {id}: the daemon (pid {pid}) has no pending request with that id, or refused it; `tunlion requests` lists the pending ones"
+        ),
+    }
 }
 
 /// The owner-signed artifact that makes a peer a member of this mesh.
@@ -357,15 +374,15 @@ pub(crate) fn mesh_enrolment(
 /// detach itself is one portable operation in `platform::spawn_detached`, whose
 /// two arms ship together (#215 was the half-written version: the Windows arm
 /// computed the log path and threw it away).
-pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> {
+///
+/// `daemon_argv` is the whole `up` argv from `up_logs::DaemonOpts`, so the
+/// detached daemon gets every flag this `up --detach` was given (it used to get
+/// `--server` and `--dir` only, and silently lost `--shell`, `--relay`,
+/// `--userspace` and the rest).
+pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log_path = crate::platform::Paths::config_path("daemon.log");
-    let dir_arg: Option<String> = dir.as_deref().and_then(|d| d.to_str()).map(str::to_string);
-    let mut args: Vec<&str> = vec!["up", "--server", server];
-    if let Some(d) = dir_arg.as_deref() {
-        args.push("--dir");
-        args.push(d);
-    }
+    let args: Vec<&str> = daemon_argv.iter().map(String::as_str).collect();
     let child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
     // Let the child write its pidfile before we return; poll briefly.
     let mut came_up = false;

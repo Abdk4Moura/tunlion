@@ -727,7 +727,11 @@ pub(crate) fn default_display_name() -> String {
 
 
 pub(crate) fn human(bytes: u64) -> String {
-    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    // Byte counts and rates for all transfer output, in binary units: the
+    // divisor is 1024, so the labels are the IEC ones. They used to say
+    // KB/MB/GB over the same divisor, which reads as decimal and understated
+    // every size and rate (by about 7% at the GB scale).
     let mut v = bytes as f64;
     let mut i = 0;
     while v >= 1024.0 && i < U.len() - 1 {

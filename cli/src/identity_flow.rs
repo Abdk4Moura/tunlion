@@ -420,18 +420,22 @@ pub(crate) async fn init_experience(
         false
     };
     if start_background {
+        // No daemon flags are forwarded: the inbox was just written to the
+        // config (`dir` above), which the service reads on every start, so a
+        // later `tunlion set drop-dir` still applies to it.
         up_cmd(
             server,
-            true,
-            false,
-            false,
+            crate::up_logs::UpMode {
+                install: true,
+                ..Default::default()
+            },
+            &crate::up_logs::DaemonOpts::default(),
             Some(inbox.clone()),
             relay,
             false,
             None,
             None,
             None,
-            false,
             false,
             false,
         )
