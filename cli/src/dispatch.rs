@@ -142,6 +142,33 @@ pub(crate) fn grant_operands(
     }
 }
 
+/// Check a grant spec before anything else looks at it, so every device gives
+/// the same answer. `grant hostA port:8000` used to tell a joined device to
+/// "run this on the owner's machine: tunlion grant hostA port:8000", while the
+/// owner answered "unknown capability 'port'": the advice suggested a command
+/// that cannot work. The spec is now checked first, on every device, and
+/// `port[:N]` names the narrow path that does work (`expose`).
+///
+/// The owner key only names a route's resource id; validity does not depend on
+/// it, so a placeholder key checks the spec on a device that holds none.
+pub(crate) fn validate_grant_spec(spec: &str) -> Result<()> {
+    let (name, rest) = match spec.split_once(':') {
+        Some((n, r)) => (n, Some(r.trim())),
+        None => (spec, None),
+    };
+    if matches!(name.trim().to_ascii_lowercase().as_str(), "port" | "ports") {
+        let cmd = match rest.filter(|p| p.parse::<u16>().is_ok()) {
+            Some(p) => format!("tunlion expose {p}"),
+            None => "tunlion expose <port>".to_string(),
+        };
+        bail!(
+            "'{spec}' is not a capability (valid: {}). To let your devices reach a port on this machine, expose it:\n  {cmd}",
+            crate::capability::CANONICAL_CAPABILITIES.join(", ")
+        );
+    }
+    crate::capability::parse_grant_spec(spec, &[0u8; 32]).map(|_| ())
+}
+
 pub(crate) async fn async_main() -> Result<()> {
     // Pick ring explicitly before anything touches TLS. Kept UNCONDITIONAL on
     // purpose: skipping it for local-only commands was tried and measured at
@@ -1553,6 +1580,9 @@ pub(crate) async fn async_main() -> Result<()> {
             tag,
         } => {
             let (device, capability) = grant_operands(device, capability, tag.as_deref())?;
+            // Valid on every device or on none: checked before the owner/joined
+            // split, so no advice below can name a spec that would be refused.
+            validate_grant_spec(&capability)?;
             // The owner key resolves the RESOURCE, so it is needed before the
             // capability name is final: `route:10.0.0.0/24` names an owner-bound
             // resource, while `shell` names "self".
