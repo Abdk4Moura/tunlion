@@ -938,6 +938,86 @@ else
   tail -n 3 "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-j.err" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
 fi
 
+# ---------------------------------------------------------------- gate T3 ---
+say "T3: receive -o - into a slow pipe streams in order, verified (no seek on a pipe)"
+# Every `receive <code> -o - | reader` failed "Invalid seek (os error 29)": the
+# stdout writer used positional writes, which a pipe refuses. The reader here
+# is deliberately slow so the pipe fills and writes block.
+D="$WORK/gT3"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$CODE_WORD" --server "$SERVER" >"$WORK/gT3-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/gT3-send.log") || { bad "stdout-pipe (no code minted)"; tail -n 3 "$WORK/gT3-send.log"; }
+if [ -n "${W:-}" ]; then
+  { timeout 120 "$BIN" receive "$W" -y -o - --server "$SERVER" 2>"$WORK/gT3-recv.log"; echo $? >"$WORK/gT3-recv.rc"; } \
+    | python3 -c '
+import sys, time
+out = open(sys.argv[1], "wb")
+while True:
+    b = sys.stdin.buffer.read(65536)
+    if not b:
+        break
+    out.write(b)
+    time.sleep(0.05)
+' "$D/out.bin"
+  RCR=$(cat "$WORK/gT3-recv.rc" 2>/dev/null || echo missing)
+  wait_for_exit $SP 60; RCS=$?
+  if [ "$RCR" = 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/out.bin")" = "$H_SMALL" ] \
+     && ! grep -qi "invalid seek\|could not save" "$WORK/gT3-recv.log" "$WORK/gT3-send.log"; then
+    ok "stdout-pipe: -o - into a slow pipe is byte-exact, and the sender got a verified ack (exit 0 both)"
+  else
+    bad "stdout-pipe"
+    echo "  receiver rc=$RCR sender rc=$RCS"
+    tail -n 4 "$WORK/gT3-recv.log" "$WORK/gT3-send.log"
+  fi
+fi
+
+# ---------------------------------------------------------------- gate T4 ---
+say "T4: one-shot receiver whose sender is SIGKILLed mid-transfer gives up honestly and in bounded time"
+# Was: ~96 s, then "lost the sender after 5 attempts; the partial is kept,
+# re-run `tunlion receive <code>` to resume" (exit 1) for a code that had
+# already burned, plus five "polite-role: legacy path" debug lines at the
+# default verbosity. Now: the rejoin bound (25 s), exit 6 where the exit-code
+# taxonomy exists, a message naming what was kept and the resume that works.
+D="$WORK/gT4"; mkdir -p "$D"
+FILAMENT_TEST_TRANSFER_STALL_MS=10 \
+  "$BIN" send "$BIG" --word "$CODE_WORD" --server "$SERVER" >"$WORK/gT4-send.log" 2>&1 &
+SP=$!; pids+=($SP)
+W=$(wait_code "$WORK/gT4-send.log") || { bad "sender-killed (no code minted)"; tail -n 3 "$WORK/gT4-send.log"; }
+if [ -n "${W:-}" ]; then
+  "$BIN" receive "$W" -y --dir "$D" --server "$SERVER" >"$WORK/gT4-recv.log" 2>&1 &
+  R=$!; pids+=($R)
+  for _ in $(seq 1 120); do
+    sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+    [ "$sz" -gt $((4 * 1024 * 1024)) ] && break
+    sleep 0.5
+  done
+  GT4SZ=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  # The sender runs without a timeout wrapper, so SIGKILL reaches it.
+  kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
+  T0=$(date +%s)
+  wait_for_exit $R 120; RCR=$?
+  T1=$(date +%s)
+  WANT_RC=nonzero
+  "$BIN" --help 2>&1 | grep -q "EXIT CODES" && WANT_RC=6
+  if [ "$GT4SZ" -eq 0 ]; then
+    bad "sender-killed: nothing was received before the kill, so nothing was mid-transfer"
+  elif [ $RCR -eq 124 ] || [ $RCR -eq 0 ]; then
+    bad "sender-killed: receiver exit $RCR (124 = still running after 120s)"; tail -n 4 "$WORK/gT4-recv.log"
+  elif [ "$WANT_RC" = 6 ] && [ $RCR -ne 6 ]; then
+    bad "sender-killed: receiver exited $RCR, not 6 (the sender is unreachable)"; tail -n 4 "$WORK/gT4-recv.log"
+  elif [ $((T1 - T0)) -gt 60 ]; then
+    bad "sender-killed: receiver took $((T1 - T0))s to give up (bound 60s)"; tail -n 4 "$WORK/gT4-recv.log"
+  elif ! grep -q "unreachable" "$WORK/gT4-recv.log" || ! grep -q "big.bin.part (" "$WORK/gT4-recv.log" \
+       || ! grep -q "new code" "$WORK/gT4-recv.log" || grep -q "receive <code>\` to resume" "$WORK/gT4-recv.log" \
+       || [ ! -s "$D/big.bin.part" ]; then
+    bad "sender-killed: the message is not the true one, or the partial it names is not there"; tail -n 4 "$WORK/gT4-recv.log"
+  elif grep -q "polite-role" "$WORK/gT4-recv.log"; then
+    bad "sender-killed: debug lines at the default verbosity"; grep -m2 "polite-role" "$WORK/gT4-recv.log"
+  else
+    ok "sender-killed: receiver gave up in $((T1 - T0))s, exit $RCR, named the kept partial and the resume that works"
+  fi
+fi
+
 # --------------------------------------------------------- L2 tunnel gates ---
 # ssh / TCP over the data channel (docs/L2-tunnel-design.md). These run their
 # OWN fixture backend on port 8097 (NOT this suite's 8077) and are OPT-IN:

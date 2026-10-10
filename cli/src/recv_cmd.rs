@@ -840,6 +840,11 @@ pub(crate) async fn recv_cmd(
     let mut sio = net::connect_signaling(server, tx.clone()).await?;
 
     let mut paired = code.is_some();
+    // For the give-up message: a code works once, so "re-run with the code"
+    // can never resume anything, and only the partials THIS receive started
+    // are ours to report (or to clean up when they hold nothing).
+    let code_claimed = code.is_some();
+    let mut session_parts: Vec<crate::transfer_truth::SessionPart> = Vec::new();
     // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
@@ -1651,6 +1656,28 @@ pub(crate) async fn recv_cmd(
         // unless FILAMENT_TEST_WEDGE_LOOP is set (test-hooks builds only).
         if test_hooks::wedge_loop_on_shutdown() && !conn.links.is_empty() {
             std::future::pending::<()>().await;
+        }
+        // A one-shot receive whose sender left and did not come back ends here,
+        // saying what is actually on disk and how it can actually continue.
+        // The shared rejoin expiry in `next_ev` said "partial state kept for
+        // resume" whether or not anything was kept, and "re-run `receive
+        // <code>`" for a code that already burned.
+        if !daemon {
+            if let Some(since) = conn.rejoin.waiting_rejoin {
+                if since.elapsed() > conn.rejoin.rejoin_window {
+                    ui::clear_sticky();
+                    let why = format!(
+                        "the sender is unreachable: it disconnected and did not come back within {}s",
+                        conn.rejoin.rejoin_window.as_secs()
+                    );
+                    bail!(crate::transfer_truth::sender_gone_message(
+                        &why,
+                        &crate::transfer_truth::kept_partials(&session_parts),
+                        &dir,
+                        code_claimed,
+                    ));
+                }
+            }
         }
         let ev = tokio::select! {
             biased;
@@ -6399,6 +6426,15 @@ pub(crate) async fn recv_cmd(
                         }
                         #[cfg(unix)]
                         {
+                            let out = out.into_std().await;
+                            // A pipe cannot seek, so stdout gets an in-order
+                            // writer (StdoutSink) instead of positional writes,
+                            // which failed every `-o - | reader` with ESPIPE. It
+                            // hashes what it writes, so the stream is verified
+                            // against the offered digest and acked like a file.
+                            let sink = Arc::new(std::sync::Mutex::new(
+                                crate::recv_files::StdoutSink::new(out.try_clone()?),
+                            ));
                             st.by_sid.insert(
                                 (pid.clone(), sid),
                                 IncomingFile {
@@ -6407,20 +6443,25 @@ pub(crate) async fn recv_cmd(
                                     size,
                                     received: Arc::new(AtomicU64::new(0)),
                                     ranges: Arc::new(std::sync::Mutex::new(vec![])),
-                                    file: Arc::new(out.into_std().await),
+                                    file: Arc::new(out),
                                     part_path: PathBuf::new(),
-                                    // Pipe mode streams to a fd we can't re-read, so we
-                                    // can't recompute the digest, no verify, no ack
-                                    // (the sender's bounded fallback covers it).
-                                    full: None,
+                                    full: offer_full.clone(),
                                     inflight: Arc::new(AtomicI64::new(0)),
                                     end_seen: Arc::new(AtomicBool::new(false)),
                                     ack_sid: 0,
                                     last_tick: 0,
                                     bar: ui::Progress::new("(stdout)", size),
+                                    stdout: Some(sink),
                                 },
                             );
-                            t.send_control(&protocol::accept_msg(&id, 0)).await?;
+                            // Ask for ONE in-order stream: split across parallel
+                            // links, the second half would have to be held in
+                            // memory until the first had been written. An older
+                            // sender ignores this and the sink holds a bounded
+                            // amount instead. Stdout cannot resume, so offset 0.
+                            let mut accept = protocol::accept_msg(&id, 0);
+                            accept["sequential"] = json!(true);
+                            t.send_control(&accept).await?;
                             continue;
                         }
                     }
@@ -6479,6 +6520,7 @@ pub(crate) async fn recv_cmd(
                         }
                     };
                     let bar = ui::Progress::new(&name, size);
+                    crate::transfer_truth::note_part(&mut session_parts, &name, &part_path, size);
                     let file = Arc::new(file.into_std().await);
                     let received = Arc::new(AtomicU64::new(offset));
                     let ranges = Arc::new(std::sync::Mutex::new(if offset > 0 {
@@ -6502,6 +6544,7 @@ pub(crate) async fn recv_cmd(
                             ack_sid: 0,
                             last_tick: 0,
                             bar,
+                            stdout: None,
                         },
                     );
                     t.send_control(&protocol::accept_msg(&id, offset)).await?;
@@ -6546,6 +6589,7 @@ pub(crate) async fn recv_cmd(
                     })
                     .await;
                     if to_stdout {
+                        stdout_delivered(&inc, &conn, &pid, sid).await?;
                         st.completed += 1;
                         continue;
                     }
@@ -6702,6 +6746,7 @@ pub(crate) async fn recv_cmd(
                 };
                 if let Some(mut inc) = st.by_sid.remove(&(pid.clone(), sid)) {
                     if to_stdout {
+                        stdout_delivered(&inc, &conn, &pid, ack_sid).await?;
                         st.completed += 1;
                         continue;
                     }
@@ -6880,6 +6925,7 @@ pub(crate) async fn recv_cmd(
                     };
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
+                    let stdout_sink = inc.stdout.clone();
                     let inflight = Arc::clone(&inc.inflight);
                     let end_seen = Arc::clone(&inc.end_seen);
                     let ranges = Arc::clone(&inc.ranges);
@@ -6899,7 +6945,11 @@ pub(crate) async fn recv_cmd(
                         // print that itself, which put terminal output inside the
                         // byte-writing primitive. The primitive returns the fact
                         // now and the decision to report it lives out here.
-                        let wrote = pwrite_at(&file, &data, pos);
+                        // `-o -` writes in order instead: stdout may be a pipe.
+                        let wrote = match &stdout_sink {
+                            Some(sink) => crate::recv_files::stdout_put(sink, pos, &data),
+                            None => pwrite_at(&file, &data, pos),
+                        };
                         if let Err(_e) = &wrote {
                             // Write failed: do NOT record coverage (leaves the gap).
                             // The whole-file digest will fail and trigger a re-fetch.
@@ -7198,10 +7248,14 @@ pub(crate) async fn recv_cmd(
                     )
                     .await?;
                     if st.completed == 0 {
-                        bail!(
-                            "lost the sender after {} attempts; the partial is kept, re-run `tunlion receive <code>` to resume",
-                            MAX_ATTEMPTS
-                        );
+                        bail!(crate::transfer_truth::sender_gone_message(
+                            &format!(
+                                "the sender is unreachable: the connection to it failed {MAX_ATTEMPTS} times"
+                            ),
+                            &crate::transfer_truth::kept_partials(&session_parts),
+                            &dir,
+                            code_claimed,
+                        ));
                     }
                 }
             }
@@ -7218,10 +7272,14 @@ pub(crate) async fn recv_cmd(
                     )
                     .await?;
                     if st.completed == 0 {
-                        bail!(
-                            "lost the sender after {} attempts; the partial is kept, re-run `tunlion receive <code>` to resume",
-                            MAX_ATTEMPTS
-                        );
+                        bail!(crate::transfer_truth::sender_gone_message(
+                            &format!(
+                                "the sender is unreachable: the connection to it failed {MAX_ATTEMPTS} times"
+                            ),
+                            &crate::transfer_truth::kept_partials(&session_parts),
+                            &dir,
+                            code_claimed,
+                        ));
                     }
                 }
             }
@@ -7265,6 +7323,8 @@ pub(crate) async fn recv_cmd(
                     .as_str()
                     .and_then(|p| conn.link(p))
                     .map(|l| l.name.clone());
+                let left_pid = v["id"].as_str().unwrap_or_default().to_string();
+                let left_mid_transfer = st.by_sid.keys().any(|(p, _)| *p == left_pid);
                 if conn.on_peer_left(&v) {
                     let secs = conn.rejoin.rejoin_window.as_secs();
                     if !st.by_sid.is_empty() {
@@ -7315,10 +7375,62 @@ pub(crate) async fn recv_cmd(
                         }
                     }
                 }
+                // The sender of a one-shot receive left mid-transfer and its link
+                // is gone, but it was not the ACTIVE link, so no rejoin window
+                // opened and nothing bounded the wait: the receive then sat
+                // through the whole reconnect ladder against a dead process (a
+                // SIGKILLed sender measured ~96 s) before giving up. Open the
+                // same bounded window the active case gets.
+                if !daemon
+                    && paired
+                    && !keep_open
+                    && left_mid_transfer
+                    && !conn.links.contains_key(&left_pid)
+                    && conn.rejoin.waiting_rejoin.is_none()
+                {
+                    conn.rejoin.rejoin_window = crate::rejoin_unwarned();
+                    conn.rejoin.waiting_rejoin = Some(Instant::now());
+                    ui::say(&ui::paint(
+                        ui::Tone::Dim,
+                        &format!(
+                            "  sender disconnected mid-transfer, waiting up to {}s",
+                            conn.rejoin.rejoin_window.as_secs()
+                        ),
+                    ));
+                    flush_inflight(&mut st.by_sid).await;
+                }
             }
             _ => {}
         }
     }
+}
+
+/// `receive -o -`: the sender said the stream ended. Every byte written in
+/// order and the digest of what was written matching the offered one is a
+/// delivery like a file's, and is acked the same way, so the sender can report
+/// it verified. Anything else ends the receive with the reason: the bytes are
+/// already out and stdout cannot be rewound to re-fetch them.
+async fn stdout_delivered(inc: &IncomingFile, conn: &Conn, pid: &str, sid: u32) -> Result<()> {
+    let Some(sink) = &inc.stdout else {
+        return Ok(());
+    };
+    let (verdict, written) = {
+        let s = sink
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the stdout writer for {} failed", inc.name))?;
+        (s.verdict(inc.size, inc.full.as_deref()), s.written())
+    };
+    if let Err(why) = verdict {
+        bail!("{}: {why}", inc.name);
+    }
+    inc.bar.done(written);
+    if inc.full.is_some() {
+        if let Some(t) = conn.transport_of(pid) {
+            let _ = t.send_control(&protocol::delivery_ack_msg(&inc.id, sid)).await;
+            let _ = t.flush().await;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

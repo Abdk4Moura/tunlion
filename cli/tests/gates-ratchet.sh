@@ -61,6 +61,8 @@ EXPECTED_GREEN=(
   "deferred drop: flowing link survives its peer-left|deferred-drop (#28 trigger)"
   "stepped-away sender: held|stepped-away wait"
   "U1: created once|u1-implicit-init"
+  "stdout-pipe: -o - into a slow pipe|stdout-pipe"
+  "sender-killed: receiver gave up|sender-killed"
 )
 
 # A missing PASS line has three different causes and they want different

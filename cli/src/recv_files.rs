@@ -298,6 +298,137 @@ pub(crate) struct IncomingFile {
     /// re-ticking the same value). Not atomic — only accessed from the event loop.
     pub(crate) last_tick: u64,
     pub(crate) bar: ui::Progress,
+    /// `receive -o -`: the in-order writer to stdout. `None` for a file.
+    pub(crate) stdout: Option<Arc<std::sync::Mutex<StdoutSink<std::fs::File>>>>,
+}
+
+/// How many bytes `-o -` may hold back while it waits for an earlier gap to
+/// arrive. The receiver asks the sender for one in-order stream, so the only
+/// reordering left is between concurrent writer tasks; this bounds what an
+/// older sender that still splits the file across links can make it hold.
+pub(crate) const STDOUT_REORDER_LIMIT: usize = 64 * 1024 * 1024;
+
+/// `receive -o -` into a pipe. A pipe cannot seek, so positional writes (what a
+/// `.part` file gets) fail with ESPIPE: every `-o - | reader` used to end in
+/// "Invalid seek (os error 29)". This writes strictly in order, holding a chunk
+/// that arrives early until the bytes before it have been written, and hashes
+/// what it writes, so the stream can still be verified against the sender's
+/// whole-file digest (and acked) although it can never be re-read.
+pub(crate) struct StdoutSink<W: std::io::Write> {
+    out: W,
+    next: u64,
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
+    pending_bytes: usize,
+    hasher: Sha256,
+}
+
+impl<W: std::io::Write> StdoutSink<W> {
+    pub(crate) fn new(out: W) -> Self {
+        StdoutSink {
+            out,
+            next: 0,
+            pending: Default::default(),
+            pending_bytes: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    /// Bytes written to the output so far (always a contiguous prefix).
+    pub(crate) fn written(&self) -> u64 {
+        self.next
+    }
+
+    /// Hex SHA-256 of everything written so far.
+    pub(crate) fn digest(&self) -> String {
+        self.hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn emit(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.out.write_all(data)?;
+        self.hasher.update(data);
+        self.next += data.len() as u64;
+        Ok(())
+    }
+
+    /// Accept `data` at absolute offset `pos`. Bytes already written are
+    /// skipped (a re-sent range), bytes ahead of a gap are held, and anything
+    /// that closes a gap is written together with what it unblocks.
+    pub(crate) fn put(&mut self, pos: u64, data: &[u8]) -> std::io::Result<()> {
+        let end = pos + data.len() as u64;
+        if end <= self.next {
+            return Ok(()); // all of it is already out
+        }
+        if pos > self.next {
+            if self.pending_bytes + data.len() > STDOUT_REORDER_LIMIT {
+                return Err(std::io::Error::other(format!(
+                    "data arrived {} ahead of the stream written to stdout; more than {} would have to be held",
+                    crate::human(pos - self.next),
+                    crate::human(STDOUT_REORDER_LIMIT as u64)
+                )));
+            }
+            self.pending_bytes += data.len();
+            if let Some(old) = self.pending.insert(pos, data.to_vec()) {
+                self.pending_bytes -= old.len();
+            }
+            return Ok(());
+        }
+        let skip = (self.next - pos) as usize;
+        self.emit(&data[skip..])?;
+        loop {
+            let Some(p) = self.pending.keys().next().copied() else {
+                break;
+            };
+            if p > self.next {
+                break;
+            }
+            let chunk = self.pending.remove(&p).unwrap_or_default();
+            self.pending_bytes -= chunk.len();
+            let end = p + chunk.len() as u64;
+            if end > self.next {
+                let skip = (self.next - p) as usize;
+                self.emit(&chunk[skip..])?;
+            }
+        }
+        self.out.flush()
+    }
+
+    /// The verdict once the sender said the stream ended: every byte out, and
+    /// (when the sender offered one) the digest of what was written matches.
+    pub(crate) fn verdict(&self, size: u64, full: Option<&str>) -> std::result::Result<(), String> {
+        if self.next != size {
+            return Err(format!(
+                "the stream to stdout ended after {} of {}",
+                crate::human(self.next),
+                crate::human(size)
+            ));
+        }
+        match full {
+            Some(want) if want != self.digest() => Err(
+                "the bytes written to stdout do not match the sender's whole-file SHA-256 \
+                 (they cannot be re-fetched: stdout cannot be rewound)"
+                    .to_string(),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// One positional chunk into a `-o -` sink, shaped like `pwrite_at` (the count
+/// is write iterations, always 1 here) so the writer task treats both alike.
+pub(crate) fn stdout_put(
+    sink: &std::sync::Mutex<StdoutSink<std::fs::File>>,
+    pos: u64,
+    data: &[u8],
+) -> std::io::Result<u32> {
+    let mut s = sink
+        .lock()
+        .map_err(|_| std::io::Error::other("stdout writer poisoned"))?;
+    s.put(pos, data).map(|()| 1)
 }
 
 /// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
@@ -474,6 +605,51 @@ pub(crate) async fn finalize_incoming(
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+
+    /// A writer that refuses to seek, like a pipe: `-o -` must never need to.
+    struct Pipe(Vec<u8>);
+    impl std::io::Write for Pipe {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            // Short writes, as a slow pipe gives them.
+            let n = b.len().min(7);
+            self.0.extend_from_slice(&b[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `receive -o - | slow-reader`: chunks arriving out of order, re-sent and
+    /// overlapping still come out as exactly the original bytes, in order, and
+    /// the digest of what was written is the whole-file digest.
+    #[test]
+    fn stdout_sink_writes_in_order_without_seeking() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut s = super::StdoutSink::new(Pipe(Vec::new()));
+        // Second half first, then a duplicate of an early range, then the rest.
+        s.put(5_000, &data[5_000..]).unwrap();
+        assert_eq!(s.written(), 0, "nothing past a gap may be written");
+        s.put(0, &data[..3_000]).unwrap();
+        s.put(1_000, &data[1_000..2_000]).unwrap(); // already out: skipped
+        s.put(2_500, &data[2_500..5_000]).unwrap(); // overlaps what is out
+        assert_eq!(s.written(), 10_000);
+        assert_eq!(s.out.0, data, "byte-exact and in order");
+        assert_eq!(s.digest(), sha256_hex(&data));
+        assert_eq!(s.verdict(10_000, Some(&sha256_hex(&data))), Ok(()));
+        assert!(s.verdict(10_000, Some("00")).unwrap_err().contains("SHA-256"));
+        assert!(s.verdict(20_000, None).unwrap_err().contains("ended after"));
+    }
+
+    /// An early chunk is held only up to the bound, never without limit.
+    #[test]
+    fn stdout_sink_bounds_what_it_holds() {
+        let mut s = super::StdoutSink::new(Pipe(Vec::new()));
+        let big = vec![0u8; super::STDOUT_REORDER_LIMIT];
+        s.put(1, &big).unwrap();
+        let e = s.put(1 + big.len() as u64, &[1u8]).unwrap_err();
+        assert!(e.to_string().contains("ahead of the stream"), "{e}");
+    }
 
     #[test]
     fn full_hash_whole_file_integrity() {

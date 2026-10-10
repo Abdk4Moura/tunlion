@@ -1194,7 +1194,10 @@ pub fn polite_role_legacy(my_uid: &str, peer_uid: Option<&str>, my_id: &str, pee
     }
     ensure_ascii_session_id(my_id)?;
     ensure_ascii_session_id(peer_id)?;
-    eprintln!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
+    // Debug builds only: at the default verbosity this printed one line per
+    // decision into a user's `receive` (five of them before a failure message).
+    let _ = (source, peer_present);
+    dlog!("polite-role: legacy path source={source} peer_present={peer_present} uid_available={} my_id={my_id:?} peer_id={peer_id:?}", peer_uid.is_some());
     Ok(match peer_uid {
         Some(p) if p != my_uid => my_uid > p,
         _ => my_id > peer_id,

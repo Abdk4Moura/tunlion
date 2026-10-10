@@ -1658,7 +1658,12 @@ pub(crate) async fn send_cmd(
                         .map(|l| l.workers.clone())
                         .unwrap_or_default();
                     let mut transports = vec![t];
-                    transports.extend(workers);
+                    // A receiver writing to a stream (`receive -o -`, a pipe)
+                    // asks for one in-order stream; splitting the file across
+                    // parallel links would make it hold the later ranges.
+                    if !crate::transfer_truth::accept_is_sequential(&v) {
+                        transports.extend(workers);
+                    }
                     let offset = v["offset"].as_u64().unwrap_or(0);
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     {
@@ -2082,12 +2087,10 @@ async fn stream_one(
         (o.sid, o.name.clone(), o.size, o.path.clone())
     };
     if offset > 0 {
-        // DEBUG, resilience internal (transfer resuming from a saved offset).
-        ui::debug(&format!(
-            "{name}: resuming at {} ({:.0}%)",
-            human(offset),
-            offset as f64 / size.max(1) as f64 * 100.0
-        ));
+        // Said at the default level: a re-run that picks up a kept partial
+        // used to look exactly like a fresh send, so nobody could tell that
+        // the resume they were told to run had actually resumed.
+        ui::say(&crate::transfer_truth::resume_line(&name, offset, size));
     }
     // #28 deterministic test hook: once we cross this byte offset, synthesize a
     // peer-left for the ACTIVE peer WITHOUT touching the data channel, exactly
