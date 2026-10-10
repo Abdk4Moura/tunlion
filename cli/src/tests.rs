@@ -2928,9 +2928,14 @@ fn printed_hints_name_verbs_that_exist() {
     // protocol", "start tunlion with `tunlion up`", "enable --now tunlion
     // failed", "# Added by tunlion for L3 overlay access". Each was read and
     // is prose about the program, not an instruction.
+    // Third row, from integrating #386..#393 under this whole-tree scan: "the
+    // tunlion server" (#393's network message), "let tunlion create a virtual
+    // network interface" (#393), "the tunlion proxy requires it" (#388),
+    // "use your tunlion keys" (#392). Each was read; each is prose.
     for prose in [
         "daemon", "state", "mounts", "was", "from", "video", "identity",
         "needs", "per", "has", "with", "failed", "for",
+        "server", "create", "proxy", "keys",
     ] {
         valid.insert(prose.into());
     }

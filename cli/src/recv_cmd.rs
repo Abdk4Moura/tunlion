@@ -7126,7 +7126,7 @@ pub(crate) async fn recv_cmd(
                     // device up from the store.
                     ui::say(&ui::paint(
                         ui::Tone::Dim,
-                        "  to pair a device, run `tunlion pair` (or `tunlion pair <code>`) in another terminal",
+                        "  to pair a device, run `tunlion add <device>` in another terminal (the other side runs `tunlion join <code>`)",
                     ));
                 } else if ans == "pair" || ans == "code" {
                     sio.emit("pair-create", json!({})).await.ok();

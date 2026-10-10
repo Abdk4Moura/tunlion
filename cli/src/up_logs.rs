@@ -546,7 +546,15 @@ pub(crate) fn restart_command(up_flags: &[String]) -> String {
             }
         })
         .collect();
-    format!("tunlion down --yes && tunlion up {}", words.join(" "))
+    // Built word by word rather than as `up {}`: the whole command is pinned
+    // by `the_restart_command_parses`, and a `{}` placeholder here reads to the
+    // printed-hint scanner as a positional `up` does not take.
+    let mut cmd = String::from("tunlion down --yes && tunlion up");
+    for w in &words {
+        cmd.push(' ');
+        cmd.push_str(w);
+    }
+    cmd
 }
 
 #[cfg(test)]

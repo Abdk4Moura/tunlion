@@ -254,7 +254,7 @@ pub(crate) fn refuse_unowned_rewrite(
     if let Some(s) = secret {
         if existing["secret"].as_str() != Some(s) {
             anyhow::bail!(
-                "refusing to re-key record '{name}': a new pair secret for an existing device needs an owner re-pair (`tunlion pair`)"
+                "refusing to re-key record '{name}': a new pair secret for an existing device needs an owner re-pair (`tunlion add {name}` on the owner device)"
             );
         }
     }
