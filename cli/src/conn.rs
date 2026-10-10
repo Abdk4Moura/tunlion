@@ -267,6 +267,22 @@ pub(crate) fn label_is_raw_id(label: &str, id: &str, uid: Option<&str>) -> bool 
     label == id
         || uid == Some(label)
         || (label.len() >= 16 && label.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        || looks_like_session_id(label)
+}
+
+/// A signaling session id by its shape: 20 base64url characters mixing upper
+/// case, lower case and digits (`hNZONFIoto2k9bQ9ABGV`). A link can carry one
+/// that is not its own key (the name it was filed under came from an earlier
+/// session), so `label == id` missed it and a person read "ok
+/// hNZONFIoto2k9bQ9ABGV" on the roster line. A device name of exactly that
+/// shape is not a name anyone types. Pure.
+pub(crate) fn looks_like_session_id(label: &str) -> bool {
+    let count = |f: fn(&char) -> bool| label.chars().filter(|c| f(c)).count();
+    label.len() == 20
+        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && count(char::is_ascii_digit) >= 2
+        && count(char::is_ascii_uppercase) >= 3
+        && count(char::is_ascii_lowercase) >= 3
 }
 
 fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
@@ -3903,6 +3919,12 @@ mod raw_label_tests {
         assert!(label_is_raw_id("3f9c0a1be2d4c5f60718293a4b5c6d7e", "sid", None));
         assert!(!label_is_raw_id("alpha", "sid", None));
         assert!(!label_is_raw_id("p5-b", "sid", Some("uid")));
+        // A session id that is not this link's key (the tester's "ok hNZONFIoto2k9bQ9ABGV").
+        assert!(label_is_raw_id("hNZONFIoto2k9bQ9ABGV", "other-sid", None));
+        // Names, including long mixed ones, stay names.
+        assert!(!label_is_raw_id("WorkstationAlpha2", "sid", None));
+        assert!(!label_is_raw_id("my-laptop-2024-home", "sid", None));
+        assert!(!label_is_raw_id("buildbox-ci-runner-1", "sid", None));
         assert!(!label_is_raw_id("cafe", "sid", None)); // short hex is a name
     }
 }
