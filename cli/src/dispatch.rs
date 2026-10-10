@@ -2107,6 +2107,12 @@ pub(crate) async fn async_main() -> Result<()> {
                         "--options, --foreground, and --save-auto belong to the retired sshfs path and are not supported by mesh-native mount"
                     );
                 }
+                // A missing local prerequisite (no FUSE) is a problem with this
+                // machine's setup, not a failure of the mount: exit 2 (usage:
+                // bad input or environment), before anything connects.
+                crate::platform::mount_prerequisite().map_err(|m| {
+                    crate::exit_codes::err(crate::exit_codes::ExitKind::Usage, m)
+                })?;
                 let plan = resolve_mount_plan(&ui_caps, peer, remote, local, read_write)?;
                 require_known_device(&plan.peer)?;
                 let client = l2::mount_cmd(&server, &plan.peer, relay, &plan.remote).await?;

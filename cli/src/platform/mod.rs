@@ -326,6 +326,27 @@ impl filament_id::KeyStore for PlatformKeyStore {
     }
 }
 
+// ------------------------------------------------------- mount prerequisite --
+
+/// Whether this machine can present a local mount at all, checked before any
+/// connection is made. Linux needs the FUSE device: without /dev/fuse (a
+/// container started without `--device /dev/fuse`, or no fuse module) the mount
+/// can only fail, and it used to fail late, as exit 1, after saying "mounted".
+/// Err carries the sentence to show; elsewhere the platform adapter reports
+/// its own prerequisite.
+pub fn mount_prerequisite() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if !Path::new("/dev/fuse").exists() {
+            return Err(
+                "this machine cannot mount: /dev/fuse is missing. Install FUSE (the fuse3 package), or start the container with --device /dev/fuse, then run the mount again"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------- DevicesFileLock --
 
 /// An exclusive advisory lock on the `devices.json.lock` sidecar, held for the
@@ -1147,6 +1168,20 @@ impl ShellHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mount` without FUSE is refused up front, naming the missing piece,
+    /// and only then: a machine that has /dev/fuse is never refused by it.
+    #[test]
+    fn mount_prerequisite_tracks_the_fuse_device() {
+        let has_fuse = !cfg!(target_os = "linux") || Path::new("/dev/fuse").exists();
+        match mount_prerequisite() {
+            Ok(()) => assert!(has_fuse, "no /dev/fuse here, yet the mount was allowed"),
+            Err(m) => {
+                assert!(!has_fuse, "refused although FUSE is present: {m}");
+                assert!(m.contains("/dev/fuse"), "{m}");
+            }
+        }
+    }
 
     #[test]
     fn detect_returns_a_valid_variant() {

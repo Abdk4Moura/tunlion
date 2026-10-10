@@ -193,7 +193,7 @@ test holds to the help text.
 |---|---|---|
 | 0 | | success |
 | 1 | `error` | anything not classified below |
-| 2 | `usage` | bad arguments or flags |
+| 2 | `usage` | bad arguments or flags, or a missing local prerequisite (`mount` with no FUSE) |
 | 3 | `unknown_device` | no such device, or not paired with this one |
 | 4 | `denied` | refused by the peer, a capability or ceiling, or the system |
 | 5 | `still_relayed` | `reach --until-direct`: the link is up but still on a relay |
