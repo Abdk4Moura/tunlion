@@ -12,6 +12,11 @@
 #                              roster, and roster presence never authorises
 #   shell-gates.sh             a shell refusal reaches the initiator as a
 #                              nonzero exit WITH a reason (#219/#223)
+#   config-scope-gates.sh      a second config dir (XDG_CONFIG_HOME) gets no
+#                              copy of the default one's keys and cannot see
+#                              or stop its daemon; HOME unset never writes a
+#                              relative inbox; output into a closed pipe exits
+#                              0 instead of panicking
 #   whoami-candidate-gates.sh  an unchecked /api/whoami answer must not become
 #                              an advertised candidate (#237), observed on the
 #                              wire with tcpdump rather than from a log line
@@ -55,6 +60,7 @@ on:
       - 'cli/tests/roster-gates.sh'
       - 'cli/tests/shell-gates.sh'
       - 'cli/tests/whoami-candidate-gates.sh'
+      - 'cli/tests/config-scope-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -125,6 +131,7 @@ jobs:
             [cli/tests/roster-gates.sh]=8
             [cli/tests/shell-gates.sh]=6
             [cli/tests/whoami-candidate-gates.sh]=8
+            [cli/tests/config-scope-gates.sh]=3
           )
           # MODE MATTERS HERE, and it is not a formality: `[ -x "$g" ]` below
           # fails the gate when the file is not executable, which is how this
@@ -141,7 +148,8 @@ jobs:
                    cli/tests/devices-write-race-gates.sh \
                    cli/tests/roster-gates.sh \
                    cli/tests/shell-gates.sh \
-                   cli/tests/whoami-candidate-gates.sh; do
+                   cli/tests/whoami-candidate-gates.sh \
+                   cli/tests/config-scope-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare
