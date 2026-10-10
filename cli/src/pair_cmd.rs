@@ -98,6 +98,96 @@ pub(crate) fn invitation_not_a_code_msg() -> String {
         .to_string()
 }
 
+/// The default enrolment ceiling for a device added over a spoken code when
+/// `--allow` was not given: the same transfer+mount the invitation path gives a
+/// device. Shell is owner-equivalent and stays a deliberate `--allow ...shell`,
+/// because pairing alone never yields a shell.
+pub(crate) fn default_device_ceiling() -> Vec<String> {
+    vec!["transfer".to_string(), "mount".to_string()]
+}
+
+/// `--expires` for the spoken-code path, parsed and bounded exactly like the
+/// invitation path (`add --out`). `enrols` is false for a pairing that issues
+/// no certificate (a person, or an ordinary pair): there is nothing for the
+/// value to bound, so it is refused rather than silently ignored.
+pub(crate) fn code_enrolment_ttl(expires: Option<&str>, enrols: bool) -> Result<Option<u64>> {
+    let Some(raw) = expires else {
+        return Ok(None);
+    };
+    if !enrols {
+        bail!(
+            "--expires bounds an invitation or an enrolment certificate, and this pairing issues neither. Use `--out <file>` for a bounded invitation, or `--for device` to enrol one of your devices."
+        );
+    }
+    let ttl = crate::file_io::parse_mint_ttl(raw)?;
+    if ttl == 0 || ttl > 30 * 24 * 3600 {
+        bail!("invitations must expire between 1 second and 30 days");
+    }
+    Ok(Some(ttl))
+}
+
+/// What `tunlion grant <device> <capability>` does about a device's enrolment
+/// ceiling. Only a DELEGATED device has one (`principal_ceiling_for` is None
+/// for every other record), and for it a grant can neither widen the ceiling
+/// nor add what it already holds. `grant` decides with this, and the pairing
+/// hint below asks the same question, so the hint cannot name a command that
+/// `grant` would then refuse.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantVsCeiling {
+    /// No ceiling binds this device: proceed.
+    Proceed,
+    /// The ceiling already holds it; a bare grant would add nothing.
+    AlreadyCovered,
+    /// Outside the ceiling (or resource-scoped under one): only a new
+    /// invitation carrying it can add it.
+    OutsideCeiling,
+}
+
+pub(crate) fn grant_vs_ceiling(
+    ceiling: Option<&[String]>,
+    capability: &str,
+    resource_scoped: bool,
+) -> GrantVsCeiling {
+    match ceiling {
+        None => GrantVsCeiling::Proceed,
+        Some(c) if !resource_scoped && c.iter().any(|x| x == capability) => {
+            GrantVsCeiling::AlreadyCovered
+        }
+        Some(_) => GrantVsCeiling::OutsideCeiling,
+    }
+}
+
+/// The one line printed after enrolling a device without shell: how to give it
+/// one, as a command that parses AND that `grant` accepts for this device.
+/// `caps` is what the enrolment recorded; `ceiling` is what binds it
+/// (`principal_ceiling_for`): None for an owner's own device, which takes a
+/// plain `grant` (a first-time-user test was told to re-add a device that
+/// `tunlion grant p5-b shell` served at once). Only a delegated device whose
+/// ceiling excludes shell is sent to a new invitation.
+pub(crate) fn shell_not_granted_hint(
+    name: &str,
+    caps: &[String],
+    ceiling: Option<&[String]>,
+) -> Option<String> {
+    if caps.iter().any(|c| c == "shell") {
+        return None;
+    }
+    match grant_vs_ceiling(ceiling, "shell", false) {
+        GrantVsCeiling::AlreadyCovered => None,
+        GrantVsCeiling::Proceed => Some(format!(
+            "shell was not granted; to allow a terminal later:  tunlion grant {name} shell"
+        )),
+        GrantVsCeiling::OutsideCeiling => {
+            let mut allow: Vec<String> = ceiling.unwrap_or(caps).to_vec();
+            allow.push("shell".to_string());
+            let allow = allow.join(",");
+            Some(format!(
+                "shell was not granted, and a grant cannot widen this device's ceiling; to allow a terminal later, re-add it with shell:  tunlion add {name} --allow {allow}"
+            ))
+        }
+    }
+}
+
 /// `internal` means: issue the peer an owner-signed certificate and admit it to
 /// this mesh. `posture` is the ceiling to grant it, empty meaning the
 /// same-person default. Both are decided by the operator at the moment of
@@ -110,6 +200,10 @@ pub(crate) async fn pair_cmd(
     relay: bool,
     internal: bool,
     posture: Vec<String>,
+    // `--expires`, already parsed and bounded (`code_enrolment_ttl`): the
+    // lifetime of the certificate an `internal` pairing issues. None keeps the
+    // default certificate lifetime.
+    enrol_ttl: Option<u64>,
     // `add <name>` on a terminal: the person has said who, and nothing else is
     // worth asking before the code is on screen. Skips the guided "choose words"
     // entry (Enter there only ever meant "generate them") and puts the file
@@ -564,6 +658,12 @@ pub(crate) async fn pair_cmd(
                                         "enrol: could not record the certificate: {e}"
                                     ));
                                 }
+                                let ceiling = crate::principal_ceiling_for(&n);
+                                if let Some(hint) =
+                                    shell_not_granted_hint(&n, caps, ceiling.as_deref())
+                                {
+                                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {hint}")));
+                                }
                             }
                         } else {
                             // #23: atomic (secret,cert) together in ONE write, not separate writes.
@@ -949,20 +1049,19 @@ pub(crate) async fn pair_cmd(
                                                 });
                                             if let Some(dpub) = dpub {
                                                 // The posture the operator chose. Empty means the
-                                                // same-person convenience; anything given is the
-                                                // ceiling verbatim, so a device added deliberately
-                                                // without shell does not get shell.
+                                                // documented device default (transfer+mount, the
+                                                // same as `add --out`); anything given is the
+                                                // ceiling verbatim. Shell is never implied.
                                                 let caps: Vec<String> = if posture.is_empty() {
-                                                    vec![
-                                                        "transfer".to_string(),
-                                                        "mount".to_string(),
-                                                        "shell".to_string(),
-                                                    ]
+                                                    default_device_ceiling()
                                                 } else {
                                                     posture.clone()
                                                 };
-                                                let expires = identity::now_secs()
-                                                    .saturating_add(identity::CERT_TTL_SECS);
+                                                // `--expires` when given, the default
+                                                // certificate lifetime otherwise.
+                                                let expires = identity::now_secs().saturating_add(
+                                                    enrol_ttl.unwrap_or(identity::CERT_TTL_SECS),
+                                                );
                                                 match mesh_enrolment(
                                                     &owner_key, dpub, &caps, expires, true,
                                                 ) {
@@ -1269,5 +1368,80 @@ pub(crate) async fn pair_cmd(
             Ev::Interrupted => bail!("interrupted"),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod promise_tests {
+    use super::*;
+
+    // `add <device>` over a spoken code: --allow omitted must mean the
+    // documented transfer+mount, never shell ("pairing alone never yields a
+    // shell", `grant` help).
+    #[test]
+    fn code_path_default_ceiling_has_no_shell() {
+        let caps = default_device_ceiling();
+        assert_eq!(caps, vec!["transfer", "mount"]);
+        assert!(!caps.iter().any(|c| c == "shell"));
+    }
+
+    // --expires reaches the enrolment, parsed and bounded like `add --out`.
+    #[test]
+    fn code_path_expires_is_parsed_and_bounded() {
+        assert_eq!(code_enrolment_ttl(None, true).unwrap(), None);
+        assert_eq!(code_enrolment_ttl(Some("2h"), true).unwrap(), Some(7200));
+        assert_eq!(
+            code_enrolment_ttl(Some("30d"), true).unwrap(),
+            Some(30 * 24 * 3600)
+        );
+        assert!(code_enrolment_ttl(Some("31d"), true).is_err());
+        assert!(code_enrolment_ttl(Some("0"), true).is_err());
+        assert!(code_enrolment_ttl(Some("soon"), true).is_err());
+        // A pairing that issues no certificate refuses the flag, not ignores it.
+        assert!(code_enrolment_ttl(Some("2h"), false).is_err());
+        assert_eq!(code_enrolment_ttl(None, false).unwrap(), None);
+    }
+
+    // The printed remedy must be a command that parses AND one `grant` would
+    // carry out for that device: a plain grant for a device no ceiling binds,
+    // a re-add (keeping the ceiling, adding shell) only where the ceiling
+    // truly excludes shell.
+    #[test]
+    fn the_suggested_shell_command_parses_and_grant_accepts_it() {
+        use clap::Parser;
+        let parse = |hint: &str, verb: &str| -> Vec<String> {
+            let start = hint.find(verb).expect("the hint names a command");
+            let cmd = hint[start..].trim();
+            let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+            assert!(
+                crate::Cli::try_parse_from(&argv).is_ok(),
+                "suggested command does not parse: {cmd}"
+            );
+            argv
+        };
+        let caps = default_device_ceiling();
+
+        // An owner's own device: no ceiling binds it, so `grant` proceeds and
+        // the hint says exactly that command.
+        let hint = shell_not_granted_hint("p5-b", &caps, None).expect("a hint is printed");
+        let argv = parse(&hint, "tunlion grant");
+        assert_eq!(argv, ["tunlion", "grant", "p5-b", "shell"]);
+        assert_eq!(grant_vs_ceiling(None, "shell", false), GrantVsCeiling::Proceed);
+
+        // A delegated device whose ceiling excludes shell: `grant` refuses,
+        // so the hint is the re-add, and it keeps the ceiling it had.
+        let hint = shell_not_granted_hint("laptop", &caps, Some(caps.as_slice())).expect("a hint");
+        assert!(!hint.contains("tunlion grant"), "{hint}");
+        let argv = parse(&hint, "tunlion add");
+        assert_eq!(argv.last().map(String::as_str), Some("transfer,mount,shell"));
+        assert_eq!(
+            grant_vs_ceiling(Some(caps.as_slice()), "shell", false),
+            GrantVsCeiling::OutsideCeiling
+        );
+
+        // Shell already there, by the enrolment or by the ceiling: no hint.
+        let with_shell = vec!["transfer".to_string(), "shell".to_string()];
+        assert!(shell_not_granted_hint("laptop", &with_shell, None).is_none());
+        assert!(shell_not_granted_hint("laptop", &caps, Some(with_shell.as_slice())).is_none());
     }
 }

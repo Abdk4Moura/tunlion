@@ -65,6 +65,9 @@
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
+#   FORGET-REVOKES  `devices forget` on a live certificate holder revokes its
+#       KEY (revoked-keys.json) and frees the name; a fresh fleet-hello from
+#       that device is not re-indexed.
 #   I1/I2/I3 IMPOSTOR (F1 acceptance, live): a sibling daemon hellos as the
 #       ceilinged device's exact name, trailing-space name, and control-char
 #       name; each is refused, the victim record is byte-identical, and the
@@ -356,7 +359,63 @@ DM="$WORK/$MALLORY"
 enroll_delegate "$MALLORY" --allow transfer
 start_spoke "$DM" "$MALLORY"
 sleep 6
-"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$MALLORY" >"$WORK/forget.log" 2>&1
+# FORGET-REVOKES: `devices forget` on a device holding a live fleet
+# certificate used to print "it can no longer find or auto-connect to this
+# machine" while fleet-hello let it straight back in. It was then REFUSED,
+# which left the name unusable for the certificate's whole life (the re-link
+# chain after a reset began with a forget that refused). Now the forget records
+# the device KEY as revoked (revoked-keys.json, kept until the certificate
+# expires) before dropping the record. Asserted end to end, on its own
+# enrollee so the impostor fixture below is untouched: the forget succeeds and
+# says it revoked, the record and the name are gone, the key is on the key
+# list, and the forgotten device's daemon, restarted so it hellos again, is
+# NOT re-indexed by fleet auto-mesh (before this change a forgotten live key
+# came straight back as a record).
+FORGOTTEN=forgetme
+DFG="$WORK/$FORGOTTEN"
+enroll_delegate "$FORGOTTEN" --allow transfer
+start_spoke "$DFG" "$FORGOTTEN"
+sleep 4
+FG_PUB=$(python3 -c "import json,sys;print(next((d.get('deviceCert',{}).get('devicePub','') for d in json.load(open('$DA/devices.json')) if d.get('name')=='$FORGOTTEN'),''))" 2>/dev/null)
+say "FORGET-REVOKES: forgetting a live certificate holder revokes its key and frees the name"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$FORGOTTEN" >"$WORK/forget.log" 2>&1
+rcFG=$?
+pkill -f "up --dir $WORK/$FORGOTTEN-drop" 2>/dev/null || true
+sleep 2
+start_spoke "$DFG" "$FORGOTTEN-again"
+sleep 10
+FG_HELLO=0; grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null && FG_HELLO=1
+FG_REINDEXED=$(python3 -c "import json;print(1 if any(d.get('deviceCert',{}).get('devicePub')=='$FG_PUB' or d.get('name')=='$FORGOTTEN' for d in json.load(open('$DA/devices.json'))) else 0)" 2>/dev/null)
+FG_LISTED=$(python3 -c "import json;print(1 if any(e.get('devicePub')=='$FG_PUB' for e in json.load(open('$DA/revoked-keys.json'))) else 0)" 2>/dev/null)
+echo "## forget rc=$rcFG key=${FG_PUB:0:16}... on key list=$FG_LISTED re-indexed after a fresh hello=$FG_REINDEXED (hello attempted=$FG_HELLO)"
+if [ "$rcFG" = "0" ] && [ -n "$FG_PUB" ] \
+   && grep -q "revoked its fleet certificate" "$WORK/forget.log" \
+   && [ "$FG_LISTED" = "1" ] && [ "$FG_REINDEXED" = "0" ] && [ "$FG_HELLO" = "1" ]; then
+  ok "gateFORGET-REVOKES: forget revoked the live key, freed the name, and fleet-hello did not re-admit it"
+else
+  echo "-- forget.log (rc=$rcFG) --"; cat "$WORK/forget.log"
+  echo "-- forgotten device log --"; tail -5 "$WORK/up-$FORGOTTEN-again.log" 2>/dev/null
+  bad "gateFORGET-REVOKES: forget of a live certificate holder did not cut it off truthfully (rc=$rcFG listed=$FG_LISTED reindexed=$FG_REINDEXED hello=$FG_HELLO)"
+fi
+pkill -f "up --dir $WORK/$FORGOTTEN-again-drop" 2>/dev/null || true
+# The impostor shape these gates need, "valid cert, no record, NOT revoked",
+# can no longer be produced by `devices forget` (above: it revokes the key).
+# Build it the way forget used to: drop the record from the store under the
+# same devices.json.lock flock the CLI and daemon take, with the same atomic
+# owner-only replace. Fixture setup only; nothing asserted below changes.
+python3 - "$DA" "$MALLORY" <<'PY'
+import fcntl, json, os, sys, tempfile
+d, name = sys.argv[1], sys.argv[2]
+with open(os.path.join(d, "devices.json.lock"), "a+") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    p = os.path.join(d, "devices.json")
+    arr = [r for r in json.load(open(p)) if r.get("name") != name]
+    fd, tmp = tempfile.mkstemp(dir=d)
+    with os.fdopen(fd, "w") as f:
+        json.dump(arr, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, p)
+PY
 sleep 2
 # Stable fields only (timestamps/last_seen drift between snapshots, so a
 # whole-record comparison would fail spuriously -- gate B does the same).

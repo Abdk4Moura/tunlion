@@ -23,6 +23,9 @@
 #      `boxB rsync --server ...`, which our trailing-argv shape takes directly --
 #      itself an argv-exactness proof under a real workload.
 #   J  NEGATIVE revoked -- grant revoked, same command refused again.
+#   K  REVOKED MID-SESSION -- a live exec ends when the grant is revoked.
+#   L  SHELL-USER -- a root acceptor with `--shell-user nobody` runs the exec
+#      as nobody (unix; needs root or passwordless sudo, as CI runners have).
 #
 # PLATFORM NOTE, stated honestly: executed here on Linux. The wire property
 # under test (array preserved, never re-parsed) is platform-independent code --
@@ -294,6 +297,50 @@ if [ "$rcK" != "0" ] && [ "$rcK" != "124" ] && grep -qi "revoked" "$WORK/K.err";
 else
   echo "-- K.err --"; cat "$WORK/K.err"
   bad "gateK: revoked session NOT ended (rc=$rcK)"
+fi
+
+# ===================================================================== GATE L ==
+# --shell-user REACHES EXEC: a ROOT acceptor started with `--shell-user nobody`
+# must run `exec -- id -un` as nobody. Before the fix exec ignored the flag and
+# spawned as the daemon user (root), while help and the security doc promised
+# the drop. Unix only (Windows refuses exec under --shell-user instead; that
+# decision is unit-tested). Needs root: on a box with neither root nor
+# passwordless sudo the gate is skipped, and CI's count assertion catches that.
+# The root daemon gets its OWN config dir (root-owned files would break the
+# other gates' dir) and an isolated HOME, so it writes nothing of the runner's.
+say L
+if [ "$PLATFORM" != "unix" ]; then
+  echo "SKIP gateL: --shell-user exec drop is unix only (refusal is unit-tested)"
+elif [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
+  echo "SKIP gateL: needs root or passwordless sudo"
+else
+  if [ "$(id -u)" = "0" ]; then AS_ROOT=(); else AS_ROOT=(sudo -n); fi
+  # Stop the unprivileged acceptor so only the root one answers as boxB (the
+  # backend in $pids keeps running; the acceptor is matched by its drop dir).
+  for p in $(pgrep -f -- "--dir $WORK/Bdrop" 2>/dev/null); do kill "$p" 2>/dev/null; done
+  sleep 2
+  DR="$WORK/Broot"; RHOME="$WORK/Broot-home"; RDROP="$WORK/Broot-drop"
+  mkdir -p "$DR" "$RHOME" "$RDROP"
+  cp "$DB/devices.json" "$DR/devices.json"
+  "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" FILAMENT_CONFIG_DIR="$DR" \
+    "$BIN" grant boxA shell >"$WORK/grantL.log" 2>&1
+  "${AS_ROOT[@]}" env HOME="$RHOME" XDG_CONFIG_HOME="$RHOME/.config" FILAMENT_L2=1 \
+    FILAMENT_CONFIG_DIR="$DR" FILAMENT_NAME=boxB \
+    "$BIN" up --dir "$RDROP" --server "$SERVER" --shell-user nobody >"$WORK/upL.log" 2>&1 &
+  sleep 4
+  OUTL=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- id -un 2>"$WORK/L.err" </dev/null)
+  rcL=$?
+  echo "## (--shell-user nobody) rc=$rcL out='$OUTL'"
+  if [ "$rcL" = "0" ] && [ "$OUTL" = "nobody" ]; then
+    ok "gateL: exec under --shell-user nobody ran as nobody"
+  else
+    echo "-- L.err --"; cat "$WORK/L.err"; echo "-- upL.log --"; tail -20 "$WORK/upL.log"
+    bad "gateL: exec did NOT run as the --shell-user account (rc=$rcL out='$OUTL')"
+  fi
+  # The daemon is root's: stop it as root. Matched by its unique drop dir.
+  for p in $(pgrep -f -- "--dir $RDROP" 2>/dev/null); do "${AS_ROOT[@]}" kill "$p" 2>/dev/null; done
+  sleep 1
+  "${AS_ROOT[@]}" chown -R "$(id -u):$(id -g)" "$DR" "$RHOME" "$RDROP" 2>/dev/null
 fi
 
 # ========================================================================= sum =

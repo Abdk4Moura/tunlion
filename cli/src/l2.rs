@@ -1576,7 +1576,11 @@ pub(crate) async fn bring_up_to_known(
                 // hyperkit CI), the L2 establish skips direct-quic entirely and
                 // uses WebRTC (srflx / relay candidates), exercising the relay
                 // fallback path.
-                if !direct_racing && crate::direct::direct_enabled() {
+                // --relay: no offer at all, it would carry our host/public
+                // candidates to the peer (`direct_permitted`).
+                if !direct_racing
+                    && crate::conn::direct_permitted(relay, crate::direct::direct_enabled())
+                {
                     if endpoint.is_none() {
                         match crate::direct::bind_endpoint() {
                             Ok((ep, port)) => {
@@ -1702,6 +1706,11 @@ pub(crate) async fn bring_up_to_known(
                 // so the DirectTransport's reader funnels Chunk/Control/PcState to
                 // the rx the caller hands to `pump_initiator`.
                 if data["type"].as_str() == Some("transport-offer") {
+                    // --relay hides our address from the peer: dialing its
+                    // direct candidates would hand it our IP as the source.
+                    if !crate::conn::direct_permitted(relay, true) {
+                        continue;
+                    }
                     if direct_racing {
                         continue; // already racing the first offer; ignore re-sends
                     }

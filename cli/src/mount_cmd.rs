@@ -52,6 +52,7 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
 
     let cfg = crate::settings::config_dir();
     let mut wiped: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
 
     // 3. Strip the managed authorized_keys blocks BEFORE devices.json is gone,
     //    so we know every petname whose block tunlion may have installed. Only
@@ -76,81 +77,27 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
                     ak_path.display()
                 ));
             } else {
-                ui::say(&ui::paint(
-                    ui::Tone::Warn,
-                    &format!(
-                        "  could not rewrite {} — leaving it untouched",
-                        ak_path.display()
-                    ),
+                failed.push(format!(
+                    "managed authorized_keys blocks: {}  ({}): could not rewrite the file",
+                    stripped.join(", "),
+                    ak_path.display()
                 ));
             }
         }
     }
 
-    // 4. Remove tunlion's own state files. Each is filament-authored; a missing
-    //    file is a silent no-op. Explicit list (NOT a blanket rmdir of the config
-    //    dir) so a mis-set FILAMENT_CONFIG_DIR can never take out unrelated files.
-    reset_remove(
-        &cfg.join("identity.ed25519"),
-        "user identity key",
-        &mut wiped,
-    );
-    reset_remove(
-        &cfg.join("identity/device-cert.json"),
-        "local device certificate",
-        &mut wiped,
-    );
-    reset_remove(&cfg.join("overlay.ed25519"), "overlay key", &mut wiped);
-    reset_remove(
-        &cfg.join("devices.json"),
-        "paired-device store (device certs)",
-        &mut wiped,
-    );
-    reset_remove(&cfg.join("caps.json"), "capability store", &mut wiped);
-    reset_remove(
-        &cfg.join("requests.json"),
-        "pending consent requests",
-        &mut wiped,
-    );
-    reset_remove(
-        &cfg.join("expose.json"),
-        "exposed-service records",
-        &mut wiped,
-    );
-    reset_remove(&cfg.join("mounts.json"), "mount records", &mut wiped);
-    reset_remove(
-        &cfg.join("l2-allow.json"),
-        "L2 forward allowlist",
-        &mut wiped,
-    );
-    reset_remove(
-        &cfg.join("signaling-dns.json"),
-        "signaling DNS cache",
-        &mut wiped,
-    );
-    reset_remove(&cfg.join("peerconf"), "per-peer settings", &mut wiped);
-    reset_remove(&cfg.join("config"), "global settings", &mut wiped);
-    reset_remove(&cfg.join("diag.jsonl"), "diagnostics log", &mut wiped);
-    reset_remove(
-        &cfg.join("mount-profiles"),
-        "saved mount profiles",
-        &mut wiped,
-    );
-    // Managed ssh material (private key, known_hosts pins, bootstrap cache) lives
-    // under {config}/ssh — filament-authored, distinct from the user's ~/.ssh.
-    reset_remove(
-        &cfg.join("ssh"),
-        "managed ssh material (key, known_hosts, cache)",
-        &mut wiped,
-    );
+    // 4. Remove tunlion's own state files (RESET_STATE). Every failure is
+    //    collected and reported: a reset that silently leaves state behind
+    //    must not call itself a clean slate.
+    let outcome = reset_state_in(&cfg, &reset_remove);
+    wiped.extend(outcome.wiped);
+    failed.extend(outcome.failed);
 
     // 5. Invalidate the in-process cap-store read cache so a same-process reader
     //    can't serve the just-deleted store from memory.
     crate::capability::invalidate_cap_cache();
 
-    if wiped.is_empty() {
-        ui::say("  nothing to wipe / no local tunlion state found");
-    } else {
+    if !wiped.is_empty() {
         ui::say(&format!(
             "  {} wiped local tunlion state:",
             ui::paint(ui::Tone::Ok, ui::glyph_ok())
@@ -158,9 +105,147 @@ pub(crate) fn reset_cmd(ui_caps: &UiCapability) -> Result<()> {
         for line in &wiped {
             ui::say(&format!("    - {line}"));
         }
+    }
+    if !failed.is_empty() {
+        ui::say(&format!(
+            "  {} could not remove:",
+            ui::paint(ui::Tone::Warn, ui::glyph_warn())
+        ));
+        for line in &failed {
+            ui::say(&format!("    - {line}"));
+        }
+        bail!(
+            "reset is incomplete: {} item(s) above are still in place, so this machine is NOT a clean slate. Fix the cause (often a file owned by another user, e.g. state written by a daemon started with sudo) and run `tunlion reset` again.",
+            failed.len()
+        );
+    }
+    if wiped.is_empty() {
+        ui::say("  nothing to wipe / no local tunlion state found");
+    } else {
         ui::say("  this machine is now a clean slate (`tunlion init` to start over)");
     }
     Ok(())
+}
+
+/// Every piece of tunlion's OWN state under the config dir, with the label
+/// `reset` reports for it. An explicit list (NOT a blanket rmdir of the config
+/// dir) so a mis-set FILAMENT_CONFIG_DIR can never take out unrelated files.
+/// A writer that adds a file to the config dir must add it here, or `reset`
+/// stops being the clean slate it says it is. Lock sidecars come last.
+pub(crate) const RESET_STATE: &[(&str, &str)] = &[
+    ("identity.ed25519", "user identity key"),
+    ("identity", "local device certificate (identity/)"),
+    ("overlay.ed25519", "overlay key"),
+    ("overlay.announce-seq", "overlay announce sequence"),
+    ("device.id", "install id"),
+    ("devices.json", "paired-device store (device certs)"),
+    (
+        crate::fleet_support::KEY_REVOCATIONS_FILE,
+        "revoked device keys (forgotten certificate holders)",
+    ),
+    ("caps.json", "capability store"),
+    ("requests.json", "pending consent requests"),
+    ("expose.json", "exposed-service records"),
+    ("mounts.json", "mount records"),
+    ("l2-allow.json", "L2 forward allowlist"),
+    ("signaling-dns.json", "signaling DNS cache"),
+    ("fleet.rv", "fleet rendezvous secret"),
+    ("roster.json", "fleet roster"),
+    ("roster-state.json", "fleet roster state"),
+    ("armed.json", "armed invitations"),
+    ("ssh_ca_issued.json", "ssh certificate issuance log"),
+    ("ssh_ca_serial", "ssh certificate serial counter"),
+    ("peerconf", "per-peer settings"),
+    ("config", "global settings"),
+    ("diag.jsonl", "diagnostics log"),
+    ("up.log", "daemon session log"),
+    ("daemon.log", "daemon console log"),
+    ("up.pid", "daemon pidfile"),
+    // The daemon's other run-state: its executable record, its readiness
+    // marker, its single-instance lock and the local proxy's token. A reset
+    // that left these behind was not a clean slate (the hostile-env test
+    // found up.ready, up.exe and proxy.token surviving `reset -y`).
+    ("up.exe", "daemon executable record"),
+    ("up.ready", "daemon readiness marker"),
+    ("up.lock", "daemon single-instance lock"),
+    ("proxy.token", "local proxy token"),
+    // What the local proxy and the transfer history record. `reset` called the
+    // machine a clean slate while both survived it: proxy.json names the
+    // proxy's address and user, transfers.json every file sent or received,
+    // with peers and digests.
+    ("proxy.json", "local proxy record"),
+    ("transfers.json", "transfer history"),
+    ("down.marker", "last `tunlion down` marker"),
+    ("control.sock", "daemon control socket"),
+    ("mount-profiles", "saved mount profiles"),
+    // Managed ssh material (private key, known_hosts pins, bootstrap cache, the
+    // ssh CA key) lives under {config}/ssh, distinct from the user's ~/.ssh.
+    ("ssh", "managed ssh material (key, known_hosts, cache, CA)"),
+    ("permissions-migration", "permissions migration stamp"),
+    ("identity.lock", "identity lock file"),
+    ("devices.json.lock", "device store lock file"),
+];
+
+/// What a reset removed, and what it could not.
+#[derive(Debug, Default)]
+pub(crate) struct ResetOutcome {
+    pub(crate) wiped: Vec<String>,
+    pub(crate) failed: Vec<String>,
+}
+
+/// Remove every RESET_STATE entry under `cfg` through `remove` (Ok(true)
+/// removed, Ok(false) absent, Err could not). Split from `reset_cmd` so the
+/// list and the failure reporting are testable on a temp dir.
+pub(crate) fn reset_state_in(
+    cfg: &std::path::Path,
+    remove: &dyn Fn(&std::path::Path) -> std::io::Result<bool>,
+) -> ResetOutcome {
+    let mut out = ResetOutcome::default();
+    // Files named per peer, which a fixed list cannot spell: the provisional
+    // identity records a code-based transfer writes (`provisional_peer-<id>.json`,
+    // each holding a peer's device key, certificate and user key). One per
+    // transfer piled up, and `reset` called the machine a clean slate while
+    // every one of them survived. Swept before the fixed list, by prefix.
+    let mut per_peer: Vec<std::path::PathBuf> = std::fs::read_dir(cfg)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(is_provisional_identity_file)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    per_peer.sort();
+    let mut provisional = 0usize;
+    for path in &per_peer {
+        match remove(path) {
+            Ok(true) => provisional += 1,
+            Ok(false) => {}
+            Err(e) => out.failed.push(format!("provisional peer identity  ({}): {e}", path.display())),
+        }
+    }
+    if provisional > 0 {
+        out.wiped.push(format!(
+            "provisional peer identities: {provisional} file(s)  ({}/provisional_*.json)",
+            cfg.display()
+        ));
+    }
+    for (name, label) in RESET_STATE {
+        let path = cfg.join(name);
+        match remove(&path) {
+            Ok(true) => out.wiped.push(format!("{label}  ({})", path.display())),
+            Ok(false) => {}
+            Err(e) => out.failed.push(format!("{label}  ({}): {e}", path.display())),
+        }
+    }
+    out
+}
+
+/// A provisional peer identity record: `provisional_<name>.json`. Pure.
+pub(crate) fn is_provisional_identity_file(name: &str) -> bool {
+    name.starts_with("provisional_") && name.ends_with(".json")
 }
 
 pub(crate) fn resolve_mount_plan(
@@ -393,4 +478,144 @@ pub(crate) async fn mount_fuse_cmd(
         let _ = std::fs::remove_dir(&mnt);
     }
     result
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    fn temp_cfg(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tunlion-reset-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn populate(dir: &std::path::Path) {
+        for (name, _) in RESET_STATE {
+            let p = dir.join(name);
+            if matches!(*name, "identity" | "ssh" | "mount-profiles") {
+                std::fs::create_dir_all(&p).unwrap();
+                std::fs::write(p.join("inner"), b"x").unwrap();
+            } else {
+                std::fs::write(&p, b"x").unwrap();
+            }
+        }
+    }
+
+    // The files the audit found `reset` leaving behind are on the list.
+    #[test]
+    fn reset_list_covers_every_config_dir_writer() {
+        let names: Vec<&str> = RESET_STATE.iter().map(|(n, _)| *n).collect();
+        for must in [
+            "fleet.rv",
+            "roster.json",
+            "roster-state.json",
+            "armed.json",
+            "up.log",
+            "daemon.log",
+            "ssh_ca_issued.json",
+            "ssh_ca_serial",
+            "device.id",
+            "overlay.announce-seq",
+            "up.pid",
+            "up.exe",
+            "up.ready",
+            "up.lock",
+            "proxy.token",
+            "proxy.json",
+            "transfers.json",
+            "control.sock",
+            "identity",
+            "devices.json",
+            "caps.json",
+            "ssh",
+            "revoked-keys.json",
+        ] {
+            assert!(names.contains(&must), "reset does not remove {must}");
+        }
+    }
+
+    // Per-peer provisional identity records (peer device key, certificate and
+    // user key, one per code-based transfer) are swept by prefix: a reset that
+    // left them was not the clean slate it said it was.
+    #[test]
+    fn reset_removes_every_provisional_peer_identity() {
+        let dir = temp_cfg("prov");
+        for id in ["peer-hNZONFIoto2k9bQ9ABGV", "peer-abc", "bravo"] {
+            std::fs::write(dir.join(format!("provisional_{id}.json")), b"{}").unwrap();
+        }
+        std::fs::write(dir.join("provisional-notes.txt"), b"keep").unwrap();
+        let out = reset_state_in(&dir, &crate::reset_remove);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert!(out.wiped.iter().any(|w| w.contains("3 file(s)")), "{:?}", out.wiped);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["provisional-notes.txt".to_string()], "{left:?}");
+        assert!(super::is_provisional_identity_file("provisional_peer-x.json"));
+        assert!(!super::is_provisional_identity_file("provisional_peer-x.json.tmp"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A real directory: everything on the list goes, nothing else does.
+    #[test]
+    fn reset_removes_all_state_and_only_state() {
+        let dir = temp_cfg("all");
+        populate(&dir);
+        std::fs::write(dir.join("not-ours.txt"), b"keep").unwrap();
+        let out = reset_state_in(&dir, &crate::reset_remove);
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert_eq!(out.wiped.len(), RESET_STATE.len());
+        for (name, _) in RESET_STATE {
+            assert!(!dir.join(name).exists(), "{name} survived reset");
+        }
+        assert!(dir.join("not-ours.txt").exists(), "reset removed a file it does not own");
+        // Idempotent: a second run finds nothing and fails nothing.
+        let again = reset_state_in(&dir, &crate::reset_remove);
+        assert!(again.wiped.is_empty() && again.failed.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A deletion that fails is reported, never swallowed: this is what lets
+    // `reset_cmd` refuse to call the machine a clean slate.
+    #[test]
+    fn reset_reports_every_failed_deletion() {
+        let dir = temp_cfg("fail");
+        populate(&dir);
+        let failing = |p: &std::path::Path| -> std::io::Result<bool> {
+            if p.ends_with("fleet.rv") || p.ends_with("ssh") {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
+            } else {
+                crate::reset_remove(p)
+            }
+        };
+        let out = reset_state_in(&dir, &failing);
+        assert_eq!(out.failed.len(), 2, "{:?}", out.failed);
+        assert!(out.failed.iter().any(|f| f.contains("fleet.rv") && f.contains("denied")));
+        assert!(out.failed.iter().any(|f| f.contains("ssh")));
+        assert_eq!(out.wiped.len(), RESET_STATE.len() - 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // reset_remove's outcomes: absent is Ok(false), removed is Ok(true) (the
+    // Err arm is exercised through the injected remover above).
+    #[test]
+    fn reset_remove_distinguishes_absent_from_removed() {
+        let dir = temp_cfg("err");
+        let file = dir.join("plain");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!crate::reset_remove(&dir.join("absent")).unwrap());
+        assert!(crate::reset_remove(&file).unwrap());
+        assert!(!file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
