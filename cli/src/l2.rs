@@ -2291,30 +2291,110 @@ async fn probe_forward(mux: &Arc<Mux>, rport: u16) -> ForwardProbe {
     }
 }
 
+/// How `forward` should treat one refusal from the peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardRefusal {
+    /// The peer's POLICY says no (tunnels off, no grant, revoked grant or
+    /// certificate, ceiling, untrusted device): every later connection will be
+    /// refused the same way, so retrying is pointless and a supervisor must be
+    /// told.
+    Policy,
+    /// The peer is willing, but nothing accepts on the target port there. A
+    /// service may start later, so the forward keeps running.
+    NothingListening,
+    /// Anything else (the acceptor's stream cap, another dial error): this
+    /// connection failed; the forward keeps running and retries as before.
+    Transient,
+}
+
+/// Classify a refusal reason as carried in `l2-close{err}`. Policy is decided
+/// by the canonical reasons `refusal::code_from_reason` recognizes, plus the
+/// acceptor's bare "denied" for an untrusted device. A closed target port is
+/// recognized by the OS dial error ("Connection refused" on unix, "actively
+/// refused it" on Windows).
+pub(crate) fn classify_forward_refusal(reason: &str) -> ForwardRefusal {
+    let r = reason.trim();
+    if crate::refusal::code_from_reason(r).is_some() || r == "denied" {
+        return ForwardRefusal::Policy;
+    }
+    if r.to_ascii_lowercase().contains("refused") {
+        return ForwardRefusal::NothingListening;
+    }
+    ForwardRefusal::Transient
+}
+
+/// Exit status of a running `forward` that the peer stopped allowing (grant or
+/// certificate revoked, tunnels turned off): distinct from a plain failure (1)
+/// so a supervisor can tell "denied, a restart will not help" from "broke".
+///
+/// 4 is `exit_codes::ExitKind::Denied` in the exit-code taxonomy
+/// (cli/src/exit_codes.rs, #393). It is a literal here only because this branch
+/// predates exit_codes.rs; once both have merged, switch it to that constant.
+pub(crate) const FORWARD_DENIED_EXIT: i32 = 4;
+
+/// What the startup probe learned about the target, for the "ready" line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardTarget {
+    /// The peer accepted the probe (or gave no conclusive answer).
+    Open,
+    /// The peer is willing, but nothing listens on the target port yet.
+    NothingListening,
+}
+
+/// The word that opens the "ready" line, carrying the target's state so a
+/// warning printed above it is not contradicted by a bare "ready" below it.
+pub(crate) fn forward_ready_word(rport: u16, target: ForwardTarget) -> String {
+    match target {
+        ForwardTarget::Open => "ready".to_string(),
+        ForwardTarget::NothingListening => {
+            format!("ready (nothing is listening on {rport} there yet)")
+        }
+    }
+}
+
+/// The final line a forward prints when the peer's policy stops it.
+pub(crate) fn forward_denied_line(peer: &str, rport: u16, reason: &str) -> String {
+    format!(
+        "tunlion: forward to {peer}:{rport} stopped: {peer} no longer allows it ({reason}); not listening any more (exit {FORWARD_DENIED_EXIT})"
+    )
+}
+
+/// The remedy lines for a policy refusal, when the reason carries a known code.
+fn forward_refusal_fix(peer: &str, reason: &str) -> Option<(String, Option<String>)> {
+    let code = crate::refusal::code_from_reason(reason)?;
+    let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
+    Some(crate::refusal::remedy(code, peer, &me))
+}
+
 /// Act on a probe verdict: a POLICY refusal (the peer will refuse every
 /// connection: tunnels off, no grant, revoked) ends the forward now with the
 /// reason and its remedy; a refusal of the target port itself (nothing
 /// listening there yet) is a warning, since a service may start later.
-fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<()> {
+fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<ForwardTarget> {
     match probe {
-        ForwardProbe::Accepted | ForwardProbe::Silent => Ok(()),
-        ForwardProbe::Refused(reason) => {
-            if crate::refusal::code_from_reason(&reason).is_some() {
-                let me = crate::refusal::name_from_reason(&reason)
-                    .unwrap_or_else(crate::display_name);
-                let code = crate::refusal::code_from_reason(&reason).unwrap();
-                let (text, cmd) = crate::refusal::remedy(code, peer, &me);
-                let fix = match cmd {
-                    Some(c) => format!("\n  {text}\n    {c}"),
-                    None => format!("\n  {text}"),
+        ForwardProbe::Accepted | ForwardProbe::Silent => Ok(ForwardTarget::Open),
+        ForwardProbe::Refused(reason) => match classify_forward_refusal(&reason) {
+            ForwardRefusal::Policy => {
+                let fix = match forward_refusal_fix(peer, &reason) {
+                    Some((text, Some(c))) => format!("\n  {text}\n    {c}"),
+                    Some((text, None)) => format!("\n  {text}"),
+                    None => String::new(),
                 };
                 bail!("tunlion: {peer}:{rport} refused the connection: {reason}{fix}");
             }
-            crate::ui::critical(&format!(
-                "tunlion: {peer}:{rport} refused a test connection: {reason}. Nothing is accepting on port {rport} there right now; connections will fail until something listens on it."
-            ));
-            Ok(())
-        }
+            ForwardRefusal::NothingListening => {
+                crate::ui::critical(&format!(
+                    "tunlion: {peer}:{rport} refused a test connection: {reason}. Nothing is accepting on port {rport} there right now; connections will fail until something listens on it."
+                ));
+                Ok(ForwardTarget::NothingListening)
+            }
+            ForwardRefusal::Transient => {
+                crate::ui::critical(&format!(
+                    "tunlion: {peer}:{rport} refused a test connection: {reason}. The forward stays up; connections may fail until that clears."
+                ));
+                Ok(ForwardTarget::Open)
+            }
+        },
     }
 }
 
@@ -3551,20 +3631,29 @@ struct ForwardActivity {
     /// would otherwise repeat the same line per connection, and a reason
     /// printed twenty times reads as a storm rather than an explanation.
     refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A POLICY refusal (revoked, not granted, tunnels off) is final: every later
+    /// connection would be refused the same way. The connection task reports it
+    /// here and the accept loop ends the process with the denied exit code, so a
+    /// supervisor sees the forward stop instead of a listener that resets every
+    /// client forever while the reason goes only to the log.
+    denied: tokio::sync::mpsc::UnboundedSender<String>,
     peer: String,
     rport: u16,
 }
 
 impl ForwardActivity {
-    fn new(peer: &str, rport: u16) -> Self {
-        Self {
+    fn new(peer: &str, rport: u16) -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (denied, denied_rx) = tokio::sync::mpsc::unbounded_channel();
+        let me = Self {
             active: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             first: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             refused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            denied,
             peer: peer.to_string(),
             rport,
-        }
+        };
+        (me, denied_rx)
     }
     fn line(&self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -3583,6 +3672,7 @@ impl ForwardActivity {
             total: self.total.clone(),
             first: self.first.clone(),
             refused: self.refused.clone(),
+            denied: self.denied.clone(),
             peer: self.peer.clone(),
             rport: self.rport,
         }
@@ -3600,22 +3690,30 @@ impl ForwardActivity {
     /// Reported for EVERY refused connection, on stderr at the level `-q` keeps:
     /// a client that gets an empty reply needs the reason each time, not only
     /// the first. The remedy (when the reason has one) is printed once.
+    ///
+    /// A POLICY refusal is different in kind: the forward cannot work again
+    /// until the owner changes something, so its remedy is always printed and
+    /// the accept loop is told to end the process (`FORWARD_DENIED_EXIT`).
+    /// Anything else (nothing listening on the port, a transient failure) keeps
+    /// the forward up, exactly as before.
     fn refused_once(&self, reason: &str) {
         use std::sync::atomic::Ordering::Relaxed;
         crate::ui::critical(&format!(
             "tunlion: {}:{} refused the connection: {reason}",
             self.peer, self.rport
         ));
-        if self.refused.swap(true, Relaxed) {
+        let policy = classify_forward_refusal(reason) == ForwardRefusal::Policy;
+        if self.refused.swap(true, Relaxed) && !policy {
             return;
         }
-        if let Some(code) = crate::refusal::code_from_reason(reason) {
-            let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
-            let (text, cmd) = crate::refusal::remedy(code, &self.peer, &me);
+        if let Some((text, cmd)) = forward_refusal_fix(&self.peer, reason) {
             crate::ui::critical(&format!("  {text}"));
             if let Some(c) = cmd {
                 crate::ui::critical(&format!("    {c}"));
             }
+        }
+        if policy {
+            let _ = self.denied.send(reason.trim().to_string());
         }
     }
 
@@ -3769,16 +3867,18 @@ pub async fn forward_cmd(
         // second case is what left the user unsure whether it was forwarding.
         // Ask once through the daemon, so a refusal ends the forward here with
         // its reason instead of reaching the first client as an empty reply.
-        match crate::ctl::forward_probe(peer, rport).await {
-            Some(Ok(())) => {}
-            Some(Err(reason)) => forward_probe_verdict(peer, rport, ForwardProbe::Refused(reason))?,
-            None => {}
-        }
+        let target = match crate::ctl::forward_probe(peer, rport).await {
+            Some(Err(reason)) => {
+                forward_probe_verdict(peer, rport, ForwardProbe::Refused(reason))?
+            }
+            Some(Ok(())) | None => ForwardTarget::Open,
+        };
         match crate::ctl::try_ping(peer).await {
             Some(facts) => {
                 let route = facts["route"].as_str().unwrap_or("link");
                 crate::ui::say(&format!(
-                    "tunlion: ready - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})"
+                    "tunlion: {} - 127.0.0.1:{lport} -> {peer}:{rport} over the daemon's live {route} link (no extra presence on {peer})",
+                    forward_ready_word(rport, target)
                 ));
             }
             None => {
@@ -3805,20 +3905,33 @@ pub async fn forward_cmd(
         }
         // ...and ask the peer once, so "ready" also means "it will forward".
         let first = rx.borrow().clone();
-        if let Some(m) = first {
-            forward_probe_verdict(peer, rport, probe_forward(&m, rport).await)?;
-        }
+        let target = match first {
+            Some(m) => forward_probe_verdict(peer, rport, probe_forward(&m, rport).await)?,
+            None => ForwardTarget::Open,
+        };
         crate::ui::say(&format!(
-            "tunlion: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})"
+            "tunlion: {}, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})",
+            forward_ready_word(rport, target)
         ));
         Some(rx)
     };
 
-    let activity = ForwardActivity::new(peer, rport);
+    let (activity, mut denied_rx) = ForwardActivity::new(peer, rport);
     loop {
         // A transient accept error (e.g. EMFILE/ENFILE under fd pressure) must NOT
         // tear down the listener; back off briefly and keep serving.
-        let sock = match listener.accept().await {
+        let accepted = tokio::select! {
+            r = listener.accept() => r,
+            // A connection task saw a POLICY refusal (revoked, not granted,
+            // tunnels off). The forward can never work again without the owner,
+            // so stop listening and exit with the denied code instead of
+            // resetting every later client. Transport errors never reach here.
+            Some(reason) = denied_rx.recv() => {
+                crate::ui::critical(&forward_denied_line(peer, rport, &reason));
+                std::process::exit(FORWARD_DENIED_EXIT);
+            }
+        };
+        let sock = match accepted {
             Ok((s, _)) => s,
             Err(e) => {
                 crate::ui::status(&format!("tunlion: accept paused ({e}), retrying..."));
@@ -5974,5 +6087,121 @@ mod h1_tests {
         mux.on_frame(sid, Bytes::new()).await;
         drop(client);
         s.await.expect("serve task panicked");
+    }
+}
+
+#[cfg(test)]
+mod forward_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn policy_refusals_are_classified_as_policy() {
+        for reason in [
+            crate::capability::REVOKED_REASON,
+            crate::capability::TUNNEL_OFF_REASON,
+            crate::capability::SHELL_OFF_REASON,
+            crate::capability::CEILING_REASON,
+            "not authorized: device lacks shell grant",
+            "shell not granted to 'bravo' here",
+            "shell revoked for 'bravo' here",
+            "device revoked",
+            "denied",
+        ] {
+            assert_eq!(
+                classify_forward_refusal(reason),
+                ForwardRefusal::Policy,
+                "{reason:?} must end the forward"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_target_port_is_not_policy() {
+        for reason in [
+            "Connection refused (os error 111)",
+            "No connection could be made because the target machine actively refused it. (os error 10061)",
+        ] {
+            assert_eq!(
+                classify_forward_refusal(reason),
+                ForwardRefusal::NothingListening,
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_and_capacity_failures_keep_retrying() {
+        for reason in [
+            "too many streams",
+            "sid in use",
+            "stream input flooded (consumer stalled)",
+            "Connection reset by peer (os error 104)",
+            "timed out",
+        ] {
+            assert_eq!(
+                classify_forward_refusal(reason),
+                ForwardRefusal::Transient,
+                "{reason:?} must not stop the forward"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_line_says_when_nothing_listens() {
+        assert_eq!(forward_ready_word(8000, ForwardTarget::Open), "ready");
+        assert_eq!(
+            forward_ready_word(8000, ForwardTarget::NothingListening),
+            "ready (nothing is listening on 8000 there yet)"
+        );
+    }
+
+    #[test]
+    fn a_nothing_listening_probe_reports_that_state() {
+        let t = forward_probe_verdict(
+            "bravo",
+            39998,
+            ForwardProbe::Refused("Connection refused (os error 111)".into()),
+        )
+        .expect("a closed port must not end the forward");
+        assert_eq!(t, ForwardTarget::NothingListening);
+        assert_eq!(
+            forward_probe_verdict("bravo", 39998, ForwardProbe::Accepted).unwrap(),
+            ForwardTarget::Open
+        );
+    }
+
+    #[test]
+    fn a_policy_probe_ends_the_forward_with_the_reason() {
+        let e = forward_probe_verdict(
+            "bravo",
+            8000,
+            ForwardProbe::Refused(crate::capability::TUNNEL_OFF_REASON.into()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("refused the connection"), "{e}");
+        assert!(e.contains("tunnelling is off"), "{e}");
+    }
+
+    #[test]
+    fn denied_line_names_the_reason_and_the_exit_code() {
+        assert_eq!(FORWARD_DENIED_EXIT, 4);
+        let l = forward_denied_line("bravo", 8000, "access revoked");
+        assert!(l.contains("access revoked"), "{l}");
+        assert!(l.contains("exit 4"), "{l}");
+        assert!(l.contains("bravo:8000"), "{l}");
+    }
+
+    #[test]
+    fn only_a_policy_refusal_signals_the_accept_loop() {
+        let (act, mut rx) = ForwardActivity::new("bravo", 8000);
+        act.refused_once("Connection refused (os error 111)");
+        act.refused_once("too many streams");
+        assert!(
+            rx.try_recv().is_err(),
+            "a non-policy refusal must not stop the forward"
+        );
+        act.handle().refused_once(crate::capability::REVOKED_REASON);
+        assert_eq!(rx.try_recv().unwrap(), crate::capability::REVOKED_REASON);
     }
 }
