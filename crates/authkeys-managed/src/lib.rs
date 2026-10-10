@@ -228,6 +228,14 @@ pub fn install_ca_trust_line(line: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether tunlion's CA-trust block is in this user's authorized_keys: the
+/// per-user trust `tunlion shell --ssh` relies on (no root, no sshd_config).
+pub fn has_ca_trust_line() -> bool {
+    std::fs::read_to_string(authorized_keys_path())
+        .map(|text| text.lines().any(|l| l.trim() == CA_BEGIN))
+        .unwrap_or(false)
+}
+
 /// Remove tunlion's CA-trust block. No-op if absent.
 pub fn remove_ca_trust_line() -> Result<()> {
     let path = authorized_keys_path();

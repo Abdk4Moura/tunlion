@@ -301,8 +301,17 @@ pub fn sshd_ca_status(config_text: &str) -> (bool, bool) {
 }
 
 /// Doctor check: both CA lines present in the live sshd_config.
-pub fn check_sshd_ca() -> std::result::Result<(), String> {
+///
+/// Ok carries what trusts the CA. The per-user line in ~/.ssh/authorized_keys
+/// is the primary setup (no root, no sshd reload) and is enough on its own;
+/// doctor used to look only at sshd_config, so it said "unconfigured (run the
+/// CA setup)" on a box where `--ssh` worked, and named no command either way.
+pub fn check_sshd_ca() -> std::result::Result<String, String> {
+    if authkeys_managed::has_ca_trust_line() {
+        return Ok("per-user trust line in ~/.ssh/authorized_keys".to_string());
+    }
     check_sshd_ca_at(Path::new(SSHD_CONFIG_DEFAULT))
+        .map(|()| "TrustedUserCAKeys + principals in sshd_config".to_string())
 }
 
 /// Whether tunlion's ssh is in play on this host: its sshd config already
@@ -331,6 +340,10 @@ fn arming_note(line: &str) {
         crate::ui::debug(line);
     }
 }
+
+/// What sets the CA trust up, named as the commands that do it. Only
+/// `tunlion shell --ssh` needs it; plain `tunlion shell` and `exec` do not.
+pub const SSH_CA_SETUP: &str = "only `tunlion shell --ssh` needs it. It is set up when this device starts serving shells: `tunlion grant <device> shell`, or `tunlion up --shell --i-know`; either adds a per-user trust line to ~/.ssh/authorized_keys";
 
 /// Best-effort arming for shell-serving flows (`up --shell`, `grant shell`):
 /// ensure the CA block plus the daemon principals entry. Loud on any
@@ -457,17 +470,38 @@ fn install_user_ca_trust(config_dir: &Path, user: &str) -> Result<()> {
 /// Same against an explicit path (tests use temp files, never the live one).
 pub fn check_sshd_ca_at(path: &Path) -> std::result::Result<(), String> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("sshd config unreadable at {}: {e}", path.display()))?;
+        .map_err(|e| format!("no CA trust (sshd config unreadable at {}: {e}); {SSH_CA_SETUP}", path.display()))?;
     match sshd_ca_status(&text) {
         (true, true) => Ok(()),
-        (false, _) => Err("TrustedUserCAKeys line missing (run the CA setup)".to_string()),
-        (_, false) => Err("AuthorizedPrincipalsFile line missing (run the CA setup)".to_string()),
+        (false, _) => Err(format!("no CA trust (no per-user line, no TrustedUserCAKeys in sshd_config); {SSH_CA_SETUP}")),
+        (_, false) => Err(format!("AuthorizedPrincipalsFile line missing from sshd_config; {SSH_CA_SETUP}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// doctor said "sshd-ca unconfigured (run the CA setup)", a step with no
+    /// command. Every unconfigured verdict now names the commands that set it
+    /// up, and says only `--ssh` needs it.
+    #[test]
+    fn an_unconfigured_ca_names_the_commands_that_configure_it() {
+        let dir = std::env::temp_dir().join(format!("tl-sshd-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("sshd_config");
+        std::fs::write(&cfg, "Port 22\n").unwrap();
+        for e in [
+            check_sshd_ca_at(&cfg).unwrap_err(),
+            check_sshd_ca_at(&dir.join("absent")).unwrap_err(),
+        ] {
+            assert!(!e.contains("run the CA setup"), "{e}");
+            assert!(e.contains("tunlion grant <device> shell"), "{e}");
+            assert!(e.contains("tunlion up --shell"), "{e}");
+            assert!(e.contains("tunlion shell --ssh"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_block_written_before_the_rename_is_recognised() {
