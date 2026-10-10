@@ -112,6 +112,16 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         Some(_) => crate::ctl::daemon_responds(STATUS_PROBE).await,
         None => Some(false),
     };
+    // Suspended (SIGSTOP) is told apart from wedged where the kernel says so.
+    let suspended = pid_alive.is_some_and(|p| crate::platform::process_stopped(p) == Some(true));
+    // Answering is not serving either: a daemon whose signaling link is down
+    // or flapping answers here while no peer can reach it. It reports its link.
+    let signaling = if responding == Some(true) {
+        crate::daemon_health::signaling().await
+    } else {
+        None
+    };
+    let degraded = signaling.as_ref().and_then(crate::daemon_health::degraded_reason);
     if json {
         let pid = pid_alive;
         let exposed: Vec<Value> = expose::load()
@@ -130,6 +140,11 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 // false: a process holds the pidfile but does not answer on its
                 // control socket. null: this platform cannot ask.
                 "responding": responding,
+                "suspended": suspended,
+                // The daemon's own view of its signaling link, and the reason
+                // it is degraded (null when healthy or not running).
+                "signaling": signaling,
+                "degraded": degraded,
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
@@ -138,11 +153,20 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         return Ok(());
     }
     match pid_alive {
+        Some(pid) if responding == Some(false) && suspended => ui::say(&format!(
+            "  {} running but not responding (pid {pid}): it is suspended (SIGSTOP), so it serves nothing. `kill -CONT {pid}` resumes it; `tunlion down` stops it",
+            ui::paint(ui::Tone::Err, ui::glyph_err()),
+        )),
         Some(pid) if responding == Some(false) => ui::say(&format!(
             "  {} running but not responding (pid {pid}): it did not answer on its control socket ({}) within {}s. It may be stopped (SIGSTOP) or wedged; `tunlion down` then `tunlion up` restarts it",
             ui::paint(ui::Tone::Err, ui::glyph_err()),
             crate::ctl::control_sock_path().display(),
             STATUS_PROBE.as_secs_f32()
+        )),
+        Some(pid) if degraded.is_some() => ui::say(&format!(
+            "  {} up but degraded (pid {pid}): {}",
+            ui::paint(ui::Tone::Warn, "!"),
+            degraded.as_deref().unwrap_or_default()
         )),
         Some(pid) => ui::say(&format!(
             "  {} up (pid {pid})",
@@ -393,8 +417,10 @@ pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> 
     match crate::platform::InstanceLock::try_acquire(&lock_path) {
         Ok(Some(lock)) => drop(lock),
         Ok(None) => {
-            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
-            return Ok(());
+            return crate::daemon_stop::report_holder(
+                crate::daemon_stop::lock_holder(&lock_path),
+                &lock_path,
+            );
         }
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!(
@@ -403,6 +429,9 @@ pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> 
             )));
         }
     }
+    // For the startup-death message below: a `down` that ran after this
+    // moment is the likely reason a fresh daemon died by a signal.
+    let spawned_at = std::time::SystemTime::now();
     let mut child = crate::platform::spawn_detached(&exe, &args, &log_path)?;
     let pid = child.id();
     // Wait for THIS child to become the daemon (its pid in the pidfile), or to
@@ -433,18 +462,30 @@ pub(crate) async fn detach_up(server: &str, dir: Option<PathBuf>) -> Result<()> 
             Ok(())
         }
         Some(Ok(())) => Err(anyhow!(
-            "the daemon (pid {pid}) stopped right after starting; see {}",
+            "the daemon (pid {pid}) stopped right after starting{}; see {}",
+            if crate::daemon_stop::stopped_by_down_since(spawned_at) {
+                ". A `tunlion down` ran while it was starting and stopped it"
+            } else {
+                ""
+            },
             log_path.display()
         )),
         Some(Err(Some(code))) if code == crate::up_logs::UP_LOST_ELECTION_EXIT => {
-            // Another `up` won the election at the same instant: a daemon is
-            // running, which is what was asked for.
-            crate::up_logs::already_running(crate::up_logs::wait_for_winner_pid());
-            Ok(())
+            // Another `up` won the election at the same instant. Say which
+            // process holds it; a suspended or unnamed holder is not "running".
+            crate::daemon_stop::report_holder(
+                crate::daemon_stop::lock_holder(&lock_path),
+                &lock_path,
+            )
         }
         Some(Err(code)) => Err(anyhow!(
-            "the daemon exited during startup ({}); its output is in {}",
+            "the daemon exited during startup ({}){}; its output is in {}",
             code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed by a signal".into()),
+            if crate::daemon_stop::stopped_by_down_since(spawned_at) {
+                ". A `tunlion down` ran while it was starting and stopped it"
+            } else {
+                ""
+            },
             log_path.display()
         )),
         None => {

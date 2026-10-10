@@ -20,6 +20,11 @@
 #                              (mounts small tmpfs disks, so it uses sudo)
 #   reenrol-advice-gates.sh    the advice for widening a joined device's ceiling
 #                              is run exactly as printed, and it works
+#   daemon-stop-gates.sh       `down` on a suspended daemon returns only once
+#                              it is gone, the next `up` starts one instead of
+#                              "already running (starting)", a suspended lock
+#                              holder is named, and a daemon cut off from its
+#                              server is reported degraded by status and doctor
 #
 # mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
 # 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
@@ -62,6 +67,7 @@ on:
       - 'cli/tests/whoami-candidate-gates.sh'
       - 'cli/tests/hostile-env-gates.sh'
       - 'cli/tests/reenrol-advice-gates.sh'
+      - 'cli/tests/daemon-stop-gates.sh'
       - 'backend/**'
       - '.github/workflows/gate-suite.yml'
   workflow_dispatch: {}
@@ -134,6 +140,7 @@ jobs:
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/hostile-env-gates.sh]=12
             [cli/tests/reenrol-advice-gates.sh]=3
+            [cli/tests/daemon-stop-gates.sh]=4
           )
           # MODE MATTERS HERE, and it is not a formality: `[ -x "$g" ]` below
           # fails the gate when the file is not executable, which is how this
@@ -152,7 +159,8 @@ jobs:
                    cli/tests/shell-gates.sh \
                    cli/tests/whoami-candidate-gates.sh \
                    cli/tests/hostile-env-gates.sh \
-                   cli/tests/reenrol-advice-gates.sh; do
+                   cli/tests/reenrol-advice-gates.sh \
+                   cli/tests/daemon-stop-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare

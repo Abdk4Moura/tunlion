@@ -194,6 +194,14 @@ pub(crate) async fn up_cmd(
     let headless = std::env::var_os(platform::DETACHED_CHILD_ENV).is_some()
         || platform::stdio_is_file(&console_log);
     if let Some(pid) = daemon_alive() {
+        // A suspended daemon keeps its pid and its lock but serves nothing;
+        // "already running; nothing to do" about it was false.
+        if platform::process_stopped(pid) == Some(true) {
+            return crate::daemon_stop::report_holder(
+                crate::daemon_stop::Holder::Stopped(pid),
+                &platform::Paths::config_path("up.lock"),
+            );
+        }
         dlog!(
             "[up] already-up: pidfile={:?} pid={pid} cmdline={:?}",
             pidfile(),
@@ -226,20 +234,33 @@ pub(crate) async fn up_cmd(
     // lives until `up_cmd` returns) and the kernel drops it if we die.
     let lock_path = platform::Paths::config_path("up.lock");
     let _instance = match platform::InstanceLock::try_acquire(&lock_path) {
-        Ok(Some(lock)) => lock,
+        Ok(Some(lock)) => {
+            // Name ourselves in the lock, so a loser can say which process
+            // holds it instead of "already running (starting)" about nobody.
+            lock.record_owner();
+            lock
+        }
         Ok(None) => {
-            let pid = wait_for_winner_pid();
+            let holder = crate::daemon_stop::lock_holder(&lock_path);
             if headless {
-                // The losing child of a concurrent `up --detach`: its parent turns
-                // this exit into "already running".
-                already_running(pid);
+                // The losing child of a concurrent `up --detach`: its parent
+                // reports the holder itself; this line is for daemon.log.
+                if let Err(e) = crate::daemon_stop::report_holder(holder, &lock_path) {
+                    ui::say(&format!("  {e}"));
+                }
                 std::process::exit(UP_LOST_ELECTION_EXIT);
             }
-            ui::say(&format!(
-                "  daemon already running{}; following its log (ctrl-c to detach)",
-                pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
-            ));
-            return logs_cmd(true, 20).await;
+            match holder {
+                crate::daemon_stop::Holder::Serving(p) | crate::daemon_stop::Holder::Starting(p) => {
+                    ui::say(&format!(
+                        "  daemon already running (pid {p}); following its log (ctrl-c to detach)"
+                    ));
+                    return logs_cmd(true, 20).await;
+                }
+                // A suspended holder, or one nobody can name, is not a daemon
+                // to follow: say so rather than tail a log nothing writes.
+                other => return crate::daemon_stop::report_holder(other, &lock_path),
+            }
         }
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!(
@@ -546,19 +567,7 @@ pub(crate) fn already_running(pid: Option<u32>) {
     ui::say(&format!(
         "  {} daemon already running{}; nothing to do",
         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-        pid.map(|p| format!(" (pid {p})")).unwrap_or_else(|| " (starting)".to_string())
+        pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
     ));
 }
 
-/// The pid of the daemon that won the election, once it has written its
-/// pidfile. The winner takes the lock first and writes the pidfile a moment
-/// later, so a loser waits briefly rather than reporting no pid.
-pub(crate) fn wait_for_winner_pid() -> Option<u32> {
-    for _ in 0..20 {
-        if let Some(pid) = daemon_alive() {
-            return Some(pid);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    None
-}

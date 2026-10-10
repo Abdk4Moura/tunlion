@@ -1583,6 +1583,93 @@ impl InstanceLock {
         }
         Ok(Some(InstanceLock { _file: file }))
     }
+
+    /// Write this process's pid into the lock file, so a loser can say WHICH
+    /// process holds the election. Holding the lock already proves the holder is
+    /// alive (the kernel drops it on exit); the pid is what turns "already running
+    /// (starting)" into a claim that can be checked. Best effort.
+    pub fn record_owner(&self) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = &self._file;
+        let _ = f.set_len(0);
+        let _ = f.seek(SeekFrom::Start(0));
+        let _ = writeln!(f, "{}", std::process::id());
+        let _ = f.flush();
+    }
+
+    /// The pid the current holder recorded in `path`, if any. On Windows a held
+    /// lock blocks the read, so this is None there and callers fall back to the
+    /// pidfile alone.
+    pub fn recorded_owner(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+}
+
+// --------------------------------------------------------- process control --
+
+/// The signals `down` uses beyond its first polite request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Escalate {
+    /// Resume a stopped (SIGSTOP) process so it can act on the request to exit
+    /// it already has pending. A no-op where processes cannot be stopped.
+    Continue,
+    /// End it now (SIGKILL; TerminateProcess on Windows).
+    Kill,
+}
+
+#[cfg(unix)]
+pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
+    let sig = match how {
+        Escalate::Continue => libc::SIGCONT,
+        Escalate::Kill => libc::SIGKILL,
+    };
+    if unsafe { libc::kill(pid as libc::pid_t, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+pub fn escalate(pid: u32, how: Escalate) -> std::io::Result<()> {
+    match how {
+        Escalate::Continue => Ok(()),
+        Escalate::Kill => {
+            let st = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if st.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("taskkill exited {st}")))
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn escalate(_pid: u32, _how: Escalate) -> std::io::Result<()> {
+    Err(std::io::Error::other("cannot signal processes on this platform"))
+}
+
+/// Is `pid` stopped (SIGSTOP, a debugger, a terminal stop)? Some(true/false)
+/// where the kernel says, None where this platform cannot tell. A stopped
+/// process keeps its pid and its locks but runs nothing: it neither serves nor
+/// exits when asked, which is why `status` and `up` must not call it running.
+#[cfg(target_os = "linux")]
+pub fn process_stopped(pid: u32) -> Option<bool> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The state is the first field after the parenthesised command name, which
+    // may itself contain spaces or parentheses, so split at the LAST ')'.
+    let state = stat.rsplit_once(')')?.1.split_whitespace().next()?;
+    Some(matches!(state, "T" | "t"))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_stopped(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// Make `opts` create the file owner-only (0600), whatever the umask. A no-op
