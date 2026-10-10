@@ -418,6 +418,17 @@ pub trait Transport: Send + Sync {
         let idle_ms = self.idle_ms();
         (idle_ms != u64::MAX).then_some(idle_ms)
     }
+    /// Milliseconds since the PEER last sent us anything at all (data, control,
+    /// or its keepalive), or `None` when this transport does not track it.
+    ///
+    /// Not `idle_ms`: that is stamped when OUR writes succeed too, and the relay
+    /// keepalive writes every 5 s whether or not anyone is listening, so a relay
+    /// link to a stopped or wiped peer kept `idle_ms` near zero forever and was
+    /// shown as "online (last seen just now)". A healthy relay peer sends its own
+    /// keepalive every 5 s, so silence here past a few seconds means it is gone.
+    fn heard_ms(&self) -> Option<u64> {
+        None
+    }
     /// Best-effort liveness: `false` if the underlying connection is known closed.
     /// Default `true` (untracked transports are assumed live). Warm-link reuse
     /// consults this so it never opens a stream over a dead/zombie link (and falls
@@ -565,6 +576,9 @@ pub struct DataChannelTransport {
     // signaling reconnect must not supersede a link whose data channel, which
     // is independent of the socket, is still flowing.
     last_activity: Arc<std::sync::atomic::AtomicU64>,
+    // Monotonic ms-stamp of the last message the PEER sent, of any kind (see
+    // `Transport::heard_ms`). Never stamped by our own writes.
+    last_heard: Arc<std::sync::atomic::AtomicU64>,
     // Flips true the first time a DATA frame moves in either direction. Backs the
     // before-first-byte establishment grace (a link awaiting its first chunk over
     // a high-RTT relay is establishing, not stalled).
@@ -699,6 +713,13 @@ impl Transport for DataChannelTransport {
 
     fn max_payload(&self) -> usize {
         MAX_DC_PAYLOAD
+    }
+
+    fn heard_ms(&self) -> Option<u64> {
+        if self.is_dead() {
+            return Some(u64::MAX);
+        }
+        Some(now_ms().saturating_sub(self.last_heard.load(std::sync::atomic::Ordering::Relaxed)))
     }
 
     fn idle_ms(&self) -> u64 {
@@ -1930,6 +1951,8 @@ async fn wire_channel(
             // Seed activity at open so a link mid-handshake (no bytes yet) is
             // never falsely treated as idle/supersedable (#28 guard).
             let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
+            // Seeded at open too: a link that just came up has just heard its peer.
+            let last_heard = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
             let first_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
             // L3-over-relay queues, created BEFORE the read loop so the reader
             // owns the inbound sender and the transport owns the receiver.
@@ -1957,12 +1980,19 @@ async fn wire_channel(
                 let dead = dead.clone();
                 let drained = drained.clone();
                 let last_activity = last_activity.clone();
+                let last_heard = last_heard.clone();
                 let first_data = first_data.clone();
                 let peer_id = peer_id.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
-                        match raw.read_data_channel(&mut buf).await {
+                        let read = raw.read_data_channel(&mut buf).await;
+                        if matches!(read, Ok((n, _)) if n > 0) {
+                            // Anything the peer sent, its keepalive included,
+                            // proves it is there (Transport::heard_ms).
+                            last_heard.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        match read {
                             Ok((0, _)) | Err(_) => {
                                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
                                 drained.notify_waiters(); // wake parked senders
@@ -2066,7 +2096,7 @@ async fn wire_channel(
                 }
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport {
-                        raw, drained, dead, last_activity, first_data, answerer: polite,
+                        raw, drained, dead, last_activity, last_heard, first_data, answerer: polite,
                         l3_in: tokio::sync::Mutex::new(l3_in_rx),
                         l3_out: l3_out_tx,
                     });

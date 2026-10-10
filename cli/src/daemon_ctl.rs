@@ -535,15 +535,17 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
         .filter_map(|(pid, link)| {
             let name = link.verified_name.as_deref()?;
             let transport = link.transport.as_ref()?;
-            // `devices` renders "online" from this list, so a link is listed only
-            // while it is FRESH, by the same rule warm reuse applies: alive, and
-            // for a relay link (no QUIC keepalive) not idle past the eviction
-            // window. A relay link to a peer that has gone away (stopped, wiped)
-            // keeps reading `is_alive()` for a while, and that showed the peer as
-            // "online, last seen just now" after it no longer existed.
+            // `devices` renders "online" from this list, so a link is listed
+            // only while its peer is demonstrably there (peer_present): a relay
+            // link to a stopped or wiped peer stays `is_alive()` and kept being
+            // shown "online, last seen just now".
             if !link.trusted
-                || !transport.is_alive()
-                || (!link.direct && transport.idle_ms() >= WARM_RELAY_STALE_MS)
+                || !peer_present(
+                    transport.is_alive(),
+                    link.direct,
+                    transport.heard_ms(),
+                    transport.idle_ms(),
+                )
             {
                 return None;
             }
@@ -563,7 +565,6 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
     req.reply(&json!({ "ok": true, "links": links })).await;
 }
 
-#[cfg(unix)]
 /// A non-direct (relay/WebRTC) link has no QUIC keepalive, so an idle one may be
 /// silently NAT/relay-evicted while `is_alive()`/`is_dead()` still lag (the read
 /// loop hasn't seen the EOF yet). Container/DERP paths evict ~10s; reusing such a
@@ -575,6 +576,25 @@ pub(crate) async fn handle_list_warm(conn: &Conn, req: ctl::Req) {
 /// The net.rs 5s relay keepalive keeps idle_ms under this gate on healthy links;
 /// tripping it means the keepalive stopped, so a fresh establish is the right answer.
 const WARM_RELAY_STALE_MS: u64 = 8_000;
+
+/// Is the PEER on this link demonstrably there right now? What `devices` may
+/// call "online" and what refreshes a device's "last seen". Pure.
+///
+/// `alive` is the transport's own verdict (a direct QUIC link flips it within
+/// its 21 s idle timeout of a peer going silent). `heard_ms` is how long since
+/// the peer last sent anything, where the transport tracks it (relay links):
+/// both ends send a keepalive every 5 s, so past WARM_RELAY_STALE_MS of silence
+/// the peer is gone even though our own keepalive writes keep succeeding. It
+/// used to be judged on `idle_ms`, which those writes stamp, so a relay link to
+/// a SIGSTOPped or wiped peer read as "online (last seen just now)" forever.
+/// Without `heard_ms`, a relay link falls back to the old `idle_ms` rule.
+pub(crate) fn peer_present(alive: bool, direct: bool, heard_ms: Option<u64>, idle_ms: u64) -> bool {
+    alive
+        && match heard_ms {
+            Some(h) => h < WARM_RELAY_STALE_MS,
+            None => direct || idle_ms < WARM_RELAY_STALE_MS,
+        }
+}
 
 #[cfg(unix)]
 /// Resolve `peer` (matched case-insensitively on the PROVEN `verified_name`, the
