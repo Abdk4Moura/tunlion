@@ -311,7 +311,12 @@ pub(crate) async fn up_cmd(
         // the rest used to pass as "same settings" whenever the shell posture
         // matched, and were silently not applied.
         let verdict = already_up_verdict(&shell_policy, &launch, running.as_ref());
-        if verdict != AlreadyUp::Same {
+        // The detached child of a racing `up --detach` lost the election to a
+        // daemon that may not be answering yet, so its settings are unknown and
+        // the verdict would read as a conflict (exit 10, reported by the parent
+        // as a crash). The parent compared settings before spawning; the child
+        // only says "already running".
+        if verdict != AlreadyUp::Same && !headless {
             // Never follow the log here: that blocked forever and silently
             // dropped the flags, so `up --detach --shell` looked like it worked
             // while the daemon went on serving no shell.
