@@ -122,6 +122,39 @@ impl Client {
         }
     }
 
+    /// A client whose websocket rides a loopback TCP pair with NO signaling
+    /// server behind it: emits land in the returned far-end socket, nothing is
+    /// ever read back, and no ack ever arrives (`emit_with_ack` times out to
+    /// `Ok(None)`, the normal "not heard back" outcome).
+    ///
+    /// For tests and harnesses that need a real `Client` value to construct
+    /// connection state (the CLI's `Conn` holds one) without a network or a
+    /// backend. Keep the far end alive for as long as the client is used, or
+    /// emits start failing, which every caller already tolerates.
+    #[doc(hidden)]
+    pub async fn loopback() -> Result<(Client, tokio::net::TcpStream)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (dial, accept) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let dial = dial?;
+        let (far, _) = accept?;
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(dial),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (writer, _reader) = ws.split();
+        Ok((
+            Client {
+                writer: Arc::new(Mutex::new(writer)),
+                next_ack: Arc::new(AtomicU64::new(1)),
+                pending: Arc::new(Mutex::new(HashMap::new())),
+            },
+            far,
+        ))
+    }
+
     /// Close the Socket.IO session and the websocket under it.
     ///
     /// Best effort by design: this runs on paths that are already tearing down,

@@ -1876,6 +1876,14 @@ pub(crate) async fn send_cmd(
                     );
                 }
             }
+            Ev::RetryLink(pid, generation) => {
+                if conn.on_retry_due(&pid, generation).await? {
+                    bail!(
+                        "lost the receiving peer after {} attempts; the partial is kept, re-run the same `tunlion send` to resume",
+                        MAX_ATTEMPTS
+                    );
+                }
+            }
             Ev::GraceExpired(pid, generation) => {
                 if conn.on_stuck(&pid, generation, "lost").await? {
                     bail!(

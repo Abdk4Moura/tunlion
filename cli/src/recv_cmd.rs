@@ -2987,6 +2987,11 @@ pub(crate) async fn recv_cmd(
         }
 
         match ev {
+            // A sid left a channel we watch: forget it from the roster so
+            // warm-hold never dials a departed instance (see on_known_peer_left).
+            Ev::KnownPeerLeft(v) => {
+                conn.on_known_peer_left(&v);
+            }
             // A warm-reuse open found this held link black-holing new streams
             // (zombie: alive at QUIC, dead for data). Drop it so the proactive
             // re-connect forms a fresh, healthy held link and warm-reuse goes
@@ -3169,6 +3174,9 @@ pub(crate) async fn recv_cmd(
                             &name,
                         ));
                     }
+                    // The roster itself: a sid absent from two digests is gone
+                    // even when its known-peer-left was lost.
+                    conn.prune_roster_absent(&channel_present, &present);
                 }
             }
             // C29: a code minted in-session (`pair` typed into up).
@@ -7224,8 +7232,18 @@ pub(crate) async fn recv_cmd(
                     }
                 }
             }
-            Ev::GraceExpired(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
+            // RetryLink: the stuck-link ladder's scheduled retry came due (the
+            // backoff runs on a timer task, never on this loop). Its exhausted
+            // outcome is the same as a lost link's, so it shares the handling.
+            ev @ (Ev::GraceExpired(..) | Ev::RetryLink(..)) => {
+                let exhausted = match ev {
+                    Ev::GraceExpired(pid, generation) => {
+                        conn.on_stuck(&pid, generation, "lost").await?
+                    }
+                    Ev::RetryLink(pid, generation) => conn.on_retry_due(&pid, generation).await?,
+                    _ => false,
+                };
+                if exhausted && paired && !keep_open {
                     sweep_completed_streams(
                         &mut st.by_sid,
                         &conn,

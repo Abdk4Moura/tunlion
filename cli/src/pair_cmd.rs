@@ -1300,6 +1300,9 @@ pub(crate) async fn pair_cmd(
             Ev::GraceExpired(pid, g) => {
                 conn.on_stuck(&pid, g, "lost").await?;
             }
+            Ev::RetryLink(pid, g) => {
+                conn.on_retry_due(&pid, g).await?;
+            }
             Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
             Ev::PeerLeft(v) => {
                 // A faster, friendlier signal than the ceremony budget when it
