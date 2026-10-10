@@ -1872,6 +1872,34 @@ pub fn process_stopped(_pid: u32) -> Option<bool> {
     None
 }
 
+/// Does `pid` name a process that has not exited? A zombie (exited, waiting to
+/// be reaped) has exited. Unlike `process_exe_path` this works for a daemon
+/// whose executable cannot be read (one run from a setcap'd binary is not
+/// dumpable), which `down` must not mistake for gone.
+#[cfg(target_os = "linux")]
+pub fn process_exists(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => !matches!(
+            stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next()),
+            Some("Z" | "X") | None
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn process_exists(pid: u32) -> bool {
+    // Signal 0 checks existence and permission without delivering anything;
+    // EPERM still means the process exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub fn process_exists(pid: u32) -> bool {
+    process_exe_path(pid).is_some()
+}
+
 /// Make `opts` create the file owner-only (0600), whatever the umask. A no-op
 /// on Windows, where the profile ACL already restricts it.
 pub fn owner_only_mode(opts: &mut std::fs::OpenOptions) {

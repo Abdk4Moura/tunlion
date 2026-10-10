@@ -58,11 +58,19 @@ impl Stopped {
 
 /// Is `pid` still the daemon whose executable was `exe`? A pid that died and
 /// was reused by an unrelated process is NOT, so `down` never kills a stranger.
+///
+/// Existence comes first and does not depend on reading the executable: a
+/// daemon run from a setcap'd binary is not dumpable, its `/proc/<pid>/exe`
+/// cannot be read, and treating that as "gone" would print "stopped" over a
+/// live daemon, the exact false success this module exists to remove. The
+/// executable is compared only when both sides can be read.
 fn still_ours(pid: u32, exe: Option<&Path>) -> bool {
+    if !platform::process_exists(pid) {
+        return false;
+    }
     match (platform::process_exe_path(pid), exe) {
         (Some(live), Some(exe)) => crate::same_executable(&live, exe),
-        (Some(_), None) => true,
-        (None, _) => false,
+        _ => true,
     }
 }
 
@@ -171,7 +179,7 @@ pub(crate) fn lock_holder(lock_path: &Path) -> Holder {
     let stopped = |pid: u32| platform::process_stopped(pid) == Some(true);
     let mut last = Holder::Unknown;
     for _ in 0..20 {
-        let recorded = platform::InstanceLock::recorded_owner(lock_path).filter(|p| ours(*p));
+        let recorded = holder_pid(lock_path).filter(|p| ours(*p));
         last = classify(crate::daemon_alive(), recorded, stopped);
         if matches!(last, Holder::Serving(_) | Holder::Stopped(_)) {
             return last;
@@ -187,14 +195,25 @@ pub(crate) fn lock_holder(lock_path: &Path) -> Holder {
 /// is returned; `down` stops it like any other.
 pub(crate) fn orphaned_lock_holder() -> Option<u32> {
     let lock_path = platform::Paths::config_path("up.lock");
-    match platform::InstanceLock::try_acquire(&lock_path) {
-        Ok(None) => {
-            let exe = std::env::current_exe().ok();
-            platform::InstanceLock::recorded_owner(&lock_path)
-                .filter(|p| still_ours(*p, exe.as_deref()))
-        }
-        // Free (we just held and dropped it) or unreadable: nobody to stop.
-        _ => None,
+    let exe = std::env::current_exe().ok();
+    holder_pid(&lock_path).filter(|p| still_ours(*p, exe.as_deref()))
+}
+
+/// The pid holding the election lock at `lock_path`, read without taking it.
+/// The kernel's answer (/proc/locks) where there is one; elsewhere the pid the
+/// holder recorded in the lock file, trusted only while the lock is held.
+fn holder_pid(lock_path: &Path) -> Option<u32> {
+    match platform::instance_lock_holder(lock_path) {
+        platform::LockHolder::Held(Some(pid)) => Some(pid),
+        platform::LockHolder::Free => None,
+        platform::LockHolder::Held(None) => platform::InstanceLock::recorded_owner(lock_path),
+        // The platform cannot say who holds it. Ask the lock itself: if it can
+        // be taken nobody holds it (we drop it at once); if not, the holder's
+        // own record names it.
+        platform::LockHolder::Unknown => match platform::InstanceLock::try_acquire(lock_path) {
+            Ok(None) => platform::InstanceLock::recorded_owner(lock_path),
+            _ => None,
+        },
     }
 }
 
