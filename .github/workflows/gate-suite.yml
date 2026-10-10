@@ -78,6 +78,16 @@ jobs:
 
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Fall back to uncached builds if the cache backend is down
+        shell: bash
+        run: |
+          # The Actions cache backend can refuse service ("Egress is over the
+          # account limit"), and with RUSTC_WRAPPER=sccache every compile then
+          # fails. A slower uncached build beats a red job that tested nothing.
+          if ! sccache --start-server >/dev/null 2>&1 && ! sccache --show-stats >/dev/null 2>&1; then
+            echo "::warning::sccache unavailable; building without it"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
