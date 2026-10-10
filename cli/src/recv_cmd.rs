@@ -852,7 +852,8 @@ pub(crate) async fn recv_cmd(
     // (`recv` vs `pair`) decides whether the agreed secret is discarded or kept.
     // So `recv` no longer redirects a 4-digit code away (the old width-based
     // hint is obsolete); any well-formed code is a valid claim here.
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Owner-only: peers write here (platform::create_inbox_dir).
+    crate::platform::create_inbox_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     // P2 (GAP-2): `mut` so the long-lived acceptor's outer reconnect loop can

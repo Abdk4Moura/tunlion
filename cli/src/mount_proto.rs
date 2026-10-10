@@ -928,7 +928,7 @@ fn do_open(root: &PathBuf, path: &str, flags: i32, open_files: &mut HashMap<u64,
         Ok(r) => r.to_path_buf(),
         Err(_) => return Err(MountError { code: EACCES, msg: "path not beneath root".into() }),
     };
-    let file = safe_open_beneath(root, &rel, flags, false)
+    let file = safe_open_beneath(root, &rel, flags, false, 0o644)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     let fh = *next_fh;
     *next_fh += 1;
@@ -948,7 +948,7 @@ fn do_create(root: &PathBuf, path: &str, mode: u32, flags: i32, open_files: &mut
     // (on non-Unix, safe_open_beneath's fallback does not consume POSIX creation
     // flags: Windows mounts go through WinFsp, where this is not the create surface).
     let create_flags = crate::platform::fs_at::create_excl_flags(flags);
-    let file = safe_open_beneath(root, &rel, create_flags, false)
+    let file = safe_open_beneath(root, &rel, create_flags, false, 0o644)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     // The mode is applied through the handle we just created (a path could
     // have been swapped for a symlink since), and only its permission bits:
@@ -1078,7 +1078,7 @@ fn do_truncate(root: &PathBuf, path: &str, size: u64) -> Result<Value, MountErro
     // #148: truncate FOLLOWS its target, so unlike the four name-ops it is an
     // open. Reuse safe_open_beneath unchanged: on Linux RESOLVE_BENEATH
     // refuses (EXDEV) any component that resolves outside the root.
-    let file = safe_open_beneath(root, rel, O_WRONLY, false)
+    let file = safe_open_beneath(root, rel, O_WRONLY, false, 0o644)
         .map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     file.set_len(size).map_err(|e| MountError { code: e.raw_os_error().unwrap_or(EIO), msg: e.to_string() })?;
     Ok(Value::Null)
@@ -1148,7 +1148,7 @@ fn open_file(path: &std::path::Path, flags: i32) -> std::io::Result<std::fs::Fil
 /// directory cannot plant a symlink that redirects an incoming transfer within
 /// that directory).
 #[cfg(unix)]
-pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool) -> std::io::Result<std::fs::File> {
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool, create_mode: u32) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // On Linux 5.6+, use openat2 with RESOLVE_BENEATH for strictest enforcement.
@@ -1177,11 +1177,12 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
         // mode is non-zero without one of them. libc::O_TMPFILE includes the
         // O_DIRECTORY bit, so `flags & O_TMPFILE != 0` is true for every directory
         // open; require the FULL O_TMPFILE bit set instead so a plain directory
-        // open keeps mode 0. Set 0o644 for creates (matching the non-Linux
-        // fallback), 0 otherwise (e.g. the O_WRONLY resume open).
+        // open keeps mode 0. Creates take the caller's `create_mode` (the mount
+        // server passes 0o644, the .part writers 0o600 so a partial is
+        // owner-only), 0 otherwise (e.g. the O_WRONLY resume open).
         let creating = (flags & libc::O_CREAT) != 0
             || (flags & libc::O_TMPFILE) == libc::O_TMPFILE;
-        how.mode = if creating { 0o644 } else { 0 };
+        how.mode = if creating { u64::from(create_mode) } else { 0 };
         // Mount path allows symlinks beneath the root (legitimate content);
         // the .part writers add NO_SYMLINKS so the final component can never
         // be a symlink planted inside the download directory.
@@ -1282,7 +1283,7 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
                     }
 
                     let fd = unsafe {
-                        libc::openat(current.as_raw_fd(), name_cstr.as_ptr(), walk_flags, 0o644)
+                        libc::openat(current.as_raw_fd(), name_cstr.as_ptr(), walk_flags, create_mode as libc::c_uint)
                     };
                     if fd < 0 {
                         return Err(std::io::Error::last_os_error());
@@ -1312,8 +1313,10 @@ pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, fla
 }
 
 #[cfg(not(unix))]
-pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool) -> std::io::Result<std::fs::File> {
-    // Non-Unix fallback: canonicalize + starts_with (no TOCTOU guarantee)
+pub fn safe_open_beneath(root: &std::path::Path, rel_path: &std::path::Path, flags: i32, deny_symlinks: bool, create_mode: u32) -> std::io::Result<std::fs::File> {
+    // Non-Unix fallback: canonicalize + starts_with (no TOCTOU guarantee).
+    // There are no POSIX modes here; the file takes the directory's ACL.
+    let _ = create_mode;
     let full = root.join(rel_path);
     // deny_symlinks callers (the .part writers) bypass this fallback on their
     // native arms, but refuse a reparse point here too so the property holds

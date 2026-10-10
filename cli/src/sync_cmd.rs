@@ -285,6 +285,11 @@ struct Report {
     /// Where the files landed on the peer, as the peer reported it in its
     /// ack (absolute). `None` from an older peer that does not say.
     dest: Option<String>,
+    /// Files on the device that the local directory does not have, left in
+    /// place because `--delete` was not given. Counted so the summary can say
+    /// so: sync is a one-way update, and a deletion on the source that is not
+    /// carried over must not pass silently.
+    kept_on_peer: u64,
 }
 impl Report {
     fn line(&mut self, state: &'static str, p: &str, bytes: u64, reason: Option<&str>) {
@@ -318,7 +323,7 @@ pub(crate) async fn run(
     relay: bool,
     opts: SyncOpts,
 ) -> i32 {
-    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new(), dest: None };
+    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new(), dest: None, kept_on_peer: 0 };
     match sync_inner(server, local, peer, remote_dir, relay, &opts, &mut rep).await {
         Ok(total) => {
             let partial = rep.counts.get("failed").copied().unwrap_or(0) > 0;
@@ -331,6 +336,7 @@ pub(crate) async fn run(
                 for (k, v) in &rep.counts {
                     d[k] = json!(v);
                 }
+                d["only_on_peer"] = json!(rep.kept_on_peer);
                 println!("{}", json!({ "ok": !partial, "verb": "sync", "data": d }));
             } else {
                 let c = |k: &str| rep.counts.get(k).copied().unwrap_or(0);
@@ -358,6 +364,9 @@ pub(crate) async fn run(
                     if opts.dry_run { "would land in" } else { "on" },
                     sync_destination(peer, remote_dir, rep.dest.as_deref())
                 ));
+                if let Some(line) = kept_on_peer_line(rep.kept_on_peer, peer) {
+                    ui::say(&line);
+                }
             }
             exit
         }
@@ -377,6 +386,19 @@ pub(crate) async fn run(
             exit
         }
     }
+}
+
+/// The honest end of a sync without `--delete`: files that exist only on the
+/// device were left there. A first-time-user test deleted a file locally,
+/// re-ran sync, and saw nothing say that the device still had it.
+fn kept_on_peer_line(n: u64, peer: &str) -> Option<String> {
+    (n > 0).then(|| {
+        format!(
+            "  {n} file{} exist{} only on '{peer}' (not deleted; use --delete to remove)",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "s" } else { "" },
+        )
+    })
 }
 
 async fn sync_inner(
@@ -511,6 +533,9 @@ async fn sync_inner(
             rep.line("failed", &n.p, bytes, Some(ack["err"].as_str().unwrap_or("receiver refused the file")));
         }
     }
+    if !opts.delete {
+        rep.kept_on_peer = plan.extra.len() as u64;
+    }
     if opts.delete && !plan.extra.is_empty() {
         if opts.dry_run {
             for p in &plan.extra {
@@ -600,7 +625,8 @@ pub(crate) fn resolve_root(drop_dir: &Path, req: &str, create: bool) -> Result<P
     if !create && !target.exists() {
         return Ok(target);
     }
-    std::fs::create_dir_all(&target).map_err(|e| format!("cannot create remote dir: {e}"))?;
+    crate::platform::create_content_dirs(drop_dir, &target)
+        .map_err(|e| format!("cannot create remote dir: {e}"))?;
     if !crate::path_within_canonical(drop_dir, &target) {
         return Err(outside());
     }
@@ -763,7 +789,7 @@ fn bound_parent(root: &Path, parent: &Path) -> Result<()> {
     if !crate::path_within_canonical(root, &probe) {
         bail!("path escapes the remote dir");
     }
-    std::fs::create_dir_all(parent)?;
+    crate::platform::create_content_dirs(root, parent)?;
     if !crate::path_within_canonical(root, parent) {
         bail!("path escapes the remote dir");
     }
@@ -1026,6 +1052,19 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn files_left_on_the_peer_are_reported_not_silent() {
+        assert_eq!(kept_on_peer_line(0, "box"), None);
+        assert_eq!(
+            kept_on_peer_line(1, "box").as_deref(),
+            Some("  1 file exists only on 'box' (not deleted; use --delete to remove)")
+        );
+        assert_eq!(
+            kept_on_peer_line(3, "box").as_deref(),
+            Some("  3 files exist only on 'box' (not deleted; use --delete to remove)")
+        );
     }
 
     /// `sync --delete` must use the same containment as the writes: a

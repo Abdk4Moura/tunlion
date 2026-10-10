@@ -103,6 +103,11 @@ pub async fn expose_cmd(
         target,
         scope_str(&peers),
     ));
+    // Without a TUN, peers reach this port as <this-device>.mesh through their
+    // SOCKS proxy, and this side reaches theirs the same way; say how.
+    if let Some(p) = crate::proxy_state::current() {
+        ui::say(&crate::proxy_state::mesh_hint(&p));
+    }
     notify_daemon().await;
     Ok(())
 }
