@@ -113,6 +113,12 @@ pub struct Attempt {
     /// the JSONL records, WITHOUT re-parsing the file. `doctor` is the consumer;
     /// the live connect paths simply never read it. Ordered by completion.
     timings: Vec<PhaseTiming>,
+    /// Also POST each event to the server's telemetry endpoint. The l2 bring-up
+    /// always has; a span opened with `new_local` (a `send`) stays on this
+    /// machine, in the JSONL `doctor` reads, and adds no network traffic.
+    beacon: bool,
+    /// Terminal event already emitted (`up` or `fail`).
+    finished: bool,
 }
 
 /// One completed phase of a connect span: which phase, how long it took, and
@@ -147,9 +153,39 @@ impl Attempt {
             phase: Phase::Signaling,
             phase_at: now,
             timings: Vec::new(),
+            beacon: true,
+            finished: false,
         };
         a.emit("start", json!({ "phase": a.phase.name() }));
         a
+    }
+
+    /// A span recorded only in the local JSONL (no telemetry POST). `send`
+    /// opens one per known-device transfer so `tunlion doctor` (no device)
+    /// sees those connects too: it said "no recorded connect attempts yet"
+    /// after several sends, because only the shell/exec/forward bring-up
+    /// recorded spans.
+    pub fn new_local(peer_hash: &str, role: &'static str) -> Attempt {
+        let now = Instant::now();
+        let a = Attempt {
+            id: correlation_id(),
+            server: String::new(),
+            peer: peer_hash.to_string(),
+            role,
+            start: now,
+            phase: Phase::Signaling,
+            phase_at: now,
+            timings: Vec::new(),
+            beacon: false,
+            finished: false,
+        };
+        a.emit("start", json!({ "phase": a.phase.name() }));
+        a
+    }
+
+    /// Has this span ended (`up` or `fail` emitted)?
+    pub fn finished(&self) -> bool {
+        self.finished
     }
 
     /// Transition into `next`: records the time spent in the phase we are leaving
@@ -178,6 +214,7 @@ impl Attempt {
     /// span time and the route/transport labels (e.g. route "direct"/"relayed",
     /// transport "direct-quic"/"datachannel").
     pub fn up(&mut self, route: &str, transport: &str) {
+        self.finished = true;
         let now = Instant::now();
         // Record the duration of the phase we are leaving (typically L2Open) so
         // the ladder has its final rung; Up itself is the steady state, no timing.
@@ -203,6 +240,7 @@ impl Attempt {
     /// Terminal failure: the overall deadline expired or an error ended the
     /// bring-up. Records the phase we died in and the total span time.
     pub fn fail(&mut self, reason: &str) {
+        self.finished = true;
         let total_ms = self.start.elapsed().as_millis() as u64;
         self.emit(
             "fail",
@@ -250,7 +288,9 @@ impl Attempt {
         obj.insert("peer".into(), json!(self.peer));
         obj.insert("id".into(), json!(self.id));
         write_jsonl(&fields);
-        beacon(&self.server, fields);
+        if self.beacon {
+            beacon(&self.server, fields);
+        }
     }
 }
 
@@ -656,5 +696,30 @@ mod tests {
         assert!(!secret.contains(&h));
         // Stable: same secret -> same hash.
         assert_eq!(h, peer_hash_from_secret(secret));
+    }
+}
+
+#[cfg(test)]
+mod local_span_tests {
+    /// A `send` span is local (no telemetry runtime needed) and lands in the
+    /// history `doctor` (no device) prints: it said "no recorded connect
+    /// attempts yet" after several sends.
+    #[test]
+    fn a_local_span_is_counted_by_the_doctor_history() {
+        let _guard = crate::tests::lock_test_config();
+        let dir = std::env::temp_dir().join(format!("fil-diag-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let mut ok = super::Attempt::new_local("abcdef0123", "send");
+        ok.enter(super::Phase::Presence);
+        ok.up("relayed", "datachannel");
+        assert!(ok.finished());
+        let mut bad = super::Attempt::new_local("abcdef0123", "send");
+        assert!(!bad.finished());
+        bad.fail("offline");
+        let h = super::summarize(10);
+        assert_eq!((h.considered, h.ups, h.fails), (2, 1, 1));
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

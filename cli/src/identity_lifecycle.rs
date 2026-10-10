@@ -640,13 +640,64 @@ pub(crate) fn store_provisional_identity(
     peer_cert: &identity::DeviceCert,
 ) -> Result<()> {
     let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
+    let now = identity::now_secs();
+    // Collect what earlier sessions left behind before adding one more. Each
+    // code-based transfer writes `provisional_peer-<session id>.json` (a peer's
+    // device key, certificate and user key) and nothing ever read it back
+    // under that name, so one file per transfer piled up forever.
+    if let Some(dir) = p.parent() {
+        sweep_stale_provisional(dir, now);
+    }
     let data = json!({
         "name": name,
         "deviceCert": peer_cert.to_json(),
-        "storedAt": identity::now_secs()
+        "storedAt": now
     });
     crate::platform::SecretFile::write_str(&p, &serde_json::to_string_pretty(&data)?)?;
     Ok(())
+}
+
+/// How long a provisional identity is worth keeping. It exists to bridge one
+/// session's identity proof to that session's overlay announcement, which
+/// follows within seconds; an hour is generous.
+pub(crate) const PROVISIONAL_TTL_SECS: u64 = 3600;
+
+/// Remove provisional identity records under `dir` older than
+/// PROVISIONAL_TTL_SECS (by their `storedAt`, or the file's mtime when that is
+/// unreadable). Returns how many were removed. Best effort: a file that cannot
+/// be removed is left for the next sweep or `tunlion reset`.
+pub(crate) fn sweep_stale_provisional(dir: &std::path::Path, now: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let is_provisional = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("provisional_") && n.ends_with(".json"));
+        if !is_provisional {
+            continue;
+        }
+        let stored_at = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|v| v["storedAt"].as_u64())
+            .or_else(|| {
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+            })
+            .unwrap_or(0);
+        if now.saturating_sub(stored_at) >= PROVISIONAL_TTL_SECS && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 pub(crate) fn load_provisional_identity(name: &str) -> Option<identity::DeviceCert> {
@@ -659,4 +710,32 @@ pub(crate) fn load_provisional_identity(name: &str) -> Option<identity::DeviceCe
 pub(crate) fn clear_provisional_identity(name: &str) {
     let p = crate::platform::Paths::config_path(format!("provisional_{}.json", name));
     let _ = std::fs::remove_file(&p);
+}
+
+#[cfg(test)]
+mod provisional_sweep_tests {
+    use super::{PROVISIONAL_TTL_SECS, sweep_stale_provisional};
+
+    #[test]
+    fn stale_provisional_identities_are_collected_and_fresh_ones_kept() {
+        let dir = std::env::temp_dir().join(format!("fil-prov-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 10_000_000u64;
+        let write = |name: &str, at: u64| {
+            std::fs::write(
+                dir.join(format!("provisional_{name}.json")),
+                serde_json::json!({"name": name, "storedAt": at}).to_string(),
+            )
+            .unwrap();
+        };
+        write("peer-old", now - PROVISIONAL_TTL_SECS - 1);
+        write("peer-older", 1);
+        write("peer-fresh", now - 5);
+        std::fs::write(dir.join("devices.json"), b"[]").unwrap();
+        assert_eq!(sweep_stale_provisional(&dir, now), 2);
+        assert!(dir.join("provisional_peer-fresh.json").exists(), "a live session keeps its record");
+        assert!(!dir.join("provisional_peer-old.json").exists());
+        assert!(dir.join("devices.json").exists(), "only provisional records are swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

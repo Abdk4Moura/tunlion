@@ -3292,13 +3292,15 @@ pub(crate) async fn recv_cmd(
                         channel_digest_absent.remove(&pid);
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         conn.drop_link(&pid);
-                        ui::say(&conn.roster(
-                            &pid,
-                            "○",
-                            ui::Tone::Dim,
-                            "left (channel digest reconcile), still listening",
-                            &name,
-                        ));
+                        // A stale duplicate of a peer that is still linked is
+                        // housekeeping, not a departure: it printed "ok alpha
+                        // ○ alpha left (channel digest reconcile), still listening", one
+                        // peer both present and gone, with an internal reason.
+                        if crate::conn::departure_is_news(&name, conn.links.values().map(|l| l.name.as_str())) {
+                            ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left, still listening", &name));
+                        } else {
+                            ui::debug(&format!("dropped a stale duplicate link to '{name}' (channel digest reconcile)"));
+                        }
                     }
                     let peers = roster.peers;
                     digest_alone = peers.is_empty();
@@ -3346,13 +3348,15 @@ pub(crate) async fn recv_cmd(
                         digest_absent.remove(&pid);
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         conn.drop_link(&pid);
-                        ui::say(&conn.roster(
-                            &pid,
-                            "○",
-                            ui::Tone::Dim,
-                            "left (digest reconcile), still listening",
-                            &name,
-                        ));
+                        // A stale duplicate of a peer that is still linked is
+                        // housekeeping, not a departure: it printed "ok alpha
+                        // ○ alpha left (digest reconcile), still listening", one
+                        // peer both present and gone, with an internal reason.
+                        if crate::conn::departure_is_news(&name, conn.links.values().map(|l| l.name.as_str())) {
+                            ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left, still listening", &name));
+                        } else {
+                            ui::debug(&format!("dropped a stale duplicate link to '{name}' (digest reconcile)"));
+                        }
                     }
                     // The roster itself: a sid absent from two digests is gone
                     // even when its known-peer-left was lost.

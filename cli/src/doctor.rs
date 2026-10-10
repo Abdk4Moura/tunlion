@@ -581,7 +581,7 @@ fn preflight_result(sig: &std::result::Result<u64, String>) -> Result<()> {
 
 fn print_history(h: &diag::Summary) {
     if h.considered == 0 {
-        println!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (run `tunlion doctor <device>` or connect once)"));
+        println!("  {}", ui::paint(Tone::Dim, "no recorded connect attempts yet (send, shell, exec and forward to a known device record them; `tunlion doctor <device>` measures one now)"));
         return;
     }
     println!("  attempts     {}", h.considered);

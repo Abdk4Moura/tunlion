@@ -575,6 +575,17 @@ pub(crate) async fn send_cmd(
             return Err(exit_codes::err(ExitKind::Denied, why));
         }
     }
+    // A connect span for `doctor`'s history (local JSONL only, no telemetry
+    // POST). Closed as `up` when the channel to the target opens; any other
+    // way out of this function records it as failed (SendSpan's Drop).
+    let mut send_span = SendSpan(
+        known_target
+            .as_ref()
+            .map(|(_, sec)| crate::diag::Attempt::new_local(&crate::diag::peer_hash_from_secret(sec), "send")),
+    );
+    if let Some(a) = send_span.0.as_mut() {
+        a.enter(crate::diag::Phase::Presence);
+    }
     if let Some((n, sec)) = &known_target {
         ui::say(&format!(
             "  waiting for known device {}",
@@ -1368,6 +1379,13 @@ pub(crate) async fn send_cmd(
                 // Bug 6: a live channel to the active peer disarms the
                 // establishment timeout, the rest of the transfer is unbounded.
                 established = true;
+                if let Some(a) = send_span.0.as_mut().filter(|a| !a.finished()) {
+                    let direct = conn.link(&pid).is_some_and(|l| l.direct);
+                    a.up(
+                        if direct { "direct" } else { "relayed" },
+                        if direct { "direct-quic" } else { "datachannel" },
+                    );
+                }
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 // Fleet target: present our certificate and demand theirs before
                 // anything is offered. Fails closed, including on a transport with
@@ -2854,6 +2872,19 @@ mod revoked_send_tests {
         for cmd in ["tunlion devices restore p9-b", "tunlion devices forget p9-b"] {
             let argv: Vec<&str> = cmd.split_whitespace().collect();
             assert!(crate::Cli::try_parse_from(&argv).is_ok(), "{cmd}");
+        }
+    }
+}
+
+/// The connect span of one `send` to a known device. A send that returns
+/// before its channel opened (offline, timed out, refused) records `fail`
+/// when this drops, so `doctor`'s history counts it.
+struct SendSpan(Option<crate::diag::Attempt>);
+
+impl Drop for SendSpan {
+    fn drop(&mut self) {
+        if let Some(a) = self.0.as_mut().filter(|a| !a.finished()) {
+            a.fail("send ended before a channel to the device opened");
         }
     }
 }

@@ -253,6 +253,18 @@ pub(crate) fn devices_info(name: &str) -> Option<(u64, Option<String>, Option<St
 /// The tier no longer changes the sentence, because the tier does not change
 /// the fact. If renewal is ever built, this is where the distinction earns its
 /// way back, and not before.
+/// What a roster row says about a sibling. A roster entry under THIS
+/// device's own name but another key is this device before a reset: the owner
+/// still lists the old key until it forgets it. It was shown as an ordinary
+/// sibling ("p9-b  known via owner") on p9-b itself. Pure.
+pub(crate) fn roster_row_label(petname: &str, my_name: &str) -> &'static str {
+    if !my_name.is_empty() && petname.eq_ignore_ascii_case(my_name) {
+        "a previous identity of this device (the owner can forget it)"
+    } else {
+        "known via owner"
+    }
+}
+
 pub(crate) fn device_countdown(
     _tier: fleet_ui::devices::DeviceTier,
     cert: Option<&identity::DeviceCert>,
@@ -271,7 +283,13 @@ pub(crate) fn device_countdown(
             .unwrap_or_else(|| "expired".to_string());
         return format!("expired {date}");
     }
-    format!("expires in {}", remaining_span(cert.expires - now))
+    // "cert expires in", the words the delegated rows use for the same clock
+    // (status_cmd::deadline_text). One device's row read "expires in 90d" and
+    // the other's "30d left (cert expires)" for the same kind of fact. Both
+    // terms are real: this device's certificate from the owner runs out then.
+    // An owner's own devices are certified for 90 days and renewed; a device
+    // that joined by invitation is certified for the term its invitation set.
+    format!("cert expires in {}", remaining_span(cert.expires - now))
 }
 
 /// A time remaining (`secs` until something expires), rounded UP to the
@@ -431,6 +449,7 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                 .and_then(|r| r["devices"].as_array().cloned())
                 .map(|arr| {
                     let self_pub = crate::overlay::overlay_pubkey_bytes().ok();
+                    let my_name = crate::display_name();
                     arr.into_iter()
                         .filter_map(move |d| {
                             let name = d["petname"].as_str()?.to_string();
@@ -451,11 +470,12 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
                                     }
                                 }
                             }
+                            let caps_summary = roster_row_label(&name, &my_name).to_string();
                             Some(fleet_ui::devices::DeviceEntry {
                                 name,
                                 tier: fleet_ui::devices::DeviceTier::MeshRoster,
                                 online: None, // unknown liveness (#217), never idle/offline
-                                caps_summary: "known via owner".to_string(),
+                                caps_summary,
                                 countdown: String::new(),
                                 last_seen: None,
                             })
@@ -483,5 +503,18 @@ mod span_tests {
         assert_eq!(remaining_span(3600 * 5 - 1), "5h");
         assert_eq!(remaining_span(61), "2m");
         assert_eq!(remaining_span(59), "59s");
+    }
+}
+
+#[cfg(test)]
+mod roster_row_label_tests {
+    use super::roster_row_label;
+
+    #[test]
+    fn this_devices_old_key_is_named_as_such() {
+        assert!(roster_row_label("p9-b", "p9-b").contains("previous identity of this device"));
+        assert!(roster_row_label("P9-B", "p9-b").contains("previous identity"));
+        assert_eq!(roster_row_label("alpha", "p9-b"), "known via owner");
+        assert_eq!(roster_row_label("alpha", ""), "known via owner");
     }
 }
