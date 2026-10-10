@@ -422,11 +422,11 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     // SSH CA trust (sshd side of `shell --ssh`). Human-facing row, so
     // ui::say (not bare println!: the print ratchet counts those).
     match &sshca {
-        Ok(()) => ui::say(&format!(
+        Ok(how) => ui::say(&format!(
             "  {:<13} {}  {}",
             "sshd-ca",
             ui::paint(Tone::Ok, "trusted CA configured"),
-            ui::paint(Tone::Dim, "TrustedUserCAKeys + principals present"),
+            ui::paint(Tone::Dim, how),
         )),
         Err(e) => ui::say(&format!(
             "  {:<13} {}  {}",
@@ -709,7 +709,7 @@ fn preflight_json(
     ice: &IceResult,
     ifaces: &[Iface],
     history: &diag::Summary,
-    sshca: &std::result::Result<(), String>,
+    sshca: &std::result::Result<String, String>,
 ) -> Value {
     let sig_json = match sig {
         Ok(ms) => json!({ "reachable": true, "round_trip_ms": ms }),
@@ -721,7 +721,7 @@ fn preflight_json(
         IceResult::Failed(e) => json!({ "works": false, "error": e }),
     };
     let sshca_json = match sshca {
-        Ok(()) => json!({ "configured": true }),
+        Ok(how) => json!({ "configured": true, "detail": how }),
         Err(e) => json!({ "configured": false, "detail": e }),
     };
     json!({
