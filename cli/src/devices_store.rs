@@ -223,7 +223,7 @@ pub(crate) fn name_pinned_by_other(name: &str, device_pub_hex: &str) -> bool {
 ///   That is what a `pair-intro` or `pair-keep` naming an existing device did.
 ///
 /// Both are refused unless the caller holds `allow_reanchor`, the explicit
-/// owner decision (an owner-run `tunlion pair`, joining under an owner-signed
+/// owner decision (an owner-run `tunlion add`, joining under an owner-signed
 /// invitation, re-enrolling the same key). Writing the SAME secret back is not
 /// a re-key and passes. A network-driven write that wants a record must create
 /// a NEW one: see `devices_store_new`.
@@ -254,7 +254,7 @@ pub(crate) fn refuse_unowned_rewrite(
     if let Some(s) = secret {
         if existing["secret"].as_str() != Some(s) {
             anyhow::bail!(
-                "refusing to re-key record '{name}': a new pair secret for an existing device needs an owner re-pair (`tunlion pair`)"
+                "refusing to re-key record '{name}': a new pair secret for an existing device needs an owner re-pair (`tunlion add {name}` on the owner device)"
             );
         }
     }
