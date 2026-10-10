@@ -1374,10 +1374,29 @@ pub fn extract_archive(path: &Path, into: &Path) -> Result<usize> {
         if written > max_files || total > max_bytes {
             bail!("archive exceeds extract limits ({written} files / {total} bytes); extract it manually");
         }
+        // Where unpack_in puts it, for the mode below (it strips any `..` and
+        // leading `/`, and refuses what would leave `into`).
+        let rel = e.path().ok().map(|p| p.into_owned());
+        let executable = e.header().mode().map(|m| m & 0o111 != 0).unwrap_or(false);
         // unpack_in refuses to write outside `into` (returns Ok(false) on a
         // crafted `..`/absolute path); that is our zip-slip guard.
         match e.unpack_in(into) {
-            Ok(true) => written += 1,
+            Ok(true) => {
+                written += 1;
+                // An extracted entry takes the mode a received file takes
+                // (0644, or 0755 for a directory or an executable, under the
+                // umask), never the SENDER's: tar kept the archive's bits, so
+                // a file that was 0600 on the sender landed 0600 here while
+                // every plain received file was 0644.
+                if let Some(rel) = rel.as_deref() {
+                    let landed = into.join(rel);
+                    if et.is_dir() {
+                        let _ = crate::platform::publish_received_path(&landed, true);
+                    } else if et.is_file() {
+                        let _ = crate::platform::publish_received_path(&landed, executable);
+                    }
+                }
+            }
             Ok(false) => skipped += 1,
             Err(_) => skipped += 1,
         }
@@ -1586,6 +1605,45 @@ mod tests {
             assert_eq!(n, 1, "only the safe entry is written");
             assert!(into.join("bundle/ok.txt").exists());
             assert!(!config_dir().join("escape.txt").exists(), "traversal blocked");
+        });
+    }
+
+    /// Received files were "sometimes 644 and sometimes 600": auto-extract
+    /// kept the SENDER's modes from the archive, while every plain received
+    /// file got 0644 under the umask. Extracted entries now get exactly what a
+    /// received file gets (0755 for a directory or an executable).
+    #[test]
+    fn extracted_entries_take_the_received_file_mode_not_the_senders() {
+        with_tmp_cfg(|| {
+            let src = config_dir().join("modes.tar");
+            {
+                let mut b = tar::Builder::new(std::fs::File::create(&src).unwrap());
+                for (name, mode) in [("pkg/secret.txt", 0o600u32), ("pkg/run.sh", 0o750)] {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_size(3);
+                    h.set_mode(mode);
+                    h.set_cksum();
+                    b.append_data(&mut h, name, &b"abc"[..]).unwrap();
+                }
+                b.finish().unwrap();
+            }
+            let into = config_dir().join("x");
+            assert_eq!(extract_archive(&src, &into).unwrap(), 2);
+            // What this process's umask makes of a plain create, for reference.
+            let probe = config_dir().join("probe");
+            std::fs::File::create(&probe).unwrap();
+            std::fs::create_dir(config_dir().join("probe.d")).unwrap();
+            let (Some(plain), Some(dir)) = (
+                crate::platform::file_mode(&probe),
+                crate::platform::file_mode(&config_dir().join("probe.d")),
+            ) else {
+                return; // no POSIX modes on this platform
+            };
+            let received = plain & 0o644;
+            let secret = crate::platform::file_mode(&into.join("pkg/secret.txt")).unwrap();
+            let run = crate::platform::file_mode(&into.join("pkg/run.sh")).unwrap();
+            assert_eq!(secret & 0o777, received, "got {secret:o}");
+            assert_eq!(run & 0o777, received | (dir & 0o111), "got {run:o}");
         });
     }
 

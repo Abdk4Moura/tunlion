@@ -378,6 +378,27 @@ pub fn publish_received_file(file: &std::fs::File) -> std::io::Result<()> {
     fs_at::set_mode_via_handle(file, 0o644 & !process_umask())
 }
 
+/// The same received-file mode for something auto-extract just created at
+/// `path` (never a symlink: extraction skips links and never overwrites):
+/// 0644 under the umask, or 0755 for a directory or an executable. Windows:
+/// nothing to set.
+pub fn publish_received_path(path: &Path, executable: bool) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Ok(());
+        }
+        let base = if executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(base & !process_umask()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, executable);
+        Ok(())
+    }
+}
+
 /// The process umask. Linux reads it from /proc/self/status (no side effect);
 /// other unix learns it once by the set-and-restore dance, cached so the brief
 /// swap happens at most once per process. Non-unix: 0 (unused).

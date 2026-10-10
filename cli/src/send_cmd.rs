@@ -246,7 +246,8 @@ pub(crate) async fn send_cmd(
         if p == "-" {
             let spool = SpoolDir::path_in(&mut spool_dir, "stdin")?;
             let mut f = SpoolDir::create(&spool)?;
-            let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
+            let n = spool_copy(&mut std::io::stdin().lock(), &mut f)
+                .map_err(|(written, e)| spool_error("stdin", &spool, written, e))?;
             drop(f);
             let head = head_hash(&spool);
             let full = full_hash(&spool);
@@ -290,8 +291,11 @@ pub(crate) async fn send_cmd(
                 {
                     let f = SpoolDir::create(&spool)?;
                     let mut b = tar::Builder::new(f);
-                    b.append_dir_all(&dirname, &path)?;
-                    b.finish()?;
+                    let packed = b.append_dir_all(&dirname, &path).and_then(|()| b.finish());
+                    if let Err(e) = packed {
+                        let written = std::fs::metadata(&spool).map(|m| m.len()).unwrap_or(0);
+                        return Err(spool_error(&format!("the directory {p}"), &spool, written, e));
+                    }
                 }
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
@@ -2066,6 +2070,58 @@ pub(crate) async fn send_cmd(
     }
 }
 
+/// Copy `from` into the spool file, returning the bytes written, or the bytes
+/// written so far with the error: a full spool is reported with how far it got.
+fn spool_copy(
+    from: &mut impl std::io::Read,
+    to: &mut impl std::io::Write,
+) -> std::result::Result<u64, (u64, std::io::Error)> {
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut written = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err((written, e)),
+        };
+        to.write_all(&buf[..n]).map_err(|e| (written, e))?;
+        written += n as u64;
+    }
+    to.flush().map_err(|e| (written, e))?;
+    Ok(written)
+}
+
+/// The error for staging `what` into the spool file `spool`. A send of stdin
+/// is STAGED IN FULL before anything is offered, because the offer carries the
+/// whole file's size and SHA-256 (the receiver checks both, and resumes by
+/// them); it cannot be streamed. So a 30 MB `head -c ... | tunlion send -`
+/// on a 16 MB /tmp failed in 23 ms with only "No space left on device (os
+/// error 28)", which named neither the disk that filled nor why it was used.
+/// This names both and the fix: TMPDIR on a disk with room.
+fn spool_error(what: &str, spool: &std::path::Path, written: u64, e: std::io::Error) -> anyhow::Error {
+    let dir = spool.parent().unwrap_or(spool);
+    let full = matches!(
+        e.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    );
+    if !full {
+        return anyhow::Error::new(e).context(format!(
+            "could not stage {what} for sending in the local temp spool at {}",
+            dir.display()
+        ));
+    }
+    anyhow::anyhow!(
+        "could not stage {what} for sending: the local temp spool at {} ran out of space after {} ({e}). \
+         tunlion stages it in full before offering it, because the offer carries its size and SHA-256, \
+         so the temp directory needs room for all of it. Point TMPDIR at a directory on a disk with \
+         room, for example:  TMPDIR=/var/tmp tunlion send - ...  (or send a file path instead of stdin, \
+         which is read in place and needs no staging)",
+        dir.display(),
+        crate::human(written)
+    )
+}
+
 /// Private staging directory for `send -` and directory sends, removed with
 /// everything in it when dropped. Created lazily so a plain-file send makes
 /// nothing on disk.
@@ -2332,3 +2388,59 @@ async fn stream_one(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod spool_tests {
+    use super::{spool_copy, spool_error};
+
+    /// A writer that fills after `room` bytes, like a 16 MB /tmp.
+    struct Small {
+        room: usize,
+        got: usize,
+    }
+    impl std::io::Write for Small {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.got >= self.room {
+                return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            let n = b.len().min(self.room - self.got);
+            self.got += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `head -c 30000000 /dev/zero | tunlion send -` on a 16 MB /tmp: the
+    /// error names the spool directory, how far it got, why stdin is staged,
+    /// and TMPDIR. It used to be "No space left on device (os error 28)".
+    #[test]
+    fn a_full_spool_names_the_directory_the_reason_and_tmpdir() {
+        let mut input = std::io::Read::take(std::io::repeat(0), 30_000_000);
+        let mut out = Small { room: 16 * 1024 * 1024, got: 0 };
+        let (written, e) = spool_copy(&mut input, &mut out).unwrap_err();
+        assert!(written <= 16 * 1024 * 1024 && written > 15 * 1024 * 1024, "{written}");
+        let spool = std::path::Path::new("/tmp/fil-send-spool-1/stdin");
+        let msg = format!("{:#}", spool_error("stdin", spool, written, e));
+        assert!(msg.contains("/tmp/fil-send-spool-1"), "{msg}");
+        assert!(msg.contains("ran out of space after"), "{msg}");
+        assert!(msg.contains("TMPDIR="), "{msg}");
+        assert!(msg.contains("SHA-256"), "{msg}");
+        // Anything else is reported as itself, with the spool named.
+        let other = format!(
+            "{:#}",
+            spool_error("stdin", spool, 0, std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        );
+        assert!(other.contains("could not stage stdin") && !other.contains("TMPDIR="), "{other}");
+    }
+
+    #[test]
+    fn a_spool_copy_that_fits_copies_everything() {
+        let mut input = std::io::Read::take(std::io::repeat(7), 1_000_000);
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(spool_copy(&mut input, &mut out).unwrap(), 1_000_000);
+        assert_eq!(out.len(), 1_000_000);
+    }
+}
+
