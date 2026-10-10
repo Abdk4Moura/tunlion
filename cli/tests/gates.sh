@@ -1237,9 +1237,9 @@ done
 T1BSZ=$(stat -c %s "$DT1B/rx/shrinks.bin.part" 2>/dev/null || echo 0)
 truncate -s 1048576 "$DT1B/shrinks.bin"
 T0=$(date +%s)
-bounded_wait $ST1B 60 "shrinking-source sender" "$WORK/gT1b-send.log"; RT1BS=$?
+wait_for_exit $ST1B 60; RT1BS=$?
 T1BT=$(( $(date +%s) - T0 ))
-bounded_wait $RT1BP 60 "shrinking-source receiver" "$WORK/gT1b-recv.log"; RT1BR=$?
+wait_for_exit $RT1BP 60; RT1BR=$?
 T1BRX=$(ls -A "$DT1B/rx" | tr '\n' ' ')
 echo "  part at truncation: $T1BSZ; sender rc=$RT1BS in ${T1BT}s; receiver rc=$RT1BR; receiver holds: [$T1BRX]"
 if [ "$T1BSZ" -eq 0 ]; then
