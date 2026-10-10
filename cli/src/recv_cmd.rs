@@ -6512,6 +6512,24 @@ pub(crate) async fn recv_cmd(
                             continue;
                         }
                     }
+                    // The inbox may have been deleted while this ran: recreate it,
+                    // or refuse with that reason (not "No such file or directory").
+                    match crate::recv_files::ensure_inbox(&dir) {
+                        Ok(true) => ui::say(&ui::paint(
+                            ui::Tone::Warn,
+                            &format!("  the inbox {} was missing; recreated it", dir.display()),
+                        )),
+                        Ok(false) => {}
+                        Err(e) => {
+                            let (token, msg) = crate::recv_files::inbox_refusal(&dir, &name, &e);
+                            ui::critical(&ui::paint(
+                                ui::Tone::Err,
+                                &format!("  refused {name} from {sender_name}: {msg}"),
+                            ));
+                            t.send_control(&protocol::refuse_msg(&id, token, &msg)).await?;
+                            continue;
+                        }
+                    }
                     // Refuse up front what cannot fit. Discovering ENOSPC half way
                     // through used to read as a CORRUPT file ("checksum still wrong
                     // after 3 re-fetches") on this side and "the receiver may have

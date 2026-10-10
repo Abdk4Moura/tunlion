@@ -146,6 +146,12 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 "signaling": signaling,
                 "degraded": degraded,
                 "devices": devices_load().len(),
+                // A running daemon's inbox that is missing or not a directory
+                // (null when fine, or when no daemon runs).
+                "inbox_problem": pid
+                    .is_some()
+                    .then(|| crate::recv_files::inbox_problem(&crate::recv_files::inbox_to_check(true)))
+                    .flatten(),
                 "exposed": exposed,
                 "recent": recent,
             }))?
@@ -191,6 +197,17 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         n,
         if n == 1 { "" } else { "s" }
     ));
+    // An inbox deleted under a running daemon refused every file with a bare
+    // "No such file or directory"; say so here rather than at the next send.
+    // Only for a running daemon: before the first `up` there is no inbox yet,
+    // and that is not a problem.
+    if let Some(problem) = pid_alive
+        .is_some()
+        .then(|| crate::recv_files::inbox_problem(&crate::recv_files::inbox_to_check(true)))
+        .flatten()
+    {
+        ui::say(&format!("  {} {problem}", ui::paint(ui::Tone::Warn, "!")));
+    }
     let exposed = expose::load();
     if !exposed.is_empty() {
         ui::say(&ui::paint(ui::Tone::Dim, "  exposed on .mesh:"));
