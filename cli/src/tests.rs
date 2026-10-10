@@ -3913,3 +3913,33 @@ fn tour_screen_never_mints_an_identity() {
         "tour_cmd no longer reads the identity at all, so this test has drifted from the source"
     );
 }
+
+#[test]
+fn the_default_device_name_is_the_short_hostname() {
+    use crate::short_host_label as l;
+    assert_eq!(l("laptop"), "laptop");
+    assert_eq!(l("Kabir-MacBook-Pro.local"), "kabir-macbook-pro");
+    assert_eq!(l("vps3584156.trouble-free.net"), "vps3584156");
+    assert_eq!(l("DESKTOP-7Q2K1"), "desktop-7q2k1");
+    // Characters a `.mesh` label cannot carry become single dashes, never
+    // leading or trailing ones.
+    assert_eq!(l("my_box  two"), "my-box-two");
+    assert_eq!(l("-edge-"), "edge");
+    // Nothing usable left: a stable word, never an empty name.
+    assert_eq!(l(""), "device");
+    assert_eq!(l("...."), "device");
+    assert_eq!(l("___"), "device");
+    // A DNS label is at most 63 bytes.
+    assert_eq!(l(&"a".repeat(80)).len(), 63);
+}
+
+#[test]
+fn the_default_device_name_comes_from_the_os_not_a_constant() {
+    // The old unix path read /etc/hostname, which macOS does not have, so every
+    // Mac was called "cli". The OS call must return the real name.
+    let os = crate::platform::os_hostname();
+    assert!(os.as_deref().is_some_and(|h| !h.is_empty()), "no hostname from the OS: {os:?}");
+    let name = crate::default_display_name();
+    assert_ne!(name, "cli");
+    assert!(!name.contains('@'), "the default must not carry the user: {name}");
+}
