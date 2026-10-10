@@ -1076,6 +1076,29 @@ mod tests {
         assert!(grant_operands(d, c, t.as_deref()).is_err(), "--tag with a device is ambiguous");
     }
 
+    /// `grant hostA port:8000` gets one answer on every device: `port` is not a
+    /// capability, and the fix is `expose 8000`. Valid specs still pass, so
+    /// the joined-device advice (which runs after this check) only ever names a
+    /// spec the owner's machine will accept.
+    #[test]
+    fn grant_spec_is_checked_before_any_advice() {
+        use crate::dispatch::validate_grant_spec;
+        let e = validate_grant_spec("port:8000").unwrap_err().to_string();
+        assert!(e.contains("not a capability"), "{e}");
+        assert!(e.contains("tunlion expose 8000"), "{e}");
+        assert!(!e.contains("tunlion grant"), "never suggest the refused spec: {e}");
+        for valid in crate::capability::CANONICAL_CAPABILITIES {
+            assert!(e.contains(valid), "the valid list must name {valid}: {e}");
+        }
+        let e = validate_grant_spec("port").unwrap_err().to_string();
+        assert!(e.contains("tunlion expose <port>"), "{e}");
+        assert!(validate_grant_spec("bogus").unwrap_err().to_string().contains("unknown capability"));
+        assert!(validate_grant_spec("route").is_err(), "route needs a prefix");
+        for ok in ["shell", "transfer", "mount", "route:10.0.0.0/24"] {
+            assert!(validate_grant_spec(ok).is_ok(), "{ok} must stay valid");
+        }
+    }
+
     /// The global -y help names `down`, which refuses without it from a pipe.
     #[test]
     fn yes_help_names_the_commands_that_need_it() {
