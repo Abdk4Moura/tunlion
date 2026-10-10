@@ -81,7 +81,18 @@ xdgc() { env -u FILAMENT_CONFIG_DIR HOME="$HOMEA" XDG_CONFIG_HOME="$XDG" "$@"; }
 echo "## XDG_CONFIG_HOME is ${#XDG} bytes"
 # Any command runs the legacy migration; status is the read-only one.
 xdgc timeout 20 "$BIN" status >"$WORK/xdg-status0.log" 2>&1; rcS0=$?
-leaked=$(find "$XDG" -type f 2>/dev/null | sed "s|$XDG/||" | tr '\n' ' ')
+# Leaked: any file of the default config that now also exists in the new one,
+# by name (identity.ed25519, overlay.ed25519, proxy.token, devices.json, up.pid,
+# the logs...). The one exception is the permissions-migration stamp, which
+# every command writes into its OWN config dir (its content is a version
+# number, not state copied from anywhere).
+leaked=""
+for f in $(cd "$DEFCFG" && find . -type f | sed 's|^\./||'); do
+  [ "$f" = "permissions-migration" ] && continue
+  [ -e "$XDG/filament/$f" ] && leaked="$leaked $f"
+done
+others=$(find "$XDG" -type f ! -name permissions-migration 2>/dev/null | sed "s|$XDG/||" | tr '\n' ' ')
+[ -n "$others" ] && leaked="$leaked [unexpected: $others]"
 xdgc "$BIN" init --name bravo --recovery-file "$WORK/bravo-rec.txt" --yes >"$WORK/xdg-init.log" 2>&1; rcI=$?
 NEWCFG="$XDG/filament"
 same_key=no
