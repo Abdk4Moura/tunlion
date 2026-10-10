@@ -960,7 +960,7 @@ while True:
     time.sleep(0.05)
 ' "$D/out.bin"
   RCR=$(cat "$WORK/gT3-recv.rc" 2>/dev/null || echo missing)
-  bounded_wait $SP 60 "stdout-pipe sender" "$WORK/gT3-send.log" "$WORK/gT3-recv.log"; RCS=$?
+  wait_for_exit $SP 60; RCS=$?
   if [ "$RCR" = 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/out.bin")" = "$H_SMALL" ] \
      && ! grep -qi "invalid seek\|could not save" "$WORK/gT3-recv.log" "$WORK/gT3-send.log"; then
     ok "stdout-pipe: -o - into a slow pipe is byte-exact, and the sender got a verified ack (exit 0 both)"
@@ -995,7 +995,7 @@ if [ -n "${W:-}" ]; then
   # The sender runs without a timeout wrapper, so SIGKILL reaches it.
   kill -9 $SP 2>/dev/null; wait $SP 2>/dev/null
   T0=$(date +%s)
-  bounded_wait $R 120 "sender-killed receiver" "$WORK/gT4-recv.log"; RCR=$?
+  wait_for_exit $R 120; RCR=$?
   T1=$(date +%s)
   WANT_RC=nonzero
   "$BIN" --help 2>&1 | grep -q "EXIT CODES" && WANT_RC=6
