@@ -1753,6 +1753,71 @@ pub fn apply_header(store: &mut Vec<Value>, new_header: &CapHeader) -> Result<()
     Ok(())
 }
 
+/// Store type of a revoke TOMBSTONE: the signed Revoke op itself, kept where the
+/// grant it beat used to be.
+///
+/// A revoke used to DELETE the grant entry, and the entry was the only place the
+/// anti-rollback version lived. After the delete, `apply_cap_op` found nothing to
+/// compare against, so replaying the OLDER grant op (still validly signed, still
+/// unexpired) was accepted and the revoked capability came back. The tombstone
+/// keeps the version the revoke established, so every op at or below it is
+/// refused, while a genuinely newer grant replaces it.
+///
+/// The type is deliberately NOT `cap_grant`: every reader that decides what is
+/// granted filters on `type == "cap_grant"`, so a tombstone is not-granted to all
+/// of them by construction rather than by each remembering a `revoked` flag.
+pub const CAP_TOMBSTONE_TYPE: &str = "cap_revoked";
+
+/// Does this store entry record an op (live grant or revoke tombstone) for the
+/// given (grantor, resource, target) key?
+fn is_op_entry_for(
+    entry: &Value,
+    grantor_hex: &str,
+    resource: &str,
+    target_kind: u8,
+    target_hex: &str,
+) -> bool {
+    let ty = entry.get("type").and_then(|v| v.as_str());
+    (ty == Some("cap_grant") || ty == Some(CAP_TOMBSTONE_TYPE))
+        && entry["grantor"].as_str() == Some(grantor_hex)
+        && entry["resource"].as_str() == Some(resource)
+        && entry["targetKind"].as_u64().unwrap_or(0) == target_kind as u64
+        && entry["target"].as_str() == Some(target_hex)
+}
+
+/// The highest op version the store has recorded for one (grantor, resource,
+/// target) key, counting revoke tombstones. A writer minting the next op takes
+/// `hlc_next` of this, so a regrant after a revoke lands ABOVE the tombstone
+/// instead of being refused by it. 0 when nothing has been recorded.
+pub fn latest_op_version(
+    store: &[Value],
+    grantor: &[u8; 32],
+    resource: &str,
+    target_kind: u8,
+    target: &[u8; 32],
+) -> u64 {
+    let (g, t) = (hex::encode(grantor), hex::encode(target));
+    store
+        .iter()
+        .filter(|e| is_op_entry_for(e, &g, resource, target_kind, &t))
+        .filter_map(|e| e["version"].as_u64())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Is `op` at or below a revoke tombstone for its key? Such an op is a replay of
+/// something the owner already revoked and must not be stored by any path,
+/// including the raw fleet-policy merge, which does not go through
+/// `apply_cap_op`.
+pub fn superseded_by_tombstone(store: &[Value], op: &CapOp) -> bool {
+    let (g, t) = (hex::encode(op.grantor), hex::encode(op.target));
+    store.iter().any(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some(CAP_TOMBSTONE_TYPE)
+            && is_op_entry_for(e, &g, &op.resource, op.target_kind, &t)
+            && e["version"].as_u64().unwrap_or(u64::MAX) >= op.version
+    })
+}
+
 /// Apply a verified capability op to the store.
 pub fn apply_cap_op(
     store: &mut Vec<Value>,
@@ -1783,33 +1848,38 @@ pub fn apply_cap_op(
     let grantor_hex = hex::encode(op.grantor);
     let target_hex = hex::encode(op.target);
 
-    let mut found_idx = None;
-    for (i, entry) in store.iter().enumerate() {
-        if entry.get("type").and_then(|v| v.as_str()) != Some("cap_grant") {
-            continue;
-        }
-        if entry["grantor"].as_str() == Some(&grantor_hex)
-            && entry["resource"].as_str() == Some(op.resource.as_str())
-            && entry["targetKind"].as_u64() == Some(op.target_kind as u64)
-            && entry["target"].as_str() == Some(target_hex.as_str())
-        {
-            let existing_version = entry["version"].as_u64().unwrap_or(0);
-            if existing_version >= op.version {
-                bail!(
-                    "monotonic version refusal: existing {} >= new {}",
-                    existing_version,
-                    op.version
-                );
-            }
-            found_idx = Some(i);
-            break;
+    // EVERY entry for this key, live grant or tombstone, bounds the version. The
+    // first match used to end the scan, so a second entry for the same key (the
+    // bounded-grant writer appends rather than replaces) was never compared.
+    let matching: Vec<usize> = store
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_op_entry_for(e, &grantor_hex, &op.resource, op.target_kind, &target_hex))
+        .map(|(i, _)| i)
+        .collect();
+    for &i in &matching {
+        let existing_version = store[i]["version"].as_u64().unwrap_or(0);
+        if existing_version >= op.version {
+            bail!(
+                "monotonic version refusal: existing {} >= new {}",
+                existing_version,
+                op.version
+            );
         }
     }
+    let found_idx = matching.first().copied();
 
     if op.op == CapOpKind::Revoke || op.permissions.is_empty() {
-        if let Some(idx) = found_idx {
-            store.remove(idx);
+        // Keep the version this revoke established as a tombstone in place of
+        // the entries it beat. All of them go: a duplicate live grant left
+        // behind would keep authorizing what was just revoked.
+        let mut tombstone = op.to_json();
+        tombstone["type"] = Value::from(CAP_TOMBSTONE_TYPE);
+        tombstone["revoked"] = Value::from(true);
+        for &i in matching.iter().rev() {
+            store.remove(i);
         }
+        store.push(tombstone);
         return Ok(());
     }
 
@@ -2304,6 +2374,125 @@ mod tests {
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_grant"))
             .collect();
         assert_eq!(grants.len(), 0, "revoke must remove grant");
+    }
+
+    #[test]
+    fn revoke_tombstone_refuses_replay_of_the_grant_it_beat() {
+        // Grant v1, revoke v2, replay grant v1: the revoke used to DELETE the
+        // only entry carrying the version, so the replay was accepted and the
+        // revoked capability came back.
+        let owner = make_owner();
+        let pk = owner_pub(&owner);
+        let target = CapTarget::Device([0xcc; 32]);
+        let principal_user = [0xaa; 32];
+        let header = make_genesis_header(&owner, &[0x01; 32], &[]);
+        let seed = now_ms();
+        let v1 = hlc_next(0, seed);
+        let v2 = hlc_next(v1, seed);
+        let v3 = hlc_next(v2, seed);
+        let grant_v1 = make_grant(&owner, target, &header.resource, &["shell"], v1, 86400);
+        let revoke_v2 = make_revoke(&owner, target, &header.resource, v2, 86400);
+        let grant_v3 = make_grant(&owner, target, &header.resource, &["shell"], v3, 86400);
+        let authorized = |store: &[Value]| {
+            matches!(
+                evaluate(
+                    store,
+                    &header,
+                    &[0xcc; 32],
+                    &principal_user,
+                    &header.resource,
+                    "shell",
+                    now_secs(),
+                    None,
+                ),
+                Decision::Authorized
+            )
+        };
+
+        let mut store = init_store(&header);
+        apply_cap_op(&mut store, &header, &grant_v1, now_secs()).unwrap();
+        assert!(authorized(&store));
+        apply_cap_op(&mut store, &header, &revoke_v2, now_secs()).unwrap();
+        assert!(!authorized(&store), "revoked");
+        // The tombstone is the version record, and it is not a grant.
+        let tombstones: Vec<_> = store
+            .iter()
+            .filter(|e| e["type"].as_str() == Some(CAP_TOMBSTONE_TYPE))
+            .collect();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0]["version"].as_u64(), Some(v2));
+        assert_eq!(tombstones[0]["revoked"].as_bool(), Some(true));
+        assert!(
+            !store.iter().any(|e| e["type"].as_str() == Some("cap_grant")),
+            "no live grant may survive the revoke"
+        );
+        assert_eq!(
+            latest_op_version(
+                &store,
+                &pk,
+                &header.resource,
+                target.kind_byte(),
+                &target.target_bytes()
+            ),
+            v2
+        );
+        assert!(superseded_by_tombstone(&store, &grant_v1));
+        assert!(!superseded_by_tombstone(&store, &grant_v3));
+
+        // Replay of the beaten grant: refused, and nothing changes.
+        let before = store.clone();
+        let replay = apply_cap_op(&mut store, &header, &grant_v1, now_secs());
+        assert!(
+            replay.is_err(),
+            "replaying grant v1 over revoke v2 must be refused"
+        );
+        assert_eq!(store, before, "a refused replay must not touch the store");
+        assert!(!authorized(&store), "still revoked after the replay attempt");
+        // Replaying the revoke itself is also at the tombstone's version.
+        assert!(apply_cap_op(&mut store, &header, &revoke_v2, now_secs()).is_err());
+
+        // A genuinely newer grant re-grants, replacing the tombstone.
+        apply_cap_op(&mut store, &header, &grant_v3, now_secs()).unwrap();
+        assert!(authorized(&store), "a newer grant (v3) re-grants");
+        assert!(
+            !store
+                .iter()
+                .any(|e| e["type"].as_str() == Some(CAP_TOMBSTONE_TYPE)),
+            "the regrant takes the tombstone's place, one entry per key"
+        );
+    }
+
+    #[test]
+    fn revoke_removes_every_duplicate_grant_for_the_key() {
+        // The bounded-grant writer appends; the old revoke removed only the
+        // first matching entry, so a duplicate kept authorizing.
+        let owner = make_owner();
+        let target = CapTarget::Device([0xcc; 32]);
+        let header = make_genesis_header(&owner, &[0x01; 32], &[]);
+        let seed = now_ms();
+        let v1 = hlc_next(0, seed);
+        let v2 = hlc_next(v1, seed);
+        let v3 = hlc_next(v2, seed);
+        let mut store = init_store(&header);
+        let first = make_grant(&owner, target, &header.resource, &["shell"], v1, 86400);
+        apply_cap_op(&mut store, &header, &first, now_secs()).unwrap();
+        let mut dup = make_grant(&owner, target, &header.resource, &["mount"], v2, 86400).to_json();
+        dup["type"] = Value::from("cap_grant");
+        store.push(dup);
+        let revoke = make_revoke(&owner, target, &header.resource, v3, 86400);
+        apply_cap_op(&mut store, &header, &revoke, now_secs()).unwrap();
+        assert!(
+            !store
+                .iter()
+                .any(|e| e["type"].as_str() == Some("cap_grant"))
+        );
+        assert_eq!(
+            store
+                .iter()
+                .filter(|e| e["type"].as_str() == Some(CAP_TOMBSTONE_TYPE))
+                .count(),
+            1
+        );
     }
 
     #[test]

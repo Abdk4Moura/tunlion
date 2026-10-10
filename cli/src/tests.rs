@@ -4354,3 +4354,286 @@ fn c1_network_secret_lands_in_a_new_record() {
             .is_err()
     );
 }
+
+// --- Grant target: a per-device grant names the DEVICE key --------------------
+
+/// Two devices of MY fleet (both certified by my user key), with the owner key
+/// on disk, so the real writers and the real gate inputs run.
+fn fleet_pair_fixture(tag: &str) -> (std::path::PathBuf, identity::UserKey, identity::DeviceCert, identity::DeviceCert) {
+    let dir = td(tag);
+    let uk = identity::UserKey::generate(&crate::platform::PlatformKeyStore).unwrap();
+    let now = identity::now_secs();
+    let laptop = identity::DeviceCert::certify(&uk, [0x11u8; 32], now, 86400).unwrap();
+    let desktop = identity::DeviceCert::certify(&uk, [0x22u8; 32], now, 86400).unwrap();
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&json!([
+            {"name": "laptop", "secret": "a".repeat(64), "v": 2, "caps": ["transfer"],
+             "userKey": hex::encode(uk.public_key_bytes()), "deviceCert": laptop.to_json()},
+            {"name": "desktop", "secret": "b".repeat(64), "v": 2, "caps": ["transfer"],
+             "userKey": hex::encode(uk.public_key_bytes()), "deviceCert": desktop.to_json()},
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    (dir, uk, laptop, desktop)
+}
+
+/// `has_explicit_grant` as the authoritative gate computes it (no owner shortcut).
+fn explicit_shell(dir: &std::path::Path, c: &identity::DeviceCert) -> bool {
+    crate::capability::cap_fleet_inputs(
+        dir,
+        "self",
+        "shell",
+        Some(&c.device_pub),
+        Some(&c.user_pub),
+        None,
+    )
+    .1
+}
+
+fn apply_and_save(dir: &std::path::Path, ops: &[crate::capability::CapOp]) {
+    let mut store = crate::capability::load_cap_store(dir);
+    let hdr = store
+        .iter()
+        .find(|e| e["type"].as_str() == Some("cap_header") && e["resource"].as_str() == Some("self"))
+        .and_then(crate::capability::CapHeader::from_json)
+        .expect("self header");
+    for op in ops {
+        crate::capability::apply_cap_op(&mut store, &hdr, op, crate::capability::now_secs()).unwrap();
+    }
+    crate::capability::save_and_list_revoked(&store, dir).unwrap();
+}
+
+#[test]
+fn grant_to_one_fleet_device_does_not_authorize_its_sibling() {
+    let _guard = lock_test_config();
+    let (dir, _uk, laptop, desktop) = fleet_pair_fixture("grant-dev-target");
+    let expires = crate::capability::now_secs() + 3600;
+    assert!(crate::device_caps::issue_signed_bounded_grant("laptop", "shell", expires).unwrap());
+
+    // The op names laptop's DEVICE key, not the user key both devices share.
+    let store = crate::capability::load_cap_store(&dir);
+    let grant = store
+        .iter()
+        .find(|e| e["type"].as_str() == Some("cap_grant"))
+        .expect("grant stored");
+    assert_eq!(grant["targetKind"].as_u64(), Some(0x01));
+    assert_eq!(grant["target"].as_str(), Some(hex::encode(laptop.device_pub).as_str()));
+
+    assert!(explicit_shell(&dir, &laptop), "the granted device holds shell");
+    assert!(
+        !explicit_shell(&dir, &desktop),
+        "granting laptop must not grant its same-owner sibling"
+    );
+    let revoked = crate::capability::devices_with_shell_revoked(&dir);
+    assert!(revoked.contains(&"desktop".to_string()));
+    assert!(!revoked.contains(&"laptop".to_string()));
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn revoking_one_fleet_device_leaves_its_sibling_granted() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, desktop) = fleet_pair_fixture("revoke-dev-target");
+    let expires = crate::capability::now_secs() + 3600;
+    assert!(crate::device_caps::issue_signed_bounded_grant("laptop", "shell", expires).unwrap());
+    assert!(crate::device_caps::issue_signed_bounded_grant("desktop", "shell", expires).unwrap());
+    assert!(explicit_shell(&dir, &laptop) && explicit_shell(&dir, &desktop));
+
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    assert!(!also_user_wide, "no user-wide grant exists here");
+    assert_eq!(ops.len(), 1);
+    apply_and_save(&dir, &ops);
+
+    assert!(!explicit_shell(&dir, &laptop), "laptop's grant is revoked");
+    assert!(explicit_shell(&dir, &desktop), "revoking laptop must leave desktop untouched");
+
+    // Regrant after the revoke lands above the tombstone instead of being
+    // refused by it.
+    let store = crate::capability::load_cap_store(&dir);
+    let regrant = crate::device_caps::sign_next_cap_op(
+        &store,
+        &uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::Device.target(&laptop),
+        "self",
+        vec!["shell".to_string()],
+        expires,
+    );
+    apply_and_save(&dir, &[regrant]);
+    assert!(explicit_shell(&dir, &laptop), "a newer grant re-grants");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn user_wide_grant_is_explicit_and_a_device_revoke_takes_it() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, desktop) = fleet_pair_fixture("grant-user-wide");
+    let mut store = crate::capability::load_cap_store(&dir);
+    crate::device_caps::ensure_self_header(&mut store, &uk).unwrap();
+    crate::capability::save_and_list_revoked(&store, &dir).unwrap();
+    // `grant laptop shell --user`: the documented per-person wildcard.
+    let user_wide = crate::device_caps::sign_next_cap_op(
+        &store,
+        &uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::User.target(&laptop),
+        "self",
+        vec!["shell".to_string()],
+        crate::capability::now_secs() + 3600,
+    );
+    assert_eq!(user_wide.target_kind, 0x00);
+    apply_and_save(&dir, &[user_wide]);
+    assert!(explicit_shell(&dir, &laptop) && explicit_shell(&dir, &desktop));
+
+    // A per-device revoke must not report success while the user-wide grant
+    // keeps laptop authorized: it takes the user-wide grant too, and says so.
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    assert!(also_user_wide);
+    assert_eq!(ops.len(), 2);
+    apply_and_save(&dir, &ops);
+    assert!(!explicit_shell(&dir, &laptop), "revoke must actually bite");
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fleet_merge_refuses_a_grant_beaten_by_a_local_tombstone() {
+    let _guard = lock_test_config();
+    let (dir, uk, laptop, _desktop) = fleet_pair_fixture("merge-tombstone");
+    // This device trusts the owner through its own header.
+    assert!(crate::fleet::my_owner_pub().is_some());
+    let mut store = crate::capability::load_cap_store(&dir);
+    crate::device_caps::ensure_self_header(&mut store, &uk).unwrap();
+    crate::capability::save_and_list_revoked(&store, &dir).unwrap();
+    let grant = crate::device_caps::sign_next_cap_op(
+        &store,
+        &uk,
+        crate::capability::CapOpKind::Grant,
+        crate::device_caps::GrantScope::Device.target(&laptop),
+        "self",
+        vec!["shell".to_string()],
+        crate::capability::now_secs() + 3600,
+    );
+    let mut grant_json = grant.to_json();
+    grant_json["type"] = json!("cap_grant");
+    apply_and_save(&dir, &[grant]);
+    let store = crate::capability::load_cap_store(&dir);
+    let (ops, _) = crate::device_caps::signed_revoke_ops(
+        &store,
+        &uk,
+        &laptop,
+        "shell",
+        crate::device_caps::GrantScope::Device,
+    );
+    apply_and_save(&dir, &ops);
+    // The tombstone is not handed out as fleet policy.
+    assert!(
+        crate::owner_signed_cap_ops()
+            .iter()
+            .all(|e| e["type"].as_str() != Some(crate::capability::CAP_TOMBSTONE_TYPE))
+    );
+    // A peer relaying the OLD (still validly signed) grant cannot restore it.
+    assert_eq!(crate::merge_owner_cap_ops(&[grant_json]), 0);
+    assert!(!explicit_shell(&dir, &laptop));
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- Join must not re-key a record that is not provably the owner -------------
+
+#[test]
+fn join_leaves_a_certless_record_named_like_the_owner_untouched() {
+    let now = identity::now_secs();
+    let owner_cert = cert_for(0x41, 0x42, now + 86400);
+    for (label, record) in [
+        (
+            "secret-only",
+            json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
+                   "caps": ["transfer", "shell"], "deniedCaps": []}),
+        ),
+        (
+            "vouched",
+            json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
+                   "caps": ["transfer", "shell"], "introducedBy": "hub",
+                   "userKey": hex::encode([0x41u8; 32])}),
+        ),
+    ] {
+        let mut arr = vec![record.clone()];
+        let stored = crate::devices_store::place_joined_owner(
+            &mut arr,
+            "owner",
+            &"c".repeat(64),
+            &owner_cert,
+            &["transfer".to_string()],
+            identity::IntroScope::Device.to_byte(),
+        )
+        .unwrap();
+        assert_eq!(arr[0], record, "{label}: the existing record must be untouched");
+        assert_eq!(stored, "owner-2", "{label}: the owner lands in a new record");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(
+            arr[1]["deviceCert"]["devicePub"].as_str(),
+            Some(hex::encode(owner_cert.device_pub).as_str())
+        );
+        assert_eq!(arr[1]["secret"].as_str(), Some("c".repeat(64).as_str()));
+        assert_eq!(arr[1]["caps"], json!(["transfer"]), "{label}: no grants carried over");
+    }
+}
+
+#[test]
+fn join_updates_only_the_record_pinned_to_the_owner_key() {
+    let now = identity::now_secs();
+    let owner_cert = cert_for(0x41, 0x42, now + 86400);
+    // Re-join: the record pinned to the same device key is updated in place,
+    // whatever it is called now.
+    let mut arr = vec![json!({"name": "renamed", "secret": "a".repeat(64), "v": 2,
+                              "deviceCert": owner_cert.to_json()})];
+    let stored = crate::devices_store::place_joined_owner(
+        &mut arr,
+        "owner",
+        &"d".repeat(64),
+        &owner_cert,
+        &["transfer".to_string()],
+        identity::IntroScope::Device.to_byte(),
+    )
+    .unwrap();
+    assert_eq!(stored, "renamed");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["secret"].as_str(), Some("d".repeat(64).as_str()));
+
+    // A record under the owner's name pinned to a DIFFERENT key is refused.
+    let other = cert_for(0x41, 0x43, now + 86400);
+    let mut arr = vec![json!({"name": "owner", "secret": "a".repeat(64), "v": 2,
+                              "deviceCert": other.to_json()})];
+    let before = arr.clone();
+    assert!(
+        crate::devices_store::place_joined_owner(
+            &mut arr,
+            "owner",
+            &"d".repeat(64),
+            &owner_cert,
+            &["transfer".to_string()],
+            identity::IntroScope::Device.to_byte(),
+        )
+        .is_err()
+    );
+    assert_eq!(arr, before);
+}

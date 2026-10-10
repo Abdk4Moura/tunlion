@@ -610,6 +610,10 @@ pub(crate) enum Cmd {
         /// Target a tag instead of a device
         #[arg(long)]
         tag: Option<String>,
+        /// Grant to the device's USER key instead: every device that user has
+        /// certified receives it (for your own fleet, that is every device).
+        #[arg(long, conflicts_with = "tag")]
+        user: bool,
     },
     /// Revoke a capability or a fleet certificate from a known device.
     Revoke {
@@ -620,6 +624,10 @@ pub(crate) enum Cmd {
         /// Revoke the device's local fleet certificate instead of a capability.
         #[arg(long)]
         certificate: bool,
+        /// Revoke a user-wide grant (one made with `grant --user`), which
+        /// removes it from every device of that user.
+        #[arg(long, conflicts_with = "certificate")]
+        user: bool,
     },
     /// Mount a remote directory over Tunlion's native filesystem protocol.
     /// Read-only is the default; the remote share root and grant remain authoritative.
