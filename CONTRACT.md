@@ -251,7 +251,7 @@ a NEW record. If its proposed name is taken, the name is suffixed (`laptop-2`);
 a secret that some record already holds is refused. The device store refuses
 any write that would replace an existing record's secret (or pin a different
 certificate to it) unless the write carries an explicit owner decision: the
-owner-run `tunlion pair` ceremony, joining under an owner-signed invitation,
+owner-run `tunlion add` ceremony, joining under an owner-signed invitation,
 or the same key re-enrolling. A name is presentation; grants follow the
 record, so re-keying a record in place would hand its grants to whoever sent
 the secret.
@@ -264,7 +264,7 @@ the secret.
   vouch in turn.
 - The interactive `tunlion up` console no longer pairs in-session (it ran a v1
   code and handed a secret over a DataChannel the signaling server could MITM);
-  it points at `tunlion pair`.
+  it points at `tunlion add <device>` / `tunlion join <code>`.
 
 ### Link channel binding (`l3-nonce`, `fleet-hello`, `l3-announce`)
 `fleet-hello` and `l3-announce` sign `DOMAIN || addr || seq || cb`, where `cb`
