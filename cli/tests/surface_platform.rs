@@ -67,7 +67,8 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // platform::fs_at (stat/readlink/readdir/uid/gid/create flags/mode).
         ("mount_proto.rs", 39),
         // 39 -> 40 for the warm-pty verdict enum sharing its fn's gate.
-        ("l2.rs", 40),
+        // 40 -> 39 measured on the integration of #378..#394.
+        ("l2.rs", 39),
         // Should approach zero as the armed set stops needing IPC at all.
         ("ctl.rs", 6),
         ("tun/mod.rs", 6),

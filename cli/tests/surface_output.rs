@@ -58,7 +58,7 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // per-probe envelope (the plain --json result goes through ui::json_out).
         ("ping.rs", 1),
         ("tun/linux.rs", 11),
-        ("interact.rs", 5),
+        // interact.rs: 5 -> 0 after #391 routed its prompts through ui::.
         // ui.rs is the emitter of last resort; these ARE the implementation.
         ("ui.rs", 4),
         ("l2.rs", 3),
