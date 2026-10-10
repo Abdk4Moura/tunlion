@@ -285,10 +285,20 @@ pub fn check_sshd_ca() -> std::result::Result<(), String> {
     check_sshd_ca_at(Path::new(SSHD_CONFIG_DEFAULT))
 }
 
-/// Whether ssh is in play on this host at all: there is an sshd config to arm.
-/// A native `shell`/`exec` user without sshd has no use for the CA lines.
+/// Whether tunlion's ssh is in play on this host: its sshd config already
+/// carries tunlion's CA lines (some earlier `shell --ssh` setup armed them, so
+/// a failure to keep them current matters). A host merely HAVING sshd is not
+/// enough: a first-time-user test ran `grant <dev> shell` on a stock box and
+/// was told "ssh CA arming skipped (cannot determine serving user)" about a
+/// feature it never asked for. The native `shell`/`exec` path needs none of
+/// this, and `tunlion doctor` still reports the CA lines for anyone using ssh.
 fn ssh_relevant() -> bool {
-    sshd_config_path().exists()
+    std::fs::read_to_string(sshd_config_path())
+        .map(|text| {
+            let (ca, principals) = sshd_ca_status(&text);
+            ca || principals
+        })
+        .unwrap_or(false)
 }
 
 /// An arming outcome: shown when ssh is relevant here, debug-only otherwise.

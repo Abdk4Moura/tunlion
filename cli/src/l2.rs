@@ -1524,11 +1524,17 @@ pub(crate) async fn bring_up_to_known(
     let connect_started = tokio::time::Instant::now();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(7));
     heartbeat.tick().await; // consume the immediate first tick
-    // A known device whose daemon is not running never appears on its presence
-    // channel, and this loop used to say only "still reaching" until the
-    // timeout. Once nothing has shown up for a few seconds, say the likely
-    // cause ONCE, and keep waiting (it may still come up).
-    let mut seen_presence = false;
+    // A known device whose daemon is not running never answers, and this loop
+    // used to say only "still reaching" until the timeout. Once nothing has
+    // answered for a few seconds, say the likely cause ONCE, and keep waiting
+    // (it may still come up). "Answered" is a signal FROM a candidate, not its
+    // presence: a daemon stopped without a clean leave stays on the roster as
+    // a ghost for a while, and a fleet channel carries siblings that are not
+    // the target. Keyed on presence, the first-time-user test saw `exec` and
+    // `shell` against a stopped daemon print "still reaching ... (35s)" with
+    // no hint at all, while `send` named the cause. A live acceptor offers its
+    // transport the instant it sees us, well inside the hint delay.
+    let mut heard_from_peer = false;
     let mut offline_hinted = false;
     let mut offline_check = tokio::time::interval(Duration::from_millis(500));
     offline_check.tick().await;
@@ -1635,11 +1641,8 @@ pub(crate) async fn bring_up_to_known(
                 }
                 continue;
             }
-            _ = offline_check.tick(), if !offline_hinted && !seen_presence => {
-                if connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER
-                    && peer.is_none()
-                    && queue.is_empty()
-                {
+            _ = offline_check.tick(), if !offline_hinted && !heard_from_peer => {
+                if connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER {
                     offline_hinted = true;
                     if role != "doctor" && !silent {
                         crate::ui::say(&crate::conn::offline_hint(peer_name));
@@ -1704,7 +1707,6 @@ pub(crate) async fn bring_up_to_known(
                 if crate::is_self_uid(&my_uid, v["uid"].as_str()) {
                     continue;
                 }
-                seen_presence = true;
                 // Queue every distinct sid; the loop top rotates through them.
                 if peer.as_ref().is_some_and(|p| p.id == pid)
                     || queue.iter().any(|(q, _, _)| *q == pid)
@@ -1714,6 +1716,7 @@ pub(crate) async fn bring_up_to_known(
                 queue.push_back((pid, v["uid"].as_str().map(|s| s.to_string()), true));
             }
             Ev::Signal(v) => {
+                heard_from_peer = true;
                 let data = v["data"].clone();
                 // Item 3: a relayed `transport-offer` carries the peer's direct
                 // candidates. Do NOT hand it to the WebRTC `Peer`; instead consume
@@ -2772,6 +2775,12 @@ impl Drop for RawGuard {
     }
 }
 
+/// The acceptor's answer to a RESUME-only attach whose session is gone: the
+/// shell exited while we were away (or on the warm path, which cannot tell a
+/// clean exit from a drop, see `pty_cmd`). It is the normal end of a session,
+/// never a refusal. The wire string is fixed: older acceptors send exactly it.
+pub(crate) const NO_SUCH_SESSION: &str = "no such session";
+
 /// Why a single PTY attach ended.
 enum PtyOutcome {
     /// The remote shell exited (acceptor sent `l2-close` while the link was
@@ -3089,6 +3098,12 @@ async fn pty_attach_once(
     }
     pump.abort();
     match close_reason {
+        // A resume that finds no session is the shell having exited: the
+        // common case is `exit` in a shell opened over the warm link, which
+        // hands off to this resume-only attach. Reported as a refusal it
+        // printed "shell refused ... no such session", exited 1, and left the
+        // terminal raw. It is a clean end.
+        Some(reason) if resume && reason.trim() == NO_SUCH_SESSION => Ok(PtyOutcome::Exited),
         // A mid-session denial (revoke): nonzero with the reason, never a clean
         // exit that would carry a `&&` pipeline forward (#223).
         Some(reason) => Ok(PtyOutcome::Refused(reason)),
@@ -3195,6 +3210,16 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
     // attach, AFTER its status lines, so they don't staircase), persists across
     // reconnects, and is restored on every exit path by this guard's Drop.
     let mut raw: Option<RawGuard> = None;
+    // The guard's Drop does not run on `process::exit` (every exit below drops
+    // it first) nor on a signal from outside: SIGTERM, or
+    // SIGHUP when the terminal goes away. Restore the terminal for those too.
+    if interactive {
+        tokio::spawn(async {
+            let code = crate::platform::termination_signal().await;
+            let _ = crossterm::terminal::disable_raw_mode();
+            std::process::exit(code);
+        });
+    }
 
     // ONE fd0 reader for the whole invocation, shared across the warm bridge and
     // every cold reattach. tokio's stdin singleton can't be cancelled, so a
@@ -3291,6 +3316,9 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
         {
             Ok(PtyOutcome::Exited) => return Ok(()),
             Ok(PtyOutcome::Refused(reason)) => {
+                // Cooked mode first: the message must not stair-step, and the
+                // exit below skips the guard's Drop.
+                drop(raw.take());
                 // The peer is up and said no. Nonzero with the reason; never a
                 // false success that would carry a `&&` pipeline forward.
                 // The remedy depends on WHICH refusal, and the acceptor's reason
@@ -3323,6 +3351,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 std::process::exit(1);
             }
             Ok(PtyOutcome::Unconfirmed(reason)) => {
+                drop(raw.take());
                 // We could not establish that the peer opened a shell. Say the
                 // weaker true sentence rather than a confident wrong one.
                 crate::ui::problem(
@@ -3349,6 +3378,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                 // warm session just ended, a failed reattach should RETRY (the mesh
                 // may be mid-repair) until the reaper window, not bail.
                 if !ever_connected && !warm_ended {
+                    drop(raw.take());
                     // A REFUSAL is not a reachability failure, and saying it is
                     // sends the user to `ping`/`doctor` to debug a healthy link.
                     // The peer answers an unauthorized open with an l2-close
@@ -3420,7 +3450,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                             ),
                         ],
                     );
-                    std::process::exit(1);
+                    // 6 = unreachable in the exit-code taxonomy (#393's
+                    // exit_codes::ExitKind::Unreachable), the code `exec` and
+                    // `send` give for the same "it did not answer" outcome.
+                    std::process::exit(6);
                 }
                 // A reconnect attempt failed. Keep trying until the acceptor would
                 // have reaped the detached session (SESSION_DETACHED_IDLE = 180s);

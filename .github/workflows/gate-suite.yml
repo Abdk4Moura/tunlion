@@ -123,7 +123,7 @@ jobs:
             [cli/tests/cap-verbs-gates.sh]=3
             [cli/tests/devices-write-race-gates.sh]=2
             [cli/tests/roster-gates.sh]=8
-            [cli/tests/shell-gates.sh]=11
+            [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
           )
           # MODE MATTERS HERE, and it is not a formality: `[ -x "$g" ]` below

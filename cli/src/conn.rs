@@ -260,6 +260,15 @@ pub(crate) enum Presence {
     Reconnecting,
 }
 
+/// True when a link's label is an identifier rather than a name: the
+/// signaling id or uid it was filed under, or a long run of hex (a key or id
+/// a peer announced in place of a name). Shown to a person only under -v.
+pub(crate) fn label_is_raw_id(label: &str, id: &str, uid: Option<&str>) -> bool {
+    label == id
+        || uid == Some(label)
+        || (label.len() >= 16 && label.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+}
+
 fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
     match p {
         Presence::Ready => (ui::glyph_ok(), ui::Tone::Ok, ""),
@@ -3774,21 +3783,41 @@ impl Conn {
         note: &str,
         fallback_name: &str,
     ) -> String {
+        // A link with no name yet is labelled by its raw signaling id. That id
+        // means nothing to a person (a first-time-user test read "ok alpha
+        // ok 3f9c...e1" after `receive <code>`), so it shows only under -v:
+        // the line names the peer it is about, and leaves unnamed others out.
+        let show_raw = ui::enabled(ui::Level::Debug);
         let mut links: Vec<(&String, &Link)> = self.links.iter().collect();
         links.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         let mut parts = Vec::new();
         let mut seen = false;
         for (id, l) in links {
+            let unnamed = label_is_raw_id(l.label(), id, l.uid.as_deref());
             if id == pid {
                 seen = true;
-                parts.push(peer_entry(l.label(), mark, tone, note));
+                let label = if unnamed && !show_raw && !label_is_raw_id(fallback_name, pid, None) {
+                    fallback_name
+                } else if unnamed && !show_raw {
+                    "the other device"
+                } else {
+                    l.label()
+                };
+                parts.push(peer_entry(label, mark, tone, note));
+            } else if unnamed && !show_raw {
+                continue;
             } else {
                 let (m, t, n) = presence_glyph(l.presence);
                 parts.push(peer_entry(l.label(), m, t, n));
             }
         }
         if !seen {
-            parts.push(peer_entry(fallback_name, mark, tone, note));
+            let label = if label_is_raw_id(fallback_name, pid, None) && !show_raw {
+                "the other device"
+            } else {
+                fallback_name
+            };
+            parts.push(peer_entry(label, mark, tone, note));
         }
         format!("  {}", parts.join("   "))
     }
@@ -3859,6 +3888,22 @@ impl Conn {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod raw_label_tests {
+    use super::label_is_raw_id;
+
+    // `receive <code>` printed "ok <raw peer id>": names show, ids do not.
+    #[test]
+    fn ids_are_raw_and_names_are_not() {
+        assert!(label_is_raw_id("Xy3_fAbcQ1", "Xy3_fAbcQ1", None));
+        assert!(label_is_raw_id("u-123", "sid", Some("u-123")));
+        assert!(label_is_raw_id("3f9c0a1be2d4c5f60718293a4b5c6d7e", "sid", None));
+        assert!(!label_is_raw_id("alpha", "sid", None));
+        assert!(!label_is_raw_id("p5-b", "sid", Some("uid")));
+        assert!(!label_is_raw_id("cafe", "sid", None)); // short hex is a name
     }
 }
 

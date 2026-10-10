@@ -664,7 +664,7 @@ async fn handle_pty_open(
     // cleanly rather than getting a surprise re-login.
     if resume {
         let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "no such session" }))
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": l2::NO_SUCH_SESSION }))
             .await;
         return;
     }
@@ -5977,7 +5977,9 @@ pub(crate) async fn recv_cmd(
                                                                             }
                                                                             // The peer by name, not its raw signaling id.
                                                                             let who = conn.link(&pid).map(|l| l.label().to_string()).unwrap_or_else(|| pid.to_string());
-                                                                            ui::say(&format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), who));
+                                                                            let line = format!("  {} identity verified for peer {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), who);
+                                                                            // A raw id is an internal: -v only.
+                                                                            if who.as_str() == &pid[..] { ui::debug(&line) } else { ui::say(&line) }
                                                                             // Erase held nonce single-use
                                                                             identity_nonces.remove(&pid);
                     }
