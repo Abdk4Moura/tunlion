@@ -1023,7 +1023,7 @@ mod tests {
     fn grant_takes_a_tag_instead_of_a_device() {
         use crate::dispatch::grant_operands;
         let get = |words: &[&str]| match parse(words).expect("parses").cmd {
-            Some(crate::Cmd::Grant { device, capability, tag }) => (device, capability, tag),
+            Some(crate::Cmd::Grant { device, capability, tag, .. }) => (device, capability, tag),
             _ => unreachable!(),
         };
         let (d, c, t) = get(&["grant", "--tag", "ci", "shell"]);
