@@ -483,6 +483,25 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
         ui::paint(tone, word),
         ui::paint(Tone::Dim, &detail),
     ));
+    // The running daemon's inbox: deleted under it, every file sent was
+    // refused with a bare "No such file or directory".
+    if crate::daemon_alive().is_some() {
+        let inbox = crate::recv_files::inbox_to_check(true);
+        match crate::recv_files::inbox_problem(&inbox) {
+            None => ui::say(&format!(
+                "  {:<13} {}  {}",
+                "inbox",
+                ui::paint(Tone::Ok, "ok"),
+                ui::paint(Tone::Dim, &inbox.display().to_string()),
+            )),
+            Some(problem) => ui::say(&format!(
+                "  {:<13} {}  {}",
+                "inbox",
+                ui::paint(Tone::Warn, "MISSING"),
+                ui::paint(Tone::Dim, &problem),
+            )),
+        }
+    }
 
     // ICE / STUN.
     match &ice {

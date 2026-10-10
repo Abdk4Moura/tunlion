@@ -169,7 +169,7 @@ jobs:
             [cli/tests/shell-gates.sh]=12
             [cli/tests/whoami-candidate-gates.sh]=8
             [cli/tests/warm-hold-idle-gates.sh]=9
-            [cli/tests/hostile-env-gates.sh]=16
+            [cli/tests/hostile-env-gates.sh]=17
             [cli/tests/reenrol-advice-gates.sh]=3
             [cli/tests/daemon-stop-gates.sh]=4
             [cli/tests/signaling-freeze-gates.sh]=5

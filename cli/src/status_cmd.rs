@@ -146,6 +146,11 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         None
     };
     let degraded = signaling.as_ref().and_then(crate::daemon_health::degraded_reason);
+    // The verdict comes first, before anything is printed: the human text, the
+    // JSON and the exit code are three renderings of ONE answer. `--json` used
+    // to say `"ok": true` with exit 0 for a daemon that was down or frozen,
+    // while the same question without `--json` exited 11 or 6.
+    let code = status_exit_code(pid_alive.is_some(), responding);
     if json {
         let pid = pid_alive;
         let exposed: Vec<Value> = expose::load()
@@ -158,8 +163,11 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "ok": true,
                 "verb": "status",
+                // `ok` is the exit code's answer: true only when a daemon
+                // serves this config dir and answers. `error` names why not.
+                "ok": code == 0,
+                "error": status_error(code, pid),
                 "running": pid.is_some(),
                 "pid": pid,
                 // false: a process holds the pidfile but does not answer on its
@@ -171,6 +179,12 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 "signaling": signaling,
                 "degraded": degraded,
                 "devices": devices_load().len(),
+                // A running daemon's inbox that is missing or not a directory
+                // (null when fine, or when no daemon runs).
+                "inbox_problem": pid
+                    .is_some()
+                    .then(|| crate::recv_files::inbox_problem(&crate::recv_files::inbox_to_check(true)))
+                    .flatten(),
                 "exposed": exposed,
                 "recent": recent,
                 // Always the owner fingerprint or null; `role` says whether
@@ -184,7 +198,10 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
                 "proxy": crate::proxy_state::to_json(crate::proxy_state::current().as_ref()),
             }))?
         );
-        return Ok(());
+        return match code {
+            0 => Ok(()),
+            code => std::process::exit(code),
+        };
     }
     if !crate::identity_flow::has_identity() {
         ui::say(&format!(
@@ -232,6 +249,17 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
         n,
         if n == 1 { "" } else { "s" }
     ));
+    // An inbox deleted under a running daemon refused every file with a bare
+    // "No such file or directory"; say so here rather than at the next send.
+    // Only for a running daemon: before the first `up` there is no inbox yet,
+    // and that is not a problem.
+    if let Some(problem) = pid_alive
+        .is_some()
+        .then(|| crate::recv_files::inbox_problem(&crate::recv_files::inbox_to_check(true)))
+        .flatten()
+    {
+        ui::say(&format!("  {} {problem}", ui::paint(ui::Tone::Warn, "!")));
+    }
     let exposed = expose::load();
     if !exposed.is_empty() {
         ui::say(&ui::paint(ui::Tone::Dim, "  exposed on .mesh:"));
@@ -270,9 +298,31 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
             }
         }
     }
-    match status_exit_code(pid_alive.is_some(), responding) {
+    match code {
         0 => Ok(()),
         code => std::process::exit(code),
+    }
+}
+
+/// The `error` object `status --json` carries when it exits nonzero, in the
+/// shape every verb's failure envelope uses (`code` token, `exit`, `message`),
+/// or null when the daemon serves and answers. Pure.
+pub(crate) fn status_error(code: i32, pid: Option<u32>) -> Value {
+    match code {
+        0 => Value::Null,
+        STATUS_NOT_RUNNING => json!({
+            "code": "not_running",
+            "exit": code,
+            "message": "no daemon is running for this config directory; start it with `tunlion up`",
+        }),
+        _ => json!({
+            "code": "unreachable",
+            "exit": code,
+            "message": format!(
+                "the daemon (pid {}) is running but did not answer on its control socket",
+                pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+            ),
+        }),
     }
 }
 
@@ -285,9 +335,12 @@ pub(crate) async fn status_cmd(json: bool) -> Result<()> {
 ///   dir but did not answer on its control socket in time (suspended, wedged,
 ///   or no socket).
 ///
-/// `status --json` keeps exit 0 and reports both in `running`/`responding`:
-/// the JSON is the answer, and its reader asked for data, not a verdict.
-/// A platform that cannot ask the daemon (`responding` null) is not a failure.
+/// `status --json` exits with the SAME code, with `"ok"` equal to `code == 0`
+/// and an `error` naming the reason; the data fields (`running`,
+/// `responding`, ...) are all still there. It used to exit 0 with `"ok": true`
+/// for a down or frozen daemon, so a script gating on `status --json` went
+/// ahead against a machine the plain `status` called down. A platform that
+/// cannot ask the daemon (`responding` null) is not a failure.
 pub(crate) fn status_exit_code(running: bool, responding: Option<bool>) -> i32 {
     match (running, responding) {
         (false, _) => STATUS_NOT_RUNNING,
@@ -314,6 +367,32 @@ mod status_exit_tests {
         assert_eq!(status_exit_code(true, Some(false)), 6);
         assert_eq!(status_exit_code(false, Some(false)), 11);
         assert_eq!(status_exit_code(false, None), 11);
+    }
+
+    /// A `down` that ran after the spawn vetoes "detached", even while the
+    /// stopping daemon is still alive with its pidfile in place.
+    #[test]
+    fn up_detach_never_claims_a_daemon_a_down_is_stopping() {
+        use super::may_claim_detached as claim;
+        assert!(claim(true, true, false));
+        assert!(!claim(true, true, true), "a down since the spawn: it is stopping");
+        assert!(!claim(false, true, false), "the child exited");
+        assert!(!claim(true, false, false), "another process holds the pidfile");
+    }
+
+    /// The JSON's `ok` and `error` are the exit code, said again: never
+    /// `ok: true` beside a daemon that is down or not answering.
+    #[test]
+    fn status_json_error_matches_the_exit_code() {
+        use super::status_error;
+        assert!(status_error(0, Some(7)).is_null());
+        let down = status_error(status_exit_code(false, Some(false)), None);
+        assert_eq!(down["code"], "not_running");
+        assert_eq!(down["exit"], 11);
+        let frozen = status_error(status_exit_code(true, Some(false)), Some(2830));
+        assert_eq!(frozen["code"], "unreachable");
+        assert_eq!(frozen["exit"], 6);
+        assert!(frozen["message"].as_str().unwrap().contains("2830"));
     }
 }
 
@@ -515,6 +594,17 @@ pub(crate) fn mesh_enrolment(
     Ok((cert, payload))
 }
 
+/// How long `up --detach` re-watches a daemon it has just called detached.
+const DETACH_SETTLE: Duration = Duration::from_millis(400);
+
+/// May `up --detach` say the daemon it spawned is running? Only while the
+/// child has not exited, the pidfile names it, and no `down` has run since it
+/// was spawned (a daemon that is shutting down is still alive for a moment,
+/// with its pidfile in place, and must not be reported as detached). Pure.
+pub(crate) fn may_claim_detached(child_running: bool, pidfile_names_child: bool, down_since_spawn: bool) -> bool {
+    child_running && pidfile_names_child && !down_since_spawn
+}
+
 /// this terminal. The detached child writes the pidfile and serves; its console
 /// output goes to {config}/daemon.log so `tunlion logs` can follow it. The
 /// detach itself is one portable operation in `platform::spawn_detached`, whose
@@ -578,7 +668,16 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
     let outcome = match outcome {
         DetachOutcome::Ready => match child.try_wait() {
             Ok(Some(status)) => DetachOutcome::Exited(status.code()),
-            _ if daemon_alive() != Some(pid) => DetachOutcome::Exited(None),
+            // A `down` since the spawn vetoes "serving" even while the
+            // stopping daemon is still alive with its pidfile in place.
+            _ if !may_claim_detached(
+                true,
+                daemon_alive() == Some(pid),
+                crate::daemon_stop::stopped_by_down_since(spawned_at),
+            ) =>
+            {
+                DetachOutcome::Exited(None)
+            }
             _ => DetachOutcome::Ready,
         },
         other => other,
@@ -602,6 +701,28 @@ pub(crate) async fn detach_up(daemon_argv: &[String]) -> Result<()> {
                 pidfile().display(),
                 log_path.display()
             ));
+            // Verify AFTER the sentence too. A daemon told to stop shuts down
+            // gracefully, so for a moment it is still alive with its pidfile in
+            // place: `up --detach` and `down` half a second apart printed
+            // "stopped (pid N)" and "detached (pid N)" and both exited 0 with
+            // nothing running. A claim that stopped being true while it was
+            // printed is corrected, and the exit says so.
+            std::thread::sleep(DETACH_SETTLE);
+            if !may_claim_detached(
+                child.try_wait().ok().flatten().is_none(),
+                daemon_alive() == Some(pid),
+                crate::daemon_stop::stopped_by_down_since(spawned_at),
+            ) {
+                return Err(anyhow!(
+                    "the daemon (pid {pid}) stopped right after starting{}, so it is NOT running; see {}",
+                    if crate::daemon_stop::stopped_by_down_since(spawned_at) {
+                        ". A `tunlion down` ran while it was starting and stopped it"
+                    } else {
+                        ""
+                    },
+                    log_path.display()
+                ));
+            }
             Ok(())
         }
         DetachOutcome::NotReadyYet => {

@@ -423,6 +423,14 @@ pub(crate) async fn up_cmd(
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
     write_pidfile()?;
+    // Which inbox this daemon serves, so `status` and `doctor` can say when it
+    // has gone missing (`up --dir` may differ from the configured one).
+    // Best-effort: a status that cannot read it checks the configured inbox.
+    let inbox_abs = std::path::absolute(&dir).unwrap_or_else(|_| dir.clone());
+    let _ = std::fs::write(
+        crate::recv_files::daemon_inbox_marker(),
+        format!("{}\n", inbox_abs.display()),
+    );
     let granted_names = shell_grant_names();
     match &shell_policy {
         // M-2: --shell intentionally grants ALL proof-verified paired devices
