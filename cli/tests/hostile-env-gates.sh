@@ -22,6 +22,8 @@
 #      up.lock included): `status` there says not running (exit 11) and `down`
 #      there leaves the original's daemon alone.
 #   Z  after `down`, `status` says not running and exits 11 (it exited 0).
+#   J  `status --json` exits with the same code as `status` (6 frozen, 11
+#      stopped) and says `"ok": false` with an `error`; it said ok:true, exit 0.
 #   L  a config path past PATH_MAX: `up` names the length, not writability.
 #   D  a send into a 2 MB disk: refused BEFORE streaming, the sender exits 4 and
 #      names "out of disk space" with both sizes; nothing is left on that disk.
@@ -187,6 +189,7 @@ fi
 say "P: a stopped daemon is not reported up"
 if [ -n "$DPID" ] && kill -STOP "$DPID" 2>/dev/null; then
   STP=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcP=$?
+  STPJ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcPJ=$?
   kill -CONT "$DPID" 2>/dev/null
   echo "## status rc=$rcP"; echo "$STP" | sed 's/^/    /'
   if echo "$STP" | grep -q "not responding" && ! echo "$STP" | grep -q " up (pid" && [ "$rcP" = "6" ]; then
@@ -227,11 +230,36 @@ say "Z: status after down says not running and exits 11"
 STZ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status 2>&1); rcZ=$?
 STZJ=$(env FILAMENT_CONFIG_DIR="$DS" timeout 20 "$BIN" status --json 2>/dev/null); rcZJ=$?
 echo "## status rc=$rcZ, status --json rc=$rcZJ"; echo "$STZ" | head -1 | sed 's/^/    /'
-if [ "$rcZ" = "11" ] && echo "$STZ" | grep -q "not running" && [ "$rcZJ" = "0" ] \
+if [ "$rcZ" = "11" ] && echo "$STZ" | grep -q "not running" && [ "$rcZJ" = "11" ] \
    && echo "$STZJ" | "$PYV" -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("running") is False else 1)'; then
-  ok "gateZ: no daemon is exit 11 (text), and --json reports running:false with exit 0"
+  ok "gateZ: no daemon is exit 11, as text and as --json (running:false)"
 else
   bad "gateZ: status with no daemon (rc=$rcZ, --json rc=$rcZJ)"
+fi
+
+# ===================================================================== GATE J ==
+say "J: status --json says what the exit code says, for a frozen and a stopped daemon"
+# `ok` used to be true, with exit 0, for both: a script gating on
+# `status --json` went ahead against a daemon the plain `status` called down.
+# Now `ok` is false, `error.exit` repeats the code, and the process exits with
+# it; the frozen daemon's proxy is not reported as running.
+jcheck() {  # $1 = json, $2 = rc, $3 = want exit, $4 = want error code
+  printf '%s' "$1" | "$PYV" -c '
+import sys, json
+d = json.load(sys.stdin)
+rc, want, tok = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+err = d.get("error") or {}
+proxy = d.get("proxy")
+ok = (rc == want and d.get("ok") is False and err.get("exit") == want
+      and err.get("code") == tok and not (isinstance(proxy, dict) and proxy.get("running")))
+sys.exit(0 if ok else 1)' "$2" "$3" "$4"
+}
+echo "## frozen: --json rc=${rcPJ:-unset}"; printf '%s\n' "${STPJ:-}" | head -12 | sed 's/^/    /'
+echo "## stopped: --json rc=$rcZJ"; printf '%s\n' "$STZJ" | head -6 | sed 's/^/    /'
+if jcheck "${STPJ:-}" "${rcPJ:-0}" 6 unreachable && jcheck "$STZJ" "$rcZJ" 11 not_running; then
+  ok "gateJ: status --json is ok:false with the exit code (6 frozen, 11 stopped), never ok:true"
+else
+  bad "gateJ: status --json disagrees with its exit code (frozen rc=${rcPJ:-unset}, stopped rc=$rcZJ)"
 fi
 
 # ===================================================================== GATE L ==
