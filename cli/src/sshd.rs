@@ -305,6 +305,23 @@ pub fn check_sshd_ca() -> std::result::Result<(), String> {
     check_sshd_ca_at(Path::new(SSHD_CONFIG_DEFAULT))
 }
 
+/// Whether ssh is in play on this host at all: there is an sshd config to arm.
+/// A native `shell`/`exec` user without sshd has no use for the CA lines.
+fn ssh_relevant() -> bool {
+    sshd_config_path().exists()
+}
+
+/// An arming outcome: shown when ssh is relevant here, debug-only otherwise.
+/// "ssh CA arming skipped" printed on every `up --shell` for people who never
+/// use ssh, and named a fix for a feature they were not using.
+fn arming_note(line: &str) {
+    if ssh_relevant() {
+        crate::ui::say(line);
+    } else {
+        crate::ui::debug(line);
+    }
+}
+
 /// Best-effort arming for shell-serving flows (`up --shell`, `grant shell`):
 /// ensure the CA block plus the daemon principals entry. Loud on any
 /// failure but always Ok: serving must not newly require root. Paths honor
@@ -313,7 +330,7 @@ pub async fn arm_ssh_ca_for_serving() {
     let user = match crate::ssh_ca::valid_principal() {
         Ok(u) => u,
         Err(_) => {
-            crate::ui::say("ssh CA arming skipped (cannot determine serving user); cert logins will refuse until applied");
+            arming_note("ssh CA arming skipped (cannot determine serving user); cert logins will refuse until applied");
             return;
         }
     };
@@ -322,7 +339,7 @@ pub async fn arm_ssh_ca_for_serving() {
     // (idempotent). A mint failure stops arming loudly -- without a CA
     // there is nothing to anchor or trust.
     if let Err(e) = crate::ssh_ca::ensure_ca_key(&config_dir).await {
-        crate::ui::say(&format!(
+        arming_note(&format!(
             "ssh CA arming skipped (no CA key: {e}); cert logins will refuse until applied"
         ));
         return;
@@ -368,7 +385,7 @@ pub async fn arm_ssh_ca_for_serving() {
     let anchor = ca_pub_anchor_path();
     let ca_src = crate::ssh_ca::ca_key_path(&config_dir).with_extension("pub");
     if let Err(e) = install_ca_pub_anchor(&ca_src, &anchor) {
-        crate::ui::say(&format!(
+        arming_note(&format!(
             "ssh CA arming skipped (anchor unwritable: {e}); cert logins will refuse until applied:\n{}",
             sshd_ca_manual_steps(
                 &ca_src,
@@ -388,13 +405,13 @@ pub async fn arm_ssh_ca_for_serving() {
         &ca_src,
         true,
     ) {
-        crate::ui::say(&format!(
+        arming_note(&format!(
             "ssh CA arming skipped ({e}); cert logins will refuse until applied"
         ));
         return;
     }
     if let Err(e) = ensure_principals_entry(&principals_base_dir(), &user) {
-        crate::ui::say(&format!(
+        arming_note(&format!(
             "ssh principals entry skipped ({e}); cert logins will refuse until applied"
         ));
     }

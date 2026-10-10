@@ -281,6 +281,9 @@ struct Report {
     json: bool,
     moved: u64,
     counts: BTreeMap<&'static str, u64>,
+    /// Where the files landed on the peer, as the peer reported it in its
+    /// ack (absolute). `None` from an older peer that does not say.
+    dest: Option<String>,
 }
 impl Report {
     fn line(&mut self, state: &'static str, p: &str, bytes: u64, reason: Option<&str>) {
@@ -314,13 +317,16 @@ pub(crate) async fn run(
     relay: bool,
     opts: SyncOpts,
 ) -> i32 {
-    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new() };
+    let mut rep = Report { json: opts.json, moved: 0, counts: BTreeMap::new(), dest: None };
     match sync_inner(server, local, peer, remote_dir, relay, &opts, &mut rep).await {
         Ok(total) => {
             let partial = rep.counts.get("failed").copied().unwrap_or(0) > 0;
             let exit = if partial { 7 } else { 0 };
             if opts.json {
                 let mut d = json!({ "moved": rep.moved, "total": total, "dry_run": opts.dry_run, "exit": exit });
+                if let Some(dest) = &rep.dest {
+                    d["dest"] = json!(dest);
+                }
                 for (k, v) in &rep.counts {
                     d[k] = json!(v);
                 }
@@ -343,6 +349,13 @@ pub(crate) async fn run(
                         String::new()
                     },
                     if partial { format!(", {} FAILED", c("failed")) } else { String::new() },
+                ));
+                // Say WHERE: `sync dir peer:proj` lands under the peer's drop
+                // folder, which the output never said, so the files looked lost.
+                ui::say(&format!(
+                    "  {} {}",
+                    if opts.dry_run { "would land in" } else { "on" },
+                    sync_destination(peer, remote_dir, rep.dest.as_deref())
                 ));
             }
             exit
@@ -417,7 +430,9 @@ async fn sync_inner(
             match rx.recv().await {
                 Some(Ev::Control(_, v)) if v["sid"].as_u64() == Some(sid as u64) => {
                     match v["type"].as_str() {
-                        Some("sync-open-ack") => break Ok(()),
+                        Some("sync-open-ack") => {
+                            break Ok(v["dest"].as_str().map(str::to_string));
+                        }
                         Some("l2-close") => {
                             break Err(v["err"].as_str().unwrap_or("closed").to_string());
                         }
@@ -432,8 +447,11 @@ async fn sync_inner(
     })
     .await
     .map_err(|_| fail(5, "unreachable", format!("no answer from '{peer}' (is `tunlion up` running there?)")))?;
-    if let Err(reason) = ack {
-        return Err(fail(4, "denied", format!("'{peer}' refused sync: {reason}")));
+    match ack {
+        Err(reason) => {
+            return Err(fail(4, "denied", format!("'{peer}' refused sync: {reason}")));
+        }
+        Ok(dest) => rep.dest = dest,
     }
     let mut recs = Records::default();
     send_json(&t, sid, &json!({ "type": "manifest", "files": files })).await?;
@@ -588,6 +606,15 @@ pub(crate) fn resolve_root(drop_dir: &Path, req: &str, create: bool) -> Result<P
     target.canonicalize().map_err(|e| e.to_string())
 }
 
+/// `peer:/abs/path` as the peer reported it, else the request as typed with
+/// where it is relative to (an older peer does not report the path).
+fn sync_destination(peer: &str, remote_dir: &str, dest: Option<&str>) -> String {
+    match dest {
+        Some(d) => format!("{peer}:{d}"),
+        None => format!("{peer}:{remote_dir} (under {peer}'s drop folder)"),
+    }
+}
+
 pub(crate) async fn handle_sync_open(
     conn: &mut Conn,
     pid: &str,
@@ -646,7 +673,11 @@ pub(crate) async fn handle_sync_open(
         return refuse("sid in use".into()).await;
     };
     let delete = v["delete"].as_bool() == Some(true);
-    let _ = t.send_control(&json!({ "type": "sync-open-ack", "sid": sid })).await;
+    // `dest`: the resolved absolute destination, so the sender can say where
+    // its files went (additive; older senders ignore it).
+    let _ = t
+        .send_control(&json!({ "type": "sync-open-ack", "sid": sid, "dest": root.display().to_string() }))
+        .await;
     ui::say(&format!("sync: '{who}' -> {}{}", root.display(), if dry_run { " (dry run)" } else { "" }));
     tokio::spawn(async move {
         if let Err(e) = serve_sync(&t, &mux, sid, &root, delete, dry_run, pipe).await {

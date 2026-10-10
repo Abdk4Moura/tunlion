@@ -1551,6 +1551,14 @@ pub(crate) async fn bring_up_to_known(
     let connect_started = tokio::time::Instant::now();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(7));
     heartbeat.tick().await; // consume the immediate first tick
+    // A known device whose daemon is not running never appears on its presence
+    // channel, and this loop used to say only "still reaching" until the
+    // timeout. Once nothing has shown up for a few seconds, say the likely
+    // cause ONCE, and keep waiting (it may still come up).
+    let mut seen_presence = false;
+    let mut offline_hinted = false;
+    let mut offline_check = tokio::time::interval(Duration::from_millis(500));
+    offline_check.tick().await;
 
     loop {
         // One candidate at a time: start the next attempt whenever idle.
@@ -1658,6 +1666,18 @@ pub(crate) async fn bring_up_to_known(
                 }
                 continue;
             }
+            _ = offline_check.tick(), if !offline_hinted && !seen_presence => {
+                if connect_started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER
+                    && peer.is_none()
+                    && queue.is_empty()
+                {
+                    offline_hinted = true;
+                    if role != "doctor" && !silent {
+                        crate::ui::say(&crate::conn::offline_hint(peer_name));
+                    }
+                }
+                continue;
+            }
             _ = resubscribe.tick() => {
                 if my_id.is_none() {
                     // No Welcome yet. Re-emit the `join` once (it may have raced the
@@ -1715,6 +1735,7 @@ pub(crate) async fn bring_up_to_known(
                 if crate::is_self_uid(&my_uid, v["uid"].as_str()) {
                     continue;
                 }
+                seen_presence = true;
                 // Queue every distinct sid; the loop top rotates through them.
                 if peer.as_ref().is_some_and(|p| p.id == pid)
                     || queue.iter().any(|(q, _, _)| *q == pid)
@@ -2189,7 +2210,6 @@ pub(crate) fn warm_verify_window() -> std::time::Duration {
 /// than handing the client a dead connection (which would stall until ITS own
 /// timeout - the 25s ssh ConnectTimeout we measured). Verifying first means the
 /// fallback is immediate and the client never sends bytes into a black hole.
-#[cfg(unix)]
 async fn verify_first_frame(
     mux: &Arc<Mux>,
     sid: u32,
@@ -2218,15 +2238,117 @@ async fn verify_first_frame(
 /// Open an L2 stream over a warm link and CONFIRM the peer responds before the
 /// caller commits the client. Returns (sid, first_frame, remaining_rx) once the
 /// first inbound frame lands. `Err` on a zombie link (see `verify_first_frame`).
-#[cfg(unix)]
+/// Production goes through `open_stream_verified_reason` (the daemon must tell a
+/// refusal from a zombie); this flattening of it is what the zombie tests pin.
+#[cfg(all(unix, test))]
 pub(crate) async fn open_stream_verified(
     mux: &Arc<Mux>,
     rport: u16,
     verify: std::time::Duration,
 ) -> Result<(u32, PipeItem, mpsc::Receiver<PipeItem>)> {
-    let (sid, rx) = open_stream(mux, rport).await?;
-    let (first, rx) = verify_first_frame(mux, sid, rx, verify).await?;
-    Ok((sid, first, rx))
+    match open_stream_verified_reason(mux, rport, verify).await {
+        WarmOpen::Opened(sid, first, rx) => Ok((sid, first, rx)),
+        WarmOpen::Refused(reason) => Err(anyhow!("warm stream refused: {reason}")),
+        WarmOpen::Dead(e) => Err(e),
+    }
+}
+
+/// `open_stream_verified`, but a REFUSAL stays a refusal. The plain version maps
+/// a peer's `l2-close{err}` to the same error as a zombie link, so the daemon
+/// dropped a healthy warm link every time a forward was refused, and the client
+/// fell to a cold path that refused again with nothing on its terminal.
+pub(crate) enum WarmOpen {
+    Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
+    Refused(String),
+    Dead(anyhow::Error),
+}
+
+pub(crate) async fn open_stream_verified_reason(
+    mux: &Arc<Mux>,
+    rport: u16,
+    verify: std::time::Duration,
+) -> WarmOpen {
+    let (sid, rx) = match open_stream(mux, rport).await {
+        Ok(v) => v,
+        Err(e) => return WarmOpen::Dead(e),
+    };
+    match verify_first_frame(mux, sid, rx, verify).await {
+        Ok((first, rx)) => WarmOpen::Opened(sid, first, rx),
+        // on_close records the reason BEFORE it closes the pipe the verify
+        // reads, so a refusal is always visible here.
+        Err(e) => match mux.take_close_err(sid).await {
+            Some(reason) => WarmOpen::Refused(reason),
+            None => WarmOpen::Dead(e),
+        },
+    }
+}
+
+/// What the peer said to one probe open of `rport`, before `forward` says ready.
+pub(crate) enum ForwardProbe {
+    Accepted,
+    Refused(String),
+    Silent,
+}
+
+/// Ask the peer to open `rport` once and close it again, so `forward` can tell
+/// the user the truth BEFORE it claims to be ready: it used to print "ready"
+/// having asked nothing, and the first client got an empty reply while the
+/// refusal went to a log. Costs one connect+close on the peer's target port.
+async fn probe_forward(mux: &Arc<Mux>, rport: u16) -> ForwardProbe {
+    let Ok((sid, mut rx)) = open_stream(mux, rport).await else {
+        return ForwardProbe::Silent;
+    };
+    let outcome = tokio::time::timeout(Duration::from_secs(8), rx.recv()).await;
+    match outcome {
+        // The ack's liveness marker, or a server-speaks-first banner: open.
+        Ok(Some(_)) => {
+            mux.drop_stream(sid).await;
+            let _ = mux
+                .transport
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            ForwardProbe::Accepted
+        }
+        Ok(None) => match mux.take_close_err(sid).await {
+            Some(reason) => ForwardProbe::Refused(reason),
+            None => ForwardProbe::Silent,
+        },
+        Err(_) => {
+            mux.drop_stream(sid).await;
+            let _ = mux
+                .transport
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            ForwardProbe::Silent
+        }
+    }
+}
+
+/// Act on a probe verdict: a POLICY refusal (the peer will refuse every
+/// connection: tunnels off, no grant, revoked) ends the forward now with the
+/// reason and its remedy; a refusal of the target port itself (nothing
+/// listening there yet) is a warning, since a service may start later.
+fn forward_probe_verdict(peer: &str, rport: u16, probe: ForwardProbe) -> Result<()> {
+    match probe {
+        ForwardProbe::Accepted | ForwardProbe::Silent => Ok(()),
+        ForwardProbe::Refused(reason) => {
+            if crate::refusal::code_from_reason(&reason).is_some() {
+                let me = crate::refusal::name_from_reason(&reason)
+                    .unwrap_or_else(crate::display_name);
+                let code = crate::refusal::code_from_reason(&reason).unwrap();
+                let (text, cmd) = crate::refusal::remedy(code, peer, &me);
+                let fix = match cmd {
+                    Some(c) => format!("\n  {text}\n    {c}"),
+                    None => format!("\n  {text}"),
+                };
+                bail!("tunlion: {peer}:{rport} refused the connection: {reason}{fix}");
+            }
+            crate::ui::critical(&format!(
+                "tunlion: {peer}:{rport} refused a test connection: {reason}. Nothing is accepting on port {rport} there right now; connections will fail until something listens on it."
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Bridge a verified warm stream to the client `sock`, replaying the already-read
@@ -3045,9 +3167,10 @@ async fn try_warm_pty(
     let sock = match crate::ctl::try_pty_reason(peer, session, cols, rows, term, cmd).await {
         Ok(sock) => sock,
         Err(Some(reason)) if reason.starts_with("refused:") => {
+            let why = reason.trim_start_matches("refused:").trim();
             return Some(Err(anyhow!(
                 "{}",
-                reason.trim_start_matches("refused:").trim()
+                crate::refusal::explain("a shell", peer, why, None, None)
             )));
         }
         Err(_) => return None, // no warm path; the cold path is the right answer
@@ -3214,36 +3337,31 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
             Ok(PtyOutcome::Refused(reason)) => {
                 // The peer is up and said no. Nonzero with the reason; never a
                 // false success that would carry a `&&` pipeline forward.
-                // The remedy depends on WHICH refusal: a revoked certificate is
-                // not repaired by a grant, so the hint must not say "grant".
-                let hint = if reason == crate::capability::REVOKED_REASON {
-                    format!(
-                        "the peer's certificate was revoked; restore it with {}",
+                // The remedy depends on WHICH refusal, and the acceptor's reason
+                // says which: a revoked certificate is not repaired by a grant,
+                // a ceiling cannot be widened by one, and a missing grant is not
+                // "serving is off". `refusal` maps each to its one fix, naming
+                // this device the way the peer knows it.
+                let hint = match crate::refusal::code_from_reason(&reason) {
+                    Some(code) => {
+                        let me = crate::refusal::name_from_reason(&reason)
+                            .unwrap_or_else(crate::display_name);
+                        let (text, cmd) = crate::refusal::remedy(code, peer, &me);
+                        match cmd {
+                            Some(c) => format!(
+                                "{text} {}",
+                                crate::ui::paint(crate::ui::Tone::Brand, &c)
+                            ),
+                            None => text,
+                        }
+                    }
+                    None => format!(
+                        "if this device should have a shell there, on '{peer}' run: {}",
                         crate::ui::paint(
                             crate::ui::Tone::Brand,
-                            "tunlion devices restore <this-device>"
+                            &format!("tunlion grant {} shell", crate::display_name())
                         )
-                    )
-                } else if reason == crate::capability::CEILING_REASON {
-                    // A grant cannot widen an enrolment ceiling, and `tunlion
-                    // grant` says so when you run it. Prescribing it here sent
-                    // the owner to a command that refuses, and the refusal named
-                    // the real fix. Name it here instead, one step earlier.
-                    format!(
-                        "shell is outside this device's invitation ceiling, and a grant cannot widen one. Re-invite with shell: {}",
-                        crate::ui::paint(
-                            crate::ui::Tone::Brand,
-                            "tunlion add --for <this-device> --allow shell"
-                        )
-                    )
-                } else {
-                    format!(
-                        "grant shell on the peer: {}",
-                        crate::ui::paint(
-                            crate::ui::Tone::Brand,
-                            &format!("tunlion grant <this-device> shell")
-                        )
-                    )
+                    ),
                 };
                 crate::ui::problem(&format!("shell refused by '{peer}'"), &reason, &[hint]);
                 std::process::exit(1);
@@ -3489,15 +3607,27 @@ impl ForwardActivity {
     /// never did. pty already reads it via `take_close_err`. So this is wiring a
     /// channel that existed, not building one, which is the correction the
     /// reviewer made to my first description of this work.
+    ///
+    /// Reported for EVERY refused connection, on stderr at the level `-q` keeps:
+    /// a client that gets an empty reply needs the reason each time, not only
+    /// the first. The remedy (when the reason has one) is printed once.
     fn refused_once(&self, reason: &str) {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.refused.swap(true, Relaxed) {
-            return;
-        }
         crate::ui::critical(&format!(
             "tunlion: {}:{} refused the connection: {reason}",
             self.peer, self.rport
         ));
+        if self.refused.swap(true, Relaxed) {
+            return;
+        }
+        if let Some(code) = crate::refusal::code_from_reason(reason) {
+            let me = crate::refusal::name_from_reason(reason).unwrap_or_else(crate::display_name);
+            let (text, cmd) = crate::refusal::remedy(code, &self.peer, &me);
+            crate::ui::critical(&format!("  {text}"));
+            if let Some(c) = cmd {
+                crate::ui::critical(&format!("    {c}"));
+            }
+        }
     }
 
     /// Register a newly accepted connection; the returned guard decrements on drop.
@@ -3648,6 +3778,13 @@ pub async fn forward_cmd(
         // hold a live warm link (then connections really are instant) or none yet
         // (then it opens on the first connection) - saying "ready, instant" in the
         // second case is what left the user unsure whether it was forwarding.
+        // Ask once through the daemon, so a refusal ends the forward here with
+        // its reason instead of reaching the first client as an empty reply.
+        match crate::ctl::forward_probe(peer, rport).await {
+            Some(Ok(())) => {}
+            Some(Err(reason)) => forward_probe_verdict(peer, rport, ForwardProbe::Refused(reason))?,
+            None => {}
+        }
         match crate::ctl::try_ping(peer).await {
             Some(facts) => {
                 let route = facts["route"].as_str().unwrap_or("link");
@@ -3677,6 +3814,11 @@ pub async fn forward_cmd(
                 );
             }
         }
+        // ...and ask the peer once, so "ready" also means "it will forward".
+        let first = rx.borrow().clone();
+        if let Some(m) = first {
+            forward_probe_verdict(peer, rport, probe_forward(&m, rport).await)?;
+        }
         crate::ui::say(&format!(
             "tunlion: ready, listening on 127.0.0.1:{lport} -> {peer}:{rport} (connect to it to forward; run `tunlion up` here to avoid a separate presence on {peer})"
         ));
@@ -3700,13 +3842,23 @@ pub async fn forward_cmd(
         // per connection so it is used whenever the daemon holds a warm link.
         #[cfg(unix)]
         if warm {
-            if let Some(usock) = crate::ctl::try_open(peer, rport).await {
-                let guard = activity.begin();
-                tokio::spawn(async move {
-                    let _guard = guard; // decrements + refreshes the activity line on close
-                    let _ = bridge_streams(sock, usock).await;
-                });
-                continue;
+            match crate::ctl::try_open_reason(peer, rport).await {
+                Ok(usock) => {
+                    let guard = activity.begin();
+                    tokio::spawn(async move {
+                        let _guard = guard; // decrements + refreshes the activity line on close
+                        let _ = bridge_streams(sock, usock).await;
+                    });
+                    continue;
+                }
+                // The PEER said no: say so on this terminal, for this connection,
+                // and drop it. A cold retry would only be refused again.
+                Err(Some(reason)) if reason.starts_with("refused:") => {
+                    activity.refused_once(reason.trim_start_matches("refused:").trim());
+                    drop(sock);
+                    continue;
+                }
+                Err(_) => {}
             }
             // Warm miss (the daemon has no live link to the peer right now): fall
             // through to a cold link instead of dropping the connection. The cold
@@ -4550,6 +4702,15 @@ async fn shell_bootstrap(
                     let why = v["reason"]
                         .as_str()
                         .unwrap_or("shell capability not granted");
+                    // A peer of this build says exactly why (`code`) and what it
+                    // calls us (`as`); one remedy per cause, never two.
+                    let (code, as_name) = crate::refusal::from_frame(&v, "reason");
+                    if code.is_some() {
+                        break Err(anyhow!(
+                            "{}",
+                            crate::refusal::explain("a shell", peer, why, code, as_name.as_deref())
+                        ));
+                    }
                     // Same trap as the non-ssh path: a grant cannot widen an
                     // enrolment ceiling, so do not prescribe one when the
                     // ceiling is the reason.

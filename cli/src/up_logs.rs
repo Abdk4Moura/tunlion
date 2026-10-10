@@ -286,6 +286,50 @@ pub(crate) async fn up_cmd(
             pidfile(),
             std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default()
         );
+        // Asked of the RUNNING daemon (like `revoke`'s #244 check): its shell
+        // posture comes from launch flags that never touch the settings file,
+        // so only the daemon can say what it is serving.
+        let running = crate::ctl::try_cap_status().await;
+        let verdict = already_up_verdict(
+            &shell_policy,
+            running.as_ref(),
+            // Only flags that can come from the command line alone: relay and
+            // shell-user also fold in from settings, which the running daemon
+            // read too, so counting them would refuse every second `up`.
+            dir.is_some() || no_proxy_fallback,
+        );
+        if verdict != AlreadyUp::Same {
+            // Never follow the log here: that blocked forever and silently
+            // dropped the flags, so `up --detach --shell` looked like it worked
+            // while the daemon went on serving no shell.
+            // The restart carries EVERY daemon flag this `up` was given (the
+            // same argv `--detach` hands its child), not a hand-picked subset.
+            let mut restart_flags = vec!["--detach".to_string()];
+            restart_flags.extend(daemon_argv.iter().skip(1).cloned());
+            let restart = restart_command(&restart_flags);
+            let detail = match (&verdict, running.as_ref()) {
+                (AlreadyUp::Differs, Some(st)) => format!(
+                    "it is serving shells to {}, and this `up` asked for {}. Your flags were NOT applied.",
+                    describe_running(st),
+                    describe_policy(&shell_policy)
+                ),
+                _ => "it did not report its settings, so the flags you gave may not be in effect. Your flags were NOT applied.".to_string(),
+            };
+            ui::problem(
+                &format!("a daemon is already running (pid {pid}) with different settings"),
+                &detail,
+                &[format!("to apply them, restart it:  {restart}")],
+            );
+            std::process::exit(ALREADY_UP_DIFFERENT_EXIT);
+        }
+        if detach {
+            // --detach never blocks: the daemon already serves exactly this.
+            ui::say(&format!(
+                "  {} daemon already running (pid {pid}) with these settings; nothing to do",
+                ui::paint(ui::Tone::Ok, ui::glyph_ok())
+            ));
+            return Ok(());
+        }
         // #192: `up` twice should not dead-end. The daemon is already serving;
         // follow its log. Ctrl-c detaches and leaves it running.
         ui::say(&format!(
@@ -412,6 +456,149 @@ pub(crate) async fn up_cmd(
     .await;
     let _ = std::fs::remove_file(pidfile());
     res
+}
+
+/// Exit status when `up` finds a daemon already running with settings other
+/// than the ones asked for: distinct from a plain failure (1) so a script can
+/// tell "nothing changed, restart to apply" apart from "up broke".
+pub(crate) const ALREADY_UP_DIFFERENT_EXIT: i32 = 3;
+
+/// What `up` should do about a daemon that is already running.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AlreadyUp {
+    /// It already serves what was asked: nothing to apply.
+    Same,
+    /// It reported a different shell posture.
+    Differs,
+    /// It did not report, and flags it cannot confirm were given.
+    Unknown,
+}
+
+/// Compare the asked-for posture with what the running daemon reports via
+/// `cap-status` (`shell_policy` label + `shell_auto` names). `other_flags`:
+/// flags given that the daemon cannot report back (`--dir`,
+/// `--no-proxy-fallback`); those cannot be confirmed, so they count as a change.
+pub(crate) fn already_up_verdict(
+    asked: &ShellPolicy,
+    running: Option<&serde_json::Value>,
+    other_flags: bool,
+) -> AlreadyUp {
+    let Some(st) = running else {
+        return if asked.enables_l2() || other_flags {
+            AlreadyUp::Unknown
+        } else {
+            AlreadyUp::Same
+        };
+    };
+    let label = st["shell_policy"].as_str().unwrap_or("");
+    let mut auto: Vec<String> = st["shell_auto"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    auto.sort();
+    if label != asked.label() || (label == "only" && auto != asked.auto_names()) {
+        return AlreadyUp::Differs;
+    }
+    if other_flags {
+        AlreadyUp::Unknown
+    } else {
+        AlreadyUp::Same
+    }
+}
+
+fn describe_policy(p: &ShellPolicy) -> String {
+    match p {
+        ShellPolicy::All => "every paired device (--shell)".to_string(),
+        ShellPolicy::Only(_) => format!("only {} (--shell-only)", p.auto_names().join(", ")),
+        ShellPolicy::Granted => "only devices you granted shell (no --shell)".to_string(),
+    }
+}
+
+fn describe_running(st: &serde_json::Value) -> String {
+    match st["shell_policy"].as_str().unwrap_or("") {
+        "all" => "every paired device (--shell)".to_string(),
+        "only" => format!(
+            "only {} (--shell-only)",
+            st["shell_auto"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default()
+        ),
+        _ => "only devices you granted shell (no --shell)".to_string(),
+    }
+}
+
+/// `tunlion down --yes && tunlion up <flags>`, quoting any flag value that
+/// needs it. The `up` half is pinned by a parse test.
+pub(crate) fn restart_command(up_flags: &[String]) -> String {
+    let words: Vec<String> = up_flags
+        .iter()
+        .map(|f| {
+            if f.chars().any(|c| c.is_whitespace()) {
+                format!("'{f}'")
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    format!("tunlion down --yes && tunlion up {}", words.join(" "))
+}
+
+#[cfg(test)]
+mod already_up_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_different_posture_is_reported_not_followed() {
+        let running = json!({"shell_policy": "granted", "shell_auto": []});
+        assert_eq!(
+            already_up_verdict(&ShellPolicy::All, Some(&running), false),
+            AlreadyUp::Differs
+        );
+        assert_eq!(
+            already_up_verdict(&ShellPolicy::Granted, Some(&running), false),
+            AlreadyUp::Same
+        );
+        let only = json!({"shell_policy": "only", "shell_auto": ["b", "a"]});
+        let asked = ShellPolicy::Only(["a".to_string(), "b".to_string()].into_iter().collect());
+        assert_eq!(already_up_verdict(&asked, Some(&only), false), AlreadyUp::Same);
+        let other = ShellPolicy::Only(["a".to_string()].into_iter().collect());
+        assert_eq!(already_up_verdict(&other, Some(&only), false), AlreadyUp::Differs);
+    }
+
+    #[test]
+    fn unconfirmable_flags_are_never_silently_dropped() {
+        let running = json!({"shell_policy": "granted", "shell_auto": []});
+        assert_eq!(
+            already_up_verdict(&ShellPolicy::Granted, Some(&running), true),
+            AlreadyUp::Unknown
+        );
+        assert_eq!(already_up_verdict(&ShellPolicy::All, None, false), AlreadyUp::Unknown);
+        assert_eq!(already_up_verdict(&ShellPolicy::Granted, None, false), AlreadyUp::Same);
+    }
+
+    /// Both halves of the suggested restart are commands the CLI accepts.
+    #[test]
+    fn the_restart_command_parses() {
+        use clap::Parser;
+        let flags: Vec<String> = ["--detach", "--shell-only", "laptop,phone", "--i-know"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let cmd = restart_command(&flags);
+        let (down, up) = cmd.split_once(" && ").expect("two commands");
+        for half in [down, up] {
+            let argv: Vec<&str> = half.split_whitespace().collect();
+            assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {half}");
+        }
+        assert!(up.contains("--detach"), "{up}");
+        let shell: Vec<String> = ["--detach", "--shell", "--i-know"].iter().map(|s| s.to_string()).collect();
+        let cmd = restart_command(&shell);
+        let up = cmd.split_once(" && ").unwrap().1;
+        let argv: Vec<&str> = up.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {up}");
+    }
 }
 
 /// Where `tunlion logs` reads from. Pure, so the order is pinned by a test.

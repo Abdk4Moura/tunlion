@@ -677,6 +677,8 @@ pub(crate) async fn send_cmd(
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
     let mut saw_known_peer: HashSet<String> = HashSet::new();
+    // Once, when a known target has shown no presence for a few seconds.
+    let mut offline_hinted = false;
     // P4 (delivery-ack window): when every transfer's bytes have been `sent` but
     // the whole-file `delivery-ack` hasn't landed, we wait up to this bound for
     // the ack. CRITICAL (silent-data-loss fix): elapsing this window does NOT mean
@@ -713,6 +715,19 @@ pub(crate) async fn send_cmd(
                  (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
                 establish_deadline.as_secs()
             );
+        }
+        // A known device that never appears is usually one whose daemon is not
+        // running. Say so once, then keep waiting until the timeout.
+        if let Some((n, _)) = &known_target {
+            if !offline_hinted
+                && !established
+                && saw_known_peer.is_empty()
+                && started.elapsed() >= crate::conn::OFFLINE_HINT_AFTER
+            {
+                offline_hinted = true;
+                ui::clear_sticky();
+                ui::say(&crate::conn::offline_hint(n));
+            }
         }
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.rejoin.waiting_rejoin.is_none() {
@@ -955,12 +970,14 @@ pub(crate) async fn send_cmd(
                 } else {
                     server.to_string()
                 };
-                ui::clipboard(&full);
+                // Claim the copy only where a clipboard can exist: on a headless
+                // box or over a plain ssh login the OSC 52 write lands nowhere.
+                let copied = ui::clipboard(&full);
                 ui::say("");
                 ui::say(&format!(
                     "  code   {}   {}",
                     ui::paint(ui::Tone::Brand, &full),
-                    ui::paint(ui::Tone::Dim, "(copied to clipboard)")
+                    ui::paint(ui::Tone::Dim, if copied { "(copied to clipboard)" } else { "" })
                 ));
                 ui::say(&format!(
                     "         {}",
@@ -1262,7 +1279,7 @@ pub(crate) async fn send_cmd(
                     ui::say(&format!(
                         "  {} {}",
                         ui::paint(ui::Tone::Ok, ui::glyph_ok()),
-                        ui::paint(ui::Tone::Bold, l.shown())
+                        ui::paint(ui::Tone::Bold, l.label())
                     ));
                     let is_direct = l.direct;
                     let direct_route = l.direct_route;

@@ -1479,7 +1479,15 @@ fn spawn_reader(
                     // worker). `dead` stays false exactly as the comment above
                     // requires.
                     rx_ended.store(true, std::sync::atomic::Ordering::Relaxed);
-                    note_reader_exit(&peer_id, primary, "finished-early(hdr)", frames, false);
+                    // At a frame boundary this is the peer ending its send half
+                    // on purpose (a one-shot finishing): the normal end, so it
+                    // is debug-level like the clean-close arm below. It printed
+                    // after every successful exec/send at normal verbosity. The
+                    // liveness consequence is unchanged (`rx_ended`, decided by
+                    // `is_dead()`); a FIN mid-frame (`body`) stays loud.
+                    crate::hooks::debug(&format!(
+                        "l2: link reader exited peer={peer_id} primary={primary} reason=finished-early(hdr) frames={frames} dead=false"
+                    ));
                     break;
                 }
                 // A connection WE closed (a one-shot `exec` finishing) or one the

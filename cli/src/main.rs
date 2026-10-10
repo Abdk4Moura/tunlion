@@ -161,6 +161,8 @@ mod shell_support;
 pub(crate) use shell_support::{any_shell_grant, daemon_alive, daemon_running, require_shell_owner_ack, service_manager_for_pid, shell_argv, shell_grant_names, shell_root_note};
 /// The single shell gate shared by pty-open and exec-open.
 mod shell_gate;
+/// Precise shell-class refusal codes and the remedy each one implies.
+mod refusal;
 #[cfg(test)]
 pub(crate) use shell_support::service_manager_for_cgroup;
 /// Hashing, time and randomness primitives.
@@ -552,7 +554,9 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
         return;
     }
     *shown = true;
-    ui::say(&ui::paint(
+    // Debug-level: this names a BROWSER setting (chrome://flags), and the
+    // terminal-to-terminal case it fired in at normal verbosity has no browser.
+    ui::debug(&ui::paint(
         ui::Tone::Dim,
         "  still can't connect, if both ends are on the SAME machine, a browser's \
          mDNS (.local) ICE candidates can block this; try a different network path, \

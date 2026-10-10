@@ -545,6 +545,25 @@ fn shell_owner_ack_is_required_without_user_drop() {
     assert!(require_shell_owner_ack(false, None, false, false).is_ok());
 }
 
+/// The refusal states the risk once and offers `--i-know` as the explicit
+/// choice, as a command the CLI accepts. Both postures, since a non-root user
+/// has no other way to serve a shell.
+#[test]
+fn owner_shell_refusal_offers_i_know_as_a_parseable_choice() {
+    use clap::Parser;
+    for root in [false, true] {
+        let msg = crate::shell_support::owner_shell_refusal(root);
+        assert!(msg.contains("owner's authority"), "{msg}");
+        let line = msg
+            .lines()
+            .find(|l| l.contains("--i-know"))
+            .expect("names --i-know");
+        let cmd = line[line.find("tunlion ").unwrap()..].trim();
+        let argv: Vec<&str> = cmd.split_whitespace().collect();
+        assert!(crate::Cli::try_parse_from(&argv).is_ok(), "does not parse: {cmd}");
+    }
+}
+
 #[test]
 fn shell_user_unsupported_requires_owner_ack() {
     let denied = require_shell_owner_ack(true, Some("alice"), false, false)

@@ -309,16 +309,26 @@ pub(crate) async fn authorize_exec(
     conn: &mut Conn,
     pid: &str,
     shell_policy: &crate::ShellPolicy,
-) -> Result<String, String> {
+) -> Result<String, crate::refusal::Refusal> {
     let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
         conn,
         pid,
         shell_policy,
         crate::capability::CAP_SHELL,
     );
+    // The refusal carries a precise code and the name this device files the
+    // peer under, so the initiator can print the one remedy that applies (a
+    // missing grant used to be indistinguishable from serving being off).
     crate::shell_gate::exec_gate_decision(&inputs)
-        .map(|()| dev.unwrap_or_else(|| pid.to_string()))
-        .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
+        .map(|()| dev.clone().unwrap_or_else(|| pid.to_string()))
+        .map_err(|r| {
+            crate::refusal::Refusal::from_shell_gate(
+                inputs.cert_revoked,
+                inputs.denied,
+                r.as_deref(),
+                dev.clone(),
+            )
+        })
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login
@@ -678,7 +688,8 @@ pub(crate) async fn handle_exec_open(
     if !l2::is_l2_sid(sid) {
         return;
     }
-    if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
+    if let Err(refusal) = authorize_exec(conn, pid, shell_policy).await {
+        let reason = refusal.reason.clone();
         // Settle-then-evaluate: the verdict above may rest on stale
         // (unproven) identity. Park for re-drive on proof when the deny
         // is attributable to it; otherwise the live verdict stands.
@@ -702,9 +713,7 @@ pub(crate) async fn handle_exec_open(
         // no-op by design.
         let who = conn.link(pid).and_then(|l| l.verified_name.clone());
         crate::enqueue_if_requestable(who.as_deref().unwrap_or("<unverified>"), "shell");
-        let _ = t
-            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
-            .await;
+        let _ = t.send_control(&refusal.close_frame(sid)).await;
         return;
     };
     // H-1 (DoS): refuse over the per-link stream cap BEFORE spawning, same as

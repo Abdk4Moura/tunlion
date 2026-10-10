@@ -351,10 +351,13 @@ pub(crate) enum Cmd {
         /// Drop directory (default: `tunlion config dir`, else ~/Filament if it exists, else ~/Tunlion)
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept seamless `tunlion shell --ssh` from ANY paired (proof-verified) device,
-        /// no per-device `grant` needed. Enables the tunnel acceptor too, so you
-        /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
-        /// required). Prints a security banner.
+        /// Serve a shell to ANY paired (proof-verified) device, with no per-device
+        /// `grant`: `tunlion shell <this>` (interactive), `tunlion exec <this> -- cmd`
+        /// (one command) and `tunlion shell <this> --ssh` (real ssh). Enables the
+        /// tunnel acceptor too (forward/netcat), so FILAMENT_L2=1 is not needed.
+        /// Strangers still can't get in (pairing is required). Without
+        /// --shell-user the shell runs as you, so this also needs --i-know.
+        /// To allow single devices instead: `tunlion grant <device> shell`.
         #[arg(long)]
         shell: bool,
         /// Like --shell but ONLY for these devices (comma-separated petnames);
@@ -373,7 +376,8 @@ pub(crate) enum Cmd {
         /// (often root). Requires `up` to run as root (runuser is setuid).
         #[arg(long, value_name = "USER")]
         shell_user: Option<String>,
-        /// Acknowledge that serving shell without --shell-user grants owner authority.
+        /// Serve the shell as yourself, knowingly: any device let in can do
+        /// anything you can, including act as you with your tunlion keys.
         #[arg(long)]
         i_know: bool,
         /// Internal: re-invoked after elevation to do the system-level install.

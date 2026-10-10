@@ -143,7 +143,7 @@ jobs:
             # depend on was never checked and in fact fails for the vouched
             # record; the slot reports it (KNOWN-RED today, counted here).
             [cli/tests/shell-posture-gates.sh]=4
-            [cli/tests/forward-refusal-gates.sh]=5
+            [cli/tests/forward-refusal-gates.sh]=6
           )
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
