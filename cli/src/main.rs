@@ -102,6 +102,8 @@ mod recv_cmd;
 use recv_cmd::recv_cmd;
 /// `tunlion send`.
 mod send_cmd;
+/// `tunlion send`'s source checks: refuse what cannot be read before offering.
+mod send_source;
 /// `tunlion send --json`: the result object.
 mod send_report;
 mod transfer_history;
