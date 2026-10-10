@@ -75,6 +75,8 @@ mod sdnotify;
 mod daemon_stop;
 /// What status and doctor say about the running daemon beyond a live pid.
 mod daemon_health;
+/// The daemon's signaling link: re-dial policy, log collapse, reported health.
+mod signaling_health;
 // The wire vocabulary and its pure decisions now live in their own crate. Kept
 // under the `protocol::` name so every call site reads unchanged.
 use filament_proto as protocol;

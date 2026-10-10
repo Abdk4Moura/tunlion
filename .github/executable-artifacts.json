@@ -359,6 +359,17 @@
       ]
     },
     {
+      "path": "cli/tests/signaling-freeze-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/signaling-freeze-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/ssh-ca-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/tunlion bash cli/tests/ssh-ca-gates.sh",
