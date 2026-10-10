@@ -251,7 +251,7 @@ pub fn registry() -> &'static [Setting] {
             scope: ScopeKind::GlobalOrPeer,
             env: None,
             daemon: true,
-            help: "Accept seamless `tunlion ssh` from paired devices (per-peer with --peer)",
+            help: "Accept seamless `tunlion shell` from paired devices (per-peer with --peer)",
         },
         Setting {
             key: "shell-user",
@@ -947,7 +947,7 @@ pub async fn run_set(
     }
     if reset || unset_key {
         let Some(k) = key else {
-            bail!("name the setting to reset: tunlion set <key> --unset");
+            bail!("name the setting to reset: tunlion set <key> --unset   reset all: tunlion set --reset");
         };
         if value.is_some() {
             bail!("--unset/--reset take a key, not a value: tunlion set {k} --unset");
@@ -1178,7 +1178,7 @@ fn render_missing_interactive(s: &Setting) -> Result<()> {
                 _ => {}
             }
             println!();
-            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset"));
+            println!("{}", ui::paint_when(color, ui::Tone::Dim, "set: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset   reset all: tunlion set --reset"));
         }
     }
     Ok(())
@@ -1379,7 +1379,7 @@ fn readout(json_out: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset")
+        ui::paint_when(color, ui::Tone::Dim, "edit: tunlion set <key>   change: tunlion set <key> <value> [--peer <peer>]   reset: tunlion set <key> --unset   reset all: tunlion set --reset")
     );
     Ok(())
 }

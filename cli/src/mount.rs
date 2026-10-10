@@ -791,14 +791,14 @@ pub fn print_mount_help() {
     println!("  tunlion mount --profiles                          List saved profiles");
     println!();
     println!("OPTIONS:");
-    println!("  --read-only                  Mount read-only");
+    println!("  --read-write                 Permit writes (read-only is the default)");
     println!("  --foreground                 Run sshfs in foreground (blocks terminal)");
     println!("  --save-auto                  Auto-restore this mount on daemon start");
     println!("  --options <opts>             Extra sshfs options (comma-separated)");
     println!();
     println!("EXAMPLES:");
     println!("  tunlion mount other-do /data /mnt/data");
-    println!("  tunlion mount other-do /data /mnt/data --read-only");
+    println!("  tunlion mount other-do /data /mnt/data --read-write");
     println!("  tunlion mount other-do /data --save-auto");
     println!("  tunlion mount --list");
     println!("  tunlion mount --check abc123");

@@ -67,19 +67,34 @@ fi
 # reason reaches the initiator's stderr. Exit 0 is the #223 false success; a
 # still-running process is a wedge (the terminal stopped but cannot be reaped).
 say B
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >"$WORK/revoke.out" 2>&1
+revoke_rc=$?
+echo "## revoke exit code: $revoke_rc"
 sleep "$GRACE"
+# Bound the wait BEFORE taking it. A bare `wait` on a wedged shell blocks until
+# the shell's own 60s loop ends (or forever, if the session is truly stuck), so
+# the wedge branch below was unreachable: the gate either hung or, once the loop
+# ran out, saw an exit it had not earned within GRACE. Liveness is judged at
+# exactly GRACE seconds, and a still-running shell is killed so `wait` returns.
+wedged=0
+if kill -0 "$SHELL_PID" 2>/dev/null; then
+  wedged=1
+  kill "$SHELL_PID" 2>/dev/null
+fi
 wait "$SHELL_PID" 2>/dev/null; rc=$?
-echo "## shell exit code after revoke: $rc"
+echo "## shell exit code after revoke: $rc (wedged at ${GRACE}s: $wedged)"
 echo "## tail: $(tail -4 "$WORK/pty.out" | tr '\n' ' ')"
-if [ "$rc" = "0" ]; then
+if [ "$revoke_rc" != "0" ]; then
+  bad "gateB: the revoke itself failed (rc $revoke_rc), so nothing below measures revocation"
+  sed 's/^/   revoke| /' "$WORK/revoke.out" | tail -5
+elif [ "$wedged" = "1" ]; then
+  bad "gateB: shell did NOT exit (wedged) within ${GRACE}s of the revoke"
+elif [ "$rc" = "0" ]; then
   bad "gateB: the revoked shell exited 0 (false success)"
 elif grep -q "access revoked" "$WORK/pty.err"; then
-  ok "gateB: revoked shell exited nonzero with 'access revoked' on stderr"
-elif ! kill -0 "$SHELL_PID" 2>/dev/null; then
-  bad "gateB: shell exited nonzero but no reason reached the initiator"
+  ok "gateB: revoked shell exited nonzero with 'access revoked' on stderr within ${GRACE}s"
 else
-  bad "gateB: shell did NOT exit (wedged) within ${GRACE}s"
+  bad "gateB: shell exited nonzero but no reason reached the initiator"
 fi
 
 echo

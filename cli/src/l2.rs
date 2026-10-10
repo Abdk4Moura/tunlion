@@ -2539,7 +2539,7 @@ pub async fn dial_cmd(peer: &str, port: u16) -> Result<()> {
 
 #[cfg(not(unix))]
 pub async fn dial_cmd(_peer: &str, _port: u16) -> Result<()> {
-    bail!("tunlion forward needs the local daemon's control socket (unix only)")
+    bail!("tunlion: `forward` needs the local daemon's control socket (unix only)")
 }
 
 /// `tunlion netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
@@ -3605,7 +3605,7 @@ pub async fn forward_cmd(
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             bail!(
                 "tunlion: cannot bind 127.0.0.1:{lport}: permission denied. Local ports below \
-                 1024 need root; pick a higher local port (e.g. `tunlion forward 8{lport:0>3} {peer} {rport}`) \
+                 1024 need root; pick a higher local port (e.g. `tunlion forward {peer}:{rport} --lport 8{lport:0>3}`) \
                  or run with sudo."
             );
         }
