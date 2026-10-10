@@ -358,6 +358,63 @@ pub(crate) fn storage_refusal(
     }
 }
 
+/// The inbox a daemon serves can be deleted while it runs; every file sent
+/// after that was refused "receiver could not save notes.txt: No such file or
+/// directory (os error 2)". Recreate it (owner-only, as it was made at start)
+/// before a file is accepted. `Ok(true)` when it had to be recreated.
+pub(crate) fn ensure_inbox(dir: &Path) -> std::io::Result<bool> {
+    if dir.is_dir() {
+        return Ok(false);
+    }
+    crate::platform::create_private_dir_all(dir)?;
+    Ok(true)
+}
+
+/// The typed refusal for an inbox that is missing and cannot be recreated
+/// (its parent is read-only, a file sits where it should be).
+pub(crate) fn inbox_refusal(dir: &Path, name: &str, e: &std::io::Error) -> (&'static str, String) {
+    (
+        "inbox_missing",
+        format!(
+            "receiver's inbox {} is missing and could not be recreated, so it cannot save {name} ({e})",
+            dir.display()
+        ),
+    )
+}
+
+/// What `status` and `doctor` say about an inbox, when something is wrong with
+/// it. `None` when it is a directory.
+pub(crate) fn inbox_problem(dir: &Path) -> Option<String> {
+    match std::fs::metadata(dir) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some(format!(
+            "inbox {} is not a directory: files sent here are refused until it is",
+            dir.display()
+        )),
+        Err(_) => Some(format!(
+            "inbox {} is missing: the daemon recreates it when the next file arrives (or create it: mkdir -p {})",
+            dir.display(),
+            dir.display()
+        )),
+    }
+}
+
+/// Where the running daemon keeps its inbox, beside its pidfile: `status` and
+/// `doctor` check that directory, which `up --dir` may have set.
+pub(crate) fn daemon_inbox_marker() -> PathBuf {
+    crate::pidfile().with_file_name("up.inbox")
+}
+
+/// The inbox to check: the running daemon's, else the configured one.
+pub(crate) fn inbox_to_check(daemon_running: bool) -> PathBuf {
+    daemon_running
+        .then(|| std::fs::read_to_string(daemon_inbox_marker()).ok())
+        .flatten()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| crate::drop_dir(None))
+}
+
 /// Remove what a refused file left behind: its `.part` and `.part.meta`. A
 /// refused partial is not resumable (the cause was the disk or the name, not the
 /// link), and on a full disk it is holding the very space that ran out.
@@ -544,6 +601,30 @@ pub(crate) async fn finalize_incoming(
 #[cfg(test)]
 mod tests {
     use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+
+    /// The inbox deleted under a running daemon: the next offer recreates it
+    /// (status and doctor say it is missing until then); one that cannot be
+    /// recreated is a typed refusal naming the inbox, not a bare ENOENT.
+    #[test]
+    fn a_deleted_inbox_is_recreated_or_refused_by_name() {
+        let base = std::env::temp_dir().join(format!("tunlion-inbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let inbox = base.join("Tunlion");
+        assert!(super::inbox_problem(&inbox).unwrap().contains("is missing"));
+        assert!(super::ensure_inbox(&inbox).unwrap(), "recreated");
+        assert!(inbox.is_dir());
+        assert_eq!(super::inbox_problem(&inbox), None);
+        assert!(!super::ensure_inbox(&inbox).unwrap(), "already there: nothing to do");
+        // A file where the inbox should be cannot be turned into one.
+        let blocked = base.join("blocked");
+        std::fs::write(&blocked, b"x").unwrap();
+        assert!(super::inbox_problem(&blocked).unwrap().contains("not a directory"));
+        let e = super::ensure_inbox(&blocked).unwrap_err();
+        let (token, msg) = super::inbox_refusal(&blocked, "notes.txt", &e);
+        assert_eq!(token, "inbox_missing");
+        assert!(msg.contains(&blocked.display().to_string()) && msg.contains("notes.txt"), "{msg}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn full_hash_whole_file_integrity() {
