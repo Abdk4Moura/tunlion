@@ -1336,9 +1336,14 @@ pub(crate) async fn pair_cmd(
                     .map(|l| l.name.clone());
                 conn.on_peer_left(&v);
                 let n = gone.unwrap_or_else(|| "the other device".into());
-                ui::say(&ui::paint(
-                    ui::Tone::Dim,
-                    &format!("  {n} disconnected, waiting briefly in case it reconnects..."),
+                // Debug only. In a SUCCESSFUL pairing the other side leaves on
+                // purpose: its one-shot join connection hands off to its daemon,
+                // and a first-time-user test saw this line twice right before
+                // "paired". When the leave is real, the ceremony deadline says
+                // so in plain words ("the other device disconnected before setup
+                // finished"), so nothing is lost at normal verbosity.
+                ui::debug(&format!(
+                    "  {n} disconnected, waiting briefly in case it reconnects..."
                 ));
             }
             Ev::Interrupted => bail!("interrupted"),

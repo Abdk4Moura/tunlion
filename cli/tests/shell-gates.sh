@@ -10,6 +10,9 @@
 #      nonzero and the reason names the capability.
 #   B  POSITIVE granted — `tunlion shell <peer> -- 'echo HELLO'` returns 0 with
 #      HELLO on stdout.
+#   G  INTERACTIVE clean exit — `tunlion shell boxB` under a pty over the warm
+#      link, `exit 0`: rc 0, no "refused"/"no such session", and the tty modes
+#      after equal the modes before (the terminal is restored).
 #   C  NEIGHBOUR `-- true` — a legitimately fast-exiting remote command stays
 #      exit 0 with no output; it must NOT be reported as a denial.
 #   D  NEGATIVE revoked — after `revoke <peer> shell`, the shell is refused
@@ -156,8 +159,79 @@ else
   bad "gateA2: daemon-mediated one-shot FAILED (rc=$rcA2 out='$OUTA2')"
 fi
 
-# ===================================================================== GATE C ==
-# NEIGHBOUR: `-- true` must stay exit 0, empty, NOT a denial.
+# ===================================================================== GATE G ==
+# INTERACTIVE clean exit. A first-time-user test typed `exit` in an interactive
+# `tunlion shell` over the warm link and got "shell refused by 'boxB': no such
+# session", exit 1, and a terminal left in raw mode (stair-stepping until
+# `stty sane`): the warm bridge cannot tell a clean exit from a drop, so it
+# hands off to a resume-only attach, and the acceptor's "no such session"
+# answer was read as a refusal whose exit path skipped the raw-mode guard.
+# Drive the real thing under a pty: attach, prove the shell runs, `exit 0`.
+# Asserts the CLIENT: rc 0, no refusal text, and the tty's modes after the
+# client exits are exactly the modes before it started (`stty -g` equality).
+say G
+env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA-G.log" 2>&1 &
+GDPID=$!
+sleep 3
+GRES=$("$PYV" - "$BIN" "$SERVER" "$DA" "$WORK/G.out" <<'PYEOF'
+import os, select, subprocess, sys, termios, time
+binp, server, cfg, outp = sys.argv[1:5]
+master, slave = os.openpty()
+before = termios.tcgetattr(slave)
+env = dict(os.environ, FILAMENT_CONFIG_DIR=cfg, FILAMENT_NAME="boxA", TERM="xterm")
+p = subprocess.Popen([binp, "--server", server, "shell", "boxB"],
+                     stdin=slave, stdout=slave, stderr=slave, env=env,
+                     start_new_session=True)
+buf = b""
+def pump(secs, until=None):
+    global buf
+    end = time.time() + secs
+    while time.time() < end:
+        if until is not None and until in buf:
+            return True
+        if p.poll() is not None:
+            r, _, _ = select.select([master], [], [], 0.2)
+            if not r:
+                return until is not None and until in buf
+        r, _, _ = select.select([master], [], [], 0.2)
+        if r:
+            try:
+                buf += os.read(master, 65536)
+            except OSError:
+                return until is not None and until in buf
+    return until is not None and until in buf
+os.write(master, b"echo G-$((40+2))\n")
+attached = pump(40, b"G-42")
+os.write(master, b"exit 0\n")
+rc = None
+end = time.time() + 60
+while time.time() < end:
+    pump(0.5)
+    rc = p.poll()
+    if rc is not None:
+        break
+if rc is None:
+    p.kill()
+    rc = "hung"
+pump(1)
+after = termios.tcgetattr(slave)
+with open(outp, "wb") as f:
+    f.write(buf)
+print("attached=%s rc=%s restored=%s" % (attached, rc, before == after))
+PYEOF
+)
+kill "$GDPID" 2>/dev/null
+wait "$GDPID" 2>/dev/null
+echo "## (interactive exit 0) $GRES"
+if [ "$GRES" = "attached=True rc=0 restored=True" ] \
+   && ! grep -qi "refused\|no such session" "$WORK/G.out"; then
+  ok "gateG: interactive shell left with 'exit 0' exits 0, quietly, and restores the tty"
+else
+  echo "-- G.out --"; cat -v "$WORK/G.out"; tail -5 "$WORK/upA-G.log"
+  bad "gateG: interactive clean exit misreported or left the tty changed ($GRES)"
+fi
+
+
 say C
 OUTC=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'true' 2>"$WORK/C.err" </dev/null)
 rcC=$?

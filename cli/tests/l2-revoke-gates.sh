@@ -9,6 +9,9 @@
 #   A  the forward streams before the revoke           (positive control)
 #   A2 a healthy forward survives its own recheck       (no-revoke control)
 #   B  after the revoke the client's connection closes within the bound
+#   C  and the forward PROCESS ends with the denied exit code (4), saying why on
+#      its stderr. It used to keep listening and reset every new client while
+#      the reason went only to its log, so a supervisor never saw it stop.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI_DIR="$(dirname "$HERE")"
@@ -48,7 +51,8 @@ FIX_PIDS+=($!)
 sleep 1
 
 env FILAMENT_CONFIG_DIR="$WORK/bravo" "$BIN" --server "$SERVER" forward "alpha:$COUNTER_PORT" --lport 9123 >"$WORK/fwd.log" 2>&1 &
-FIX_PIDS+=($!)
+FWD_PID=$!
+FIX_PIDS+=($FWD_PID)
 sleep 3
 
 # ===================================================================== GATE A ==
@@ -100,6 +104,30 @@ elif [ "$reason_after" -le "$reason_before" ]; then
   echo "-- up.log (tail) --"; tail -8 "$WORK/up.log"
 else
   ok "gateB: the revoked forward closed the client's connection within ${GRACE}s, and the acceptor names the revocation"
+fi
+
+# ===================================================================== GATE C ==
+# The forward itself must stop: a policy refusal is final, so it exits with the
+# denied code (4, exit_codes::ExitKind::Denied from #393) and names the reason on
+# stderr. Still running here means it keeps a listener that only resets clients.
+say C
+# One fresh client as well, the case a user hits: a NEW connection after the
+# revoke is refused by policy. Harmless when the forward has already exited.
+( timeout 5 nc 127.0.0.1 9123 </dev/null >/dev/null 2>&1 ) || true
+for _ in $(seq 1 "$GRACE"); do kill -0 "$FWD_PID" 2>/dev/null || break; sleep 1; done
+if kill -0 "$FWD_PID" 2>/dev/null; then
+  bad "gateC: the forward is still running after its access was revoked"
+  echo "-- fwd.log --"; tail -5 "$WORK/fwd.log"
+else
+  wait "$FWD_PID"; FWD_RC=$?
+  fwdlog=$(tr -d '\r' <"$WORK/fwd.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g')
+  if [ "$FWD_RC" -eq 4 ] && printf '%s\n' "$fwdlog" | grep -q 'access revoked' \
+     && printf '%s\n' "$fwdlog" | grep -q 'stopped'; then
+    ok "gateC: the revoked forward exited 4 and said why"
+  else
+    bad "gateC: the forward ended rc=$FWD_RC without the denied code and reason"
+    echo "-- fwd.log --"; printf '%s\n' "$fwdlog" | tail -5
+  fi
 fi
 
 echo
