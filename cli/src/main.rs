@@ -561,6 +561,10 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
 /// The clap command surface.
 mod cli_def;
 pub(crate) use cli_def::{Cli, Cmd, DevicesAction, EphemeralAction, IdAction};
+/// The mesh name responder: a pure DNS codec and the zone it answers from.
+mod mesh_dns;
+/// `tunlion dns query`.
+mod dns_cmd;
 #[cfg(test)]
 pub(crate) use cli_def::EXAMPLES;
 

@@ -100,6 +100,33 @@ pub(crate) fn tour_cmd() -> Result<()> {
     Ok(())
 }
 
+/// The running daemon's mesh name table (`dns-names`), when one answers.
+///
+/// Asked of the control socket directly, NOT gated on `daemon_alive`: a daemon
+/// running from a binary with file capabilities (`setcap cap_net_admin`, the
+/// unprivileged kernel-TUN path) is non-dumpable, so its /proc/<pid>/exe is
+/// unreadable and `daemon_alive` reports it as not running. The socket
+/// answering is the evidence that matters here.
+fn mesh_names() -> Option<Value> {
+    crate::ctl::dns_request(&json!({ "op": "dns-names" }))
+}
+
+/// The name rows of `status`: how many devices the responder serves, and every
+/// name two devices share (it resolves to neither) with the aliases that work.
+fn say_mesh_names(v: &Value) {
+    let n = v["names"].as_array().map_or(0, |a| a.len());
+    ui::say(&format!(
+        "  {} {n} name{} served as .{} (responder {})",
+        ui::paint(ui::Tone::Dim, "·"),
+        if n == 1 { "" } else { "s" },
+        v["suffix"].as_str().unwrap_or(crate::mesh_dns::SUFFIX),
+        v["responder"].as_str().unwrap_or("?"),
+    ));
+    for line in crate::mesh_dns::collision_lines(v) {
+        ui::say(&format!("  {} {line}", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
+    }
+}
+
 pub(crate) fn status_cmd(json: bool) -> Result<()> {
     if json {
         let pid = daemon_alive();
@@ -119,6 +146,8 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
                 "devices": devices_load().len(),
                 "exposed": exposed,
                 "recent": recent,
+                // The responder's table and collisions; null without a daemon.
+                "mesh": mesh_names(),
             }))?
         );
         return Ok(());
@@ -132,6 +161,9 @@ pub(crate) fn status_cmd(json: bool) -> Result<()> {
             "  {} not running, start with: tunlion up",
             ui::paint(ui::Tone::Dim, "·")
         )),
+    }
+    if let Some(v) = mesh_names() {
+        say_mesh_names(&v);
     }
     let n = devices_load().len();
     ui::say(&format!(

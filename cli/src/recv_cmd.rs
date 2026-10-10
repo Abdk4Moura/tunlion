@@ -21,7 +21,7 @@ use crate::{
     AdoptSource, Ceremony, Conn, DaemonMounts, Ev, IncomingFile, MAX_ATTEMPTS, MAX_VERIFY_FAILS,
     PROVEN_CHALLENGE_DEADLINE, PakeInbound, PartMeta, Presence, RecvState, Rung, ShellPolicy,
     TtyGuard, WarmPtys, any_shell_grant, apply_reconfigure, cancelled, channel_of,
-    clear_provisional_identity, codeentry, command_arg, config_get, consent_token, ctl,
+    clear_provisional_identity, codeentry, command_arg, consent_token, ctl,
     daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
     device_name_for_pub, device_set_cap, devices_load, devices_path, devices_remove, devices_store,
     devices_sweep_lapsed, devices_touch, devices_upsert_atomic, direct, direct_ok_for,
@@ -1359,12 +1359,14 @@ pub(crate) async fn recv_cmd(
                                     addr,
                                     v4
                                 ));
-                                // Show the .mesh name that resolves to this machine.
-                                let my_name = l3::hostname();
+                                // Show the .mesh name that resolves to this machine:
+                                // the SAME name registered below (it used to print
+                                // the hostname while registering the `name`
+                                // setting, so the banner named a host nobody served).
                                 ui::say(&format!(
-                                    "    this machine resolves as {}{}",
-                                    l3::sanitize_host(&my_name),
-                                    ".mesh"
+                                    "    this machine resolves as {}.{}",
+                                    l3::self_mesh_name(),
+                                    crate::mesh_dns::SUFFIX
                                 ));
                             }
                             // Add this machine's own address to MagicDNS so
@@ -1372,10 +1374,9 @@ pub(crate) async fn recv_cmd(
                             // Uses the tunlion device name (from `tunlion set name`
                             // or hostname if unset), sanitized for DNS.
                             if let Some(id) = m.identity_ref() {
-                                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
                                 let v6 = id.addr();
                                 let v4 = Some(id.addr_v4());
-                                m.names_insert("__self__", &l3::sanitize_host(&my_name), v6, v4)
+                                m.names_insert(l3::SELF_PID, &l3::self_mesh_name(), v6, v4)
                                     .await;
                                 if !m.is_userspace() {
                                     m.refresh_hosts().await;
@@ -1570,6 +1571,8 @@ pub(crate) async fn recv_cmd(
         children: HashMap::new(),
     };
     let mut last_mount_check = Instant::now();
+    #[cfg(l3)]
+    let mut last_l3_sweep = Instant::now();
 
     // WARM-HOLD: periodic check for warm peers that need connections
     let mut last_warm_hold_tick = Instant::now();
@@ -1741,6 +1744,28 @@ pub(crate) async fn recv_cmd(
                                     }
                                     None => req.reject("L3 overlay is not up").await,
                                 }
+                            }
+                            #[cfg(not(l3))]
+                            req.reject("L3 overlay not supported on this build").await;
+                        } else if matches!(&req.kind, ctl::ReqKind::DnsQuery { .. } | ctl::ReqKind::DnsNames) {
+                            // The mesh name responder, asked over the control
+                            // socket (`tunlion dns query`, `status`, `doctor`, the
+                            // ssh L3 path). Same zone, same code path as a packet
+                            // to the responder address, and it works in userspace
+                            // mode too, where no packet can reach it.
+                            #[cfg(l3)]
+                            match l3.as_ref() {
+                                Some(m) => {
+                                    let zone = m.zone().await;
+                                    let v = match &req.kind {
+                                        ctl::ReqKind::DnsQuery { name, qtype } => {
+                                            crate::mesh_dns::query_json(&zone, name, *qtype)
+                                        }
+                                        _ => crate::mesh_dns::names_json(&zone),
+                                    };
+                                    req.reply(&v).await;
+                                }
+                                None => req.reject("L3 overlay is not up").await,
                             }
                             #[cfg(not(l3))]
                             req.reject("L3 overlay not supported on this build").await;
@@ -2662,6 +2687,18 @@ pub(crate) async fn recv_cmd(
         }
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // Names and routes of links that have stayed gone past the grace. A
+        // repair inside the grace keeps everything (continuity); a device that
+        // left stops resolving instead of living in the name table until the
+        // daemon restarts. Throttled: the link table only matters at this pace.
+        #[cfg(l3)]
+        if last_l3_sweep.elapsed() >= Duration::from_secs(5) {
+            last_l3_sweep = Instant::now();
+            if let Some(m) = l3.as_ref() {
+                let live: std::collections::HashSet<String> = conn.links.keys().cloned().collect();
+                m.sweep_departed(&live, Instant::now()).await;
+            }
+        }
         // Grace expired: decide these offers normally rather than hold them.
         // Re-injected with `__fleet_waited` so the deferral above does not catch
         // them a second time and park them forever.

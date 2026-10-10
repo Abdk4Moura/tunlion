@@ -49,6 +49,10 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("pair_cmd.rs", 1),
         ("recv_files.rs", 1),
         ("status_cmd.rs", 1),
+        // `dns query` prints its answers on stdout, one per line, like
+        // `dig +short`: that is the output a script captures (the L3 gate
+        // compares it with dig's). Its human asides go through ui::.
+        ("dns_cmd.rs", 1),
         ("mount.rs", 47),
         ("doctor.rs", 44),
         ("settings.rs", 37),

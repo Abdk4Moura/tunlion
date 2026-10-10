@@ -4474,7 +4474,7 @@ async fn run_ssh(
                 crate::ui::debug(&format!(
                     "ssh over the L3 overlay ({mesh_host}) - survives link repairs"
                 ));
-                let code = spawn_ssh_direct(login, &mesh_host, extra, &ident)?;
+                let code = spawn_ssh_direct(login, &mesh_host, addr.ip(), extra, &ident)?;
                 if code != 255 {
                     sigwatch.abort();
                     return Ok(code);
@@ -4509,12 +4509,21 @@ async fn run_ssh(
 fn spawn_ssh_direct(
     login: &str,
     mesh_host: &str,
+    addr: std::net::IpAddr,
     extra: &[String],
     ident: &crate::ssh_ca::CertIdentity,
 ) -> Result<i32> {
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{mesh_host}");
     let mut cmd = std::process::Command::new("ssh");
+    // Connect to the address the DAEMON resolved (so ssh never asks the OS
+    // resolver for a `.mesh` name), while host keys stay pinned under the
+    // `.mesh` name exactly as before (HostKeyAlias), so known_hosts entries made
+    // by earlier versions keep matching.
+    cmd.arg("-o")
+        .arg(format!("HostName={addr}"))
+        .arg("-o")
+        .arg(format!("HostKeyAlias={mesh_host}"));
     cmd.arg("-o")
         .arg(format!("IdentityFile={}", ident.key_path.display()))
         .arg("-o")
@@ -4622,19 +4631,36 @@ fn spawn_ssh(
 /// UserKnownHostsFile) with a `tunlion netcat` ProxyCommand. No prompts, no
 /// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
 /// peer lacks the `shell` cap we abort HERE, before invoking ssh.
-/// Resolve `<peer>.mesh` (the MagicDNS /etc/hosts entry) to its overlay socket
-/// address. `Some` iff the peer is on the overlay (has a route); the address is the
+/// Resolve `<peer>.mesh` to its overlay socket address by ASKING THE DAEMON's
+/// name responder (the verified table every other path resolves from), not the
+/// OS resolver. It used to go through the hosts file, so ssh over L3 silently
+/// depended on a root-written /etc/hosts entry that a userspace daemon never
+/// writes, another daemon could wipe, and a name collision made round-robin.
+/// `Some` iff the daemon has exactly one device by that name; the address is the
 /// crypto-derived, STABLE overlay IP (only the transport swaps under it on a
 /// repair), so it's a valid target to probe/connect across repairs. `None` means
-/// the peer isn't on the mesh at all -> the caller goes straight to the L2 tunnel.
-/// (Note: unlike the old `l3_ssh_target`, this does NOT probe here - the caller
-/// probes and, if the route is present but dead, REVIVES rather than dumping to L2.)
+/// no daemon, no such device, or an ambiguous name -> the caller goes straight
+/// to the L2 tunnel. (Note: unlike the old `l3_ssh_target`, this does NOT probe
+/// here - the caller probes and, if the route is present but dead, REVIVES
+/// rather than dumping to L2.)
 #[cfg(target_os = "linux")]
 fn l3_mesh_addr(peer: &str, port: u16) -> Option<(String, std::net::SocketAddr)> {
-    use std::net::ToSocketAddrs;
-    let name = format!("{}.mesh", crate::l3::sanitize_host(peer));
-    let addr = (name.as_str(), port).to_socket_addrs().ok()?.next()?;
-    Some((name, addr))
+    let host = crate::l3::sanitize_host(peer.strip_suffix(".mesh").unwrap_or(peer));
+    let name = format!("{host}.{}", crate::mesh_dns::SUFFIX);
+    let reply = crate::ctl::dns_request(&serde_json::json!({
+        "op": "dns-query",
+        "name": name,
+        "qtype": crate::mesh_dns::TYPE_AAAA,
+    }))?;
+    if reply["rcode"].as_str() != Some("NOERROR") {
+        return None;
+    }
+    let addr: std::net::IpAddr = reply["answers"]
+        .as_array()?
+        .iter()
+        .filter(|a| a["type"].as_str() == Some("AAAA"))
+        .find_map(|a| a["data"].as_str()?.parse().ok())?;
+    Some((name, std::net::SocketAddr::new(addr, port)))
 }
 
 /// Quick reachability probe of an sshd over the overlay: a bounded TCP connect.
@@ -4801,7 +4827,11 @@ pub(crate) fn l3_dest(_info: &PeerSshInfo) -> Option<String> {
 #[cfg(target_os = "linux")]
 pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
     let peer = info.host.strip_prefix("tunlion-").unwrap_or(&info.host);
-    let (mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
+    let (_mesh_host, addr) = l3_mesh_addr(peer, info.rport)?;
+    // The destination is the daemon-resolved ADDRESS (bracketed, the form
+    // ssh/sshfs/rsync all accept for IPv6), so these tools never consult the OS
+    // resolver for a `.mesh` name either.
+    let mesh_host = format!("[{}]", addr.ip());
 
     // Retry with increasing timeouts (like run_ssh does with revive+poll).
     // A single 600ms probe is too aggressive - overlay may be temporarily slow.

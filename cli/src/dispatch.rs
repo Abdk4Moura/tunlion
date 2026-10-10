@@ -618,8 +618,8 @@ pub(crate) async fn async_main() -> Result<()> {
             } else {
                 // Show this machine's address.
                 let id = overlay::load_identity()?;
-                let my_name = config_get("name").unwrap_or_else(|| l3::hostname());
-                let mesh_name = l3::sanitize_host(&my_name);
+                // The same name the daemon registers and its banner prints.
+                let mesh_name = l3::self_mesh_name();
                 if json_output {
                     println!(
                         "{}",
@@ -2043,6 +2043,7 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
         Cmd::Requests { action } => requests_cmd(action).await,
+        Cmd::Dns { action } => crate::dns_cmd::dns_cmd(action),
         Cmd::Ephemeral { action } => ephemeral_cmd(&server, action, relay).await,
         Cmd::Backup {
             peer,
