@@ -408,7 +408,7 @@ sharp invariant: after the ceremony, both stores' channel ids are EQUAL
 **Superseded for the `up` console:** the in-session ceremony claimed a v1
 code and handed the secret over a DataChannel whose fingerprints the
 signaling server chose, so a malicious server could keep it. The console now
-points at `tunlion pair` (SPAKE2), and the running daemon picks the new device
+points at `tunlion add` / `tunlion join` (SPAKE2), and the running daemon picks the new device
 up from the store within ~2 s.
 
 ### C30. The lost-emit disease class — **PHASE 1 VERIFIED (gate 19)**
