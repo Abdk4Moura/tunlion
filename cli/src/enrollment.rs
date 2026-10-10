@@ -14,7 +14,7 @@
 use crate::net::{self, Ev};
 use crate::{AdoptSource, Conn, direct, fleet, identity, session, shutdown, ui};
 use crate::{
-    capability_list_summary, config_set, devices_upsert_atomic, display_name, fresh_secret,
+    capability_list_summary, config_set, display_name, fresh_secret,
     is_self_uid, load_delegation, local_device_cert_path, merge_owner_cap_ops, mk_uid,
     open_enrollment,
 };
@@ -110,26 +110,19 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         )?,
     )?;
     let transfer_caps = vec!["transfer".to_string()];
-    // The invitation names the fleet, but it must not re-key a DIFFERENT
-    // fleet already recorded under this name (stale join, or a hostile
-    // invitation): refuse instead of silently replacing the owner's
-    // identity. Same key re-joining passes through below.
-    if crate::devices_store::name_pinned_by_other(owner_name, &hex::encode(owner_cert.device_pub)) {
-        anyhow::bail!(
-            "already have a different fleet owner recorded as '{owner_name}': forget it first, then join"
-        );
-    }
-    // allow_reanchor: joining under an owner-signed invitation is the owner
-    // decision that permits recording under this name.
-    devices_upsert_atomic(
+    // The invitation names the fleet, but the name is presentation: it must
+    // not re-key a DIFFERENT fleet already recorded under it (stale join, or
+    // a hostile invitation), and it must not re-key a certless record that
+    // merely shares the name either (that record's grants would pass to the
+    // owner's identity). Only a record pinned to the owner's own device key
+    // is updated in place; anything else gets a new, suffixed record. See
+    // devices_store::place_joined_owner.
+    crate::devices_store::devices_store_joined_owner(
         owner_name,
-        Some(secret),
-        Some(&owner_cert),
-        Some(&transfer_caps),
-        Some(identity::IntroScope::Device.to_byte()),
-        None,
-        None,
-        true,
+        secret,
+        &owner_cert,
+        &transfer_caps,
+        identity::IntroScope::Device.to_byte(),
     )?;
     // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
     // not a failure, it just means no auto-mesh (an older owner, or a join that

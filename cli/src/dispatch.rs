@@ -1510,6 +1510,7 @@ pub(crate) async fn async_main() -> Result<()> {
             device,
             capability,
             tag,
+            user,
         } => {
             // The owner key resolves the RESOURCE, so it is needed before the
             // capability name is final: `route:10.0.0.0/24` names an owner-bound
@@ -1628,6 +1629,11 @@ pub(crate) async fn async_main() -> Result<()> {
                     ceiling.join(", ")
                 );
             }
+            if user && owner_pk.is_none() {
+                bail!(
+                    "a user-wide grant (--user) is an owner-signed grant to a user key, and this device holds no owner signing key. Run it on the owner's machine, or grant to the device:\n  tunlion grant {device} {spec}"
+                );
+            }
             device_set_cap(&device, &capability, true, None)?;
             // If identity layer is active, also issue an owner-signed CapOp
             if let Ok(Some(user_key)) =
@@ -1635,7 +1641,6 @@ pub(crate) async fn async_main() -> Result<()> {
             {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
-                let pk = user_key.public_key_bytes();
 
                 // Ensure a genesis header exists for the resource being granted.
                 // Keyed by the RESOURCE, so a route prefix gets its own header
@@ -1677,14 +1682,20 @@ pub(crate) async fn async_main() -> Result<()> {
                     store.push(hdr_json);
                 }
 
-                // Create CapOp: target the peer's real user_pub from their
-                // stored device cert (not SHA-256 of the device name, which
-                // never matches evaluate()'s principal_user_pub comparison).
-                // Requires the peer to have a certified identity (paired +
-                // identity-expose completed).
+                // Create CapOp: target the peer's DEVICE key from their stored
+                // device cert (not SHA-256 of the device name, which never
+                // matches evaluate()'s principal comparison). Requires the peer
+                // to have a certified identity (paired + identity-expose
+                // completed).
+                //
+                // The DEVICE key, not the user key, unless `--user` says so. A
+                // user-targeted grant matches every device that user certified,
+                // and for a device of my own fleet that user is ME: `grant
+                // laptop shell` granted shell to the whole fleet under
+                // authoritative evaluation. See device_caps::GrantScope.
                 let Some(peer_cert) = device_cert_for(&device) else {
                     return Err(anyhow!(
-                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known user key to target"
+                        "peer identity for '{device}' is not available. Pair with the peer first so their identity can be certified; the grant requires a known device key to target"
                     ));
                 };
                 if peer_cert.verify(crate::identity::now_secs()).is_err() {
@@ -1692,39 +1703,25 @@ pub(crate) async fn async_main() -> Result<()> {
                         "peer identity cert for '{device}' is expired; re-pair to refresh it"
                     ));
                 }
-                let target_arr = peer_cert.user_pub;
-
-                // Version must EXCEED any existing grant for this target, the
-                // same monotonic ratchet `revoke` respects. This was
-                // hlc_next(0, ..), which ignores what is already in the store,
-                // so a regrant could be minted below the floor. That could not
-                // fail while the op was pushed straight in; through
-                // apply_cap_op it would be refused, which is the point.
-                let existing_ver = store
-                    .iter()
-                    .filter(|e| {
-                        e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
-                            && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
-                            && e["resource"].as_str() == Some("self")
-                            && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
-                    })
-                    .filter_map(|e| e["version"].as_u64())
-                    .max()
-                    .unwrap_or(0);
-                let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
-                let mut op = crate::capability::CapOp {
-                    op: crate::capability::CapOpKind::Grant,
-                    grantor: pk,
-                    target_kind: 0x00, // User
-                    target: target_arr,
-                    resource: cap_resource.clone(),
-                    permissions: vec![capability.clone()],
-                    expires: crate::capability::now_secs().saturating_add(90 * 24 * 3600),
-                    issued_at: crate::capability::now_secs(),
-                    version: v,
-                    sig: [0u8; 64],
+                let scope = if user {
+                    crate::device_caps::GrantScope::User
+                } else {
+                    crate::device_caps::GrantScope::Device
                 };
-                op.sig = crate::capability::sign_cap_op(&op, &user_key.keypair());
+
+                // Version must EXCEED everything recorded for this target,
+                // revoke tombstones included: the same monotonic ratchet
+                // `revoke` respects, and apply_cap_op refuses anything at or
+                // below it.
+                let op = crate::device_caps::sign_next_cap_op(
+                    &store,
+                    &user_key,
+                    crate::capability::CapOpKind::Grant,
+                    scope.target(&peer_cert),
+                    &cap_resource,
+                    vec![capability.clone()],
+                    crate::capability::now_secs().saturating_add(90 * 24 * 3600),
+                );
                 // ONE VALIDATED OP-CREATION PATH. `revoke` already went through
                 // apply_cap_op; `grant` pushed its JSON straight into the store
                 // and then called update_ratchet by hand, patching the single
@@ -1779,6 +1776,20 @@ pub(crate) async fn async_main() -> Result<()> {
             if capability == "shell" {
                 crate::sshd::arm_ssh_ca_for_serving().await;
             }
+            if user {
+                let names: Vec<String> = device_cert_for(&device)
+                    .map(|c| {
+                        crate::certified_device_names(&c.user_pub)
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ui::say(&format!(
+                    "user-wide grant: every device certified by the user key of '{device}' holds '{capability}' ({})",
+                    if names.is_empty() { device.clone() } else { names.join(", ") }
+                ));
+            }
             println!(
                 "granted '{capability}' to '{device}'. {}",
                 if capability == "shell" {
@@ -1793,6 +1804,7 @@ pub(crate) async fn async_main() -> Result<()> {
             device,
             capability,
             certificate,
+            user,
         } => {
             if certificate {
                 if capability.is_some() {
@@ -1834,6 +1846,11 @@ pub(crate) async fn async_main() -> Result<()> {
                     ceiling.join(", ")
                 );
             }
+            if user && load_owner_key().is_none() {
+                bail!(
+                    "a user-wide grant (--user) is owner-signed, and this device holds no owner signing key; run the revoke on the owner's machine"
+                );
+            }
             ui_caps.confirm(&format!("revoke {capability} from {device}"))?;
             device_set_cap(&device, &capability, false, None)?;
             // Mirror the grant path: also emit an owner-signed Revoke cap_op so
@@ -1850,7 +1867,6 @@ pub(crate) async fn async_main() -> Result<()> {
             {
                 let config_dir = crate::settings::config_dir();
                 let mut store = crate::capability::load_cap_store(&config_dir);
-                let pk = user_key.public_key_bytes();
                 let header = store
                     .iter()
                     .find(|e| {
@@ -1861,36 +1877,50 @@ pub(crate) async fn async_main() -> Result<()> {
                 // A revoke only bites if there is a header AND the peer has a
                 // certified identity to target (same requirement as grant).
                 if let (Some(hdr), Some(peer_cert)) = (header, device_cert_for(&device)) {
-                    let target_arr = peer_cert.user_pub;
-                    // Version MUST exceed the existing grant's version (monotonic
-                    // ratchet), else apply_cap_op refuses.
-                    let existing_ver = store
-                        .iter()
-                        .filter(|e| {
-                            e.get("type").and_then(|v| v.as_str()) == Some("cap_grant")
-                                && e["grantor"].as_str() == Some(hex::encode(pk).as_str())
-                                && e["resource"].as_str() == Some("self")
-                                && e["target"].as_str() == Some(hex::encode(target_arr).as_str())
-                        })
-                        .filter_map(|e| e["version"].as_u64())
-                        .max()
-                        .unwrap_or(0);
-                    let v = crate::capability::hlc_next(existing_ver, crate::capability::now_ms());
                     let now = crate::capability::now_secs();
-                    let mut op = crate::capability::CapOp {
-                        op: crate::capability::CapOpKind::Revoke,
-                        grantor: pk,
-                        target_kind: 0x00, // User
-                        target: target_arr,
-                        resource: "self".to_string(),
-                        permissions: vec![capability.clone()],
-                        expires: now.saturating_add(90 * 24 * 3600),
-                        issued_at: now,
-                        version: v,
-                        sig: [0u8; 64],
+                    // The revoke names the same key the grant named: the
+                    // DEVICE key by default, the user key with `--user`. See
+                    // device_caps::GrantScope.
+                    let scope = if user {
+                        crate::device_caps::GrantScope::User
+                    } else {
+                        crate::device_caps::GrantScope::Device
                     };
-                    op.sig = crate::capability::sign_cap_op(&op, user_key.keypair());
-                    match crate::capability::apply_cap_op(&mut store, &hdr, &op, now) {
+                    // A user-wide grant (made with `--user`, or by a release
+                    // that targeted every grant at the user key) still covers
+                    // this device after its own grant is revoked, so revoking
+                    // only the device key would print success and change
+                    // nothing. signed_revoke_ops takes the user-wide grant
+                    // too, and we say who else it covered.
+                    let (ops, also_user_wide) = crate::device_caps::signed_revoke_ops(
+                        &store,
+                        &user_key,
+                        &peer_cert,
+                        &capability,
+                        scope,
+                    );
+                    if also_user_wide {
+                        let others: Vec<String> = crate::certified_device_names(&peer_cert.user_pub)
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .filter(|n| n != &device)
+                            .collect();
+                        ui::say(&format!(
+                            "'{capability}' was also granted user-wide to the user key of '{device}'; revoking that too{}",
+                            if others.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    ", which also removes it from {} unless they hold their own grant",
+                                    others.join(", ")
+                                )
+                            }
+                        ));
+                    }
+                    let applied = ops
+                        .iter()
+                        .try_for_each(|op| crate::capability::apply_cap_op(&mut store, &hdr, op, now));
+                    match applied {
                         Ok(()) => {
                             let revoked =
                                 crate::capability::save_and_list_revoked(&store, &config_dir)
