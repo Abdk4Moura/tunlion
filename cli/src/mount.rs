@@ -114,7 +114,7 @@ fn save_mounts(mounts: &[MountEntry]) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(mounts)?;
-    std::fs::write(&path, data)?;
+    crate::platform::SecretFile::write_str(&path, &data)?;
     Ok(())
 }
 

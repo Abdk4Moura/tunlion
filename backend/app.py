@@ -34,7 +34,12 @@ from flask_socketio import SocketIO
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 import config
+import ratelimit
 import signaling
+
+# No silent default secret outside development (see config.ensure_secret).
+# Under gunicorn this raises during import, so the worker never boots.
+config.ensure_secret(dev_entrypoint=(__name__ == "__main__"))
 
 # The React build lands here (see frontend/vite.config.js -> build.outDir).
 # In the split deploy (Cloudflare Pages serves the SPA) this may be absent — the
@@ -110,7 +115,9 @@ _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
 def _client_ip():
-    return request.headers.get("cf-connecting-ip", request.remote_addr or "0.0.0.0")
+    # CF-Connecting-IP only from a configured trusted proxy: a forged header
+    # would otherwise pick another network's auto room (and its peers).
+    return ratelimit.client_ip(request)
 
 
 def _network_key(ip_str):

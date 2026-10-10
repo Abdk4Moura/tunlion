@@ -24,7 +24,7 @@ pub(crate) fn pidfile() -> PathBuf {
 pub(crate) fn write_pidfile() -> Result<()> {
     let pid = std::process::id();
     let exe = std::env::current_exe()?;
-    std::fs::write(pidfile(), format!("{pid}\n{}\n", exe.display()))?;
+    crate::platform::SecretFile::write_str(&pidfile(), &format!("{pid}\n{}\n", exe.display()))?;
     Ok(())
 }
 

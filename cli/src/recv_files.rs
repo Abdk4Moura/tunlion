@@ -453,11 +453,7 @@ pub(crate) async fn finalize_incoming(
     }
     if daemon {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(up_log())
-        {
+        if let Ok(mut f) = crate::platform::open_private_log(&up_log(), false) {
             let _ = writeln!(
                 f,
                 "{}  {}  {}  from {}",

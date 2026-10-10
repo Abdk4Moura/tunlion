@@ -234,12 +234,18 @@ pub(crate) async fn send_cmd(
     let single = paths.len() == 1;
     let my_uid = mk_uid("s");
     let mut outgoing: Vec<Outgoing> = Vec::new();
+    // `send -` and directory sends stage a copy before offering it. That copy
+    // is the user's data, so it goes in a private (0700, fresh, random) dir
+    // created exclusively, never a predictable name in the shared temp dir
+    // where another local user could read it or pre-plant a symlink. The guard
+    // removes the dir on every exit from this function, not only on success.
+    let mut spool_dir: Option<SpoolDir> = None;
     for (i, p) in paths.iter().enumerate() {
         let sid = (i + 1) as u32;
         let id = format!("{}-{}", my_uid, sid);
         if p == "-" {
-            let spool = std::env::temp_dir().join(format!("filament-stdin-{}", std::process::id()));
-            let mut f = std::fs::File::create(&spool)?;
+            let spool = SpoolDir::path_in(&mut spool_dir, "stdin")?;
+            let mut f = SpoolDir::create(&spool)?;
             let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
             drop(f);
             let head = head_hash(&spool);
@@ -279,14 +285,10 @@ pub(crate) async fn send_cmd(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "dir".into());
-                let spool = std::env::temp_dir().join(format!(
-                    "filament-tar-{}-{}.tar",
-                    std::process::id(),
-                    i
-                ));
+                let spool = SpoolDir::path_in(&mut spool_dir, &format!("tar-{i}.tar"))?;
                 ui::say(&format!("packing {p} -> {dirname}.tar ..."));
                 {
-                    let f = std::fs::File::create(&spool)?;
+                    let f = SpoolDir::create(&spool)?;
                     let mut b = tar::Builder::new(f);
                     b.append_dir_all(&dirname, &path)?;
                     b.finish()?;
@@ -2070,6 +2072,37 @@ pub(crate) async fn send_cmd(
                 }
             }
         }
+    }
+}
+
+/// Private staging directory for `send -` and directory sends, removed with
+/// everything in it when dropped. Created lazily so a plain-file send makes
+/// nothing on disk.
+struct SpoolDir(PathBuf);
+
+impl SpoolDir {
+    /// A path for `name` inside the (lazily created) private spool dir.
+    fn path_in(slot: &mut Option<SpoolDir>, name: &str) -> Result<PathBuf> {
+        if slot.is_none() {
+            *slot = Some(SpoolDir(crate::ssh_ca::secure_tempdir("send-spool")?));
+        }
+        Ok(slot.as_ref().map(|d| d.0.join(name)).unwrap_or_default())
+    }
+
+    /// Create a staging file exclusively: an existing entry (including a
+    /// symlink) is an error, never something to write through.
+    fn create(path: &std::path::Path) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create staging file {}", path.display()))
+    }
+}
+
+impl Drop for SpoolDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

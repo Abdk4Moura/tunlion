@@ -354,4 +354,25 @@ mod tests {
         assert!(PartMeta::load(&p).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A `.part.meta` planted as a symlink must not redirect the sidecar write
+    /// onto the link's target.
+    #[test]
+    fn part_meta_store_does_not_write_through_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("filament-test-meta-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        let p = dir.join("y.part.meta");
+        if crate::platform::symlink(&victim, &p).is_ok() {
+            PartMeta { size: 7, head: None, full: None }.store(&p).unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "the link target is untouched");
+            assert!(!std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(), "the sidecar is a real file now");
+            assert_eq!(PartMeta::load(&p).unwrap().size, 7);
+        } else {
+            crate::ui::say("note: this platform would not create a symlink; the symlink arm is skipped");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

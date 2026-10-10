@@ -52,6 +52,7 @@ use crate::{
     warm_link_for,
 };
 use anyhow::{Context, Result, bail};
+use filament_transfer::{MAX_RECV_RANGES, chunk_fits_offer};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1324,7 +1325,7 @@ pub(crate) async fn recv_cmd(
                                     let server = server.to_string();
                                     tokio::spawn(async move {
                                         if let Err(e) =
-                                            l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay)
+                                            l2::proxy_cmd(&server, "127.0.0.1", 1080, 0, relay, false)
                                                 .await
                                         {
                                             // Port already in use is expected (user started proxy manually);
@@ -1339,9 +1340,12 @@ pub(crate) async fn recv_cmd(
                                         "  {} started SOCKS5 proxy on 127.0.0.1:1080 (set your tools' proxy to this)",
                                         ui::paint(ui::Tone::Ok, ui::glyph_ok())
                                     ));
-                                    ui::say(&format!(
-                                        "    e.g.  curl --socks5-hostname 127.0.0.1:1080 http://<peer>.mesh:8080/"
-                                    ));
+                                    // The proxy opens mesh streams as this owner, so it
+                                    // requires the password in the token file; the
+                                    // proxy's own banner prints how to pass it.
+                                    for line in l2::proxy_usage_lines("127.0.0.1", 1080) {
+                                        ui::say(&format!("  {line}"));
+                                    }
                                 }
                             } else {
                                 // Kernel mode is dual-stack: show the v4 address too
@@ -6873,6 +6877,21 @@ pub(crate) async fn recv_cmd(
                             continue;
                         }
                     };
+                    // The peer chose both the offset and the length. Nothing it
+                    // writes may land past the size it offered (a sparse file of
+                    // any size is otherwise one frame away), and the coverage
+                    // list must stay bounded (every disjoint chunk adds a range).
+                    if !chunk_fits_offer(pos, data.len(), inc.size)
+                        || inc.ranges.lock().map(|r| r.len()).unwrap_or(usize::MAX)
+                            >= MAX_RECV_RANGES
+                    {
+                        ui::debug(&format!(
+                            "  refusing chunk for sid {sid} from {pid}: {} bytes at {pos} is outside the offered {} bytes or too fragmented",
+                            data.len(),
+                            inc.size
+                        ));
+                        continue;
+                    }
                     inc.inflight.fetch_add(1, Ordering::Relaxed);
                     let file = Arc::clone(&inc.file);
                     let inflight = Arc::clone(&inc.inflight);
@@ -6983,7 +7002,10 @@ pub(crate) async fn recv_cmd(
                         ui::clear_sticky();
                         ui::say(&ui::paint(
                             ui::Tone::Dim,
-                            &format!("  declined {}", qv["name"].as_str().unwrap_or("file")),
+                            &format!(
+                                "  declined {}",
+                                safe_incoming_name(qv["name"].as_str().unwrap_or("file"))
+                            ),
                         ));
                         if let Some(t) = conn.transport_of(&qpid) {
                             t.send_control(&protocol::decline_msg(

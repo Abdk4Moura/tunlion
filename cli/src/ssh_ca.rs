@@ -301,11 +301,10 @@ pub(crate) fn load_issued(config_dir: &std::path::Path, now_secs: u64) -> Vec<Is
         // Atomic like every other ledger write: a torn prune must not eat
         // live rows (best-effort here -- a failed prune just retries next
         // load; issuance itself already landed).
+        // SecretFile, like record_issuance: a plain write-and-rename here
+        // replaced the 0600 ledger with a umask-default (0644) file.
         if let Ok(text) = serde_json::to_string(&v) {
-            let tmp = p.with_extension("tmp");
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &p);
-            }
+            let _ = crate::platform::SecretFile::write_str(&p, &text);
         }
     }
     v
